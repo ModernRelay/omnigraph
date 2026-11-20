@@ -71,8 +71,16 @@ pub(crate) struct CorrelateRead {
     /// The tie rule's columns after the keys, by name.
     pub(crate) tiebreak: Vec<String>,
     pub(crate) limit: Option<usize>,
+    /// A `nearest` window: the ranked binding's identity column and the
+    /// window `k`, the rows of the first `k` distinct identities of each
+    /// partition in the read's order kept, every row of each.
+    pub(crate) window: Option<(String, usize)>,
     /// The reference columns that leave: each binding's columns.
     pub(crate) references: Vec<String>,
+    /// The score columns a ranking read appended to a reference's columns
+    /// (`d._distance`): the read returns the score as a value column, so a
+    /// reference leaves with its node's columns alone.
+    pub(crate) scores: Vec<String>,
     pub(crate) params: Arc<ParamMap>,
 }
 
@@ -130,7 +138,9 @@ fn output_schema(
         let carried: Vec<Field> = inner
             .fields()
             .iter()
-            .filter(|field| field.name().starts_with(&prefix))
+            .filter(|field| {
+                field.name().starts_with(&prefix) && !read.scores.contains(field.name())
+            })
             .map(|field| field.as_ref().clone())
             .collect();
         if carried.is_empty() {
@@ -305,7 +315,7 @@ async fn evaluate(
     }
     let rows = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
     reservation.hold(&rows)?;
-    if read.order_by.is_empty() && read.limit.is_none() {
+    if read.order_by.is_empty() && read.limit.is_none() && read.window.is_none() {
         return Ok(rows);
     }
     let kept = ordered_cut(&rows, tag, read).map_err(external)?;
@@ -486,9 +496,9 @@ fn ordered_cut(rows: &RecordBatch, tag: Option<&str>, read: &CorrelateRead) -> R
     } else {
         lexsort_to_indices(&keys, None).map_err(OmniError::arrow_internal)?
     };
-    let Some(limit) = read.limit else {
+    if read.limit.is_none() && read.window.is_none() {
         return Ok(sorted);
-    };
+    }
     let tags = match tag {
         Some(tag) => Some(column(rows, tag)?),
         None => None,
@@ -496,16 +506,54 @@ fn ordered_cut(rows: &RecordBatch, tag: Option<&str>, read: &CorrelateRead) -> R
     let tags = tags
         .as_ref()
         .and_then(|tags| tags.as_any().downcast_ref::<UInt32Array>());
+    // The window's targets: each row's identity as text, adjacent per
+    // target since the order reads the distance and then the identity.
+    let identities = match &read.window {
+        Some((identity, targets)) => Some((
+            arrow_cast::cast(&column(rows, identity)?, &DataType::Utf8)
+                .map_err(OmniError::arrow_internal)?,
+            *targets,
+        )),
+        None => None,
+    };
+    let window = match &identities {
+        Some((ids, targets)) => Some((
+            ids.as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| OmniError::manifest_internal("a target identity is not text"))?,
+            *targets,
+        )),
+        None => None,
+    };
     let mut kept = Vec::new();
     let mut current: Option<u32> = None;
     let mut taken = 0usize;
+    let mut targets = 0usize;
+    let mut target: Option<String> = None;
     for row in sorted.values().iter().copied() {
         let partition = tags.map_or(0, |tags| tags.value(row as usize));
         if current != Some(partition) {
             current = Some(partition);
             taken = 0;
+            targets = 0;
+            target = None;
         }
-        if taken < limit {
+        if let Some((ids, k)) = window {
+            if ids.is_null(row as usize) {
+                return Err(OmniError::manifest_internal(
+                    "a window's target has no identity",
+                ));
+            }
+            let id = ids.value(row as usize);
+            if target.as_deref() != Some(id) {
+                targets += 1;
+                target = Some(id.to_string());
+            }
+            if targets > k {
+                continue;
+            }
+        }
+        if read.limit.is_none_or(|limit| taken < limit) {
             kept.push(row);
             taken += 1;
         }

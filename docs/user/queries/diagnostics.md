@@ -295,7 +295,7 @@ a later release lowers it.
 
 | Refused |
 |---|
-| A ranking beside another pattern component or correlated on an outer name, two rankings in one pattern, a ranking inside an `optional`, a `union` arm or an inline read, a ranking over a read with its own aggregate, `distinct`, `order` or `limit` |
+| An `rrf` whose arms read a name of the enclosing scope |
 | A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope; an inline read returning an outer name under another name; a called read's `limit $k` bound to a computed argument |
 | A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` that binds no node of its own |
 | A full-text call (`match_terms`) read as a value in `return`, `order` or a block's aggregate |

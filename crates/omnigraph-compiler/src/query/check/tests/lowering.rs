@@ -58,51 +58,11 @@ struct InProgress {
 /// never writes is a [`crate::shape::ShapeError::Internal`] defect, not a
 /// refusal, and has none.
 const B_IN_PROGRESS: &[InProgress] = &[
-    // `ReadShape`: a pattern's core node with no plan node.
+    // `ReadShape`: a ranking drawn as a read of its own.
     InProgress {
-        construct: "a ranking over an inline read with an aggregate or `distinct`",
-        site: "an inline read with an aggregate or `distinct` (a `Group` in a pattern)",
-        text: "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return distinct { $d } }, $d.embedding, $v, k: 1) as $x } return { $d.id } }",
-    },
-    InProgress {
-        construct: "a ranking over an inline read with an `order`",
-        site: "an inline read with an `order` (an `Order` in a pattern)",
-        text: "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } order { $d.id } }, $d.embedding, $v, k: 1) as $x } return { $d.id } }",
-    },
-    InProgress {
-        construct: "a ranking over an inline read with a `limit`",
-        site: "an inline read with a `limit` (a `Cut` in a pattern)",
-        text: "query q($v: Vector(3)) { match { from distance({ match { $d: Doc } return { $d } limit 3 }, $d.embedding, $v) as $x } return { $d.id } }",
-    },
-    InProgress {
-        construct: "a ranking beside another pattern component",
-        site: "a `{}` node in a pattern",
-        text: "query q($s: String) { match { $p: Person, let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } where $p.handle = \"p1\" return { $p.name, $d.title, $score } }",
-    },
-    InProgress {
-        construct: "a ranking correlated on an outer variable",
-        site: "a `{}` node in a pattern",
-        text: "query q($v: Vector(3)) { match { $p: Person, from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: 3) as $s } return { $p.name, $d.title } }",
-    },
-    InProgress {
-        construct: "two rankings in one pattern",
-        site: "a `{}` node in a pattern",
-        text: "query q($s: String, $v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score, let $pop2 = { match { $e: Doc } return { $e } }, from nearest($pop2, $e.embedding, $v, k: 2) as $dist } return { $d.title, $e.title } }",
-    },
-    InProgress {
-        construct: "a ranking inside an inline read without its own order",
-        site: "a `{}` node in a pattern",
-        text: "query q($v: Vector(3)) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from nearest($all, $d.embedding, $v, k: 3) as $s } return { $d, $s } } } return { $d.title, $s } }",
-    },
-    InProgress {
-        construct: "a ranking inside an `optional`",
-        site: "a `{}` node in a pattern",
-        text: "query q($v: Vector(3)) { match { $p: Person, optional { let $all = { match { $d: Doc } return { $d } }, from nearest($all, $d.embedding, $v, k: 3) as $s } } where $p.handle = \"a\" return { $p.name } }",
-    },
-    InProgress {
-        construct: "a ranking as a `union` arm",
-        site: "a `{}` node in a pattern",
-        text: "query q($v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from union(nearest($all, $d.embedding, $v, k: 3), { match { $d: Doc } return { $d } }) } return { $d.title } }",
+        construct: "an `rrf` correlated on an outer variable",
+        site: "an `rrf` whose arms read the enclosing scope",
+        text: "query q($s: String, $v: Vector(3)) { match { $p: Person, let $pop = { match { $d: Doc, $p authored $d } return { $d } }, from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $v, k: 3)) as $f } return { $p.name, $d.title, $f } }",
     },
     // `ReadShape`: return items and order keys.
     InProgress {
@@ -156,11 +116,6 @@ const B_IN_PROGRESS: &[InProgress] = &[
         site: "a called read's `limit` over an argument that is not a literal or a parameter",
         text: "query top($k: I64) { match { $q: Person } return { $q } order { $q.age } limit $k }
                query q() { match { $p: Person, from top(3 + 1) } return { $p.name, $q.name } }",
-    },
-    InProgress {
-        construct: "a ranking inside an inline read with its own order and limit",
-        site: "a ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit`",
-        text: "query q($s: String) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $s) as $score } return { $d } order { $score desc } limit 2 } } return { $d.title } }",
     },
     // `ReadShape`: the blocks of a `where`.
     InProgress {
@@ -320,10 +275,55 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { from { match { $p: Person } return distinct { $p.city as town } } } return { $town } }",
                 Lowers,
             ),
-            // "a ranking inside an inline read with its own order and limit"
+            // A ranking inside an inline read with its own order and limit.
             (
                 "query q($s: String) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $s) as $score } return { $d } order { $score desc } limit 2 } } return { $d.title } }",
-                Refused("B"),
+                Lowers,
+            ),
+            // A ranking over an inline read with an aggregate or `distinct`.
+            (
+                "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return distinct { $d } }, $d.embedding, $v, k: 1) as $x } return { $d.id } }",
+                Lowers,
+            ),
+            // A ranking over an inline read with an `order`.
+            (
+                "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } order { $d.id } }, $d.embedding, $v, k: 1) as $x } return { $d.id } }",
+                Lowers,
+            ),
+            // A ranking over an inline read with a `limit`.
+            (
+                "query q($v: Vector(3)) { match { from distance({ match { $d: Doc } return { $d } limit 3 }, $d.embedding, $v) as $x } return { $d.id } }",
+                Lowers,
+            ),
+            // A ranking beside another pattern component.
+            (
+                "query q($s: String) { match { $p: Person, let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } where $p.handle = \"p1\" return { $p.name, $d.title, $score } }",
+                Lowers,
+            ),
+            // A ranking correlated on an outer variable.
+            (
+                "query q($v: Vector(3)) { match { $p: Person, from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: 3) as $s } return { $p.name, $d.title } }",
+                Lowers,
+            ),
+            // Two rankings in one pattern.
+            (
+                "query q($s: String, $v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score, let $pop2 = { match { $e: Doc } return { $e } }, from nearest($pop2, $e.embedding, $v, k: 2) as $dist } return { $d.title, $e.title } }",
+                Lowers,
+            ),
+            // A ranking inside an inline read without its own order.
+            (
+                "query q($v: Vector(3)) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from nearest($all, $d.embedding, $v, k: 3) as $s } return { $d, $s } } } return { $d.title, $s } }",
+                Lowers,
+            ),
+            // A ranking inside an `optional`.
+            (
+                "query q($v: Vector(3)) { match { $p: Person, optional { let $all = { match { $d: Doc } return { $d } }, from nearest($all, $d.embedding, $v, k: 3) as $s } } where $p.handle = \"a\" return { $p.name } }",
+                Lowers,
+            ),
+            // A ranking as a `union` arm.
+            (
+                "query q($v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from union(nearest($all, $d.embedding, $v, k: 3), { match { $d: Doc } return { $d } }) } return { $d.title } }",
+                Lowers,
             ),
             (
                 "query q() { match { from union({ match { $p: Person } return { $p, 1 as d } }, { match { $q: Person } return { $q as p, 2 as d } }) } return { $p.name, $d } }",
@@ -668,8 +668,7 @@ fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
 /// The term each refusal call of a shaper's source refuses, as written: a
 /// string literal, a `format!` string or a `const` naming one. The calls
 /// are `self.refuse(what)`, `self.refuse_at(what, …)`, `unsupported(name,
-/// what, …)` and `Unlowered::new(name, what, …)`; `unlowered_node`'s terms
-/// are the literals of its arms.
+/// what, …)` and `Unlowered::new(name, what, …)`.
 fn refusal_sites(source: &str) -> Vec<String> {
     // A Rust string literal starting at `text`'s first byte, unescaped.
     fn literal(text: &str) -> (String, usize) {
@@ -737,19 +736,6 @@ fn refusal_sites(source: &str) -> Vec<String> {
                 }
             };
             sites.push(what);
-        }
-    }
-    // `unlowered_node`: one term per arm.
-    if let Some(at) = source.find("fn unlowered_node(") {
-        let body = &source[at..];
-        let body = &body[..body[1..]
-            .find("\n    fn ")
-            .map_or(body.len(), |end| end + 1)];
-        let mut rest = body;
-        while let Some(quote) = rest.find('"') {
-            let (what, len) = literal(&rest[quote..]);
-            sites.push(what);
-            rest = &rest[quote + len..];
         }
     }
     sites

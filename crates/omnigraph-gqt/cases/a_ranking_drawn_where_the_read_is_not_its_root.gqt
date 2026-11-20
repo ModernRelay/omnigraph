@@ -1,0 +1,409 @@
+# issue: none
+# notes: A ranking drawn where the read's root is not (the GQ 3 RFC, section 3, "Relation
+# notes: expressions"; section 4, "Populations and laws") is a read of its own: beside another
+# notes: component, correlated on an outer name, a second ranking, inside an inline read, an
+# notes: `optional` or a `union` arm, over a population with its own `distinct`, `order` or
+# notes: `limit`, and under an inline read's own aggregate, `order` and `limit`. The population is
+# notes: the ranking's relation and the window its own: a correlated `nearest` keeps the `k`
+# notes: nearest distinct targets of each outer row (ties to the smaller identity), every row
+# notes: of each target (d3 has two authors), and an outer `where` or `limit` never sizes it.
+
+--- runner
+timeout_ms: 20000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)? @index
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Person","data":{"handle":"a","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"b","name":"Bob","age":20}}
+{"type":"Person","data":{"handle":"p1","name":"Cy","age":50}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Doc","data":{"id":"d1","title":"graph basics","body":"graph databases store graphs","year":2020,"tags":["x"],"embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"id":"d2","title":"vector search","body":"vector search over graph embeddings","year":2021,"tags":["y"],"embedding":[0.9,0.1,0.0]}}
+{"type":"Doc","data":{"id":"d3","title":"cooking","body":"pasta and graph theory of sauces","year":2022,"tags":[],"embedding":[0.0,1.0,0.0]}}
+{"type":"Doc","data":{"id":"d4","title":"rivers","body":"water flows downhill","year":2023,"tags":[],"embedding":[0.0,0.0,1.0]}}
+{"type":"Doc","data":{"id":"d5","title":"graphs again","body":"graph graph graph","year":2024,"tags":[],"embedding":[0.5,0.5,0.0]}}
+{"edge":"Authored","from":"a","to":"d1"}
+{"edge":"Authored","from":"a","to":"d3"}
+{"edge":"Authored","from":"a","to":"d4"}
+{"edge":"Authored","from":"b","to":"d2"}
+{"edge":"Authored","from":"b","to":"d5"}
+{"edge":"Authored","from":"b","to":"d3"}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"p1"}
+{"edge":"WorksAt","from":"a","to":"acme"}
+{"edge":"Cites","from":"d1","to":"d2"}
+
+--- query
+query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return distinct { $d } }, $d.embedding, $v, k: 2) as $x } return { $d.id, $x } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.id":"d1","x":0}
+{"d.id":"d2","x":0.020000005}
+
+--- expect shape
+d.id: String
+x: F32
+
+--- query
+query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } order { $d.year desc } limit 3 }, $d.embedding, $v, k: 2) as $x } return { $d.id } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.id":"d3"}
+{"d.id":"d5"}
+
+--- expect shape
+d.id: String
+
+--- query
+query q($v: Vector(3)) { match { from distance({ match { $d: Doc } return { $d } order { $d.year } limit 3 }, $d.embedding, $v) as $x } return { $d.id, $x } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.id":"d1","x":0}
+{"d.id":"d2","x":0.020000005}
+{"d.id":"d3","x":2}
+
+--- expect shape
+d.id: String
+x: F32
+
+--- query
+query q($s: String) { match { from bm25({ match { $d: Doc } return { $d } order { $d.year } limit 2 }, $d.body, $s) as $x } return { $d.id, $x } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"d.id":"d1","x":0.383576096602}
+{"d.id":"d2","x":0.275174156258}
+
+--- expect shape
+d.id: String
+x: F64
+
+--- query
+query q($s: String) { match { $p: Person, let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } where $p.handle = "p1" return { $p.name, $d.title, $score } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"d.title":"cooking","p.name":"Cy","score":0.275174156258}
+{"d.title":"graph basics","p.name":"Cy","score":0.383576096602}
+{"d.title":"graphs again","p.name":"Cy","score":0.468815229181}
+{"d.title":"vector search","p.name":"Cy","score":0.275174156258}
+
+--- expect shape
+p.name: String
+d.title: String
+score: F64
+
+--- query
+query q($v: Vector(3)) { match { $p: Person, from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: 2) as $s } return { $p.name, $d.title, $s } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.title":"cooking","p.name":"Ada","s":2}
+{"d.title":"graph basics","p.name":"Ada","s":0}
+{"d.title":"graphs again","p.name":"Bob","s":0.5}
+{"d.title":"vector search","p.name":"Bob","s":0.020000005}
+
+--- expect shape
+p.name: String
+d.title: String
+s: F32
+
+--- query
+query q($s: String, $v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score, let $pop2 = { match { $e: Doc } return { $e } }, from nearest($pop2, $e.embedding, $v, k: 2) as $dist } return { $d.title, $e.title, $score, $dist } }
+
+--- params
+{"s": "graph", "v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.title":"cooking","dist":0,"e.title":"graph basics","score":0.275174156258}
+{"d.title":"cooking","dist":0.020000005,"e.title":"vector search","score":0.275174156258}
+{"d.title":"graph basics","dist":0,"e.title":"graph basics","score":0.383576096602}
+{"d.title":"graph basics","dist":0.020000005,"e.title":"vector search","score":0.383576096602}
+{"d.title":"graphs again","dist":0,"e.title":"graph basics","score":0.468815229181}
+{"d.title":"graphs again","dist":0.020000005,"e.title":"vector search","score":0.468815229181}
+{"d.title":"vector search","dist":0,"e.title":"graph basics","score":0.275174156258}
+{"d.title":"vector search","dist":0.020000005,"e.title":"vector search","score":0.275174156258}
+
+--- expect shape
+d.title: String
+e.title: String
+score: F64
+dist: F32
+
+--- query
+query q($v: Vector(3)) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from nearest($all, $d.embedding, $v, k: 3) as $s } return { $d, $s } } } return { $d.title, $s } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.title":"graph basics","s":0}
+{"d.title":"graphs again","s":0.5}
+{"d.title":"vector search","s":0.020000005}
+
+--- expect shape
+d.title: String
+s: F32
+
+--- query
+query q($v: Vector(3)) { match { $p: Person, optional { let $all = { match { $d: Doc, $p authored $d } return { $d } }, from nearest($all, $d.embedding, $v, k: 1) as $s } } return { $p.name, $d.title, $s } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.title":"graph basics","p.name":"Ada","s":0}
+{"d.title":"vector search","p.name":"Bob","s":0.020000005}
+{"p.name":"Cy"}
+
+--- expect shape
+p.name: String
+d.title: String?
+s: F32?
+
+--- query
+query q($v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from union(nearest($all, $d.embedding, $v, k: 2), { match { $d: Doc } where $d.year = 2023 return { $d } }) } return { $d.title } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.title":"graph basics"}
+{"d.title":"rivers"}
+{"d.title":"vector search"}
+
+--- expect shape
+d.title: String
+
+--- query
+query q($s: String) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $s) as $score } return { $d } order { $score desc } limit 2 } } return { $d.title } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"d.title":"graph basics"}
+{"d.title":"graphs again"}
+
+--- expect shape
+d.title: String
+
+--- query
+query q($v: Vector(3)) { match { $p: Person, from distance({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v) as $s } return { $p.name, $d.title, $s } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.title":"cooking","p.name":"Ada","s":2}
+{"d.title":"cooking","p.name":"Bob","s":2}
+{"d.title":"graph basics","p.name":"Ada","s":0}
+{"d.title":"graphs again","p.name":"Bob","s":0.5}
+{"d.title":"rivers","p.name":"Ada","s":2}
+{"d.title":"vector search","p.name":"Bob","s":0.020000005}
+
+--- expect shape
+p.name: String
+d.title: String
+s: F32
+
+--- query
+query q($s: String) { match { $p: Person, from bm25({ match { $d: Doc, $p authored $d } return { $d } }, $d.body, $s) as $s2 } return { $p.name, $d.title, $s2 } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"d.title":"cooking","p.name":"Ada","s2":0.275174156258}
+{"d.title":"cooking","p.name":"Bob","s2":0.275174156258}
+{"d.title":"graph basics","p.name":"Ada","s2":0.383576096602}
+{"d.title":"graphs again","p.name":"Bob","s2":0.468815229181}
+{"d.title":"vector search","p.name":"Bob","s2":0.275174156258}
+
+--- expect shape
+p.name: String
+d.title: String
+s2: F64
+
+--- query
+query q($v: Vector(3), $k: I64) { match { $p: Person, from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: $k) as $s } return { $p.name, $d.title, $s } }
+
+--- params
+{"v": [1.0, 0.0, 0.0], "k": 1}
+
+--- expect unordered
+{"d.title":"graph basics","p.name":"Ada","s":0}
+{"d.title":"vector search","p.name":"Bob","s":0.020000005}
+
+--- expect shape
+p.name: String
+d.title: String
+s: F32
+
+--- query
+query q($v: Vector(3)) { match { $c: Company, from nearest({ match { $d: Doc, $p: Person, $p authored $d } return { $d, $p } }, $d.embedding, $v, k: 2) as $s } return { $c.slug, $d.id, $p.handle, $s } }
+
+--- params
+{"v": [0.0, 1.0, 0.0]}
+
+--- expect unordered
+{"c.slug":"acme","d.id":"d3","p.handle":"a","s":0}
+{"c.slug":"acme","d.id":"d3","p.handle":"b","s":0}
+{"c.slug":"acme","d.id":"d5","p.handle":"b","s":0.5}
+
+--- expect shape
+c.slug: String
+d.id: String
+p.handle: String
+s: F32
+
+--- query
+query q($s: String, $v: Vector(3)) { match { $p: Person, let $pop = { match { $d: Doc } return { $d } }, from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $v, k: 3), k: 60) as $f } where $p.handle = "a" return { $p.name, $d.id, $f } }
+
+--- params
+{"s": "graph", "v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.id":"d1","f":0.032522474881,"p.name":"Ada"}
+{"d.id":"d2","f":0.032002048131,"p.name":"Ada"}
+{"d.id":"d3","f":0.015625,"p.name":"Ada"}
+{"d.id":"d5","f":0.032266458496,"p.name":"Ada"}
+
+--- expect shape
+p.name: String
+d.id: String
+f: F64
+
+--- query
+query q($v: Vector(3)) { match { $p: Person, from distance({ match { $d: Doc, $p authored $d } return { $d, $d.year * 2 as y } }, $d.embedding, $v) as $s } where $y > 4042 return { $p.name, $d.id, $y, $s } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d.id":"d3","p.name":"Ada","s":2,"y":4044}
+{"d.id":"d3","p.name":"Bob","s":2,"y":4044}
+{"d.id":"d4","p.name":"Ada","s":2,"y":4046}
+{"d.id":"d5","p.name":"Bob","s":0.5,"y":4048}
+
+--- expect shape
+p.name: String
+d.id: String
+y: I32
+s: F32
+
+--- query
+query q($v: Vector(3)) { match { $p: Person } where count { from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: 1) as $s where $s < 0.1 } > 0 return { $p.name } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"p.name":"Ada"}
+{"p.name":"Bob"}
+
+--- expect shape
+p.name: String
+
+--- query
+query q($v: Vector(3)) { match { $p: Person, let $n = count { from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: 2) as $s } } return { $p.name, $n } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"n":0,"p.name":"Cy"}
+{"n":2,"p.name":"Ada"}
+{"n":2,"p.name":"Bob"}
+
+--- expect shape
+p.name: String
+n: I64
+
+--- query
+query q($v: Vector(3)) { match { $p: Person, from { match { from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: 2) as $s } return { count($d) as n, min($s) as best } } } return { $p.name, $n, $best } }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"best":0,"n":2,"p.name":"Ada"}
+{"best":0.020000005,"n":2,"p.name":"Bob"}
+{"n":0,"p.name":"Cy"}
+
+--- expect shape
+p.name: String
+n: I64
+best: F32?
+
+--- query
+query q($v: Vector(3)) { match { $p: Person, from nearest({ match { $d: Doc, $p authored $d } return distinct { $d } }, $d.embedding, $v, k: 1) as $s } return { $p.name, $d.id } order { $p.name } limit 2 }
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.id":"d1","p.name":"Ada"}
+{"d.id":"d2","p.name":"Bob"}
+
+--- expect shape
+p.name: String
+d.id: String
+
+--- query
+query q($v: Vector(3)) { match { $c: Company, from nearest({ match { $d: Doc, $p: Person, $p authored $d } return { $d, $p } }, $d.embedding, $v, k: 1) as $s } return { $c.slug, $d.id, $p.handle, $s } }
+
+--- params
+{"v": [0.0, 1.0, 0.0]}
+
+--- expect unordered
+{"c.slug":"acme","d.id":"d3","p.handle":"a","s":0}
+{"c.slug":"acme","d.id":"d3","p.handle":"b","s":0}
+
+--- expect shape
+c.slug: String
+d.id: String
+p.handle: String
+s: F32

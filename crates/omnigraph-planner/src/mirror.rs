@@ -37,7 +37,7 @@ use crate::physical::{
     OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankScope, RankedAccess,
     ScanInput, StatisticSource,
 };
-use crate::read_shape::InnerRead;
+use crate::read_shape::{InnerRead, TargetWindow};
 use crate::source::SideId;
 use omnigraph_compiler::types::{AggSignature, ExprType};
 
@@ -2098,6 +2098,15 @@ pub struct InnerReadMirror {
     pub order_by: Vec<OrderingMirror>,
     pub limit: Option<u64>,
     pub limit_param: Option<String>,
+    pub window: Option<TargetWindowMirror>,
+}
+
+/// A `Correlate`'s `nearest` window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TargetWindowMirror {
+    pub binding: String,
+    pub targets: Option<u64>,
+    pub targets_param: Option<String>,
 }
 
 impl From<&InnerRead> for InnerReadMirror {
@@ -2109,6 +2118,11 @@ impl From<&InnerRead> for InnerReadMirror {
             order_by: read.order_by.iter().map(OrderingMirror::from).collect(),
             limit: read.limit,
             limit_param: read.limit_param.clone(),
+            window: read.window.as_ref().map(|w| TargetWindowMirror {
+                binding: w.binding.clone(),
+                targets: w.targets,
+                targets_param: w.targets_param.clone(),
+            }),
         }
     }
 }
@@ -2122,6 +2136,11 @@ impl From<InnerReadMirror> for InnerRead {
             order_by: mirror.order_by.into_iter().map(IROrdering::from).collect(),
             limit: mirror.limit,
             limit_param: mirror.limit_param,
+            window: mirror.window.map(|w| TargetWindow {
+                binding: w.binding,
+                targets: w.targets,
+                targets_param: w.targets_param,
+            }),
         }
     }
 }

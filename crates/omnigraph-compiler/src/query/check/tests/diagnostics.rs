@@ -216,9 +216,9 @@ fn the_lowering_refusal_and_the_product_rule_stand_beside_other_type_refusals() 
         codes_at(src),
         [("T6", "$p.hndle = $h"), ("T86", "$q")].map(|(c, t)| (c.to_string(), t.to_string())),
     );
-    // A `from` whose `as` alone is refused draws its relation, so the
-    // ranking it holds, which this release does not lower, is refused too.
-    let src = "query wrapped($q: Vector(3)) { match { from { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $dist } return { $d, $dist } } as $s } return { $d.title } }";
+    // A `from` whose `as` alone is refused draws its relation, so a term
+    // it holds that this release does not lower is refused too.
+    let src = "query wrapped($s: String, $v: Vector(3)) { match { $p: Person, from { match { let $pop = { match { $d: Doc, $p authored $d } return { $d } }, from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $v, k: 3)) as $f } return { $d, $f } } as $x } return { $d.title } }";
     assert_eq!(
         pass(src)
             .iter()

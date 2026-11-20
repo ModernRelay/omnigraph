@@ -33,7 +33,23 @@ A query runs against one resolved `ReadTarget`:
    alone (`Shaper::ranking_steps`): a `nearest` arm's window over its own
    population with the arm's own `k`, an exact `Score` step, or an inline
    read's uncorrelated `Correlate` whose `order` ranks the arm (see
-   [Fusion](#fusion-one-operator-over-any-ranked-arm)). An `optional { p }` (the core's `Correlate(R,
+   [Fusion](#fusion-one-operator-over-any-ranked-arm)). A ranking that is
+   not the read's root (beside another component, correlated on an outer
+   name, a second ranking, inside an inline read, an `optional` or a `union`
+   arm, or over a population with its own aggregate, `distinct`, `order` or
+   `limit`) is the core's `Correlate` over it, drawn as a read of its own
+   (`Shaper::ranking_read`): a `PatternStep::Correlate` whose inner steps are
+   its population's, then the exact `Score` of each row (a `nearest`'s
+   distance included), whose columns are the population's and the score, and
+   whose `InnerRead::window` (a `nearest`'s `k`, `TargetWindow`) keeps the
+   rows of the first `k` distinct targets in distance-then-identity order,
+   cut per outer row by `CorrelateExec` when the read is correlated, so the
+   population is the ranking's relation and the cut is its own. Plan
+   acceptance requires such a read to end on the window binding's exact
+   distance and to order by it, then the binding's identity. A non-root
+   `nearest` is evaluated exactly, every row of its population scored; an
+   `rrf` there is a `Correlate` over its `Fuse` step. An `rrf` whose arms
+   read the enclosing scope is still `T86`. An `optional { p }` (the core's `Correlate(R,
    Union(p, Project(Filter(Env, ¬ exists p), nulls)))`, `p` stored once and
    shared by both arms, so nested optionals grow the term and every walk
    over it linearly) is a `PatternStep::Optional`
@@ -150,8 +166,8 @@ A query runs against one resolved `ReadTarget`:
    The shaper is the compiler's
    (`omnigraph_compiler::shape`), and the type checker runs it on every
    declaration it accepts: a term it does not lower (a `union` arm with
-   an edge, or with a value and an outer name, `Fix`,
-   a ranking inside an inline read with a group, order or cut) is refused at
+   an edge, or with a value and an outer name, `Fix`, an `rrf` whose arms
+   read the enclosing scope) is refused at
    type check with
    `T86`, at the construct and naming the programme stage that adds it, so
    the planner never refuses a checked read. A term that still arrives

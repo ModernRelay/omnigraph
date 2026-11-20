@@ -100,6 +100,7 @@ fn multi_input_samples(plan: &mut PhysicalPlan) -> Vec<PhysicalNode> {
                 order_by: Vec::new(),
                 limit: Some(1),
                 limit_param: None,
+                window: None,
             }),
             tiebreak: Vec::new(),
         },

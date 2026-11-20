@@ -1091,6 +1091,76 @@ impl ReadGen<'_, '_, '_> {
         });
     }
 
+    /// A ranking after the read's first element, a read of its own: over
+    /// the first type's population as written, one with its own `order`
+    /// and `limit` or `distinct`, or one correlated on an outer node through
+    /// its `where`; `nearest`, `distance`, `bm25`, or an uncorrelated `rrf`.
+    fn later_ranking(&mut self, scope: &mut Vec<Var>, elements: &mut Vec<String>) {
+        let t = 0;
+        if !self.schema.nodes[t]
+            .props
+            .iter()
+            .any(|p| matches!(p.ty, PropTy::Vector(_)))
+        {
+            return;
+        }
+        let d = self.var("d");
+        let ty = self.schema.nodes[t].name.clone();
+        let ints: Vec<String> = self.schema.nodes[t]
+            .props
+            .iter()
+            .filter(|p| p.scalar().is_some_and(|s| s.class() == Class::Int))
+            .map(|p| p.name.clone())
+            .collect();
+        let outer: Vec<String> = Self::node_vars(scope)
+            .into_iter()
+            .filter(|(_, n)| *n == t)
+            .map(|(name, _)| name)
+            .collect();
+        let mut correlated = false;
+        let pop = match self.c.below(4) {
+            0 if !outer.is_empty() && !ints.is_empty() => {
+                correlated = true;
+                let o = self.c.pick(&outer).clone();
+                let p = self.c.pick(&ints).clone();
+                format!("{{ match {{ {d}: {ty} }} where {d}.{p} = {o}.{p} return {{ {d} }} }}")
+            }
+            1 => format!(
+                "{{ match {{ {d}: {ty} }} return {{ {d} }} order {{ {d}.k desc }} limit {} }}",
+                1 + self.c.below(4)
+            ),
+            2 => format!("{{ match {{ {d}: {ty} }} return distinct {{ {d} }} }}"),
+            _ => format!("{{ match {{ {d}: {ty} }} return {{ {d} }} }}"),
+        };
+        let qv = self.vector_param();
+        let k = 1 + self.c.below(3);
+        let text = self.text_query();
+        let s = self.var("s");
+        let call = match self.c.below(4) {
+            0 => format!("nearest({pop}, {d}.v, {qv}, k: {k})"),
+            1 => format!("distance({pop}, {d}.v, {qv})"),
+            2 => format!("bm25({pop}, {d}.t, {text})"),
+            _ if correlated => format!("nearest({pop}, {d}.v, {qv}, k: {k})"),
+            _ => format!(
+                "rrf(nearest({pop}, {d}.v, {qv}, k: {k}), bm25({pop}, {d}.t, {text}), k: {})",
+                1 + self.c.below(60)
+            ),
+        };
+        elements.push(format!("from {call} as {s}"));
+        // An uncorrelated `from` is the written product: a later triple
+        // from its node would join it to another component (`T81`).
+        if correlated {
+            scope.push(Var {
+                name: d,
+                kind: VarKind::Node(t),
+            });
+        }
+        scope.push(Var {
+            name: s,
+            kind: VarKind::Scalar(Sc::F64),
+        });
+    }
+
     fn vector_param(&mut self) -> String {
         let name = self.var("qv");
         let f = |c: &mut Choices| match c.below(4) {
@@ -1171,6 +1241,9 @@ impl ReadGen<'_, '_, '_> {
                 }
             }
             4 if self.options.nesting => self.union_from(scope, elements, depth),
+            6 if self.options.search && self.options.nesting && self.c.flag(50) => {
+                self.later_ranking(scope, elements)
+            }
             _ => {
                 if let Some((text, new)) = self.traversal(scope, choice == 5, false, false) {
                     elements.push(text);

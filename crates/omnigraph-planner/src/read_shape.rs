@@ -7,7 +7,9 @@ use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::core::CoreRead;
 use omnigraph_compiler::query::codes::P006;
 use omnigraph_compiler::shape::ShapeError;
-pub use omnigraph_compiler::shape::read::{ArmRank, FuseArm, InnerRead, PatternStep, ReadShape};
+pub use omnigraph_compiler::shape::read::{
+    ArmRank, FuseArm, InnerRead, PatternStep, ReadShape, TargetWindow,
+};
 
 use crate::error::PlanError;
 

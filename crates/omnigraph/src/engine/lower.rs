@@ -1331,6 +1331,25 @@ impl Lower for Walk<'_, '_> {
             .iter()
             .map(|key| tiebreak_column(key, id_column))
             .collect::<Result<Vec<String>>>()?;
+        let scores = read
+            .columns
+            .iter()
+            .filter_map(|column| match &column.expr {
+                IRExpr::PropAccess {
+                    variable, property, ..
+                } if references.contains(variable)
+                    && [
+                        omnigraph_compiler::query::value::DISTANCE_COLUMN,
+                        omnigraph_compiler::query::value::SCORE_COLUMN,
+                        omnigraph_compiler::query::value::RRF_COLUMN,
+                    ]
+                    .contains(&property.as_str()) =>
+                {
+                    Some(format!("{variable}.{property}"))
+                }
+                _ => None,
+            })
+            .collect();
         let read = Arc::new(CorrelateRead {
             group,
             values,
@@ -1339,7 +1358,22 @@ impl Lower for Walk<'_, '_> {
             limit: read
                 .limit
                 .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
+            window: match &read.window {
+                Some(window) => Some((
+                    format!("{}.{id_column}", window.binding),
+                    window
+                        .targets
+                        .map(|k| usize::try_from(k).unwrap_or(usize::MAX))
+                        .ok_or_else(|| {
+                            OmniError::manifest_internal(
+                                "a correlated read's window reached execution without its bound count",
+                            )
+                        })?,
+                )),
+                None => None,
+            },
             references,
+            scores,
             params: Arc::clone(self.lowering.params()),
         });
         let outer = match (outer, scope, outer_var) {

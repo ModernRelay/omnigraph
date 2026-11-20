@@ -377,13 +377,39 @@ impl Requirements {
     ) -> Result<(), ValidationError> {
         let mut top = pipeline(plan, root, budget)?;
         let mut held = HashSet::new();
+        // A ranking drawn as a read of its own fuses inside its read
+        // (`check_correlates` holds its arms' order): the scope's fusion is
+        // outside every correlated read's inner tree.
+        let mut in_reads = HashSet::new();
+        for id in &top {
+            if let Some(PhysicalNode::Correlate { inner, .. }) = plan.node(*id) {
+                in_reads.extend(pipeline(plan, *inner, budget)?);
+            }
+        }
+        let scoped: Vec<NodeId> = top
+            .iter()
+            .copied()
+            .filter(|id| !in_reads.contains(id))
+            .collect();
+        // A fused read's arms are each a pipeline of its own, held by its
+        // read as the scope's fusion holds its arms.
+        let mut fused_in_reads = HashSet::new();
+        for id in &in_reads {
+            if let Some(PhysicalNode::Fuse { arms, .. }) = plan.node(*id) {
+                fused_in_reads.insert(*id);
+                for arm in arms {
+                    fused_in_reads.extend(pipeline(plan, arm.input, budget)?);
+                }
+            }
+        }
+        top.retain(|id| !fused_in_reads.contains(id));
         match &self.fuse {
             Some(fuse) => {
-                held = self.check_fusion(plan, &top, fuse, input, budget)?;
+                held = self.check_fusion(plan, &scoped, fuse, input, budget)?;
                 top.retain(|id| !held.contains(id));
             }
             None => {
-                if top
+                if scoped
                     .iter()
                     .any(|id| matches!(plan.node(*id), Some(PhysicalNode::Fuse { .. })))
                 {
@@ -408,7 +434,7 @@ impl Requirements {
         let scope: Vec<NodeId> = plan
             .subtree(root)
             .into_iter()
-            .filter(|id| !held.contains(id))
+            .filter(|id| !held.contains(id) && !fused_in_reads.contains(id))
             .collect();
         self.check_row_cuts(plan, root, &scope, budget)?;
         if outermost {
@@ -912,6 +938,7 @@ impl Requirements {
                         ),
                     ));
                 }
+                check_window(plan, *id, *inner, read)?;
                 planned.push((outer_var, read, pipeline(plan, *inner, budget)?));
             }
         }
@@ -1978,6 +2005,55 @@ fn scope_root(plan: &PhysicalPlan, id: NodeId) -> NodeId {
         }
     }
     root
+}
+
+/// A correlated read's `nearest` window counts distinct targets in its
+/// order, so each target's rows must be adjacent there and ranked by their
+/// own distance: the read's inner tree ends on the exact distance of the
+/// window's binding, and its order leads with that distance ascending, then
+/// the binding's identity.
+fn check_window(
+    plan: &PhysicalPlan,
+    id: NodeId,
+    inner: NodeId,
+    read: &crate::read_shape::InnerRead,
+) -> Result<(), ValidationError> {
+    // A fusion drawn as a read of its own: each arm yields its rows in its
+    // rank order, as the scope's fusion's do.
+    if let Some(PhysicalNode::Fuse { arms, target, .. }) = plan.node(inner) {
+        for arm in arms {
+            check_arm_order(plan, arm, target)?;
+        }
+    }
+    let Some(window) = &read.window else {
+        return Ok(());
+    };
+    let binding = &window.binding;
+    let scored = matches!(
+        plan.node(inner),
+        Some(PhysicalNode::Score { binding: scored, kind: ScoreKind::Distance, .. }) if scored == binding
+    );
+    let distance = |key: &IROrdering| {
+        !key.descending
+            && matches!(&key.expr, IRExpr::PropAccess { variable, property, .. }
+                if variable == binding && property == omnigraph_compiler::query::value::DISTANCE_COLUMN)
+    };
+    let identity = |key: &IROrdering| {
+        !key.descending
+            && matches!(&key.expr, IRExpr::PropAccess { variable, property, .. }
+                if variable == binding && property != omnigraph_compiler::query::value::DISTANCE_COLUMN)
+    };
+    let ordered = matches!(read.order_by.as_slice(), [first, second, ..] if distance(first) && identity(second));
+    if scored && ordered && window.targets.is_some() {
+        Ok(())
+    } else {
+        Err(ValidationError::violated(
+            "search identity",
+            format!(
+                "node {id}'s window over `${binding}` does not rank its targets by their own distance, then their identity"
+            ),
+        ))
+    }
 }
 
 /// A fusion arm's rows arrive in its rank order, each target's rows

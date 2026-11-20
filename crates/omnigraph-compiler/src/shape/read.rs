@@ -381,6 +381,22 @@ pub struct InnerRead {
     /// `limit $param`: the parameter the cut reads, folded into `limit`
     /// before planning as the read's own `limit $param` is.
     pub limit_param: Option<String>,
+    /// A `nearest` window drawn as a read of its own (a ranking that is not
+    /// the read's root): after its `order` (the distance, then the target's
+    /// identity), the rows of its first `targets` distinct `binding`
+    /// identities, every row of each (fan-out carries the score and adds no
+    /// vote), per outer row when the read is correlated.
+    pub window: Option<TargetWindow>,
+}
+
+/// A [`InnerRead`]'s `nearest` window: the ranked node column and the window
+/// `k` in targets, a literal or a parameter bound at execution (folded into
+/// `targets` before planning, as a `Rank` step's window is).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetWindow {
+    pub binding: String,
+    pub targets: Option<u64>,
+    pub targets_param: Option<String>,
 }
 
 impl InnerRead {
@@ -1056,6 +1072,9 @@ impl Facts {
             for correlate in &mut self.correlates {
                 correlate.inner.each_expr(f);
                 correlate.read.exprs_mut().for_each(&mut *f);
+                if let Some(score) = &mut correlate.score {
+                    f(&mut score.query);
+                }
             }
         })
     }
@@ -1098,6 +1117,9 @@ impl Facts {
             for correlate in &mut self.correlates {
                 correlate.inner.resolve(lets);
                 correlate.read.exprs_mut().for_each(|e| resolve(e, lets));
+                if let Some(score) = &mut correlate.score {
+                    resolve(&mut score.query, lets);
+                }
             }
         })
     }
@@ -1158,6 +1180,36 @@ struct CorrelateFact {
     optionals_before: usize,
     /// The read can fail (the type checker's flag on its `Correlate`).
     fails: bool,
+    /// A ranking drawn as a read of its own: the score its pattern's rows
+    /// take after the pattern, before the read's `order` and window.
+    score: Option<ScoreFact>,
+    /// A read whose pattern was placed where its facts were recovered (an
+    /// `rrf` drawn as a read of its own, whose arms are each a pipeline from
+    /// nothing): its steps, placed as they stand.
+    steps: Option<Vec<PatternStep>>,
+}
+
+/// The core's `Score` over a correlated read's rows: [`PatternStep::Score`]
+/// before it is placed.
+#[derive(Debug, Clone)]
+struct ScoreFact {
+    binding: String,
+    type_name: String,
+    property: String,
+    kind: ScoreKind,
+    query: IRExpr,
+}
+
+impl ScoreFact {
+    fn step(&self) -> PatternStep {
+        PatternStep::Score {
+            binding: self.binding.clone(),
+            type_name: self.type_name.clone(),
+            property: self.property.clone(),
+            kind: self.kind,
+            query: self.query.clone(),
+        }
+    }
 }
 
 impl CorrelateFact {
@@ -1183,6 +1235,16 @@ impl CorrelateFact {
                 }
             }
             self.read.exprs_mut().for_each(|e| rename_expr(e, &rename));
+            if let Some(window) = &mut self.read.window {
+                rename(&mut window.binding);
+            }
+            if let Some(score) = &mut self.score {
+                rename(&mut score.binding);
+                rename_expr(&mut score.query, &rename);
+            }
+            if let Some(steps) = &mut self.steps {
+                rename_inner_bindings(steps, None, renames);
+            }
         })
     }
 }
@@ -1195,6 +1257,14 @@ struct BlockFact {
     left: BlockAggregateExpr,
     op: CompOp,
     right: IRExpr,
+}
+
+/// Whether `term` is a ranking: `nearest`, `distance`, `bm25` or `rrf`.
+fn is_ranking(term: &Term) -> bool {
+    matches!(
+        term,
+        Term::ApproxTopK { .. } | Term::Score { .. } | Term::Fuse { .. }
+    )
 }
 
 /// Whether `expr` is a reference: a node or edge variable.
@@ -1309,19 +1379,15 @@ impl<'a> Shaper<'a> {
         unsupported(self.name, what, construct)
     }
 
-    /// A core node with no plan node in a pattern, at the `from` it was
-    /// written as: a ranking that is not the read's own, or a ranking's
-    /// population that groups, orders or cuts.
+    /// A core node the type checker never writes in a pattern: every
+    /// inline read's `Group`, `Order` and `Cut` arrives under its read's
+    /// final projection, a ranking anywhere is drawn as a read of its own,
+    /// and a recursion is refused before the pattern is read.
     fn unlowered_node(&self, node: &Term) -> ShapeError {
-        let what = match node {
-            Term::Group { .. } => {
-                "an inline read with an aggregate or `distinct` (a `Group` in a pattern)".into()
-            }
-            Term::Order { .. } => "an inline read with an `order` (an `Order` in a pattern)".into(),
-            Term::Cut { .. } => "an inline read with a `limit` (a `Cut` in a pattern)".into(),
-            other => format!("a `{}` node in a pattern", other.operator()),
-        };
-        self.refuse_at(what, Construct::Element(FROM, None))
+        ShapeError::Internal(format!(
+            "a `{}` node in a pattern, which the type checker never writes there",
+            node.operator()
+        ))
     }
 
     fn read(&self, read: &CoreRead) -> Result<ReadShape, ShapeError> {
@@ -1422,8 +1488,20 @@ impl<'a> Shaper<'a> {
         // fusion's arms are each placed on their own (`fuse_step`).
         let fused = ranking.as_ref().is_some_and(|ranking| ranking.fused);
         let mut facts = Facts::default();
-        if !fused {
-            self.facts(body, &mut facts)?;
+        // A population with its own aggregate, `distinct`, `order` or
+        // `limit` is a read of its own, drawn as one: its rows are the read's
+        // rows, which the ranking ranks as a step over them.
+        let drawn = ranked_node
+            .filter(|_| ranking.is_some())
+            .map(ranked_input)
+            .and_then(read_parts)
+            .filter(|(input, ..)| groups_or_cuts(input));
+        match drawn {
+            _ if fused => {}
+            Some((input, items, bindings)) => {
+                self.inline_read(input, items, bindings, &mut facts)?
+            }
+            None => self.facts(body, &mut facts)?,
         }
         let mut after_facts = Facts {
             outer_names: facts.names().into_iter().collect(),
@@ -1545,6 +1623,7 @@ impl<'a> Shaper<'a> {
         // `Rank` step, which records it.
         let windowed = ranking.as_ref().is_some_and(|ranking| {
             after.is_some()
+                || drawn.is_some()
                 || ranking.fused
                 || ranking.exact.is_some()
                 || ranking.recall.is_some()
@@ -2074,14 +2153,11 @@ impl<'a> Shaper<'a> {
             inlined: *inlined,
             ..Facts::default()
         };
-        match node.map(ranked_input) {
-            Some(Term::Project {
-                input,
-                items,
-                keep: false,
-                ..
-            }) => self.inline_read(input, items, &[], &mut facts)?,
-            _ => self.facts(population, &mut facts)?,
+        match node.map(ranked_input).and_then(read_parts) {
+            Some((input, items, bindings)) => {
+                self.inline_read(input, items, bindings, &mut facts)?
+            }
+            None => self.facts(population, &mut facts)?,
         }
         *inlined = facts.inlined;
         let lets = std::mem::take(&mut facts.lets);
@@ -2440,6 +2516,8 @@ impl<'a> Shaper<'a> {
                         facts.correlates.push(value);
                     } else if let Some((input, items, bindings)) = read_parts(inner) {
                         self.inline_read(input, items, bindings, facts)?;
+                    } else if is_ranking(inner) {
+                        self.ranking_read(inner, facts)?;
                     } else {
                         self.facts(inner, facts)?;
                     }
@@ -2449,6 +2527,12 @@ impl<'a> Shaper<'a> {
                     Ok(())
                 }
                 Term::Union { .. } => self.union(term, facts),
+                // A ranking that opens a scope other than the read's own (an
+                // inline read's, an `optional`'s): a read of its own, drawn as
+                // one.
+                Term::ApproxTopK { .. } | Term::Score { .. } | Term::Fuse { .. } => {
+                    self.ranking_read(term, facts)
+                }
                 other => Err(self.unlowered_node(other)),
             }
         })
@@ -2721,6 +2805,7 @@ impl<'a> Shaper<'a> {
             order_by: Vec::new(),
             limit: None,
             limit_param: None,
+            window: None,
         };
         facts.correlates.push(CorrelateFact {
             inner,
@@ -2728,6 +2813,8 @@ impl<'a> Shaper<'a> {
             read,
             optionals_before: facts.optionals.len(),
             fails: false,
+            score: None,
+            steps: None,
         });
         Ok(())
     }
@@ -3113,17 +3200,6 @@ impl<'a> Shaper<'a> {
             extended = items.clone();
             term = input;
         }
-        if term.any_node(|node| {
-            matches!(
-                node,
-                Term::ApproxTopK { .. } | Term::Score { .. } | Term::Fuse { .. }
-            )
-        }) {
-            return Err(self.refuse_at(
-                "a ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit`",
-                at(),
-            ));
-        }
         let mut inner = Facts {
             inlined: facts.inlined,
             ..Facts::default()
@@ -3298,6 +3374,7 @@ impl<'a> Shaper<'a> {
             order_by,
             limit,
             limit_param,
+            window: None,
         };
         for e in read.exprs_mut() {
             rename_expr(e, &rename);
@@ -3322,6 +3399,285 @@ impl<'a> Shaper<'a> {
             read,
             optionals_before: facts.optionals.len(),
             fails: false,
+            score: None,
+            steps: None,
+        });
+        Ok(())
+    }
+
+    /// A ranking that is not the read's root (beside another pattern
+    /// component, correlated on an outer name, a second ranking, inside an
+    /// inline read or an `optional`): the core's `Correlate` over its
+    /// `ApproxTopK` or `Score`, drawn as a read of its own. Its pattern is
+    /// its population as the population's inline read states it, then the
+    /// exact score of each row: `distance` or `bm25` as written, and a
+    /// `nearest` window's distance, which the read's own window then cuts to
+    /// its `k` nearest distinct targets in distance order (the target's
+    /// identity breaking ties), every row of each, per outer row when it is
+    /// correlated (the GQ 3 RFC, section 4, "Populations and laws": the
+    /// population is the ranking's relation, the cut its own). Its columns
+    /// are its population's, then its score under the name the `from`
+    /// gives it.
+    fn ranking_read(&self, node: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
+        if self.probing.get() {
+            return Ok(());
+        }
+        let (_, Some(ranking)) = self.ranking(node)? else {
+            return Err(ShapeError::Internal(
+                "a ranking read that ranks nothing".into(),
+            ));
+        };
+        if ranking.fused {
+            return self.fused_read(node, &ranking, facts);
+        }
+        let population = ranked_input(node);
+        let (input, items, bindings) = read_parts(population).ok_or_else(|| {
+            ShapeError::Internal(
+                "a ranking's population that is not a read, which the type checker always writes"
+                    .into(),
+            )
+        })?;
+        let mut outer: HashSet<String> = env_columns(population).into_iter().collect();
+        for (_, arg) in bindings {
+            let mut read = Vec::new();
+            arg.columns(&mut read);
+            outer.extend(read);
+        }
+        let mut inner = Facts {
+            inlined: facts.inlined,
+            ..Facts::default()
+        };
+        self.inline_read(input, items, bindings, &mut inner)?;
+        let inner_lets = std::mem::take(&mut inner.lets);
+        inner.resolve(&inner_lets);
+        facts.inlined = inner.inlined;
+        let type_name = inner.types.get(&ranking.column).cloned().ok_or_else(|| {
+            ShapeError::Internal(format!(
+                "a ranking ranks `{}`, which its population binds as no node",
+                ranking.column
+            ))
+        })?;
+        let (property, kind, query) = match (&ranking.exact, &ranking.key) {
+            (Some((property, kind, query)), _) => (property.clone(), *kind, query.clone()),
+            (
+                None,
+                IRExpr::Nearest {
+                    property, query, ..
+                },
+            ) => (
+                property.clone(),
+                ScoreKind::Distance,
+                query.as_ref().clone(),
+            ),
+            _ => {
+                return Err(ShapeError::Internal(
+                    "a ranking with neither an exact score nor a `nearest` key".into(),
+                ));
+            }
+        };
+        // The query may read the enclosing scope (a node's own vector).
+        let mut read_names = Vec::new();
+        query.columns(&mut read_names);
+        outer.extend(
+            read_names
+                .into_iter()
+                .filter(|name| !items.iter().any(|(column, _)| column == name)),
+        );
+        let values = self.shaped(format_args!("r{}", facts.inlined));
+        facts.inlined += 1;
+        let mut columns = Vec::with_capacity(items.len() + 1);
+        for (column, item) in items {
+            let expr = if is_reference(item) {
+                IRExpr::Variable(column.clone(), item.ty().clone())
+            } else {
+                inner_lets.get(column).cloned().ok_or_else(|| {
+                    ShapeError::Internal(format!("the population's column `{column}` has no value"))
+                })?
+            };
+            if let ExprType::Node { type_name } = expr.ty() {
+                facts.types.insert(column.clone(), type_name.clone());
+            }
+            columns.push(IRProjection {
+                ty: expr.ty().clone(),
+                expr,
+                alias: None,
+                column: column.clone(),
+            });
+        }
+        let score = IRExpr::PropAccess {
+            variable: ranking.column.clone(),
+            property: ranking.score.0.to_string(),
+            ty: ranking.score.1.clone(),
+        };
+        columns.push(IRProjection {
+            ty: score.ty().clone(),
+            expr: score.clone(),
+            alias: None,
+            column: ranking.out.clone(),
+        });
+        // A `nearest` window: the distance ascending, then the target's
+        // identity, so each target's rows are adjacent where the window
+        // counts it.
+        let (order_by, window) = match (&ranking.exact, ranking.windows.as_slice()) {
+            (None, [k]) => {
+                let id = self.catalog.system_columns.id;
+                let mut order_by = vec![IROrdering::new(score.clone(), false)];
+                let target = ExprType::Node {
+                    type_name: type_name.clone(),
+                };
+                order_by.extend(
+                    reference_identity(&ranking.column, &target, id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|expr| IROrdering::new(expr, false)),
+                );
+                let (targets, targets_param) = match k {
+                    Count::Literal(k) => (Some(*k), None),
+                    Count::Param(p) => (None, Some(p.clone())),
+                };
+                (
+                    order_by,
+                    Some(TargetWindow {
+                        binding: ranking.column.clone(),
+                        targets,
+                        targets_param,
+                    }),
+                )
+            }
+            (None, _) => {
+                return Err(ShapeError::Internal(
+                    "a `nearest` with other than one window".into(),
+                ));
+            }
+            (Some(_), _) => (Vec::new(), None),
+        };
+        // The score and the population's values are read after the `from`
+        // as columns of `values`.
+        for column in &columns {
+            if !is_reference(&column.expr) {
+                facts.lets.insert(
+                    column.column.clone(),
+                    IRExpr::PropAccess {
+                        variable: values.clone(),
+                        property: column.column.clone(),
+                        ty: column.ty.clone(),
+                    },
+                );
+            }
+        }
+        facts.correlates.push(CorrelateFact {
+            inner,
+            outer,
+            read: InnerRead {
+                values,
+                group: None,
+                columns,
+                order_by,
+                limit: None,
+                limit_param: None,
+                window,
+            },
+            optionals_before: facts.optionals.len(),
+            fails: false,
+            score: Some(ScoreFact {
+                binding: ranking.column.clone(),
+                type_name,
+                property,
+                kind,
+                query,
+            }),
+            steps: None,
+        });
+        Ok(())
+    }
+
+    /// An `rrf` that is not the read's root: the core's `Correlate` over its
+    /// `Fuse`, a read of its own whose pattern is the fusion (each arm a
+    /// pipeline from nothing, as the read's own `rrf` places them) and whose
+    /// columns are the target and the fused score under the name the `from`
+    /// gives it.
+    fn fused_read(
+        &self,
+        node: &Term,
+        ranking: &Ranking,
+        facts: &mut Facts,
+    ) -> Result<(), ShapeError> {
+        let Term::Fuse { arms, .. } = node else {
+            return Err(ShapeError::Internal(
+                "a fused ranking that is not a `Fuse`".into(),
+            ));
+        };
+        let outer: HashSet<String> = arms
+            .iter()
+            .flat_map(|arm| env_columns(ranked_input(arm)))
+            .collect();
+        if !outer.is_empty() {
+            return Err(self.refuse_at(
+                "an `rrf` whose arms read the enclosing scope",
+                Construct::Element(FROM, None),
+            ));
+        }
+        let mut scoped = FreshNames::scoped(format!("q{}", facts.inlined));
+        let mut inlined = facts.inlined;
+        let step = self.fuse_step(node, &mut inlined, &mut scoped)?;
+        facts.inlined = inlined;
+        self.minted.borrow_mut().extend(scoped.minted);
+        let target_type = match &step {
+            PatternStep::Fuse { target_type, .. } => target_type.clone(),
+            _ => {
+                return Err(ShapeError::Internal(
+                    "a fusion step that is not a `Fuse`".into(),
+                ));
+            }
+        };
+        let values = self.shaped(format_args!("r{}", facts.inlined));
+        facts.inlined += 1;
+        let target = ExprType::Node {
+            type_name: target_type.clone(),
+        };
+        facts.types.insert(ranking.column.clone(), target_type);
+        let score = IRExpr::PropAccess {
+            variable: ranking.column.clone(),
+            property: ranking.score.0.to_string(),
+            ty: ranking.score.1.clone(),
+        };
+        facts.lets.insert(
+            ranking.out.clone(),
+            IRExpr::PropAccess {
+                variable: values.clone(),
+                property: ranking.out.clone(),
+                ty: ranking.score.1.clone(),
+            },
+        );
+        facts.correlates.push(CorrelateFact {
+            inner: Facts::default(),
+            outer,
+            read: InnerRead {
+                values,
+                group: None,
+                columns: vec![
+                    IRProjection {
+                        expr: IRExpr::Variable(ranking.column.clone(), target.clone()),
+                        alias: None,
+                        column: ranking.column.clone(),
+                        ty: target,
+                    },
+                    IRProjection {
+                        ty: score.ty().clone(),
+                        expr: score,
+                        alias: None,
+                        column: ranking.out.clone(),
+                    },
+                ],
+                order_by: Vec::new(),
+                limit: None,
+                limit_param: None,
+                window: None,
+            },
+            optionals_before: facts.optionals.len(),
+            fails: false,
+            score: None,
+            steps: Some(vec![step]),
         });
         Ok(())
     }
@@ -3625,6 +3981,7 @@ impl<'a> Shaper<'a> {
             order_by: Vec::new(),
             limit: None,
             limit_param: None,
+            window: None,
         };
         facts.lets.insert(column.to_string(), value);
         Ok(CorrelateFact {
@@ -3633,6 +3990,8 @@ impl<'a> Shaper<'a> {
             read,
             optionals_before: facts.optionals.len(),
             fails,
+            score: None,
+            steps: None,
         })
     }
 
@@ -3830,17 +4189,27 @@ impl<'a> Shaper<'a> {
         names.extend(physical_names(pipeline));
         let mut inner = Vec::new();
         let mut inner_bound = visible.clone();
-        self.place(
-            &correlate.inner,
-            &[],
-            &mut inner,
-            &mut inner_bound,
-            &names,
-            fresh,
-        )?;
+        match &correlate.steps {
+            Some(steps) => inner.extend(steps.iter().cloned()),
+            None => self.place(
+                &correlate.inner,
+                &[],
+                &mut inner,
+                &mut inner_bound,
+                &names,
+                fresh,
+            )?,
+        }
+        if let Some(score) = &correlate.score {
+            inner.push(score.step());
+        }
         // With no row before it, the names it reads are values the type
-        // checker already read into it, and it reads no outer row.
-        let outer_var = (!correlate.outer.is_empty() && !pipeline.is_empty()).then(|| {
+        // checker already read into it, and it reads no outer row. A scope
+        // that starts from an outer row (an `optional`'s, a block's) has
+        // rows before its first step: the names it binds there are visible.
+        let outer_var = (!visible.is_empty()
+            || (!correlate.outer.is_empty() && !pipeline.is_empty()))
+        .then(|| {
             find_outer_var(&correlate.inner, &visible).unwrap_or_else(|| {
                 let mut outer: Vec<&String> = correlate.outer.iter().collect();
                 outer.sort();
@@ -4527,19 +4896,30 @@ struct FreshNames {
     temp: usize,
     /// Every name minted, which the shape records as made up.
     minted: Vec<String>,
+    /// A scope's own names, apart from the read's: a ranking read placed
+    /// where its facts are recovered mints under the scope's tag.
+    scope: String,
 }
 
 impl FreshNames {
+    /// Names apart from every other placement's, under `tag`.
+    fn scoped(tag: String) -> Self {
+        Self {
+            scope: tag,
+            ..Self::default()
+        }
+    }
+
     fn anon(&mut self) -> String {
         self.anon += 1;
-        let name = format!("ShapedAnon{}", self.anon);
+        let name = format!("ShapedAnon{}{}", self.scope, self.anon);
         self.minted.push(name.clone());
         name
     }
 
     fn temp(&mut self, dst: &str) -> String {
         self.temp += 1;
-        let name = format!("Shaped{}_{}", dst, self.temp);
+        let name = format!("Shaped{}{}_{}", self.scope, dst, self.temp);
         self.minted.push(name.clone());
         name
     }

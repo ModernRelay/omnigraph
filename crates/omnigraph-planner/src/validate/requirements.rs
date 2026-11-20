@@ -270,6 +270,20 @@ fn flatten<'p>(
     unions: &mut Vec<Vec<String>>,
     correlates: &mut Vec<CorrelateMatch>,
 ) {
+    flatten_in(steps, out, optionals, unions, correlates, false)
+}
+
+/// [`flatten`]; `in_read` inside a correlated read's pattern, where a
+/// fusion (a ranking drawn as a read of its own) is the read's and not the
+/// scope's: the plan holds it inside the read's inner tree.
+fn flatten_in<'p>(
+    steps: &'p [PatternStep],
+    out: &mut Vec<&'p PatternStep>,
+    optionals: &mut Vec<OptionalMatch>,
+    unions: &mut Vec<Vec<String>>,
+    correlates: &mut Vec<CorrelateMatch>,
+    in_read: bool,
+) {
     for step in steps {
         match step {
             // A union's arms each bind its names: their bindings,
@@ -280,7 +294,7 @@ fn flatten<'p>(
                     unions.push(bindings.clone());
                 }
                 for arm in arms {
-                    flatten(arm, out, optionals, unions, correlates);
+                    flatten_in(arm, out, optionals, unions, correlates, in_read);
                 }
             }
             // A correlated read's pattern binds its names and runs its
@@ -296,7 +310,7 @@ fn flatten<'p>(
                     read: read.clone(),
                     eligibility: own_eligibility(inner),
                 });
-                flatten(inner, out, optionals, unions, correlates);
+                flatten_in(inner, out, optionals, unions, correlates, true);
             }
             PatternStep::Optional {
                 outer_var, inner, ..
@@ -306,8 +320,9 @@ fn flatten<'p>(
                     outer_var: outer_var.clone(),
                     eligibility,
                 });
-                flatten(inner, out, optionals, unions, correlates);
+                flatten_in(inner, out, optionals, unions, correlates, in_read);
             }
+            PatternStep::Fuse { .. } if in_read => {}
             other => out.push(other),
         }
     }

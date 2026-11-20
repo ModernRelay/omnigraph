@@ -212,6 +212,11 @@ fn fold_pipeline(
                 if let Some(name) = &read.limit_param {
                     read.limit = Some(bound_count(name, "limit", 0, declared, params)?);
                 }
+                if let Some(window) = &mut read.window
+                    && let Some(name) = &window.targets_param
+                {
+                    window.targets = Some(bound_count(name, "k:", 1, declared, params)?);
+                }
             }
             // A window `k: $param` takes its bound count; the ranking's query
             // binds at its scan.

@@ -123,7 +123,10 @@ parameter's value is (`where $a.size = 18446744073709551615`, `replace Account
 aggregate, `distinct`, `order` and `limit` run per outer row when it reads
 an outer name (once otherwise), so an outer `where` or `limit` never widens
 or replaces its cut, and `count` with no key is 0 where nothing matches; a
-ranking inside such a read is `T86`. `from union({ … }, { … })`
+ranking may stand inside such a read, beside other elements, in an
+`optional` or a `union` arm, or correlated on an outer name, its window its
+own (per outer row), except an `rrf` whose arms read an outer name (`T86`).
+`from union({ … }, { … })`
 joins the bag of its arms' rows, columns matched by name in the first arm's
 order (`return { $q as p }` in a later one; a missing or extra name is
 `T73`); an arm may return values and

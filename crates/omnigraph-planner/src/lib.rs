@@ -90,7 +90,7 @@ pub use physical::{
     StatisticSource, operator_rows, score_column, score_kind_name, validate_streams,
 };
 pub use ranking::{PlannedRanking, planned_ranking};
-pub use read_shape::{ArmRank, InnerRead, PatternStep, ReadShape};
+pub use read_shape::{ArmRank, InnerRead, PatternStep, ReadShape, TargetWindow};
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
 pub use source::{

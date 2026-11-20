@@ -2146,6 +2146,14 @@ pub(crate) fn inner_read_json(
     if let Some(group) = &read.group {
         value["typed_group"] = json!(crate::typed::returns(group));
     }
+    // A ranking drawn as a read of its own: its `nearest` window, the
+    // first `targets` distinct identities of `binding` in the read's order.
+    if let Some(window) = &read.window {
+        value["window"] = json!({
+            "binding": window.binding,
+            "targets": window.targets,
+        });
+    }
     value
 }
 
