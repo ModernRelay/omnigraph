@@ -5712,6 +5712,7 @@ dependencies = [
  "frostem",
  "libm",
  "omnigraph-compiler",
+ "proptest",
  "serde_json",
  "unicode-normalization",
 ]

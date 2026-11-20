@@ -23,7 +23,7 @@ use omnigraph_compiler::ir::IRExpr;
 use omnigraph_compiler::ir::core::{
     Agg, Col, CoreRead, Count, LexicalQuery, RRF_MAX_K, RelTy, ScoreKind, ScoreQuery, Term, Ty,
 };
-use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
+use omnigraph_compiler::ir::expr::{IROrdering, ScalarFunc, TermsMode};
 use omnigraph_compiler::query::syntax::ArithOp;
 use omnigraph_compiler::query::value::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME};
 use omnigraph_compiler::schema::vector::{VectorDistance, is_zero_vector};
@@ -33,6 +33,9 @@ use omnigraph_compiler::{check_datetime_literal, date_literal_days, datetime_lit
 use serde_json::{Map, Value as Json};
 
 mod registry;
+
+#[cfg(test)]
+mod laws;
 
 /// Why the interpreter returned no rows.
 #[derive(Debug, Clone, PartialEq)]
@@ -335,6 +338,9 @@ pub struct Interpreter<'a> {
     binds_now: bool,
     /// The current value of each recursive read inside its `Fix`.
     rec: HashMap<String, Vec<Row>>,
+    /// The operator laws' record of every evaluated term (law 7).
+    #[cfg(test)]
+    audit: Option<laws::Audit>,
 }
 
 impl<'a> Interpreter<'a> {
@@ -355,6 +361,8 @@ impl<'a> Interpreter<'a> {
                 values
             },
             rec: HashMap::new(),
+            #[cfg(test)]
+            audit: None,
         }
     }
 
@@ -523,6 +531,14 @@ impl<'a> Interpreter<'a> {
     // Operators (section 2's table).
 
     fn term(&mut self, t: &Term, env: &Row) -> R<Rel> {
+        #[cfg(test)]
+        if self.audit.is_some() {
+            return laws::audited(self, t, env);
+        }
+        self.eval(t, env)
+    }
+
+    fn eval(&mut self, t: &Term, env: &Row) -> R<Rel> {
         omnigraph_compiler::stack::deep(|| {
             Ok(match t {
                 Term::Unit => Rel {
@@ -836,25 +852,8 @@ impl<'a> Interpreter<'a> {
                 }
                 Term::Order { input, keys } => {
                     let input = self.term(input, env)?;
-                    let mut keyed = Vec::new();
-                    for row in input.rows {
-                        let k = keys
-                            .iter()
-                            .map(|key| self.expr(&key.expr, &row, env))
-                            .collect::<R<Vec<_>>>()?;
-                        keyed.push((k, row));
-                    }
-                    keyed.sort_by(|(ka, ra), (kb, rb)| {
-                        for ((a, b), key) in ka.iter().zip(kb).zip(keys) {
-                            let o = cmp_key(a, b, key.descending, key.places_nulls_first());
-                            if o != Ordering::Equal {
-                                return o;
-                            }
-                        }
-                        tie(ra, rb)
-                    });
                     Rel {
-                        rows: keyed.into_iter().map(|(_, r)| r).collect(),
+                        rows: self.order_rows(input.rows, keys, env)?,
                         ordered: true,
                     }
                 }
@@ -1041,6 +1040,28 @@ impl<'a> Interpreter<'a> {
                 }
             })
         })
+    }
+
+    /// `rows` in `Order`'s total order: the keys, then the tie rule.
+    fn order_rows(&self, rows: Vec<Row>, keys: &[IROrdering], env: &Row) -> R<Vec<Row>> {
+        let mut keyed = Vec::new();
+        for row in rows {
+            let k = keys
+                .iter()
+                .map(|key| self.expr(&key.expr, &row, env))
+                .collect::<R<Vec<_>>>()?;
+            keyed.push((k, row));
+        }
+        keyed.sort_by(|(ka, ra), (kb, rb)| {
+            for ((a, b), key) in ka.iter().zip(kb).zip(keys) {
+                let o = cmp_key(a, b, key.descending, key.places_nulls_first());
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            tie(ra, rb)
+        });
+        Ok(keyed.into_iter().map(|(_, r)| r).collect())
     }
 
     /// An `rrf` arm's distinct targets in rank order: a ranking function's
@@ -1849,20 +1870,22 @@ fn columns(t: &Term) -> Vec<String> {
 /// The tie rule (section 2, `Order`): every reference column's identity in
 /// column order, then every other column's value.
 fn tie(a: &Row, b: &Row) -> Ordering {
-    let refs = |r: &Row| -> Vec<Value> {
-        r.iter()
-            .filter(|(_, v)| matches!(v, Value::Ref { .. }))
-            .map(|(_, v)| v.clone())
-            .collect()
+    // A column is a reference column when either row holds a reference in
+    // it: a null there is that column's null, compared in the column's
+    // place among the references, so two rows tie only when they are equal
+    // in every column. (Where both rows hold null, the column compares
+    // equal wherever it is placed.)
+    let at = |r: &Row, i: usize| r.get(i).map_or(Value::Null, |(_, v)| v.clone());
+    let width = a.len().max(b.len());
+    let is_ref = |i: &usize| {
+        matches!(at(a, *i), Value::Ref { .. }) || matches!(at(b, *i), Value::Ref { .. })
     };
-    let rest = |r: &Row| -> Vec<Value> {
-        r.iter()
-            .filter(|(_, v)| !matches!(v, Value::Ref { .. }))
-            .map(|(_, v)| v.clone())
-            .collect()
-    };
-    cmp_values(&Value::List(refs(a)), &Value::List(refs(b)))
-        .then_with(|| cmp_values(&Value::List(rest(a)), &Value::List(rest(b))))
+    let (refs, rest): (Vec<usize>, Vec<usize>) = (0..width).partition(is_ref);
+    refs.into_iter()
+        .chain(rest)
+        .map(|i| cmp_values(&at(a, i), &at(b, i)))
+        .find(|o| *o != Ordering::Equal)
+        .unwrap_or_else(|| a.len().cmp(&b.len()))
 }
 
 fn same_row(a: &Row, b: &Row) -> bool {
