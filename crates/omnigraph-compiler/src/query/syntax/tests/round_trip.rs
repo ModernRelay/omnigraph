@@ -72,23 +72,27 @@
 //!
 //! # The display round trip
 //!
-//! [`IRExpr`]'s `Display` writes GQ text. The second generator builds
-//! well-typed predicates and return values over a fixed schema and
-//! parameter list (integer, float, string, date, datetime and Boolean
-//! operands; arithmetic with its widening casts, unary minus, comparisons,
-//! null tests, `not`/`and`/`or`, `if`, `coalesce`, `concat`, `now()` and
-//! `match_terms`), type-checks the query, displays every stored filter and
-//! the returned value, puts the displayed text in the same query and
-//! type-checks it again: the second declaration must equal the first, node
-//! for node, except that a filter on `true` is dropped from both (the
-//! checker drops a written `where true` and keeps a predicate it folds to
-//! `true`). Display is lossy in two places, which the generator leaves out:
-//! list membership (`$x in $l`), `contains(…)` and `starts_with(…)`
-//! display as infix `contains` and `starts_with`, which the type checker
+//! [`IRExpr`]'s `Display` writes GQ text. The shared generator
+//! (`omnigraph_compiler::arbitrary`, the one generator of typed
+//! expressions, in its `display` mode) draws a schema and, over its first
+//! type, a well-typed predicate and return value: every operand class,
+//! arithmetic with its widening casts, unary minus, comparisons, null tests,
+//! `not`/`and`/`or`, `if`, `coalesce`, `concat`, the registry's scalar
+//! rows, `cast`, `now()` and `match_terms`, over properties, parameters and
+//! literals from wide pools (integers to `i64::MAX`, floats over every
+//! finite bit pattern, strings holding every escape). The test type-checks
+//! the query, displays every stored filter and the returned value, puts the
+//! displayed text in the same query and type-checks it again: the second
+//! declaration must equal the first, node for node, except that a filter on
+//! `true` is dropped from both (the checker drops a written `where true`
+//! and keeps a predicate it folds to `true`). Display is lossy in two
+//! places, which the display mode leaves out: list membership (`$x in $l`,
+//! `$x in [...]`) displays as an infix `contains`, which the type checker
 //! refuses (explain output, GQT plan expectations and the docs print that
 //! spelling); and a non-finite float displays as `inf`, which is not a
-//! literal. The generator writes no ranking, aggregate or bare node
-//! variable, so `Nearest`, `Aggregate` and `Variable` are not displayed.
+//! literal. The generator writes no ranking, aggregate, block or bare node
+//! variable here, so `Nearest`, `Aggregate` and `Variable` are not
+//! displayed.
 //!
 //! The ordinary test runs 300 cases; the nightly one 20,000.
 
@@ -105,7 +109,7 @@ use crate::ir::expr::IRExpr;
 use crate::query::check::check_source;
 use crate::query::file::{MutationWriteMode, UnattachedBase};
 use crate::query::syntax::parse::parse_source;
-use crate::query::syntax::print::{literal as print_literal, print_file};
+use crate::query::syntax::print::print_file;
 use crate::query::syntax::*;
 use crate::query::syntax::{EdgeSelector, Traversal};
 use crate::query::value::{AggFunc, CompOp, Literal};
@@ -1242,188 +1246,12 @@ fn whitespace_may_follow_a_minus_sign() {
 // ---------------------------------------------------------------------------
 // The display round trip.
 
-const SCHEMA: &str = r#"
-node Person {
-    name: String @key
-    bio: String @index(fulltext)
-    city: String?
-    age: I32?
-    rank: I64
-    score: F64?
-    born: Date?
-    seen: DateTime?
-    active: Bool?
-}
-"#;
-
-/// Every parameter the generated expressions read.
-const PARAMS: &str =
-    "$n: I64, $i: I32?, $f: F64, $s: String, $t: String?, $b: Bool, $d: Date, $w: DateTime?";
-
-fn ir_catalog() -> Catalog {
-    build_catalog(&parse_schema(SCHEMA).expect("the schema parses")).expect("the catalog builds")
-}
-
-/// The operand domains the typed generator draws from.
-#[derive(Clone, Copy, Debug)]
-enum Dom {
-    Int,
-    Float,
-    Str,
-    Date,
-    DateTime,
-    Bool,
-}
-
-const DOMAINS: &[Dom] = &[
-    Dom::Int,
-    Dom::Float,
-    Dom::Str,
-    Dom::Date,
-    Dom::DateTime,
-    Dom::Bool,
-];
-
-fn select_str(pool: &'static [&'static str]) -> BoxedStrategy<String> {
-    pick(pool).boxed()
-}
-
-/// A leaf of `dom`: a parameter, a property or a literal.
-fn typed_leaf(dom: Dom) -> BoxedStrategy<String> {
-    match dom {
-        Dom::Int => prop_oneof![
-            2 => select_str(&["$n", "$i", "$p.rank", "$p.age"]),
-            1 => prop_oneof![0i64..1000, 0i64..=i64::MAX].prop_map(|n| n.to_string()),
-        ]
-        .boxed(),
-        Dom::Float => prop_oneof![
-            2 => select_str(&["$f", "$p.score"]),
-            1 => float(false)
-                .prop_filter("finite", |f| f.is_finite())
-                .prop_map(|f| print_literal(&Literal::Float(f))),
-        ]
-        .boxed(),
-        Dom::Str => prop_oneof![
-            2 => select_str(&["$s", "$t", "$p.name", "$p.city", "$p.bio"]),
-            1 => text().prop_map(|s| print_literal(&Literal::String(s))),
-        ]
-        .boxed(),
-        Dom::Date => select_str(&["$d", "$p.born", "date(\"2024-02-29\")"]),
-        Dom::DateTime => select_str(&[
-            "$w",
-            "$p.seen",
-            "now()",
-            "datetime(\"2024-02-29T12:00:00Z\")",
-        ]),
-        Dom::Bool => select_str(&["$b", "$p.active", "true", "false"]),
-    }
-}
-
-/// A well-typed expression of `dom`, fully parenthesized: parentheses leave
-/// no node, so the displayed text, with its minimal ones, must type to the
-/// same tree.
-fn typed(dom: Dom, depth: u32) -> BoxedStrategy<String> {
-    if depth == 0 {
-        return typed_leaf(dom);
-    }
-    let sub = move |d: Dom| typed(d, depth - 1);
-    let conditional =
-        (sub(Dom::Bool), sub(dom), sub(dom)).prop_map(|(c, a, b)| format!("if({c}, {a}, {b})"));
-    let coalesce = (sub(dom), sub(dom)).prop_map(|(a, b)| format!("coalesce({a}, {b})"));
-    let arith = |left: Dom, right: Dom| {
-        (
-            sub(left),
-            proptest::sample::select(&["+", "-", "*", "/", "%"][..]),
-            sub(right),
-        )
-            .prop_map(|(a, op, b)| format!("({a} {op} {b})"))
-    };
-    match dom {
-        Dom::Int => prop_oneof![
-            3 => typed_leaf(dom),
-            3 => arith(Dom::Int, Dom::Int),
-            1 => sub(Dom::Int).prop_map(|a| format!("(-{a})")),
-            1 => conditional,
-            1 => coalesce,
-        ]
-        .boxed(),
-        Dom::Float => prop_oneof![
-            3 => typed_leaf(dom),
-            2 => arith(Dom::Float, Dom::Float),
-            1 => arith(Dom::Int, Dom::Float),
-            1 => arith(Dom::Float, Dom::Int),
-            1 => sub(Dom::Float).prop_map(|a| format!("(-{a})")),
-            1 => conditional,
-            1 => coalesce,
-        ]
-        .boxed(),
-        Dom::Str => prop_oneof![
-            3 => typed_leaf(dom),
-            1 => (sub(Dom::Str), sub(Dom::Str)).prop_map(|(a, b)| format!("concat({a}, {b})")),
-            1 => conditional,
-            1 => coalesce,
-        ]
-        .boxed(),
-        Dom::Date | Dom::DateTime => prop_oneof![
-            3 => typed_leaf(dom),
-            1 => conditional,
-            1 => coalesce,
-        ]
-        .boxed(),
-        Dom::Bool => {
-            let comparable = proptest::sample::select(
-                &[
-                    (Dom::Int, Dom::Int),
-                    (Dom::Int, Dom::Float),
-                    (Dom::Float, Dom::Float),
-                    (Dom::Str, Dom::Str),
-                    (Dom::Date, Dom::Date),
-                    (Dom::DateTime, Dom::DateTime),
-                    (Dom::Bool, Dom::Bool),
-                ][..],
-            );
-            let compare = (comparable, comp_op()).prop_flat_map(move |((l, r), op)| {
-                (sub(l), sub(r)).prop_map(move |(a, b)| format!("({a} {op} {b})"))
-            });
-            let null_test = (proptest::sample::select(DOMAINS), any::<bool>()).prop_flat_map(
-                move |(d, negated)| {
-                    sub(d).prop_map(move |a| {
-                        format!("({a} is {}null)", if negated { "not " } else { "" })
-                    })
-                },
-            );
-            // `terms`' text is a String literal or parameter (`T19`).
-            let query = prop_oneof![
-                1 => select_str(&["$s", "$t"]),
-                1 => text().prop_map(|s| print_literal(&Literal::String(s))),
-            ];
-            let terms = (
-                query,
-                proptest::sample::select(&["all", "any"][..]),
-                0u32..3,
-            )
-                .prop_map(|(q, mode, edits)| {
-                    format!("match_terms($p.bio, terms({q}, mode: {mode}, max_edits: {edits}))")
-                });
-            prop_oneof![
-                2 => typed_leaf(dom),
-                4 => compare,
-                2 => null_test,
-                1 => sub(Dom::Bool).prop_map(|a| format!("(not {a})")),
-                2 => (sub(Dom::Bool), sub(Dom::Bool)).prop_map(|(a, b)| format!("({a} and {b})")),
-                2 => (sub(Dom::Bool), sub(Dom::Bool)).prop_map(|(a, b)| format!("({a} or {b})")),
-                1 => terms,
-                1 => conditional,
-                1 => coalesce,
-            ]
-            .boxed()
-        }
-    }
-}
-
-fn ir_query(predicate: Option<&str>, value: &str) -> String {
+/// The read a display round trip checks: `predicate` as its `where` and
+/// `value` returned as `v`, over `$x` of `node` with the generator's
+/// parameters.
+fn ir_query(params: &str, node: &str, predicate: Option<&str>, value: &str) -> String {
     let filter = predicate.map_or(String::new(), |p| format!(" where {p}"));
-    format!("query q({PARAMS}) {{ match {{ $p: Person }}{filter} return {{ {value} as v }} }}")
+    format!("query q({params}) {{ match {{ $x: {node} }}{filter} return {{ {value} as v }} }}")
 }
 
 /// The one declaration of `source`, checked; `None` when it is refused.
@@ -1492,12 +1320,59 @@ fn filters_and_value(core: &CoreDecl) -> (Vec<IRExpr>, IRExpr) {
     (filters, value.expect("the read returns `v`"))
 }
 
+/// One generated expression pair: the schema, its first type's name, the
+/// parameter declarations, a predicate and a value.
+struct DisplayCase {
+    schema: String,
+    node: String,
+    params: String,
+    predicate: String,
+    value: String,
+}
+
+/// The shared generator (`omnigraph_compiler::arbitrary`) in its display
+/// mode: a generated schema, and over its first type a predicate of depth 3
+/// and a value of any class of depth 2.
+fn display_case(s: &[u32], q: &[u32]) -> DisplayCase {
+    use crate::arbitrary::{Choices, Class, GenSchema, ReadOptions, SchemaOptions, typed_exprs};
+    let schema = GenSchema::generate(&mut Choices::new(s), SchemaOptions::default());
+    let mut c = Choices::new(q);
+    let class = *c.pick(&[
+        Class::Int,
+        Class::Float,
+        Class::Str,
+        Class::Date,
+        Class::DateTime,
+        Class::Bool,
+    ]);
+    let options = ReadOptions {
+        nesting: false,
+        display: true,
+        ..ReadOptions::default()
+    };
+    let (exprs, params) = typed_exprs(&mut c, &schema, 0, &[(Class::Bool, 3), (class, 2)], options);
+    let [predicate, value] = <[String; 2]>::try_from(exprs).expect("two expressions");
+    DisplayCase {
+        schema: schema.text(),
+        node: schema.nodes[0].name.clone(),
+        params: params
+            .iter()
+            .map(|(_, declaration, _)| declaration.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        predicate,
+        value,
+    }
+}
+
 /// One display round trip: `Ok(true)` when the source types and the
 /// displayed text types to the same declaration, `Ok(false)` when the
 /// source is refused (a fold of a constant can overflow or divide by zero).
-fn display_round_trip(catalog: &Catalog, predicate: &str, value: &str) -> Result<bool, String> {
-    let first = ir_query(Some(predicate), value);
-    let Some(core) = checked(catalog, &first) else {
+fn display_round_trip(case: &DisplayCase) -> Result<bool, String> {
+    let catalog = build_catalog(&parse_schema(&case.schema).expect("the schema parses"))
+        .expect("the catalog builds");
+    let first = ir_query(&case.params, &case.node, Some(&case.predicate), &case.value);
+    let Some(core) = checked(&catalog, &first) else {
         return Ok(false);
     };
     let (filters, stored) = filters_and_value(&core);
@@ -1505,35 +1380,42 @@ fn display_round_trip(catalog: &Catalog, predicate: &str, value: &str) -> Result
     // last.
     let displayed_filter = IRExpr::and_all(filters.into_iter().rev()).map(|f| f.to_string());
     let displayed_value = stored.to_string();
-    let second = ir_query(displayed_filter.as_deref(), &displayed_value);
-    match checked(catalog, &second) {
+    let second = ir_query(
+        &case.params,
+        &case.node,
+        displayed_filter.as_deref(),
+        &displayed_value,
+    );
+    match checked(&catalog, &second) {
         Some(again) if again == core => Ok(true),
         Some(again) => Err(format!(
-            "the displayed text types to another declaration\n{first}\n{second}\n{core:#?}\n{again:#?}"
+            "the displayed text types to another declaration\n{}\n{first}\n{second}\n{core:#?}\n{again:#?}",
+            case.schema
         )),
         None => Err(format!(
-            "the displayed text is refused: {:?}\n{first}\n{second}",
-            check_source(catalog, &second)
-                .map(|d| d.into_iter().map(|(_, r)| r.err()).collect::<Vec<_>>())
+            "the displayed text is refused: {:?}\n{}\n{first}\n{second}",
+            check_source(&catalog, &second)
+                .map(|d| d.into_iter().map(|(_, r)| r.err()).collect::<Vec<_>>()),
+            case.schema
         )),
     }
 }
 
 fn display_then_check(cases: u32) {
-    let catalog = ir_catalog();
-    let strategy = (
-        typed(Dom::Bool, 3),
-        proptest::sample::select(DOMAINS).prop_flat_map(|d| typed(d, 2)),
+    use crate::arbitrary::choices;
+    let strategy = (choices(64), choices(256));
+    let mut runner = TestRunner::new_with_rng(
+        Config {
+            cases,
+            max_shrink_iters: 4096,
+            failure_persistence: None,
+            ..Config::default()
+        },
+        TestRng::deterministic_rng(RngAlgorithm::ChaCha),
     );
-    let mut runner = TestRunner::new(Config {
-        cases,
-        max_shrink_iters: 4096,
-        failure_persistence: None,
-        ..Config::default()
-    });
     let accepted = std::cell::Cell::new(0u32);
-    let result = runner.run(&strategy, |(predicate, value)| {
-        if display_round_trip(&catalog, &predicate, &value).map_err(TestCaseError::fail)? {
+    let result = runner.run(&strategy, |(s, q)| {
+        if display_round_trip(&display_case(&s, &q)).map_err(TestCaseError::fail)? {
             accepted.set(accepted.get() + 1);
         }
         Ok(())

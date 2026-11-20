@@ -632,6 +632,14 @@ pub struct ReadOptions {
     /// over them) in every written position, after elements that can fail
     /// (a `let`, a correlated `from` and an `optional` over a division).
     pub placement: bool,
+    /// Expressions whose display (`IRExpr`'s `Display`) is GQ text that
+    /// types back to them, for the display round trip: no `in`, which
+    /// displays as an infix `contains` the checker refuses; literals from
+    /// wide pools (integers to `i64::MAX`, floats over every finite bit
+    /// pattern, strings holding every escape the printer writes, raw
+    /// control characters and non-ASCII text); and `now()` and
+    /// `match_terms` over a full-text field beside the other forms.
+    pub display: bool,
 }
 
 impl Default for ReadOptions {
@@ -644,6 +652,7 @@ impl Default for ReadOptions {
             aggregates: true,
             order_limit: true,
             placement: false,
+            display: false,
         }
     }
 }
@@ -1610,6 +1619,11 @@ impl ReadGen<'_, '_, '_> {
     }
 
     fn literal(&mut self, class: Class) -> String {
+        if self.options.display
+            && let Some(wide) = self.wide_literal(class)
+        {
+            return wide;
+        }
         match class {
             // A literal fits every integer type it meets (`T3` refuses one
             // outside a property's range); overflow comes from the values.
@@ -1628,7 +1642,88 @@ impl ReadGen<'_, '_, '_> {
         }
     }
 
+    /// A literal from the display round trip's wide pools, or `None` for
+    /// the ordinary pool.
+    fn wide_literal(&mut self, class: Class) -> Option<String> {
+        use crate::query::syntax::print::literal as print_literal;
+        Some(match class {
+            Class::Int => match self.c.below(3) {
+                0 => return None,
+                1 => self.c.below(1_000).to_string(),
+                _ => (self.raw_bits() & i64::MAX as u64).to_string(),
+            },
+            Class::Float => {
+                let f = match self.c.below(4) {
+                    0 => return None,
+                    1 => f64::from(self.c.below(100_000) as u32) / 100.0,
+                    2 => {
+                        let f = f64::from_bits(self.raw_bits()).abs();
+                        if f.is_finite() { f } else { f64::MAX }
+                    }
+                    _ => *self
+                        .c
+                        .pick(&[0.0, f64::MIN_POSITIVE, 5e-324, f64::MAX, 1e21, 1e-7]),
+                };
+                print_literal(&Literal::Float(f))
+            }
+            Class::Str => {
+                const PARTS: [&str; 21] = [
+                    "a", "z", " ", "é", "→", "0", "$x", "\"", "\\", "\n", "\t", "\r", "\\n", "//",
+                    "/*", "*/", "{", "}", "\u{0}", "\u{1b}", "\u{7f}",
+                ];
+                if self.c.below(3) == 0 {
+                    return None;
+                }
+                let n = self.c.below(6);
+                let s: String = (0..n).map(|_| *self.c.pick(&PARTS)).collect();
+                print_literal(&Literal::String(s))
+            }
+            _ => return None,
+        })
+    }
+
+    /// Sixty-four bits from three choices.
+    fn raw_bits(&mut self) -> u64 {
+        let high = self.c.below(1 << 31) as u64;
+        let low = self.c.below(1 << 31) as u64;
+        let top = self.c.below(4) as u64;
+        (top << 62) | (high << 31) | low
+    }
+
+    /// `match_terms` over a full-text field in scope, for the display round
+    /// trip.
+    fn match_terms(&mut self, scope: &[Var]) -> Option<String> {
+        let fields: Vec<String> = scope
+            .iter()
+            .filter_map(|v| match v.kind {
+                VarKind::Node(t) => self.schema.nodes[t]
+                    .props
+                    .iter()
+                    .find(|p| p.ty == PropTy::FullText)
+                    .map(|p| format!("{}.{}", v.name, p.name)),
+                _ => None,
+            })
+            .collect();
+        if fields.is_empty() {
+            return None;
+        }
+        let field = self.c.pick(&fields).clone();
+        // `terms`' text is a String literal or parameter (`T19`).
+        let text = match self.c.below(2) {
+            0 => self.param(Class::Str),
+            _ => self.literal(Class::Str),
+        };
+        let mode = *self.c.pick(&["all", "any"]);
+        let edits = self.c.below(3);
+        Some(format!(
+            "match_terms({field}, terms({text}, mode: {mode}, max_edits: {edits}))"
+        ))
+    }
+
     fn leaf(&mut self, class: Class, scope: &[Var]) -> String {
+        if self.options.display && class == Class::DateTime && self.c.flag(15) {
+            return "now()".to_string();
+        }
         let leaves = self.leaves(class, scope);
         match self.c.below(4) {
             0 | 1 if !leaves.is_empty() => self.c.pick(&leaves).clone(),
@@ -1719,8 +1814,12 @@ impl ReadGen<'_, '_, '_> {
                 ),
                 _ => self.cast(class, scope, d),
             },
+            Class::Bool if self.options.display && self.c.flag(10) => self
+                .match_terms(scope)
+                .unwrap_or_else(|| self.leaf(class, scope)),
             Class::Bool => match self.c.below(13) {
                 0 => self.leaf(class, scope),
+                5 | 10 if self.options.display => self.leaf(class, scope),
                 1..=3 => {
                     let (l, r) = *self.c.pick(&[
                         (Class::Int, Class::Int),
@@ -2048,6 +2147,42 @@ pub fn scalar_expr(
     }];
     let e = g.expr(class, &scope, depth);
     (e, g.params)
+}
+
+/// A declared parameter: its name, its declaration and its value (`None`
+/// for an omitted nullable one).
+pub type ParamDecl = (String, String, Option<Literal>);
+
+/// Well-typed expressions over one node variable `$x` of `schema`'s type
+/// `t`, one per `(class, depth)` of `wanted`, drawn by one generator under
+/// `options` so they share its parameters: their texts and the parameters
+/// declared, as `(name, declaration, value)`.
+pub fn typed_exprs(
+    c: &mut Choices,
+    schema: &GenSchema,
+    t: usize,
+    wanted: &[(Class, u32)],
+    options: ReadOptions,
+) -> (Vec<String>, Vec<ParamDecl>) {
+    let mut g = ReadGen {
+        schema,
+        c,
+        options,
+        fresh: 0,
+        params: Vec::new(),
+        nullable_nodes: Vec::new(),
+        pure: false,
+        pure_blocks: false,
+    };
+    let scope = vec![Var {
+        name: "$x".into(),
+        kind: VarKind::Node(t),
+    }];
+    let exprs = wanted
+        .iter()
+        .map(|(class, depth)| g.expr(*class, &scope, *depth))
+        .collect();
+    (exprs, g.params)
 }
 
 // ---------------------------------------------------------------- spellings
