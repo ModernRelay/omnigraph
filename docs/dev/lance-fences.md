@@ -157,7 +157,10 @@ exhaustive `nearest` give one `F32` value per row.
 `lance_surface_guards.rs::ivf_flat_and_flat_knn_score_cosine_and_dot_exactly`,
 `schema_apply.rs::vector_distance_change_is_applied_in_place_and_serves_exactly_until_the_rebuild`,
 `staged_tests.rs::stage_create_indices_batches_mixed_types_into_one_exact_commit`,
-`cases/vector_distance_*.gqt`
+`cases/vector_distance_cosine_refuses_zero_vectors.gqt`, and the search law
+(`omnigraph-gqt` `integration/law_search.rs`), which holds every distance's
+value, `distance` and an exhaustive `nearest` under no, full and partial index
+coverage to an independent formula
 
 ### Full-text analyzer
 

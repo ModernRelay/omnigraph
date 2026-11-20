@@ -213,6 +213,9 @@ pub struct SearchRead {
     pub lexical: Option<Lexical>,
     /// Set for an `rrf` read: the parts its source is written from.
     pub rrf: Option<Rrf>,
+    /// Set for a read of one ranking call: the call, and the `limit` of its
+    /// `order` when it has one.
+    pub ranking: Option<(Arm, Option<usize>)>,
     /// The population's `where`, written inside its `let`.
     pub population: String,
 }
@@ -541,23 +544,27 @@ impl SearchCase {
                     ordered: false,
                     lexical,
                     rrf: None,
+                    ranking: None,
                     population: String::new(),
                 }
             }
             3..=5 => {
                 let arm = self.arm(c, &mut params);
-                let tail = if c.flag(40) {
-                    let dir = if arm.descending() { "desc" } else { "asc" };
-                    format!("\n  order {{ $s {dir} }}\n  limit {}", 1 + c.below(5))
-                } else {
-                    String::new()
+                let limit = c.flag(40).then(|| 1 + c.below(5));
+                let tail = match limit {
+                    Some(limit) => {
+                        let dir = if arm.descending() { "desc" } else { "asc" };
+                        format!("\n  order {{ $s {dir} }}\n  limit {limit}")
+                    }
+                    None => String::new(),
                 };
                 SearchRead {
                     source: ranking_source(&population, &arm.call(), &params, &tail),
-                    ordered: !tail.is_empty(),
+                    ordered: limit.is_some(),
                     params,
                     lexical: None,
                     rrf: None,
+                    ranking: Some((arm, limit)),
                     population,
                 }
             }
@@ -585,6 +592,7 @@ impl SearchCase {
                     ordered: false,
                     lexical: None,
                     rrf: Some(rrf),
+                    ranking: None,
                     population,
                 }
             }

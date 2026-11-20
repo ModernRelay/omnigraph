@@ -44,6 +44,15 @@
 //!   distances under that order; and an `rrf` cut by `order { $s desc }`
 //!   and `limit` keeps the largest scores, equal scores broken by the
 //!   smaller key.
+//! - (d) A `distance` or `nearest` read returns the RFC's distance, computed
+//!   here apart from both implementations (the sum of squared differences
+//!   for `l2`, one less the cosine similarity for `cosine`, one less the dot
+//!   product for `dot`, rounded to `F32`), and over the whole type returns
+//!   every row holding a vector (`distance`) or the `k` smallest distances
+//!   with equal distances broken by the smaller key (`nearest`), cut by its
+//!   `order` and `limit`. A `cosine` vector has a power-of-two norm, so each
+//!   cosine distance is exact in `F32`: the RFC bounds an indexed cosine
+//!   distance only up to `F32` rounding.
 //!
 //! Seeds are deterministic; a failing case's seed is written to
 //! `tests/regressions/law_search.txt`, which every run replays first.
@@ -486,6 +495,110 @@ async fn check_rrf(
     Ok(())
 }
 
+// ---------------------------------------------------------------- distances
+
+/// A vector parameter's components.
+fn vector_param(read: &SearchRead, name: &str) -> Option<Vec<f64>> {
+    let (_, value) = read.params.iter().find(|(n, _)| n == name)?;
+    match value {
+        omnigraph_compiler::query::value::Literal::List(items) => items
+            .iter()
+            .map(|item| match item {
+                omnigraph_compiler::query::value::Literal::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect(),
+        _ => None,
+    }
+}
+
+/// The RFC's distance of `x` from `q` under `distance`, computed apart from
+/// either implementation: the sum of squared differences for `l2`, one less
+/// the cosine similarity for `cosine`, one less the dot product for `dot`;
+/// rounded to the `F32` the column holds.
+fn distance_oracle(distance: &str, x: &[f64; 4], q: &[f64]) -> f64 {
+    let dot: f64 = x.iter().zip(q).map(|(a, b)| a * b).sum();
+    let value = match distance {
+        "l2" => x.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum(),
+        "cosine" => {
+            let norm = |v: &[f64]| v.iter().map(|a| a * a).sum::<f64>().sqrt();
+            1.0 - dot / (norm(x) * norm(q))
+        }
+        _ => 1.0 - dot,
+    };
+    f64::from(value as f32)
+}
+
+static DISTANCE_CHECKED: AtomicUsize = AtomicUsize::new(0);
+
+/// A read of one `distance` or `nearest` over the whole type: every
+/// returned distance is the oracle's, and the rows are every row holding a
+/// vector (`distance`) or the `k` smallest distances with equal distances
+/// broken by the smaller key (`nearest`), cut by its `order` and `limit`.
+fn check_distances(case: &SearchCase, read: &SearchRead, rows: &[Value]) -> Result<(), String> {
+    let Some((arm, limit)) = &read.ranking else {
+        return Ok(());
+    };
+    let (param, window) = match arm {
+        Arm::Distance { param } => (param, None),
+        Arm::Nearest { param, k } => (param, Some(*k)),
+        Arm::Bm25 { .. } => return Ok(()),
+    };
+    let q = vector_param(read, param).ok_or("a vector parameter")?;
+    let mut expected: Vec<(f64, String)> = case
+        .rows()
+        .iter()
+        .filter_map(|row| Some((distance_oracle(case.distance, &row.v?, &q), row.key.clone())))
+        .collect();
+    expected.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    if let Some(k) = window {
+        expected.truncate(k);
+    }
+    if let Some(limit) = limit {
+        expected.truncate(*limit);
+    }
+    let got: Vec<(f64, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["s"].as_f64().unwrap_or(f64::NAN),
+                r["x.k"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let mut by_key = got.clone();
+    by_key.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut want_by_key = expected.clone();
+    want_by_key.sort_by(|a, b| a.1.cmp(&b.1));
+    let order_holds = limit.is_none() || got == expected;
+    if read.population.is_empty() && (by_key != want_by_key || !order_holds) {
+        return Err(format!(
+            "{} answered {got:?}; the distance oracle under the tie rule gives {expected:?}\n--- query\n{}\n--- params\n{:?}\n{}",
+            arm.call(),
+            read.source,
+            read.params,
+            describe(case)
+        ));
+    }
+    // Under a population `where` every returned distance is still exact.
+    for (s, key) in &got {
+        let row = case.rows().into_iter().find(|r| &r.key == key);
+        let want = row
+            .and_then(|r| r.v)
+            .map(|v| distance_oracle(case.distance, &v, &q));
+        if want != Some(*s) {
+            return Err(format!(
+                "{} scored {key} {s}; the distance oracle gives {want:?}\n--- query\n{}\n{}",
+                arm.call(),
+                read.source,
+                describe(case)
+            ));
+        }
+    }
+    DISTANCE_CHECKED.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 async fn check(case: &SearchCase) -> Result<(), String> {
     for state in STATES {
         let (_dir, session) = graph(case, state).await?;
@@ -510,6 +623,7 @@ async fn check(case: &SearchCase) -> Result<(), String> {
                     ));
                 }
             }
+            check_distances(case, read, &rows)?;
             if read.rrf.is_some() && matches!(state, State::NoIndex | State::Partial) {
                 check_rrf(&session, case, read, &rows).await?;
             }
@@ -533,9 +647,11 @@ fn run_law(cases: u32) {
     let lexical = LEXICAL_CHECKED.load(Ordering::Relaxed);
     let formula = FORMULA_CHECKED.load(Ordering::Relaxed);
     let skipped = FORMULA_SKIPPED.load(Ordering::Relaxed);
+    let distances = DISTANCE_CHECKED.load(Ordering::Relaxed);
     eprintln!(
         "{nonempty} of {total} judged reads returned a row; {lexical} match_terms reads met the \
-         edit oracle; {formula} rrf reads met the formula oracle, {skipped} skipped for a null arm score"
+         edit oracle; {formula} rrf reads met the formula oracle, {skipped} skipped for a null arm \
+         score; {distances} distance and nearest reads met the distance oracle"
     );
     let access = ACCESS.lock().unwrap();
     eprintln!("access paths: {access:?}");
@@ -550,7 +666,10 @@ fn run_law(cases: u32) {
             );
         }
     }
-    assert!(lexical > 0 && formula > 0, "an oracle never ran");
+    assert!(
+        lexical > 0 && formula > 0 && distances > 0,
+        "an oracle never ran"
+    );
 }
 
 #[test]
