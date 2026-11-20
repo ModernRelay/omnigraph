@@ -5,11 +5,13 @@
 //! experiment identity. Legacy case/suite readers are retained. The local runner consumes those resolved plans, canonical JSON is
 //! the durable telemetry authority, and OmniGraph provides a disposable query
 //! projection over that archive. Cloud orchestration is a later harness slice.
+#![recursion_limit = "512"]
 
 pub mod archive;
 pub mod branch_merge;
 pub mod case;
 pub mod catalog;
+pub mod concurrent_host;
 pub mod counting;
 pub mod dataset_cache;
 pub mod dataset_identity;
