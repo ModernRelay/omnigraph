@@ -766,6 +766,71 @@ mod tests {
         }
     }
 
+    /// The banded distance against the full dynamic-programming table, over
+    /// generated term pairs (`arbitrary::search`): a term and the same term
+    /// after zero to four random edits, transpositions among them, over
+    /// ASCII, an accented letter, a sharp s, an ideograph and a digit.
+    fn banded_distance_law(cases: u32) {
+        use omnigraph_compiler::arbitrary::search::{edited, term};
+        use omnigraph_compiler::arbitrary::{Choices, choices};
+        use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
+        let full = |a: &[char], b: &[char]| {
+            let mut table = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+            for (i, row) in table.iter_mut().enumerate() {
+                row[0] = i;
+            }
+            for (j, cell) in table[0].iter_mut().enumerate() {
+                *cell = j;
+            }
+            for i in 1..=a.len() {
+                for j in 1..=b.len() {
+                    table[i][j] = (table[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]))
+                        .min(table[i - 1][j] + 1)
+                        .min(table[i][j - 1] + 1);
+                }
+            }
+            table[a.len()][b.len()]
+        };
+        let config = Config {
+            cases,
+            failure_persistence: None,
+            ..Config::default()
+        };
+        let mut runner =
+            TestRunner::new_with_rng(config, TestRng::deterministic_rng(RngAlgorithm::ChaCha));
+        runner
+            .run(&choices(32), |stream| {
+                let mut c = Choices::new(&stream);
+                let a = term(&mut c);
+                let edits = c.below(5);
+                let b = edited(&mut c, &a, edits);
+                let (a, b) = (chars(&a), chars(&b));
+                let distance = full(&a, &b);
+                for k in 0..=2u8 {
+                    let expected = (distance <= usize::from(k)).then_some(distance as u8);
+                    let got = bounded_edits(&a, &b, k);
+                    if got != expected {
+                        return Err(TestCaseError::fail(format!(
+                            "{a:?} {b:?} within {k}: {got:?}, the table gives {distance}"
+                        )));
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn the_banded_distance_equals_the_table_on_generated_terms() {
+        banded_distance_law(20_000);
+    }
+
+    #[test]
+    #[ignore = "nightly: the banded distance over generated terms at its nightly count"]
+    fn the_banded_distance_equals_the_table_on_generated_terms_at_nightly_breadth() {
+        banded_distance_law(1_000_000);
+    }
+
     #[test]
     fn a_query_is_its_distinct_analyzed_terms_in_utf8_order() {
         let mut analyzer = Analyzer::of(AnalyzerProfile::StandardV1).unwrap();

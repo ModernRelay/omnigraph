@@ -10,6 +10,7 @@ mod law_engine_reference;
 mod law_index_cost;
 mod law_refusal_soundness;
 mod law_scalar_evaluators;
+mod law_search;
 mod law_two_editions;
 mod layout_hunts;
 mod query_corpus;

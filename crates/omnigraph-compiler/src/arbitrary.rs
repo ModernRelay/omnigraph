@@ -18,6 +18,8 @@ use proptest::prelude::*;
 
 use crate::query::value::Literal;
 
+pub mod search;
+
 /// The strategy of one choice stream of at most `max_len` entries.
 pub fn choices(max_len: usize) -> impl Strategy<Value = Vec<u32>> {
     proptest::collection::vec(any::<u32>(), 0..max_len)

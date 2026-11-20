@@ -80,6 +80,7 @@ jobs:
             law_index_cost::generated_index_paths_are_cheaper_than_their_scans_at_nightly_breadth
             law_refusal_soundness::every_refusal_resting_on_a_claim_about_every_graph_holds_it_at_nightly_breadth
             law_scalar_evaluators::scalar_evaluators_agree_on_generated_expressions_at_nightly_breadth
+            law_search::search_answers_hold_under_every_index_state_and_the_rrf_formula_at_nightly_breadth
             law_two_editions::edition_2_and_edition_3_answer_generated_reads_alike_at_nightly_breadth
           )
           cargo test -p omnigraph-gqt --locked --test integration -- --ignored --exact "${names[@]}" 2>&1 | tee target/gqt-laws.log
