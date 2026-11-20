@@ -366,6 +366,8 @@ pub enum NodeMirror {
         target: String,
         k: Option<ExprMirror>,
         weights: Option<ExprMirror>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partition: Option<String>,
     },
     Projection {
         input: NodeId,
@@ -637,11 +639,13 @@ impl From<&PhysicalNode> for NodeMirror {
                 target,
                 k,
                 weights,
+                partition,
             } => Self::Fuse {
                 arms: arms.clone(),
                 target: target.clone(),
                 k: k.as_ref().map(ExprMirror::from),
                 weights: weights.as_ref().map(ExprMirror::from),
+                partition: partition.clone(),
             },
             PhysicalNode::Projection {
                 input,
@@ -929,11 +933,13 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 target,
                 k,
                 weights,
+                partition,
             } => Self::Fuse {
                 arms,
                 target,
                 k: k.map(IRExpr::from),
                 weights: weights.map(IRExpr::from),
+                partition,
             },
             NodeMirror::Projection {
                 input,

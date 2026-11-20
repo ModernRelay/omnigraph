@@ -691,6 +691,10 @@ pub enum LogicalNode {
         k: Option<IRExpr>,
         weights: Option<IRExpr>,
         reads: Vec<ColumnRef>,
+        /// Inside a correlated read's inner tree, the outer name each arm
+        /// starts from: the fusion runs per outer row, partitioned by the
+        /// outer row each arm row belongs to. `None`: one fusion.
+        partition: Option<String>,
     },
     /// The rows of the first `targets` distinct `binding` identities of its
     /// input, which arrives sorted by the ranking's score then that identity:
@@ -1329,14 +1333,21 @@ impl LogicalPlan {
                     k,
                     weights,
                     reads,
-                } => json!({
-                    "node": "Fuse",
-                    "target": target,
-                    "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
-                    "typed_k": k.as_ref().map(crate::typed::expr),
-                    "typed_weights": weights.as_ref().map(crate::typed::expr),
-                    "reads": rendered(reads),
-                }),
+                    partition,
+                } => {
+                    let mut value = json!({
+                        "node": "Fuse",
+                        "target": target,
+                        "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
+                        "typed_k": k.as_ref().map(crate::typed::expr),
+                        "typed_weights": weights.as_ref().map(crate::typed::expr),
+                        "reads": rendered(reads),
+                    });
+                    if let Some(outer) = partition {
+                        value["partition"] = json!(format!("per outer row of ${outer}"));
+                    }
+                    value
+                }
                 LogicalNode::Aggregate {
                     reads,
                     return_exprs,

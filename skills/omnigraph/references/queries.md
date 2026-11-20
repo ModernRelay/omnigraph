@@ -126,7 +126,8 @@ an outer name (once otherwise), so an outer `where` or `limit` never widens
 or replaces its cut, and `count` with no key is 0 where nothing matches; a
 ranking may stand inside such a read, beside other elements, in an
 `optional` or a `union` arm, or correlated on an outer name, its window its
-own (per outer row), except an `rrf` whose arms read an outer name (`T86`).
+own (per outer row); an `rrf` whose arms read an outer name fuses per outer
+row.
 `from union({ … }, { … })`
 joins the bag of its arms' rows, columns matched by name in the first arm's
 order (`return { $q as p }` in a later one; a missing or extra name is

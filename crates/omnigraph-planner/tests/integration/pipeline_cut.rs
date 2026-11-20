@@ -114,6 +114,7 @@ fn multi_input_samples(plan: &mut PhysicalPlan) -> Vec<PhysicalNode> {
             target: "d".to_string(),
             k: None,
             weights: None,
+            partition: None,
         },
     ]
 }

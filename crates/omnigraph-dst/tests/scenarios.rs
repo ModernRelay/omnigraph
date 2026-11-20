@@ -3650,7 +3650,8 @@ query nearest_docs($q: Vector(2)) {
 /// own): a `nearest` correlated on each outer person, its population the
 /// person's documents, scored exactly and cut to the person's two nearest
 /// by the read's own window, all outer rows in one evaluation of the
-/// population.
+/// population; and an `rrf` correlated on each outer person, a `bm25` arm
+/// and a `nearest` arm over the person's documents fused per person.
 fn ranking_read_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = r#"
 node Person {
@@ -3658,6 +3659,7 @@ node Person {
 }
 node Doc {
     slug: String @key
+    body: String @index(fulltext)
     embedding: Vector(2) @index
 }
 edge Authored: Person -> Doc
@@ -3670,8 +3672,17 @@ query nearest_per_author($q: Vector(2)) {
     }
     return { $p.handle, $d.slug }
 }
+
+query fused_per_author($q: Vector(2), $s: String) {
+    match {
+        $p: Person,
+        let $pop = { match { $d: Doc, $p authored $d } return { $d } },
+        from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $q, k: 2)) as $f
+    }
+    return { $p.handle, $d.slug, $f }
+}
 "#;
-    const LABELS: [&str; 1] = ["NearestCorrelated"];
+    const LABELS: [&str; 2] = ["NearestCorrelated", "RrfCorrelated"];
 
     struct RankingReadCost;
 
@@ -3706,7 +3717,8 @@ query nearest_per_author($q: Vector(2)) {
             }
             for row in 0..16 {
                 seed.push(format!(
-                    r#"{{"type":"Doc","data":{{"slug":"d{row:02}","embedding":[{x:?},{y:?}]}}}}"#,
+                    r#"{{"type":"Doc","data":{{"slug":"d{row:02}","body":"{body}","embedding":[{x:?},{y:?}]}}}}"#,
+                    body = if row % 2 == 0 { "graph notes" } else { "river notes" },
                     x = row as f32,
                     y = (row % 3) as f32
                 ));
@@ -3749,6 +3761,26 @@ query nearest_per_author($q: Vector(2)) {
                 rows.as_array().unwrap().len(),
                 8,
                 "two nearest documents for each of four authors: {rows}"
+            );
+            params.insert("s".to_string(), Literal::String("graph".to_string()));
+            omnigraph_dst::cost::set_label(LABELS[1]);
+            let rows = reader
+                .query(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    QUERIES,
+                    "fused_per_author",
+                    &params,
+                )
+                .await
+                .unwrap()
+                .to_rust_json()
+                .unwrap();
+            omnigraph_dst::cost::set_label("_ranking_read_verify");
+            // Each author holds four documents, two of them about graphs:
+            // the fusion of an author's two matches and two nearest.
+            assert!(
+                (4..=16).contains(&rows.as_array().unwrap().len()),
+                "each author's fused documents: {rows}"
             );
         }
     }

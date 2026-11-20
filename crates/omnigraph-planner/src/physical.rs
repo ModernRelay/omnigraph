@@ -1020,6 +1020,12 @@ physical_nodes! {
         target: String,
         k: Option<IRExpr>,
         weights: Option<IRExpr>,
+        /// Inside a correlated read's inner tree: the outer name each arm
+        /// starts from, the fusion partitioned by the outer row each arm
+        /// row belongs to (the engine's tag of that read); each arm is a
+        /// correlated read yielding its rows per outer row in its rank
+        /// order.
+        partition: Option<String>,
     } => "Fuse" [arms: Vec<FuseArm>]
         shape: PipelineShape::Breaker,
         sides: arms.iter().skip(1).map(|arm| arm.input).collect(),
@@ -1618,15 +1624,22 @@ impl PhysicalPlan {
                     target,
                     k,
                     weights,
-                } => json!({
-                    "node": "Fuse",
-                    "target": target,
-                    "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
-                    "k": k.as_ref().map(ToString::to_string),
-                    "typed_k": k.as_ref().map(crate::typed::expr),
-                    "weights": weights.as_ref().map(ToString::to_string),
-                    "typed_weights": weights.as_ref().map(crate::typed::expr),
-                }),
+                    partition,
+                } => {
+                    let mut value = json!({
+                        "node": "Fuse",
+                        "target": target,
+                        "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
+                        "k": k.as_ref().map(ToString::to_string),
+                        "typed_k": k.as_ref().map(crate::typed::expr),
+                        "weights": weights.as_ref().map(ToString::to_string),
+                        "typed_weights": weights.as_ref().map(crate::typed::expr),
+                    });
+                    if let Some(outer) = partition {
+                        value["partition"] = json!(format!("per outer row of ${outer}"));
+                    }
+                    value
+                }
                 PhysicalNode::Aggregate {
                     return_exprs,
                     aggregates,

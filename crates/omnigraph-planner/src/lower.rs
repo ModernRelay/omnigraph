@@ -37,6 +37,8 @@ pub struct FuseFields<'p> {
     pub target: &'p str,
     pub k: Option<&'p IRExpr>,
     pub weights: Option<&'p IRExpr>,
+    /// Partitioned per outer row of the enclosing correlated read.
+    pub partition: Option<&'p str>,
 }
 
 /// The fields of [`PhysicalNode::Correlate`] beside its inputs.
@@ -689,6 +691,7 @@ impl PhysicalPlan {
                 target,
                 k,
                 weights,
+                partition,
             } => {
                 let mut lowered = Vec::with_capacity(arms.len());
                 for arm in arms {
@@ -701,6 +704,7 @@ impl PhysicalPlan {
                         target,
                         k: k.as_ref(),
                         weights: weights.as_ref(),
+                        partition: partition.as_deref(),
                     },
                     lowered,
                 )

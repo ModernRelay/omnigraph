@@ -140,6 +140,7 @@ fn fusion_targets_read_the_node_object_in_every_arm() {
         target_type: "T".to_string(),
         k: None,
         weights: None,
+        outer_var: None,
     }];
     let (plan, _) = planned(&op);
     assert_eq!(projection_of(&plan, "a"), object_columns());

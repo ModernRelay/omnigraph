@@ -729,7 +729,9 @@ keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;
 `sort no tiebreak` requires an empty list. Dropping a type key or swapping key
 order fails these assertions. `fuse $d: arms [nearest, bm25]` states that a
 physical `Fuse` of `$d` ranks its arms as written, in order (`nearest`,
-`distance`, `bm25`, `ordered` or `rrf`).
+`distance`, `bm25`, `ordered` or `rrf`), and fuses once; with ` per outer row`
+appended, the `Fuse` is partitioned per outer row of the correlated read
+holding it (an `rrf` whose arms read an outer name).
 `hydrate $d: columns [..]` states that a physical `HydrateColumns` fetches
 exactly those columns of `$d` by row address above the root limit (pass
 `late_materialization`); the `scan` lines keep reading the logical plan, whose

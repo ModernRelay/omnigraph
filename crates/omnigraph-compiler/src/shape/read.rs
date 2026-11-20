@@ -292,6 +292,14 @@ pub enum PatternStep {
         k: Option<IRExpr>,
         /// The weights as written, one per arm; `None` is every arm `1.0`.
         weights: Option<IRExpr>,
+        /// An `rrf` whose arms read the enclosing scope, inside a correlated
+        /// read's pattern: each arm starts from the outer rows, an
+        /// `OuterReference` on this name, and is a correlated read ranking
+        /// its targets per outer row ([`ArmRank`]'s order, then the
+        /// target's identity, its own cut); the fusion runs per outer row,
+        /// partitioned by the row each arm row belongs to. `None` for arms
+        /// from nothing.
+        outer_var: Option<String>,
     },
 }
 
@@ -537,11 +545,6 @@ impl ReadShape {
             crate::ir::core::CoreDecl::Write(_) => Err(format!("`{name}` is a write, not a read")),
         }
     }
-}
-
-/// A term of the break that this release does not lower, at `construct`.
-fn unsupported(name: &str, what: impl std::fmt::Display, construct: Construct) -> ShapeError {
-    ShapeError::unlowered(Unlowered::new(name, what, construct))
 }
 
 /// A `from` element.
@@ -1440,11 +1443,6 @@ impl<'a> Shaper<'a> {
         reference_identity(variable, ty, self.catalog.system_columns.id)
     }
 
-    /// A refusal at `construct`.
-    fn refuse_at(&self, what: impl std::fmt::Display, construct: Construct) -> ShapeError {
-        unsupported(self.name, what, construct)
-    }
-
     /// A core node the type checker never writes in a pattern: every
     /// inline read's `Group`, `Order` and `Cut` arrives under its read's
     /// final projection, a ranking anywhere is drawn as a read of its own,
@@ -2313,6 +2311,20 @@ impl<'a> Shaper<'a> {
         inlined: &mut usize,
         fresh: &mut FreshNames,
     ) -> Result<PatternStep, ShapeError> {
+        self.fusion_step(fuse, inlined, fresh, None)
+    }
+
+    /// [`Self::fuse_step`], partitioned per outer row when `partition`
+    /// names the enclosing correlated read's outer rows: each arm is then a
+    /// correlated read ranking its targets per outer row
+    /// ([`Self::correlated_arm`]).
+    fn fusion_step(
+        &self,
+        fuse: &Term,
+        inlined: &mut usize,
+        fresh: &mut FreshNames,
+        partition: Option<&str>,
+    ) -> Result<PatternStep, ShapeError> {
         crate::stack::deep(|| {
             let Term::Fuse {
                 arms,
@@ -2326,6 +2338,10 @@ impl<'a> Shaper<'a> {
             };
             let mut shaped = Vec::with_capacity(arms.len());
             for arm in arms {
+                if let Some(outer) = partition {
+                    shaped.push(self.correlated_arm(arm, outer, inlined, fresh)?);
+                    continue;
+                }
                 let mut steps = Vec::new();
                 let mut bound = HashSet::new();
                 let rank = match self.ranking(arm)? {
@@ -2403,8 +2419,72 @@ impl<'a> Shaper<'a> {
                 target_type,
                 k,
                 weights: rrf_weights_expr(weights),
+                outer_var: partition.map(str::to_string),
             })
         })
+    }
+
+    /// One arm of an `rrf` partitioned per outer row: a correlated read
+    /// over the outer rows (an `OuterReference` on `outer`, whether or not
+    /// the arm reads one of them) whose rows for each outer row arrive in
+    /// the arm's rank order, cut by the arm's own window: a ranking's score
+    /// in its kind's direction then the target's identity, an ordered read's
+    /// own order, a nested fusion's fused score.
+    fn correlated_arm(
+        &self,
+        arm: &Term,
+        outer: &str,
+        inlined: &mut usize,
+        fresh: &mut FreshNames,
+    ) -> Result<FuseArm, ShapeError> {
+        let mut facts = Facts {
+            inlined: *inlined,
+            ..Facts::default()
+        };
+        let rank = match self.ranking(arm)? {
+            (_, Some(ranking)) if ranking.fused => {
+                self.fused_read(arm, &ranking, &mut facts, Some(outer))?;
+                ArmRank::Fused
+            }
+            (_, Some(ranking)) => {
+                self.ranked_correlate(arm, &ranking, &mut facts, true)?;
+                match ranking.exact {
+                    None => ArmRank::Nearest,
+                    Some((_, ScoreKind::Distance, _)) => ArmRank::Distance,
+                    Some((_, ScoreKind::Bm25, _)) => ArmRank::Bm25,
+                }
+            }
+            (_, None) => {
+                let (input, items, bindings) = read_parts(arm)
+                    .filter(|(input, ..)| orders(input))
+                    .ok_or_else(|| {
+                        ShapeError::Internal(
+                            "an `rrf` arm that is neither a ranking nor an inline read with an `order`, which the type checker refuses (T75)".into(),
+                        )
+                    })?;
+                self.inline_read(input, items, bindings, &mut facts)?;
+                ArmRank::Ordered
+            }
+        };
+        *inlined = facts.inlined;
+        let [correlate] = facts.correlates.as_slice() else {
+            return Err(ShapeError::Internal(
+                "a correlated `rrf` arm that is not one read".into(),
+            ));
+        };
+        let mut steps = Vec::new();
+        let mut bound: HashSet<String> = correlate.outer.clone();
+        self.place_correlate(correlate, &mut steps, &mut bound, &HashSet::new(), fresh)?;
+        let [PatternStep::Correlate { outer_var, .. }] = steps.as_mut_slice() else {
+            return Err(ShapeError::Internal(
+                "a correlated `rrf` arm placed as other than one read".into(),
+            ));
+        };
+        // An arm reading no outer name still ranks once per outer row.
+        if outer_var.is_none() {
+            *outer_var = Some(outer.to_string());
+        }
+        Ok(FuseArm { steps, rank })
     }
 
     /// The pattern of a ranking's population: an inline read returning the
@@ -3555,8 +3635,23 @@ impl<'a> Shaper<'a> {
             ));
         };
         if ranking.fused {
-            return self.fused_read(node, &ranking, facts);
+            return self.fused_read(node, &ranking, facts, None);
         }
+        self.ranked_correlate(node, &ranking, facts, false)
+    }
+
+    /// A ranking over a population, drawn as a correlated read: the
+    /// population's pattern, its score, and a `nearest` window's cut per
+    /// outer row. `ordered` orders an exact score's rows too, by the score
+    /// in its kind's direction and then the target's identity, as an `rrf`
+    /// arm ranks them; a `nearest` window always orders so.
+    fn ranked_correlate(
+        &self,
+        node: &Term,
+        ranking: &Ranking,
+        facts: &mut Facts,
+        ordered: bool,
+    ) -> Result<(), ShapeError> {
         let population = ranked_input(node);
         let (input, items, bindings) = read_parts(population).ok_or_else(|| {
             ShapeError::Internal(
@@ -3674,6 +3769,18 @@ impl<'a> Shaper<'a> {
                     "a `nearest` with other than one window".into(),
                 ));
             }
+            (Some(_), _) if ordered => {
+                let id = self.catalog.system_columns.id;
+                let mut order_by = vec![IROrdering::new(score.clone(), ranking.descending)];
+                let target = ExprType::node(type_name.clone());
+                order_by.extend(
+                    reference_identity(&ranking.column, &target, id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|expr| IROrdering::new(expr, false)),
+                );
+                (order_by, None)
+            }
             (Some(_), _) => (Vec::new(), None),
         };
         // The score and the population's values are read after the `from`
@@ -3722,30 +3829,38 @@ impl<'a> Shaper<'a> {
     /// pipeline from nothing, as the read's own `rrf` places them) and whose
     /// columns are the target and the fused score under the name the `from`
     /// gives it.
+    ///
+    /// An `rrf` whose arms read the enclosing scope (or, with `partition`,
+    /// an arm of such an `rrf`) is fused per outer row: its `Fuse` is
+    /// partitioned by the outer row each arm row belongs to
+    /// ([`Self::fusion_step`]); as an arm, its rows are ordered by the fused
+    /// score, then the target's identity.
     fn fused_read(
         &self,
         node: &Term,
         ranking: &Ranking,
         facts: &mut Facts,
+        partition: Option<&str>,
     ) -> Result<(), ShapeError> {
-        let Term::Fuse { arms, .. } = node else {
+        let Term::Fuse { .. } = node else {
             return Err(ShapeError::Internal(
                 "a fused ranking that is not a `Fuse`".into(),
             ));
         };
-        let outer: HashSet<String> = arms
-            .iter()
-            .flat_map(|arm| env_columns(ranked_input(arm)))
-            .collect();
-        if !outer.is_empty() {
-            return Err(self.refuse_at(
-                "an `rrf` whose arms read the enclosing scope",
-                Construct::Element(FROM, None),
-            ));
-        }
+        let outer: HashSet<String> = ranking_outer(node).into_iter().collect();
+        // The outer name each arm's rows start from: the enclosing fusion's,
+        // or the first the arms read.
+        let label = match partition {
+            Some(label) => Some(label.to_string()),
+            None => {
+                let mut names: Vec<&String> = outer.iter().collect();
+                names.sort();
+                names.first().map(|name| name.to_string())
+            }
+        };
         let mut scoped = FreshNames::scoped(format!("q{}", facts.inlined));
         let mut inlined = facts.inlined;
-        let step = self.fuse_step(node, &mut inlined, &mut scoped)?;
+        let step = self.fusion_step(node, &mut inlined, &mut scoped, label.as_deref())?;
         facts.inlined = inlined;
         self.minted.borrow_mut().extend(scoped.minted);
         let target_type = match &step {
@@ -3773,6 +3888,21 @@ impl<'a> Shaper<'a> {
                 ty: ranking.score.1.clone(),
             },
         );
+        // As an arm, the fused score descending, then the target's identity.
+        let order_by = match partition {
+            Some(_) => {
+                let id = self.catalog.system_columns.id;
+                let mut order_by = vec![IROrdering::new(score.clone(), true)];
+                order_by.extend(
+                    reference_identity(&ranking.column, &target, id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|expr| IROrdering::new(expr, false)),
+                );
+                order_by
+            }
+            None => Vec::new(),
+        };
         facts.correlates.push(CorrelateFact {
             inner: Facts::default(),
             outer,
@@ -3793,7 +3923,7 @@ impl<'a> Shaper<'a> {
                         column: ranking.out.clone(),
                     },
                 ],
-                order_by: Vec::new(),
+                order_by,
                 limit: None,
                 limit_param: None,
                 window: None,
@@ -4976,6 +5106,51 @@ fn env_cols(term: &Term) -> Vec<Col> {
             },
         }
     }
+}
+
+/// The outer names a ranking reads: its population's, and those its query
+/// reads beyond its population's columns; a fusion's, every arm's.
+fn ranking_outer(node: &Term) -> Vec<String> {
+    let mut out = Vec::new();
+    match node {
+        Term::Fuse { arms, .. } => {
+            for arm in arms {
+                out.extend(ranking_outer(arm));
+            }
+        }
+        Term::ApproxTopK { input, query, .. }
+        | Term::Score {
+            input,
+            query: ScoreQuery::Vector(query),
+            ..
+        } => {
+            out.extend(env_columns(input));
+            let mut read = Vec::new();
+            query.columns(&mut read);
+            let own: Vec<String> = read_parts(input)
+                .map(|(_, items, _)| items.iter().map(|(name, _)| name.clone()).collect())
+                .unwrap_or_default();
+            out.extend(read.into_iter().filter(|name| !own.contains(name)));
+        }
+        Term::Score {
+            input,
+            query: ScoreQuery::Lexical(lexical),
+            ..
+        } => {
+            out.extend(env_columns(input));
+            let mut read = Vec::new();
+            lexical.text.columns(&mut read);
+            lexical.max_edits.columns(&mut read);
+            let own: Vec<String> = read_parts(input)
+                .map(|(_, items, _)| items.iter().map(|(name, _)| name.clone()).collect())
+                .unwrap_or_default();
+            out.extend(read.into_iter().filter(|name| !own.contains(name)));
+        }
+        other => out.extend(env_columns(other)),
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The names of the outer columns a correlated pattern reads.

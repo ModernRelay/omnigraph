@@ -1094,7 +1094,8 @@ impl ReadGen<'_, '_, '_> {
     /// A ranking after the read's first element, a read of its own: over
     /// the first type's population as written, one with its own `order`
     /// and `limit` or `distinct`, or one correlated on an outer node through
-    /// its `where`; `nearest`, `distance`, `bm25`, or an uncorrelated `rrf`.
+    /// its `where`; `nearest`, `distance`, `bm25`, or an `rrf`, fused per
+    /// outer row when its population is correlated.
     fn later_ranking(&mut self, scope: &mut Vec<Var>, elements: &mut Vec<String>) {
         let t = 0;
         if !self.schema.nodes[t]
@@ -1140,7 +1141,6 @@ impl ReadGen<'_, '_, '_> {
             0 => format!("nearest({pop}, {d}.v, {qv}, k: {k})"),
             1 => format!("distance({pop}, {d}.v, {qv})"),
             2 => format!("bm25({pop}, {d}.t, {text})"),
-            _ if correlated => format!("nearest({pop}, {d}.v, {qv}, k: {k})"),
             _ => format!(
                 "rrf(nearest({pop}, {d}.v, {qv}, k: {k}), bm25({pop}, {d}.t, {text}), k: {})",
                 1 + self.c.below(60)

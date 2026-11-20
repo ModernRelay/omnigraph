@@ -295,7 +295,6 @@ a later release lowers it.
 
 | Refused |
 |---|
-| An `rrf` whose arms read a name of the enclosing scope |
 | A `Blob` read from a row in an assignment (a write group whose selection reads a type an earlier group changes is `T91`: every group selects on the write's snapshot) |
 | A read that calls itself (`Fix`) |
 

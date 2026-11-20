@@ -49,7 +49,16 @@ A query runs against one resolved `ReadTarget`:
    distance and to order by it, then the binding's identity. A non-root
    `nearest` is evaluated exactly, every row of its population scored; an
    `rrf` there is a `Correlate` over its `Fuse` step. An `rrf` whose arms
-   read the enclosing scope is still `T86`. An `optional { p }` (the core's `Correlate(R,
+   read the enclosing scope is that `Correlate` correlated on the outer rows
+   over a `Fuse` partitioned per outer row (`PatternStep::Fuse`'s
+   `outer_var`): each arm starts from the outer rows, as a correlated
+   union's arms do, and is a correlated read (`Shaper::correlated_arm`)
+   yielding each outer row's rows in the arm's rank order, its window cut
+   per outer row; `FuseExec` ranks from 1 and fuses within each partition of
+   the read's tag and carries the tag, so the read joins every outer row to
+   its own targets. Plan acceptance requires the fusion to be partitioned
+   exactly when its read is correlated and each partitioned arm to be such
+   a read ordered by its score, then the target's identity. An `optional { p }` (the core's `Correlate(R,
    Union(p, Project(Filter(Env, ¬ exists p), nulls)))`, `p` stored once and
    shared by both arms, so nested optionals grow the term and every walk
    over it linearly) is a `PatternStep::Optional`
@@ -189,8 +198,7 @@ A query runs against one resolved `ReadTarget`:
    since, so a chain of guarded blocks computes each guard once.
    The shaper is the compiler's
    (`omnigraph_compiler::shape`), and the type checker runs it on every
-   declaration it accepts: a term it does not lower (`Fix`, an `rrf` whose
-   arms read the enclosing scope) is refused at
+   declaration it accepts: a term it does not lower (`Fix`) is refused at
    type check with
    `T86`, at the construct and naming the programme stage that adds it, so
    the planner never refuses a checked read. A term that still arrives

@@ -1416,7 +1416,24 @@ impl Lower for Walk<'_, '_> {
             target,
             k,
             weights,
+            partition,
         } = fields;
+        // Partitioned, by the tag of the correlated read whose inner tree
+        // holds it: the scope open around its arms.
+        let partition = match partition {
+            Some(_) => Some(
+                self.outers
+                    .last()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(
+                            "a partitioned Fuse outside every correlated read".to_string(),
+                        )
+                    })?
+                    .tag_column
+                    .clone(),
+            ),
+            None => None,
+        };
         let method = FuseMethod {
             k: resolve_rrf_k(k, self.lowering.params())?,
             weights: resolve_rrf_weights(weights, declared.len())?,
@@ -1426,6 +1443,7 @@ impl Lower for Walk<'_, '_> {
             method,
             target,
             self.lowering.catalog.system_columns.id,
+            partition,
         )?;
         self.built(id, fuse)
     }

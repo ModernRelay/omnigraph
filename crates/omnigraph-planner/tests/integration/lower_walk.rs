@@ -470,6 +470,7 @@ fn a_fuse_lowers_each_arm_once_in_written_order() {
         target: "d".to_string(),
         k: None,
         weights: None,
+        partition: None,
     });
     plan.set_root(fuse);
 
@@ -540,6 +541,7 @@ fn a_node_with_two_consumers_refuses_the_lowering() {
         target: "d".to_string(),
         k: None,
         weights: None,
+        partition: None,
     });
     plan.set_root(fuse);
 

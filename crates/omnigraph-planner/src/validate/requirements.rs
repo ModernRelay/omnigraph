@@ -614,6 +614,7 @@ impl Requirements {
                     target_type,
                     k,
                     weights,
+                    ..
                 } => {
                     bindings.insert(
                         target.clone(),

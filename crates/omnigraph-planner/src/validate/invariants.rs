@@ -487,6 +487,7 @@ impl Requirements {
             target,
             k,
             weights,
+            ..
         }) = plan.node(id)
         else {
             unreachable!("`outer` holds fusions");
@@ -2019,10 +2020,44 @@ fn check_window(
     read: &crate::read_shape::InnerRead,
 ) -> Result<(), ValidationError> {
     // A fusion drawn as a read of its own: each arm yields its rows in its
-    // rank order, as the scope's fusion's do.
-    if let Some(PhysicalNode::Fuse { arms, target, .. }) = plan.node(inner) {
+    // rank order, as the scope's fusion's do. A fusion whose arms read the
+    // outer rows is partitioned by them exactly when the read is correlated,
+    // and each arm is then a correlated read yielding each outer row's rows
+    // in its rank order.
+    if let Some(PhysicalNode::Fuse {
+        arms,
+        target,
+        partition,
+        ..
+    }) = plan.node(inner)
+    {
+        let correlated = matches!(
+            plan.node(id),
+            Some(PhysicalNode::Correlate { input: Some(_), .. })
+        );
+        if correlated != partition.is_some() {
+            return Err(ValidationError::violated(
+                "search identity",
+                format!(
+                    "node {id}'s fusion is {} by the outer row of a read that is {}",
+                    if partition.is_some() {
+                        "partitioned"
+                    } else {
+                        "not partitioned"
+                    },
+                    if correlated {
+                        "correlated"
+                    } else {
+                        "uncorrelated"
+                    }
+                ),
+            ));
+        }
         for arm in arms {
-            check_arm_order(plan, arm, target)?;
+            match partition {
+                Some(_) => check_partitioned_arm_order(plan, arm, target)?,
+                None => check_arm_order(plan, arm, target)?,
+            }
         }
     }
     let Some(window) = &read.window else {
@@ -2053,6 +2088,66 @@ fn check_window(
                 "node {id}'s window over `${binding}` does not rank its targets by their own distance, then their identity"
             ),
         ))
+    }
+}
+
+/// An arm of a fusion partitioned per outer row is a correlated read over
+/// the outer rows returning the target, whose rows for each outer row arrive
+/// in the arm's rank order: a ranking's or a nested fusion's score in its
+/// kind's direction (`arm_score`), then the target's identity, a `nearest`
+/// window cut per outer row over that order; an ordered read's own order.
+fn check_partitioned_arm_order(
+    plan: &PhysicalPlan,
+    arm: &crate::physical::FuseArm,
+    target: &str,
+) -> Result<(), ValidationError> {
+    let ordered = match plan.node(arm.input) {
+        Some(PhysicalNode::Correlate {
+            input: Some(_),
+            read,
+            ..
+        }) if read.references().any(|name| name == target) => match arm_score(target, arm.rank) {
+            None => !read.order_by.is_empty(),
+            Some(score) => {
+                let identity = |key: &IROrdering| {
+                    !key.descending
+                        && matches!(&key.expr, IRExpr::PropAccess { variable, property, .. }
+                                if variable == target && *property != score_column(&score))
+                };
+                let window = match (&read.window, arm.rank) {
+                    (Some(window), ArmRank::Nearest) => window.binding == target,
+                    (None, ArmRank::Nearest) => false,
+                    (window, _) => window.is_none(),
+                };
+                matches!(read.order_by.as_slice(), [first, second, ..]
+                        if first.expr == score.expr
+                            && first.descending == score.descending
+                            && identity(second))
+                    && window
+                    && read.limit.is_none()
+            }
+        },
+        _ => false,
+    };
+    if ordered {
+        Ok(())
+    } else {
+        Err(ValidationError::violated(
+            "search identity",
+            format!(
+                "the partitioned fusion's {} arm (node {}) is not a correlated read yielding each outer row's rows of `${target}` in its rank order",
+                arm.rank.name(),
+                arm.input
+            ),
+        ))
+    }
+}
+
+/// The score column an arm's rank key reads.
+fn score_column(score: &IROrdering) -> String {
+    match &score.expr {
+        IRExpr::PropAccess { property, .. } => property.clone(),
+        _ => String::new(),
     }
 }
 

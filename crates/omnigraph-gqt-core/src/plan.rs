@@ -40,7 +40,7 @@ use serde_json::Value;
 use crate::load_plan::PipelineClaim;
 use crate::report::Report;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>[ <btree|bitmap|label_list|ngram>]`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `fuse $var: arms [nearest, bm25, distance, ordered, rrf]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>[ <btree|bitmap|label_list|ngram>]`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `fuse $var: arms [nearest, bm25, distance, ordered, rrf][ per outer row]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -179,10 +179,12 @@ pub(crate) enum PlanLine {
         members: Vec<(String, String)>,
     },
     /// A physical `Fuse` of `target` whose arms rank as `arms`, in written
-    /// order.
+    /// order, partitioned per outer row exactly when `partitioned` (`per
+    /// outer row`: an `rrf` whose arms read the enclosing scope).
     Fuse {
         target: String,
         arms: Vec<String>,
+        partitioned: bool,
     },
     /// An in-memory `Filter` node stays in the plan reading exactly `reads`.
     Filter {
@@ -399,6 +401,10 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             continue;
         }
         if let Some(claim) = line.strip_prefix("fuse ") {
+            let (claim, partitioned) = match claim.trim_end().strip_suffix(" per outer row") {
+                Some(claim) => (claim, true),
+                None => (claim, false),
+            };
             let (target, arms) = claim
                 .split_once(':')
                 .and_then(|(target, arms)| {
@@ -416,9 +422,13 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                         .then(|| (target.to_string(), arms))
                 })
                 .ok_or_else(|| {
-                    refused("claims `fuse $var: arms [nearest, bm25, distance, ordered, rrf]`")
+                    refused("claims `fuse $var: arms [nearest, bm25, distance, ordered, rrf][ per outer row]`")
                 })?;
-            lines.push(PlanLine::Fuse { target, arms });
+            lines.push(PlanLine::Fuse {
+                target,
+                arms,
+                partitioned,
+            });
             continue;
         }
         if let Some(claim) = line.strip_prefix("sort ") {
@@ -1023,8 +1033,9 @@ struct PlannedNodes {
     contains_joins: Vec<PlannedContainsJoin>,
     cross_joins: Vec<Vec<String>>,
     sorts: Vec<Result<Vec<String>, String>>,
-    /// Each `Fuse`: its target and how each arm ranks.
-    fusions: Vec<(String, Vec<String>)>,
+    /// Each `Fuse`: its target, how each arm ranks, and whether it is
+    /// partitioned per outer row.
+    fusions: Vec<(String, Vec<String>, bool)>,
     selections: Vec<(String, String, Value)>,
     /// `(binding, sorted columns)` of every `HydrateColumns` binding.
     hydrations: Vec<(String, Vec<String>)>,
@@ -1410,6 +1421,7 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect(),
+            node.get("partition").is_some_and(|p| !p.is_null()),
         )),
         _ => {}
     }
@@ -1704,14 +1716,17 @@ pub(crate) fn plan_mismatch(
                     ));
                 }
             }
-            PlanLine::Fuse { target, arms } => {
-                if !nodes
-                    .fusions
-                    .iter()
-                    .any(|(fused, ranked)| fused == target && ranked == arms)
-                {
+            PlanLine::Fuse {
+                target,
+                arms,
+                partitioned,
+            } => {
+                if !nodes.fusions.iter().any(|(fused, ranked, per_row)| {
+                    fused == target && ranked == arms && per_row == partitioned
+                }) {
+                    let per_row = if *partitioned { " per outer row" } else { "" };
                     return Some(format!(
-                        "expect plan: no `Fuse` of `${target}` over arms {arms:?}; the plan fuses {:?}",
+                        "expect plan: no `Fuse` of `${target}` over arms {arms:?}{per_row}; the plan fuses {:?}",
                         nodes.fusions
                     ));
                 }

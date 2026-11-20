@@ -293,8 +293,8 @@ query friends_and_oldest() {
 A ranking (`nearest`, `bm25`, `rrf`, `distance`) may stand wherever a
 relation may, correlated on an outer name too. Its window is its own: a
 correlated `nearest($pop, $d.embedding, $q, k: 2)` keeps the two nearest
-documents of each outer row, whatever the outer `where` or `limit`. An `rrf`
-whose arms read an outer name is not lowered in this release (`T86`).
+documents of each outer row, whatever the outer `where` or `limit`, and an
+`rrf` whose arms read an outer name fuses each outer row's arms on their own.
 
 `from union(a, b, …)` joins the bag union of its arms, each an inline read:
 every row of every arm, duplicates kept (`return distinct` removes them). The

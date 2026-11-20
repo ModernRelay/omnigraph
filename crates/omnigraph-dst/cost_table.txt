@@ -205,6 +205,7 @@ NearestOpen                  l.list       calls=2
 NearestColdIndexed           l.get        calls=9
 NearestWarmIndexed           l.get        calls=2
 NearestCorrelated            l.get        calls=12
+RrfCorrelated                l.get        calls=10
 VectorIndexRefreshLagging    l.get        calls=24
 VectorIndexRefreshLagging    l.list       calls=1
 VectorIndexRefreshLagging    l.put        calls=11

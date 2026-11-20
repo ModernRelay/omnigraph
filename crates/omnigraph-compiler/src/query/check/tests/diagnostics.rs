@@ -217,16 +217,6 @@ fn the_lowering_refusal_and_the_product_rule_stand_beside_other_type_refusals() 
         [("T6", "$p.hndle = $h"), ("T86", "collect($q)")]
             .map(|(c, t)| (c.to_string(), t.to_string())),
     );
-    // A `from` whose `as` alone is refused draws its relation, so a term
-    // it holds that this release does not lower is refused too.
-    let src = "query wrapped($s: String, $v: Vector(3)) { match { $p: Person, from { match { let $pop = { match { $d: Doc, $p authored $d } return { $d } }, from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $v, k: 3)) as $f } return { $d, $f } } as $x } return { $d.title } }";
-    assert_eq!(
-        pass(src)
-            .iter()
-            .map(|d| d.code.as_str())
-            .collect::<Vec<_>>(),
-        ["T85", "T86"],
-    );
     // The refused binding passes the product rule, which `$b` and `$c`
     // still break; a refused conjunct naming one of them would pass its
     // key-pin check.

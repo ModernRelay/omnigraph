@@ -813,17 +813,45 @@ fn resolve_pipeline(
                 target_type,
                 k,
                 weights,
+                outer_var,
             } => {
-                if current.is_some() {
-                    return Err(PlanError::Internal(
-                        "an `rrf` drawn after other elements, which the shaper refuses".to_string(),
-                    ));
+                // Partitioned per outer row, each arm starts from the outer
+                // rows, the first from the correlated read's own leaf, the
+                // others from leaves of their own over the same rows, as a
+                // correlated union's arms do; each arm is a correlated read
+                // yielding its rows per outer row in its rank order.
+                let mut seeds: Vec<Option<LogicalId>> = Vec::with_capacity(arms.len());
+                match outer_var {
+                    Some(outer_var) => {
+                        let first = bound(current, "partitioned fusion")?;
+                        let schema = schema_of(plan, first)?;
+                        seeds.push(Some(first));
+                        for _ in 1..arms.len() {
+                            seeds.push(Some(plan.add(
+                                LogicalNode::OuterReference {
+                                    outer_var: outer_var.clone(),
+                                },
+                                schema.clone(),
+                            )));
+                        }
+                    }
+                    None if current.is_some() => {
+                        return Err(PlanError::Internal(
+                            "an `rrf` drawn after other elements, which the shaper refuses"
+                                .to_string(),
+                        ));
+                    }
+                    None => seeds.resize(arms.len(), None),
                 }
                 let mut inputs = Vec::with_capacity(arms.len());
-                for arm in arms {
-                    let root = resolve_pipeline(plan, &arm.steps, source, next_binding, None)?;
+                for (arm, seed) in arms.iter().zip(seeds) {
+                    let root = resolve_pipeline(plan, &arm.steps, source, next_binding, seed)?;
+                    let input = match outer_var {
+                        Some(_) => root,
+                        None => ranked_arm(plan, root, target, arm.rank, source)?,
+                    };
                     inputs.push(FuseInput {
-                        input: ranked_arm(plan, root, target, arm.rank, source)?,
+                        input,
                         rank: arm.rank,
                     });
                 }
@@ -839,6 +867,7 @@ fn resolve_pipeline(
                         k: k.clone(),
                         weights: weights.clone(),
                         reads,
+                        partition: outer_var.clone(),
                     },
                     schema,
                 )
@@ -2467,6 +2496,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             k: _,
             weights: _,
             reads,
+            partition: _,
         } => {
             out.push(ColumnRef::entity(target));
             out.extend(reads.iter().cloned());
@@ -3590,6 +3620,7 @@ impl Lowering<'_> {
                 target,
                 k,
                 weights,
+                partition,
                 ..
             } => {
                 let mut lowered = Vec::with_capacity(arms.len());
@@ -3604,6 +3635,7 @@ impl Lowering<'_> {
                     target: target.clone(),
                     k: k.clone(),
                     weights: weights.clone(),
+                    partition: partition.clone(),
                 }))
             }
             LogicalNode::Ordered { input, keys } => {

@@ -59,11 +59,6 @@ struct InProgress {
 /// refusal, and has none.
 const B_IN_PROGRESS: &[InProgress] = &[
     // `ReadShape`: a ranking drawn as a read of its own.
-    InProgress {
-        construct: "an `rrf` correlated on an outer variable",
-        site: "an `rrf` whose arms read the enclosing scope",
-        text: "query q($s: String, $v: Vector(3)) { match { $p: Person, let $pop = { match { $d: Doc, $p authored $d } return { $d } }, from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $v, k: 3)) as $f } return { $p.name, $d.title, $f } }",
-    },
     // `ReadShape`: return items and order keys.
     // `WriteShape`.
     InProgress {
@@ -246,6 +241,12 @@ const CLOSURE: &[Row] = &[
             // A ranking correlated on an outer variable.
             (
                 "query q($v: Vector(3)) { match { $p: Person, from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: 3) as $s } return { $p.name, $d.title } }",
+                Lowers,
+            ),
+            // An `rrf` whose arms read an outer variable: fused per outer
+            // row.
+            (
+                "query q($s: String, $v: Vector(3)) { match { $p: Person, let $pop = { match { $d: Doc, $p authored $d } return { $d } }, from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $v, k: 3)) as $f } return { $p.name, $d.title, $f } }",
                 Lowers,
             ),
             // Two rankings in one pattern.

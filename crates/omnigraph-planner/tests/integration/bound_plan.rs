@@ -326,6 +326,7 @@ fn fused_query() -> ReadShape {
             value_type(ScalarType::I64, false),
         )),
         weights: None,
+        outer_var: None,
     }];
     shape.order_by = vec![IROrdering {
         expr: IRExpr::PropAccess {
