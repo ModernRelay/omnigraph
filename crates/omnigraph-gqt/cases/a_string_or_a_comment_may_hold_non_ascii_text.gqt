@@ -1,5 +1,6 @@
 # issue: none
-# notes: The compiler refuses `nearest` over a String property with `T15`; nothing executes.
+# notes: A string or a comment may hold a character outside ASCII; a name holding one is refused with `Q001` at that character,
+# notes: which the refusal table (`tests/integration/law_refusals.rs`) pins.
 
 --- runner
 timeout_ms: 10000
@@ -39,10 +40,14 @@ edge Cites: Doc -> Doc
 edge In: Doc -> Collection
 
 --- seed
-{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"ada","name":"Zoë","age":36}}
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.title, $v, k: 3) as $distance } return { $d.title } }
+query q() { match { $p: Person } where $p.name = "Zoë" /* naïve */ return { $p.handle } }
 
---- expect error: type error: T15:
+--- expect unordered
+{"p.handle":"ada"}
+
+--- expect shape
+p.handle: String

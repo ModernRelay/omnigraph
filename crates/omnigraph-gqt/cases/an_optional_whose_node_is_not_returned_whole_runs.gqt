@@ -1,5 +1,6 @@
 # issue: none
-# notes: The compiler refuses `terms` without its text with `T19`; nothing executes.
+# notes: An `optional` runs when its node is not returned whole. Its node returned whole, a read that calls itself and an edge
+# notes: reference returned whole are refused with `T86`, which the refusal table (`tests/integration/law_refusals.rs`) pins.
 
 --- runner
 timeout_ms: 10000
@@ -43,6 +44,13 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $d: Doc } where match_terms($d.body, terms()) return { $d.title } }
+query q($h: String) { match { $p: Person, optional { $q: Person, $p knows $q } } where $p.handle = $h return { $p.name } }
 
---- expect error: type error: T19:
+--- params
+{"h": "ada"}
+
+--- expect unordered
+{"p.name":"Ada"}
+
+--- expect shape
+p.name: String

@@ -5,9 +5,11 @@ controls execution. This private test package is not shipped in release builds.
 Every `.gqt` file under `cases/`, including subdirectories, is one test
 in the complete corpus. Test names retain the path relative to `cases/`.
 Shared cases live directly under `cases/`, plan assertions under
-`cases/planner/`, catalogue reads under `cases/catalogue/` and compiler
-refusals under `cases/diagnostics/`. These directories organize the corpus;
-discovery selects nothing by directory.
+`cases/planner/` and catalogue reads under `cases/catalogue/`. These
+directories organize the corpus; discovery selects nothing by directory.
+A compiler refusal on its own is no case: every code's refusals, their
+printed fixes and repairs are rows of one table, the refusal law
+(`tests/integration/law_refusals.rs`).
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
@@ -156,16 +158,15 @@ as `type error: T7: …` and `plan error: P002: …` do, so a case can name the
 code it expects. A compile that refuses a source for several independent
 reasons renders its first refusal; the needle matches that one, and the
 others ride the diagnostic's `further` list. Every expect-error step the
-compiler refuses is also held to fix convergence
-(`tests/integration/fix_convergence.rs`): applying every machine-applicable
+compiler refuses is also held to fix convergence by the refusal law
+(`tests/integration/law_refusals.rs`): applying every machine-applicable
 suggestion of one pass at once shrinks the refusals and reaches a fixed point
 within three passes, and a step whose refusal prints such a fix is listed
 there with the text its fixes are meant to write, which the repair must
 equal. A `--- query` or `--- mutate` section the compiler refuses at
 parse is a step only under `expect error:` (any other expectation refuses the
 case with the parse error); it runs through the engine's door like any query
-and fails there with the same refusal. The cases under `cases/diagnostics/` use this:
-one per code the parser and type checker raise.
+and fails there with the same refusal.
 
 `--- apply schema` applies its body, the whole desired `.pg` schema, to the
 graph as `omnigraph schema apply` does, through the same session, and must

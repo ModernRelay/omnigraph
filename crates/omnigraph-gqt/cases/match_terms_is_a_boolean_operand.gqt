@@ -7,7 +7,7 @@
 # notes: terms changes nothing, and a null title never matches. The twins `t1` and `t5` are
 # notes: inserted after the index was built, into a fragment no full-text segment covers, and
 # notes: are answered as their indexed originals are. An edit budget other than 0 is T86
-# notes: (`diagnostics/t86_unlowered_read_does_not_run.gqt`).
+# notes: (the refusal table, `tests/integration/law_refusals.rs`).
 
 --- runner
 timeout_ms: 10000
