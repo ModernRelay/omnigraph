@@ -194,19 +194,19 @@ written as its decimal value. The statement never forks a branch.
 
 The source is a URI the engine reads under the graph's external Blob policy
 ([External Blob references](../clusters/config.md#external-blob-references)):
-`s3://` objects beneath a configured
-base, and for an embedded run `file://` paths beneath an `embedded_only`
-base. A graph with no policy denies every source; a URI outside every base,
-an unsupported scheme, and an object over the
-[`load_source_max_bytes`](../queries/settings.md) setting (default 32 MiB)
-are refused before any byte is read, and every read of the object (each
-range an overwrite's partition reads, or the one read of an append or merge)
-is bounded by a 120-second deadline. A refused source names `csv_source_bytes`; raising the setting in
-the statement's `set` prefix (or the request's `settings` field) admits a
-larger object. A direct `omnigraph mutate`
-run installs an embedded-only base over a `file://` source's directory for
-that statement, so the file is admitted by the same rule; a served run
-refuses a `file://` source, since the server reads only what it may reach.
+`s3://` objects beneath a configured base, and for an embedded run `file://`
+paths beneath an `embedded_only` base. A graph with no policy denies every
+source; a URI outside every base, an unsupported scheme, and an object over the
+[`load_source_max_bytes`](../queries/settings.md) setting (default 32 MiB) are
+refused before any byte is read, and every read of the object (each range an
+overwrite's partition reads, or the one read of an append or merge) is bounded
+by a 120-second deadline. A refused source names `csv_source_bytes`; raising
+the setting in the statement's `set` prefix (or the request's `settings` field)
+admits a larger object. A direct `omnigraph mutate` run installs an
+embedded-only base over a `file://` source's directory for that statement, so
+the file is admitted by the same rule, unless that directory overlaps the
+graph's storage root; a served run refuses a `file://` source. A refused source
+has `effects: none` and `action: fix`.
 
 `explain` before a `load csv` statement prints the load's plan, the same
 document a query's explain prints: the source, the one validation with each
