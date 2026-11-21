@@ -105,10 +105,13 @@ pub(crate) const INSERT_ABSENCE_PROPERTY: &str = "omnigraph.insert_absence";
 pub(crate) const INSERT_ABSENCE_V1: &str = "v1";
 
 const EXTERNAL_BLOB_PROBE_CONCURRENCY: usize = 8;
-/// The IVF partition count the engine builds a declared vector index with.
-/// A fold keeps an index's own count, except for an index that holds no
-/// rows (`TableStore::vector_partition_count`).
-const ENGINE_VECTOR_PARTITIONS: usize = 1;
+/// The minimum and maximum IVF partition count for vector indexes.
+pub(crate) const ENGINE_VECTOR_PARTITIONS_MIN: usize = 1;
+pub(crate) const ENGINE_VECTOR_PARTITIONS_MAX: usize = 4096;
+/// Threshold above which Lance switches from flat k-means to hierarchical k-means.
+/// Indexes with at least this many partitions are in the multi-partition regime and
+/// are never considered degenerate.
+pub(crate) const ENGINE_VECTOR_PARTITIONS_FLAT_CEILING: usize = 256;
 const EXTERNAL_BLOB_REFERENCE_RESOURCE: &str = "external Blob reference cells";
 const EXTERNAL_BLOB_URI_METADATA_RESOURCE: &str = "external Blob URI metadata bytes";
 
@@ -2202,6 +2205,95 @@ impl TableStore {
         }
     }
 
+    /// Sizes IVF partitions for vector indexes dynamically based on non-null vector row count:
+    /// `clamp(isqrt(rows), 1, 4096).min(rows)`.
+    /// Never exceeds the row count, ensuring k-means has at least 1 training point per centroid.
+    pub(crate) fn target_vector_partitions(rows: usize) -> usize {
+        if rows == 0 {
+            return ENGINE_VECTOR_PARTITIONS_MIN;
+        }
+        rows.isqrt()
+            .clamp(ENGINE_VECTOR_PARTITIONS_MIN, ENGINE_VECTOR_PARTITIONS_MAX)
+            .min(rows)
+    }
+
+    /// Whether an existing vector index with `partitions` IVF partitions is undersized/degenerate
+    /// given the table's current `rows`.
+    /// Catches:
+    /// - Any mono-partition index (`partitions == 1`) when the table has grown to where multi-partitioning
+    ///   is appropriate (`target > 1`, i.e. >= 4 rows).
+    /// - Any index whose partition count has fallen below half the target (`partitions * 2 < target`).
+    ///
+    /// Indexes with at least [`ENGINE_VECTOR_PARTITIONS_FLAT_CEILING`] (256) partitions are in the
+    /// multi-partition regime where flat k-means operates and are never considered degenerate.
+    pub(crate) fn is_degenerate_vector_index(partitions: usize, rows: usize) -> bool {
+        if partitions >= ENGINE_VECTOR_PARTITIONS_FLAT_CEILING {
+            return false;
+        }
+        let target = Self::target_vector_partitions(rows);
+        (partitions == 1 && target > 1) || (partitions * 2 < target)
+    }
+
+    /// Helper to count non-null vector rows in `column`. Fast metadata read for non-nullable
+    /// columns; filtered count for nullable columns.
+    pub(crate) async fn non_null_vector_count(ds: &Dataset, column: &str) -> Result<usize> {
+        let nullable = ds
+            .schema()
+            .field(column)
+            .map(|f| f.nullable)
+            .unwrap_or(true);
+        if !nullable {
+            ds.count_rows(None).await.map_err(OmniError::storage)
+        } else {
+            ds.count_rows(Some(format!("`{column}` IS NOT NULL")))
+                .await
+                .map_err(OmniError::storage)
+        }
+    }
+
+    /// Whether a Lance error indicates that k-means clustering could not form the requested
+    /// number of IVF partitions (e.g. due to duplicate vectors or insufficient distinct points).
+    fn is_kmeans_cluster_failure(err: &str) -> bool {
+        (err.contains("Cannot create") && err.contains("IVF partitions"))
+            || err.contains("k-means could only form")
+            || err.contains("non-empty clusters")
+            || err.contains("too many (near-)duplicate vectors")
+            || err.contains("Reduce num_partitions to <=")
+    }
+
+    /// Extract the partition count suggested by Lance when hierarchical k-means fails.
+    fn parse_suggested_partitions(err: &str) -> Option<usize> {
+        if let Some(idx) = err.find("Reduce num_partitions to <= ") {
+            let after = &err[idx + "Reduce num_partitions to <= ".len()..];
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<usize>() {
+                return Some(n);
+            }
+        }
+        if let Some(idx) = err.find("k-means could only form ") {
+            let after = &err[idx + "k-means could only form ".len()..];
+            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<usize>() {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    /// Computes a stepped-down partition count for retrying vector index builds when
+    /// k-means clustering fails.
+    fn step_down_partitions(current: usize, err: &str, non_null_rows: usize) -> usize {
+        if let Some(suggested) = Self::parse_suggested_partitions(err) {
+            if suggested < current && suggested >= 1 {
+                return suggested.min(non_null_rows.max(1));
+            }
+        }
+        if current > ENGINE_VECTOR_PARTITIONS_FLAT_CEILING {
+            return ENGINE_VECTOR_PARTITIONS_FLAT_CEILING.min(non_null_rows.max(1));
+        }
+        (current / 2).max(1)
+    }
+
     pub(crate) fn with_external_blob_policy(mut self, policy: ExternalBlobPolicy) -> Result<Self> {
         let policy = policy.validated()?;
         policy
@@ -3367,8 +3459,7 @@ impl TableStore {
     /// `segments` covers a fragment holds no rows, and Lance reports no
     /// statistics for it (an empty object per segment): a column patch of
     /// the indexed column withdraws every fragment it touches. Its former
-    /// shape is not in its metadata, so it is rebuilt as a new declared
-    /// vector index is built, with [`ENGINE_VECTOR_PARTITIONS`].
+    /// shape is not in its metadata, so it is rebuilt with [`target_vector_partitions`].
     async fn vector_partition_count(
         ds: &Dataset,
         name: &str,
@@ -3379,7 +3470,16 @@ impl TableStore {
                 .iter()
                 .all(|segment| crate::dataset_index::covers_no_fragment(segment))
         {
-            return Ok(ENGINE_VECTOR_PARTITIONS);
+            let col = segments
+                .first()
+                .and_then(|seg| seg.fields.first())
+                .and_then(|id| ds.schema().field_by_id(*id))
+                .map(|field| field.name.clone());
+            let non_null = match col {
+                Some(col) => Self::non_null_vector_count(ds, &col).await.unwrap_or(0),
+                None => ds.count_rows(None).await.unwrap_or(0),
+            };
+            return Ok(Self::target_vector_partitions(non_null));
         }
         fn first_num_partitions(value: &serde_json::Value) -> Option<u64> {
             match value {
@@ -3414,6 +3514,7 @@ impl TableStore {
         }
         let current = crate::dataset_index::current_fragments(ds);
         let mut lag = Vec::new();
+        let mut total_rows: Option<usize> = None;
         for (name, segments) in by_name {
             let coverage =
                 crate::dataset_index::SegmentCoverage::of(segments.iter().copied(), &current);
@@ -3427,8 +3528,43 @@ impl TableStore {
             // A scalar index whose segments together cover every fragment
             // is current. A vector index split into segments (Lance's own
             // fold left deltas, or a partial rebuild) is collapsed into one.
-            if complete && !(vector && segments.len() > 1) {
-                continue;
+            if complete {
+                if !vector {
+                    continue;
+                }
+                if segments.len() <= 1 {
+                    // If the index was already created or folded at the current dataset version,
+                    // its partition count is already the converged layout for this dataset state.
+                    // Flagging it again on unchanged tables causes repeated rebuild loops (e.g.
+                    // when duplicate vectors legitimately stepped down partitions).
+                    if segments
+                        .iter()
+                        .all(|s| s.dataset_version == ds.version().version)
+                    {
+                        continue;
+                    }
+                    // Check whether this complete vector index has a degenerate
+                    // partition count (e.g. 1 IVF partition over many rows).
+                    let partitions = Self::vector_partition_count(ds, &name, &segments).await?;
+                    let non_null_rows = match segments
+                        .first()
+                        .and_then(|seg| seg.fields.first())
+                        .and_then(|id| ds.schema().field_by_id(*id))
+                        .map(|field| field.name.clone())
+                    {
+                        Some(col) => Self::non_null_vector_count(ds, &col).await?,
+                        None => {
+                            if total_rows.is_none() {
+                                total_rows =
+                                    Some(ds.count_rows(None).await.map_err(OmniError::storage)?);
+                            }
+                            total_rows.unwrap_or(0)
+                        }
+                    };
+                    if !Self::is_degenerate_vector_index(partitions, non_null_rows) {
+                        continue;
+                    }
+                }
             }
             lag.push(IndexLag {
                 name,
@@ -3536,16 +3672,73 @@ impl TableStore {
             };
             let _permit = limit.permit_for(kind).await?;
             let built = if item.vector {
-                // Keep the index's partition count across folds.
-                let partitions = Self::vector_partition_count(ds, &item.name, segments).await?;
-                let params =
-                    lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
-                ds_clone
-                    .create_index_builder(&columns, kind, &params)
-                    .name(item.name.clone())
-                    .replace(true)
-                    .execute_uncommitted()
+                // Keep the index's partition count or resize if undersized:
+                // a partitioned index (Lance's split, or an explicit build)
+                // keeps its shape across folds, but an undersized index
+                // is sized up to the target partition count for the table.
+                // If the table shrank, bound by available training vectors.
+                let partitions = Self::vector_partition_count(ds, &item.name, segments)
                     .await
+                    .map_err(|error| {
+                        error.with_context(format!(
+                            "stage_index_fold: fold index '{}' on '{column}'",
+                            item.name
+                        ))
+                    })?;
+                let non_null_rows = Self::non_null_vector_count(ds, column)
+                    .await
+                    .map_err(|error| {
+                        error.with_context(format!(
+                            "stage_index_fold: fold index '{}' on '{column}'",
+                            item.name
+                        ))
+                    })?;
+                let target = Self::target_vector_partitions(non_null_rows);
+                let mut final_partitions = if non_null_rows == 0 {
+                    1
+                } else if Self::is_degenerate_vector_index(partitions, non_null_rows) {
+                    partitions.min(non_null_rows).max(target)
+                } else {
+                    partitions.min(non_null_rows)
+                };
+                loop {
+                    let params = lance::index::vector::VectorIndexParams::ivf_flat(
+                        final_partitions,
+                        MetricType::L2,
+                    );
+                    match ds_clone
+                        .create_index_builder(&columns, kind, &params)
+                        .name(item.name.clone())
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await
+                    {
+                        Ok(idx) => break Ok(idx),
+                        Err(error) => {
+                            let err_str = error.to_string();
+                            if Self::is_kmeans_cluster_failure(&err_str) && final_partitions > 1 {
+                                let next_partitions = Self::step_down_partitions(
+                                    final_partitions,
+                                    &err_str,
+                                    non_null_rows,
+                                );
+                                if next_partitions < final_partitions {
+                                    tracing::warn!(
+                                        index = item.name.as_str(),
+                                        column = column.as_str(),
+                                        attempted = final_partitions,
+                                        retry = next_partitions,
+                                        error = %err_str,
+                                        "k-means clustering failed during fold; retrying with reduced partition count"
+                                    );
+                                    final_partitions = next_partitions;
+                                    continue;
+                                }
+                            }
+                            break Err(error);
+                        }
+                    }
+                }
             } else {
                 let params = ScalarIndexParams::default();
                 let _probe = crate::instrumentation::enter_index_build_probe().await;
@@ -6174,15 +6367,44 @@ impl TableStore {
                         .await
                 }
                 IndexBuildSpec::Vector { column } => {
-                    let params = lance::index::vector::VectorIndexParams::ivf_flat(
-                        ENGINE_VECTOR_PARTITIONS,
-                        MetricType::L2,
-                    );
-                    ds_clone
-                        .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
-                        .replace(true)
-                        .execute_uncommitted()
-                        .await
+                    let non_null_rows = Self::non_null_vector_count(&ds_clone, column).await?;
+                    let mut partitions = Self::target_vector_partitions(non_null_rows);
+                    loop {
+                        let params = lance::index::vector::VectorIndexParams::ivf_flat(
+                            partitions,
+                            MetricType::L2,
+                        );
+                        match ds_clone
+                            .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
+                            .replace(true)
+                            .execute_uncommitted()
+                            .await
+                        {
+                            Ok(idx) => break Ok(idx),
+                            Err(error) => {
+                                let err_str = error.to_string();
+                                if Self::is_kmeans_cluster_failure(&err_str) && partitions > 1 {
+                                    let next_partitions = Self::step_down_partitions(
+                                        partitions,
+                                        &err_str,
+                                        non_null_rows,
+                                    );
+                                    if next_partitions < partitions {
+                                        tracing::warn!(
+                                            column = column.as_str(),
+                                            attempted = partitions,
+                                            retry = next_partitions,
+                                            error = %err_str,
+                                            "k-means clustering failed to form requested partitions; retrying with reduced partition count"
+                                        );
+                                        partitions = next_partitions;
+                                        continue;
+                                    }
+                                }
+                                break Err(error);
+                            }
+                        }
+                    }
                 }
             };
             built.map_err(|error| {
@@ -9467,7 +9689,7 @@ mod tests {
             TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied])
                 .await
                 .unwrap(),
-            ENGINE_VECTOR_PARTITIONS
+            1
         );
         assert_eq!(
             TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied, &indices[0]])
@@ -9475,6 +9697,74 @@ mod tests {
                 .unwrap(),
             2,
             "a segment that covers rows keeps the index's count"
+        );
+    }
+
+    #[test]
+    fn target_vector_partitions_and_degeneracy_heuristics() {
+        use super::TableStore;
+
+        // Edge cases and boundaries
+        assert_eq!(TableStore::target_vector_partitions(0), 1);
+        assert_eq!(TableStore::target_vector_partitions(1), 1);
+        assert_eq!(TableStore::target_vector_partitions(2), 1);
+        assert_eq!(TableStore::target_vector_partitions(3), 1);
+        assert_eq!(TableStore::target_vector_partitions(4), 2);
+        assert_eq!(TableStore::target_vector_partitions(9), 3);
+        assert_eq!(TableStore::target_vector_partitions(100), 10);
+        assert_eq!(TableStore::target_vector_partitions(20_000), 141);
+        assert_eq!(TableStore::target_vector_partitions(1_000_000), 1000);
+        assert_eq!(TableStore::target_vector_partitions(16_777_216), 4096);
+        assert_eq!(TableStore::target_vector_partitions(100_000_000), 4096);
+
+        // Degeneracy detection
+        assert!(!TableStore::is_degenerate_vector_index(1, 0));
+        assert!(!TableStore::is_degenerate_vector_index(1, 1));
+        assert!(!TableStore::is_degenerate_vector_index(1, 3));
+        assert!(TableStore::is_degenerate_vector_index(1, 4)); // target 2, 1 partition is degenerate
+        assert!(TableStore::is_degenerate_vector_index(1, 100)); // target 10, 1 partition is degenerate
+        assert!(TableStore::is_degenerate_vector_index(1, 20_000)); // target 141, 1 partition is degenerate
+        assert!(TableStore::is_degenerate_vector_index(50, 20_000)); // target 141, 50 * 2 < 141 is degenerate
+        assert!(!TableStore::is_degenerate_vector_index(80, 20_000)); // target 141, 80 * 2 >= 141 is healthy
+        assert!(!TableStore::is_degenerate_vector_index(141, 20_000)); // target 141, exactly target is healthy
+        assert!(!TableStore::is_degenerate_vector_index(200, 20_000)); // above target is healthy
+        assert!(!TableStore::is_degenerate_vector_index(256, 1_000_000)); // at flat ceiling (256) is never degenerate
+        assert!(!TableStore::is_degenerate_vector_index(512, 16_777_216)); // above flat ceiling is never degenerate
+
+        // k-means cluster failure detection and retry parsing
+        let lance_err = "Cannot create 257 IVF partitions: k-means could only form 1 non-empty clusters from 66049 training vectors. The dataset is likely too small or has too many (near-)duplicate vectors for this many partitions. Reduce num_partitions to <= 1 or provide more diverse data.";
+        assert!(TableStore::is_kmeans_cluster_failure(lance_err));
+        assert_eq!(TableStore::parse_suggested_partitions(lance_err), Some(1));
+        assert_eq!(TableStore::step_down_partitions(257, lance_err, 66049), 1);
+
+        let general_err =
+            "Cannot create 500 IVF partitions: k-means could only form 256 non-empty clusters";
+        assert_eq!(
+            TableStore::parse_suggested_partitions(general_err),
+            Some(256)
+        );
+        assert_eq!(
+            TableStore::step_down_partitions(500, general_err, 1_000_000),
+            256
+        );
+
+        // Stepping down without explicit suggestion steps down to 256 then halves
+        let err_no_suggestion = "k-means could only form non-empty clusters";
+        assert_eq!(
+            TableStore::step_down_partitions(1000, err_no_suggestion, 1_000_000),
+            256
+        );
+        assert_eq!(
+            TableStore::step_down_partitions(256, err_no_suggestion, 1_000_000),
+            128
+        );
+        assert_eq!(
+            TableStore::step_down_partitions(128, err_no_suggestion, 1_000_000),
+            64
+        );
+        assert_eq!(
+            TableStore::step_down_partitions(1, err_no_suggestion, 1_000_000),
+            1
         );
     }
 

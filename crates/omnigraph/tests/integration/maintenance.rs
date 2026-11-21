@@ -6136,3 +6136,365 @@ async fn collector_reclaims_blob_sidecars_after_the_last_retained_pin() {
         current_payload,
     );
 }
+
+#[tokio::test]
+async fn vector_ivf_partition_sizing_issue_485_issue_486() {
+    use lance::index::DatasetIndexExt;
+
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    v: Vector(4) @index\n}\n";
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+
+    // 1. Load 100 rows with 4-dim vectors
+    let mut data = String::new();
+    for i in 0..100 {
+        data.push_str(&format!(
+            r#"{{"type":"Doc","data":{{"slug":"s{}","v":[{}.0, 1.0, 2.0, 3.0]}}}}"#,
+            i, i
+        ));
+        data.push('\n');
+    }
+    db.load_jsonl(&data, LoadMode::Merge).await.unwrap();
+
+    // Optimize creates the vector index
+    let outcome = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        outcome
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Doc" && d.committed()),
+        "initial optimize must commit index"
+    );
+
+    // Read index statistics directly from Lance dataset
+    let ds = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let indices = ds.load_indices().await.unwrap();
+    let vec_idx = indices
+        .iter()
+        .find(|idx| idx.name.contains("v"))
+        .expect("vector index must exist");
+
+    fn first_num_partitions(value: &serde_json::Value) -> Option<u64> {
+        match value {
+            serde_json::Value::Object(map) => map
+                .get("num_partitions")
+                .and_then(|v| v.as_u64())
+                .or_else(|| map.values().find_map(first_num_partitions)),
+            serde_json::Value::Array(items) => items.iter().find_map(first_num_partitions),
+            _ => None,
+        }
+    }
+
+    let stats_json = ds.index_statistics(&vec_idx.name).await.unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+    let num_partitions = first_num_partitions(&stats).unwrap_or(0);
+
+    // Issue #485: at 100 rows, target partition count is isqrt(100) = 10, NOT 1!
+    assert_eq!(
+        num_partitions, 10,
+        "vector index on 100 rows must have isqrt(100) = 10 partitions, found {num_partitions} (stats: {stats_json})"
+    );
+
+    // Load 300 more rows -> total 400 rows -> target isqrt(400) = 20.
+    // 10 partitions on 400 rows is healthy (10 * 2 = 20 >= 20, not degenerate).
+    // An optimize fold over the appended rows must preserve the 10 partitions.
+    let mut data2 = String::new();
+    for i in 100..400 {
+        data2.push_str(&format!(
+            r#"{{"type":"Doc","data":{{"slug":"s{}","v":[{}.0, 1.0, 2.0, 3.0]}}}}"#,
+            i, i
+        ));
+        data2.push('\n');
+    }
+    db.load_jsonl(&data2, LoadMode::Merge).await.unwrap();
+
+    let outcome2 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        outcome2
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Doc" && d.committed()),
+        "optimize fold over appended rows must commit"
+    );
+
+    let ds2 = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let indices2 = ds2.load_indices().await.unwrap();
+    let vec_idx2 = indices2
+        .iter()
+        .find(|idx| idx.name == vec_idx.name)
+        .expect("vector index must exist");
+    assert_ne!(
+        vec_idx2.uuid, vec_idx.uuid,
+        "optimize fold must actively rebuild the vector index with a new uuid"
+    );
+    let stats_json2 = ds2.index_statistics(&vec_idx.name).await.unwrap();
+    let stats2: serde_json::Value = serde_json::from_str(&stats_json2).unwrap();
+    let num_partitions2 = first_num_partitions(&stats2).unwrap_or(0);
+    assert_eq!(
+        num_partitions2, 10,
+        "folded vector index on 400 rows must preserve healthy 10 partitions (10 * 2 >= 20), found {num_partitions2}"
+    );
+
+    // Load 225 more rows -> total 625 rows -> target isqrt(625) = 25.
+    // Issue #486: an existing vector index with 10 partitions on 625 rows
+    // has 10 * 2 < 25 (it fell below half target), so optimize must detect it and fold/resize it.
+    let mut data3 = String::new();
+    for i in 400..625 {
+        data3.push_str(&format!(
+            r#"{{"type":"Doc","data":{{"slug":"s{}","v":[{}.0, 1.0, 2.0, 3.0]}}}}"#,
+            i, i
+        ));
+        data3.push('\n');
+    }
+    db.load_jsonl(&data3, LoadMode::Merge).await.unwrap();
+
+    let outcome3 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        outcome3
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Doc" && d.committed()),
+        "optimize must detect undersized partition count and fold/resize index"
+    );
+
+    let ds3 = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let indices3 = ds3.load_indices().await.unwrap();
+    let vec_idx3 = indices3
+        .iter()
+        .find(|idx| idx.name == vec_idx.name)
+        .expect("vector index must exist");
+    assert_ne!(
+        vec_idx3.uuid, vec_idx2.uuid,
+        "optimize fold must actively rebuild and resize the vector index with a new uuid"
+    );
+    let stats_json3 = ds3.index_statistics(&vec_idx.name).await.unwrap();
+    let stats3: serde_json::Value = serde_json::from_str(&stats_json3).unwrap();
+    let num_partitions3 = first_num_partitions(&stats3).unwrap_or(0);
+    assert_eq!(
+        num_partitions3, 25,
+        "folded vector index on 625 rows must be resized to isqrt(625) = 25 partitions, found {num_partitions3}"
+    );
+}
+
+#[tokio::test]
+async fn sparse_vector_index_does_not_rebuild_indefinitely_issue_485_issue_486() {
+    use lance::index::DatasetIndexExt;
+
+    // Table has 100 rows, but only 1 row has a non-null vector (99 nulls).
+    // Sizing must use non-null vector count (1 row -> 1 partition),
+    // and subsequent optimize calls must NOT repeatedly rebuild the index.
+    const SCHEMA: &str = "node Item {\n    slug: String @key\n    v: Vector(4)? @index\n}\n";
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+
+    let mut data = String::new();
+    // 1 row with non-null vector
+    data.push_str(r#"{"type":"Item","data":{"slug":"s0","v":[1.0, 2.0, 3.0, 4.0]}}"#);
+    data.push('\n');
+    // 99 rows with null vector
+    for i in 1..100 {
+        data.push_str(&format!(r#"{{"type":"Item","data":{{"slug":"s{}"}}}}"#, i));
+        data.push('\n');
+    }
+    db.load_jsonl(&data, LoadMode::Merge).await.unwrap();
+
+    // Initial optimize builds the vector index with target_vector_partitions(1) = 1 partition
+    let outcome1 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        outcome1
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Item" && d.committed()),
+        "initial optimize must build vector index"
+    );
+
+    // Verify 1 partition
+    let ds = helpers::open_pinned_dataset_for_test(&db, "main", "node:Item").await;
+    let indices = ds.load_indices().await.unwrap();
+    let vec_idx = indices
+        .iter()
+        .find(|idx| idx.name.contains("v"))
+        .expect("vector index must exist");
+    let stats_json = ds.index_statistics(&vec_idx.name).await.unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+    let partitions = stats
+        .pointer("/indices/0/num_partitions")
+        .or_else(|| stats.get("num_partitions"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert_eq!(
+        partitions, 1,
+        "sparse table with 1 non-null vector must size to 1 partition"
+    );
+
+    // Second optimize: table has not changed, sparse vector count is 1.
+    // It must NOT flag the 1-partition index as degenerate or rebuild it.
+    let outcome2 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        !outcome2
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Item" && d.committed()),
+        "second optimize must NOT rebuild sparse vector index"
+    );
+}
+
+#[tokio::test]
+async fn shrunk_vector_index_folds_safely_without_centroid_overflow_issue_485_issue_486() {
+    use lance::index::DatasetIndexExt;
+
+    // Table starts with 100 non-null vectors -> sized to 10 partitions.
+    // Then 99 vectors are deleted, leaving 1 non-null vector.
+    // Fold must not request 10 partitions on 1 vector (which fails Lance centroid training);
+    // it must clamp partitions to non_null_rows (1 partition).
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    v: Vector(4) @index\n}\n";
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+
+    let mut data = String::new();
+    for i in 0..100 {
+        data.push_str(&format!(
+            r#"{{"type":"Doc","data":{{"slug":"s{}","v":[{}.0, 1.0, 2.0, 3.0]}}}}"#,
+            i, i
+        ));
+        data.push('\n');
+    }
+    db.load_jsonl(&data, LoadMode::Merge).await.unwrap();
+
+    let outcome1 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        outcome1
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Doc" && d.committed()),
+        "initial optimize must build index"
+    );
+
+    // Overwrite table down to 1 remaining row (s0), causing heavy shrinkage
+    let single_row = r#"{"type":"Doc","data":{"slug":"s0","v":[0.0, 1.0, 2.0, 3.0]}}"#;
+    db.load_jsonl(single_row, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // Optimize folds index over the remaining 1 vector
+    let outcome2 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        outcome2
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Doc" && d.committed()),
+        "optimize must fold index after shrinkage without centroid training error"
+    );
+
+    // Verify index has 1 partition now
+    let ds = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let indices = ds.load_indices().await.unwrap();
+    let vec_idx = indices
+        .iter()
+        .find(|idx| idx.name.contains("v"))
+        .expect("vector index must exist");
+    let stats_json = ds.index_statistics(&vec_idx.name).await.unwrap();
+    let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
+    let partitions = stats
+        .pointer("/indices/0/num_partitions")
+        .or_else(|| stats.get("num_partitions"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert_eq!(
+        partitions, 1,
+        "folded index on 1 remaining vector must have 1 partition"
+    );
+
+    // Third optimize must not rebuild
+    let outcome3 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        !outcome3
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Doc" && d.committed()),
+        "third optimize must not rebuild index"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_vectors_fallback_and_no_loop_issue_485_issue_486() {
+    // Load rows with duplicate vectors to verify fallback handling and no endless loop
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    v: Vector(4) @index\n}\n";
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap(),
+    );
+
+    let mut data = String::new();
+    for i in 0..150 {
+        data.push_str(&format!(
+            r#"{{"type":"Doc","data":{{"slug":"s{}","v":[1.0, 1.0, 1.0, 1.0]}}}}"#,
+            i
+        ));
+        data.push('\n');
+    }
+    db.load_jsonl(&data, LoadMode::Merge).await.unwrap();
+
+    let outcome1 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        outcome1
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Doc" && d.committed()),
+        "initial optimize must build index"
+    );
+
+    // Second optimize must not rebuild
+    let outcome2 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        !outcome2
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Doc" && d.committed()),
+        "second optimize must NOT rebuild duplicate vector index"
+    );
+}

@@ -4451,3 +4451,116 @@ async fn index_fold_skips_only_a_vector_column_that_cannot_train() {
         "{error}"
     );
 }
+
+/// Issue #486: an existing vector index that covers all fragments (`complete == true`)
+/// is detected as lagging by `foldable_index_lag` if its partition count is degenerate
+/// (e.g. 1 IVF partition over 100 rows), but is not flagged when healthy (e.g. 10 partitions).
+#[tokio::test]
+async fn foldable_index_lag_detects_complete_degenerate_vector_index_issue_486() {
+    use arrow_array::{FixedSizeListArray, Float32Array, StringArray};
+    use lance::index::DatasetIndexExt;
+    use lance::index::vector::VectorIndexParams;
+    use lance_index::IndexType;
+    use lance_linalg::distance::MetricType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+
+    // 100 rows of 4-dim vectors
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let values = Float32Array::from((0..(100 * 4)).map(|v| v as f32).collect::<Vec<_>>());
+    let vectors = FixedSizeListArray::try_new(item, 4, Arc::new(values), None).unwrap();
+    let ids = StringArray::from((0..100).map(|i| format!("v{i}")).collect::<Vec<_>>());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("embedding", vectors.data_type().clone(), true),
+    ]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(vectors)]).unwrap();
+
+    // 1. Build a dataset with a degenerate mono-partition (1 IVF partition) index over 100 rows
+    let uri_degenerate = format!("{root}/degenerate_complete.lance");
+    let mut ds_degenerate = TableStore::write_dataset(&uri_degenerate, batch.clone())
+        .await
+        .unwrap();
+    ds_degenerate
+        .create_index_builder(
+            &["embedding"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+        )
+        .name("embedding_idx".to_string())
+        .await
+        .unwrap();
+
+    let ds_degenerate = Dataset::open(&uri_degenerate).await.unwrap();
+
+    // Verify fragment coverage is complete: 1 fragment, covered by the index
+    let indices = ds_degenerate.load_indices().await.unwrap();
+    let current = crate::dataset_index::current_fragments(&ds_degenerate);
+    let coverage = crate::dataset_index::SegmentCoverage::of(indices.iter(), &current);
+    assert!(
+        coverage.covers_every(&current),
+        "fragment coverage must be complete"
+    );
+
+    // Because the index has 1 partition for 100 rows, target is isqrt(100) = 10.
+    // 1 partition is degenerate (is_degenerate_vector_index(1, 100) == true).
+    // Even though the index covers every fragment (`complete == true`),
+    // foldable_index_lag must detect and return it for fold reconciliation.
+    let lag = TableStore::foldable_index_lag(&ds_degenerate)
+        .await
+        .unwrap();
+    assert_eq!(
+        lag.len(),
+        1,
+        "complete degenerate index must be detected as lagging"
+    );
+    assert_eq!(lag[0].name, "embedding_idx");
+    assert!(lag[0].vector);
+    assert!(
+        TableStore::has_foldable_unindexed_fragments(&ds_degenerate)
+            .await
+            .unwrap(),
+        "has_foldable_unindexed_fragments must report true for complete degenerate vector index"
+    );
+
+    // 2. Build a dataset with a healthy (10 IVF partitions) index over 100 rows
+    let uri_healthy = format!("{root}/healthy_complete.lance");
+    let mut ds_healthy = TableStore::write_dataset(&uri_healthy, batch)
+        .await
+        .unwrap();
+    ds_healthy
+        .create_index_builder(
+            &["embedding"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(10, MetricType::L2),
+        )
+        .name("embedding_idx".to_string())
+        .await
+        .unwrap();
+
+    let ds_healthy = Dataset::open(&uri_healthy).await.unwrap();
+    let indices_healthy = ds_healthy.load_indices().await.unwrap();
+    let current_healthy = crate::dataset_index::current_fragments(&ds_healthy);
+    let coverage_healthy =
+        crate::dataset_index::SegmentCoverage::of(indices_healthy.iter(), &current_healthy);
+    assert!(
+        coverage_healthy.covers_every(&current_healthy),
+        "healthy fragment coverage must be complete"
+    );
+
+    // Because 10 partitions matches target (isqrt(100) = 10), it is healthy.
+    // foldable_index_lag must NOT flag it.
+    let lag_healthy = TableStore::foldable_index_lag(&ds_healthy).await.unwrap();
+    assert!(
+        lag_healthy.is_empty(),
+        "complete healthy index must not be flagged as lagging"
+    );
+    assert!(
+        !TableStore::has_foldable_unindexed_fragments(&ds_healthy)
+            .await
+            .unwrap(),
+        "has_foldable_unindexed_fragments must report false for complete healthy vector index"
+    );
+}

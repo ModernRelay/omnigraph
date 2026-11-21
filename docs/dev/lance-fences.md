@@ -104,16 +104,23 @@ Lance 13 does not know or no details) makes the scan flat, and index facts
 report it `Unknown`; an index whose statistics name no partition count fails the
 fold, except one whose segments cover no fragment (a column patch withdrew them
 all, and Lance reports no statistics for such a segment), which holds no rows
-and is rebuilt with the engine's one partition
+and is rebuilt with the engine's target partitions
 (`TableStore::vector_partition_count`). The same counters decide whether a read
 reports its `nearest` search exhaustive: an attempt that searched every
 partition of such an IVF_FLAT index, or that carries neither counter (Lance's
-flat kNN), ranked exactly; one counter alone does not.
+flat kNN), ranked exactly; one counter alone does not. Previously with 1 partition,
+every search covered the single partition and was reported exhaustive. With dynamic IVF
+partition sizing (~sqrt(n) partitions via `rows.isqrt().clamp(1, 4096).min(rows)`),
+a default search probes a subset capped by `ann_nprobes` and is approximate;
+it reports exhaustive only when every partition was actually searched (such as
+mono-partition tables with <= 3 rows or when all partitions are visited), or when
+falling back to an unindexed flat scan.
 
 **Owners:** `lance_surface_guards.rs`, `search.rs`
 (`nearest_ranks_by_l2_over_a_cosine_index_issue_1297`,
 `nearest_stays_exact_over_a_quantized_index_issue_1297`),
 `integration/maintenance.rs::index_build_and_optimize_rebuild_a_vector_index_a_column_patch_left_empty`,
+`integration/maintenance.rs::vector_ivf_partition_sizing_issue_485_issue_486`,
 `omnigraph-dst` storage-cost rows `VectorIndexRefreshEmptied` beside
 `VectorIndexRefreshLagging` (`scenarios.rs::vector_index_recovery_cost_rows`)
 
