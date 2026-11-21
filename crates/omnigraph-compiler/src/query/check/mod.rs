@@ -5542,7 +5542,7 @@ impl Ctx<'_> {
             // The property fixes the type of a `null` nothing else does.
             self.null_as(sc, value, pt)?
         } else {
-            self.expr(sc, value, At::Value)?
+            self.expr(sc, value, At::Assign)?
         };
         if !sc.block_buf.is_empty() {
             return Err(err(
@@ -5864,7 +5864,13 @@ impl Ctx<'_> {
         crate::stack::deep(|| {
             self.typed_exprs += 1;
             self.spend(WorkKind::Typing, 1)?;
-            let sub = at;
+            // An operand of an assigned value is a value: only the value
+            // itself, and the `if` and `coalesce` arguments that are the
+            // value (`call_scalar`), read a Blob.
+            let sub = match at {
+                At::Assign => At::Value,
+                other => other,
+            };
             let boolean = Ty::scalar(ScalarType::Bool, false);
             Ok(match e {
                 Expr::InfixString {
@@ -5969,7 +5975,11 @@ impl Ctx<'_> {
                         )
                     } else {
                         let (p, _) = self.property(&ty, property, variable)?;
-                        if p.scalar == ScalarType::Blob && !matches!(at, At::Value) {
+                        // A Blob is copied from one cell to another by an
+                        // assignment, never read as a value: no filter,
+                        // `let`, return item, order key, aggregate or other
+                        // operand reads its bytes or its nullness.
+                        if p.scalar == ScalarType::Blob && !matches!(at, At::Assign) {
                             return Err(err(
                                 T24,
                                 format!(
@@ -6532,7 +6542,14 @@ impl Ctx<'_> {
                         if let Some(guard) = guard {
                             sc.push_guard(guard);
                         }
-                        let typed = self.expr(sc, e, At::Value);
+                        // The value an assignment writes reads a Blob through
+                        // `if`'s branches and `coalesce`'s arguments.
+                        let arg_at = match (at, name) {
+                            (At::Assign, "if") if position > 0 => At::Assign,
+                            (At::Assign, "coalesce") => At::Assign,
+                            _ => At::Value,
+                        };
+                        let typed = self.expr(sc, e, arg_at);
                         sc.truncate_guards(depth);
                         // Kept only where a later argument's guard reads it:
                         // `if`'s condition, `coalesce`'s arguments before
@@ -7003,6 +7020,11 @@ impl Ctx<'_> {
 enum At {
     Filter,
     Value,
+    /// The value an assignment writes: the one position a Blob property
+    /// is read as a value, directly or as a branch of `if` or an argument
+    /// of `coalesce` that is itself in this position. Its operands
+    /// otherwise are values ([`At::Value`]).
+    Assign,
 }
 
 enum RelArg<'a> {

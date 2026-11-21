@@ -103,4 +103,4 @@ query min_over_blob_refused() {
     return { min($p.doc) as d }
 }
 
---- expect error: T24: a Blob is not a read value, so min cannot take it
+--- expect error: T24: Blob property `p.doc` is not a read value
