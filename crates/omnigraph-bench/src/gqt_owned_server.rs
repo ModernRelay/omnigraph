@@ -184,7 +184,7 @@ pub(crate) fn execute_owned_server(
             .map_err(failed)?;
             let process = ServerProcess::start(
                 &server.path,
-                product.source_commit.as_deref(),
+                product.measured_commit(),
                 &root,
                 &tokens,
                 &environment,

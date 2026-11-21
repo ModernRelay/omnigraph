@@ -1422,6 +1422,60 @@ mod process {
     }
 
     #[test]
+    fn a_stamped_server_under_an_unstamped_product_answers_to_the_runs_commit() {
+        let ready = GraphServer::start(&[]);
+        let (requested, other) = ("a".repeat(40), "b".repeat(40));
+        let product = crate::gqt_runner::ProductBinary {
+            path: PathBuf::from("/omnigraph"),
+            package_version: "0.14.0".into(),
+            http_contract: "0.14".into(),
+            internal_schema_writes: 1,
+            executable_sha256: "e".repeat(64),
+            source_commit: None,
+            requested_commit: Some(requested.clone()),
+            server: None,
+        };
+        ready.graph().source_version = Some(other.clone());
+        let (_guard, _directory, _, started) = start_beside(
+            product.measured_commit(),
+            &listening("'exit 0'"),
+            &ready,
+            Duration::from_secs(20),
+        );
+        let error = started
+            .err()
+            .expect("a server of another commit than the run names");
+        assert_eq!(error.code, "server_commit_mismatch", "{error}");
+        assert!(
+            error.message.contains(&other) && error.message.contains(&requested),
+            "{error}"
+        );
+        let stamped = crate::gqt_runner::ProductBinary {
+            source_commit: Some(other.clone()),
+            ..product
+        };
+        assert_eq!(stamped.measured_commit(), Some(other.as_str()));
+    }
+
+    #[test]
+    fn a_cluster_root_decodes_back_to_itself_from_its_uri() {
+        for root in ["/store/servers/run-1", "/store #1/50% of ?/run-1"] {
+            let uri = crate::gqt_server_process::cluster_uri(Path::new(root)).unwrap();
+            assert_eq!(
+                url::Url::parse(&uri).unwrap().to_file_path().unwrap(),
+                Path::new(root),
+                "{uri}"
+            );
+        }
+        assert_eq!(
+            crate::gqt_server_process::cluster_uri(Path::new("/store/servers/run-1")).unwrap(),
+            "file:///store/servers/run-1"
+        );
+        let relative = crate::gqt_server_process::cluster_uri(Path::new("servers/run-1"));
+        assert_eq!(relative.unwrap_err().code, "server_start_failed");
+    }
+
+    #[test]
     fn a_failed_start_carries_what_the_server_wrote_to_both_streams() {
         let ready = GraphServer::start(&[]);
         let (_guard, _directory, _, started) = start(

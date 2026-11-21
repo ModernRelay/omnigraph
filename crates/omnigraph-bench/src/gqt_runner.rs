@@ -211,6 +211,14 @@ pub struct ServerBinary {
     pub executable_sha256: String,
 }
 impl ProductBinary {
+    /// The commit the run's rows are named by, which a server beside this
+    /// product has to answer to: the one the binary names, else the run's.
+    pub fn measured_commit(&self) -> Option<&str> {
+        self.source_commit
+            .as_deref()
+            .or(self.requested_commit.as_deref())
+    }
+
     /// The product with the server binary `server` names, read and digested.
     pub fn with_server(mut self, server: &ServerProduct) -> RunnerResult<Self> {
         let named = match server {

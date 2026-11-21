@@ -127,6 +127,15 @@ fn child_command(program: &Path, environment: &[(String, String)]) -> Command {
     command
 }
 
+/// `root` as the `file://` storage URI the server decodes back to it: a `#`,
+/// a `?` or a `%` of the path is escaped, where the bare path after the
+/// scheme would be cut or decoded into another directory.
+pub(crate) fn cluster_uri(root: &Path) -> RunnerResult<String> {
+    url::Url::from_file_path(root)
+        .map(String::from)
+        .map_err(|()| start_failed(format!("{} is not an absolute path", root.display())))
+}
+
 /// `omnigraph cluster apply` of `config` onto the empty `root`, as `actor`,
 /// under `environment` alone. The apply must converge and release its
 /// admission; a lock it leaves is named and never broken here.
@@ -231,7 +240,7 @@ impl ServerProcess {
         let mut command = child_command(binary, environment);
         command
             .arg("--cluster")
-            .arg(format!("file://{}", root.display()))
+            .arg(cluster_uri(root)?)
             .args(["--bind", "127.0.0.1:0"])
             .env(BEARER_TOKENS, serde_json::Value::Object(tokens).to_string())
             .env("TMPDIR", &scratch)
@@ -273,8 +282,8 @@ impl ServerProcess {
         Ok(server)
     }
 
-    /// Refuses a server that names another commit than the product binary
-    /// beside it; a build that names none is admitted, as the product's is.
+    /// Refuses a server that names another commit than `product_commit`, the
+    /// one the run's rows are named by; a build that names none is admitted.
     fn check_build(&self, binary: &Path, product_commit: Option<&str>) -> RunnerResult<()> {
         let Some(product) = product_commit else {
             return Ok(());
@@ -284,7 +293,7 @@ impl ServerProcess {
             Some(server) if server != product => Err(RunnerError::new(
                 "server_commit_mismatch",
                 format!(
-                    "{} says it was built from {server}; the product binary names {product}",
+                    "{} says it was built from {server}; the run measures {product}",
                     binary.display()
                 ),
             )),
