@@ -271,7 +271,7 @@ pub(crate) fn validate_token_environment_name(name: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn validate_token(token: &str) -> Result<(), String> {
+pub(crate) fn validate_token(token: &str) -> Result<(), String> {
     if token.is_empty() || token.len() > MAX_TOKEN_BYTES || token.chars().any(char::is_control) {
         return Err("invalid bounded bearer token".into());
     }

@@ -531,7 +531,7 @@ where
             continue;
         }
         if from_set.contains(src) {
-            sink(orphan_violation(
+            sink(retained_orphan_violation(
                 edge_table,
                 id,
                 system_columns.src,
@@ -540,7 +540,7 @@ where
             ))?;
         }
         if to_set.contains(dst) {
-            sink(orphan_violation(
+            sink(retained_orphan_violation(
                 edge_table,
                 id,
                 system_columns.dst,
@@ -667,8 +667,12 @@ pub(super) fn unique_violation(
     }
 }
 
-/// Canonical orphan-edge message, matching the write path's `"{src|dst} '{id}'
-/// not found in {Type}"` format.
+/// Canonical orphan-edge message, `"{__src|__dst} '{id}' not found in {Type}"`.
+/// The edge type and edge id travel as the violation's `table_key` and
+/// `row_id`: a merge conflict lists both, and [`Violation::into_omni_error`]
+/// prefixes the edge type to a load's or a mutation's refusal.
+///
+/// [`Violation::into_omni_error`]: super::Violation::into_omni_error
 pub(super) fn orphan_violation(
     edge_table: &str,
     edge_id: &str,
@@ -682,6 +686,23 @@ pub(super) fn orphan_violation(
         kind: MergeConflictKind::OrphanEdge,
         message: format!("{label} '{endpoint}' not found in {node_type}"),
     }
+}
+
+/// An orphan of path-b: a committed edge the write keeps while it removes a
+/// node the edge references. The batch need not hold the edge at all (a node
+/// overwrite), so the message says the edge is a committed one.
+fn retained_orphan_violation(
+    edge_table: &str,
+    edge_id: &str,
+    label: &str,
+    endpoint: &str,
+    node_type: &str,
+) -> Violation {
+    let mut violation = orphan_violation(edge_table, edge_id, label, endpoint, node_type);
+    violation
+        .message
+        .push_str("; the write removes that node and keeps this committed edge");
+    violation
 }
 
 pub(super) fn cardinality_violation(

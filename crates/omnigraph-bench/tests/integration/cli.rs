@@ -678,6 +678,52 @@ fn suite_run_refuses_debug_wall_clock_measurement_before_fixture_setup() {
     assert!(failure["error"].get("point_id").is_none());
 }
 
+/// `--server-product` reaches the build check in both spellings: the bare
+/// form leaves the scenario its place, and the public block scenario plans
+/// as a server point under `reset: rebuild` at every swept value.
+#[test]
+#[cfg(debug_assertions)]
+fn run_accepts_the_server_product_flag_bare_and_with_a_path() {
+    let directory = tempfile::tempdir().unwrap();
+    for spelling in [
+        "--server-product",
+        "--server-product=/nonexistent/omnigraph-server",
+    ] {
+        let output = Command::cargo_bin("omnigraph-bench")
+            .unwrap()
+            .current_dir(repository_root())
+            .args(["run", "--config"])
+            .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+            .arg("--dataset-cache")
+            .arg(directory.path().join("cache"))
+            .arg("--store")
+            .arg(directory.path().join("store"))
+            .args([spelling, "concurrent-writes", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{spelling}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result["error"]["code"], "release_build_required",
+            "{spelling}: {result}"
+        );
+        assert_eq!(
+            result["error"]["case_id"], "concurrent-writes",
+            "{spelling}: {result}"
+        );
+    }
+    let storeless = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .args(["run", "concurrent-writes", "--server-product"])
+        .output()
+        .unwrap();
+    assert!(
+        !storeless.status.success()
+            && String::from_utf8_lossy(&storeless.stderr).contains("--store"),
+        "{storeless:?}"
+    );
+}
+
 #[test]
 #[cfg(not(debug_assertions))]
 fn the_read_through_route_runs_the_production_loop() {
@@ -793,6 +839,94 @@ fn the_clone_route_runs_the_product_binary_over_a_local_store() {
         .map(|entries| entries.map(|e| e.unwrap().path()).collect())
         .unwrap_or_default();
     assert!(clones.is_empty(), "clones left after the run: {clones:?}");
+}
+
+/// The rebuild route end to end over a local store: `OMNIGRAPH_BENCH_PRODUCT`
+/// and `OMNIGRAPH_BENCH_SERVER_PRODUCT` name the build's `omnigraph` and
+/// `omnigraph-server`. Compiled in every profile; a debug build cannot measure.
+#[test]
+fn the_rebuild_route_starts_the_products_server_per_repetition() {
+    let (Some(product), Some(server)) = (
+        std::env::var_os("OMNIGRAPH_BENCH_PRODUCT"),
+        std::env::var_os("OMNIGRAPH_BENCH_SERVER_PRODUCT"),
+    ) else {
+        eprintln!(
+            "skipping the rebuild route: OMNIGRAPH_BENCH_PRODUCT and OMNIGRAPH_BENCH_SERVER_PRODUCT name no binaries"
+        );
+        return;
+    };
+    if cfg!(debug_assertions) {
+        eprintln!("skipping the rebuild route: a debug build does not measure");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("store");
+    let mut server_product = std::ffi::OsString::from("--server-product=");
+    server_product.push(&server);
+    let output = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .env_remove("OMNIGRAPH_BENCH_SERVER_PRODUCT")
+        .args(["run", "concurrent-writes", "--config"])
+        .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+        .arg("--dataset-cache")
+        .arg(directory.path().join("cache"))
+        .arg("--store")
+        .arg(&store)
+        .arg("--product")
+        .arg(&product)
+        .arg(&server_product)
+        .args(["--warmup-seconds", "0", "--duration-seconds", "2"])
+        .args(["--repetitions", "1", "--json"])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{result}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runs = result["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 5, "one run per swept worker count: {result}");
+    for run in runs {
+        assert_eq!(
+            run["bound"]["plan"]["definition"]["protocol"]["reset"], "rebuild",
+            "{run}"
+        );
+        assert_eq!(
+            run["bound"]["identity"]["cache_condition"]["process"], "fresh-per-repetition",
+            "{run}"
+        );
+        let server = &run["product"]["server"]["executable_sha256"];
+        assert_eq!(server.as_str().map(str::len), Some(64), "{run}");
+        let samples = run["samples"].as_array().unwrap();
+        assert_eq!(samples.len(), 1, "{run}");
+        for sample in samples {
+            assert_eq!(sample["outcome"], "expectations-passed", "{sample}");
+            assert_eq!(&sample["server_executable_sha256"], server, "{sample}");
+            for peak in ["peak_rss_bytes", "client_peak_rss_bytes"] {
+                assert!(
+                    sample[peak].as_u64().is_some_and(|bytes| bytes > 0),
+                    "{peak}: {sample}"
+                );
+            }
+            assert!(sample["logical_store_calls"].is_null(), "{sample}");
+            assert!(
+                sample["concurrent"]["readback"]["rows"]
+                    .as_u64()
+                    .is_some_and(|rows| rows > 0),
+                "{sample}"
+            );
+        }
+    }
+    let roots: Vec<_> = std::fs::read_dir(store.join("servers"))
+        .map(|entries| entries.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(
+        roots.is_empty(),
+        "cluster roots left after the run: {roots:?}"
+    );
 }
 
 /// The product wrapped so that `version --json` names `commit`, every other
@@ -1091,12 +1225,19 @@ fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
     );
     let groups = series["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 2, "{series}");
+    let harness = commit_of("HEAD");
     let mut order = Vec::new();
     for group in groups {
+        assert_eq!(
+            group["harness_commits"],
+            serde_json::json!([harness]),
+            "one instrument measured both refs: {group}"
+        );
         let rows = group["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "{series}");
         for row in rows {
             assert_eq!(row["sut"], "product-binary", "{row}");
+            assert_eq!(row["harness_commit"], harness.as_str(), "{row}");
             assert_eq!(row["status"], "complete", "{row}");
             assert_eq!(row["observed_repetitions"], 1, "{row}");
             order.push((
@@ -1121,6 +1262,133 @@ fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
             ("tiny-mutate", previous_commit),
         ],
         "the refs run interleaved per scenario: {series}"
+    );
+}
+
+/// `run concurrent-writes --at HEAD=<product> --at HEAD~1=<product>
+/// --server-product`: each ref's server is the `omnigraph-server` beside its
+/// `omnigraph`, every swept point is put once per ref, and `report` reads them.
+#[test]
+#[cfg(not(debug_assertions))]
+fn the_rebuild_route_starts_the_products_server_per_repetition_at_each_ref() {
+    let (Some(product), Some(server)) = (
+        std::env::var_os("OMNIGRAPH_BENCH_PRODUCT"),
+        std::env::var_os("OMNIGRAPH_BENCH_SERVER_PRODUCT"),
+    ) else {
+        eprintln!(
+            "skipping the rebuild route at two refs: OMNIGRAPH_BENCH_PRODUCT and OMNIGRAPH_BENCH_SERVER_PRODUCT name no binaries"
+        );
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("store");
+    let catalog = repository_root().join("benchmarks");
+    let product = repository_root().join(&product).display().to_string();
+    let head = product_claiming(directory.path(), &product, &commit_of("HEAD"));
+    let previous = product_claiming(directory.path(), &product, &commit_of("HEAD~1"));
+    std::os::unix::fs::symlink(
+        repository_root().join(&server),
+        directory.path().join("omnigraph-server"),
+    )
+    .unwrap();
+    let output = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .env_remove("OMNIGRAPH_BENCH_SERVER_PRODUCT")
+        .args(["run", "concurrent-writes", "--catalog"])
+        .arg(&catalog)
+        .arg("--dataset-cache")
+        .arg(directory.path().join("cache"))
+        .arg("--store")
+        .arg(&store)
+        .arg("--at")
+        .arg(format!("HEAD={head}"))
+        .arg("--at")
+        .arg(format!("HEAD~1={previous}"))
+        .arg("--server-product")
+        .args(["--warmup-seconds", "0", "--duration-seconds", "2"])
+        .args(["--repetitions", "1", "--json"])
+        .output()
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{result}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let at = result["at"].as_array().unwrap();
+    assert_eq!(at.len(), 2, "{result}");
+    assert_ne!(at[0]["commit"], at[1]["commit"], "{result}");
+    let mut servers = Vec::new();
+    for target in at {
+        let records = target["output"]["store_records"]["records"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            5,
+            "one record per swept worker count: {target}"
+        );
+        let runs = target["output"]["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 5, "{target}");
+        for run in runs {
+            assert_eq!(run["case_id"], "concurrent-writes", "{run}");
+            assert_eq!(
+                run["product"]["requested_commit"], target["commit"],
+                "{run}"
+            );
+            let server = &run["product"]["server"]["executable_sha256"];
+            assert_eq!(server.as_str().map(str::len), Some(64), "{run}");
+            servers.push(server.clone());
+            for sample in run["samples"].as_array().unwrap() {
+                assert_eq!(sample["outcome"], "expectations-passed", "{sample}");
+                assert_eq!(&sample["server_executable_sha256"], server, "{sample}");
+            }
+        }
+    }
+    servers.dedup();
+    assert_eq!(
+        servers.len(),
+        1,
+        "both refs take the one server binary beside their `omnigraph`, which a build that names no commit admits beside any ref: {servers:?}"
+    );
+    let report = Command::cargo_bin("omnigraph-bench")
+        .unwrap()
+        .current_dir(repository_root())
+        .env_remove("OMNIGRAPH_BENCH_PRODUCT")
+        .env_remove("OMNIGRAPH_BENCH_SERVER_PRODUCT")
+        .args(["report", "concurrent-writes", "--catalog"])
+        .arg(&catalog)
+        .arg("--store")
+        .arg(&store)
+        .arg("--json")
+        .output()
+        .unwrap();
+    let series: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert!(
+        report.status.success(),
+        "{series}\n{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let rows: Vec<&serde_json::Value> = series["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["rows"].as_array().unwrap())
+        .collect();
+    assert_eq!(rows.len(), 10, "five points per ref: {series}");
+    for row in rows {
+        assert_eq!(row["sut"], "product-server", "{row}");
+        assert_eq!(row["status"], "complete", "{row}");
+        assert_eq!(row["observed_repetitions"], 1, "{row}");
+    }
+    let roots: Vec<_> = std::fs::read_dir(store.join("servers"))
+        .map(|entries| entries.map(|e| e.unwrap().path()).collect())
+        .unwrap_or_default();
+    assert!(
+        roots.is_empty(),
+        "cluster roots left after the run: {roots:?}"
     );
 }
 

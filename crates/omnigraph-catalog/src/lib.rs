@@ -1992,7 +1992,7 @@ impl ManifestCoordinator {
         control_session: &Arc<lance::session::Session>,
     ) -> Result<PreparedManifestOpen> {
         let root = root_uri.trim_end_matches('/');
-        let dataset = open_manifest_dataset_with_session(root, None, control_session).await?;
+        let dataset = layout::open_main_manifest_of_graph(root, control_session).await?;
         migrations::refuse_if_stamp_unsupported(migrations::guard_stamp(&dataset)?)?;
         Ok(PreparedManifestOpen {
             root_uri: root.to_string(),

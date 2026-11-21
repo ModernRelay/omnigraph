@@ -20,6 +20,10 @@ pub const MAX_EXPANDED_STEPS: usize = 4096;
 /// The most workers one label of a workload's measured block declares; any
 /// other block of the workload keeps the scripted hosts' bound.
 pub const MEASURED_BLOCK_WORKERS: usize = 256;
+/// The most sessions a workload's measured block declares against a server,
+/// counted over the whole block at the swept value: every session there is
+/// an actor with a bearer token of its own.
+pub const SERVED_BLOCK_SESSIONS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GqtScenario {
@@ -445,18 +449,43 @@ pub struct BoundGqt {
 impl PlannedGqt {
     pub fn dataset_build_plan(&self) -> Result<DatasetBuildPlan, String> {
         match self.definition.environment.target {
-            Target::Engine => Ok(DatasetBuildPlan {
-                dataset: self.dataset.clone(),
-                index_queries: Some(self.queries.clone()),
-                recipe_sha256: self.recipe_sha256.clone(),
-                environment: self.definition.environment.clone(),
-                reset: self.definition.protocol.reset,
-                needs_indices: self.needs_indices,
-            }),
+            Target::Engine => Ok(self.build_plan_in(
+                self.definition.environment.clone(),
+                self.definition.protocol.reset,
+            )),
             Target::Server => Err(
                 "served scenarios run against a provisioned graph; the dataset cache does not apply"
                     .into(),
             ),
+        }
+    }
+
+    /// The build of the frozen base a `reset: rebuild` server point binds its
+    /// dataset identity to and counts its seeded tables against: the base an
+    /// embedded clone point of the same scenario and backend reads.
+    pub fn base_build_plan(&self) -> Result<DatasetBuildPlan, String> {
+        let environment = &self.definition.environment;
+        if environment.target != Target::Server
+            || self.definition.protocol.reset != ResetMode::Rebuild
+        {
+            return Err(
+                "only a server point under reset: rebuild binds a base it does not read".into(),
+            );
+        }
+        Ok(self.build_plan_in(
+            GqtEnvironment::embedded(environment.backend.clone()),
+            ResetMode::Clone,
+        ))
+    }
+
+    fn build_plan_in(&self, environment: GqtEnvironment, reset: ResetMode) -> DatasetBuildPlan {
+        DatasetBuildPlan {
+            dataset: self.dataset.clone(),
+            index_queries: Some(self.queries.clone()),
+            recipe_sha256: self.recipe_sha256.clone(),
+            environment,
+            reset,
+            needs_indices: self.needs_indices,
         }
     }
     /// A workload that sweeps nothing hashes as it always did; a swept value
@@ -642,11 +671,18 @@ fn validate_run(
             }
         }
         Target::Server => {
-            if protocol.reset != ResetMode::None
+            if !matches!(protocol.reset, ResetMode::None | ResetMode::Rebuild)
                 || protocol.attribution != crate::case::Attribution::Off
             {
                 return Err(
-                    "served read-only execution requires reset:none and attribution:off".into(),
+                    "served execution requires reset: none (a provisioned graph) or reset: rebuild (a server started per repetition), and attribution: off".into(),
+                );
+            }
+            if protocol.reset == ResetMode::Rebuild
+                && environment.network_position != NetworkPosition::SameHost
+            {
+                return Err(
+                    "reset: rebuild starts the server beside the bench and requires network_position: same-host".into(),
                 );
             }
         }
@@ -887,6 +923,7 @@ pub(crate) fn admit_point_queries(
 ) -> Result<CacheCondition, String> {
     admit_target_environment(case, target)?;
     let process = match (target, reset) {
+        (Target::Server, ResetMode::Rebuild) => ProcessLifecycle::FreshPerRepetition,
         (Target::Server, _) => ProcessLifecycle::LongRunningServer,
         (Target::Engine, ResetMode::Clone) => ProcessLifecycle::FreshPerStep,
         (Target::Engine, _) => ProcessLifecycle::FreshPerRepetition,
@@ -902,7 +939,9 @@ pub(crate) fn admit_point_queries(
             Item::Loop { steps, .. } => steps.as_slice(),
         }) {
             let ordinal = step.ordinal();
-            if let Some(refusal) = served_step_refusal(step, selected.ordinal) {
+            if reset != ResetMode::Rebuild
+                && let Some(refusal) = served_step_refusal(step, selected.ordinal)
+            {
                 return Err(format!(
                     "step {ordinal} ({}) {refusal}",
                     served_step_label(step)
@@ -937,11 +976,23 @@ pub(crate) fn admit_point_queries(
                 block.ordinal, selected.ordinal
             ));
         }
-        Some(_) if target != Target::Engine || reset == ResetMode::Clone => {
+        Some(_)
+            if match target {
+                Target::Engine => reset == ResetMode::Clone,
+                Target::Server => reset != ResetMode::Rebuild,
+            } =>
+        {
             return Err(
-                "a `--- concurrent measured` block runs embedded on a restored store; the served target and the clone reset level do not run it yet"
+                "a `--- concurrent measured` block runs embedded on a restored store, or against a server started per repetition (reset: rebuild); a provisioned server and the clone reset level do not run it"
                     .into(),
             );
+        }
+        Some(block) if target == Target::Server && block.sessions.len() > SERVED_BLOCK_SESSIONS => {
+            return Err(format!(
+                "a measured block against a server runs at most {SERVED_BLOCK_SESSIONS} sessions, each an actor with a token of its own; step {} declares {}",
+                block.ordinal,
+                block.sessions.len()
+            ));
         }
         Some(_) => {}
         None if matches!(
@@ -1116,6 +1167,9 @@ pub(crate) fn served_step_refusal(step: &Step, measured: usize) -> Option<String
         StepKind::CommitDrop => Some(
             "drops a commit this workload did not bind; a served drop names a `--- bind commit $name` of this workload".into(),
         ),
+        StepKind::Concurrent => Some(
+            "writes the graph every repetition shares; a measured block runs against a server started per repetition (reset: rebuild)".into(),
+        ),
         _ => Some(
             "is not admissible served; reset:none requires every served workload step, including loops and verification, to be a read, an `as commit` write, or the drop of a bound commit".into(),
         ),
@@ -1190,7 +1244,20 @@ pub fn validate_point_spec(spec: &GqtPointIdentityV1) -> Result<(), String> {
     };
     validate_definition(&synthetic)?;
     let c = &spec.cache_condition;
-    let valid = if spec.environment.target == Target::Server {
+    let server = spec.environment.target == Target::Server;
+    let valid = if server && spec.protocol.reset == ResetMode::Rebuild {
+        c.process == ProcessLifecycle::FreshPerRepetition
+            && c.page_cache == PageCacheCondition::Uncontrolled
+            && matches!(
+                (c.engine, c.program, c.iterations),
+                (EnginePreparation::PreparationOnly, WarmupProgram::None, 0)
+                    | (
+                        EnginePreparation::WarmedByProgram,
+                        WarmupProgram::GqtReadSetV1,
+                        1..=4096
+                    )
+            )
+    } else if server {
         c.process == ProcessLifecycle::LongRunningServer
             && c.page_cache == PageCacheCondition::Uncontrolled
             && matches!(

@@ -126,6 +126,19 @@ edge-property declarations are accepted as schema intent but do not currently
 create a property index. Edge endpoints are indexed independently for traversal.
 See [Search](../search/index.md#indexes).
 
+### Edge endpoints
+
+Every edge's `from` and `to` must name an existing node of the declared type.
+A write is refused when it would leave an edge whose endpoint does not exist:
+an edge it writes, or, in a node `overwrite` load, a committed edge of a type
+the batch does not replace whose node the batch leaves out. The refusal names
+the edge type and the missing endpoint, and says when the edge is a committed
+one, such as `edge type 'Knows': __dst 'Bob' not found in Person; the write
+removes that node and keeps this committed edge`. To drop such a node in an
+overwrite, put the edge's type in the same batch without that edge. A [branch
+merge](../branching/merge.md#conflicts) lists such an edge as an `orphan_edge`
+conflict with its id.
+
 ### Edge cardinality
 
 `@card(min..max)` counts, for each node of the edge's source type, the edges of

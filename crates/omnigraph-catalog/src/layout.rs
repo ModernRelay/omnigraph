@@ -263,6 +263,31 @@ async fn open_main_manifest(
     }
 }
 
+/// Main's latest `__manifest`, refusing a root that holds no graph. Only
+/// Lance's typed dataset miss, the absence `Omnigraph::exists` also reads,
+/// proves there is no graph: the refusal is a typed not-found that names the
+/// root. Any other miss, such as a live manifest naming a missing object,
+/// stays the storage error it is, so a damaged graph never reads as a
+/// missing one.
+pub(crate) async fn open_main_manifest_of_graph(
+    root_uri: &str,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    let root = root_uri.trim_end_matches('/');
+    crate::instrumentation::open_dataset_if_present(
+        &manifest_uri(root),
+        Some(control_session),
+        crate::instrumentation::manifest_wrapper(),
+    )
+    .await?
+    .ok_or_else(|| {
+        OmniError::manifest_not_found(format!(
+            "no graph at '{}': it holds no __manifest; create one with `omnigraph init`",
+            crate::storage::redacted_storage_uri(root)
+        ))
+    })
+}
+
 /// A native branch of the opened `main`, at its latest or at a known version.
 async fn checkout_manifest_branch(
     main: &Dataset,
