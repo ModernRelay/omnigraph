@@ -85,9 +85,10 @@ documentation-only entry skips the same work it skips on a pull request.
 Workspace tests fail fast as they do on pull requests. The PR metadata gates
 stay on `pull_request_target`; on the queue `Fix Regression Gate` reports a
 pass and `PR Title` checks the squash subject the entry is about to land; the
-vocabulary audit, Azurite, the format fence, the RustFS shards and the
-deployment jobs keep their pull-request or post-merge schedule and never run
-on the queue; the DST pinned suite runs there as a reporting context. Queue
+vocabulary audit, Azurite, the format fence, the RustFS shards, the arm64
+benchmark harness tests and the deployment jobs keep their pull-request or
+post-merge schedule and never run on the queue; the DST pinned suite runs
+there as a reporting context. Queue
 runs never publish releases or save the main branch's caches. Details:
 [branch-protection.md](branch-protection.md), Merge queue.
 
@@ -521,7 +522,7 @@ every cache key, so the pin is what keeps caches warm across Rust releases.
 The release and publish workflows still build on the floating `stable`
 action and save their caches from the tag ref; they are outside this rule.
 
-The remaining jobs own contracts that need special infrastructure. They run after merge, on tags, and by manual dispatch; four of them, the format fence, the RustFS S3 integration, the Azurite Azure integration, and the AWS feature build, also run on pull requests:
+The remaining jobs own contracts that need special infrastructure. They run after merge, on tags, and by manual dispatch; five of them, the format fence, the RustFS S3 integration, the Azurite Azure integration, the AWS feature build, and the arm64 benchmark harness tests, also run on pull requests:
 
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
@@ -549,6 +550,7 @@ The remaining jobs own contracts that need special infrastructure. They run afte
   readiness), is inherited from `main` or from infrastructure: compare with
   the latest `main` run before reading it as the pull request's.
 - **AWS feature** builds and tests `omnigraph-server` with `--features aws`; it also runs on every pull request and blocks `main` through `CI Gate`.
+- **Benchmark harness (arm64 Linux)** runs the unit tests of `omnigraph-bench` on the pinned `ubuntu-24.04-arm` runner. The harness captures the identity of the host it runs on from `/proc/cpuinfo`, the cgroup files and the memory total, the benchmark lab's machines are arm64 Linux, and every other test job is x86_64: a host read that differs between the two architectures fails here and nowhere else. It runs on every pull request that changes engine input, as a reporting context, and after merge, on tags, and by manual dispatch; wait for it before clicking Merge when ready on a pull request that touches `crates/omnigraph-bench`. The job prints the runner's CPU identification before the tests, so a red run shows the file the harness read.
 
 Azure remains a qualification preview. Emulator coverage and the completed
 managed-identity smoke proof do not replace the pending adversarial live-Azure

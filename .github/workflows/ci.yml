@@ -1185,6 +1185,65 @@ jobs:
           RUST_MIN_STACK: 16777216
         run: cargo test --locked -p omnigraph-server --features aws
 
+  bench_harness_arm64:
+    name: Benchmark Harness (arm64 Linux)
+    # The benchmark harness reads the host it runs on (`/proc/cpuinfo`, the
+    # cgroup files, the memory total), and the benchmark lab's machines are
+    # arm64 Linux, where `cpuinfo` names no CPU model. The harness's unit
+    # tests capture the identity of their own host, so they run here on that
+    # architecture; every other test job is x86_64. The runner is pinned as
+    # the release archives pin theirs. A reporting context, like the RustFS
+    # shards: not on the merge queue's branch.
+    needs: classify_changes
+    if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_full_ci == 'true'
+    runs-on: ubuntu-24.04-arm
+    # Sized for a cold dependency graph, as `Test omnigraph-server --features
+    # aws`; the cache saves only from main.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          key: bench-arm64
+          # Save only from main, red or green (same rule as `lint`).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      # sccache fetches unchanged dependency compiles when rust-cache misses
+      # (docs/dev/ci.md, Full correctness graphs).
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
+
+      # Printed before the tests so a red run shows the file the harness read.
+      - name: Print the host's CPU identification
+        run: grep -m 12 -E '^(processor|model name|Hardware|CPU )' /proc/cpuinfo
+
+      - name: Run the benchmark harness unit tests
+        run: cargo test --locked -p omnigraph-bench --lib
+
   rustfs_integration:
     name: RustFS S3 Integration (${{ matrix.shard }})
     # Pull requests too, as a reporting context, same reason as the format
