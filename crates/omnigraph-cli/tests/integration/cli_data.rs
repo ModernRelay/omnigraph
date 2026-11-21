@@ -3829,11 +3829,11 @@ fn an_embedded_load_reports_its_fork_from_the_engine() {
     assert_eq!(forked.status.code(), Some(2), "{forked:?}");
     let body = parse_stdout_json(&forked);
     // The fork published, and the engine marks the load's later error as
-    // following it without proving that the failing step wrote nothing, so
-    // the whole command's effects are unknown.
+    // following it. That error's type is a refusal of the rows, so the failing
+    // step wrote nothing: the fork alone stands, and the request needs fixing.
     assert_eq!(
         body["disposition"],
-        json!({"effects":"unknown","action":"reconcile"}),
+        json!({"effects":"partial","action":"fix"}),
         "{body}"
     );
     assert!(branches().contains("fresh"), "the fork published");
