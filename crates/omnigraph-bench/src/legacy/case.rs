@@ -466,6 +466,9 @@ pub enum ResetMode {
     /// Each repetition opens an empty graph shallow clone over a frozen
     /// fixture that nothing writes to; a new point beside the restore levels.
     Clone,
+    /// Each repetition starts a server of its own over an empty cluster and
+    /// loads the fixture through it: nothing is restored and nothing shared.
+    Rebuild,
 }
 
 impl ResetMode {

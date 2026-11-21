@@ -672,6 +672,9 @@ fn a_route_that_plans_one_point_refuses_a_workload_swept_over_several_values() {
     );
 }
 
+#[path = "gqt_owned_server_tests.rs"]
+mod owned_server;
+
 #[cfg(unix)]
 mod supervised {
     use super::*;
