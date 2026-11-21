@@ -3677,8 +3677,22 @@ impl TableStore {
                 // keeps its shape across folds, but an undersized index
                 // is sized up to the target partition count for the table.
                 // If the table shrank, bound by available training vectors.
-                let partitions = Self::vector_partition_count(ds, &item.name, segments).await?;
-                let non_null_rows = Self::non_null_vector_count(ds, column).await?;
+                let partitions = Self::vector_partition_count(ds, &item.name, segments)
+                    .await
+                    .map_err(|error| {
+                        error.with_context(format!(
+                            "stage_index_fold: fold index '{}' on '{column}'",
+                            item.name
+                        ))
+                    })?;
+                let non_null_rows = Self::non_null_vector_count(ds, column)
+                    .await
+                    .map_err(|error| {
+                        error.with_context(format!(
+                            "stage_index_fold: fold index '{}' on '{column}'",
+                            item.name
+                        ))
+                    })?;
                 let target = Self::target_vector_partitions(non_null_rows);
                 let mut final_partitions = if non_null_rows == 0 {
                     1
@@ -3686,7 +3700,6 @@ impl TableStore {
                     partitions.min(non_null_rows).max(target)
                 };
                 loop {
-                    let _probe = crate::instrumentation::enter_index_build_probe().await;
                     let params = lance::index::vector::VectorIndexParams::ivf_flat(
                         final_partitions,
                         MetricType::L2,
@@ -6355,7 +6368,6 @@ impl TableStore {
                     let non_null_rows = Self::non_null_vector_count(&ds_clone, column).await?;
                     let mut partitions = Self::target_vector_partitions(non_null_rows);
                     loop {
-                        let _probe = crate::instrumentation::enter_index_build_probe().await;
                         let params = lance::index::vector::VectorIndexParams::ivf_flat(
                             partitions,
                             MetricType::L2,

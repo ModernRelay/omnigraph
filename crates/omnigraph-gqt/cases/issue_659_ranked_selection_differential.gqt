@@ -77,6 +77,7 @@ edge Tagged: Doc -> Marker
 {"edge":"Tagged","id":"t40","from":"d041","to":"ok"}
 
 --- query
+set ann_nprobes = 0;
 query nearest_named($q: Vector(4)) {
     match { $d: Doc $t: Doc $d knows $t  }
     return { $d.slug as slug }
@@ -96,6 +97,7 @@ expand $d $t: selection named [Knows out]
 expand $d $t: mode indexed_scan ran indexed_scan
 
 --- query
+set ann_nprobes = 0;
 query nearest_alternative($q: Vector(4)) {
     match { $d: Doc $t: Doc $d (knows | knows) $t  }
     return { $d.slug as slug }
@@ -115,6 +117,7 @@ expand $d $t: selection alternation [Knows out]
 expand $d $t: mode indexed_scan ran indexed_scan
 
 --- query
+set ann_nprobes = 0;
 query nearest_wildcard($q: Vector(4)) {
     match { $d: Doc $t: Doc $d * $t  }
     return { $d.slug as slug }
@@ -134,6 +137,7 @@ expand $d $t: selection wildcard [Knows out]
 expand $d $t: mode indexed_scan ran indexed_scan
 
 --- query
+set ann_nprobes = 0;
 query nearest_named_chain($q: Vector(4)) {
     match { $d: Doc $t: Doc $d knows $t $t tagged $m }
     return { $d.slug as slug }
@@ -155,6 +159,7 @@ expand $t $m: selection named [Tagged out]
 expand $t $m: mode indexed_scan ran indexed_scan
 
 --- query
+set ann_nprobes = 0;
 query nearest_selected_chain($q: Vector(4)) {
     match { $d: Doc $t: Doc $d knows $t $t (tagged | tagged) $m }
     return { $d.slug as slug }
@@ -176,6 +181,7 @@ expand $t $m: selection alternation [Tagged out]
 expand $t $m: mode indexed_scan ran indexed_scan
 
 --- query
+set ann_nprobes = 0;
 query fused_sparse_named($q: Vector(4), $other: Vector(4)) {
     match { $d: Doc $t: Doc $d knows $t }
     return { $d.slug as slug }
@@ -195,6 +201,7 @@ rank fuse row tiebreak [$t.@id]
 scan Doc as $d: ranked nearest diagnostics present
 
 --- query
+set ann_nprobes = 0;
 query fused_sparse_wildcard($q: Vector(4), $other: Vector(4)) {
     match { $d: Doc $t: Doc $d * $t }
     return { $d.slug as slug }

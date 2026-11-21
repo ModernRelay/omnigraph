@@ -13,7 +13,7 @@ node Doc {
     slug: String @key
     n: I64 @index
     name: String @index
-    embedding: Vector(4) @index
+    embedding: Vector(4)
 }
 
 edge Knows: Doc -> Doc {
