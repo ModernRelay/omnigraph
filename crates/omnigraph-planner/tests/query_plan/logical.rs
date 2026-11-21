@@ -1,4 +1,6 @@
 use super::*;
+use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
+use omnigraph_planner::read_shape::{ArmRank, FuseArm};
 
 /// Synthetic IR coverage: the executor currently rejects a secondary nearest
 /// ordering, so a real-source GQT case cannot exercise this demand rule.
@@ -37,6 +39,7 @@ fn entity_reference_keeps_a_later_nearest_vector_column_demanded_by_name() {
             "c".to_string(),
             omnigraph_compiler::ExprType::Node {
                 type_name: "T".into(),
+                nullable: false,
             },
         )],
         vec![
@@ -64,17 +67,20 @@ fn metadata_count_rewrite_converges() {
     let op = ir(
         vec![scan("c")],
         vec![IRExpr::Aggregate {
+            fraction: None,
             func: AggFunc::Count,
             distinct: false,
             arg: Box::new(IRExpr::Variable(
                 "c".to_string(),
                 omnigraph_compiler::ExprType::Node {
                     type_name: "T".into(),
+                    nullable: false,
                 },
             )),
             signature: AggSignature {
                 arg: ExprType::Node {
                     type_name: "T".into(),
+                    nullable: false,
                 },
                 result: ExprType::from_prop(&PropType::scalar(ScalarType::I64, true)),
             },
@@ -99,172 +105,66 @@ fn metadata_count_rewrite_converges() {
 }
 
 #[test]
-fn search_expression_arms_attribute_field_and_nested_columns() {
-    let op = ir(
-        vec![scan("c")],
-        vec![prop("c", "slug")],
-        vec![IRExpr::Rrf {
-            primary: Box::new(IRExpr::Fuzzy {
-                field: Box::new(prop("c", "title")),
-                query: Box::new(prop("c", "probe")),
-                max_edits: Some(Box::new(prop("c", "edits"))),
-                ty: value_type(ScalarType::Bool, false),
-            }),
-            secondary: Box::new(IRExpr::Bm25 {
-                field: Box::new(prop("c", "body")),
-                query: Box::new(IRExpr::Literal(
-                    Literal::String("q".into()),
-                    value_type(ScalarType::String, false),
-                )),
-                ty: value_type(ScalarType::F32, false),
-            }),
-            k: Some(Box::new(prop("c", "k_ref"))),
-            ty: value_type(ScalarType::F64, false),
-        }],
-    );
-    let (plan, _) = planned(&op);
-    assert_eq!(
-        projection_of(&plan, "c"),
-        set(&["__id", "slug", "title", "probe", "edits", "body", "k_ref"])
-    );
-}
-
-#[test]
-fn rank_fuse_targets_read_the_node_object_in_both_arms() {
-    let op = ir(
-        vec![scan("a"), scan("b")],
-        vec![prop("a", "x")],
-        vec![IRExpr::Rrf {
-            primary: Box::new(IRExpr::Nearest {
-                variable: "a".to_string(),
-                property: "embedding".to_string(),
-                query: Box::new(IRExpr::Param(
-                    "q".to_string(),
-                    value_type(ScalarType::String, false),
-                )),
-                ty: value_type(ScalarType::F32, false),
-            }),
-            secondary: Box::new(IRExpr::Bm25 {
-                field: Box::new(prop("b", "text")),
-                query: Box::new(IRExpr::Literal(
-                    Literal::String("q".into()),
-                    value_type(ScalarType::String, false),
-                )),
-                ty: value_type(ScalarType::F32, false),
-            }),
-            k: None,
-            ty: value_type(ScalarType::F64, false),
-        }],
-    );
+fn fusion_targets_read_the_node_object_in_every_arm() {
+    // Each arm ranks `a` over its own population; every arm's scan of the
+    // target reads the node object the fusion carries from the first arm
+    // that selected a target.
+    let nearest = FuseArm {
+        steps: vec![
+            scan("a"),
+            PatternStep::Rank {
+                key: IRExpr::Nearest {
+                    variable: "a".to_string(),
+                    property: "embedding".to_string(),
+                    query: Box::new(IRExpr::Param(
+                        "q".to_string(),
+                        value_type(ScalarType::String, false),
+                    )),
+                    ty: value_type(ScalarType::F32, false),
+                },
+                binding: "a".to_string(),
+                window: Some(3),
+                window_param: None,
+                recall: None,
+            },
+        ],
+        rank: ArmRank::Nearest,
+    };
+    let mut op = ir(nearest.steps.clone(), vec![prop("a", "x")], vec![]);
+    let Operation::Query(shape) = &mut op else {
+        unreachable!("a read")
+    };
+    shape.pipeline = vec![PatternStep::Fuse {
+        arms: vec![nearest.clone(), nearest],
+        target: "a".to_string(),
+        target_type: "T".to_string(),
+        k: None,
+        weights: None,
+        outer_var: None,
+    }];
     let (plan, _) = planned(&op);
     assert_eq!(projection_of(&plan, "a"), object_columns());
-    assert_eq!(projection_of(&plan, "b"), object_columns());
-}
-
-#[test]
-fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlations() {
-    let query = Box::new(IRExpr::Param(
-        "q".to_string(),
-        value_type(ScalarType::String, false),
-    ));
-    let expressions = [
-        (
-            IRExpr::Search {
-                field: Box::new(prop("b", "text")),
-                query: query.clone(),
-                ty: value_type(ScalarType::Bool, false),
-            },
-            true,
-        ),
-        (
-            IRExpr::MatchText {
-                field: Box::new(prop("b", "text")),
-                query: query.clone(),
-                ty: value_type(ScalarType::Bool, false),
-            },
-            true,
-        ),
-        (
-            IRExpr::Fuzzy {
-                field: Box::new(prop("b", "text")),
-                query,
-                max_edits: None,
-                ty: value_type(ScalarType::Bool, false),
-            },
-            false,
-        ),
-        (
-            IRExpr::Search {
-                field: Box::new(prop("b", "text")),
-                query: Box::new(prop("a", "probe")),
-                ty: value_type(ScalarType::Bool, false),
-            },
-            false,
-        ),
-    ];
-    for (expression, pushed) in expressions {
-        for embedded in [false, true] {
-            let filter = IRExpr::comparison(
-                expression.clone(),
-                CompOp::Eq,
-                IRExpr::Literal(Literal::Bool(true), value_type(ScalarType::Bool, false)),
-            );
-            let mut pipeline = vec![
-                scan("a"),
-                expand(
-                    "a",
-                    "b",
-                    if embedded {
-                        vec![filter.clone()]
-                    } else {
-                        vec![]
-                    },
-                ),
-            ];
-            if !embedded {
-                pipeline.push(IROp::Filter(filter));
-            }
-            let (plan, _) = planned(&ir(pipeline, vec![prop("b", "slug")], vec![]));
-            let destination = plan
-                .live()
-                .find_map(|(_, node)| match node {
-                    LogicalNode::TableScan {
-                        input: Some(_),
-                        spec,
-                    } => Some(spec),
-                    _ => None,
-                })
-                .expect("a dependent scan");
-            assert_eq!(
-                destination.filter.is_some(),
-                pushed,
-                "{expression:?}, embedded={embedded}"
-            );
-            assert_eq!(
-                plan.live()
-                    .any(|(_, node)| matches!(node, LogicalNode::Filter { .. })),
-                !pushed
-            );
-            assert_eq!(projection_of(&plan, "b"), set(&["__id", "slug", "text"]));
-        }
-    }
 }
 
 #[test]
 fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
-    let negation = |value: &str| IROp::AntiJoin {
+    let negation = |value: &str| PatternStep::AntiJoin {
+        fails: false,
         outer_var: "a".to_string(),
         predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
         inner: vec![
-            expand("a", "x", vec![]),
-            IROp::Filter(IRExpr::comparison(
-                prop("x", "state"),
-                CompOp::Eq,
-                IRExpr::Literal(
-                    Literal::String(value.to_string()),
-                    value_type(ScalarType::String, false),
+            expand("a", "x"),
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
+                    prop("x", "state"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String(value.to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
                 ),
-            )),
+                fails: false,
+            },
         ],
     };
     let (plan, _) = planned(&ir(
@@ -299,23 +199,28 @@ fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
     assert_eq!(values, set(&["open", "closed"]));
 }
 
-/// A search filter whose query argument reads another binding is no scan
+/// A lexical predicate whose query argument reads another binding is no scan
 /// predicate of its field's binding: it stays where the query wrote it.
 #[test]
-fn a_search_filter_reading_a_second_binding_is_not_placed_on_a_root_scan() {
+fn a_lexical_filter_reading_a_second_binding_is_not_placed_on_a_root_scan() {
     let (plan, _) = planned(&ir(
         vec![
             scan("a"),
             scan("b"),
-            IROp::Filter(IRExpr::comparison(
-                IRExpr::Search {
-                    field: Box::new(prop("b", "text")),
-                    query: Box::new(prop("a", "probe")),
+            PatternStep::Filter {
+                pred: IRExpr::Call {
+                    func: ScalarFunc::MatchTerms {
+                        mode: TermsMode::Any,
+                    },
+                    args: vec![
+                        prop("b", "text"),
+                        prop("a", "probe"),
+                        IRExpr::Literal(Literal::Integer(0), value_type(ScalarType::I64, false)),
+                    ],
                     ty: value_type(ScalarType::Bool, false),
                 },
-                CompOp::Eq,
-                IRExpr::Literal(Literal::Bool(true), value_type(ScalarType::Bool, false)),
-            )),
+                fails: false,
+            },
         ],
         vec![prop("b", "slug")],
         vec![],
@@ -356,65 +261,39 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
         }
     }
     for dependent in [false, true] {
-        for embedded in [false, true] {
-            if !dependent && embedded {
-                continue;
+        let binding = if dependent { "b" } else { "a" };
+        let filter = IRExpr::comparison(
+            prop(binding, "state"),
+            CompOp::Eq,
+            IRExpr::Literal(
+                Literal::String("open".into()),
+                value_type(ScalarType::String, false),
+            ),
+        );
+        let mut pipeline = if dependent {
+            vec![scan("a"), expand("a", "b")]
+        } else {
+            vec![scan("a")]
+        };
+        pipeline.push(PatternStep::Filter {
+            pred: filter,
+            fails: false,
+        });
+        let op = ir(pipeline, vec![prop(binding, "slug")], vec![]);
+        let source = RefusingSource(source());
+        let mut plan = resolve(&op, &source).expect("query resolves");
+        rewrite(&mut plan, &source).expect("rewrite");
+        assert!(
+            plan.live()
+                .any(|(_, node)| matches!(node, LogicalNode::Filter { .. }))
+        );
+        for (_, node) in plan.live() {
+            if let LogicalNode::TableScan { spec, .. } = node {
+                assert!(spec.filter.is_none());
             }
-            let binding = if dependent { "b" } else { "a" };
-            let filter = IRExpr::comparison(
-                prop(binding, "state"),
-                CompOp::Eq,
-                IRExpr::Literal(
-                    Literal::String("open".into()),
-                    value_type(ScalarType::String, false),
-                ),
-            );
-            let mut pipeline = if dependent {
-                vec![
-                    scan("a"),
-                    expand(
-                        "a",
-                        "b",
-                        if embedded {
-                            vec![filter.clone()]
-                        } else {
-                            vec![]
-                        },
-                    ),
-                ]
-            } else {
-                vec![IROp::NodeScan {
-                    variable: "a".into(),
-                    type_name: "T".into(),
-                    filters: if embedded {
-                        vec![filter.clone()]
-                    } else {
-                        vec![]
-                    },
-                }]
-            };
-            if !embedded {
-                pipeline.push(IROp::Filter(filter));
-            }
-            let op = ir(pipeline, vec![prop(binding, "slug")], vec![]);
-            let source = RefusingSource(source());
-            let mut plan = resolve(&op, &source).expect("query resolves");
-            rewrite(&mut plan, &source).expect("rewrite");
-            assert!(
-                plan.live()
-                    .any(|(_, node)| matches!(node, LogicalNode::Filter { .. }))
-            );
-            for (_, node) in plan.live() {
-                if let LogicalNode::TableScan { spec, .. } = node {
-                    assert!(spec.filter.is_none());
-                }
-            }
-            let expected: &[&str] = if dependent {
-                &["__id", "slug", "state"]
-            } else {
-                &["slug", "state"]
-            };
-            assert_eq!(projection_of(&plan, binding), set(expected));
         }
+        // The `limit` cuts the tie rule's order, which reads the id.
+        let expected: &[&str] = &["__id", "slug", "state"];
+        assert_eq!(projection_of(&plan, binding), set(expected));
     }
 }

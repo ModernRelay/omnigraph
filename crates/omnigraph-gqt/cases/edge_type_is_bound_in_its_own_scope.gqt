@@ -1,0 +1,86 @@
+# issue: none
+# notes: A variable's edge type belongs to the scope that binds it. Two write
+# notes: groups that each bind `$e` to another edge type read their own `$e.@type`,
+# notes: as do two sibling blocks of one read. The `@type` of a single-type edge
+# notes: bound inside an `optional` is null on a row with no match.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+}
+node Company {
+    slug: String @key
+}
+edge WorksAt: Person -> Company
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada"}}
+{"type":"Person","data":{"handle":"bob"}}
+{"type":"Person","data":{"handle":"cy"}}
+{"type":"Company","data":{"slug":"acme"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"Knows","from":"ada","to":"bob"}
+
+--- query
+query known_in_one_block_employed_in_another() {
+    match { $p: Person }
+    where exists { $q: Person, $p $e:knows $q where $e.@type = "Knows" }
+      and exists { $c: Company, $p $e:worksAt $c where $e.@type = "WorksAt" }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query edge_kinds() {
+    match { $p: Person, optional { $c: Company, $p $e:worksAt $c } }
+    return { $p.handle, $e.@type as kind }
+}
+
+--- expect unordered
+{"kind":"WorksAt","p.handle":"ada"}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+kind: String?
+
+--- mutate
+query drop_both() {
+    match { $p: Person, $q: Person, $p $e:knows $q } where $e.@type = "Knows"
+    delete $e
+    match { $p: Person, $c: Company, $p $e:worksAt $c } where $e.@type = "WorksAt"
+    delete $e
+}
+
+--- expect affected: nodes=0 edges=2
+
+--- query
+query edges_left() {
+    match { $p: Person }
+    return { count { $q: Person, $p knows $q } as knows, count { $c: Company, $p worksAt $c } as works }
+    order { knows }
+}
+
+--- expect ordered
+{"knows":0,"works":0}
+{"knows":0,"works":0}
+{"knows":0,"works":0}
+
+--- expect shape
+knows: I64
+works: I64

@@ -13,7 +13,7 @@ duration_seconds: 30
 sweep: { W: [1, 2, 4, 8, 16] }
 
 --- concurrent measured
-writer x${W}: load generate: v1 seed: 42 mode: append
+writer x${W}: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -22,13 +22,13 @@ writer x${W}: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 7}
         n: {kind: ordinal, start: 100000, step: 1}
-reader x4: query seeded_row() { match { $c: Chunk { slug: "seed-0017" } } return { $c.n } }
+reader x4: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-0017" return { $c.n } }
 --- expect
 writer: ok
 reader: ok
 
 --- query branch: main
-query seeded_row() { match { $c: Chunk { slug: "seed-0017" } } return { $c.slug, $c.n } }
+query seeded_row() { match { $c: Chunk } where $c.slug = "seed-0017" return { $c.slug, $c.n } }
 --- expect unordered
 {"c.slug":"seed-0017","c.n":17}
 --- expect shape

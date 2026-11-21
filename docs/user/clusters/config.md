@@ -103,7 +103,9 @@ queries:
 ```
 
 Unreadable files, parse errors, duplicate query names, and queries that do not
-type-check against the graph's desired schema fail validation.
+type-check against the graph's desired schema fail validation. One name
+declared twice in a single file is `query_parse_error` with the diagnostic
+`T83`; one name declared in two files is `duplicate_query_name`.
 
 ## Embedding providers
 

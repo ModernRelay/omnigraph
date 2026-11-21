@@ -23,7 +23,7 @@ action: fail
 scope: next_step
 
 --- mutate branch: work
-query add() { insert Person { name: "bob" } }
+query add() { replace Person { name: "bob" } }
 --- expect error: injected failpoint triggered: mutation.post_table_commit
 --- query branch: work
 query unchanged() { match { $p: Person } return { $p.name } }
@@ -32,7 +32,7 @@ query unchanged() { match { $p: Person } return { $p.name } }
 --- expect shape
 p.name: String
 --- mutate branch: work
-query retry() { insert Person { name: "carol" } }
+query retry() { replace Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
 --- query branch: work
 query after_write() { match { $p: Person } return { $p.name } }

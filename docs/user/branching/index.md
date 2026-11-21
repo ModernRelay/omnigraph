@@ -10,7 +10,7 @@ review a multi-step change without exposing intermediate results on `main`.
 omnigraph branch create review/add-benchmark --from main --target ./graph.omni
 
 # Write and inspect it.
-omnigraph load --data benchmark.jsonl --mode append \
+omnigraph load --data benchmark.jsonl --mode insert \
   --branch review/add-benchmark --target ./graph.omni
 omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' \
@@ -213,14 +213,13 @@ id (`--snapshot <id>`), and the commit lists with `published: false`.
 
 ```gq
 query propose_bob() as commit {
-    insert Person { name: "bob", age: 41 }
+    replace Person { name: "bob", age: 41 }
 }
-
-branch merge feature into main as commit
-
-commit publish "<commit-id>"
-commit drop "<commit-id>"
 ```
+
+A merge is written `branch merge feature into main as commit`. Each control
+statement stands alone in its source: `commit publish "<commit-id>"` and
+`commit drop "<commit-id>"`.
 
 `commit publish` installs the commit on the branch it recorded as its target.
 The published commit keeps the actor and timestamp of the write that created
@@ -260,11 +259,11 @@ their own snapshot and see nothing of each other's.
 
 ```gq
 query add_person($name: String) as unattached branch {
-    insert Person { name: $name }
+    replace Person { name: $name }
 }
 
 query add_address($id: String, $base: String) as unattached branch on $base {
-    insert Address { owner: $id, city: "Delft" }
+    replace Address { owner: $id, city: "Delft" }
 }
 ```
 
@@ -314,16 +313,17 @@ refused on an explicit historical target because historical schema membership
 is not reconstructed. Explicit edge alternatives retain named-edge historical
 read rules.
 
-A historical query is written against the current schema. A type renamed since
-the commit still reads under its current name, but a property reads only where
-the commit stores that same property under its current name. A property added
-since the commit, renamed since, or dropped and re-added with the same name is
-refused at that commit, naming the property, rather than answering with null or
-with the dropped property's values. A whole-node `return { $p }` reads every
-current property, so it is refused at commits made before a property was added.
-Table data written before v0.10 records no property identity, so a commit that
-reads such data refuses its properties too, unless that data is still the
-table's current version.
+A read at a commit sees its data and the schema accepted there, under today's
+names: each property is matched by identity. A property renamed since reads
+under its current name; a whole-node `return { $p }` returns the properties
+the commit holds; naming one it does not hold, added since or dropped and added
+again (a new property), is `T6` naming the commit, before anything runs. The
+shape is fixed before planning, so a replayed plan at the commit agrees. An
+embedded export at a commit (`Omnigraph::export_jsonl_at`) follows the same
+rule. A commit from before the storage upgrade has the schema live at the
+upgrade ([upgrade](../operations/upgrade.md)), and a property its tables lack,
+or written before v0.10 with no identity and since replaced, is refused when
+the read reaches it.
 
 Historical reads can eventually fail after destructive cleanup removes the
 versions that commit needs. Branch deletion can likewise end access to branch-only history.

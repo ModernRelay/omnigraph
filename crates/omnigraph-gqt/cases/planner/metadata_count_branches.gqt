@@ -1,0 +1,96 @@
+# issue: none
+# notes: Count live rows after deletion and resolve each branch's pinned dataset.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc { slug: String @key }
+
+--- seed
+{"type":"Doc","data":{"slug":"a"}}
+{"type":"Doc","data":{"slug":"b"}}
+{"type":"Doc","data":{"slug":"c"}}
+
+--- mutate
+branch create saved
+
+--- expect ok
+
+--- mutate
+query delete_main() { match { $x: Doc } where $x.slug = "a"  delete $x }
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: main
+query count_docs() { match { $d: Doc } return { count($d) as n } }
+
+--- expect unordered
+{"n":2}
+
+--- expect shape
+n: I64
+
+--- expect plan
+pass aggregate_pushdown
+
+--- query branch: saved
+query count_docs() { match { $d: Doc } return { count($d) as n } }
+
+--- expect unordered
+{"n":3}
+
+--- expect shape
+n: I64
+
+--- expect plan
+pass aggregate_pushdown
+
+--- mutate branch: saved
+query delete_saved() { match { $x: Doc } where $x.slug = "b"  delete $x }
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: saved
+query count_docs() { match { $d: Doc } return { count($d) as n } }
+
+--- expect unordered
+{"n":2}
+
+--- expect shape
+n: I64
+
+--- expect plan
+pass aggregate_pushdown
+
+--- mutate
+query delete_remaining() { match { $x: Doc } where $x.slug != "a"  delete $x }
+
+--- expect affected: nodes=2 edges=0
+
+--- query branch: main
+query count_docs() { match { $d: Doc } return { count($d) as n } }
+
+--- expect unordered
+{"n":0}
+
+--- expect shape
+n: I64
+
+--- expect plan
+pass aggregate_pushdown
+
+--- query branch: saved
+query count_docs() { match { $d: Doc } return { count($d) as n } }
+
+--- expect unordered
+{"n":2}
+
+--- expect shape
+n: I64
+
+--- expect plan
+pass aggregate_pushdown

@@ -22,7 +22,7 @@ node Person {
 --- mutate
 set write_max_bytes = 67108864;
 query above_old_ceiling() {
-    insert Person { id: 1, name: "alice" }
+    replace Person { id: 1, name: "alice" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -43,7 +43,7 @@ p.name: String
 --- mutate
 set write_max_bytes = 1;
 query refused() {
-    insert Person { id: 2, name: "bob" }
+    replace Person { id: 2, name: "bob" }
 }
 
 --- expect error: resource limit exceeded

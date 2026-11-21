@@ -19,12 +19,32 @@ pub(crate) struct InitArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct LintArgs {
-    #[arg(long)]
-    pub(crate) query: PathBuf,
+    /// The `.gq` file to lint; with `--fix`, a file or a directory, every
+    /// `.gq` file below it
+    #[arg(long, required_unless_present = "config")]
+    pub(crate) query: Option<PathBuf>,
+    /// The schema to check against; without it, the target graph's schema
     #[arg(long)]
     pub(crate) schema: Option<PathBuf>,
+    /// With `--fix`: a cluster configuration directory, whose stored-query
+    /// files are fixed against the schema of the graph that declares them;
+    /// `cluster apply` then registers them
+    #[arg(long, requires = "fix", conflicts_with_all = ["query", "schema"])]
+    pub(crate) config: Option<PathBuf>,
     #[arg(long)]
     pub(crate) json: bool,
+    /// Apply the fixes the compiler prints, pass by pass, and write each
+    /// changed file in place; a file holding a refusal with no fix is left
+    /// as it was and listed
+    #[arg(long)]
+    pub(crate) fix: bool,
+    /// With `--fix`: also apply the fixes printed for review
+    /// (`needs_review`), which can change what a query means
+    #[arg(long, requires = "fix")]
+    pub(crate) review_fixes: bool,
+    /// With `--fix`: report what would change and write nothing
+    #[arg(long, requires = "fix")]
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]

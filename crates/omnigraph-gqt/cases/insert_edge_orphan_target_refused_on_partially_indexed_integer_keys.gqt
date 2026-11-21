@@ -24,7 +24,7 @@ tables:
     columns:
       id: {kind: ordinal, start: 0, step: 1}
 
---- load generate: v1 seed: 43 mode: append
+--- load generate: v1 seed: 43 mode: insert
 tables:
   - kind: node
     name: Person
@@ -35,7 +35,7 @@ tables:
 --- expect ok
 
 --- mutate
-query ins() { insert Knows { from: "2", to: "99" } }
+query ins() { insert Knows { @src: "2", @dst: "99" } }
 
 --- expect error: __dst '99' not found in Person
 

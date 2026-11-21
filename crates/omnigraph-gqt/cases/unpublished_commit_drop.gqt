@@ -21,7 +21,7 @@ node Person {
 
 --- mutate
 query propose_bob() as commit {
-    insert Person { name: "bob", age: 41 }
+    replace Person { name: "bob", age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0

@@ -302,13 +302,6 @@ mod tests {
             rebuild.command
         );
         assert!(
-            OmniError::FullTextIndexRequired {
-                index: "Doc.body".into(),
-            }
-            .to_string()
-            .contains(INDEX_BUILD_COMMAND)
-        );
-        assert!(
             OmniError::FullTextIndexRebuildRequired {
                 index: "body_idx".into(),
                 reason: "analyzer certificate is missing".into(),

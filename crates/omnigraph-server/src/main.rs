@@ -63,6 +63,8 @@ struct Cli {
     mcp_allowed_hosts: Vec<String>,
 }
 
+// Every worker and blocking thread compiles and runs queries with Tokio's
+// default stack: every walk over a deep query grows its own.
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;

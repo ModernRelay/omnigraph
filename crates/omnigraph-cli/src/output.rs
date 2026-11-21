@@ -134,6 +134,14 @@ pub(crate) fn write_optimize(
     Ok(())
 }
 
+/// The warnings an `index rebuild --kind full-text` that rebuilt an index
+/// prints: what replaced the old analysis, and the one-way step it is for a
+/// binary before this release.
+pub(crate) const FULL_TEXT_REBUILD_WARNINGS: [&str; 2] = [
+    "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced.",
+    "Binaries before this release refuse full-text reads on this graph from now on; that binary's own `omnigraph index rebuild --kind full-text` restores them.",
+];
+
 pub(crate) fn write_full_text_rebuild(
     uri: &str,
     result: &omnigraph::db::FullTextIndexRebuildResult,
@@ -144,9 +152,7 @@ pub(crate) fn write_full_text_rebuild(
     let warnings = if result.rebuilt_indexes.is_empty() {
         Vec::new()
     } else {
-        vec![
-            "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.",
-        ]
+        FULL_TEXT_REBUILD_WARNINGS.to_vec()
     };
     if json {
         write_json(
@@ -333,6 +339,34 @@ pub(crate) struct SchemaPlanOutput<'a> {
     pub(crate) supported: bool,
     pub(crate) step_count: usize,
     pub(crate) steps: &'a [SchemaMigrationStep],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub(crate) one_way_constructs: &'a [omnigraph_compiler::schema::one_way::OneWayConstruct],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) one_way_note: Option<&'static str>,
+}
+
+/// The one-way constructs of a schema plan or apply, one line each, then the
+/// line naming what they cost.
+pub(crate) fn write_one_way_human(
+    constructs: impl IntoIterator<Item = (String, String, usize, usize, String)>,
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let mut any = false;
+    for (type_name, property, line, column, description) in constructs {
+        any = true;
+        writeln!(
+            writer,
+            "one-way: {type_name}.{property} (line {line}, column {column}): {description}"
+        )?;
+    }
+    if any {
+        writeln!(
+            writer,
+            "{}",
+            omnigraph_compiler::schema::one_way::ONE_WAY_NOTE
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn write_schema_apply_human(
@@ -366,7 +400,18 @@ pub(crate) fn write_schema_apply_human(
     for step in &output.steps {
         writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
-    Ok(())
+    write_one_way_human(
+        output.one_way_constructs.iter().map(|c| {
+            (
+                c.type_name.clone(),
+                c.property.clone(),
+                c.line,
+                c.column,
+                c.description.clone(),
+            )
+        }),
+        writer,
+    )
 }
 
 pub(crate) fn query_kind_label(kind: QueryLintQueryKind) -> &'static str {
@@ -397,6 +442,23 @@ pub(crate) fn write_query_lint_human(
                     result.name,
                     query_kind_label(result.kind)
                 )?;
+            }
+            QueryLintStatus::Error if !result.diagnostics.is_empty() => {
+                // Every refusal of the query's compile pass, each where it
+                // stands.
+                for diagnostic in &result.diagnostics {
+                    match diagnostic.position {
+                        Some(at) => writeln!(
+                            writer,
+                            "ERROR query `{}`: line {}, column {}: {diagnostic}",
+                            result.name, at.line, at.column
+                        )?,
+                        None => writeln!(writer, "ERROR query `{}`: {diagnostic}", result.name)?,
+                    }
+                    if let Some(fix) = &diagnostic.fix {
+                        writeln!(writer, "  fix: {fix}")?;
+                    }
+                }
             }
             QueryLintStatus::Error => {
                 writeln!(
@@ -492,11 +554,18 @@ pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Wri
             } else {
                 ""
             };
+            let text_only = if change.text_only { " [text only]" } else { "" };
             writeln!(
                 stdout,
-                "  {:?} {}{bindings}",
+                "  {:?} {}{bindings}{text_only}",
                 change.operation, change.resource
             )?;
+            if change.text_only {
+                writeln!(
+                    stdout,
+                    "      no step: the accepted identity is unchanged, so apply publishes no graph commit; the graph keeps its accepted schema source, which `omnigraph schema show` shows"
+                )?;
+            }
             if let Some(migration) = &change.migration {
                 if !migration.supported {
                     writeln!(stdout, "      migration UNSUPPORTED:")?;
@@ -507,6 +576,22 @@ pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Wri
                         "      {}",
                         serde_json::to_string(step).unwrap_or_else(|_| format!("{step:?}"))
                     )?;
+                }
+                let mut one_way = Vec::new();
+                write_one_way_human(
+                    migration.one_way_constructs.iter().map(|c| {
+                        (
+                            c.type_name.clone(),
+                            c.property.clone(),
+                            c.line,
+                            c.column,
+                            c.description.clone(),
+                        )
+                    }),
+                    &mut one_way,
+                )?;
+                for line in String::from_utf8_lossy(&one_way).lines() {
+                    writeln!(stdout, "      {line}")?;
                 }
             }
         }
@@ -606,6 +691,19 @@ pub(crate) fn diagnostic_detail_lines(
     lines
 }
 
+/// The further refusals of the same compile pass, after the first one's
+/// lines: each one's code and expectation, then its detail lines.
+pub(crate) fn further_diagnostic_lines(
+    diagnostic: &omnigraph_api_types::DiagnosticOutput,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for further in &diagnostic.further {
+        lines.push(format!("error[{}]: {}", further.code, further.expected));
+        lines.extend(diagnostic_detail_lines(further));
+    }
+    lines
+}
+
 pub(crate) fn write_cluster_diagnostics(
     diagnostics: &[omnigraph_cluster::Diagnostic],
     stdout: &mut dyn Write,
@@ -622,7 +720,10 @@ pub(crate) fn write_cluster_diagnostics(
         )?;
         if let Some(detail) = &diagnostic.detail {
             let detail = omnigraph_api_types::DiagnosticOutput::from(detail.as_ref());
-            for line in diagnostic_detail_lines(&detail) {
+            for line in diagnostic_detail_lines(&detail)
+                .into_iter()
+                .chain(further_diagnostic_lines(&detail))
+            {
                 writeln!(stdout, "{line}")?;
             }
         }
@@ -720,13 +821,24 @@ pub(crate) fn write_schema_plan_human(
         if plan.supported { "yes" } else { "no" }
     )?;
     if plan.steps.is_empty() {
-        writeln!(writer, "no table migration steps")?;
+        writeln!(writer, "no schema changes; an apply publishes nothing")?;
         return Ok(());
     }
     for step in &plan.steps {
         writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
-    Ok(())
+    write_one_way_human(
+        plan.one_way_constructs.iter().map(|c| {
+            (
+                c.type_name.clone(),
+                c.property.clone(),
+                c.line,
+                c.column,
+                c.description.clone(),
+            )
+        }),
+        writer,
+    )
 }
 
 pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
@@ -822,6 +934,36 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             type_name,
             render_annotations(annotations)
         ),
+        SchemaMigrationStep::ChangeFullTextAnalysis {
+            type_kind,
+            type_name,
+            property_name,
+            from,
+            to,
+        } => format!(
+            "change full-text analysis of '{}.{}' on {} '{}' ({} -> {})",
+            type_name,
+            property_name,
+            schema_type_kind_label(*type_kind),
+            type_name,
+            render_full_text_analysis(from.as_ref()),
+            render_full_text_analysis(to.as_ref())
+        ),
+        SchemaMigrationStep::ChangeVectorDistance {
+            type_kind,
+            type_name,
+            property_name,
+            from,
+            to,
+        } => format!(
+            "change vector distance of '{}.{}' on {} '{}' ({} -> {}); its index is rebuilt by `index build` or `optimize`",
+            type_name,
+            property_name,
+            schema_type_kind_label(*type_kind),
+            type_name,
+            from,
+            to
+        ),
         SchemaMigrationStep::RequireProperty {
             type_kind,
             type_name,
@@ -901,6 +1043,19 @@ pub(crate) fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> Stri
     } else {
         base
     }
+}
+
+/// `analyzer = "english_v1", scorer = "none"`: the profile and scorer the
+/// index resolves to, an omitted analyzer or scorer named by its default.
+fn render_full_text_analysis(
+    analysis: Option<&omnigraph_compiler::schema::analysis::FullTextAnalysis>,
+) -> String {
+    let resolved = omnigraph_compiler::schema::analysis::FullTextAnalysis::resolved(analysis);
+    format!(
+        "analyzer = \"{}\", scorer = \"{}\"",
+        resolved.profile(),
+        resolved.scorer
+    )
 }
 
 pub(crate) fn render_annotations(
@@ -1844,6 +1999,34 @@ mod tests {
         render_annotations,
     };
 
+    /// Every refusal of one compile pass is printed: the further ones after
+    /// the first, each with its code, expectation, position and fix.
+    #[test]
+    fn further_refusals_print_after_the_first() {
+        let catalog = omnigraph_compiler::build_catalog(
+            &parse_schema("node Company { slug: String @key  name: String }").unwrap(),
+        )
+        .unwrap();
+        let refusals = omnigraph_compiler::query::check::check_source_all(
+            &catalog,
+            r#"query q() { match { $c: Company } where $c.names = "x" and $c.slug = 3 return { $c } }"#,
+        );
+        let first = omnigraph_compiler::QueryDiagnostic::first_of(refusals).unwrap();
+        let output = omnigraph_api_types::DiagnosticOutput::from(&first);
+        assert_eq!(
+            super::diagnostic_detail_lines(&output)
+                .into_iter()
+                .chain(super::further_diagnostic_lines(&output))
+                .collect::<Vec<_>>(),
+            [
+                "  --> line 1, column 41",
+                "error[T3]: property `slug` has type String, which is not numeric, but got the number 3",
+                "  --> line 1, column 60",
+                "  fix: \"3\"",
+            ]
+        );
+    }
+
     #[test]
     fn graph_type_subject_hides_type_key_syntax() {
         assert_eq!(graph_type_subject("node:Person"), "node type 'Person'");
@@ -2197,7 +2380,8 @@ mod tests {
     #[test]
     fn maintenance_full_text_reports_keep_warning_stream_and_noop_distinct() {
         use omnigraph::db::{FullTextIndexRebuildResult, RebuiltFullTextIndex};
-        let warning = "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced.";
+        let [warning, one_way] = super::FULL_TEXT_REBUILD_WARNINGS;
+        assert!(one_way.contains("Binaries before this release refuse full-text reads"));
         let result = FullTextIndexRebuildResult {
             branch: "dev".into(),
             graph_commit_id: Some("commit-1".into()),
@@ -2208,7 +2392,7 @@ mod tests {
         };
         assert_maintenance_report(
             "index rebuild graph — branch dev, 1 indexes rebuilt\n  node type 'Doc', property 'body'\ngraph commit: commit-1\n",
-            serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","warnings":[warning],"rebuilt_indexes":[{"type_key":"node:Doc","property":"body"}]}),
+            serde_json::json!({"uri":"graph","branch":"dev","graph_commit_id":"commit-1","warnings":[warning, one_way],"rebuilt_indexes":[{"type_key":"node:Doc","property":"body"}]}),
             |json, writer| {
                 let mut stderr = Vec::new();
                 let output =
@@ -2218,7 +2402,7 @@ mod tests {
                     if json {
                         Vec::new()
                     } else {
-                        format!("warning: {warning}\n").into_bytes()
+                        format!("warning: {warning}\nwarning: {one_way}\n").into_bytes()
                     }
                 );
                 output
@@ -2307,20 +2491,42 @@ mod tests {
             type_kind: SchemaTypeKind::Node,
             name: "Doc".to_string(),
         };
+        let distance = omnigraph_compiler::schema::one_way::OneWayConstruct {
+            construct: "vector_distance".to_string(),
+            description: "an explicit `distance` on a Vector, `l2` included".to_string(),
+            type_name: "Doc".to_string(),
+            property: "emb".to_string(),
+            line: 1,
+            column: 30,
+        };
+        let one_way = "one-way: Doc.emb (line 1, column 30): an explicit `distance` on a Vector, `l2` included\nbinaries before this release refuse the whole graph after this apply, and only a backup taken before the upgrade restores it\n";
         for (plan, expected) in [
             (
                 SchemaMigrationPlan {
                     supported: true,
                     steps: Vec::new(),
+                    one_way_constructs: Vec::new(),
+                    one_way_note: None,
                 },
-                "schema plan for graph\nsupported: yes\nno table migration steps\n",
+                "schema plan for graph\nsupported: yes\nno schema changes; an apply publishes nothing\n".to_string(),
             ),
             (
                 SchemaMigrationPlan {
                     supported: true,
                     steps: vec![added.clone()],
+                    one_way_constructs: Vec::new(),
+                    one_way_note: None,
                 },
-                "schema plan for graph\nsupported: yes\n- add node type 'Doc'\n",
+                "schema plan for graph\nsupported: yes\n- add node type 'Doc'\n".to_string(),
+            ),
+            (
+                SchemaMigrationPlan {
+                    supported: true,
+                    steps: vec![added.clone()],
+                    one_way_constructs: vec![distance.clone()],
+                    one_way_note: None,
+                },
+                format!("schema plan for graph\nsupported: yes\n- add node type 'Doc'\n{one_way}"),
             ),
             (
                 SchemaMigrationPlan {
@@ -2330,32 +2536,44 @@ mod tests {
                         reason: "type changed".to_string(),
                         code: None,
                     }],
+                    one_way_constructs: Vec::new(),
+                    one_way_note: None,
                 },
-                "schema plan for graph\nsupported: no\n- unsupported change on Doc.body: type changed\n",
+                "schema plan for graph\nsupported: no\n- unsupported change on Doc.body: type changed\n".to_string(),
             ),
         ] {
-            assert_human_format(expected, |writer| {
+            assert_human_format(&expected, |writer| {
                 super::write_schema_plan_human("graph", &plan, writer)
             });
         }
 
-        for (applied, steps, expected) in [
+        for (applied, steps, constructs, expected) in [
             (
                 false,
                 Vec::new(),
-                "schema apply for graph\nsupported: yes\napplied: no\ngraph_manifest_version: 7\nno schema changes\n",
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: no\ngraph_manifest_version: 7\nno schema changes\n".to_string(),
             ),
             (
                 true,
                 Vec::new(),
-                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\nschema source updated; no table migration steps\n",
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\nschema source updated; no table migration steps\n".to_string(),
+            ),
+            (
+                true,
+                vec![added.clone()],
+                Vec::new(),
+                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\n- add node type 'Doc'\n".to_string(),
             ),
             (
                 true,
                 vec![added],
-                "schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\n- add node type 'Doc'\n",
+                vec![distance],
+                format!("schema apply for graph\nsupported: yes\napplied: yes\ngraph_manifest_version: 7\n- add node type 'Doc'\n{one_way}"),
             ),
         ] {
+            let (one_way_constructs, one_way_note) = omnigraph_api_types::one_way_report(constructs);
             let output = omnigraph_api_types::SchemaApplyOutput {
                 uri: "graph".to_string(),
                 supported: true,
@@ -2363,8 +2581,10 @@ mod tests {
                 step_count: steps.len(),
                 graph_manifest_version: 7,
                 steps,
+                one_way_constructs,
+                one_way_note,
             };
-            assert_human_format(expected, |writer| {
+            assert_human_format(&expected, |writer| {
                 super::write_schema_apply_human(&output, writer)
             });
         }
@@ -2392,6 +2612,7 @@ mod tests {
                     status: QueryLintStatus::Ok,
                     warnings: vec!["unused parameter".to_string()],
                     error: None,
+                    diagnostics: Vec::new(),
                     operation: None,
                 },
                 QueryLintQueryResult {
@@ -2400,6 +2621,7 @@ mod tests {
                     status: QueryLintStatus::Ok,
                     warnings: Vec::new(),
                     error: None,
+                    diagnostics: Vec::new(),
                     operation: None,
                 },
                 QueryLintQueryResult {
@@ -2408,6 +2630,7 @@ mod tests {
                     status: QueryLintStatus::Error,
                     warnings: Vec::new(),
                     error: None,
+                    diagnostics: Vec::new(),
                     operation: None,
                 },
             ],
@@ -2421,9 +2644,11 @@ mod tests {
                 severity,
                 code: "L000".to_string(),
                 message: message.to_string(),
+                fix: None,
                 type_name: None,
                 property: None,
                 query_names: Vec::new(),
+                suggestion: None,
             })
             .collect(),
         };
@@ -2484,7 +2709,7 @@ mod tests {
             branch: "work".to_string(),
             base_branch: Some("main".to_string()),
             branch_created: true,
-            mode: omnigraph::loader::LoadMode::Append,
+            mode: omnigraph::loader::LoadMode::Insert,
             nodes: vec![omnigraph_api_types::GraphBatchDeclarationOutput {
                 name: "Doc".to_string(),
                 entities_loaded: 2,
@@ -2496,7 +2721,7 @@ mod tests {
             commit: None,
         };
         assert_human_format(
-            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n\
+            "loaded graph on branch work with insert: 2 entities across 1 node types and 0 edge types\n\
              branch work created from main\n\
              Loads do not generate embeddings. Supplied vectors are preserved; omitted vectors follow schema nullability. Supply vectors in the input or prepare them with omnigraph embed.\n",
             |writer| super::write_load_human("graph", &output, writer),
@@ -2504,7 +2729,7 @@ mod tests {
         output.branch_created = false;
         output.embedding_generation = None;
         assert_human_format(
-            "loaded graph on branch work with append: 2 entities across 1 node types and 0 edge types\n",
+            "loaded graph on branch work with insert: 2 entities across 1 node types and 0 edge types\n",
             |writer| super::write_load_human("graph", &output, writer),
         );
     }

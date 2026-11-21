@@ -1,10 +1,10 @@
 # Explain
 
 `explain` before a read declaration returns the query's v2 plan instead of
-its rows, regardless of the selected execution engine; before a `load csv`
+its rows; before a `load csv`
 statement it returns the load's plan ([explaining a load statement](explain-load.md)).
-It is a statement:
-one per file, never beside a declaration. The query is compiled and planned
+It is a statement, one per file, after any declarations: the read it
+explains may call the reads declared before it, and nothing follows it. The query is compiled and planned
 against the target's schema and snapshot without executing it. Planning
 may read metadata for byte estimates and index planning, including row-ID
 and deletion metadata for overlays or index-detail discovery on legacy tables;
@@ -13,10 +13,8 @@ or invoke the embedding client.
 
 ```gq
 explain query adults() {
-  match {
-    $p: Person
-    $p.age > 30
-  }
+  match { $p: Person }
+  where $p.age > 30
   return { $p.name }
 }
 ```
@@ -37,8 +35,8 @@ listing prints them:
 
 Every fresh physical `Scan` records `access`. `sequential` disables scalar
 indexing. `index_probe` includes `index` (sorted names), `index_query` (a
-Boolean tree with index name, physical column and Lance-rendered search at
-each leaf), and `residual` (the indexed branch's remaining predicate, or
+Boolean tree with index name, family (`btree`, `bitmap`, `label_list` or
+`ngram`), physical column and Lance-rendered search at each leaf), and `residual` (the indexed branch's remaining predicate, or
 null). Uncovered fragments still apply the full filter. `runtime` records a
 `reason`: ranking, search membership, join-generated filters or a dynamic
 expression can add inputs unavailable during planning. Those reads retain
@@ -80,26 +78,26 @@ run may take instead: `id_lookup` when the build refuses memory before the
 traversal is consumed, `null` when the plan declares none. A run takes no
 switch the plan does not declare; which side ran is in the
 [`profile`](#profile) rows, never in explain. A physical `Scan` row of a
-binding a leading `nearest()` or `bm25()` ranks carries `ranked`: an object
-with `kind` (`nearest` or `bm25`), `property`, `query` (the argument as the
-query wrote it, a parameter name such as `$q` or a literal, never its bound
-value), `fetch` (the candidates the index is asked for: the query's limit
-for `nearest`, `null` for `bm25`, which is uncapped), `nprobes` on a
-`nearest` scan (the `ann_nprobes` setting when the plan was built, the IVF
+binding a `nearest` ranking ranks carries `ranked`: an object with `kind`
+(`nearest`), `property`, `query` (the argument as the query wrote it, a
+parameter name such as `$q` or a literal, never its bound value), `fetch`
+(the candidates the index is asked for, the query's limit or the window's
+`k`), `nprobes` (the `ann_nprobes` setting when the plan was built, the IVF
 partitions probed per index delta; `null` is no cap) and `scope` (`order`
-for the query's own order, `primary` or `secondary` for an arm of `rrf()`).
+for the query's own ranking, `window` for a ranking drawn as a pattern step,
+a fusion's `nearest` arm included).
 A `nearest` scan's `policy` declares what the run may do when an attempt
 leaves it short: `probe_factor` (each rescan multiplies the probe cap),
 `flat_rescan_on_unreached`, `uncapped_on_missing_counters` and
-`flat_when_eligible_within_fetch`. A `bm25` scan's `eligibility` says where it
-applies its filter: `before_scoring` when the property's full-text index
-covers every fragment of the pinned version, `after_scoring` otherwise, so a
-filter never changes a BM25 score. A
+`flat_when_eligible_within_fetch`. A `bm25` ranks no scan: it is an exact
+`Score` row, which reads no full-text index. A
 physical
-`RankFuse` row has two inputs, one subtree per arm, each with its own ranked
-`Scan`; it carries `arms` (binding and kind per arm), `k`, `limit` (the
-query's, which sizes the nearest arm's candidate window; the fused rows are
-cut by the `Limit` above the `Sort`) and `row_tiebreak`. A physical `AntiJoin`
+`Fuse` row has one input per `rrf` arm, each the subtree the arm's ranking
+runs standing alone (a `nearest` window's ranked `Scan`, `Sort` and
+`TargetCut`, an exact score's `Score` and the `Sort` by it, an ordered
+read's `Correlate`); it carries `target`, `arms` (how each arm ranks:
+`nearest`, `distance`, `bm25`, `ordered` or `rrf`), `k` and `weights`. The
+fused rows are ordered by the `Sort` above it and cut by the `Limit`. A physical `AntiJoin`
 row (a correlated block: `not`, `exists`, `count` and the column aggregates)
 carries `strategy`: `correlated` when its second input starts from the outer
 rows through an `OuterReference`, `key_set` when the block's pattern runs once
@@ -109,13 +107,10 @@ each outer row. The planner chooses `key_set` only for a block that reads
 nothing of the outer rows but that identity, and only when its row estimate is
 lower; it then records the pass `anti_join_strategy` and the statistic
 `anti_join_rows($x)` with both estimates. Either strategy returns the same
-rows. These downstream
-row keys follow the arm's score and fused node ID; selected edges use
-`$e.@type` before `$e.@id`. Fusion still scores the ranked node by its ID and
-appends the fused score as `<binding>._rrf`. A
+rows. A
 physical `CrossJoin` row carries `filters`, the conjuncts over both bindings
 it keeps pairs by, when it has any. A physical `ContainsJoin` row is the
-planner's join for one `$r.x contains $l.y` conjunct: it carries `haystack`
+planner's join for one `contains($r.x, $l.y)` conjunct: it carries `haystack`
 (`$r.x`, the text searched) and `needle` (`$l.y`, the text searched for) as
 GQ spells them, and `residual`, the other conjuncts of the same filter as
 text; its second input is the table `Scan` of `$r`, whose `runtime_filter`
@@ -140,7 +135,7 @@ describes), `logical_hash` (the structural hash of the logical plan),
 `explain_version`, `operation`, and the statistics used by planning; then
 `validation`, what plan acceptance checked: `{"scope": "exact_subset"}` when
 the query is a member of the exact fragment (one binding, Boolean, integer and
-String filters, an optional leading `bm25()`, property sort keys, a limit and a
+String filters, an optional `bm25` ranking, property sort keys, a limit and a
 projection of properties and the score) and every rewrite from its canonical
 form was checked, `{"scope": "invariants_only"}` when the plan was checked
 against the query's requirements alone. A plan that fails acceptance is never
@@ -151,17 +146,13 @@ value); `settings`, each setting it read with its spelling (`traversal`,
 `ann_nprobes`); `env`, each environment variable it read with the value it
 resolved (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`,
 `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`, when the query traverses); `gate_policy`,
-the `rrf_plan` mode and the prefilter gate's admission thresholds;
-`full_text`, the full-text coverage of every property a `bm25` scan ranks,
-keyed `<table>.<property>` (`full` only when the index is known to cover every
-fragment, `partial` when coverage is incomplete or unknown, `absent` without a
-full-text index); and
+the `rrf_plan` mode and the prefilter gate's admission thresholds; and
 `memory_limit`, the query pool in bytes. Selector statements also capture
 `traversal_work_limit`, shared across the execution, and `has_wildcard_traversal`,
 retained through rewrites so historical replay can enforce the target rule. Every
 planned document carries `pipelines`, the physical plan cut at each node whose
 operator emits nothing before it has seen its whole input (`Sort`, `Aggregate`,
-`AntiJoin`, `RankFuse`, a load's `Validate`, a costed multi-hop `Expand`) and
+`AntiJoin`, `Fuse`, a load's `Validate`, a costed multi-hop `Expand`) and
 at a join's build side (a hash join's build, the collected left side of a
 cross join or a contains join): each entry names its `source`, its
 `partitions` (the streams its source runs: a `load csv` source's
@@ -180,22 +171,25 @@ Traversal costing uses these facts; absent, unusable or incomplete endpoint
 indexes receive scan cost. Saved plans retain this coverage. Older accepted
 plans without coverage provenance continue to check coverage during execution.
 
-Sort keys and ordering use GQ text such as `$p.name desc`; a ranked scan's
+Sort keys and ordering use GQ text such as `$p.name desc`, with a written
+null placement after the direction (`$p.rank desc nulls first`); a ranked scan's
 ordering names `$p._distance asc` or `$p._score desc`, and the physical
 `Sort` above a search order leads its `keys` with that score key, followed by
-the query's plain keys; a fusion's ordering is `rrf($a, $b) desc` and it
-plans no `Sort`. A `Sort` row's `tiebreak` lists the metadata keys it appends after
+the query's plain keys; a fusion's rows leave unordered, and the read's own
+`order` sorts them by the fused score like any other column. A `Sort` row's `tiebreak` lists the metadata keys it appends after
 `keys` (`$p.@id`, and `$e.@type` plus `$e.@id` for selected bound edges, the
-bindings the query declares in name order, then any binding the query does not
-name), empty where equal rows are indistinguishable; its `ordering` property
+bindings the query declares in the order its pattern binds them, then a
+`from`'s value columns and any binding the query does not name), empty where
+equal rows are indistinguishable; a `limit` with no `order` plans a `Sort` of
+these keys alone; its `ordering` property
 is its whole comparator, those keys included as `$p.@id asc`, and a `Filter`
 keeps its input's ordering.
 
-The `datafusion` tree is the plan the query executes on the `v2` route: the
+The `datafusion` tree is the plan the query executes: the
 physical tree lowered to operators, every read operator omnigraph's own
 (`ScanExec`, `ExpandExec`, `HashJoinExec`, `FilterExec`, `ProjectionExec`,
 `SortExec`, `LimitExec`, `HydrateExec`, `CrossJoinExec`, `ContainsJoinExec`,
-`AntiJoinMaskExec`, `RankFuseExec`,
+`AntiJoinMaskExec`, `FuseExec`,
 `MetadataCountExec`) except the aggregate, DataFusion's `AggregateExec`, one
 row per operator with `depth` from
 its nesting and `detail` the operator's own text (a filter's predicate, a
@@ -204,7 +198,7 @@ block, `not`, `exists`, `count` and the column aggregates, and prints its
 predicate, then `key_set` under that strategy). It is the tree of the query's first pass; a
 search that widens its scan after a short answer lowers it again. An
 `explain` runs nothing, so when the lowering would need the embedding client
-(a `nearest()` whose query is a string), the tree is left out and one `plan`
+(a `nearest` whose query is a string), the tree is left out and one `plan`
 row `datafusion` reads `unavailable: …` with the reason.
 
 ## Profile
@@ -233,15 +227,18 @@ declared policy: `node` `gate` (a pre-pass gate's `plan`, `prefilter`,
 overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
-`Executed::profile`). The row schema is `explain_version` 8 (version 8 added
-the `DeltaSource` node a staged write's plan starts from): `pipelines`
+`Executed::profile`). The row schema is `explain_version` 9 (version 9
+replaced the two-arm `RankFuse` node with `Fuse` and added `TargetCut`,
+`Score`, `Let`, `Union`, `OptionalJoin` and `Correlate`, and removed
+`TextSearch`; version 8 added the
+`DeltaSource` node a staged write's plan starts from): `pipelines`
 entries (on every planner document since version 7, on diff and merge
 documents only before it) carry a pipeline `id` and `depends_on`, with
 `source`, `operators` and `sink` as objects whose `id` joins the
 `physical_plan` node ids; an operator's emission is set by the shape wrapper
 the engine builds its stream through, the one the planner's cut names, so the
 printed pipelines are the executed ones. Saved physical
-plans use a `bound_plan_version: 11` envelope whose `body` contains `plan` and
+plans use a `bound_plan_version: 17` envelope whose `body` contains `plan` and
 `values`. Unversioned plans and other versions are refused with a regeneration
 instruction, including plans without traversal nodes.
 
@@ -279,8 +276,8 @@ query's memory budget, so these rows can differ between runs of one plan.
 An `Aggregate` node's `aggregates` array aligns with `exprs`, with `null` for
 group keys. Each aggregate records its result `column`, `func`, declared `input`
 and `result` types, `accumulator`, and `overflow` conversion. A type's `?` marks
-declared nullability. Integer `sum` uses `exact_integer` and `round_to_nearest`;
-floating-point `sum` and `avg` use `float64`.
+declared nullability. Integer `sum` and `avg` use `exact_integer` and
+`round_to_nearest`; floating-point `sum` and `avg` use `float64`.
 
 Aggregate, Projection and MetadataCount also print `columns`, an ordered list
 such as `["total: F64?", "person: Person"]`. Names match executed result columns;
@@ -318,6 +315,5 @@ the same doors with a `--branch` target only: a historical `--snapshot` is
 refused, since a load targets a branch head. Served load explain requests
 require the load's `change` permission on that branch before source access.
 
-Every read executes on engine v2, the one value of the session setting
-`engine`, so explain describes the route the query runs. See
-[session settings](index.md#session-settings).
+Every read executes from its plan, so explain describes the route the query
+runs.

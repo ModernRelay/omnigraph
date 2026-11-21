@@ -23,7 +23,7 @@ action: fail
 scope: next_step
 
 --- mutate
-query rejected_write() { insert Person { name: "bob" } }
+query rejected_write() { replace Person { name: "bob" } }
 --- expect error: injected failpoint triggered: publish.pre_merge
 
 --- query
@@ -34,7 +34,7 @@ query unchanged_rows() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- mutate
-query next_write() { insert Person { name: "carol" } }
+query next_write() { replace Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
 
 --- restart

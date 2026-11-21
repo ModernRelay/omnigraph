@@ -2,8 +2,9 @@
 # pool-quiescing variables for every job. Every test below is `#[ignore]`d on
 # the `Test Workspace` gate and keeps its real waits here: a `nightly:` test
 # waits out a production deadline (the 30 s managed deadline, the 5 s discovery
-# bound, the CLI's 2 s and 500 ms polls) or runs a whole CLI/server journey on
-# those polls, and a `heavy-repro:` test is a scale repro (AGENTS.md, ignore
+# bound, the CLI's 2 s and 500 ms polls), runs a whole CLI/server journey on
+# those polls, or runs a generated-case property at the breadth its gate twin
+# gives up, and a `heavy-repro:` test is a scale repro (AGENTS.md, ignore
 # species). nextest selects on names, not on the ignore message, so a test
 # enrols by its exact name in the list below, and the owner check refuses a
 # run in which an enrolled name did not run or did not pass. A second step
@@ -99,7 +100,17 @@ jobs:
             repro_issue_1442::delete_of_many_ids_over_indexed_and_unindexed_edge_fragments_stays_bounded_issue_1442 \
             mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect \
             merge_fast_forward::hydration_chunks_stay_bounded_when_row_widths_step_up \
-            merge_fast_forward::hydration_chunks_stay_bounded_when_wide_rows_interleave
+            merge_fast_forward::hydration_chunks_stay_bounded_when_wide_rows_interleave \
+            query::syntax::tests::round_trip::print_then_parse_is_the_identity_on_generated_declarations_at_nightly_breadth \
+            query::syntax::tests::round_trip::a_displayed_expression_types_to_the_expression_at_nightly_breadth \
+            arbitrary::tests::generated_reads_type_check_at_nightly_breadth \
+            arbitrary::tests::generated_blob_writes_lower_at_nightly_breadth \
+            engine::lexical_scan::tests::the_banded_distance_equals_the_table_on_generated_terms_at_nightly_breadth \
+            laws::generated_reads_hold_the_operator_laws_at_nightly_breadth \
+            laws::generated_unions_type_as_the_rfc_joins_their_arms_at_nightly_breadth \
+            laws::generated_recursions_agree_on_their_least_fixpoint_at_nightly_breadth \
+            query::check::tests::compile_cost::compile_cost_grows_linearly_in_every_construct_family_at_nightly_breadth \
+            plan_replay::every_single_plan_edit_is_refused_or_replays_the_run_at_nightly_breadth
           do
             filter="${filter:+$filter + }test(=$test_name)"
             owners+=(--passed "$test_name")

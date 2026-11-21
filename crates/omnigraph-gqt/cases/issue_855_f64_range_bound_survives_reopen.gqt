@@ -23,9 +23,7 @@ node Reading {
 
 --- query
 query all() {
-    match {
-        $r: Reading
-    }
+    match { $r: Reading }
     return { $r.name }
 }
 

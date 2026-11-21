@@ -1,0 +1,126 @@
+# issue: none
+# notes: A triple from a correlated `union`'s column, written before an `optional`, expands before it,
+# notes: so the `optional` correlates on the triple's destination as an outer column and pads its own
+# notes: names alone. The shaper used to place such a triple after every `optional`, which then bound the
+# notes: destination itself; its padded nulls reached a column typed non-null, and the engine refused
+# notes: its own rows where the reference answered. An `optional` whose `where` can fail runs on the
+# notes: rows the triples written before it produced, and a triple written after it expands after it.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+}
+node B {
+    k: String @key
+}
+node C {
+    k: String @key
+    p1: I32
+}
+edge Rel1: C -> A
+edge Rel2: B -> A
+
+--- seed
+{"type":"A","data":{"k":"a1"}}
+{"type":"A","data":{"k":"a2"}}
+{"type":"A","data":{"k":"a3"}}
+{"type":"B","data":{"k":"b1"}}
+{"type":"B","data":{"k":"b2"}}
+{"type":"C","data":{"k":"c1","p1":1}}
+{"type":"C","data":{"k":"c3","p1":0}}
+{"edge":"Rel2","from":"b1","to":"a1","data":{}}
+{"edge":"Rel2","from":"b2","to":"a2","data":{}}
+{"edge":"Rel1","from":"c1","to":"a1","data":{}}
+{"edge":"Rel1","from":"c3","to":"a3","data":{}}
+
+--- query
+query destination_and_its_optional() {
+    match {
+        $n1: A,
+        from union({ match { $n3: B, $n3 rel2 $n1 } return { $n3 as u4 } }, { match { $n5: B } return { $n5 as u4 } }),
+        $u4 rel2 $n6,
+        optional { $n7: C, $n7 rel1 $n6 where (1 % $n7.p1) = 0 }
+    }
+    return { $n1.k, $u4.k, $n6.k, $n7.k }
+}
+
+--- expect unordered
+{"n1.k":"a1","n6.k":"a1","n7.k":"c1","u4.k":"b1"}
+{"n1.k":"a1","n6.k":"a1","n7.k":"c1","u4.k":"b1"}
+{"n1.k":"a1","n6.k":"a2","u4.k":"b2"}
+{"n1.k":"a2","n6.k":"a2","u4.k":"b2"}
+{"n1.k":"a2","n6.k":"a2","u4.k":"b2"}
+{"n1.k":"a2","n6.k":"a1","n7.k":"c1","u4.k":"b1"}
+{"n1.k":"a3","n6.k":"a1","n7.k":"c1","u4.k":"b1"}
+{"n1.k":"a3","n6.k":"a2","u4.k":"b2"}
+
+--- expect shape
+n1.k: String
+u4.k: String
+n6.k: String
+n7.k: String?
+
+--- query
+query optional_that_can_fail_after_the_triple() {
+    match {
+        $n1: A,
+        from union({ match { $n3: B, $n3 rel2 $n1 } return { $n3 as u4 } }, { match { $n5: B } return { $n5 as u4 } }),
+        $u4 rel2 $n6,
+        optional { $n7: C, $n7 rel1 $n6 where (1 / $n7.p1) = 1 }
+    }
+    return { $n6.k, $n7.k }
+}
+
+--- expect unordered
+{"n6.k":"a1","n7.k":"c1"}
+{"n6.k":"a1","n7.k":"c1"}
+{"n6.k":"a1","n7.k":"c1"}
+{"n6.k":"a1","n7.k":"c1"}
+{"n6.k":"a2"}
+{"n6.k":"a2"}
+{"n6.k":"a2"}
+{"n6.k":"a2"}
+
+--- expect shape
+n6.k: String
+n7.k: String?
+
+--- query
+query triple_after_an_optional_that_can_fail() {
+    match {
+        $n1: A,
+        from union({ match { $n3: B, $n3 rel2 $n1 } return { $n3 as u4 } }, { match { $n5: B } return { $n5 as u4 } }),
+        optional { $n7: C, $n7 rel1 $n1 where (1 / $n7.p1) = 1 },
+        $u4 rel2 $n1
+    }
+    return { $n1.k, $n7.k }
+}
+
+--- expect error: E2
+
+--- query
+query triple_before_an_optional_that_can_fail() {
+    match {
+        $n1: A,
+        from union({ match { $n3: B, $n3 rel2 $n1 } return { $n3 as u4 } }, { match { $n5: B } return { $n5 as u4 } }),
+        $u4 rel2 $n1,
+        optional { $n7: C, $n7 rel1 $n1 where (1 / $n7.p1) = 1 }
+    }
+    return { $n1.k, $n7.k }
+}
+
+--- expect unordered
+{"n1.k":"a1","n7.k":"c1"}
+{"n1.k":"a1","n7.k":"c1"}
+{"n1.k":"a2"}
+{"n1.k":"a2"}
+
+--- expect shape
+n1.k: String
+n7.k: String?

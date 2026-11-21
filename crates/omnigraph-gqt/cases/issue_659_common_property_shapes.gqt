@@ -39,7 +39,7 @@ edge Likes: Person -> Person {
 
 --- query
 query common_values() {
-    match { $a: Person $a $e:(knows | likes) $b }
+    match { $a: Person, $a $e:(knows | likes) $b }
     return { $e.@type as kind, $e.tags as tags, $e.embedding as vector, $e.state as state, $e.label as label }
 }
 --- expect unordered
@@ -57,7 +57,7 @@ expand $a $b: selection alternation [Knows out, Likes out]
 
 --- query
 query selected_list_predicate() {
-    match { $a: Person $a $e:(knows | likes) $b $e.tags contains "x" }
+    match { $a: Person, $a $e:(knows | likes) $b } where "x" in $e.tags
     return { $e.@type as kind }
 }
 --- expect unordered
@@ -67,31 +67,30 @@ kind: String
 
 --- query
 query selected_blob_is_not_a_read_value() {
-    match { $a: Person $a $e:(knows | likes) $b }
+    match { $a: Person, $a $e:(knows | likes) $b }
     return { $e.payload }
 }
 --- expect error: Blob
 
 --- query
 query incompatible_scalar_and_list_property() {
-    match { $a: Person $a $e:(knows | likes) $b }
+    match { $a: Person, $a $e:(knows | likes) $b }
     return { $e.shape }
 }
 --- expect error: must exist with compatible types on every selected edge
 
 --- query
 query incompatible_vector_dimensions() {
-    match { $a: Person $a $e:(knows | likes) $b }
+    match { $a: Person, $a $e:(knows | likes) $b }
     return { $e.width }
 }
 --- expect error: must exist with compatible types on every selected edge
 
 --- query
 query nullable_block_argument_counts_nonnull_values() {
-    match {
-        $a: Person { name: "a" }
-        count($e.state contains "open") { $a $e:(knows | likes) $b } = 2
-    }
+    match { $a: Person }
+    where $a.name = "a"
+      and count(contains($e.state, "open")) { $b: Person, $a $e:(knows | likes) $b } = 2
     return { $a.name as name }
 }
 --- expect unordered
@@ -101,10 +100,9 @@ name: String
 
 --- query
 query nullable_block_argument_parameter_counts_nonnull_values($term: String) {
-    match {
-        $a: Person { name: "a" }
-        count($e.state contains $term) { $a $e:(knows | likes) $b } = 2
-    }
+    match { $a: Person }
+    where $a.name = "a"
+      and count(contains($e.state, $term)) { $b: Person, $a $e:(knows | likes) $b } = 2
     return { $a.name as name }
 }
 --- params
@@ -116,10 +114,8 @@ name: String
 
 --- query
 query count_all_includes_null_property_edges() {
-    match {
-        $a: Person { name: "a" }
-        count { $a $e:(knows | likes) $b } = 3
-    }
+    match { $a: Person }
+    where $a.name = "a" and count { $b: Person, $a $e:(knows | likes) $b } = 3
     return { $a.name as name }
 }
 --- expect unordered

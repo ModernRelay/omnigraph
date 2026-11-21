@@ -363,7 +363,11 @@ graph written under Lance 11 is served as it is.
 Experimental V2_3, spilled row lineage and stable-row-ID fragment-reuse indexes
 remain outside the graph contract. Retaining V2_2 alone is not a general rollback
 guarantee: qualify old readers against actual new writes using the predecessor
-journey in [test ownership](test-ownership.md#lance-compatibility).
+journey in [test ownership](test-ownership.md#lance-compatibility). Rollback in place after
+the current build has built or rebuilt an index is not supported: the older
+binary must refuse or answer as the current one does, and the supported
+rollback restores the backup taken before the upgrade
+([upgrade guide](../user/operations/upgrade.md#lance-substrate-upgrades-v010-v014)).
 
 Current compatibility fences are in
 [Lance compatibility fences](lance-fences.md); the required upstream reading
@@ -392,7 +396,7 @@ and skipped required cases fail the job.
 | Source format | Normal open | `omnigraph upgrade` | Required coverage owner |
 |---|---|---|---|
 | Current / v17 | Accepted | `already_current` for the default or target 17; any other target is `unsupported_target` | `upgrade/tests.rs` and CLI `crossversion_upgrade.rs::storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph`; stamp tests in `migrations.rs` |
-| v16 (releases 0.14.x and 0.15.0) | Accepted; a publish keeps it at 16 | `stamp-v14-to-v17`: one metadata commit per live ref, main first; `check_passed` then `completed` | `upgrade/tests.rs::a_v16_graph_is_stamped_current_per_live_ref` and `a_v16_branch_holding_cold_registry_fragments_is_stamped_and_keeps_them`; `omnigraph-catalog` `tests.rs::v17_a_publish_writes_back_the_stamp_it_loaded`; CLI `crossversion_upgrade.rs::genuine_lance11_storage_upgrade_round_trip`, whose predecessor reads what the candidate published |
+| v16 (releases 0.14.x and 0.15.0) | Accepted; a publish keeps it at 16 | `stamp-v14-to-v17`: one metadata commit per live ref, main first; `check_passed` then `completed` | `upgrade/tests.rs::a_v16_graph_is_stamped_current_per_live_ref` and `a_v16_branch_holding_cold_registry_fragments_is_stamped_and_keeps_them`; `omnigraph-catalog` `tests.rs::v17_a_publish_writes_back_the_stamp_it_loaded`; CLI `crossversion_upgrade.rs::genuine_lance11_storage_upgrade_round_trip`, whose predecessor reads what the candidate published and refuses the full-text indexes it rebuilt |
 | v15 (main builds 2026-10-10 to 2026-10-11) | Accepted; stamped 16 by its first publish | `stamp-v14-to-v17`: one metadata commit per live ref, main first; `check_passed` then `completed` | `upgrade/tests.rs::a_v15_graph_is_stamped_current_per_live_ref` and `a_v15_graph_is_served_and_stamped_by_its_first_publish`; stamp tests in `migrations.rs` |
 | v14 (releases 0.12.x and 0.13.x; main builds 2026-10-04 to 2026-10-10) | Accepted; stamped 16 by its first publish | `stamp-v14-to-v17`: one metadata commit per live ref, main first; `check_passed` then `completed` | `upgrade/tests.rs::a_v14_graph_is_stamped_current_per_live_ref` and `a_live_ref_left_at_v14_is_stamped_alone`; stamp tests in `migrations.rs` |
 | v13 (main builds 2026-10-01 to 2026-10-04), standalone | Refused, naming `omnigraph upgrade` | Converted in place: `check_passed`, then `completed`; branches and history kept | CLI `crossversion_upgrade.rs::genuine_v13_storage_upgrade_preserves_history` against the genuine `c0a4519f` binary; `upgrade/tests.rs` over `legacy::write::LegacyHistory` fixtures; `omnigraph-catalog` `legacy_` tests |

@@ -11,11 +11,7 @@ environments:
 
 --- query
 query hop1() {
-    match {
-        $a: Person
-        $b: Person
-        $a knows $b
-    }
+    match { $a: Person, $b: Person, $a knows $b }
     return { $a.name, $b.name }
 }
 --- expect unordered
@@ -57,11 +53,7 @@ b.name: String
 
 --- query
 query hop1() {
-    match {
-        $a: Person
-        $b: Person
-        $a knows $b
-    }
+    match { $a: Person, $b: Person, $a knows $b }
     return { $a.name, $b.name }
 }
 --- expect unordered
@@ -105,11 +97,7 @@ b.name: String
 
 --- query
 query hop1() {
-    match {
-        $a: Person
-        $b: Person
-        $a knows $b
-    }
+    match { $a: Person, $b: Person, $a knows $b }
     return { $a.name, $b.name }
 }
 --- expect unordered

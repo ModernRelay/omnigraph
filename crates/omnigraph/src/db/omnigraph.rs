@@ -187,6 +187,10 @@ pub struct SchemaApplyResult {
     pub applied: bool,
     pub graph_manifest_version: u64,
     pub steps: Vec<SchemaMigrationStep>,
+    /// The constructs this publication stored that a binary before this
+    /// release refuses (`omnigraph_compiler::schema::one_way`); empty for a
+    /// no-op, which stores nothing.
+    pub one_way_constructs: Vec<omnigraph_compiler::schema::one_way::OneWayConstruct>,
     /// The exact commit published by this invocation; absent for an exact no-op.
     pub commit: Option<GraphCommit>,
     /// Accepted source and stable schema identity of this invocation's result.
@@ -1020,6 +1024,16 @@ impl Omnigraph {
     /// without blocking concurrent `apply_schema`.
     pub fn catalog(&self) -> Arc<Catalog> {
         Arc::clone(&self.schema_view.load().catalog)
+    }
+
+    /// The catalog a read query on `target` type-checks against: the
+    /// accepted one on a branch, and at an explicit commit the current
+    /// schema as that commit holds it ([`Catalog::at_commit`]), whose
+    /// [`Catalog::historical`] names the commit.
+    pub async fn query_catalog(&self, target: impl Into<ReadTarget>) -> Result<Arc<Catalog>> {
+        self.capture_query_view(target)
+            .await
+            .map(|(_, catalog)| catalog)
     }
 
     /// Returns an `Arc<String>` snapshot of the schema source.
@@ -2795,7 +2809,80 @@ impl Omnigraph {
         );
         let catalog = self.catalog_for_image_vintage(&snapshot, catalog).await?;
         snapshot.bind_catalog_aliases(&catalog, &live)?;
+        let commit = snapshot
+            .graph_head(branch.as_deref())
+            .map_or_else(|| format!("manifest version {version}"), str::to_string);
+        let catalog = self
+            .bind_historical_schema(&mut snapshot, catalog, &commit)
+            .await?;
         Ok((snapshot, catalog))
+    }
+
+    /// [`Self::capture_read_view`] for a read query: on an explicit
+    /// historical target, the view is bound to the schema accepted at that
+    /// commit ([`Self::bind_historical_schema`]).
+    pub(crate) async fn capture_query_view(
+        &self,
+        target: impl Into<ReadTarget>,
+    ) -> Result<(ResolvedTarget, Arc<Catalog>)> {
+        let target = target.into();
+        let historical = matches!(&target, ReadTarget::Snapshot(_));
+        let (mut resolved, catalog) = self.capture_read_view(target).await?;
+        if !historical {
+            return Ok((resolved, catalog));
+        }
+        let commit = resolved
+            .graph_commit_id
+            .clone()
+            .unwrap_or_else(|| resolved.snapshot_id.as_str().to_string());
+        let catalog = self
+            .bind_historical_schema(&mut resolved.snapshot, catalog, &commit)
+            .await?;
+        Ok((resolved, catalog))
+    }
+
+    /// The one place that decides the shape of a read query at an earlier
+    /// commit (RFC GQ 3, A2): a snapshot is its data and the schema accepted
+    /// at it. `catalog` is the current catalog, already bound to `snapshot`'s
+    /// tables by type identity; the read sees each property the commit holds
+    /// under its current name, through its stable identity, and no other.
+    ///
+    /// The catalog returned is the current one restricted to the property
+    /// identities the commit's recorded schema declares
+    /// ([`Catalog::at_commit`]), so the type checker refuses a property the
+    /// commit does not hold, naming `commit`, and a whole node expands to
+    /// the properties it holds; the shape is fixed before planning and the
+    /// bound plan records it. A commit whose schema was not recorded (a
+    /// version written before the contract lived in `__manifest`, or a
+    /// commit converted with none) is planned against the current schema,
+    /// as it was before. Either way every table opens under the property
+    /// view of the catalog returned, so a property renamed since reads under
+    /// its current name and a dropped property's column, even one sharing a
+    /// current name, is unreachable.
+    async fn bind_historical_schema(
+        &self,
+        snapshot: &mut Snapshot,
+        catalog: Arc<Catalog>,
+        commit: &str,
+    ) -> Result<Arc<Catalog>> {
+        let current = catalog.bound_schema_ir().ok_or_else(|| {
+            OmniError::manifest_internal(
+                "a historical read needs an identity-bound catalog".to_string(),
+            )
+        })?;
+        let recorded = snapshot
+            .schema_contract()
+            .filter(|_| snapshot.records_schema());
+        let catalog = match recorded {
+            Some(identity) if identity != SchemaContractIdentity::from_ir(current)? => {
+                let row = snapshot.read_schema_contract(self.uri()).await?;
+                let (at, _) = validate_schema_contract_row(&row)?;
+                Arc::new(catalog.at_commit(&at, commit)?)
+            }
+            _ => catalog,
+        };
+        snapshot.set_property_views(property_views(&catalog));
+        Ok(catalog)
     }
 
     /// The catalog a pinned image plans against: the accepted one, or its
@@ -3887,7 +3974,7 @@ impl Omnigraph {
     }
 
     pub async fn export_jsonl(&self, branch: &str, type_names: &[String]) -> Result<String> {
-        export::export_jsonl(self, branch, type_names).await
+        export::export_jsonl(self, ReadTarget::branch(branch), type_names).await
     }
 
     pub async fn export_jsonl_to_writer<W: Write>(
@@ -3896,7 +3983,19 @@ impl Omnigraph {
         type_names: &[String],
         writer: &mut W,
     ) -> Result<()> {
-        export::export_jsonl_to_writer(self, branch, type_names, writer).await
+        export::export_jsonl_to_writer(self, ReadTarget::branch(branch), type_names, writer).await
+    }
+
+    /// [`Self::export_jsonl`] at a read target, a branch head or a captured
+    /// snapshot: the rows a query at that target reads. GQT's reference
+    /// comparison reads a step's target through it.
+    #[doc(hidden)]
+    pub async fn export_jsonl_at(
+        &self,
+        target: impl Into<ReadTarget>,
+        type_names: &[String],
+    ) -> Result<String> {
+        export::export_jsonl(self, target, type_names).await
     }
 
     /// Stream export rows without a defined physical row order.
@@ -3989,8 +4088,10 @@ impl Omnigraph {
     /// the selected branch's current rows, publishing all tables together.
     /// Inherited tables are first-touch forked; other branches and historical
     /// snapshots retain their original indexes. Scalar/vector indexes are kept.
-    /// Rebuilt full-text indexes use the engine's default analyzer, including
-    /// indexes originally created externally with custom tokenizer settings.
+    /// Rebuilt full-text indexes use each property's declared analyzer
+    /// profile, or the engine's default analyzer where none is declared,
+    /// including indexes originally created externally with custom tokenizer
+    /// settings.
     ///
     /// Unlike [`Self::ensure_indices_on_as`], this replaces existing FTS
     /// indexes even when their row coverage is complete. It establishes the
@@ -5492,6 +5593,36 @@ fn changed_kind_under_gate(commit_id: &str) -> OmniError {
     ))
 }
 
+/// Per table key, each property `catalog` declares, stable property id to
+/// name: the names a historical read opens its tables under.
+fn property_views(catalog: &Catalog) -> crate::db::snapshot::PropertyViews {
+    let schemas = catalog
+        .node_types
+        .iter()
+        .map(|(name, node)| (format!("node:{name}"), &node.arrow_schema))
+        .chain(
+            catalog
+                .edge_types
+                .iter()
+                .map(|(name, edge)| (format!("edge:{name}"), &edge.arrow_schema)),
+        );
+    schemas
+        .map(|(table_key, schema)| {
+            let view = schema
+                .fields()
+                .iter()
+                .filter_map(|field| {
+                    field
+                        .metadata()
+                        .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
+                        .map(|id| (id.clone(), field.name().clone()))
+                })
+                .collect();
+            (table_key, view)
+        })
+        .collect()
+}
+
 fn validate_bound_catalog_against_snapshot(catalog: &Catalog, snapshot: &Snapshot) -> Result<()> {
     let schema_ir = catalog.bound_schema_ir().ok_or_else(|| {
         OmniError::manifest_internal(
@@ -6954,7 +7085,8 @@ edge WorksAt: Person -> Company
         // rebuilding indexes inline (deferred); ensure_indices restores them.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
-        let initial_schema = TEST_SCHEMA.replace("name: String @key", "name: String @key @index");
+        let initial_schema =
+            TEST_SCHEMA.replace("name: String @key", "name: String @key @index(fulltext)");
         let mut db = Omnigraph::init(uri, &initial_schema).await.unwrap();
         seed_person_row(&mut db, "Alice", Some(30)).await;
 

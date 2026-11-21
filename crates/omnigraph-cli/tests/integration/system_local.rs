@@ -66,7 +66,7 @@ fn insert_person_query(graph: &SystemGraph, name: &str) -> std::path::PathBuf {
         name,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     )
@@ -77,7 +77,7 @@ fn add_friend_query(graph: &SystemGraph, name: &str) -> std::path::PathBuf {
         name,
         r#"
 query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 "#,
     )
@@ -266,7 +266,9 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
             .arg("--target")
             .arg(graph.path())
             .arg("-e")
-            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg(
+                "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
+            )
             .arg("--params")
             .arg(r#"{"name":"Inline","age":42}"#)
             .arg("--json"),
@@ -281,7 +283,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
             .arg("--target")
             .arg(graph.path())
             .arg("--query-string")
-            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }")
             .arg("--params")
             .arg(r#"{"name":"Inline"}"#)
             .arg("--json"),
@@ -394,7 +396,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&ingest_data)
             .arg("--branch")
@@ -411,7 +413,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["branch_created"], true);
     assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
     assert!(ingest_payload["commit"]["graph_manifest_version"].is_number());
-    assert_eq!(ingest_payload["mode"], "merge");
+    assert_eq!(ingest_payload["mode"], "replace");
     assert_eq!(ingest_payload["nodes"][0]["name"], "Person");
     assert_eq!(ingest_payload["nodes"][0]["entities_loaded"], 2);
     assert_eq!(ingest_payload["total_entities"], 2);
@@ -421,7 +423,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&ingest_data)
             .arg("--branch")
@@ -497,7 +499,7 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&extra)
             .arg("--branch")
@@ -515,7 +517,7 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&extra)
             .arg("--branch")
@@ -529,7 +531,7 @@ fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
     assert_eq!(payload["branch"], "feature-load");
     assert_eq!(payload["base_branch"], "main");
     assert_eq!(payload["branch_created"], true);
-    assert_eq!(payload["mode"], "merge");
+    assert_eq!(payload["mode"], "replace");
     assert_eq!(payload["nodes"][0]["name"], "Person");
     assert_eq!(payload["nodes"][0]["entities_loaded"], 1);
     assert_eq!(payload["total_entities"], 1);
@@ -600,7 +602,7 @@ fn local_cli_export_round_trips_full_branch_graph() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(graph.path()),
     );
@@ -777,7 +779,7 @@ fn local_cli_failed_load_keeps_target_state_unchanged() {
             .arg("--data")
             .arg(&bad_data)
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(graph.path()),
     );
@@ -850,9 +852,8 @@ fn local_cli_resolves_relative_query_cwd_relative() {
         &cwd_dir.join("local.gq"),
         r#"
 query get_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.age, $p.name }
 }
 "#,
@@ -863,9 +864,8 @@ query get_person($name: String) {
         &other_dir.join("local.gq"),
         r#"
 query get_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.name }
 }
 "#,
@@ -925,11 +925,8 @@ node Task {
         &queries,
         r#"
 query due_with_tag($deadline: DateTime, $tag: String) {
-    match {
-        $t: Task
-        $t.due_at <= $deadline
-        $t.tags contains $tag
-    }
+    match { $t: Task }
+    where $t.due_at <= $deadline and $tag in $t.tags
     return { $t.slug, $t.due_at, $t.tags, $t.scores, $t.active_days }
 }
 
@@ -941,7 +938,7 @@ query insert_task(
     $scores: [I32],
     $active_days: [Date]
 ) {
-    insert Task {
+    replace Task {
         slug: $slug,
         title: $title,
         due_at: $due_at,
@@ -958,16 +955,17 @@ query update_task(
     $scores: [I32],
     $active_days: [Date]
 ) {
-    update Task set {
+    match { $x: Task } where $x.slug = $slug
+    update $x set {
         due_at: $due_at,
         tags: $tags,
         scores: $scores,
         active_days: $active_days
-    } where slug = $slug
+    }
 }
 
 query get_task($slug: String) {
-    match { $t: Task { slug: $slug } }
+    match { $t: Task } where $t.slug = $slug
     return { $t.slug, $t.due_at, $t.tags, $t.scores, $t.active_days }
 }
 "#,
@@ -1104,9 +1102,9 @@ node Doc {
         &queries,
         r#"
 query vector_search($q: String) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 "#,
@@ -1354,7 +1352,8 @@ fn local_cli_change_enforces_engine_layer_policy() {
         cluster.path(),
         &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", POLICY_TOKENS_JSON)],
     );
-    let insert = "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+    let insert =
+        "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }";
     let before = served_policy_state(&server);
 
     // Case 1: no token → the server refuses before any policy check.
@@ -1586,7 +1585,7 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
         .envs(server.credential("bruno-tok"))
         .arg("load")
         .arg("--mode")
-        .arg("merge")
+        .arg("replace")
         .arg("--target")
         .fixture_target(&server.base_url)
         .arg("--graph")
@@ -1614,7 +1613,7 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
             .envs(server.credential("ragnor-tok"))
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .fixture_target(&server.base_url)
             .arg("--graph")
@@ -1887,7 +1886,7 @@ fn local_cluster_apply_then_server_boots_from_cluster_state() {
     .unwrap();
     std::fs::write(
         temp.path().join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -2108,12 +2107,12 @@ fn write_two_graph_cluster(dir: &std::path::Path) {
     .unwrap();
     std::fs::write(
         dir.join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
     )
     .unwrap();
     std::fs::write(
         dir.join("services.gq"),
-        "\nquery find_service($name: String) {\n  match { $s: Service { name: $name } }\n  return { $s.name }\n}\n",
+        "\nquery find_service($name: String) {\n  match { $s: Service } where $s.name = $name\n  return { $s.name }\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -2235,7 +2234,7 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     .unwrap();
     std::fs::write(
         dir.join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name, $p.bio }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name, $p.bio }\n}\n",
     )
     .unwrap();
     let plan = cluster_cli(dir, &["plan"]);
@@ -2366,7 +2365,7 @@ fn local_cluster_serving_enforces_applied_policy_bindings() {
     .unwrap();
     std::fs::write(
         dir.join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -2680,12 +2679,12 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     fs::copy(fixture("test.pg"), cluster.path().join("local.pg")).unwrap();
     fs::write(
         cluster.path().join("find-person.gq"),
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }",
     )
     .unwrap();
     fs::write(
         cluster.path().join("insert-person.gq"),
-        "query insert_person($name: String) { insert Person { name: $name, age: 41 } }",
+        "query insert_person($name: String) { replace Person { name: $name, age: 41 } }",
     )
     .unwrap();
     fs::write(
@@ -2805,7 +2804,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .arg("--graph")
         .arg("local")
         .arg("--query-string")
-        .arg("query q($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
+        .arg("query q($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }")
         .arg("--params")
         .arg(r#"{"name":"Alice"}"#)
         .arg("--json")

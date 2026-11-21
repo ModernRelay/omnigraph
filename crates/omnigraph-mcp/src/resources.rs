@@ -34,12 +34,12 @@ pub(super) const BEST_PRACTICES: &[BestPractice] = &[
     BestPractice {
         key: "queries",
         title: "GQ query best practices",
-        description: "Read before writing a query for `query` or `mutate`. Covers .gq grammar, choosing a declared query by name, parameter declarations, the PascalCase to lowerCamelCase edge casing trap, search operators that need a trailing `limit`, and the non-nullable lint rule.",
+        description: "Read before writing a query for `query` or `mutate`. Covers .gq grammar, choosing a declared query by name, parameter declarations, the PascalCase to lowerCamelCase edge casing trap, rankings drawn with `from` and named with `as`, and the non-nullable lint rule.",
     },
     BestPractice {
         key: "data",
         title: "Data load patterns",
-        description: "Read before calling `load`. Covers choosing `merge`, `append` or `overwrite`, the branch, load, verify, merge loop for large or risky writes, embeddings that `merge` does not recompute, and when to use `mutate` instead.",
+        description: "Read before calling `load`. Covers choosing `insert`, `upsert`, `replace` or `overwrite`, the branch, load, verify, merge loop for large or risky writes, embeddings that `upsert` and `replace` do not recompute, and when to use `mutate` instead.",
     },
     BestPractice {
         key: "schema",
@@ -49,7 +49,7 @@ pub(super) const BEST_PRACTICES: &[BestPractice] = &[
     BestPractice {
         key: "search",
         title: "Vector and full-text search",
-        description: "Read before using `nearest`, `bm25` or `rrf`. Covers scoping first and ranking second, schema-declared embeddings, and the trailing `limit` requirement. Match vector dimensions and models to the live schema; CLI examples are not MCP tools.",
+        description: "Read before using `nearest`, `bm25` or `rrf`. Covers scoping first and ranking second, schema-declared embeddings, `nearest`'s window `k`, and `limit` as a separate cut. Match vector dimensions and models to the live schema; CLI examples are not MCP tools.",
     },
     BestPractice {
         key: "changes",

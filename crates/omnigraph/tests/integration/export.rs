@@ -9,17 +9,17 @@ use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 
 use crate::helpers::*;
 
 const EXPORT_MUTATIONS: &str = r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 
 query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 "#;
 
@@ -46,7 +46,7 @@ node Counter {
 
 const U64_KEY_MUTATION: &str = r#"
 query insert_counter($sequence: U64, $label: String) {
-    insert Counter { sequence: $sequence, label: $label }
+    replace Counter { sequence: $sequence, label: $label }
 }
 "#;
 
@@ -104,11 +104,12 @@ edge Related: Membership -> Membership
 
 const COMPOSITE_KEY_MUTATION: &str = r#"
 query put_membership($tenant: String, $slot: U32, $label: String) {
-    insert Membership { tenant: $tenant, slot: $slot, label: $label }
+    replace Membership { tenant: $tenant, slot: $slot, label: $label }
 }
 
 query move_membership($tenant: String, $next_slot: U32) {
-    update Membership set { slot: $next_slot } where tenant = $tenant
+    match { $x: Membership } where $x.tenant = $tenant
+    update $x set { slot: $next_slot }
 }
 "#;
 
@@ -139,15 +140,15 @@ node FloatBoundary {
 
 const NARROWING_MUTATIONS: &str = r#"
 query put_signed($value: I32) {
-    insert SignedBoundary { value: $value }
+    replace SignedBoundary { value: $value }
 }
 
 query put_unsigned($value: U32) {
-    insert UnsignedBoundary { value: $value }
+    replace UnsignedBoundary { value: $value }
 }
 
 query put_float($value: F32) {
-    insert FloatBoundary { value: $value }
+    replace FloatBoundary { value: $value }
 }
 "#;
 
@@ -350,7 +351,7 @@ node Document {
         "data": { "key": "wide", "body": "λ".repeat(40_000) }
     })
     .to_string();
-    db.load_jsonl(&wide, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&wide, LoadMode::Insert).await.unwrap();
     let small = (0..200)
         .map(|row| {
             serde_json::json!({
@@ -360,7 +361,7 @@ node Document {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    db.load_jsonl(&small, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&small, LoadMode::Insert).await.unwrap();
     let expected = db.export_jsonl("main", &[]).await.unwrap();
     let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
     let mut chunks = Vec::new();
@@ -417,7 +418,7 @@ async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
                 "{{\"type\":\"Counter\",\"data\":{{\"sequence\":{},\"label\":\"loader\"}}}}",
                 u64::MAX
             ),
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -525,7 +526,7 @@ async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_tri
         ),
     ] {
         let duplicate = source
-            .load_jsonl(duplicate_row, LoadMode::Append)
+            .load_jsonl(duplicate_row, LoadMode::Insert)
             .await
             .unwrap_err();
         assert!(
@@ -647,7 +648,7 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
     let duplicate = db
         .load_jsonl(
             r#"{"type":"Rounded","data":{"value":16777217}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -678,7 +679,7 @@ async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed()
 {"type":"Padded","id":"00042","data":{"value":42}}
 {"type":"Padded","id":"42","data":{"value":42}}
 "#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -719,7 +720,7 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     let duplicate = db
         .load_jsonl(
             r#"{"type":"Membership","data":{"tenant":"acme","slot":7,"label":"append"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap_err();
@@ -754,7 +755,7 @@ async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids(
     assert!(
         key_update
             .to_string()
-            .contains("cannot update @key property 'slot'"),
+            .contains("`slot`, a key property of `Membership`"),
         "every composite component is immutable: {key_update}"
     );
     assert_eq!(count_rows(&db, "node:Membership").await, 1);
@@ -843,7 +844,7 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
     .collect::<Vec<_>>()
     .join("\n");
     loader
-        .load_jsonl(&boundaries, LoadMode::Append)
+        .load_jsonl(&boundaries, LoadMode::Insert)
         .await
         .unwrap();
 
@@ -854,7 +855,7 @@ async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_e
         ("FloatBoundary", serde_json::json!(f64::MAX)),
     ] {
         let row = serde_json::json!({"type":table,"data":{"value":bad_value}}).to_string();
-        let error = loader.load_jsonl(&row, LoadMode::Append).await.unwrap_err();
+        let error = loader.load_jsonl(&row, LoadMode::Insert).await.unwrap_err();
         assert!(
             error.to_string().contains("range"),
             "{table} out-of-range load must fail clearly: {error}"
@@ -1116,7 +1117,7 @@ node Document {
     db.load_jsonl(concat!(
             "{\"type\":\"Document\",\"data\":{\"title\":\"valid-empty\",\"content\":\"base64:\"}}\n",
             "{\"type\":\"Document\",\"data\":{\"title\":\"neighbor\",\"content\":\"base64:TmVpZ2hib3I=\"}}",
-        ), LoadMode::Append, )
+        ), LoadMode::Insert, )
     .await
     .unwrap();
     // Export is descriptor-first for external references: reproducing the
@@ -1240,7 +1241,7 @@ node Document {
     imported
         .load_jsonl(
             r#"{"type":"Document","data":{"title":"later","content":"base64:AAECA/8="}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();

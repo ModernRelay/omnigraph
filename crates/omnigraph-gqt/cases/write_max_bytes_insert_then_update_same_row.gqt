@@ -1,6 +1,6 @@
 # issue: none
-# notes: An insert and an update of the same key in one mutation are two staged batches until the last-write-wins fold; the update carries the pending row's Blob, so the payload counts twice as input.
-# notes: The 2,115-byte payload reaches 4,230 at write_max_bytes = 4093 and is refused as `materialized blob payload bytes` before any write; the table stays empty.
+# notes: Two updates of one row in one group are two staged versions until the last-write-wins fold; the first assigns the Blob and the second carries the pending row's Blob, so the payload counts twice.
+# notes: The 2,115-byte payload reaches 4,230 at write_max_bytes = 4093 and is refused as `materialized blob payload bytes` before any write; the row keeps its note and no Blob.
 
 --- runner
 timeout_ms: 10000
@@ -19,12 +19,14 @@ node Doc {
 }
 
 --- seed
+{"type":"Doc","data":{"slug":"twice","note":"n"}}
 
 --- mutate
 set write_max_bytes = 4093;
-query insert_then_update($payload: Blob) {
-    insert Doc { slug: "twice", content: $payload, note: "n" }
-    update Doc set { note: "u" } where slug = "twice"
+query assign_then_retitle($payload: Blob) {
+    match { $x: Doc } where $x.slug = "twice"
+    update $x set { content: $payload }
+    update $x set { note: "u" }
 }
 
 --- params
@@ -39,6 +41,7 @@ query docs() {
 }
 
 --- expect unordered
+{"d.slug":"twice","d.note":"n"}
 
 --- expect shape
 d.slug: String

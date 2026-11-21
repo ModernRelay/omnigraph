@@ -1,0 +1,1 @@
+- A block is a value: `let $n = count { … }`, `count { … } as n` in `return`, a block compared with another block, or under `or` and `not`. A `count` over no match is 0.

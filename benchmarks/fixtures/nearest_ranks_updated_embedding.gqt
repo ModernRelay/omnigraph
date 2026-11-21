@@ -25,7 +25,8 @@ node Doc {
 
 --- mutate
 query move_embedding($s: String, $e: Vector(4)) {
-    update Doc set { embedding: $e } where slug = $s
+    match { $x: Doc } where $x.slug = $s
+    update $x set { embedding: $e }
 }
 
 --- params

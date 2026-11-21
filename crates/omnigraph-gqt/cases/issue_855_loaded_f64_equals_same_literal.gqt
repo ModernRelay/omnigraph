@@ -23,17 +23,15 @@ node Person {
 
 --- mutate
 query insert_literal() {
-    insert Person { name: "b", x: 123456789.12345679 }
+    replace Person { name: "b", x: 123456789.12345679 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- query
 query loaded_f64_equals_literal() {
-    match {
-        $p: Person
-        $p.x = 123456789.12345679
-    }
+    match { $p: Person }
+    where $p.x = 123456789.12345679
     return { $p.name }
 }
 
@@ -47,10 +45,8 @@ p.name: String
 
 --- query
 query f64_param_equals_literal($v: F64) {
-    match {
-        $p: Person
-        $p.x = $v
-    }
+    match { $p: Person }
+    where $p.x = $v
     return { $p.name }
 }
 

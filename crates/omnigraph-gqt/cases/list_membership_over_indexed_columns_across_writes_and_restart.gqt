@@ -36,24 +36,18 @@ edge Holds: Root -> Item
 {"edge":"Holds","from":"root","to":"z"}
 
 --- query
-set engine = v2;
 query membership_of_a_node() {
-    match {
-        $r: Root
-        $r in $i
-    }
+    match { $r: Root, $i: Item }
+    where $r in $i
     return { $r.rid }
 }
 
---- expect error: T7: `$r in $i` tests membership and `$r` is a node; `in` takes a value on the left and a list on the right
+--- expect error: T7: `$i` is a node, so `$r in $i` is a triple over the edge named `in`
 
 --- query
-set engine = v2;
 query indexed_identity($ids: [String]) {
-    match {
-        $i: Item
-        $i.@id in $ids
-    }
+    match { $i: Item }
+    where $i.@id in $ids
     return { $i.slug }
 }
 
@@ -74,12 +68,9 @@ pass predicate_pushdown
 
 
 --- query
-set engine = v2;
 query indexed_integer() {
-    match {
-        $i: Item
-        $i.code in [1, 3, 7, 9]
-    }
+    match { $i: Item }
+    where $i.code in [1, 3, 7, 9]
     return { $i.slug }
 }
 
@@ -97,12 +88,9 @@ pass predicate_pushdown
 
 
 --- query
-set engine = v2;
 query indexed_date($days: [Date]) {
-    match {
-        $i: Item
-        $i.day in $days
-    }
+    match { $i: Item }
+    where $i.day in $days
     return { $i.slug }
 }
 
@@ -123,12 +111,9 @@ pass predicate_pushdown
 
 
 --- query
-set engine = v2;
 query string_without_an_index() {
-    match {
-        $i: Item
-        $i.word in ["alpha", "gamma", "theta", "omega"]
-    }
+    match { $i: Item }
+    where $i.word in ["alpha", "gamma", "theta", "omega"]
     return { $i.slug }
 }
 
@@ -146,12 +131,9 @@ pass predicate_pushdown
 
 
 --- query
-set engine = v2;
 query indexed_negated() {
-    match {
-        $i: Item
-        not ($i.code in [1, 3, 7, 9])
-    }
+    match { $i: Item }
+    where not ($i.code in [1, 3, 7, 9])
     return { $i.slug }
 }
 
@@ -169,22 +151,18 @@ pass predicate_pushdown
 
 --- mutate
 query append_tail() {
-    insert Item { slug: "tail", code: 7, day: date("2024-07-07"), word: "theta" }
-    insert Item { slug: "tail_miss", code: 8, day: date("2024-08-08"), word: "other" }
-    insert Holds { from: "root", to: "tail" }
-    insert Holds { from: "root", to: "tail_miss" }
+    replace Item { slug: "tail", code: 7, day: date("2024-07-07"), word: "theta" }
+    replace Item { slug: "tail_miss", code: 8, day: date("2024-08-08"), word: "other" }
+    insert Holds { @src: "root", @dst: "tail" }
+    insert Holds { @src: "root", @dst: "tail_miss" }
 }
 
 --- expect affected: nodes=2 edges=2
 
 --- query
-set engine = v2;
 query tail_identity($ids: [String]) {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.@id in $ids
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.@id in $ids
     return { $i.slug }
 }
 
@@ -207,13 +185,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query tail_integer() {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.code in [1, 3, 7, 9]
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.code in [1, 3, 7, 9]
     return { $i.slug }
 }
 
@@ -233,13 +207,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query tail_date($days: [Date]) {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.day in $days
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.day in $days
     return { $i.slug }
 }
 
@@ -262,13 +232,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query tail_string() {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.word in ["alpha", "gamma", "theta", "omega"]
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.word in ["alpha", "gamma", "theta", "omega"]
     return { $i.slug }
 }
 
@@ -288,21 +254,25 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- mutate
-query change_covered_rows() {
-    update Item set { code: 10, day: date("2024-10-10"), word: "outside" } where slug = "a"
-    update Item set { code: 7, day: date("2024-07-07"), word: "theta" } where slug = "b"
+query change_covered_row_a() {
+    match { $x: Item } where $x.slug = "a"
+    update $x set { code: 10, day: date("2024-10-10"), word: "outside" }
 }
 
---- expect affected: nodes=2 edges=0
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query change_covered_row_b() {
+    match { $x: Item } where $x.slug = "b"
+    update $x set { code: 7, day: date("2024-07-07"), word: "theta" }
+}
+
+--- expect affected: nodes=1 edges=0
 
 --- query
-set engine = v2;
 query updated_integer() {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.code in [1, 3, 7, 9]
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.code in [1, 3, 7, 9]
     return { $i.slug }
 }
 
@@ -322,13 +292,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query updated_date($days: [Date]) {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.day in $days
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.day in $days
     return { $i.slug }
 }
 
@@ -351,13 +317,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query updated_string() {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.word in ["alpha", "gamma", "theta", "omega"]
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.word in ["alpha", "gamma", "theta", "omega"]
     return { $i.slug }
 }
 
@@ -378,19 +340,16 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 --- mutate
 query delete_covered_member() {
-    delete Item where slug = "c"
+    match { $x: Item } where $x.slug = "c"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=1
 
 --- query
-set engine = v2;
 query deleted_identity($ids: [String]) {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.@id in $ids
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.@id in $ids
     return { $i.slug }
 }
 
@@ -412,13 +371,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query deleted_integer() {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.code in [1, 3, 7, 9]
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.code in [1, 3, 7, 9]
     return { $i.slug }
 }
 
@@ -437,13 +392,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query deleted_negated() {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        not ($i.code in [1, 3, 7, 9])
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and not ($i.code in [1, 3, 7, 9])
     return { $i.slug }
 }
 
@@ -464,13 +415,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 --- restart
 
 --- query
-set engine = v2;
 query reopened_identity($ids: [String]) {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.@id in $ids
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.@id in $ids
     return { $i.slug }
 }
 
@@ -492,13 +439,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query reopened_integer() {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.code in [1, 3, 7, 9]
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.code in [1, 3, 7, 9]
     return { $i.slug }
 }
 
@@ -517,13 +460,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query reopened_date($days: [Date]) {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.day in $days
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.day in $days
     return { $i.slug }
 }
 
@@ -545,13 +484,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query reopened_string() {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        $i.word in ["alpha", "gamma", "theta", "omega"]
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and $i.word in ["alpha", "gamma", "theta", "omega"]
     return { $i.slug }
 }
 
@@ -570,13 +505,9 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 
 --- query
-set engine = v2;
 query reopened_negated() {
-    match {
-        $r: Root { rid: "root" }
-        $r holds $i
-        not ($i.code in [1, 3, 7, 9])
-    }
+    match { $r: Root, $r holds $i }
+    where $r.rid = "root" and not ($i.code in [1, 3, 7, 9])
     return { $i.slug }
 }
 

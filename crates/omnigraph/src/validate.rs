@@ -95,9 +95,11 @@ pub(crate) enum AccessPath {
     Scan,
 }
 
-/// Keys per batched committed probe: uniqueness holders and `@card` edges.
-/// Bounds the pushed-down filter size, since a merge delta is not row-capped
-/// and a load holds many keyed batches of `KEYED_WRITE_MAX_ROWS` rows.
+/// Keys per batched committed probe: uniqueness holders and `@card` edges,
+/// and the ids per membership predicate of a `delete` over a write group's
+/// selection rows. Bounds the pushed-down filter size, since a merge delta is
+/// not row-capped, a load holds many keyed batches of `KEYED_WRITE_MAX_ROWS`
+/// rows, and a delete's selection is bounded only by the removed-id budget.
 pub(crate) const PROBE_CHUNK_KEYS: usize = 8_192;
 
 /// How one node removal reads an edge table for the committed edges that
@@ -1256,7 +1258,7 @@ mod endpoint_probe_tests {
             db.load(
                 "main",
                 r#"{"edge":"Link","from":"keep","to":"keep"}"#,
-                LoadMode::Append,
+                LoadMode::Insert,
             )
             .await
             .unwrap();

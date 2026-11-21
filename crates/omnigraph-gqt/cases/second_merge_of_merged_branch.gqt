@@ -25,7 +25,7 @@ branch create b0
 
 --- mutate branch: b0
 query insert_on_b0() {
-    insert Person { name: "bob" }
+    replace Person { name: "bob" }
 }
 
 --- expect affected: nodes=1 edges=0

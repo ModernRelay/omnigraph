@@ -1,0 +1,60 @@
+# issue: none
+# notes: Whitespace may follow a minus sign (section 7 of the GQ 3 RFC): a unary minus, a parameter default's sign and a
+# notes: negative number in a list each read as the tight spelling.
+
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)?
+    payload: Blob?
+}
+node Collection {
+    slug: String @key
+    min_docs: I32
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+edge In: Doc -> Collection
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":2}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+
+--- query
+query q($floor: I32 = - 3) {
+    match { $p: Person }
+    where - $p.age in [- 36, - 1] and - $p.age < $floor
+    return { $p.name, - $p.age as negated }
+}
+
+--- expect unordered
+{"p.name":"Ada","negated":-36}
+
+--- expect shape
+p.name: String
+negated: I32?

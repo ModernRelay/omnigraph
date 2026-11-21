@@ -5,6 +5,7 @@ use arrow_ord::cmp;
 use arrow_schema::Fields;
 use datafusion::arrow::compute::kernels::boolean;
 use omnigraph_compiler::catalog::NodeType;
+use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_planner::PhysicalNode;
 
 /// Node type per pipeline binding, for projecting a bare `$p` as one struct,
@@ -13,6 +14,9 @@ use omnigraph_planner::PhysicalNode;
 pub(super) struct ProjectionContext {
     catalog: Arc<Catalog>,
     bindings: HashMap<String, String>,
+    /// Each edge binding an `Expand` names, with whether its selection
+    /// spans several edge types, whose rows then carry the type column.
+    edges: HashMap<String, bool>,
 }
 
 impl ProjectionContext {
@@ -20,6 +24,7 @@ impl ProjectionContext {
     /// node type, an `Expand` binds its destination, inner trees included.
     pub(super) fn for_plan(catalog: &Arc<Catalog>, plan: &PhysicalPlan) -> Self {
         let mut bindings = HashMap::new();
+        let mut edges = HashMap::new();
         for (_, node) in plan.live() {
             match node {
                 PhysicalNode::Scan { spec, .. } | PhysicalNode::MetadataCount { spec, .. } => {
@@ -28,8 +33,17 @@ impl ProjectionContext {
                         bindings.insert(binding.clone(), type_name.to_string());
                     }
                 }
-                PhysicalNode::Expand { dst, dst_type, .. } => {
+                PhysicalNode::Expand {
+                    dst,
+                    dst_type,
+                    edges: selection,
+                    edge_binding,
+                    ..
+                } => {
                     bindings.insert(dst.clone(), dst_type.clone());
+                    if let Some(edge) = edge_binding {
+                        edges.insert(edge.clone(), selection.named().is_none());
+                    }
                 }
                 PhysicalNode::SortMergeJoin { .. }
                 | PhysicalNode::HashJoin { .. }
@@ -38,13 +52,19 @@ impl ProjectionContext {
                 | PhysicalNode::RowCompare { .. }
                 | PhysicalNode::ClassifyThreeWay { .. }
                 | PhysicalNode::Limit { .. }
+                | PhysicalNode::TargetCut { .. }
+                | PhysicalNode::Score { .. }
+                | PhysicalNode::Let { .. }
                 | PhysicalNode::Page { .. }
                 | PhysicalNode::CrossJoin { .. }
                 | PhysicalNode::ContainsJoin { .. }
                 | PhysicalNode::Filter { .. }
                 | PhysicalNode::AntiJoin { .. }
+                | PhysicalNode::OptionalJoin { .. }
+                | PhysicalNode::Correlate { .. }
+                | PhysicalNode::Union { .. }
                 | PhysicalNode::OuterReference { .. }
-                | PhysicalNode::RankFuse { .. }
+                | PhysicalNode::Fuse { .. }
                 | PhysicalNode::Projection { .. }
                 | PhysicalNode::Aggregate { .. }
                 | PhysicalNode::Sort { .. }
@@ -57,6 +77,7 @@ impl ProjectionContext {
         Self {
             catalog: Arc::clone(catalog),
             bindings,
+            edges,
         }
     }
 
@@ -81,7 +102,19 @@ impl ProjectionContext {
             ExprType::ExactInteger { .. } => Err(OmniError::manifest_internal(
                 "internal exact integer cannot be a public result field",
             )),
-            ExprType::Node { type_name } => {
+            ExprType::Edge {
+                type_name,
+                nullable,
+            } => {
+                let fields = self.catalog.edge_object_fields(type_name).ok_or_else(|| {
+                    OmniError::manifest_internal(format!("edge type {type_name} is absent"))
+                })?;
+                Ok(Field::new(name, DataType::Struct(fields), *nullable))
+            }
+            ExprType::Node {
+                type_name,
+                nullable,
+            } => {
                 let node = self.catalog.query_node_type(type_name).ok_or_else(|| {
                     OmniError::manifest_internal(format!("node type {type_name} is absent"))
                 })?;
@@ -91,7 +124,7 @@ impl ProjectionContext {
                         Field::new(member, field.data_type().clone(), field.is_nullable())
                     })
                     .collect();
-                Ok(Field::new(name, DataType::Struct(fields.into()), false))
+                Ok(Field::new(name, DataType::Struct(fields.into()), *nullable))
             }
         }
     }
@@ -103,17 +136,16 @@ impl ProjectionContext {
 }
 
 #[cfg(test)]
-pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String, String>) {
+pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<String, String>) {
     for op in pipeline {
         match op {
-            IROp::NodeScan {
+            PatternStep::NodeScan {
                 variable,
                 type_name,
-                filters: _,
             } => {
                 out.insert(variable.clone(), type_name.clone());
             }
-            IROp::Expand {
+            PatternStep::Expand {
                 src_var: _,
                 dst_var,
                 edges: _,
@@ -121,17 +153,37 @@ pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String,
                 dst_type,
                 min_hops: _,
                 max_hops: _,
-                dst_filters: _,
                 edge_binding: _,
             } => {
                 out.insert(dst_var.clone(), dst_type.clone());
             }
-            IROp::Filter(_) => {}
-            IROp::AntiJoin {
+            PatternStep::Filter { .. }
+            | PatternStep::Rank { .. }
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. } => {}
+            PatternStep::AntiJoin {
                 outer_var: _,
                 inner,
                 predicate: _,
+                fails: _,
             } => collect_node_bindings(inner, out),
+            PatternStep::Optional {
+                outer_var: _,
+                inner,
+                ..
+            }
+            | PatternStep::Correlate {
+                outer_var: _,
+                inner,
+                read: _,
+                fails: _,
+            } => collect_node_bindings(inner, out),
+            PatternStep::Union { arms, .. } => {
+                arms.iter().for_each(|arm| collect_node_bindings(arm, out))
+            }
+            PatternStep::Fuse { arms, .. } => arms
+                .iter()
+                .for_each(|arm| collect_node_bindings(&arm.steps, out)),
         }
     }
 }
@@ -183,7 +235,7 @@ pub(super) fn kept_rows(mask: &BooleanArray) -> BooleanArray {
 /// most [`PRE_SELECTION_SHARE`] of the rows are selected, only those rows are
 /// evaluated, over just the columns `filter` reads, so an expensive operand
 /// skips the rows a cheaper one already removed. Above that share every row
-/// is evaluated, the unselected ones included.
+/// is evaluated, the unselected ones included, unless `filter` can fail.
 ///
 /// So the result never depends on the unselected rows, but whether they are
 /// evaluated does, through how many rows of the same batch are selected. That
@@ -206,7 +258,9 @@ pub(super) fn evaluate_filter_where(
     if kept == 0 {
         return Ok(BooleanArray::new_null(rows));
     }
-    if kept == rows || kept as f64 > rows as f64 * PRE_SELECTION_SHARE {
+    // A term that can fail is evaluated on the selected rows alone: `and`
+    // and `or` are guards, so an unselected row must not fail it.
+    if kept == rows || (!filter.can_fail() && kept as f64 > rows as f64 * PRE_SELECTION_SHARE) {
         return evaluate_filter(batch, filter, params);
     }
     let reads = columns_read(batch, filter).unwrap_or_else(|| batch.clone());
@@ -256,7 +310,7 @@ fn evaluate_boolean(
     filter: &IRExpr,
     params: &ParamMap,
 ) -> Result<BooleanArray> {
-    match filter {
+    omnigraph_compiler::stack::deep(|| match filter {
         IRExpr::Binary {
             left,
             op: BinaryOp::Compare(op),
@@ -302,18 +356,19 @@ fn evaluate_boolean(
         }
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Param(_, _)
         | IRExpr::Literal(_, _)
         | IRExpr::Aggregate { .. }
         | IRExpr::AliasRef(_, _)
-        | IRExpr::Cast { .. } => Err(OmniError::manifest_internal("expected a Boolean operator")),
-    }
+        | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. }
+        | IRExpr::Binary {
+            op: BinaryOp::Arith(_),
+            ..
+        } => Err(OmniError::manifest_internal("expected a Boolean operator")),
+    })
 }
 
 fn boolean_mask(values: ArrayRef, expr: &IRExpr) -> Result<BooleanArray> {
@@ -360,6 +415,7 @@ pub(super) fn compare_arrays(
             right.data_type()
         )));
     }
+    let (left, right) = (&positive_zero(left)?, &positive_zero(right)?);
     match op {
         CompOp::Eq => cmp::eq(left, right),
         CompOp::Ne => cmp::neq(left, right),
@@ -374,51 +430,163 @@ pub(super) fn compare_arrays(
     .map_err(OmniError::arrow_internal)
 }
 
+/// The array with every `-0.0` replaced by `0.0`, for a comparison.
+///
+/// Arrow's comparison kernels compare floats by their bits (the total
+/// order), where `-0.0` and `0.0` differ; a comparison treats them as equal,
+/// as IEEE 754 does and as a filter Lance evaluates in the scan does. Sorting,
+/// `distinct` and grouping keep the total order, so only comparisons call
+/// this.
+pub(super) fn positive_zero(values: &ArrayRef) -> Result<ArrayRef> {
+    Ok(match values.data_type() {
+        DataType::Float64 => {
+            let values = values
+                .as_any()
+                .downcast_ref::<arrow_array::Float64Array>()
+                .ok_or_else(|| OmniError::manifest_internal("F64 array of another layout"))?;
+            Arc::new(values.unary::<_, arrow_array::types::Float64Type>(|value| {
+                if value == 0.0 { 0.0 } else { value }
+            }))
+        }
+        DataType::Float32 => {
+            let values = values
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .ok_or_else(|| OmniError::manifest_internal("F32 array of another layout"))?;
+            Arc::new(values.unary::<_, arrow_array::types::Float32Type>(|value| {
+                if value == 0.0 { 0.0 } else { value }
+            }))
+        }
+        _ => values.clone(),
+    })
+}
+
 /// Execute an expression in its recorded type and check the produced array.
 pub(super) fn evaluate_expr(
     batch: &RecordBatch,
     expr: &IRExpr,
     params: &ParamMap,
 ) -> Result<ArrayRef> {
-    let values: ArrayRef = match expr {
-        IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } => {
-            Arc::new(evaluate_boolean(batch, expr, params)?)
+    omnigraph_compiler::stack::deep(|| {
+        let values: ArrayRef = match expr {
+            IRExpr::Binary {
+                left,
+                op: BinaryOp::Arith(op),
+                right,
+                ty: _,
+            } => {
+                let left = evaluate_expr(batch, left, params)?;
+                let right = evaluate_expr(batch, right, params)?;
+                super::arith::binary(*op, &left, &right)?
+            }
+            IRExpr::Neg { expr: child, .. } => {
+                let values = evaluate_expr(batch, child, params)?;
+                super::arith::negate(&values)?
+            }
+            // `if` evaluates its condition, then each branch only on the rows
+            // that select it, and `coalesce` each argument only on the rows still
+            // null: a branch not taken never fails (A3).
+            IRExpr::Call {
+                func: ScalarFunc::If,
+                args,
+                ty,
+            } if args.len() == 3 => {
+                let cond = evaluate_expr(batch, &args[0], params)?;
+                let taken: BooleanArray = cond
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| OmniError::manifest_internal("`if` condition is not Boolean"))?
+                    .iter()
+                    .map(|value| Some(value == Some(true)))
+                    .collect();
+                let other = boolean::not(&taken).map_err(OmniError::arrow_internal)?;
+                let then = evaluate_selected(batch, &args[1], params, &taken)?;
+                let otherwise = evaluate_selected(batch, &args[2], params, &other)?;
+                super::arith::call(ScalarFunc::If, &[cond, then, otherwise], ty)?
+            }
+            IRExpr::Call {
+                func: ScalarFunc::Coalesce,
+                args,
+                ty,
+            } if !args.is_empty() => {
+                let mut values = evaluate_expr(batch, &args[0], params)?;
+                for next in &args[1..] {
+                    let missing = boolean::is_null(&values).map_err(OmniError::arrow_internal)?;
+                    let next = evaluate_selected(batch, next, params, &missing)?;
+                    values = super::arith::call(ScalarFunc::Coalesce, &[values, next], ty)?;
+                }
+                values
+            }
+            // The break's rows read their arguments' stored types too: a
+            // `cast` converts from its argument's.
+            IRExpr::Call { func, args, ty } if super::scalar_rows::is_row(*func) => {
+                let arrays = args
+                    .iter()
+                    .map(|arg| evaluate_expr(batch, arg, params))
+                    .collect::<Result<Vec<_>>>()?;
+                let types: Vec<&omnigraph_compiler::types::ExprType> =
+                    args.iter().map(IRExpr::ty).collect();
+                super::scalar_rows::call(*func, &arrays, &types, ty)?
+            }
+            IRExpr::Call { func, args, ty } => {
+                let args = args
+                    .iter()
+                    .map(|arg| evaluate_expr(batch, arg, params))
+                    .collect::<Result<Vec<_>>>()?;
+                super::arith::call(*func, &args, ty)?
+            }
+            IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } => {
+                Arc::new(evaluate_boolean(batch, expr, params)?)
+            }
+            IRExpr::Cast { expr: child, ty } => {
+                let values = evaluate_expr(batch, child, params)?;
+                super::typed_value::cast_array(&values, child, ty)?
+            }
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => {
+                let col_name = property_column(variable, property);
+                Arc::clone(batch.column_by_name(&col_name).ok_or_else(|| {
+                    OmniError::manifest(format!("column '{col_name}' not found in wide batch"))
+                })?)
+            }
+            IRExpr::Literal(lit, ty) => typed_literal_to_array(lit, ty, batch.num_rows())?,
+            IRExpr::Param(name, ty) => {
+                let lit = params.get(name).ok_or_else(|| {
+                    OmniError::manifest(format!("parameter '{name}' not provided"))
+                })?;
+                typed_literal_to_array(lit, ty, batch.num_rows())?
+            }
+            IRExpr::AliasRef(name, _) => alias_column(batch, name)?,
+            IRExpr::Nearest { .. } | IRExpr::Variable(_, _) | IRExpr::Aggregate { .. } => {
+                return Err(OmniError::manifest(format!(
+                    "unsupported expression in filter: {expr}"
+                )));
+            }
+        };
+        super::typed_value::check_array_type_of(&values, expr.ty(), || expr.to_string())?;
+        Ok(values)
+    })
+}
+
+/// `expr` evaluated on the rows `selected` keeps alone, null on the others;
+/// a row not selected is never evaluated, so it never fails.
+fn evaluate_selected(
+    batch: &RecordBatch,
+    expr: &IRExpr,
+    params: &ParamMap,
+    selected: &BooleanArray,
+) -> Result<ArrayRef> {
+    omnigraph_compiler::stack::deep(|| {
+        if selected.true_count() == batch.num_rows() {
+            return evaluate_expr(batch, expr, params);
         }
-        IRExpr::Cast { expr: child, ty } => {
-            let values = evaluate_expr(batch, child, params)?;
-            super::typed_value::cast_array(&values, child, ty)?
-        }
-        IRExpr::PropAccess {
-            variable, property, ..
-        } => {
-            let col_name = property_column(variable, property);
-            Arc::clone(batch.column_by_name(&col_name).ok_or_else(|| {
-                OmniError::manifest(format!("column '{col_name}' not found in wide batch"))
-            })?)
-        }
-        IRExpr::Literal(lit, ty) => typed_literal_to_array(lit, ty, batch.num_rows())?,
-        IRExpr::Param(name, ty) => {
-            let lit = params
-                .get(name)
-                .ok_or_else(|| OmniError::manifest(format!("parameter '{name}' not provided")))?;
-            typed_literal_to_array(lit, ty, batch.num_rows())?
-        }
-        IRExpr::AliasRef(name, _) => alias_column(batch, name)?,
-        IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Aggregate { .. } => {
-            return Err(OmniError::manifest(format!(
-                "unsupported expression in filter: {expr}"
-            )));
-        }
-    };
-    check_array_type(&values, expr.ty(), &expr.to_string())?;
-    Ok(values)
+        let rows = arrow_select::filter::filter_record_batch(batch, selected)
+            .map_err(OmniError::arrow_internal)?;
+        let values = evaluate_expr(&rows, expr, params)?;
+        datafusion::physical_expr_common::utils::scatter(selected, &values)
+            .map_err(|err| OmniError::manifest_internal(err.to_string()))
+    })
 }
 
 /// The wide-batch column that holds `variable.property`. Evaluation and
@@ -516,8 +684,9 @@ pub(super) fn array_value_eq(
     if left.is_null(left_index) || right.is_null(right_index) {
         return Ok(false);
     }
-    let equal = arrow_ord::cmp::eq(&left.slice(left_index, 1), &right.slice(right_index, 1))
-        .map_err(OmniError::arrow_internal)?;
+    let left = positive_zero(&left.slice(left_index, 1))?;
+    let right = positive_zero(&right.slice(right_index, 1))?;
+    let equal = arrow_ord::cmp::eq(&left, &right).map_err(OmniError::arrow_internal)?;
     Ok(equal.value(0))
 }
 
@@ -554,86 +723,193 @@ pub(super) fn evaluate_projection(
             let arr = typed_literal_to_array(lit, ty, wide_batch.num_rows())?;
             Ok((name.clone(), arr))
         }
+        IRExpr::Variable(
+            name,
+            omnigraph_compiler::types::ExprType::Edge {
+                type_name,
+                nullable,
+            },
+        ) => {
+            let members = ctx.catalog.edge_object_members(type_name).ok_or_else(|| {
+                OmniError::manifest_internal(format!("edge type {type_name} is absent"))
+            })?;
+            let node = result_object(wide_batch, name, &members, *nullable)?;
+            Ok((name.clone(), node))
+        }
         IRExpr::Variable(name, ty) => {
             let node_type = ctx.node_type(name).ok_or_else(|| {
                 OmniError::manifest(format!("variable '{}' is not a node binding", name))
             })?;
-            if ty
-                != &(omnigraph_compiler::types::ExprType::Node {
-                    type_name: node_type.name.clone(),
-                })
-            {
+            let omnigraph_compiler::types::ExprType::Node {
+                type_name,
+                nullable,
+            } = ty
+            else {
+                return Err(OmniError::manifest_internal(
+                    "node variable type disagrees with its binding",
+                ));
+            };
+            if *type_name != node_type.name {
                 return Err(OmniError::manifest_internal(
                     "node variable type disagrees with its binding",
                 ));
             }
-            let wide_schema = wide_batch.schema();
-            let mut fields: Vec<Field> = Vec::new();
-            let mut columns: Vec<ArrayRef> = Vec::new();
-            for (member, field) in node_type.node_object_members() {
-                let col_name = format!("{}.{}", name, field.name());
-                let (idx, _wide_field) =
-                    wide_schema.column_with_name(&col_name).ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "column '{}' not found in wide batch",
-                            col_name
-                        ))
-                    })?;
-                let col = wide_batch.column(idx).clone();
-                if col.data_type() != field.data_type()
-                    || !field.is_nullable() && col.null_count() != 0
-                {
-                    return Err(OmniError::manifest_internal(format!(
-                        "node member {col_name} violates its declared field"
-                    )));
-                }
-                fields.push(Field::new(
-                    member,
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                ));
-                columns.push(col);
-            }
-            let node = StructArray::try_new(Fields::from(fields), columns, None)
-                .map_err(OmniError::arrow_internal)?;
-            Ok((name.clone(), Arc::new(node) as ArrayRef))
+            let members: Vec<(String, Field)> = node_type
+                .node_object_members()
+                .map(|(member, field)| (member.to_string(), field.as_ref().clone()))
+                .collect();
+            let node = result_object(wide_batch, name, &members, *nullable)?;
+            Ok((name.clone(), node))
         }
-        IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } | IRExpr::Cast { .. } => {
-            Ok((expr.to_string(), evaluate_expr(wide_batch, expr, params)?))
-        }
+        IRExpr::Binary { .. }
+        | IRExpr::Not(_, _)
+        | IRExpr::IsNull { .. }
+        | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. } => Ok((expr.to_string(), evaluate_expr(wide_batch, expr, params)?)),
         IRExpr::AliasRef(name, _) => Ok((name.clone(), alias_column(wide_batch, name)?)),
-        IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Aggregate { .. } => Err(OmniError::manifest(format!(
+        IRExpr::Nearest { .. } | IRExpr::Aggregate { .. } => Err(OmniError::manifest(format!(
             "unsupported projection expression: {}",
             expr
         ))),
     }
 }
 
+/// A reference's object: one member per `(member, field)` of `members`, read
+/// from the binding's column `<variable>.<field>`. A reference an `optional`
+/// introduces (`nullable`) is a null object where its identity is null, the
+/// rows the `optional` kept without a match; a null in a member the field
+/// declares non-null anywhere else fails.
+fn result_object(
+    wide_batch: &RecordBatch,
+    variable: &str,
+    members: &[(String, Field)],
+    nullable: bool,
+) -> Result<ArrayRef> {
+    let mut fields = Vec::with_capacity(members.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(members.len());
+    let mut absent = None;
+    for (member, field) in members {
+        let col_name = format!("{variable}.{}", field.name());
+        let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
+            OmniError::manifest(format!("column '{col_name}' not found in wide batch"))
+        })?;
+        if nullable && member == "@id" {
+            absent = col.logical_nulls();
+        }
+        if col.data_type() != field.data_type()
+            || !field.is_nullable() && !nullable && col.null_count() != 0
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "object member {col_name} violates its declared field"
+            )));
+        }
+        fields.push(Field::new(
+            member,
+            field.data_type().clone(),
+            field.is_nullable(),
+        ));
+        columns.push(col.clone());
+    }
+    let object = StructArray::try_new(Fields::from(fields), columns, absent)
+        .map_err(OmniError::arrow_internal)?;
+    Ok(Arc::new(object))
+}
+
 /// What `count($var)` counts: the binding's identity column, one per row and
 /// never null, under the bare `$var` projection's name. The scan behind the
-/// binding is pruned to it (`projection_pushdown`, #704), so no node struct is built.
+/// binding is pruned to it (`projection_pushdown`), so no node struct is
+/// built. A node binding's identity is its id; an edge binding's is its id
+/// too, and for an edge over several types, whose rows carry the edge type,
+/// its type and id together, joined by a NUL that no type name holds, so
+/// `count(distinct $k)` tells two types' equal ids apart. Which of the two
+/// follows from the binding's declared selection, never from the columns the
+/// batch happens to hold: a selection over several types whose rows lack the
+/// type column fails.
 pub(super) fn identity_column(
     wide_batch: &RecordBatch,
     variable: &str,
     ctx: &ProjectionContext,
 ) -> Result<(String, ArrayRef)> {
-    if ctx.node_type(variable).is_none() {
-        return Err(OmniError::manifest(format!(
-            "variable '{}' is not a node binding",
-            variable
-        )));
-    }
     let col_name = format!("{}.{}", variable, ctx.catalog.system_columns.id);
     let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
         OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
     })?;
-    Ok((variable.to_string(), col.clone()))
+    if ctx.node_type(variable).is_some() {
+        return Ok((variable.to_string(), col.clone()));
+    }
+    let type_name = format!(
+        "{variable}.{}",
+        omnigraph_compiler::traversal::EDGE_TYPE_COLUMN
+    );
+    let types = match ctx.edges.get(variable) {
+        Some(false) => return Ok((variable.to_string(), col.clone())),
+        Some(true) => wide_batch.column_by_name(&type_name).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "edge binding '{variable}' spans several edge types but its rows carry no '{type_name}'"
+            ))
+        })?,
+        None => match wide_batch.column_by_name(&type_name) {
+            Some(types) => types,
+            None => return Ok((variable.to_string(), col.clone())),
+        },
+    };
+    let as_strings = |array: &ArrayRef, name: &str| {
+        array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .cloned()
+            .ok_or_else(|| OmniError::manifest_internal(format!("column '{name}' is not a String")))
+    };
+    let (ids, types) = (as_strings(col, &col_name)?, as_strings(types, &type_name)?);
+    let identities: StringArray = (0..ids.len())
+        .map(|row| {
+            (ids.is_valid(row) && types.is_valid(row))
+                .then(|| format!("{}\0{}", types.value(row), ids.value(row)))
+        })
+        .collect();
+    Ok((variable.to_string(), Arc::new(identities)))
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use omnigraph_compiler::catalog::build_catalog;
+    use omnigraph_compiler::schema::parser::parse_schema;
+
+    fn context(edges: &[(&str, bool)]) -> ProjectionContext {
+        let schema = "node P {\n  k: String @key\n}\nedge A: P -> P\nedge B: P -> P\n";
+        ProjectionContext {
+            catalog: Arc::new(build_catalog(&parse_schema(schema).unwrap()).unwrap()),
+            bindings: HashMap::new(),
+            edges: edges.iter().map(|(n, m)| (n.to_string(), *m)).collect(),
+        }
+    }
+
+    fn ids_only(catalog: &Catalog) -> RecordBatch {
+        let name = format!("k.{}", catalog.system_columns.id);
+        RecordBatch::try_from_iter([(
+            name.as_str(),
+            Arc::new(StringArray::from(vec!["e1", "e1"])) as ArrayRef,
+        )])
+        .unwrap()
+    }
+
+    /// An edge over one type counts by its id; one over several types needs
+    /// the type column its rows carry, and fails rather than merging two
+    /// types' equal ids when the batch lacks it.
+    #[test]
+    fn an_edge_identity_follows_the_declared_selection() {
+        let one = context(&[("k", false)]);
+        let (_, ids) = identity_column(&ids_only(&one.catalog), "k", &one).unwrap();
+        assert_eq!(ids.len(), 2);
+        let several = context(&[("k", true)]);
+        let error = identity_column(&ids_only(&several.catalog), "k", &several).unwrap_err();
+        assert!(
+            error.to_string().contains("spans several edge types"),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(test)]

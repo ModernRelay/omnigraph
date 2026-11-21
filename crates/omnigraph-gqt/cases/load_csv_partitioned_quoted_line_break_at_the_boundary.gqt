@@ -247,10 +247,8 @@ load executed: partitions 1 rows 83
 
 --- query
 query specials() {
-    match {
-        $i: Item
-        $i.n < 0
-    }
+    match { $i: Item }
+    where $i.n < 0
     return { $i.id, $i.name, $i.n }
 }
 

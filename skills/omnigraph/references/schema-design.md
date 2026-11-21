@@ -158,7 +158,7 @@ things.
 
 **In Omnigraph:** use `@key` on a semantic slug or a composite `@key(a, b)`;
 give edges `@key(@src, @dst[, prop])` so repeated inserts upsert instead of
-duplicating, and load with `--mode merge`. Put an `@embed` vector on text that
+duplicating, and load with `--mode replace`. Put an `@embed` vector on text that
 agents must deduplicate, populate it with `omnigraph embed`, and have writers
 run a `nearest(...)` lookup before inserting. Use `@rename_from` so a rename
 keeps identity and history.
@@ -171,7 +171,7 @@ node Customer {
     name: String
     name_embedding: Vector(3072)? @embed("name")   // writers run nearest() on it before inserting
 }
-edge Attended: Person -> Meeting { @key(@src, @dst) }   // recording the same attendance twice upserts
+edge Attended: Person -> Meeting { @key(@src, @dst) }   // a `replace` of the same attendance twice writes one edge
 ```
 
 ### 2. Kinds are types; roles are edges
@@ -364,10 +364,8 @@ needs the same query for conclusions:
 ```gq
 // GraphPolicy pol-assertion-has-span, check_query: assertions_without_span
 query assertions_without_span() {
-    match {
-        $a: Assertion
-        not { $a extractedFrom $s }
-    }
+    match { $a: Assertion }
+    where not exists { $s: TranscriptSegment, $a extractedFrom $s }
     return { $a.slug }
 }
 ```
@@ -389,10 +387,8 @@ well supported an assertion is instead of storing a `support_count`.
 
 ```gq
 query support_count($slug: String) {
-    match {
-        $a: Assertion { slug: $slug }
-        $s supports $a
-    }
+    match { $a: Assertion, $s supports $a }
+    where $a.slug = $slug
     return { count($s) as supporting }
 }
 ```
@@ -465,7 +461,7 @@ Agents use it in three ways:
 - **Before writing**, read the active policies, so writes conform from the
   start.
 - **To lint**, run each policy's `check_query` for mechanical rules (usually a
-  `not { ... }` negation that returns the rows that break it), and apply the
+  `not exists { ... }` negation that returns the rows that break it), and apply the
   `statement` with judgment for rules a query cannot express.
 - **To fix**, correct small breaks directly and propose larger ones on a branch
   for review.
@@ -484,7 +480,7 @@ node or adds, moves or removes one of its edges, so a non-zero minimum such as
 load, and schema apply refuses a new required link from an existing node type.
 It does not count a node until a write touches it, so nodes older versions
 wrote without the link can sit below the minimum, and a traversal along that
-link silently misses them. Give every required link an orphan check, the same `not { ... }`
+link silently misses them. Give every required link an orphan check, the same `not exists { ... }`
 shape as the example below ([principle 6](#6-layer-derived-knowledge-over-raw-sources)
 shows one for extraction lineage).
 
@@ -495,10 +491,8 @@ query:
 ```gq
 // GraphPolicy pol-strategic-has-owner, check_query: strategic_without_owner
 query strategic_without_owner() {
-    match {
-        $c: Customer { tier: "strategic" }
-        not { $c accountOwner $p }
-    }
+    match { $c: Customer }
+    where $c.tier = "strategic" and not exists { $p: Person, $c accountOwner $p }
     return { $c.slug }
 }
 ```
@@ -565,7 +559,7 @@ Design for both halves of retrieval.
   omission.
 - **Precision**: specific edge types and filterable properties (time, status,
   source kind, confidence) let an agent take exactly the part of a
-  neighbourhood it needs; a generic `RelatedTo` edge or a hub node returns
+  neighborhood it needs; a generic `RelatedTo` edge or a hub node returns
   everything and therefore nothing. Make retrievable units the size of an
   answer (a claim, a segment), not a whole document.
 - **Together**: traverse to scope the candidate set completely, then rank
@@ -590,12 +584,11 @@ unit you want back, not on a whole document.
 ```gq
 query customer_evidence($slug: String, $q: String) {
     match {
-        $c: Customer { slug: $slug }
-        $a: Assertion
-        $a about $c
+      let $pop = { match { $c: Customer, $a: Assertion, $a about $c } where $c.slug = $slug return { $c, $a } },
+      from nearest($pop, $a.embedding, $q, k: 10) as $distance,
     }
     return { $a.statement }
-    order { nearest($a.embedding, $q) }
+    order { $distance }
     limit 10
 }
 ```

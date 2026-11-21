@@ -36,12 +36,12 @@ name,title
 carol,cfo
 
 --- mutate
-load csv "new_person.csv" into node:Person mode append header
+load csv "new_person.csv" into node:Person mode insert header
 
 --- expect error: @card violation on edge WorksAt: source 'carol' has 0 edges (min 1)
 
 --- mutate
-load csv "new_person.csv" into node:Person mode merge header
+load csv "new_person.csv" into node:Person mode replace header
 
 --- expect error: @card violation on edge WorksAt: source 'carol' has 0 edges (min 1)
 
@@ -61,14 +61,14 @@ name,title
 alice,cto
 
 --- mutate
-load csv "retitle.csv" into node:Person mode merge header
+load csv "retitle.csv" into node:Person mode replace header
 
 --- expect ok
 
 --- expect plan
 load route: pipeline
 load validate source_cardinality node:Person edge:WorksAt: access probe
-load write: merge upsert
+load write: replace upsert
 
 --- csv everyone.csv
 name,title
@@ -97,11 +97,7 @@ load csv "bob_only.csv" into edge:WorksAt mode overwrite header
 
 --- query
 query employment() {
-    match {
-        $p: Person
-        $c: Company
-        $p worksAt $c
-    }
+    match { $p: Person, $c: Company, $p worksAt $c }
     return { $p.name, $p.title, $c.name }
 }
 

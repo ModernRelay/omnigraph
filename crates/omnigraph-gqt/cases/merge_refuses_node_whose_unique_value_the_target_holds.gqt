@@ -30,11 +30,11 @@ branch create b
 --- expect ok
 
 --- mutate branch: b
-query ins_b() { insert Person { id: "p000008", email: "e000008" } }
+query ins_b() { replace Person { id: "p000008", email: "e000008" } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query ins_main() { insert Person { id: "p000009", email: "e000008" } }
+query ins_main() { replace Person { id: "p000009", email: "e000008" } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate

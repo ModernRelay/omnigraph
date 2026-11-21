@@ -24,8 +24,22 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// (`correlated` or `key_set`). Version 10 adds to version 9 every table's
 /// `source` (`dataset` or `catalogue`) and the assumptions' catalogue
 /// fingerprints. Version 11 adds to version 10 a literal arm for an integer
-/// outside the `i64` range, carried as its decimal text.
-pub const BOUND_PLAN_VERSION: u32 = 11;
+/// outside the `i64` range, carried as its decimal text. Version 12 adds to
+/// version 11 an `rrf`'s `weights`, on its expression and its `RankFuse`.
+/// Version 13 replaces version 12's two-arm `RankFuse`, its `rrf`
+/// expression and its fused order key with a `Fuse` node over 2 to 16 arm
+/// subtrees, each with its rank kind. Version 14 removes from version 13
+/// the native ranked `bm25` scan: the `bm25` rank kind and expression, a
+/// ranked scan's `eligibility`, a pre-pass's `on_empty` and
+/// `coverage_admits`, and the assumptions' full-text coverage. Version 15
+/// removes from version 14 a ranked scan's `kind`, which named `nearest`,
+/// the one ranking a scan computes. Version 16 adds to version 15 the
+/// assumptions' `plan_work`, the read's plan budget and the work typing,
+/// shaping and planning charged to it, which a replay's compile must
+/// charge again. Version 17 adds to version 16 the `collect` aggregate and
+/// its `list` accumulator. Version 18 adds to version 17 the `stddev` and
+/// `percentile` aggregates and an aggregate's `fraction`.
+pub const BOUND_PLAN_VERSION: u32 = 18;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

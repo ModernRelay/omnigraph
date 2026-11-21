@@ -1,0 +1,305 @@
+# issue: none
+# notes: Every population shape the retired fusion prefilter gate decided over (single and multi-hop
+# notes: traversals, a filtered destination, both directions, several hops, a block, a ranked destination,
+# notes: no traversal) fuses two exact `bm25` arms and a `nearest` window over that population, and each
+# notes: answer agrees with the reference interpreter: every arm ranks the population's distinct targets,
+# notes: whatever the traversal that admits them. The traversals leave the nearest Chunks (c00, c01)
+# notes: without an edge, so a window over the whole type would miss the population.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Chunk {
+    slug: String @key
+    text: String @index(fulltext, analyzer = "standard_v1")
+    embedding: Vector(2) @index
+}
+node Artifact {
+    slug: String @key
+}
+edge ChunkOfArtifact: Chunk -> Artifact
+edge ChunkCites: Chunk -> Chunk
+
+--- seed
+{"type":"Chunk","data":{"slug":"c00","text":"needle sharp","embedding":[0.0,0.0]}}
+{"type":"Chunk","data":{"slug":"c01","text":"needle","embedding":[1.0,0.0]}}
+{"type":"Chunk","data":{"slug":"c02","text":"sharp needle needle","embedding":[2.0,0.0]}}
+{"type":"Chunk","data":{"slug":"c03","text":"hay","embedding":[3.0,0.0]}}
+{"type":"Chunk","data":{"slug":"c04","text":"needle hay","embedding":[4.0,0.0]}}
+{"type":"Chunk","data":{"slug":"c05","text":"sharp","embedding":[5.0,0.0]}}
+{"type":"Chunk","data":{"slug":"c06","text":"needle needle needle","embedding":[6.0,0.0]}}
+{"type":"Chunk","data":{"slug":"c07","text":"sharp sharp","embedding":[7.0,0.0]}}
+{"type":"Artifact","data":{"slug":"art-0"}}
+{"type":"Artifact","data":{"slug":"art-1"}}
+{"edge":"ChunkOfArtifact","from":"c02","to":"art-0"}
+{"edge":"ChunkOfArtifact","from":"c03","to":"art-1"}
+{"edge":"ChunkOfArtifact","from":"c04","to":"art-0"}
+{"edge":"ChunkOfArtifact","from":"c06","to":"art-1"}
+{"edge":"ChunkCites","from":"c02","to":"c03"}
+{"edge":"ChunkCites","from":"c03","to":"c05"}
+{"edge":"ChunkCites","from":"c05","to":"c06"}
+{"edge":"ChunkCites","from":"c07","to":"c02"}
+
+--- query
+query single_hop($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c02","score":0.048915917504}
+{"c.slug":"c06","score":0.016393442623}
+{"c.slug":"c03","score":0.016129032258}
+{"c.slug":"c04","score":0.015873015873}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query filtered_population($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where match_terms($c.text, terms($q1, mode: any)) return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c02","score":0.048915917504}
+{"c.slug":"c04","score":0.032002048131}
+{"c.slug":"c06","score":0.016393442623}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query multi_hop($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk, $d: Chunk, $c chunkCites{1,2} $d } return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c02","score":0.048659901119}
+{"c.slug":"c07","score":0.016393442623}
+{"c.slug":"c03","score":0.016129032258}
+{"c.slug":"c05","score":0.016129032258}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query multi_hop_min_two($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk, $d: Chunk, $c chunkCites{2,2} $d } return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c02","score":0.048915917504}
+{"c.slug":"c07","score":0.016393442623}
+{"c.slug":"c03","score":0.016129032258}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query destination_filtered($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where $a.slug = "art-0" return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c02","score":0.049180327869}
+{"c.slug":"c04","score":0.032258064516}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query direction_both($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk, $d: Chunk, $c <chunkCites> $d } return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c02","score":0.048395490754}
+{"c.slug":"c06","score":0.016393442623}
+{"c.slug":"c07","score":0.016393442623}
+{"c.slug":"c03","score":0.016129032258}
+{"c.slug":"c05","score":0.016129032258}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query direction_in($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk, $d: Chunk, $d chunkCites $c } return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c02","score":0.048651507139}
+{"c.slug":"c05","score":0.016393442623}
+{"c.slug":"c06","score":0.016393442623}
+{"c.slug":"c03","score":0.016129032258}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query several_expands($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk, $a: Artifact, $d: Chunk, $c chunkOfArtifact $a, $c chunkCites $d } return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c02","score":0.049180327869}
+{"c.slug":"c03","score":0.016129032258}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query block_only($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk } where not exists { $a: Artifact, $c chunkOfArtifact $a } return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c00","score":0.048395490754}
+{"c.slug":"c01","score":0.032522474881}
+{"c.slug":"c07","score":0.016393442623}
+{"c.slug":"c05","score":0.016129032258}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query ranked_destination($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $d: Chunk, $c: Chunk, $d chunkCites $c } return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c02","score":0.048651507139}
+{"c.slug":"c05","score":0.016393442623}
+{"c.slug":"c06","score":0.016393442623}
+{"c.slug":"c03","score":0.016129032258}
+
+--- expect shape
+c.slug: String
+score: F64
+
+--- query
+query no_traversal($q1: String, $q2: String) {
+    match {
+      let $pop = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($pop, $c.text, $q1), bm25($pop, $c.text, $q2), nearest($pop, $c.embedding, [0.0, 0.0], k: 2), k: 60) as $score,
+    }
+    return { $c.slug, $score }
+    order { $score desc, $c.slug }
+    limit 5
+}
+
+--- params
+{"q1": "needle", "q2": "sharp"}
+
+--- expect ordered
+{"c.slug":"c00","score":0.047891458496}
+{"c.slug":"c01","score":0.032258064516}
+{"c.slug":"c02","score":0.031498015873}
+{"c.slug":"c06","score":0.016393442623}
+{"c.slug":"c07","score":0.016393442623}
+
+--- expect shape
+c.slug: String
+score: F64

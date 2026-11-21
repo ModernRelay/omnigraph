@@ -1,0 +1,256 @@
+# issue: none
+# notes: `match_terms(field, terms(…))` is a predicate and a Boolean operand like any other
+# notes: (the GQ 3 RFC, section 4, "The lexical query"): standing alone,
+# notes: under `not` and `or`, compared with a value, in a `let`, in a count block and an
+# notes: `exists`, and in a write's selection. `mode: all` (the default) needs every analyzed
+# notes: query term in the document, `mode: any` one of them; repeating or reordering query
+# notes: terms changes nothing, and a null title never matches. The twins `t1` and `t5` are
+# notes: inserted after the index was built, into a fragment no full-text segment covers, and
+# notes: are answered as their indexed originals are. Read as a value, in `return`, `order` or an
+# notes: aggregate, the call is the same Boolean (`full_text_calls_read_as_values.gqt`).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String? @index(fulltext, analyzer = "standard_folded_v1")
+    year: I64
+}
+node Person {
+    name: String @key
+}
+edge Wrote: Person -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"Graph Engines","year":2020}}
+{"type":"Doc","data":{"slug":"d2","title":"graph search","year":2021}}
+{"type":"Doc","data":{"slug":"d3","title":"Databases","year":1999}}
+{"type":"Doc","data":{"slug":"d4","year":2022}}
+{"type":"Doc","data":{"slug":"d5","title":"search engines","year":2023}}
+{"type":"Person","data":{"name":"ada"}}
+{"type":"Person","data":{"name":"bob"}}
+{"type":"Person","data":{"name":"cy"}}
+{"type":"Person","data":{"name":"dee"}}
+{"edge":"Wrote","from":"ada","to":"d1","data":{}}
+{"edge":"Wrote","from":"bob","to":"d3","data":{}}
+{"edge":"Wrote","from":"cy","to":"d5","data":{}}
+
+--- query
+query every_term() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("graph engines", mode: all))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query every_term_by_default_repeated_and_reordered() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("engines graph graph", max_edits: 0))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query any_term() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("graph engines", mode: any))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d2"}
+{"d.slug": "d5"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query every_term_from_a_parameter($q: String) {
+    match { $d: Doc }
+    where match_terms($d.title, terms($q))
+    return { $d.slug }
+}
+
+--- params
+{"q": "search engines"}
+
+--- expect unordered
+{"d.slug": "d5"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query not_every_term() {
+    match { $d: Doc }
+    where not match_terms($d.title, terms("graph engines"))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d2"}
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+{"d.slug": "d5"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query every_term_or_old() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("search engines")) or $d.year < 2000
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d3"}
+{"d.slug": "d5"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query compared_with_false() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("graph")) = false
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+{"d.slug": "d5"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query matched_in_a_let() {
+    match { $d: Doc, let $hit = match_terms($d.title, terms("engines", mode: any)) }
+    where $hit and $d.year > 2020
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d5"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query wrote_about_engines() {
+    match { $p: Person }
+    where count { $d: Doc, $p wrote $d where match_terms($d.title, terms("engines")) } > 0
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "ada"}
+{"p.name": "cy"}
+
+--- expect shape
+p.name: String
+
+--- query
+query wrote_nothing_but_engines() {
+    match { $p: Person }
+    where not exists { $d: Doc, $p wrote $d where not match_terms($d.title, terms("engines")) }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "ada"}
+{"p.name": "cy"}
+{"p.name": "dee"}
+
+--- expect shape
+p.name: String
+
+--- query
+query counted() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("graph search", mode: any))
+    return { count($d) as n }
+}
+
+--- expect unordered
+{"n": 3}
+
+--- expect shape
+n: I64
+
+--- mutate
+query twins() {
+    replace Doc { slug: "t1", title: "Graph Engines", year: 2020 }
+    replace Doc { slug: "t5", title: "search engines", year: 2023 }
+}
+
+--- expect ok
+
+--- query
+query every_term_after_insert() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("graph engines"))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "t1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query not_any_term_after_insert() {
+    match { $d: Doc }
+    where not match_terms($d.title, terms("graph engines", mode: any))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+
+--- expect shape
+d.slug: String
+
+--- mutate
+query backdate_search_engines() {
+    match { $d: Doc } where match_terms($d.title, terms("engines search"))
+    update $d set { year: 1990 }
+}
+
+--- expect ok
+
+--- query
+query backdated() {
+    match { $d: Doc }
+    where $d.year = 1990
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d5"}
+{"d.slug": "t5"}
+
+--- expect shape
+d.slug: String

@@ -1,0 +1,135 @@
+# issue: 1278
+# red_on: none; guard case pinning whole-row replacement, edition 2's keyed insert, which `replace` keeps
+# notes: `replace` on an existing key writes the whole row: every nullable property the statement omits becomes null (scalar, list and vector here; Blob in writes.rs), an explicit `null` clears too, and a missing required property is refused on an existing key as on a new one. `upsert` and `update` set only named properties (issue_1278_upsert_keeps_omitted_properties.gqt).
+# notes: The same holds on a branch, leaves main untouched, and survives a restart.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String
+    n: I64?
+    tags: [String]?
+    emb: Vector(3)?
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"one","n":7,"tags":["a","b"],"emb":[1.0,2.0,3.0]}}
+{"type":"Doc","data":{"slug":"d2","title":"two","n":8,"tags":["c"],"emb":[4.0,5.0,6.0]}}
+{"type":"Doc","data":{"slug":"d3","title":"three","n":9,"tags":["d"],"emb":[7.0,8.0,9.0]}}
+
+--- mutate
+query replace_d1() {
+    replace Doc { slug: "d1", title: "new" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query clear_d2_n() {
+    replace Doc { slug: "d2", title: "two", n: null, tags: ["c"], emb: [4.0, 5.0, 6.0] }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.n, $d.tags, $d.emb }
+}
+
+--- expect unordered
+{"d.slug":"d1","d.title":"new"}
+{"d.emb":[4.0,5.0,6.0],"d.slug":"d2","d.tags":["c"],"d.title":"two"}
+{"d.emb":[7.0,8.0,9.0],"d.n":9,"d.slug":"d3","d.tags":["d"],"d.title":"three"}
+--- expect shape
+d.slug: String
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(3)?
+
+--- mutate
+query existing_key_without_title() {
+    replace Doc { slug: "d3", n: 1 }
+}
+
+--- expect error: type error: T12:
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query replace_d3_on_feature() {
+    replace Doc { slug: "d3", title: "branch" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: feature
+query d3() {
+    match { $d: Doc } where $d.slug = "d3"
+    return { $d.title, $d.n, $d.tags, $d.emb }
+}
+
+--- expect unordered
+{"d.title":"branch"}
+--- expect shape
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(3)?
+
+--- restart
+
+--- query
+query d3() {
+    match { $d: Doc } where $d.slug = "d3"
+    return { $d.title, $d.n, $d.tags, $d.emb }
+}
+
+--- expect unordered
+{"d.emb":[7.0,8.0,9.0],"d.n":9,"d.tags":["d"],"d.title":"three"}
+--- expect shape
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(3)?
+
+--- query branch: feature
+query d3() {
+    match { $d: Doc } where $d.slug = "d3"
+    return { $d.title, $d.n, $d.tags, $d.emb }
+}
+
+--- expect unordered
+{"d.title":"branch"}
+--- expect shape
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(3)?
+
+--- query
+query d1() {
+    match { $d: Doc } where $d.slug = "d1"
+    return { $d.title, $d.n, $d.tags, $d.emb }
+}
+
+--- expect unordered
+{"d.title":"new"}
+--- expect shape
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(3)?

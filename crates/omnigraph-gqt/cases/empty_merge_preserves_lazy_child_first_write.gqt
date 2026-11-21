@@ -25,7 +25,8 @@ branch create parent
 
 --- mutate branch: parent
 query parent_first_write() {
-    update Person set { age: 31 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -47,7 +48,8 @@ branch merge main into parent
 
 --- mutate branch: parent
 query owner_next_write() {
-    update Person set { age: 32 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 32 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -69,7 +71,7 @@ p.age: I32
 
 --- mutate branch: child
 query child_first_write() {
-    insert Person { name: "bob", age: 40 }
+    replace Person { name: "bob", age: 40 }
 }
 
 --- expect affected: nodes=1 edges=0

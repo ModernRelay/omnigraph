@@ -1,0 +1,92 @@
+# issue: none
+# notes: `update` takes an edge variable as it takes a node variable: it sets the properties it names on every selected edge, keyed or not, keeps the others, and `null` clears one. Endpoints and keys stay as they were (assigning one is T93, in diagnostics/).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    since: I32?
+    note: String?
+    @key(@src, @dst)
+}
+
+edge Mentors: Person -> Person {
+    weight: I32
+    note: String?
+}
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","from":"a","to":"b","data":{"since":2001,"note":"school"}}
+{"edge":"Knows","from":"a","to":"c","data":{"since":2002,"note":"work"}}
+{"edge":"Mentors","from":"b","to":"c","data":{"weight":1,"note":"first"}}
+{"edge":"Mentors","from":"b","to":"c","data":{"weight":2,"note":"second"}}
+
+--- mutate
+query knows_since() {
+    match { $a: Person, $b: Person, $a $k:knows $b } where $b.name = "b"
+    update $k set { since: 2020 }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query clear_note() {
+    match { $a: Person, $b: Person, $a $k:knows $b } where $b.name = "c"
+    update $k set { note: null }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query heavier_mentoring() {
+    match { $a: Person, $b: Person, $a $m:mentors $b } where $a.name = "b"
+    update $m set { weight: 5 }
+}
+
+--- expect affected: nodes=0 edges=2
+
+--- query
+query knows() {
+    match { $a: Person, $b: Person, $a $k:knows $b }
+    return { $a.name, $b.name, $k.since, $k.note }
+}
+
+--- expect unordered
+{"a.name":"a","b.name":"b","k.note":"school","k.since":2020}
+{"a.name":"a","b.name":"c","k.since":2002}
+--- expect shape
+a.name: String
+b.name: String
+k.since: I32?
+k.note: String?
+
+--- query
+query mentors() {
+    match { $a: Person, $b: Person, $a $m:mentors $b }
+    return { $a.name, $b.name, $m.weight, $m.note }
+}
+
+--- expect unordered
+{"a.name":"b","b.name":"c","m.note":"first","m.weight":5}
+{"a.name":"b","b.name":"c","m.note":"second","m.weight":5}
+--- expect shape
+a.name: String
+b.name: String
+m.weight: I32
+m.note: String?

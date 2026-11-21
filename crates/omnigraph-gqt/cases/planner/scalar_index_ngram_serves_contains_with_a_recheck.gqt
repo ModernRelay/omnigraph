@@ -1,0 +1,414 @@
+# issue: none
+# traversal: auto
+# notes: `@index` on a String builds an NGRAM beside its BTREE, and no full-text index (the GQ 3
+# notes: RFC section 4, "Scalar indexes"). `contains` probes it for candidates (lowercased, ASCII-folded trigrams)
+# notes: and Lance rechecks each with the case-sensitive substring test, so a case-mismatched or accent-folded
+# notes: needle returns the scan's rows. A needle shorter than three characters, a needle with no alphanumeric
+# notes: trigram (which Lance 13 would answer with no row, so the engine pushes it in a form no index answers)
+# notes: and a negated `contains` take the scan. Rows equal the reference interpreter's and an unindexed twin's;
+# notes: a null text never matches. The appended rows lie outside the index (partial coverage). A delete
+# notes: through a trigram-less needle removes its row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Note {
+    slug: String @key
+    text: String? @index
+}
+node PlainNote {
+    slug: String @key
+    text: String?
+}
+
+--- seed
+{"type": "Note", "data": {"slug": "n1", "text": "Hello World"}}
+{"type": "Note", "data": {"slug": "n2", "text": "hello there"}}
+{"type": "Note", "data": {"slug": "n3"}}
+{"type": "Note", "data": {"slug": "n4", "text": "a-b c"}}
+{"type": "Note", "data": {"slug": "n5", "text": "café crème"}}
+{"type": "Note", "data": {"slug": "n6", "text": "WORLDWIDE web"}}
+{"type": "PlainNote", "data": {"slug": "n1", "text": "Hello World"}}
+{"type": "PlainNote", "data": {"slug": "n2", "text": "hello there"}}
+{"type": "PlainNote", "data": {"slug": "n3"}}
+{"type": "PlainNote", "data": {"slug": "n4", "text": "a-b c"}}
+{"type": "PlainNote", "data": {"slug": "n5", "text": "café crème"}}
+{"type": "PlainNote", "data": {"slug": "n6", "text": "WORLDWIDE web"}}
+
+--- query
+query contains_exact_case_indexed() {
+    match { $n: Note }
+    where contains($n.text, "World")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n1"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access index_probe text ngram
+
+--- query
+query contains_exact_case_unindexed() {
+    match { $n: PlainNote }
+    where contains($n.text, "World")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n1"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- query
+query contains_other_case_indexed() {
+    match { $n: Note }
+    where contains($n.text, "world")
+    return { $n.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access index_probe text ngram
+
+--- query
+query contains_other_case_unindexed() {
+    match { $n: PlainNote }
+    where contains($n.text, "world")
+    return { $n.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- query
+query contains_lower_indexed() {
+    match { $n: Note }
+    where contains($n.text, "hello")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n2"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access index_probe text ngram
+
+--- query
+query contains_lower_unindexed() {
+    match { $n: PlainNote }
+    where contains($n.text, "hello")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n2"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- query
+query contains_accented_indexed() {
+    match { $n: Note }
+    where contains($n.text, "café")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n5"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access index_probe text ngram
+
+--- query
+query contains_accented_unindexed() {
+    match { $n: PlainNote }
+    where contains($n.text, "café")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n5"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- query
+query contains_folded_accent_indexed() {
+    match { $n: Note }
+    where contains($n.text, "cafe")
+    return { $n.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access index_probe text ngram
+
+--- query
+query contains_folded_accent_unindexed() {
+    match { $n: PlainNote }
+    where contains($n.text, "cafe")
+    return { $n.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- query
+query contains_short_indexed() {
+    match { $n: Note }
+    where contains($n.text, "lo")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n1"}
+{"n.slug": "n2"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access sequential
+
+--- query
+query contains_short_unindexed() {
+    match { $n: PlainNote }
+    where contains($n.text, "lo")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n1"}
+{"n.slug": "n2"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- query
+query contains_no_trigram_indexed() {
+    match { $n: Note }
+    where contains($n.text, "a-b")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n4"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access sequential
+
+--- query
+query contains_no_trigram_unindexed() {
+    match { $n: PlainNote }
+    where contains($n.text, "a-b")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n4"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- query
+query not_contains_indexed() {
+    match { $n: Note }
+    where not contains($n.text, "hello")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n1"}
+{"n.slug": "n4"}
+{"n.slug": "n5"}
+{"n.slug": "n6"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access sequential
+
+--- query
+query not_contains_unindexed() {
+    match { $n: PlainNote }
+    where not contains($n.text, "hello")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n1"}
+{"n.slug": "n4"}
+{"n.slug": "n5"}
+{"n.slug": "n6"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- mutate
+query append_notes() {
+    replace Note { slug: "n7", text: "hello world again" }
+    replace PlainNote { slug: "n7", text: "hello world again" }
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query appended_contains_lower_indexed() {
+    match { $n: Note }
+    where contains($n.text, "hello")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n2"}
+{"n.slug": "n7"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access index_probe text ngram
+
+--- query
+query appended_contains_lower_unindexed() {
+    match { $n: PlainNote }
+    where contains($n.text, "hello")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n2"}
+{"n.slug": "n7"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- query
+query appended_contains_no_trigram_indexed() {
+    match { $n: Note }
+    where contains($n.text, "a-b")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n4"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access sequential
+
+--- query
+query appended_contains_no_trigram_unindexed() {
+    match { $n: PlainNote }
+    where contains($n.text, "a-b")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n4"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan PlainNote as $n: access sequential
+
+--- mutate
+query delete_no_trigram() {
+    match { $n: Note } where contains($n.text, "a-b")
+    delete $n
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query deleted_no_trigram_indexed() {
+    match { $n: Note }
+    where contains($n.text, "a-b")
+    return { $n.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access sequential
+
+--- query
+query deleted_no_trigram_lower() {
+    match { $n: Note }
+    where contains($n.text, "hello")
+    return { $n.slug }
+}
+
+--- expect unordered
+{"n.slug": "n2"}
+{"n.slug": "n7"}
+
+--- expect shape
+n.slug: String
+
+--- expect plan
+scan Note as $n: access index_probe text ngram

@@ -65,9 +65,9 @@ omnigraph export --target production --graph knowledge \
 For `load --from <base> --branch <review>`, inspect the review branch rather
 than assuming branch creation means the load landed. Strict inserts of unkeyed
 nodes and edges can duplicate on a blind retry. Mutation `insert` and
-`load --mode merge` upsert keyed nodes and keyed edges (`@key(@src, @dst, …)`)
+`load --mode replace` upsert keyed nodes and keyed edges (`@key(@src, @dst, …)`)
 by their derived logical IDs;
-`load --mode append` remains strict and reports an ID collision. Verification
+`load --mode insert` remains strict and reports an ID collision. Verification
 is still safer when the requested value matters.
 
 ## Conditional mutations
@@ -105,9 +105,9 @@ route.
   unchanged retry need not succeed. Use `--if-commit` to refuse a write when
   the head moved. Commit conflicts use generic `conflict`,
   so HTTP `409` alone does not identify a retryable case.
-- `key_conflict`: an append or strict insert found an existing id. Decide
-  whether that entity is the intended one; do not silently turn the operation
-  into an upsert.
+- `key_conflict`: an `insert` statement or load found an existing id. Decide
+  whether that entity is the intended one; a retried job should have used
+  `upsert` or `replace`, but do not switch silently.
 - `writer_fenced` (HTTP `409` with `writer_fenced: {held?, read?, current}`):
   the branch's writer epoch refused the writing process, because another
   process claimed the branch or the serving one holds no claim. Nothing was

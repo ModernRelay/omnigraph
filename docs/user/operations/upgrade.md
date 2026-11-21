@@ -7,10 +7,17 @@ graph at v8 or v9 (release 0.11.x) or at v13 is converted in place by that offli
 format, and every cluster-managed graph below v14, is refused and takes the
 [export/import rebuild](#rebuild) with the binary that wrote the graph.
 
-For an upgrade from 0.15.0, check your graph format, access policies and
-maintenance scripts against the [0.16.0 upgrade actions](../../releases/v0.16.0-overview.md#upgrade-actions).
+For an upgrade from 0.15.0, check your graph format, access policies and maintenance scripts against the [0.16.0 upgrade actions](../../releases/v0.16.0-overview.md#upgrade-actions).
 Start with the [0.13 → 0.14 checklist](upgrade-0.14.md) for fleet,
 CLI configuration, HTTP/MCP, and client compatibility changes.
+
+## Query language (GQ 3)
+
+This release parses GQ 3 only: a stored query or `.gq` file written for an
+earlier release fails to compile, and [Upgrading queries to GQ
+3](../queries/upgrading-to-gq3.md) maps each older form to its GQ 3 form. Validate stored queries with the new binary first (`omnigraph queries validate`), rewrite the failing ones from their printed fixes (`omnigraph lint --fix` applies them), and apply the rewritten registry in the same step as the binary switch, since an older server cannot load the new syntax ([procedure](../queries/upgrading-to-gq3.md#stored-queries-at-upgrade)). Each declaration of a stored file is available on its own: one that fails is unavailable with its own diagnostic, one that calls it is unavailable naming it, and the rest of the file serves. `omnigraph version` and `/healthz` name the query language (`gq3`); an earlier binary names none.
+
+A schema apply that stores a [one-way construct](../queries/upgrading-to-gq3.md#schemas), which `schema plan` and `cluster plan` name first, makes an earlier binary refuse the whole graph until the backup is restored. After `index rebuild --kind full-text` it refuses full-text reads, and its own `index rebuild --kind full-text` restores them; `index build` and `optimize` never recommend it.
 
 ## Storage upgrade
 
@@ -139,11 +146,17 @@ migration, but the full-text upgrade below. v0.14 moves to Lance 13 with graph
 format 16 and V2_2 data files unchanged: no `omnigraph upgrade` for a format-16
 graph, and full-text indexes stay searchable, the analyzer being unchanged.
 
-Neither transition is rolling-compatible. Update the CLI, server, and client
-integrations together with application traffic stopped, never run an old and new
-fleet against the same graph, and keep the old executables and a verified whole-root
-backup until the upgrade is proven: a graph the new fleet has written is not qualified
-for the old reader ([Lance contract](../../dev/versioning.md#lance-contract), [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility)).
+Neither transition is rolling-compatible. Update the CLI, server, and client integrations together
+with traffic stopped, never run an old and new fleet against the same graph, and keep the old
+executables and a verified whole-root backup until the upgrade is proven ([Lance contract](../../dev/versioning.md#lance-contract), [v0.10 compatibility notes](../../releases/v0.10.0.md#compatibility)).
+
+Once this release has built or rebuilt an index (`index build`, `index rebuild`, `optimize`, a
+schema apply, or a write declaring a column's first full-text index), rollback in place is not
+supported. An earlier binary refuses full-text search on that index, whose certificate records
+the field's [analyzer profile](../search/analyzers.md), and returns no rows. It reads the BITMAP,
+LABEL_LIST and NGRAM indexes [`@index` builds](../schema/index.md#what-index-builds), but rebuilds
+a lagging one as a BTREE or fails. To roll back, restore the backup taken before the upgrade, or
+rebuild the indexes with the earlier binary on each live branch; a stored one-way construct has no such repair.
 
 ## Full-text index upgrade
 
@@ -153,11 +166,10 @@ see the [v0.10 upgrade guide](https://github.com/ModernRelay/omnigraph/blob/v0.1
 for its branch inventory, rebuild and rollback steps. The current CLI cannot open
 v6, so a graph still on that format needs an [export/import rebuild](#rebuild).
 
-In v0.14, certified full-text indexes from Lance 11 remain searchable with
-Lance 13 because the analyzer generation is unchanged. Missing or incompatible
-analyzer proofs still fail closed. For a graph that normal open accepts
-(formats 14–17), use the explicit maintenance command on each branch that needs
-new indexes:
+No query reads a full-text index, so an earlier release's index changes no rows. An index
+qualifies only where its certificate's [analyzer profile](../search/analyzers.md) and terms
+over fixed probe texts match this binary's, never for an earlier release's index. For a graph
+that normal open accepts (formats 14–17), rebuild on each branch that needs new indexes:
 
 ```bash
 omnigraph index rebuild --kind full-text --target ./graph.omni --branch main --as operator --json
@@ -165,9 +177,9 @@ omnigraph index rebuild --kind full-text --target ./graph.omni --branch main --a
 
 Follow the [full-text maintenance procedure](maintenance.md#rebuild-full-text-indexes)
 for authorization, tokenizer changes and result checks. Rebuilding a live branch
-publishes its indexes in one graph commit; it leaves earlier snapshots unchanged,
-so those snapshots may still refuse full-text search. `optimize` is not a
-replacement for an analyzer rebuild.
+publishes its indexes in one graph commit and leaves earlier snapshots
+unchanged; a search reads no index, so it answers alike on either. `optimize`
+is not a replacement for an analyzer rebuild.
 
 A retained published commit under the current schema can start a branch with
 `branch create --from-commit <id>`; pre-upgrade commits are refused. See the

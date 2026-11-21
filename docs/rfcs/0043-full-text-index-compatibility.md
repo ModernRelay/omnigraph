@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - Andrew
 created: 2026-08-31
-updated: 2026-10-18
+updated: 2026-11-15
 discussion: null
 supersedes: []
 superseded_by: []
@@ -228,3 +228,12 @@ None for this slice. Incremental full-text proof propagation is out of scope.
   UUIDs and certificate bytes, and verify indexed and uncovered rows. This
   does not relax refusal of uncertified Lance 10 artifacts or qualify arbitrary
   rollback across a different analyzer generation.
+- 2026-11-15: A property may declare an analyzer profile
+  (docs/rfcs/2026-11-07-gq-3.md, section 4). Its segments are built with the
+  profile's explicit parameters, and a format-2 certificate records the
+  field's analyzer fingerprint beside the generation; verification compares it
+  with the accepted schema's, so a certificate of another analysis refuses.
+  Edition 2's analysis keeps format 1. Declaring or changing a profile
+  replaces the column's segments in the schema apply's publication by an
+  untrained segment of the new analysis; the explicit rebuild and the
+  reconciler build postings with the declared profile.

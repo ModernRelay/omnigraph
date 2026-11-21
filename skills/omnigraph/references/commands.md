@@ -204,7 +204,9 @@ omnigraph schema plan --schema next.pg --target $REPO --json
 omnigraph schema apply --schema next.pg --target $REPO
 ```
 
-Both commands require a direct target; server and managed targets refuse. Cluster-managed
+Both commands require a direct target; server and managed targets refuse. A
+plan with no step publishes nothing; `one_way_constructs` names what a binary
+before GQ 3 cannot read back. Cluster-managed
 graphs evolve through `cluster apply`. See `references/schema.md` for the full
 workflow.
 
@@ -235,9 +237,13 @@ executing.
 omnigraph lint --schema schema.pg --query queries/foo.gq --json
 # or against a live repo:
 omnigraph lint --query queries/foo.gq --target $REPO --json
+# write the printed fixes and canonical forms into the files:
+omnigraph lint --fix --query queries/ --schema schema.pg --dry-run
 ```
 
-`lint` is the single query-validation command. See `references/queries.md`.
+`lint` is the single query-validation command; `--fix` applies its fixes
+(`--config <dir>` for a cluster's stored queries, `--review-fixes` to apply
+`needs_review` ones). See `references/queries.md`.
 
 ## Embed
 
@@ -268,18 +274,18 @@ never overwrites an initialized graph or purges Lance datasets.
 
 ```bash
 # bare load: operates on an existing branch (default main); --mode is required
-omnigraph load --data seed.jsonl --mode merge --target $REPO
+omnigraph load --data seed.jsonl --mode replace --target $REPO
 
 # --from forks a missing branch from <base>, then loads onto it (one-shot review branch)
-omnigraph load --data delta.jsonl --branch feature-x --from main --mode merge --target $REPO
+omnigraph load --data delta.jsonl --branch feature-x --from main --mode replace --target $REPO
 ```
 
-`--mode` is **required** (no default): `merge`, `append`, or `overwrite`.
+`--mode` is **required** (no default): `insert`, `upsert`, `replace` or `overwrite`, each the write statement of its name; `append` and `merge` are refused with `insert` and `replace` as fixes.
 Address either direct storage or a served graph. See [`data.md`](data.md).
 
 `omnigraph load` reads JSONL only. Load one CSV object into one type with a
 `load csv` statement: `omnigraph mutate --target $REPO -e 'load csv
-"file:///data/person.csv" into node:Person mode append header'` (optional
+"file:///data/person.csv" into node:Person mode insert header'` (optional
 `delimiter "|"`, `columns (…)`, `--branch`). A served graph reads only `s3://`
 sources its external Blob policy admits. See
 [CSV loading](../../../docs/user/mutations/index.md#csv-loading).
@@ -352,11 +358,12 @@ Builds every declared index a table on the branch lacks (a type whose first rows
 landed there) and rebuilds each BTREE or vector index that leaves the branch's
 rows uncovered, in one graph commit on that branch; a second run is a no-op with
 a null `graph_commit_id`. Read `indexes` (`kind`, `action`: `built` or
-`refreshed`) and `pending_indexes`: full-text coverage stays pending with the
-`index rebuild --kind full-text` remedy, as do vector properties with no vectors.
-Only those are pending: a rebuild that fails for another reason, a storage
+`refreshed`) and `pending_indexes`: vector properties with no vectors. No
+query reads a full-text index, so its coverage is never pending and the build
+never recommends `index rebuild --kind full-text`, after which a binary before
+GQ 3 refuses full-text reads until its own rebuild. Only those are pending: a rebuild that fails for another reason, a storage
 failure for one, fails the command.
-The remedy for `FullTextIndexRequired` on any branch.
+No query waits on it: matching and `bm25` read the rows, not the index.
 
 ### `index rebuild` — explicit analyzer upgrade
 
@@ -368,11 +375,13 @@ omnigraph index rebuild --kind full-text --target "$REPO" --branch main --json
 
 Direct storage only; `--target <root> --graph <id>` also works. Stop overlapping
 writers, preserve a verified whole-store backup, and rebuild every live branch
-that needs search when moving from uncertified pre-Lance-11 indexes. Certified
-Lance 11 indexes remain compatible under Lance 13 and need no rebuild solely
-for that dependency change. Do not mix fleets across an incompatible analyzer
-transition. Rebuilds use default English analysis, replacing custom tokenizer
-settings; JSON `warnings` reports this for actual work. Check the selected
+that needs a full-text index for its field's profile. No GQ query reads a
+full-text index, so no query needs a rebuild; an index built by an earlier
+release, whose certificate names no analyzer profile, never qualifies for a
+native read. Do not mix fleets across an incompatible analyzer transition. An earlier binary refuses full-text search on an index this binary
+built or rebuilt, so roll back by restoring the backup
+([roll back](migrations.md#roll-back-to-an-earlier-binary)). Rebuilds use each property's analyzer profile (`english_v1` where
+none is declared), replacing custom tokenizer settings; JSON `warnings` reports this for actual work. Check the selected
 `branch`, `graph_commit_id`, and `rebuilt_indexes`; an empty list/null commit is
 a no-op, not a migration of other branches or historical snapshots. On a
 cluster graph the cluster's applied graph policy judges `--as` (`maintain` on

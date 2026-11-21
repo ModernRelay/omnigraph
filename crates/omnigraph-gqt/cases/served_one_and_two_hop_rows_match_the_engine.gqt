@@ -27,10 +27,7 @@ edge Knows: Person -> Person
 
 --- query
 query hop1() {
-    match {
-        $p: Person
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
     return { $p.name as person, $f.name as friend }
 }
 
@@ -45,11 +42,7 @@ friend: String
 
 --- query
 query hop2() {
-    match {
-        $p: Person
-        $p knows $f
-        $f knows $g
-    }
+    match { $p: Person, $p knows $f, $f knows $g }
     return { $p.name as person, $g.name as friend_of_friend }
 }
 

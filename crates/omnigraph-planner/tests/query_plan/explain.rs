@@ -5,7 +5,7 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
     let op = ir(
         vec![
             scan("a"),
-            IROp::Expand {
+            PatternStep::Expand {
                 src_var: "a".to_string(),
                 dst_var: "b".to_string(),
                 edges: EdgeSelection::Named(EdgeMember {
@@ -16,15 +16,18 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
                 dst_type: "T".to_string(),
                 min_hops: 1,
                 max_hops: Some(1),
-                dst_filters: vec![IRExpr::comparison(
+                edge_binding: None,
+            },
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
                     prop("b", "state"),
                     CompOp::Eq,
                     IRExpr::Literal(
                         Literal::String("open".into()),
                         value_type(ScalarType::String, false),
                     ),
-                )],
-                edge_binding: None,
+                ),
+                fails: false,
             },
         ],
         vec![prop("a", "slug")],
@@ -56,7 +59,7 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
     );
     assert!(matches!(plan.node(input), Some(LogicalNode::Expand { .. })));
     let json = plan.to_json();
-    let destination = &json["inputs"][0]["inputs"][0];
+    let destination = &under_cut(&json)["inputs"][0];
     assert_eq!(destination["node"], "TableScan");
     assert_eq!(destination["id_restriction"], "input");
     assert_eq!(destination["version"], 7);
@@ -70,11 +73,12 @@ fn the_explain_document_names_the_binding_and_the_projection() {
     let op = ir(vec![scan("c")], vec![prop("c", "slug")], vec![]);
     let (plan, _) = planned(&op);
     let json = plan.to_json();
-    let scan = json["inputs"][0]["inputs"][0].clone();
+    let scan = under_cut(&json)["inputs"][0].clone();
     assert_eq!(scan["node"], "TableScan");
     assert_eq!(scan["binding"], "c");
     assert_eq!(scan["table"], "node:T");
-    assert_eq!(scan["projection"], serde_json::json!(["slug"]));
+    // The `limit` cuts the tie rule's order, which reads the id.
+    assert_eq!(scan["projection"], serde_json::json!(["__id", "slug"]));
 }
 
 #[test]
@@ -88,7 +92,7 @@ fn physical_destination_scan_retains_its_input_and_does_not_claim_table_cardinal
         }],
     );
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -122,7 +126,7 @@ fn physical_destination_scan_retains_its_input_and_does_not_claim_table_cardinal
             .is_empty()
     );
     let json = physical.to_json();
-    let destination = &json["inputs"][0]["inputs"][0];
+    let destination = &under_cut(&json)["inputs"][0];
     assert_eq!(destination["node"], "Scan");
     assert_eq!(destination["id_restriction"], "input");
     assert_eq!(destination["inputs"][0]["node"], "Expand");
@@ -135,7 +139,7 @@ fn physical_destination_scan_retains_its_input_and_does_not_claim_table_cardinal
 fn physical_expand_carries_its_pinned_edge_version() {
     let source = source().with_edge_version("knows", 5);
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -148,7 +152,7 @@ fn physical_expand_carries_its_pinned_edge_version() {
         } if versions.get("knows") == Some(&Some(5))
     )));
     let json = physical.to_json();
-    let expand = &json["inputs"][0]["inputs"][0]["inputs"][0];
+    let expand = &under_cut(&json)["inputs"][0]["inputs"][0];
     assert_eq!(expand["node"], "Expand");
     assert_eq!(expand["versions"]["knows"], 5);
     let bound = omnigraph_planner::BoundPlan {
@@ -184,9 +188,10 @@ fn physical_anti_join_predicate_reads_back_equal() {
     let op = ir(
         vec![
             scan("a"),
-            IROp::AntiJoin {
+            PatternStep::AntiJoin {
+                fails: false,
                 outer_var: "a".to_string(),
-                inner: vec![expand("a", "x", vec![])],
+                inner: vec![expand("a", "x")],
                 predicate: predicate.clone(),
             },
         ],
@@ -228,12 +233,14 @@ fn physical_anti_join_predicate_reads_back_equal() {
     assert_eq!(restored, printed);
 }
 
-/// A plan's words are GQ: `Sort` keys carry their direction, a leading search
-/// function leads the declared ordering with its score column, and a query
-/// node prints no `schema` and the root scan its pinned version.
+/// A plan's words are GQ: `Sort` keys carry their direction and a written
+/// null placement (the declared ordering prints one only where it is not the
+/// direction's own), a leading search function leads the declared ordering
+/// with its score column, and a query node prints no `schema` and the root
+/// scan its pinned version.
 #[test]
 fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
-    let op = Operation::Query(Box::new(QueryIR {
+    let op = Operation::Query(Box::new(ReadShape {
         name: "q".to_string(),
         params: vec![],
         pipeline: vec![scan("c")],
@@ -251,13 +258,19 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
                     ty: value_type(ScalarType::F32, false),
                 },
                 descending: false,
+                nulls_first: None,
             },
             IROrdering {
                 expr: prop("c", "rank"),
                 descending: true,
+                nulls_first: Some(true),
             },
         ],
         limit: Some(10),
+        limit_param: None,
+        written_columns: Vec::new(),
+        made_up: Default::default(),
+        work: Default::default(),
     }));
     let (logical, _) = planned(&op);
     assert!(matches!(
@@ -283,12 +296,12 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     assert_eq!(sort["node"], "Sort");
     assert_eq!(
         sort["keys"],
-        serde_json::json!(["$c._distance asc", "$c.rank desc"])
+        serde_json::json!(["$c._distance asc", "$c.rank desc nulls first"])
     );
     assert_eq!(sort["fetch"], 10);
     assert_eq!(
         sort["properties"]["ordering"],
-        serde_json::json!(["$c._distance asc", "$c.rank desc", "$c.@id asc"]),
+        serde_json::json!(["$c._distance asc", "$c.rank desc nulls first", "$c.@id asc"]),
         "a sort's output order is its whole comparator, identity keys included"
     );
     assert!(sort["properties"].get("schema").is_none());
@@ -323,124 +336,13 @@ fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
     assert!(root_scan["properties"].get("schema").is_none());
 }
 
-/// A bare search order plans the score `Sort` the engine runs, with the
-/// query's limit as its fetch; a fusion plans the same `Sort` over its fused
-/// score column, and each arm keeps every cross-binding conjunct in its subtree.
-#[test]
-fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
-    let bm25 = IRExpr::Bm25 {
-        field: Box::new(prop("c", "text")),
-        query: Box::new(IRExpr::Param(
-            "t".to_string(),
-            value_type(ScalarType::String, false),
-        )),
-        ty: value_type(ScalarType::F32, false),
-    };
-    let (plan, _) = physical(
-        &ir(vec![scan("c")], vec![prop("c", "slug")], vec![bm25.clone()]),
-        &source(),
-    );
-    let json = plan.to_json();
-    assert_eq!(json["node"], "Page");
-    let sort = &json["inputs"][0];
-    assert_eq!(sort["node"], "Sort");
-    assert_eq!(sort["keys"], serde_json::json!(["$c._score desc"]));
-    assert_eq!(sort["fetch"], 10);
-    assert_eq!(sort["inputs"][0]["node"], "Projection");
-    let ranked = &sort["inputs"][0]["inputs"][0]["ranked"];
-    assert_eq!(ranked["kind"], "bm25");
-    assert_eq!(ranked["query"], "$t");
-    assert!(ranked["fetch"].is_null());
-
-    let rrf = IRExpr::Rrf {
-        primary: Box::new(IRExpr::Nearest {
-            variable: "c".to_string(),
-            property: "embedding".to_string(),
-            query: Box::new(IRExpr::Param(
-                "q".to_string(),
-                value_type(ScalarType::String, false),
-            )),
-            ty: value_type(ScalarType::F32, false),
-        }),
-        secondary: Box::new(bm25),
-        k: None,
-        ty: value_type(ScalarType::F64, false),
-    };
-    let contains = IRExpr::comparison(prop("c", "text"), CompOp::StringContains, prop("n", "slug"));
-    let residual = IRExpr::comparison(prop("n", "slug"), CompOp::Ne, prop("c", "slug"));
-    let (plan, _) = physical(
-        &ir(
-            vec![
-                scan("n"),
-                scan("c"),
-                IROp::Filter(
-                    IRExpr::and_all([contains.clone(), residual.clone()]).expect("two conjuncts"),
-                ),
-            ],
-            vec![prop("c", "slug")],
-            vec![rrf],
-        ),
-        &source(),
-    );
-    let json = plan.to_json();
-    assert_eq!(json["node"], "Page");
-    let sort = &json["inputs"][0];
-    assert_eq!(sort["node"], "Sort");
-    assert_eq!(sort["keys"], serde_json::json!(["$c._rrf desc"]));
-    assert_eq!(sort["fetch"], 10);
-    assert_eq!(sort["inputs"][0]["node"], "Projection");
-    let fuse = &sort["inputs"][0]["inputs"][0];
-    assert_eq!(fuse["node"], "RankFuse");
-    assert_eq!(fuse["limit"], 10);
-    assert!(fuse["k"].is_null());
-    assert!(fuse["properties"]["ordering"].is_null());
-    let arms = fuse["inputs"].as_array().expect("two arm inputs");
-    assert_eq!(arms.len(), 2);
-    assert_ne!(arms[0]["id"], arms[1]["id"]);
-    for (arm, (kind, scope)) in arms
-        .iter()
-        .zip([("nearest", "primary"), ("bm25", "secondary")])
-    {
-        assert_eq!(arm["node"], "CrossJoin", "{scope} arm");
-        assert_eq!(
-            arm["filters"],
-            serde_json::json!([contains.to_string(), residual.to_string()]),
-            "{scope} arm keeps every conjunct"
-        );
-        let inputs = arm["inputs"].as_array().expect("two join inputs");
-        assert_eq!(inputs.len(), 2);
-        assert_eq!(inputs[0]["node"], "Scan");
-        assert_eq!(inputs[0]["binding"], "n");
-        assert_eq!(inputs[1]["node"], "Scan");
-        assert_eq!(inputs[1]["binding"], "c");
-        assert!(
-            inputs
-                .iter()
-                .all(|scan| scan.get("runtime_filter").is_none())
-        );
-        assert_eq!(inputs[1]["ranked"]["kind"], kind);
-        assert_eq!(inputs[1]["ranked"]["scope"], scope);
-    }
-    assert_ne!(arms[0]["inputs"][0]["id"], arms[1]["inputs"][0]["id"]);
-    assert_ne!(arms[0]["inputs"][1]["id"], arms[1]["inputs"][1]["id"]);
-    assert_eq!(arms[0]["inputs"][1]["ranked"]["fetch"], 10);
-    assert!(arms[1]["inputs"][1]["ranked"]["fetch"].is_null());
-    assert_eq!(
-        plan.live()
-            .filter(|(_, node)| matches!(node, PhysicalNode::Sort { .. }))
-            .count(),
-        1,
-        "one Sort above the fusion, none inside an arm"
-    );
-}
-
 /// A `CrossJoin` collects its whole left side before it pairs, so that side
 /// is a build pipeline keeping its operators, the right side streams through
 /// the join, and a query's explain carries the plan's `pipelines`.
 #[test]
 fn a_cross_join_left_side_is_a_build_pipeline_and_a_query_explain_has_pipelines() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![]), scan("c")],
+        vec![scan("a"), expand("a", "b"), scan("c")],
         vec![prop("b", "slug"), prop("c", "slug")],
         vec![],
     );
@@ -488,8 +390,8 @@ fn a_cross_join_left_side_is_a_build_pipeline_and_a_query_explain_has_pipelines(
             .pipelines
             .as_ref()
             .map(|p| p.as_array().map(Vec::len)),
-        Some(Some(2)),
-        "the collected left side is drained first, the right side streams through the join"
+        Some(Some(3)),
+        "the collected left side is drained first, the right side streams through the join into the sort the `limit` cuts"
     );
     assert_eq!(
         explain.to_value()["pipelines"][1]["operators"][0]["name"],

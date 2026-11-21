@@ -1,0 +1,42 @@
+# issue: none
+# notes: An `optional` and a correlated block that write the same conjunct (`false`):
+# notes: plan validation tells the block's copy from the optional's. Found by the generated
+# notes: engine-equals-reference law (law_engine_reference.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p0: I64?
+}
+edge Rel0: A -> A
+
+--- seed
+{"type":"A","data":{"k":"a","p0":0}}
+{"type":"A","data":{"k":"c"}}
+{"edge":"Rel0","from":"a","to":"c","data":{}}
+{"edge":"Rel0","from":"a","to":"a","data":{}}
+
+--- query
+query q() { match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where false }, let $l3 = (count { $n4: A, $n1 rel0 $n4 where false }) } return { $n1.k as c0 } }
+
+--- expect unordered
+{"c0":"a"}
+{"c0":"c"}
+
+--- expect shape
+c0: String
+
+--- query
+query q() { match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where false }, $n1 rel0 $n1, let $l3 = (sum($n4.p0) { $n4: A, $n1 rel0 $n4 where (10 in [3]) }) } return { $n1.k as c0 } }
+
+--- expect unordered
+{"c0":"a"}
+
+--- expect shape
+c0: String

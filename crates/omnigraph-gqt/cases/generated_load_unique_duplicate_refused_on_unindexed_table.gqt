@@ -25,7 +25,7 @@ tables:
       id: {kind: key, prefix: p, width: 6}
       email: {kind: key, prefix: e, width: 6}
 
---- load generate: v1 seed: 44 mode: append
+--- load generate: v1 seed: 44 mode: insert
 tables:
   - kind: node
     name: Person

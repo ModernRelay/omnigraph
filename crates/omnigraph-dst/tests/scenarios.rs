@@ -564,7 +564,7 @@ fn dst_sessions_agree_and_replay() {
 #[test]
 #[serial]
 fn dst_maintenance_commit_uses_execution_branch() {
-    for (seed, write, op) in [(228_301, 84, 13), (228_317, 95, 9)] {
+    for (seed, write, op) in [(228_301, 78, 13), (228_317, 81, 9)] {
         let report = run_universe(
             &format!("shared-memory://dst-maintenance-commit-{seed}"),
             &Scenario {
@@ -2753,19 +2753,69 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
 /// vector, which fits the write budget as matched, but its 8 KiB title
 /// assignment takes it past the budget at staging, so the update reads the
 /// Blob, then stages the patch.
+///
+/// The keyed writes beside them: an `insert` of a new key (`InsertNewKey`)
+/// probes the key once in its strict preflight; an `upsert` of a new key
+/// (`UpsertNewKey`) reads the stored row its key would keep values from,
+/// finds none and stages as `replace` does; an `upsert` of an existing key
+/// that omits the Blob (`UpsertKeepBlob1M`) reads that row's omitted columns,
+/// the 1 MiB Blob's bytes included, and rewrites them; one that names the
+/// Blob (`UpsertKeepScalars`) reads only the omitted scalar and vector
+/// columns; and `replace` of an existing key (`ReplaceBlob1M`) reads no
+/// stored row. The load door's modes beside them: an `insert` load of a new
+/// key (`LoadInsertNewKey`), an `upsert` load of an existing key whose record
+/// omits the Blob and the vector (`LoadUpsertKeepBlob1M`), which reads them
+/// from the committed row and rewrites them, and a `replace` load of it
+/// (`LoadReplaceBlob1M`), which reads no stored row.
+///
+/// A Blob read from a row in an assignment: an `update` copying one row's
+/// 1 MiB Blob into another (`UpdateCopyBlob1M`) reads the source cell's
+/// descriptor by its id, then its bytes, and rewrites the target row; a
+/// `replace` copying all four rows' Blobs into four new keys
+/// (`ReplaceCopy4Blob1M`) reads the four source cells in one batched read.
 fn update_patch_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    content: Blob?\n    emb: Vector(8)?\n}\n";
     const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
+    // `rewrite`'s second statement on `Doc` is an insert whose selection, over
+    // another type, matches nothing: beside it the update writes whole rows.
+    const MARKED_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    content: Blob?\n    emb: Vector(8)?\n}\nnode Marker {\n    name: String @key\n}\n";
     const UPDATES: &str = r#"
 query patch() {
-    update Doc set { score: 1 } where slug = "d1"
+    match { $x: Doc } where $x.slug = "d1"
+    update $x set { score: 1 }
 }
 query rewrite() {
-    update Doc set { score: 2 } where slug = "d1"
-    update Doc set { score: 2 } where slug = "nobody"
+    match { $x: Doc } where $x.slug = "d1"
+    update $x set { score: 2 }
+    match { $m: Marker } where $m.name = "nobody"
+    replace Doc { slug: "never", age: 0 }
 }
 query widen($title: String) {
-    update Doc set { title: $title } where slug = "d1"
+    match { $x: Doc } where $x.slug = "d1"
+    update $x set { title: $title }
+}
+query insert_new() {
+    insert Doc { slug: "d9", age: 9 }
+}
+query upsert_new() {
+    upsert Doc { slug: "d9", age: 9 }
+}
+query upsert_keep_blob() {
+    upsert Doc { slug: "d1", age: 7 }
+}
+query upsert_keep_scalars() {
+    upsert Doc { slug: "d1", age: 7, content: null }
+}
+query replace_existing() {
+    replace Doc { slug: "d1", age: 7 }
+}
+query copy_one() {
+    match { $s: Doc, $t: Doc } where $s.slug = "d2" and $t.slug = "d1"
+    update $t set { content: $s.content }
+}
+query copy_all() {
+    match { $s: Doc }
+    replace Doc { slug: concat($s.slug, "-copy"), age: $s.age, content: $s.content }
 }
 "#;
 
@@ -2852,9 +2902,31 @@ query widen($title: String) {
                 omnigraph_compiler::ir::ParamMap::new()
             };
             omnigraph_dst::cost::set_label(self.label);
+            let load = match self.query {
+                "load_insert_new" => Some((
+                    LoadMode::Insert,
+                    r#"{"type":"Doc","data":{"slug":"d9","age":9}}"#,
+                )),
+                "load_upsert_keep_blob" => Some((
+                    LoadMode::Upsert,
+                    r#"{"type":"Doc","data":{"slug":"d1","age":7}}"#,
+                )),
+                "load_replace_existing" => Some((
+                    LoadMode::Replace,
+                    r#"{"type":"Doc","data":{"slug":"d1","age":7}}"#,
+                )),
+                _ => None,
+            };
+            if let Some((mode, record)) = load {
+                let result = db.load_jsonl(record, mode).await;
+                omnigraph_dst::cost::set_label("_update_verify");
+                result.unwrap();
+                return;
+            }
             let result = db.mutate("main", UPDATES, self.query, &params).await;
             omnigraph_dst::cost::set_label("_update_verify");
-            assert_eq!(result.unwrap().affected_nodes, 1);
+            let affected = if self.query == "copy_all" { 4 } else { 1 };
+            assert_eq!(result.unwrap().affected_nodes, affected);
         }
     }
 
@@ -2863,7 +2935,14 @@ query widen($title: String) {
         (SCHEMA, 8, 16 * 1024, "patch", None, "UpdatePatchBlob16K"),
         (SCHEMA, 8, 128 * 1024, "patch", None, "UpdatePatchBlob128K"),
         (SCHEMA, 8, 1024 * 1024, "patch", None, "UpdatePatchBlob1M"),
-        (SCHEMA, 8, 1024 * 1024, "rewrite", None, "UpdateRowsBlob1M"),
+        (
+            MARKED_SCHEMA,
+            8,
+            1024 * 1024,
+            "rewrite",
+            None,
+            "UpdateRowsBlob1M",
+        ),
         (
             WIDE_SCHEMA,
             2048,
@@ -2871,6 +2950,65 @@ query widen($title: String) {
             "widen",
             Some(12 * 1024),
             "UpdateRowsOverBudget",
+        ),
+        (SCHEMA, 8, 1024 * 1024, "insert_new", None, "InsertNewKey"),
+        (SCHEMA, 8, 1024 * 1024, "upsert_new", None, "UpsertNewKey"),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "upsert_keep_blob",
+            None,
+            "UpsertKeepBlob1M",
+        ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "upsert_keep_scalars",
+            None,
+            "UpsertKeepScalars",
+        ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "replace_existing",
+            None,
+            "ReplaceBlob1M",
+        ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "load_insert_new",
+            None,
+            "LoadInsertNewKey",
+        ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "load_upsert_keep_blob",
+            None,
+            "LoadUpsertKeepBlob1M",
+        ),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "load_replace_existing",
+            None,
+            "LoadReplaceBlob1M",
+        ),
+        (SCHEMA, 8, 1024 * 1024, "copy_one", None, "UpdateCopyBlob1M"),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "copy_all",
+            None,
+            "ReplaceCopy4Blob1M",
         ),
     ] {
         rows.push_str(&labeled_cost_rows(
@@ -2893,13 +3031,16 @@ query widen($title: String) {
 /// two table sizes: 2 and 16 fragments of 8 people, the id BTREE covering
 /// all of them (one index page at both sizes, so a lookup reads the same
 /// index bytes). A keyed `insert` (`KeyedInsert`), a whole-row `update`
-/// (`KeyedUpdate`) and a `load --mode merge` of one present and one new row
+/// (`KeyedUpdate`) and a `load --mode replace` of one present and one new row
 /// (`MergeLoadPresent`, `MergeLoadNew`) reach their rows through the index:
 /// the update's `<key> = v` match adds the derived id conjunct, and an upsert
 /// whose rows are all new or all present skips Lance's full-table merge
 /// join. Their calls do not follow the fragment count. The rows of the two
 /// sizes differ only in one GET of `KeyedInsert`, the first write after the
-/// reopen, which the forced join paid as well (it read 10 and 25). At 2
+/// reopen, which the forced join paid as well (it read 10 and 25); the
+/// table's manifest at 16 fragments still fits the 4 KiB tail Lance reads
+/// first, since a `@key` alone adds only its BTREE to the index section. The
+/// update's `<key> = v` reads the key's BTREE beside the id BTREE. At 2
 /// fragments the two writes before `MergeLoadPresent` leave as many fragments
 /// uncovered as covered, so it keeps the join; each write after the first
 /// finds the dataset the previous one committed in the handle cache, so that
@@ -2908,10 +3049,11 @@ fn keyed_write_table_size_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node Person {\n    slug: String @key\n    age: I32\n}\n";
     const WRITES: &str = r#"
 query insert_one() {
-    insert Person { slug: "new-0", age: 1 }
+    replace Person { slug: "new-0", age: 1 }
 }
 query update_one() {
-    update Person set { age: 2 } where slug = "p0003"
+    match { $x: Person } where $x.slug = "p0003"
+    update $x set { age: 2 }
 }
 "#;
     const SIZES: [(u32, [&str; 4]); 2] = [
@@ -2967,7 +3109,7 @@ query update_one() {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                db.load_jsonl(&rows, LoadMode::Append).await.unwrap();
+                db.load_jsonl(&rows, LoadMode::Insert).await.unwrap();
             }
             db.ensure_indices_as(None).await.unwrap();
             drop(db);
@@ -2988,14 +3130,14 @@ query update_one() {
             omnigraph_dst::cost::set_label(self.labels[2]);
             db.load_jsonl(
                 r#"{"type":"Person","data":{"slug":"p0005","age":50}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
             omnigraph_dst::cost::set_label(self.labels[3]);
             db.load_jsonl(
                 r#"{"type":"Person","data":{"slug":"new-1","age":51}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -3018,21 +3160,114 @@ query update_one() {
     rows
 }
 
+/// The scalar index kinds `@index` builds beside BTREE
+/// (the GQ 3 RFC, section 4): one reconciliation that builds
+/// an enum's and a `Bool`'s BITMAP, a list's LABEL_LIST, a plain `@index`
+/// String's NGRAM and BTREE and the key's BTREE together, and no full-text
+/// index, which only `@index(fulltext)` declares (`ScalarKindsBuild`), then on a
+/// reopened handle one read probing each kind: an enum equality through the
+/// BITMAP, a list membership through the LABEL_LIST and a `contains` through
+/// the NGRAM, whose candidates Lance rechecks.
+fn scalar_index_kind_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = "node Item {\n    slug: String @key\n    status: enum(open, closed) @index\n    done: Bool @index\n    tags: [String] @index\n    note: String @index\n}\n";
+    const READS: &str = r#"
+query by_status() {
+    match { $i: Item } where $i.status = "open"
+    return { $i.slug }
+}
+query by_tag() {
+    match { $i: Item } where "rust" in $i.tags
+    return { $i.slug }
+}
+query by_substring() {
+    match { $i: Item } where contains($i.note, "graph")
+    return { $i.slug }
+}
+"#;
+    const LABELS: [&str; 4] = [
+        "ScalarKindsBuild",
+        "ScalarKindsBitmapRead",
+        "ScalarKindsLabelListRead",
+        "ScalarKindsNgramRead",
+    ];
+
+    struct ScalarKindCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for ScalarKindCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_scalar_kinds_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let rows = (0..16)
+                .map(|n| {
+                    let status = if n % 2 == 0 { "open" } else { "closed" };
+                    let tag = if n % 4 == 0 { "rust" } else { "go" };
+                    let note = if n % 3 == 0 { "graph engines" } else { "search" };
+                    format!(
+                        r#"{{"type":"Item","data":{{"slug":"i{n:02}","status":"{status}","done":{},"tags":["{tag}"],"note":"{note} {n}"}}}}"#,
+                        n % 5 == 0
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            db.load_jsonl(&rows, LoadMode::Insert).await.unwrap();
+            omnigraph_dst::cost::set_label(LABELS[0]);
+            db.ensure_indices_as(None).await.unwrap();
+            drop(db);
+            omnigraph_dst::cost::set_label("_scalar_kinds_setup");
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            );
+            let params = omnigraph_compiler::ir::ParamMap::new();
+            for (label, query, expected) in [
+                (LABELS[1], "by_status", 8),
+                (LABELS[2], "by_tag", 4),
+                (LABELS[3], "by_substring", 6),
+            ] {
+                omnigraph_dst::cost::set_label(label);
+                let result = query_main(&db, READS, query, &params).await;
+                omnigraph_dst::cost::set_label("_scalar_kinds_verify");
+                assert_eq!(result.unwrap().num_rows(), expected, "{query}");
+            }
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-scalar-kind-cost-{replay}"),
+        &ScalarKindCost,
+        &LABELS,
+    )
+}
+
 /// A keyed lookup and a one-hop traversal on main, in the order a served
 /// graph meets them: a freshly opened handle's first read, then warm repeats,
 /// then a read after another handle published a commit (the stale path). The
 /// graph carries `commits` small update commits on main before the reopen.
 const WARM_READ_QUERIES: &str = r#"
 query get_person($name: String) {
-    match { $p: Person { name: $name } }
+    match { $p: Person } where $p.name = $name
     return { $p.name, $p.age }
 }
 
 query friends_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $q
-    }
+    match { $p: Person, $p knows $q }
+    where $p.name = $name
     return { $q.name }
 }
 "#;
@@ -3240,7 +3475,7 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
     async fn run(&self, resources: &mut omnigraph_dst::memory::MemoryStorage, _workload_seed: u64) {
         const HIRE: &str = r#"
 query hire($person: String, $company: String) {
-    insert WorksAt { from: $person, to: $company }
+    insert WorksAt { @src: $person, @dst: $company }
 }
 "#;
         let [cold, warm, after_other, after_branch, after_own] = GRAPH_INDEX_RETENTION_LABELS;
@@ -3316,9 +3551,9 @@ node Doc {
 "#;
     const QUERIES: &str = r#"
 query nearest_docs($q: Vector(2)) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 4
 }
 "#;
@@ -3328,7 +3563,7 @@ query nearest_docs($q: Vector(2)) {
 
     impl NearestCost {
         async fn nearest(db: &Session) -> serde_json::Value {
-            use omnigraph_compiler::query::ast::Literal;
+            use omnigraph_compiler::query::value::Literal;
             let mut params = omnigraph_compiler::ir::ParamMap::new();
             params.insert(
                 "q".to_string(),
@@ -3434,6 +3669,255 @@ query nearest_docs($q: Vector(2)) {
     )
 }
 
+/// The storage calls of a ranking drawn as a read of its own (the GQ 3
+/// RFC, section 4: the population is the ranking's relation, the cut its
+/// own): a `nearest` correlated on each outer person, its population the
+/// person's documents, scored exactly and cut to the person's two nearest
+/// by the read's own window, all outer rows in one evaluation of the
+/// population; an `rrf` correlated on each outer person, a `bm25` arm
+/// and a `nearest` arm over the person's documents fused per person; and a
+/// `bm25` over every document (`Bm25Body`), which reads the field once: its
+/// corpus pass scores each matching document, and its population scan reads
+/// no text.
+fn ranking_read_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = r#"
+node Person {
+    handle: String @key
+}
+node Doc {
+    slug: String @key
+    body: String @index(fulltext)
+    embedding: Vector(2) @index
+}
+edge Authored: Person -> Doc
+"#;
+    const QUERIES: &str = r#"
+query nearest_per_author($q: Vector(2)) {
+    match {
+        $p: Person,
+        from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $q, k: 2) as $s
+    }
+    return { $p.handle, $d.slug }
+}
+
+query fused_per_author($q: Vector(2), $s: String) {
+    match {
+        $p: Person,
+        let $pop = { match { $d: Doc, $p authored $d } return { $d } },
+        from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $q, k: 2)) as $f
+    }
+    return { $p.handle, $d.slug, $f }
+}
+
+query bm25_body($s: String) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from bm25($pop, $d.body, $s) as $score
+    }
+    return { $d.slug, $score }
+}
+"#;
+    const LABELS: [&str; 3] = ["NearestCorrelated", "RrfCorrelated", "Bm25Body"];
+
+    struct RankingReadCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for RankingReadCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use omnigraph_compiler::query::value::Literal;
+            omnigraph_dst::cost::set_label("_ranking_read_setup");
+            let writer = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            let mut seed = Vec::new();
+            for person in 0..4 {
+                seed.push(format!(
+                    r#"{{"type":"Person","data":{{"handle":"p{person}"}}}}"#
+                ));
+            }
+            for row in 0..16 {
+                seed.push(format!(
+                    r#"{{"type":"Doc","data":{{"slug":"d{row:02}","body":"{body}","embedding":[{x:?},{y:?}]}}}}"#,
+                    body = if row % 2 == 0 { "graph notes" } else { "river notes" },
+                    x = row as f32,
+                    y = (row % 3) as f32
+                ));
+                seed.push(format!(
+                    r#"{{"edge":"Authored","from":"p{}","to":"d{row:02}"}}"#,
+                    row % 4
+                ));
+            }
+            writer
+                .load_jsonl(&seed.join("\n"), LoadMode::Overwrite)
+                .await
+                .unwrap();
+            let reader = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            let mut params = omnigraph_compiler::ir::ParamMap::new();
+            params.insert(
+                "q".to_string(),
+                Literal::List(vec![Literal::Float(3.0), Literal::Float(1.0)]),
+            );
+            omnigraph_dst::cost::set_label(LABELS[0]);
+            let rows = reader
+                .query(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    QUERIES,
+                    "nearest_per_author",
+                    &params,
+                )
+                .await
+                .unwrap()
+                .to_rust_json()
+                .unwrap();
+            omnigraph_dst::cost::set_label("_ranking_read_verify");
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                8,
+                "two nearest documents for each of four authors: {rows}"
+            );
+            params.insert("s".to_string(), Literal::String("graph".to_string()));
+            omnigraph_dst::cost::set_label(LABELS[1]);
+            let rows = reader
+                .query(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    QUERIES,
+                    "fused_per_author",
+                    &params,
+                )
+                .await
+                .unwrap()
+                .to_rust_json()
+                .unwrap();
+            omnigraph_dst::cost::set_label("_ranking_read_verify");
+            // Each author holds four documents, two of them about graphs:
+            // the fusion of an author's two matches and two nearest.
+            assert!(
+                (4..=16).contains(&rows.as_array().unwrap().len()),
+                "each author's fused documents: {rows}"
+            );
+            omnigraph_dst::cost::set_label(LABELS[2]);
+            let rows = reader
+                .query(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    QUERIES,
+                    "bm25_body",
+                    &params,
+                )
+                .await
+                .unwrap()
+                .to_rust_json()
+                .unwrap();
+            omnigraph_dst::cost::set_label("_ranking_read_verify");
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                8,
+                "the eight documents about graphs: {rows}"
+            );
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-ranking-read-cost-{replay}"),
+        &RankingReadCost,
+        &LABELS,
+    )
+}
+
+/// The storage calls of a schema apply that changes a full-text field's
+/// analyzer on a reopened handle: the redeclaration's detached commit
+/// (`commit_full_text_redeclarations`), which replaces the column's
+/// segments with an untrained one, and the one publication.
+fn analyzer_redeclaration_cost_rows(replay: &str) -> String {
+    let schema = |analyzer: &str| {
+        format!(
+            "node Doc {{\n    slug: String @key\n    body: String @index(fulltext, analyzer = \"{analyzer}\")\n}}\n"
+        )
+    };
+    const LABEL: &str = "SchemaApplyAnalyzerChange";
+
+    struct AnalyzerChange {
+        before: String,
+        after: String,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for AnalyzerChange {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_analyzer_setup");
+            let writer = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        &self.before,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            writer
+                .load_jsonl(
+                    r#"{"type":"Doc","data":{"slug":"d1","body":"Runners were RUNNING"}}
+{"type":"Doc","data":{"slug":"d2","body":"Cafe creme"}}"#,
+                    LoadMode::Overwrite,
+                )
+                .await
+                .unwrap();
+            writer.ensure_indices_as(None).await.unwrap();
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            omnigraph_dst::cost::set_label(LABEL);
+            db.apply_schema(&self.after).await.unwrap();
+            omnigraph_dst::cost::set_label("_analyzer_verify");
+            assert!(db.schema_source().contains("english_v1"));
+        }
+    }
+
+    labeled_cost_rows(
+        format!("shared-memory://dst-analyzer-cost-{replay}"),
+        &AnalyzerChange {
+            before: schema("standard_v1"),
+            after: schema("english_v1"),
+        },
+        LABEL,
+    )
+}
+
 /// `index build` of a vector index on a reopened handle, in the two lagging
 /// states it rebuilds. `VectorIndexRefreshEmptied`: an `update` of the vector
 /// beside an unassigned Blob is a column patch, which withdrew the index's
@@ -3443,15 +3927,16 @@ query nearest_docs($q: Vector(2)) {
 /// every run). `VectorIndexRefreshLagging`, for comparison: a load appended a
 /// second fragment, so the build reads the index's statistics to keep its
 /// partition count and rebuilds it over both fragments, and also refreshes
-/// the id BTREE, which the append left lagging too. The setup is the one of
-/// the engine test
+/// the id and `@key` BTREEs, which the append left lagging too. The setup is
+/// the one of the engine test
 /// `index_build_and_optimize_rebuild_a_vector_index_a_column_patch_left_empty`,
 /// whose carried columns make the patch cheaper than a row rewrite.
 fn vector_index_recovery_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node D {\n    slug: String @key\n    n: I64?\n    s: String?\n    b: Blob?\n    v: Vector(4)? @index\n}\n";
     const PATCH: &str = r#"
 query patch($v: Vector(4)) {
-    update D set { v: $v } where slug in ["k2", "k5"]
+    match { $x: D } where $x.slug in ["k2", "k5"]
+    update $x set { v: $v }
 }
 "#;
     const LABELS: [&str; 2] = ["VectorIndexRefreshLagging", "VectorIndexRefreshEmptied"];
@@ -3498,7 +3983,7 @@ query patch($v: Vector(4)) {
             _workload_seed: u64,
         ) {
             use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
-            use omnigraph_compiler::query::ast::Literal;
+            use omnigraph_compiler::query::value::Literal;
             omnigraph_dst::cost::set_label("_vector_recovery_setup");
             let db = session(
                 Omnigraph::init_with_storage(
@@ -3516,7 +4001,7 @@ query patch($v: Vector(4)) {
                     "\n",
                     r#"{"type":"D","data":{"slug":"k5","v":[1.0,-2.0,-2.0,-1.0]}}"#,
                 ),
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -3540,7 +4025,7 @@ query patch($v: Vector(4)) {
             } else {
                 db.load_jsonl(
                     r#"{"type":"D","data":{"slug":"k7","v":[0.0,1.0,2.0,3.0]}}"#,
-                    LoadMode::Append,
+                    LoadMode::Insert,
                 )
                 .await
                 .unwrap();
@@ -3565,6 +4050,9 @@ query patch($v: Vector(4)) {
             };
             let mut expected = vec![refreshed("v", BuiltIndexKind::Vector)];
             if !self.emptied {
+                // The append left the key BTREEs lagging too: the id and the
+                // `@key` slug's.
+                expected.insert(0, refreshed("slug", BuiltIndexKind::Btree));
                 expected.insert(0, refreshed("__id", BuiltIndexKind::Btree));
             }
             assert_eq!(built.indexes, expected, "{label}");
@@ -4348,7 +4836,7 @@ fn overwrite_removal_cost_rows(replay: &str) -> String {
             _workload_seed: u64,
         ) {
             use omnigraph::loader::CsvLoadRequest;
-            use omnigraph_compiler::query::ast::LoadTarget;
+            use omnigraph_compiler::query::file::LoadTarget;
 
             omnigraph_dst::cost::set_label("_overwrite_removal_setup");
             let schema = "node Person { id: String @key } \
@@ -4511,7 +4999,7 @@ fn removal_edge_read_cost_rows(replay: &str) -> String {
             for to in ["keep", "d00000"] {
                 db.load_jsonl(
                     &format!(r#"{{"edge":"Link","from":"keep","to":"{to}"}}"#),
-                    LoadMode::Append,
+                    LoadMode::Insert,
                 )
                 .await
                 .unwrap();
@@ -4542,7 +5030,7 @@ fn removal_edge_read_cost_rows(replay: &str) -> String {
                 let result = db
                     .mutate(
                         "main",
-                        r#"query drop_docs() { delete Doc where slug != "keep" }"#,
+                        r#"query drop_docs() { match { $d: Doc } where $d.slug != "keep"  delete $d }"#,
                         "drop_docs",
                         &mixed_params(&[], &[]),
                     )
@@ -4591,7 +5079,7 @@ fn endpoint_probe_cost_rows(replay: &str) -> String {
             _workload_seed: u64,
         ) {
             use omnigraph::loader::CsvLoadRequest;
-            use omnigraph_compiler::query::ast::LoadTarget;
+            use omnigraph_compiler::query::file::LoadTarget;
 
             omnigraph_dst::cost::set_label("_endpoint_probe_setup");
             let schema = "node Account { id: I64 @key } \
@@ -4727,9 +5215,12 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&update_patch_cost_rows("a"));
     table.push_str(&keyed_write_table_size_cost_rows("a"));
     table.push_str(&nearest_cost_rows("a"));
+    table.push_str(&ranking_read_cost_rows("a"));
     table.push_str(&vector_index_recovery_cost_rows("a"));
     table.push_str(&carried_write_cost_rows("a"));
     table.push_str(&writer_claim_cost_rows("a"));
+    table.push_str(&analyzer_redeclaration_cost_rows("a"));
+    table.push_str(&scalar_index_kind_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -4747,9 +5238,12 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&update_patch_cost_rows("b"));
     table2.push_str(&keyed_write_table_size_cost_rows("b"));
     table2.push_str(&nearest_cost_rows("b"));
+    table2.push_str(&ranking_read_cost_rows("b"));
     table2.push_str(&vector_index_recovery_cost_rows("b"));
     table2.push_str(&carried_write_cost_rows("b"));
     table2.push_str(&writer_claim_cost_rows("b"));
+    table2.push_str(&analyzer_redeclaration_cost_rows("b"));
+    table2.push_str(&scalar_index_kind_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"

@@ -20,16 +20,16 @@ edits.
 | Task | Command | Why |
 |------|---------|-----|
 | Add/update a single entity | `mutate` with a named mutation | typechecked, parameterized, auditable |
-| Bulk upsert by logical entity ID | `load --mode merge` | preserves rows not in the file; keyed node and edge IDs derive from `@key` |
-| Additive-only bulk | `load --mode append` | fails on key collision |
+| Bulk upsert by logical entity ID | `load --mode replace` | replaces each matched row whole (an omitted property becomes null); preserves rows not in the file; keyed node and edge IDs derive from `@key` |
+| Additive-only bulk | `load --mode insert` | fails on key collision |
 | Replace complete batches by type | `load --mode overwrite` | **destructive for represented types**; absent types remain |
-| Bulk load onto a fresh review branch | `load --from main --mode merge --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
-| Load one CSV object into one type | `mutate -e 'load csv "<uri>" into node:<Type> mode merge header'` | typed by the `.pg`; `omnigraph load` reads JSONL only; the source must sit under the graph's external Blob policy (a direct run admits its own `file://` directory) and within `load_source_max_bytes` |
+| Bulk load onto a fresh review branch | `load --from main --mode replace --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
+| Load one CSV object into one type | `mutate -e 'load csv "<uri>" into node:<Type> mode replace header'` | typed by the `.pg`; `omnigraph load` reads JSONL only; the source must sit under the graph's external Blob policy (a direct run admits its own `file://` directory) and within `load_source_max_bytes` |
 
 > **`--mode` is required** — there is no default. Overwrite is destructive, so
 > the CLI never picks a mode for you.
 
-> **Per-load bounds.** One keyed load (`append`/`merge`)
+> **Per-load bounds.** One keyed load (`insert`/`upsert`/`replace`)
 > stages at most **8,192 entities and 32 MiB of Arrow memory per touched type**; a larger
 > batch is refused up front (HTTP 413, typed `resource_limit`) with no durable
 > effect — split it into chunks, each an atomic graph commit. Two further
@@ -122,7 +122,7 @@ and omits null-valued property keys; change images keep explicit nulls.
 Load command:
 
 ```bash
-omnigraph load --data seed.jsonl --mode merge --target ./spike-intel.omni
+omnigraph load --data seed.jsonl --mode replace --target ./spike-intel.omni
 ```
 
 `--from <base>` forks a missing `--branch` from `<base>` before loading (the
@@ -135,14 +135,24 @@ one-shot review-branch flow below). Without `--from`, the target `--branch`
   edge type present in the batch; types absent from the batch stay unchanged.
   The loader validates constraints and referential integrity before publication.
   Use a review branch for an established graph.
-- **`merge`** (upsert) — inserts or updates each row by logical entity `id`
-  (derived from the typed `@key` tuple for keyed nodes and keyed edges). Rows
-  not in the file are preserved. The safe default for incremental bulk updates.
-  An unkeyed edge without a supplied `id` never matches an existing row, so
-  re-running the same merge file duplicates it; declare `@key(@src, @dst)` when
-  creating the edge type if repeated loads must converge.
-- **`append`** (strict insert) — fails on entity-ID collision. Use when you're
-  certain every row is new.
+Each mode is the write statement of its name, matched by logical entity `id`
+(derived from the typed `@key` tuple for keyed nodes and keyed edges); rows not
+in the file are preserved:
+
+- **`insert`** (strict) — fails on an entity-ID collision with `key_conflict`,
+  publishing nothing. Use when every row is new.
+- **`upsert`** (patch) — creates, or sets the properties a record names: an
+  absent property key keeps its stored value, an explicit `null` clears it
+  (in CSV, a property with no column keeps its value, an empty field clears).
+- **`replace`** (whole row) — creates, or replaces a matched row whole: a
+  property the record omits becomes null, Blob and vector included.
+
+A job that retries a load uses `upsert` or `replace`. `append` and `merge`,
+edition 2's names, are refused with `insert` and `replace` as the fixes (under
+`--json`, a `bad_request` error whose `diagnostic` is `Q004` with the fix). An
+unkeyed edge without a supplied `id` never matches an existing row, so re-running
+a file duplicates it; declare `@key(@src, @dst)` when creating the edge type if
+repeated loads must converge.
 
 With `--json`, an effectful `mutate` or `load` returns the exact published
 `commit`; a no-op mutation returns `commit: null`. For compare-and-swap writes,
@@ -154,7 +164,7 @@ branch operation had no effect. See [branch outcome details](changes.md#branch-s
 
 ### Embeddings are explicit input
 
-`@embed` does not populate vectors during `merge` or `overwrite`. Supply
+`@embed` does not populate vectors during any load mode. Supply
 vectors in the JSONL, or run the offline `omnigraph embed` file transformation
 and load its output. See [`search.md`](search.md).
 
@@ -177,7 +187,7 @@ REPO=./spike-intel.omni
 omnigraph branch create --from main staging-2026-04-14 --target $REPO
 
 # 2. Load delta onto the branch (merge mode is typical for review)
-omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode merge --target $REPO
+omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode replace --target $REPO
 
 # 3. Verify on the branch (reads can target --branch or --snapshot)
 omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14 --target $REPO
@@ -217,7 +227,7 @@ HTTP `409`). The same edge inserted on both branches depends on its identity:
 unkeyed edges are both kept; `@unique(@src, @dst)` reports `unique_violation`;
 `@key(@src, @dst)` converges identical inserts to one row and reports
 `divergent_insert` (with the derived id) when non-key properties differ —
-re-insert the agreed values on one branch, then merge again. A branch both
+`replace` the key with the agreed values on one branch, then merge again. A branch both
 sides merged earlier stays their merge base after it is deleted, and `cleanup`
 keeps the history that base needs.
 

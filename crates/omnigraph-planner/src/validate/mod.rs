@@ -14,6 +14,7 @@
 
 mod budget;
 mod invariants;
+mod placement;
 mod replay;
 mod requirements;
 mod returns;
@@ -26,11 +27,11 @@ pub use replay::{
     accept_replay, catalog_digest, decode_replay,
 };
 pub use requirements::{KeyIds, Requirements};
-pub use subset::{ChainNode, ChainRanking, Derivation, Rule, Step};
+pub use subset::{ChainNode, Derivation, Rule, Step};
 
-use omnigraph_compiler::CheckedRead;
+use crate::read_shape::ReadShape;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{ParamMap, QueryIR};
+use omnigraph_compiler::ir::ParamMap;
 use serde::{Deserialize, Serialize};
 
 use crate::bound::{BoundPlan, ValueTable};
@@ -41,7 +42,7 @@ use crate::physical::PhysicalPlan;
 /// the query is a member of the closed exact fragment and every rewrite from
 /// its canonical form to the plan was reconstructed and compared;
 /// `invariants_only`: the plan was checked against the query's requirements
-/// (search identity, retained predicates, score origin, approximation,
+/// (search identity, retained predicates, score origin,
 /// order and cut, declared policies), which does not prove row-selection
 /// equivalence. Only the validator chooses it; nothing upgrades it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,16 +107,18 @@ impl std::fmt::Display for ValidationError {
     }
 }
 
-/// Everything acceptance reads beside the plan source: the checked
-/// declaration the requirements come from, the catalog it was checked
-/// against, the typed IR the planner plans (constants of filter positions
-/// already folded to their bound values), the bound parameter values
-/// (`now()` among them), the derivation of a key's canonical id, and the
-/// limits.
+/// Everything acceptance reads beside the plan source: the catalog the read
+/// was checked against, the shape of its core term the planner plans and
+/// the requirements come from (constants of filter positions already folded
+/// to their bound values), the bound parameter values (`now()` among them),
+/// the derivation of a key's canonical id, and the limits.
 pub struct AcceptInput<'a> {
-    pub checked: &'a CheckedRead,
     pub catalog: &'a Catalog,
-    pub ir: &'a QueryIR,
+    pub ir: &'a ReadShape,
+    /// The checked core read `ir` was shaped from: the placement check
+    /// derives each scope's conjuncts and where each may run from it
+    /// ([`placement`]), never from the shape or the optimizer.
+    pub core: Option<&'a omnigraph_compiler::ir::core::CoreRead>,
     pub params: &'a ParamMap,
     pub keys: &'a dyn KeyIds,
     pub limits: ValidationLimits,
@@ -250,13 +253,12 @@ pub(crate) fn check(
         "output schema",
         crate::output::validate_output_schemas(plan),
     )?;
-    formed(
-        "fusion row keys",
-        crate::optimizer::validate_rank_fuse_row_tiebreaks(plan),
-    )?;
     formed("catalogue source", source::validate_catalogue_sources(plan))?;
     let requirements = Requirements::derive(input, budget)?;
     requirements.check(plan, input, budget)?;
+    if let Some(core) = input.core {
+        placement::check(plan, core, input.params, budget)?;
+    }
     let Some(member) = subset::membership(input) else {
         return Ok((ValidationScope::InvariantsOnly, None));
     };

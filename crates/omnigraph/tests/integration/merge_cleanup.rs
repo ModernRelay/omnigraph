@@ -12,7 +12,7 @@ async fn set_age(db: &Session, branch: &str, name: &str, age: i32) {
     db.load(
         branch,
         &format!(r#"{{"type":"Person","data":{{"name":"{name}","age":{age}}}}}"#),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();

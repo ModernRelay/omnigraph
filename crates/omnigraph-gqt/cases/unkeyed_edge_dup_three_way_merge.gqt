@@ -31,36 +31,33 @@ branch create b0
 --- expect ok
 
 --- mutate branch: main
-query add_loop_on_main() { insert Knows { from: "Diana", to: "Diana" } }
+query add_loop_on_main() { insert Knows { @src: "Diana", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query add_loop_on_branch() { insert Knows { from: "Diana", to: "Diana" } }
+query add_loop_on_branch() { insert Knows { @src: "Diana", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query duplicate_branch_loop() { insert Knows { from: "Diana", to: "Diana" } }
+query duplicate_branch_loop() { insert Knows { @src: "Diana", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: b0
-query duplicate_inherited_edge() { insert Knows { from: "Alice", to: "Bob" } }
+query duplicate_inherited_edge() { insert Knows { @src: "Alice", @dst: "Bob" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: main
-query add_person_on_main() { insert Person { name: "Eve" } }
+query add_person_on_main() { replace Person { name: "Eve" } }
 
 --- expect affected: nodes=1 edges=0
 
 --- query branch: b0
 query edges() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 
@@ -83,10 +80,7 @@ branch merge b0
 
 --- query branch: main
 query edges() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 
@@ -128,10 +122,7 @@ branch delete b0
 
 --- query branch: main
 query edge_count() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { count($q.name) as n }
 }
 

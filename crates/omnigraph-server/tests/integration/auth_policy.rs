@@ -333,9 +333,9 @@ async fn signed_identities_obey_current_policy_and_attribute_writes() {
 
 fn signed_load_request(token: &str, fork: bool) -> Request<Body> {
     let path = if fork {
-        "/load/ndjson?branch=load_review&from=main&mode=merge"
+        "/load/ndjson?branch=load_review&from=main&mode=replace"
     } else {
-        "/load/ndjson?branch=load_review&mode=merge"
+        "/load/ndjson?branch=load_review&mode=replace"
     };
     Request::builder()
         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
@@ -582,6 +582,8 @@ async fn healthz_succeeds_after_startup() {
         Some(source_version) => assert_eq!(body["source_version"], source_version),
         None => assert!(body.get("source_version").is_none()),
     }
+    // The query language tells this server from one before the GQ 3 break.
+    assert_eq!(body["query_language"], "gq3");
 
     for path in ["/healthz", "/readyz", "/openapi.json"] {
         for method in [Method::GET, Method::HEAD] {
@@ -1864,7 +1866,7 @@ async fn policy_commit_publish_and_drop_denials_are_indistinguishable_from_unkno
         statement_request(
             "/mutate",
             "writer-token",
-            "query propose() as commit { insert Person { name: \"Pia\", age: 33 } }",
+            "query propose() as commit { replace Person { name: \"Pia\", age: 33 } }",
         ),
     )
     .await;
@@ -2009,7 +2011,7 @@ async fn policy_unattached_child_writes_authorize_on_the_recorded_target() {
     let sprout = |token: &str, name: &str, base: Option<&str>, branch: Option<&str>| {
         let on = base.map(|id| format!(" on \"{id}\"")).unwrap_or_default();
         let mut body = json!({"query": format!(
-            "query sprout() as unattached branch{on} {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+            "query sprout() as unattached branch{on} {{ replace Person {{ name: \"{name}\", age: 33 }} }}"
         )});
         if let Some(branch) = branch {
             body["branch"] = json!(branch);
@@ -2172,7 +2174,7 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         .load_with_receipt(
             "feature",
             r#"{"type":"Person","data":{"name":"feature-only","age":40}}"#,
-            omnigraph::loader::LoadMode::Merge,
+            omnigraph::loader::LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2185,7 +2187,7 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         .load_with_receipt(
             "gone",
             r#"{"type":"Person","data":{"name":"gone-only","age":41}}"#,
-            omnigraph::loader::LoadMode::Merge,
+            omnigraph::loader::LoadMode::Replace,
         )
         .await
         .unwrap()
@@ -2364,7 +2366,7 @@ async fn policy_commit_diff_forbidden_is_indistinguishable_from_unknown() {
         .load_with_receipt(
             "main",
             r#"{"type":"Person","data":{"name":"later","age":42}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2413,7 +2415,7 @@ async fn policy_merge_dry_run_needs_read_and_not_branch_merge() {
     db.load_with_receipt(
         "feature",
         r#"{"type":"Person","data":{"name":"feature-only","age":40}}"#,
-        omnigraph::loader::LoadMode::Merge,
+        omnigraph::loader::LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2489,7 +2491,7 @@ async fn policy_branch_review_needs_read_on_the_target() {
             "\n",
             r#"{"type":"Person","data":{"name":"feature-two","age":41}}"#,
         ),
-        omnigraph::loader::LoadMode::Merge,
+        omnigraph::loader::LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2497,7 +2499,7 @@ async fn policy_branch_review_needs_read_on_the_target() {
         .load_with_receipt(
             "private",
             r#"{"type":"Person","data":{"name":"private-only","age":42}}"#,
-            omnigraph::loader::LoadMode::Merge,
+            omnigraph::loader::LoadMode::Replace,
         )
         .await
         .unwrap()
@@ -2658,7 +2660,7 @@ async fn policy_diff_continuation_follows_a_moved_inherited_head() {
             "\n",
             r#"{"type":"Person","data":{"name":"other-two","age":41}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2708,7 +2710,7 @@ async fn policy_diff_continuation_follows_a_moved_inherited_head() {
         .load_with_receipt(
             "fresh",
             r#"{"type":"Person","data":{"name":"fresh-one","age":42}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -2853,6 +2855,116 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     }
 }
 
+/// `act-writer` holds `change` alone; `act-editor` holds `read` and `change`.
+const READ_GATE_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  writers: [act-writer, act-editor]
+  editors: [act-editor]
+rules:
+  - id: writers-change
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: any
+  - id: editors-read
+    allow:
+      actors: { group: editors }
+      actions: [read]
+      branch_scope: any
+"#;
+
+/// A write with a `match` selects its rows from stored data, so over HTTP as
+/// in the engine it needs `read` on the branch as well as `change`: an actor
+/// holding `change` alone is refused with the route's 403 and nothing is
+/// published, while its `match`-less insert is admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_a_match_write_needs_read_as_well_as_change() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, READ_GATE_POLICY_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![
+            ("act-writer".to_string(), "writer-token".to_string()),
+            ("act-editor".to_string(), "editor-token".to_string()),
+        ],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+    let change = |token: &str, name: &str, params: Value| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g("/mutate"))
+            .method(Method::POST)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&ChangeRequest {
+                    query: MUTATION_QUERIES.to_string(),
+                    name: Some(name.to_string()),
+                    params: Some(params),
+                    branch: Some("main".to_string()),
+                    settings: None,
+                })
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+
+    let before = manifest_dataset_version(&graph).await;
+    let (status, body) = json_response(
+        &app,
+        change(
+            "writer-token",
+            "set_age",
+            json!({"name": "Alice", "age": 99}),
+        ),
+    )
+    .await;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("read")
+            || body.to_string().contains("`read`"),
+        "the refusal names the missing read: {body}"
+    );
+    assert_forbidden(status, body, "a match write with change alone");
+    assert_eq!(
+        manifest_dataset_version(&graph).await,
+        before,
+        "a refused match write publishes nothing"
+    );
+
+    let (status, body) = json_response(
+        &app,
+        change(
+            "writer-token",
+            "insert_person",
+            json!({"name": "Mina", "age": 28}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "an insert with no match: {body}");
+    assert_eq!(body["affected_nodes"], 1);
+
+    let (status, body) = json_response(
+        &app,
+        change(
+            "editor-token",
+            "set_age",
+            json!({"name": "Alice", "age": 99}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read and change admit it: {body}");
+    assert_eq!(body["affected_nodes"], 1);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let temp = init_loaded_graph().await;
@@ -2864,7 +2976,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     db.load(
         "feature",
         r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -3437,7 +3549,7 @@ async fn branch_merge_delete_branch_policy_denial_is_non_fatal() {
         .unwrap();
     db.mutate(
         "feature",
-        r#"query add() { insert Person { name: "Zoe", age: 33 } }"#,
+        r#"query add() { replace Person { name: "Zoe", age: 33 } }"#,
         "add",
         &Default::default(),
     )
@@ -4047,12 +4159,16 @@ async fn policy_commit_list_continuation_stays_on_a_readable_branch() {
         format!(r#"{{"type":"Person","data":{{"name":"{name}","age":{age}}}}}"#)
     };
     for i in 0..24 {
-        db.load_with_receipt("secret", &person(format!("secret-{i}"), i), LoadMode::Merge)
-            .await
-            .unwrap();
+        db.load_with_receipt(
+            "secret",
+            &person(format!("secret-{i}"), i),
+            LoadMode::Replace,
+        )
+        .await
+        .unwrap();
     }
     for i in 0..4 {
-        db.load_with_receipt("main", &person(format!("main-{i}"), i), LoadMode::Merge)
+        db.load_with_receipt("main", &person(format!("main-{i}"), i), LoadMode::Replace)
             .await
             .unwrap();
     }

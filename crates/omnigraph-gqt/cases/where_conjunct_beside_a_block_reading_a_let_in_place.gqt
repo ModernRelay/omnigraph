@@ -1,0 +1,41 @@
+# issue: none
+# notes: The placement check finds a written conjunct in the plan by a skeleton
+# notes: no other conjunct of the read shares. A block's own conjunct reading a
+# notes: `let` (`10 / $l2`) is tested with the `let` read in place
+# notes: (`10 / $n1.p0`), the skeleton of a conjunct the outer scope writes
+# notes: after one that can fail; that one is then not unique, and the check
+# notes: does not take the block's conjunct for it and refuse the plan.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p0: I64?
+}
+edge Rel0: A -> A
+
+--- seed
+{"type":"A","data":{"k":"a","p0":5}}
+{"type":"A","data":{"k":"b","p0":2}}
+{"edge":"Rel0","from":"a","to":"b"}
+{"edge":"Rel0","from":"b","to":"a"}
+
+--- query
+query q() {
+  match { $n1: A, let $l2 = $n1.p0, $n1 rel0 $n4 }
+  where ((10 / $n4.p0) > 1) and (not exists { $n7: A, $n1 rel0 $n7 where ((10 / $l2) > 3) }) and ((10 / $n1.p0) > 1)
+  return { $n1.k }
+}
+
+--- expect unordered
+{"n1.k":"a"}
+
+--- expect shape
+n1.k: String

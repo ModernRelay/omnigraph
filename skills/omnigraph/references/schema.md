@@ -61,8 +61,9 @@ key). Name rules depend on the graph's vintage:
   `__src`/`__dst` on edges, and Lance's virtual column names (`_rowid`,
   `_rowaddr`, …). Other `_` names are still accepted there, but they block
   `schema upgrade-system-columns`.
-- **All vintages:** `from` and `to` are reserved edge property names (insert
-  endpoints), and `_distance`/`_score` are refused as property names.
+- **All vintages:** `from` and `to` are reserved edge property names (edition
+  2's endpoint assignments; writes assign `@src` and `@dst`), and
+  `_distance`/`_score` are refused as property names.
 
 Inspect `system_columns` in `schema show --json` rather than inferring the
 graph vintage from the binary. Writing bare `src` in an edge constraint on a
@@ -87,9 +88,9 @@ a key on an existing edge type is refused by the planner. Repeated inserts of
 the same key upsert the edge; without a key, repeated endpoint pairs remain
 distinct edges. The derived id orders `@src`, `@dst`, then scalar members in
 catalog order (not declaration order), so omit `id` rather than building it by
-hand. Edges cannot be `update`d (`T16`): re-insert a keyed edge to change its
-non-key properties. The property-level `@key` shorthand is refused on edge
-properties.
+hand. `update $k set { … }` changes an edge's properties; its endpoints and
+key are its identity, which an `update` refuses (`T93`). The property-level
+`@key` shorthand is refused on edge properties.
 
 ### Lint after every edit
 
@@ -111,6 +112,21 @@ omnigraph schema apply --schema next.pg --target ./graph.omni
 
 If `supported: false`, fix the source before applying. Plan is free; run it as often as needed.
 
+A plan with no step is a no-op: its apply publishes nothing and the stored
+schema text stays as it was, even when the new text differs (a comment, an
+explicit `distance = "l2"`). A cluster applies such a text-only change of a
+graph's schema file with no graph commit: `cluster plan` marks it
+`text_only`, and `omnigraph schema show` still shows the stored source.
+
+**One-way constructs.** A binary before GQ 3 re-parses the stored schema on
+every open, so once an apply stores one of these it refuses the whole graph,
+and only a backup taken before the upgrade restores it: an explicit
+`distance` on a Vector (`l2` included), `@index` on a List property,
+`@index(fulltext)` with or without options, an `analyzer` or a `scorer` in it.
+`schema plan`, `schema apply` and `cluster plan` name each one under
+`one_way_constructs` (`construct`, `type_name`, `property`, `line`, `column`)
+with a `one_way_note`; nothing gates the apply.
+
 Plan/apply diagnostics may carry stable codes of the form **`OG-XXX-NNN`**. When
 a code is present, match it rather than the free-form message text.
 
@@ -125,7 +141,10 @@ commit (merging a branch releases nothing), then run `cleanup` with a
 retention that excludes the commits before the optimize, for example
 `--keep 1 --confirm`. No flag makes a drop destructive at apply. Re-adding a
 dropped name starts a new property, so historical reads never see the old
-values through it. The HTTP server has no `POST /graphs/{id}/schema/apply`
+values through it. A read at an earlier commit (`--snapshot <id>`) sees the
+schema accepted there under current names: a property renamed since reads,
+`return { $p }` holds only the properties that commit has, and naming one it
+lacks (added since, or dropped and re-added) is `T6` naming the commit. The HTTP server has no `POST /graphs/{id}/schema/apply`
 route; evolve a served graph through `cluster plan` and `cluster apply`.
 
 ### Apply is main-only
@@ -151,7 +170,7 @@ unsupported. Pattern:
 
 1. Add as optional: `new_prop: String?`
 2. Apply
-3. Backfill via a `mutate` or `load --mode merge`
+3. Backfill via a `mutate` or `load --mode replace`
 4. Promote it: change `new_prop: String?` to `new_prop: String` and apply. The
    constraints section below says when that apply is refused.
 
@@ -169,7 +188,18 @@ Changing the key field is effectively a replace — it invalidates every externa
 
 ### Constraints: `@index` and a node's `@unique` are added in place
 
-Adding `@index` is metadata only. Adding `@unique` to a node type, and making a
+Adding `@index` is metadata only. Changing a full-text field's profile or
+`scorer` also applies in place (`schema plan` shows `change full-text
+analysis`): the apply replaces the property's index with an untrained one
+for the new analysis and `omnigraph index build` then builds its postings.
+Every query reads the field with its profile through the exact lexical scan,
+never the index, so its rows follow the new analysis at once. Writing out
+`analyzer = "english_v1"`, or removing it, changes no index. A rename keeps
+the analysis and the index. Changing a vector's `distance` is in place too (`schema plan`
+shows `change vector distance`) and writes no table: `distance` and `nearest`
+answer from the exact scan with the new distance until `omnigraph index build`
+(or `optimize`) replaces the index; stored zero vectors are not rechecked and
+drop from a field that becomes `cosine`. Adding `@unique` to a node type, and making a
 nullable property required (`T?` → `T`, node or edge), first read the stored
 rows under the apply's locks: a live row holding a null (OG-MF-104) or two rows
 sharing a key (OG-MF-108) refuse the apply and change nothing. To add a required
@@ -189,8 +219,9 @@ property drops every constraint that names only dropped properties (its own
 `@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
 or a constraint that also names a field that stays, is refused. In-place
 migrations are additions of nullable properties and types, `@index` and node
-`@unique` additions, nullable-to-required promotion, enum widening, `@card`
-widening, renames, and drops; any other tightening means a rebuild.
+`@unique` additions, full-text analyzer and scorer changes, vector distance
+changes, nullable-to-required promotion, enum widening, `@card` widening,
+renames, and drops; any other tightening means a rebuild.
 
 ### `schema apply` blocks writes while running
 
@@ -199,7 +230,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 ## Supported Types
 
 - **Scalars:** `String`, `Bool`, `I32`, `I64`, `U32`, `U64`, `F32`, `F64`, `Date`, `DateTime`, `Blob`
-- **Collections:** `Vector(N)` (fixed-size float vector), `[ScalarType]` (list of a non-Blob scalar; `[Blob]` is refused)
+- **Collections:** `Vector(N)` (fixed-size float vector; `Vector(N, distance = "l2" | "cosine" | "dot")` declares the distance `distance` and `nearest` read, `l2` when omitted; a `cosine` field refuses a zero vector), `[ScalarType]` (list of a non-Blob scalar; `[Blob]` is refused)
 - **Enums:** `enum(value1, value2, ...)` — inline only, values can contain alphanumerics, underscores, hyphens
 - **Optional:** any type + `?` suffix (`String?`, `[I32]?`, `Vector(4)?`)
 
@@ -208,7 +239,8 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 **Property-level shorthand:**
 - `@key` — single-property node key
 - `@unique` — single-property uniqueness constraint
-- `@index` — single-property index intent (currently materialized automatically only for node properties). A String property used in `search`, `fuzzy`, `match_text` or `bm25` must declare it, or the call is refused at type check (`T27`); an enum takes no full-text index (compare it with `=`)
+- `@index` — single-property index intent, materialized for node properties by `omnigraph index build` or `optimize` (never by a write), by type: an enum or `Bool` gets a BITMAP (`=`, `!=`, `in [...]`, ranges, `is null`), a list a LABEL_LIST (`value in $x.list`), a free-text String an NGRAM (`contains`) and a BTREE (`=`, `in [...]`, ranges, `starts_with`), a number, `Date` or `DateTime` a BTREE, a vector its vector index. A String `@key` alone builds a BTREE only (`contains` on it reads the rows); `@key` with `@index` follows `@index`. Only `@index(fulltext, ...)` builds a full-text index. An index changes cost, never rows. A String property used in `match_terms` or `bm25` must carry a one-column `@index`, `@key` or `@index(fulltext)`, or the call is refused at type check (`T27`); the exact scan answers it whatever is built. An enum takes no full-text index (compare it with `=`)
+- `@index(fulltext, analyzer = "english_v1", scorer = "none")` — a node String property's full-text index with its analysis. `analyzer` is one of `standard_v1` (lowercase only), `standard_folded_v1` (lowercase, ASCII folding) or `english_v1` (lowercase, English stemmer, English stop words, ASCII folding); none has a token-length filter. `scorer` is `bm25_v1` (default) or `none`, which keeps matching and makes `bm25` over the field `T87`. Without `analyzer` the field is `english_v1`, as is a plain `@index` or `@key` String read by `match_terms` or `bm25`, which builds no full-text index. A full-text index an earlier release built for a plain `@index` or `@key` stays in place, unread; declare `@index(fulltext)` to keep one built. An unknown profile, scorer or option is a schema error listing the admitted names; analysis is refused on interface and edge properties. See [`search.md`](search.md#analyzers)
 - `@embed("source_prop")` — associates a node Vector property with a String source; does not populate it during writes
 - `@description("...")` — metadata (no migration impact)
 

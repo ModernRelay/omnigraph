@@ -1,0 +1,65 @@
+# issue: none
+# traversal: auto
+# notes: Lance's typed filter planner chooses the integer probe after coercion and operand normalization.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I32 @index
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alpha","age":11}}
+{"type":"Person","data":{"slug":"beta","age":22}}
+
+--- query
+query reversed() {
+    match { $p: Person } where 11 = $p.age
+    return { $p.slug }
+}
+--- expect unordered
+{"p.slug":"alpha"}
+--- expect shape
+p.slug: String
+--- expect plan
+scan Person as $p: access index_probe age
+not pass key_to_id
+
+
+--- mutate
+query append_person() {
+    replace Person { slug: "gamma", age: 11 }
+}
+--- expect affected: nodes=1 edges=0
+
+--- query
+query partial() {
+    match { $p: Person } where $p.age = 11
+    return { $p.slug }
+}
+--- expect unordered
+{"p.slug":"alpha"}
+{"p.slug":"gamma"}
+--- expect shape
+p.slug: String
+--- expect plan
+scan Person as $p: access index_probe age
+
+--- query
+query appended_key() {
+    match { $p: Person } where $p.slug = "gamma"
+    return { $p.slug }
+}
+--- expect unordered
+{"p.slug":"gamma"}
+--- expect shape
+p.slug: String
+--- expect plan
+scan Person as $p: access index_probe __id
+pass key_to_id

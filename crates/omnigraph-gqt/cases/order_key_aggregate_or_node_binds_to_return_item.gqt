@@ -21,7 +21,6 @@ node Person {
 {"type":"Person","data":{"name":"alice","age":40}}
 
 --- query
-set engine = v2;
 query count_ordered() {
     match { $p: Person }
     return { count($p) as total }
@@ -35,7 +34,6 @@ query count_ordered() {
 total: I64
 
 --- query
-set engine = v2;
 query order_by_a_node() {
     match { $p: Person }
     return { $p }

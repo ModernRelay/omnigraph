@@ -1,0 +1,66 @@
+# issue: none
+# notes: An `optional` after a ranking `from` that reads the ranked node: the node is the
+# notes: ranking's, not the optional's, so the read may return it whole. Found by the
+# notes: generated read generator's soundness test (omnigraph_compiler::arbitrary).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    v: Vector(3)?
+}
+edge Rel0: A -> A
+
+--- seed
+{"type":"A","data":{"k":"a","v":[1.0,0.0,0.0]}}
+{"type":"A","data":{"k":"b","v":[0.0,1.0,0.0]}}
+{"type":"A","data":{"k":"c","v":[0.0,0.0,1.0]}}
+{"edge":"Rel0","from":"b","to":"a"}
+
+--- query
+query q($qv: Vector(3)) {
+  match {
+    let $pop = { match { $d: A } return { $d } },
+    from distance($pop, $d.v, $qv) as $s,
+    optional { $n: A, $n rel0 $d }
+  }
+  return { $d as d, $n.k as n }
+}
+
+--- params
+{"qv": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d":{"@id":"a","k":"a"},"n":"b"}
+{"d":{"@id":"b","k":"b"}}
+{"d":{"@id":"c","k":"c"}}
+
+--- expect shape
+d: A
+n: String?
+
+--- query
+query q($qv: Vector(3)) {
+  match {
+    let $pop = { match { $d: A } return { $d } },
+    from nearest($pop, $d.v, $qv, k: 2) as $s,
+    optional { $n: A, $n rel0 $d }
+  }
+  return { $d.k as d, $n.k as n }
+}
+
+--- params
+{"qv": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"d":"a","n":"b"}
+{"d":"b"}
+
+--- expect shape
+d: String
+n: String?

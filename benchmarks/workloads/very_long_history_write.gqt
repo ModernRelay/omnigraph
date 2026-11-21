@@ -8,7 +8,7 @@ environments:
     storage: local-filesystem
 
 --- mutate
-query next_write() { update HistoryRow set { value: 1 } where key = "hot" }
+query next_write() { match { $x: HistoryRow } where $x.key = "hot"  update $x set { value: 1 } }
 --- expect affected: nodes=1 edges=0
 
 --- query branch: main

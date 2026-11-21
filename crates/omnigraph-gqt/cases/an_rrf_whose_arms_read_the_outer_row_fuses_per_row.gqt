@@ -1,0 +1,150 @@
+# issue: none
+# notes: An `rrf` whose arms read the enclosing scope fuses per outer row (the GQ 3 RFC, section 2, `Correlate` and `Fuse`; section 4, Fusion): each outer row's arms rank that row's population, each arm's window is its own and cut per outer row, ranks restart from 1 for each row, the constant and the weights apply to each row's fusion,, so an arm reading no outer name ranks the same targets for every row. An outer row whose arms select nothing leaves no row, as a `from` over an empty relation does. The plan holds one `Fuse` partitioned per outer row inside the correlated read, each arm a correlated read yielding its rows in its rank order.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)? @index
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Person","data":{"handle":"a","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"b","name":"Bob","age":20}}
+{"type":"Person","data":{"handle":"p1","name":"Cy","age":50}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Doc","data":{"id":"d1","title":"graph basics","body":"graph databases store graphs","year":2020,"tags":["x"],"embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"id":"d2","title":"vector search","body":"vector search over graph embeddings","year":2021,"tags":["y"],"embedding":[0.9,0.1,0.0]}}
+{"type":"Doc","data":{"id":"d3","title":"cooking","body":"pasta and graph theory of sauces","year":2022,"tags":[],"embedding":[0.0,1.0,0.0]}}
+{"type":"Doc","data":{"id":"d4","title":"rivers","body":"water flows downhill","year":2023,"tags":[],"embedding":[0.0,0.0,1.0]}}
+{"type":"Doc","data":{"id":"d5","title":"graphs again","body":"graph graph graph","year":2024,"tags":[],"embedding":[0.5,0.5,0.0]}}
+{"edge":"Authored","from":"a","to":"d1"}
+{"edge":"Authored","from":"a","to":"d3"}
+{"edge":"Authored","from":"a","to":"d4"}
+{"edge":"Authored","from":"b","to":"d2"}
+{"edge":"Authored","from":"b","to":"d5"}
+{"edge":"Authored","from":"b","to":"d3"}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"p1"}
+{"edge":"WorksAt","from":"a","to":"acme"}
+{"edge":"Cites","from":"d1","to":"d2"}
+
+--- query
+query per_author($s: String, $v: Vector(3)) { match { $p: Person, let $pop = { match { $d: Doc, $p authored $d } return { $d } }, from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $v, k: 2)) as $f } return { $p.handle, $d.id, $f } order { $p.handle, $f desc, $d.id } }
+
+--- params
+{"s": "graph", "v": [1.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.id":"d1","f":0.032786885246,"p.handle":"a"}
+{"d.id":"d3","f":0.032258064516,"p.handle":"a"}
+{"d.id":"d2","f":0.032522474881,"p.handle":"b"}
+{"d.id":"d5","f":0.032522474881,"p.handle":"b"}
+{"d.id":"d3","f":0.015873015873,"p.handle":"b"}
+
+--- expect shape
+p.handle: String
+d.id: String
+f: F64
+
+--- expect plan
+fuse $d: arms [bm25, nearest] per outer row
+
+--- query
+query weighted_per_author($s: String, $v: Vector(3)) { match { $p: Person, from rrf(nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: 1), bm25({ match { $d: Doc, $p authored $d } return { $d } }, $d.body, $s), k: 1, weights: [2.0, 1.0]) as $f } return { $p.handle, $d.id, $f } order { $p.handle, $f desc, $d.id } }
+
+--- params
+{"s": "graph", "v": [0.0, 1.0, 0.0]}
+
+--- expect ordered
+{"d.id":"d3","f":1.333333333333,"p.handle":"a"}
+{"d.id":"d1","f":0.5,"p.handle":"a"}
+{"d.id":"d3","f":1.25,"p.handle":"b"}
+{"d.id":"d5","f":0.5,"p.handle":"b"}
+{"d.id":"d2","f":0.333333333333,"p.handle":"b"}
+
+--- expect shape
+p.handle: String
+d.id: String
+f: F64
+
+--- query
+query one_arm_reads_no_outer_name($s: String, $v: Vector(3)) { match { $p: Person, from rrf(bm25({ match { $d: Doc, $p authored $d } return { $d } }, $d.body, $s), nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2)) as $f } return { $p.handle, $d.id, $f } order { $p.handle, $f desc, $d.id } }
+
+--- params
+{"s": "graph", "v": [1.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.id":"d1","f":0.032786885246,"p.handle":"a"}
+{"d.id":"d2","f":0.016129032258,"p.handle":"a"}
+{"d.id":"d3","f":0.016129032258,"p.handle":"a"}
+{"d.id":"d2","f":0.032258064516,"p.handle":"b"}
+{"d.id":"d1","f":0.016393442623,"p.handle":"b"}
+{"d.id":"d5","f":0.016393442623,"p.handle":"b"}
+{"d.id":"d3","f":0.015873015873,"p.handle":"b"}
+{"d.id":"d1","f":0.016393442623,"p.handle":"p1"}
+{"d.id":"d2","f":0.016129032258,"p.handle":"p1"}
+
+--- expect shape
+p.handle: String
+d.id: String
+f: F64
+
+--- query
+query ordered_arm($s: String) { match { $p: Person, from rrf(bm25({ match { $d: Doc, $p authored $d } return { $d } }, $d.body, $s), { match { $d: Doc, $p authored $d } return { $d } order { $d.year desc } limit 2 }) as $f } return { $p.handle, $d.id, $f } order { $p.handle, $f desc, $d.id } }
+
+--- params
+{"s": "graph"}
+
+--- expect ordered
+{"d.id":"d3","f":0.032258064516,"p.handle":"a"}
+{"d.id":"d1","f":0.016393442623,"p.handle":"a"}
+{"d.id":"d4","f":0.016393442623,"p.handle":"a"}
+{"d.id":"d5","f":0.032786885246,"p.handle":"b"}
+{"d.id":"d3","f":0.032002048131,"p.handle":"b"}
+{"d.id":"d2","f":0.016129032258,"p.handle":"b"}
+
+--- expect shape
+p.handle: String
+d.id: String
+f: F64
+
+--- expect plan
+fuse $d: arms [bm25, ordered] per outer row
+
+--- query
+query fused_then_limited($s: String, $v: Vector(3)) { match { $p: Person, let $pop = { match { $d: Doc, $p authored $d } return { $d } }, from rrf(bm25($pop, $d.body, $s), nearest($pop, $d.embedding, $v, k: 2)) as $f } where $p.handle = "b" return { $d.id, $f } order { $f desc } limit 1 }
+
+--- params
+{"s": "graph", "v": [1.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.id":"d2","f":0.032522474881}
+
+--- expect shape
+d.id: String
+f: F64

@@ -18,7 +18,7 @@ edge Pays: Person -> Person { amount: I64? }
 {"edge":"Pays","from":"a","to":"a"}
 --- query
 query edge_total() {
-    match { $p: Person $p $e:pays $q }
+    match { $p: Person, $p $e:pays $q }
     return { sum($e.amount) as total }
 }
 --- expect unordered

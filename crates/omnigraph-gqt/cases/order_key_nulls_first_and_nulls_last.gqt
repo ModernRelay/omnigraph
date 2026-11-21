@@ -1,0 +1,350 @@
+# issue: none
+# notes: An order key places its nulls as written: `nulls first` before every non-null value of the
+# notes: key, `nulls last` after, whatever the direction; with neither, the fixed value order's
+# notes: placement holds, nulls first ascending and last descending. Only that key's nulls move:
+# notes: rows whose key is null tie on it and fall to the later keys, then the tie rule. Covered:
+# notes: an I32, an F64 and a String key, each direction with each placement, a `limit` cutting
+# notes: the placed order, groups cut by a nullable key (group rows take `expect unordered`, so
+# notes: the `limit` shows which groups the placement keeps), and a correlated `from` whose own
+# notes: `order` and `limit` pick one row per outer row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+    score: F64?
+    city: String? @index
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"ann","age":30,"score":1.5,"city":"Oslo"}}
+{"type":"Person","data":{"name":"bob","score":-2.0}}
+{"type":"Person","data":{"name":"cyd","age":30,"city":"Rome"}}
+{"type":"Person","data":{"name":"dan","age":25,"score":0.0,"city":"Oslo"}}
+{"type":"Person","data":{"name":"eve","score":3.25}}
+{"type":"Person","data":{"name":"fay","age":41}}
+{"edge":"Knows","from":"ann","to":"bob"}
+{"edge":"Knows","from":"ann","to":"dan"}
+{"edge":"Knows","from":"ann","to":"fay"}
+{"edge":"Knows","from":"cyd","to":"eve"}
+{"edge":"Knows","from":"cyd","to":"cyd"}
+{"edge":"Knows","from":"dan","to":"fay"}
+
+--- query
+query age_default() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age, $p.name }
+}
+
+--- expect ordered
+{"p.name":"bob"}
+{"p.name":"eve"}
+{"p.age":25,"p.name":"dan"}
+{"p.age":30,"p.name":"ann"}
+{"p.age":30,"p.name":"cyd"}
+{"p.age":41,"p.name":"fay"}
+
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query age_nulls_first() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age nulls first, $p.name }
+}
+
+--- expect ordered
+{"p.name":"bob"}
+{"p.name":"eve"}
+{"p.age":25,"p.name":"dan"}
+{"p.age":30,"p.name":"ann"}
+{"p.age":30,"p.name":"cyd"}
+{"p.age":41,"p.name":"fay"}
+
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query age_nulls_last() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age nulls last, $p.name }
+}
+
+--- expect ordered
+{"p.age":25,"p.name":"dan"}
+{"p.age":30,"p.name":"ann"}
+{"p.age":30,"p.name":"cyd"}
+{"p.age":41,"p.name":"fay"}
+{"p.name":"bob"}
+{"p.name":"eve"}
+
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query age_desc_default() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc, $p.name }
+}
+
+--- expect ordered
+{"p.age":41,"p.name":"fay"}
+{"p.age":30,"p.name":"ann"}
+{"p.age":30,"p.name":"cyd"}
+{"p.age":25,"p.name":"dan"}
+{"p.name":"bob"}
+{"p.name":"eve"}
+
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query age_desc_nulls_first_names_desc() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc nulls first, $p.name desc }
+}
+
+--- expect ordered
+{"p.name":"eve"}
+{"p.name":"bob"}
+{"p.age":41,"p.name":"fay"}
+{"p.age":30,"p.name":"cyd"}
+{"p.age":30,"p.name":"ann"}
+{"p.age":25,"p.name":"dan"}
+
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query age_desc_nulls_last() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc nulls last, $p.name }
+}
+
+--- expect ordered
+{"p.age":41,"p.name":"fay"}
+{"p.age":30,"p.name":"ann"}
+{"p.age":30,"p.name":"cyd"}
+{"p.age":25,"p.name":"dan"}
+{"p.name":"bob"}
+{"p.name":"eve"}
+
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- query
+query age_nulls_last_tie_rule() {
+    match { $p: Person }
+    return { $p.age }
+    order { $p.age nulls last }
+}
+
+--- expect ordered
+{"p.age":25}
+{"p.age":30}
+{"p.age":30}
+{"p.age":41}
+{}
+{}
+
+--- expect shape
+p.age: I32?
+
+--- query
+query score_desc_nulls_first_limit() {
+    match { $p: Person }
+    return { $p.name, $p.score }
+    order { $p.score desc nulls first, $p.name }
+    limit 3
+}
+
+--- expect ordered
+{"p.name":"cyd"}
+{"p.name":"fay"}
+{"p.name":"eve","p.score":3.25}
+
+--- expect shape
+p.name: String
+p.score: F64?
+
+--- query
+query score_nulls_last_limit() {
+    match { $p: Person }
+    return { $p.name, $p.score }
+    order { $p.score nulls last, $p.name }
+    limit 2
+}
+
+--- expect ordered
+{"p.name":"bob","p.score":-2}
+{"p.name":"dan","p.score":0}
+
+--- expect shape
+p.name: String
+p.score: F64?
+
+--- query
+query score_desc_limit_past_the_values() {
+    match { $p: Person }
+    return { $p.name, $p.score }
+    order { $p.score desc, $p.name desc }
+    limit 5
+}
+
+--- expect ordered
+{"p.name":"eve","p.score":3.25}
+{"p.name":"ann","p.score":1.5}
+{"p.name":"dan","p.score":0}
+{"p.name":"bob","p.score":-2}
+{"p.name":"fay"}
+
+--- expect shape
+p.name: String
+p.score: F64?
+
+--- query
+query city_nulls_last() {
+    match { $p: Person }
+    return { $p.name, $p.city }
+    order { $p.city nulls last, $p.name desc }
+}
+
+--- expect ordered
+{"p.city":"Oslo","p.name":"dan"}
+{"p.city":"Oslo","p.name":"ann"}
+{"p.city":"Rome","p.name":"cyd"}
+{"p.name":"fay"}
+{"p.name":"eve"}
+{"p.name":"bob"}
+
+--- expect shape
+p.name: String
+p.city: String?
+
+--- query
+query city_desc_nulls_first_limit() {
+    match { $p: Person }
+    return { $p.name, $p.city }
+    order { $p.city desc nulls first, $p.name }
+    limit 4
+}
+
+--- expect ordered
+{"p.name":"bob"}
+{"p.name":"eve"}
+{"p.name":"fay"}
+{"p.city":"Rome","p.name":"cyd"}
+
+--- expect shape
+p.name: String
+p.city: String?
+
+--- query
+query groups_nulls_last_limit() {
+    match { $p: Person }
+    return { $p.city, count($p) as n }
+    order { $p.city nulls last }
+    limit 2
+}
+
+--- expect unordered
+{"n":1,"p.city":"Rome"}
+{"n":2,"p.city":"Oslo"}
+
+--- expect shape
+p.city: String?
+n: I64
+
+--- query
+query groups_desc_nulls_first_limit() {
+    match { $p: Person }
+    return { $p.city, count($p) as n }
+    order { $p.city desc nulls first }
+    limit 2
+}
+
+--- expect unordered
+{"n":1,"p.city":"Rome"}
+{"n":3}
+
+--- expect shape
+p.city: String?
+n: I64
+
+--- query
+query alias_key_nulls_last() {
+    match { $p: Person }
+    return { $p.name, $p.age as age }
+    order { age desc nulls last, $p.name }
+    limit 4
+}
+
+--- expect ordered
+{"age":41,"p.name":"fay"}
+{"age":30,"p.name":"ann"}
+{"age":30,"p.name":"cyd"}
+{"age":25,"p.name":"dan"}
+
+--- expect shape
+p.name: String
+age: I32?
+
+--- query
+query correlated_youngest_friend_nulls_last() {
+    match {
+        $p: Person,
+        from { match { $f: Person, $p knows $f } return { $f, $f.age as age } order { $f.age nulls last } limit 1 },
+    }
+    return { $p.name, $f.name as friend, $age }
+}
+
+--- expect unordered
+{"age":25,"friend":"dan","p.name":"ann"}
+{"age":30,"friend":"cyd","p.name":"cyd"}
+{"age":41,"friend":"fay","p.name":"dan"}
+
+--- expect shape
+p.name: String
+friend: String
+age: I32?
+
+--- query
+query correlated_oldest_friend_nulls_first() {
+    match {
+        $p: Person,
+        from { match { $f: Person, $p knows $f } return { $f, $f.age as age } order { $f.age desc nulls first } limit 1 },
+    }
+    return { $p.name, $f.name as friend, $age }
+}
+
+--- expect unordered
+{"age":41,"friend":"fay","p.name":"dan"}
+{"friend":"bob","p.name":"ann"}
+{"friend":"eve","p.name":"cyd"}
+
+--- expect shape
+p.name: String
+friend: String
+age: I32?

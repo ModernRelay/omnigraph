@@ -276,7 +276,7 @@ fn parity_ranked_query_ranking() {
     let queries = p._temp.path().join("ranked.gq");
     std::fs::write(
         &queries,
-        "query ranked($q: String) {\n    match { $p: Person }\n    return { $p.name, bm25($p.name, $q) as relevance }\n    order { bm25($p.name, $q) }\n    limit 2\n}\n",
+        "query ranked($q: String) {\n    match { let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.name, $q) as $score }\n    return { $p.name, $score as relevance }\n    order { $score desc }\n    limit 2\n}\n",
     )
     .unwrap();
     let (l, r) = p.run(&[
@@ -458,7 +458,7 @@ fn parity_mutate() {
     let (l, r) = p.run(&[
         "mutate",
         "-e",
-        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+        "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
         "--params",
         r#"{"name":"Parity","age":7}"#,
         "--json",
@@ -468,7 +468,7 @@ fn parity_mutate() {
     let (l, r) = p.run(&[
         "mutate",
         "-e",
-        "query no_match() { update Person set { age: 99 } where name = \"Nobody\" }",
+        "query no_match() { match { $x: Person } where $x.name = \"Nobody\"  update $x set { age: 99 } }",
         "--json",
     ]);
     assert_parity("no-op mutate", &l, &r);
@@ -489,7 +489,7 @@ fn parity_mutate() {
         "--branch",
         "feature",
         "-e",
-        "query root() as unattached branch { insert Person { name: \"Root\", age: 8 } }",
+        "query root() as unattached branch { replace Person { name: \"Root\", age: 8 } }",
         "--json",
     ]);
     for (arm, root) in [("local", local_root), ("remote", remote_root)] {
@@ -498,7 +498,7 @@ fn parity_mutate() {
         let base = root["commit"]["graph_commit_id"].as_str().unwrap();
         let source = format!(
             "query child() as unattached branch on \"{base}\" {{ \
-             insert Person {{ name: \"Child\", age: 9 }} }}"
+             replace Person {{ name: \"Child\", age: 9 }} }}"
         );
         let run = |args: &[&str]| {
             let mut command = cli();
@@ -570,7 +570,7 @@ fn parity_branch_merge() {
         "--branch",
         "feature",
         "-e",
-        "query add() { insert Person { name: \"Receipt\", age: 31 } }",
+        "query add() { replace Person { name: \"Receipt\", age: 31 } }",
         "--json",
     ]);
     assert_write_parity("merge source write", &l, &r);
@@ -584,7 +584,7 @@ fn parity_branch_merge() {
             "--branch",
             " main",
             "-e",
-            "query add() { insert Person { name: \"Padded\", age: 32 } }",
+            "query add() { replace Person { name: \"Padded\", age: 32 } }",
             "--json",
         ][..],
     ] {
@@ -652,7 +652,7 @@ fn parity_branch_merge() {
     let (l, r) = p.run(&[
         "mutate",
         "-e",
-        "query add() { insert Person { name: \"Retained\", age: 32 } }",
+        "query add() { replace Person { name: \"Retained\", age: 32 } }",
         "--json",
     ]);
     assert_write_parity("refused deletion source write", &l, &r);
@@ -734,7 +734,7 @@ fn parity_branch_statements() {
         "--branch",
         "stmt",
         "-e",
-        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+        "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
         "--params",
         r#"{"name":"Stmt","age":1}"#,
         "--json",
@@ -843,7 +843,7 @@ fn parity_load() {
     let (l, r) = p.run(&[
         "load",
         "--mode",
-        "merge",
+        "replace",
         "--data",
         data.to_str().unwrap(),
         "--json",
@@ -904,7 +904,7 @@ fn parity_load() {
     let (l, r) = p.run(&[
         "load",
         "--mode",
-        "append",
+        "insert",
         "--data",
         data.to_str().unwrap(),
         "--branch",
@@ -976,7 +976,7 @@ fn parity_load_embedding_diagnostics() {
                 "--branch",
                 "main",
                 "--mode",
-                "merge",
+                "replace",
                 "--data",
                 data.to_str().unwrap(),
             ];
@@ -1037,7 +1037,7 @@ fn parity_load_embedding_diagnostics() {
             "--branch",
             "main",
             "--mode",
-            "merge",
+            "replace",
             "--data",
             data.to_str().unwrap(),
             "--json",
@@ -1113,7 +1113,7 @@ fn assert_slow_export_and_baseline_complete(p: &Parity) {
     let (local, remote) = p.run(&[
         "load",
         "--mode",
-        "merge",
+        "replace",
         "--data",
         data.to_str().unwrap(),
         "--json",
@@ -1701,7 +1701,7 @@ fn parity_branch_review() {
         "--branch",
         "feature",
         "-e",
-        "query add() { insert Person { name: \"Reviewed\", age: 31 } }",
+        "query add() { replace Person { name: \"Reviewed\", age: 31 } }",
         "--json",
     ]);
     assert_write_parity("review source write", &l, &r);

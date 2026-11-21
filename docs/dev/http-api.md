@@ -37,6 +37,7 @@ commit-page default remains with the separate pagination design.
 | `parameter-descriptions` | Every parameter | `required` | Document meaning, defaults, and refusal conditions. |
 | `header-names` | Parameters and response headers | `Title-Case` | Standard headers keep their HTTP meaning. |
 | `request-schema-suffix` | Request body schemas | `Request` | Generated SDK request names. |
+| `closed-request-body` | Request body schemas | `additionalProperties=false` | Exact request admission: a key the body does not define is a `400 bad_request` naming it, never ignored (`deny_unknown_fields`). |
 | `response-schema-suffix` | Response body schemas | `Output` | Generated SDK result names. |
 | `response-schema-exception` | `ChangeBaselineRecord` | `permanent` | The engine's durable baseline record is also the HTTP response. |
 | `enum-schema-suffixes` | String enums | `Request Output Response` | Enums carry none of these transport suffixes. |

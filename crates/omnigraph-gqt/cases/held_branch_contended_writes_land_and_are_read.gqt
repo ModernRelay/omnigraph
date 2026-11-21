@@ -19,8 +19,8 @@ node Person {
 {"type":"Person","data":{"name":"alice"}}
 
 --- concurrent scripted
-w1 on main: query add_bob() { insert Person { name: "bob" } }
-w2 on main: query add_carol() { insert Person { name: "carol" } }
+w1 on main: query add_bob() { replace Person { name: "bob" } }
+w2 on main: query add_carol() { replace Person { name: "carol" } }
 order: w1 park put nodes/, w2, w1 put nodes/, w1
 --- expect
 w1: ok
@@ -33,7 +33,7 @@ action: contention
 scope: next_step
 
 --- mutate
-query add_dave() { insert Person { name: "dave" } }
+query add_dave() { replace Person { name: "dave" } }
 --- expect affected: nodes=1 edges=0
 
 --- query

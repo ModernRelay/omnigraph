@@ -284,7 +284,7 @@ async fn recorded_optimize_keeps_a_record_a_caller_reads_by_id() {
         for name in ["Ada", "Grace", "Edsger"] {
             db.load_jsonl(
                 &json!({"type": "Person", "data": {"name": name}}).to_string(),
-                omnigraph::loader::LoadMode::Merge,
+                omnigraph::loader::LoadMode::Replace,
             )
             .await
             .unwrap();

@@ -17,7 +17,7 @@ node HistoryRow { key: String @key value: I64 payload: String }
 {"type":"HistoryRow","data":{"key":"row-3","value":0,"payload":"final"}}
 
 --- loop $cycle 0 8
---- load generate: v1 seed: 0 mode: merge
+--- load generate: v1 seed: 0 mode: replace
 tables:
   - kind: node
     name: HistoryRow
@@ -30,7 +30,7 @@ tables:
       payload: {kind: repeat, text: x, count: 8}
 --- expect ok
 
---- load generate: v1 seed: 0 mode: merge
+--- load generate: v1 seed: 0 mode: replace
 tables:
   - kind: node
     name: HistoryRow

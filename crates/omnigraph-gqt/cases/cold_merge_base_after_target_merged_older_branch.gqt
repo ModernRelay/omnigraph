@@ -31,7 +31,7 @@ branch create b0
 
 --- mutate
 query insert_w2() {
-    insert Person { name: "w2", age: 0 }
+    replace Person { name: "w2", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -44,7 +44,8 @@ branch create b1
 --- loop $i 1 5
 --- mutate
 query bump_alice($n: I32) {
-    update Person set { age: $n } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: $n }
 }
 --- params
 {"n": ${i}}
@@ -53,7 +54,7 @@ query bump_alice($n: I32) {
 
 --- mutate branch: b0
 query insert_y() {
-    insert Person { name: "y", age: 0 }
+    replace Person { name: "y", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -65,7 +66,8 @@ branch merge b0
 
 --- mutate branch: b1
 query delete_w2() {
-    delete Person where name = "w2"
+    match { $x: Person } where $x.name = "w2"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0

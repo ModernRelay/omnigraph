@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_compiler::SchemaMigrationPlan;
 use omnigraph_compiler::build_catalog;
-use omnigraph_compiler::query::ast::QueryFile;
+use omnigraph_compiler::query::check::check_query_decl as typecheck_query_decl;
+use omnigraph_compiler::query::file::QueryFile;
 use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::query::typecheck::typecheck_query_decl;
 use omnigraph_compiler::schema::parser::parse_schema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -57,6 +57,7 @@ use config::{
     QueriesDecl, graph_address, load_desired, observe_declared_graphs, parse_cluster_config,
     schema_address, state_resource_digests, validate_cluster_header,
 };
+pub use config::{StoredQueryFiles, stored_query_files};
 pub use deployment::*;
 use diff::{ResourceKind, compute_blast_radius, resource_kind};
 pub use graph_read::GraphReadAuthority;
@@ -392,7 +393,7 @@ async fn plan_config_dir_impl(
             Ok(migrations) => {
                 for change in &mut changes {
                     if let ResourceKind::Schema(graph_id) = resource_kind(&change.resource) {
-                        change.migration = migrations.get(&graph_id).cloned();
+                        change.set_schema_migration(migrations.get(&graph_id).cloned());
                     }
                 }
             }

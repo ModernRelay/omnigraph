@@ -37,8 +37,9 @@ puts each changed path in one class:
 
 | Class | Paths | Jobs that run |
 |---|---|---|
-| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `PR Title`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`, `CI Gate`). `Check AGENTS.md Links` reads documentation through `scripts/check-docs.py`, `Fix Regression Gate` requires `AGENTS.md` to name the corpus path `crates/omnigraph-gqt/cases/`, and `PR Title` reads the `changelog.d/` notes a pull request adds. `Test omnigraph-server --features aws` and the `GQ Logic Tests` cells start and report without building |
-| GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` (`run_gqt`) |
+| documentation | `docs/rfcs/**`, `docs/releases/**`, `docs/**` `.mdx`, `.rst` and `.adoc` files, `changelog.d/*.md`, `changelog.d/release.json`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `PR Title`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`, `CI Gate`). `Check AGENTS.md Links` reads documentation through `scripts/check-docs.py`, `Fix Regression Gate` requires `AGENTS.md` to name the corpus path `crates/omnigraph-gqt/cases/`, and `PR Title` reads the `changelog.d/` notes a pull request adds. `Test omnigraph-server --features aws` and the `GQ Logic Tests` cells start and report without building |
+| documented queries | every other `docs/**/*.md` and the root `README.md`, whose `gq` blocks the GQT query corpus test parses | the guards plus `GQ Logic Tests` and `Cross-Edition Comparison` (`run_gqt`) |
+| GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` and `Cross-Edition Comparison` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
 
@@ -96,11 +97,12 @@ Branch protection requires five contexts: `CI Gate`, `Check Workflow Action
 Pins`, `GQ Logic Tests`, `Fix Regression Gate` and `PR Title`. `CI Gate` is the `ci_gate`
 job of `ci.yml`: it needs `classify_changes`, `check_agents_md`,
 `workflow_action_pins`, `cargo_deny`, `graph_vocabulary_guard`, `fmt`,
-`lint`, `test`, `storage_upgrade_compatibility` and `test_aws_feature`, runs
+`lint`, `test`, `storage_upgrade_compatibility`, `cross_edition` and
+`test_aws_feature`, runs
 under `if: always()`, and `scripts/ci_gate.py` turns their results into the
 verdict: `failure` and `cancelled` are red, and `skipped` is accepted only
 where the job's own `if:` was false on that event, as the script's table
-restates it. Those ten jobs are what blocks `main`; a new blocking job joins
+restates it. Those eleven jobs are what blocks `main`; a new blocking job joins
 `needs:` and the table in the same pull request, and
 `scripts/check-merge-group-triggers.py` holds the two equal and pins the
 gate's wiring. `Check Workflow Action Pins` is required on its own so a
@@ -160,6 +162,28 @@ no test features each), then the current tree's test targets, whose dev-dependen
 (`test-util`) differ, so only dependency artifacts with matching features are
 reused.
 
+`Cross-Edition Comparison` (`cross_edition` in `ci.yml`) runs wherever
+`run_gqt` is true and blocks `main` through `CI Gate`. It builds the GQT runner
+of `EDITION_2_SOURCE_COMMIT`, the merge base with `main` that the GQ 3 break
+was measured against, in a detached worktree into the job's target directory
+(inside that checkout, so its `tokio_unstable` cfg applies), copies the binary
+and the commit's `omnigraph` CLI out, cleans the path-package artifacts
+through both manifests as the storage job does, builds the current runner,
+runs `scripts/cross-edition.py run` over every case both commits hold, once
+for rows and once under `--measure` for store requests, then
+runs the two-edition generated law (`law_two_editions`) with the edition-2
+CLI and `OMNIGRAPH_REQUIRE_EDITION_2=1`, and the `lint --fix` corpus proof
+(`fix_edition_2`) over the commit's worktree (`OMNIGRAPH_EDITION_2_TREE`). A
+missing runner, CLI or tree fails the job; nothing skips. `GQT slow nightly` builds the same commit's CLI for the
+law's nightly breadth; the self-test holds the two pins equal. The comparison, the table it reads and what passes are in
+[test ownership](test-ownership.md#cross-edition-comparison); the report is kept as the
+`cross-edition-report` artifact. The pin moves only with the edition-2
+reference: until the break merges, to a later merge base when `main` is merged
+into the branch; after it, never. Measured on the 2-CPU dev box, both runner
+builds take about 11 minutes cold and the comparison 5.5 minutes at three
+jobs; on the first hosted run the two cold builds took 45 minutes and each
+comparison pass 6, so the job's budget is 120 minutes.
+
 The released 0.12 cluster-ledger journey is separate
 [manual release qualification](test-ownership.md#manual-012-cluster-upgrade-qualification).
 The complete current-version live-apply CLI journey runs in `Tests slow nightly`.
@@ -183,9 +207,7 @@ The dispatch owner also checks external-store admission and persistence.
 Automatic corpus runs supply no `--store`, so schema-less query files are
 refused there; schema-and-seed datasets with zero steps are admitted.
 `--measure` refuses a selection with no DST environment.
-`GQT (dst)` runs the whole package, on engine v2, the one engine; a step's
-`--- expect same as v1` comparison runs inside it, so no job selects an
-engine. `GQT (dst-clippy)` checks all package targets with Clippy.
+`GQT (dst)` runs the whole package. `GQT (dst-clippy)` checks all package targets with Clippy.
 `GQT (served)` runs `crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs`:
 every corpus case that declares the `omnigraph-server` target runs again
 through an in-process server, its in-process verdict must be green and its

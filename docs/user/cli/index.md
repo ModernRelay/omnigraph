@@ -55,8 +55,12 @@ Other graph commands take their destination through `--target`.
 
 - `overwrite` replaces each node or edge type represented in the batch. Types
   absent from the batch are unchanged.
-- `append` inserts new entities and rejects duplicate IDs.
-- `merge` inserts new IDs and updates existing IDs.
+- `insert` inserts new entities and fails on an existing ID (`key_conflict`).
+- `upsert` inserts new IDs and sets the properties a record names on existing
+  ones, keeping the others.
+- `replace` inserts new IDs and replaces existing IDs whole: a property a
+  record omits becomes null.
+- `append` and `merge` are refused with `insert` and `replace` as the fixes.
 
 For a stored query, omit `--query`; the positional name selects the query from
 the selected backend's registry.
@@ -65,7 +69,7 @@ the selected backend's registry.
 
 ```bash
 omnigraph branch create review/new-data --from main --target ./graph.omni
-omnigraph load --target ./graph.omni --data batch.jsonl --mode merge \
+omnigraph load --target ./graph.omni --data batch.jsonl --mode replace \
   --branch review/new-data
 omnigraph query inspect --target ./graph.omni --query review.gq \
   --branch review/new-data

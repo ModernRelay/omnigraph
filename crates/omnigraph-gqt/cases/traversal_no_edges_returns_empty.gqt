@@ -34,10 +34,8 @@ edge WorksAt: Person -> Company
 
 --- query
 query friends_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
+    where $p.name = $name
     return { $f.name, $f.age }
 }
 
@@ -52,10 +50,8 @@ f.age: I32?
 
 --- query
 query unemployed() {
-    match {
-        $p: Person
-        not { $p worksAt $_ }
-    }
+    match { $p: Person }
+    where not exists { $p worksAt $_ }
     return { $p.name }
 }
 

@@ -1,5 +1,5 @@
 use omnigraph_compiler::ir::{BlockAggregateExpr, IRExpr};
-use omnigraph_compiler::query::ast::AggFunc;
+use omnigraph_compiler::query::value::AggFunc;
 use omnigraph_compiler::types::{AggSignature, ExprType, ScalarType};
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,10 @@ pub enum Accumulator {
     ExactInteger,
     Float64,
     Extremum,
+    /// A group's non-null values in the fixed value order, held in the
+    /// query's memory pool as they arrive: `collect`'s list, and the values
+    /// `stddev` and `percentile` finish.
+    List,
 }
 
 /// Conversion of the accumulated total to the declared result type.
@@ -32,17 +36,12 @@ pub struct AggregateSpec {
 
 /// Select an implementation for the declared aggregate signature.
 pub fn plan_aggregate(func: AggFunc, signature: &AggSignature) -> Result<AggregateSpec, PlanError> {
-    let scalar = func.result_type(&signature.arg).ok_or_else(|| {
+    let expected = func.result_type(&signature.arg).ok_or_else(|| {
         PlanError::Internal(format!(
             "invalid {func} argument {}",
             signature.arg.spelling()
         ))
     })?;
-    let expected = ExprType::Value {
-        scalar,
-        list: false,
-        nullable: true,
-    };
     if signature.result != expected {
         return Err(PlanError::Internal(format!(
             "{func} result must be {}, got {}",
@@ -72,12 +71,25 @@ pub fn plan_aggregate(func: AggFunc, signature: &AggSignature) -> Result<Aggrega
                 ..
             }
             | ExprType::Node { .. }
+            | ExprType::Edge { .. }
             | ExprType::ExactInteger { .. } => {
                 return Err(PlanError::Internal("sum requires numeric input".into()));
             }
         },
-        AggFunc::Avg => (Accumulator::Float64, Overflow::RoundToNearest),
+        // An integer mean divides an exact total once; a float mean
+        // accumulates in `F64` as `sum` does.
+        AggFunc::Avg => match &signature.arg {
+            ExprType::Value {
+                scalar: ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64,
+                ..
+            } => (Accumulator::ExactInteger, Overflow::RoundToNearest),
+            _ => (Accumulator::Float64, Overflow::RoundToNearest),
+        },
         AggFunc::Min | AggFunc::Max => (Accumulator::Extremum, Overflow::Error),
+        AggFunc::Collect => (Accumulator::List, Overflow::Error),
+        // The group's values, held as `collect` holds them and finished in
+        // `F64`: an integer value rounds to the nearest `F64`.
+        AggFunc::Stddev | AggFunc::Percentile => (Accumulator::List, Overflow::RoundToNearest),
     };
     Ok(AggregateSpec {
         accumulator,
@@ -159,7 +171,7 @@ pub fn validate_aggregate_specs(plan: &PhysicalPlan) -> Result<(), PlanError> {
                             ..
                         } => {
                             matches!((arg.as_ref(), &signature.arg),
-                                (IRExpr::Variable(binding, _), ExprType::Node { type_name })
+                                (IRExpr::Variable(binding, _), ExprType::Node { type_name, .. })
                                 if spec.binding.as_ref() == Some(binding) && spec.table.type_key.strip_prefix("node:") == Some(type_name.as_str()))
                         }
                         _ => false,

@@ -5,13 +5,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::read_shape::{ArmRank, PatternStep, ReadShape};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
-use omnigraph_compiler::query::ast::{AggFunc, LoadStmtMode};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::query::codes::{P002, P004};
+use omnigraph_compiler::query::file::LoadStmtMode;
+use omnigraph_compiler::query::value::AggFunc;
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
-use omnigraph_compiler::types::Direction;
+use omnigraph_compiler::types::{Direction, ExprType};
 
 use crate::cost::{
     AccessPath, AntiJoinStrategy, CoverageProvenance, EndpointProbe, ExpandCostInputs, ExpandMode,
@@ -25,21 +27,19 @@ use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::key_set::{KeySetTree, key_set_tree};
 use crate::logical::{
     ColumnRef, ConsultedImage, CsvSourceSpec, DeltaSourceSpec, EDGE_TYPE_MEMBER, FragmentWriteSpec,
-    GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode, LogicalPlan,
-    Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, SearchArm, ValidateSpec,
-    tiebreak_text,
+    FuseInput, GqFilter, IDENTITY_MEMBER, KeyJoinKind, LOGICAL_ID, LogicalId, LogicalNode,
+    LogicalPlan, Predicate, RuntimeFilterKind, RuntimeFilterSpec, ScanSpec, ValidateSpec,
 };
 use crate::lower::ContainsJoinFields;
 use crate::operation::{Operation, Side};
 use crate::output::{node_object_types, return_schema};
 use crate::passes::{PassId, PassStage};
 use crate::physical::{
-    Assumptions, Eligibility, EmptyEligible, Estimate, Hop, HydratedBinding, HydratedColumn,
-    NearestPolicy, NodeId, OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter,
-    Properties, RankArm, RankKind, RankScope, RankedAccess, ScanInput, StatisticSource,
-    TextContains,
+    Assumptions, Estimate, FuseArm, Hop, HydratedBinding, HydratedColumn, NearestPolicy, NodeId,
+    OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankScope,
+    RankedAccess, ScanInput, StatisticSource, TextContains,
 };
-use crate::source::{FullTextCoverage, NodeTypeSpec, PlanSource, SideId};
+use crate::source::{NodeTypeSpec, PlanSource, SideId, charge_pass};
 use crate::validate::subset::{Role, Rule, Tracer};
 
 pub const ROW_ID: &str = "_rowid";
@@ -301,133 +301,15 @@ pub fn write_count_schema() -> SchemaRef {
     )]))
 }
 
-/// Stage 1, pass 1 for a GQ query: the flat `IROp` pipeline folded into a
+/// Stage 1, pass 1 for a GQ query: the flat `PatternStep` pipeline folded into a
 /// tree, then a leading search function, the `return`, the remaining
 /// `order` keys and the `limit` above it.
-/// The node properties the query's full-text calls read the index of, as
-/// `(type name, property)`, first appearance first: `search`, `fuzzy` and
-/// `match_text` in any filter (correlated blocks included), and `bm25` in the
-/// leading order key or either arm of an `rrf()` there. Planning checks each
-/// one's coverage (`require_full_text_indexes`) and acceptance requires the
-/// plan to record it. Block-local bindings stay within their lexical scope;
-/// nested blocks inherit their parent's bindings, never a sibling's locals.
-pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
-    fn bindings(ops: &[IROp], out: &mut HashMap<String, String>) {
-        for op in ops {
-            match op {
-                IROp::NodeScan {
-                    variable,
-                    type_name,
-                    filters: _,
-                } => {
-                    out.insert(variable.clone(), type_name.clone());
-                }
-                IROp::Expand {
-                    dst_var, dst_type, ..
-                } => {
-                    out.insert(dst_var.clone(), dst_type.clone());
-                }
-                IROp::AntiJoin { .. } | IROp::Filter(_) => {}
-            }
-        }
-    }
-    fn calls(expr: &IRExpr, types: &HashMap<String, String>, out: &mut Vec<(String, String)>) {
-        match expr {
-            IRExpr::Search { field, .. }
-            | IRExpr::Fuzzy { field, .. }
-            | IRExpr::MatchText { field, .. }
-            | IRExpr::Bm25 { field, .. } => {
-                if let IRExpr::PropAccess {
-                    variable, property, ..
-                } = field.as_ref()
-                {
-                    if let Some(type_name) = types.get(variable) {
-                        let target = (type_name.clone(), property.clone());
-                        if !out.contains(&target) {
-                            out.push(target);
-                        }
-                    }
-                }
-            }
-            IRExpr::Rrf {
-                primary, secondary, ..
-            } => {
-                calls(primary, types, out);
-                calls(secondary, types, out);
-            }
-            IRExpr::Binary { left, right, .. } => {
-                calls(left, types, out);
-                calls(right, types, out);
-            }
-            IRExpr::Not(inner, _)
-            | IRExpr::Cast { expr: inner, .. }
-            | IRExpr::IsNull { expr: inner, .. } => calls(inner, types, out),
-            IRExpr::PropAccess { .. }
-            | IRExpr::Nearest { .. }
-            | IRExpr::Variable(..)
-            | IRExpr::Param(..)
-            | IRExpr::Literal(..)
-            | IRExpr::Aggregate { .. }
-            | IRExpr::AliasRef(..) => {}
-        }
-    }
-    fn filter_calls(
-        ops: &[IROp],
-        types: &HashMap<String, String>,
-        out: &mut Vec<(String, String)>,
-    ) {
-        for op in ops {
-            match op {
-                IROp::NodeScan { filters, .. }
-                | IROp::Expand {
-                    dst_filters: filters,
-                    ..
-                } => filters.iter().for_each(|filter| calls(filter, types, out)),
-                IROp::Filter(filter) => calls(filter, types, out),
-                IROp::AntiJoin { inner, .. } => {
-                    let mut inner_types = types.clone();
-                    bindings(inner, &mut inner_types);
-                    filter_calls(inner, &inner_types, out);
-                }
-            }
-        }
-    }
-    let mut types = HashMap::new();
-    bindings(&ir.pipeline, &mut types);
-    let mut targets = Vec::new();
-    filter_calls(&ir.pipeline, &types, &mut targets);
-    if let Some(leading) = ir.order_by.first() {
-        calls(&leading.expr, &types, &mut targets);
-    }
-    targets
-}
-
-/// Every full-text call reads its property's full-text index, whose analyzer
-/// (case folding, stemming) a segment carries: a trained one with postings or
-/// the untrained declaration every write records. Coverage may be full or
-/// partial, since Lance scans uncovered rows with that analyzer; an absent
-/// index means no segment records the analyzer at the pinned snapshot, and
-/// Lance would fall back to a bare, case-sensitive tokenizer, so the call is
-/// refused rather than answered differently. The type checker (`T27`)
-/// already required the declaration.
-fn require_full_text_indexes(ir: &QueryIR, source: &dyn PlanSource) -> Result<(), PlanError> {
-    for (type_name, property) in full_text_targets(ir) {
-        let type_key = format!("node:{type_name}");
-        if source.full_text_coverage(&type_key, &property) == FullTextCoverage::Absent {
-            return Err(PlanError::FullTextIndexRequired {
-                index: format!("{type_name}.{property}"),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn resolve_query(
     plan: &mut LogicalPlan,
-    ir: &QueryIR,
+    ir: &ReadShape,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
-    require_full_text_indexes(ir, source)?;
+    plan.set_made_up(ir.made_up.clone());
     if ir.has_edge_selections() {
         let limit = source.traversal_work_limit().ok_or_else(|| {
             PlanError::refused(
@@ -450,7 +332,7 @@ fn resolve_query(
             ));
         }
     }
-    let QueryIR {
+    let ReadShape {
         name: _,
         params: _,
         pipeline,
@@ -458,28 +340,31 @@ fn resolve_query(
         distinct,
         order_by,
         limit,
+        limit_param,
+        written_columns,
+        made_up: _,
+        work: _,
     } = ir;
+    if let (Some(param), None) = (limit_param, limit) {
+        return Err(PlanError::Internal(format!(
+            "`limit ${param}` reached the planner without its bound count"
+        )));
+    }
     let mut next_binding = 0u16;
     let mut current = resolve_pipeline(plan, pipeline, source, &mut next_binding, None)?;
     let schema = schema_of(plan, current)?;
     let mut orderings: &[IROrdering] = order_by;
-    let mut ranked = false;
+    // A ranking drawn as a pattern step leads no sort.
+    let windowed = pipeline
+        .iter()
+        .any(|step| matches!(step, PatternStep::Rank { .. }));
     let has_aggregates = return_exprs
         .iter()
         .any(|projection| contains_aggregate(&projection.expr));
     let grouped = has_aggregates || *distinct;
-    if let Some(leading) = orderings.first() {
-        if let Some(mut node) = search_node(current, &leading.expr, *limit) {
-            if let LogicalNode::RankFuse {
-                arms, row_tiebreak, ..
-            } = &mut node
-            {
-                *row_tiebreak = scope_tiebreaks(plan, current, source)?
-                    .into_iter()
-                    .map(|(column, _)| column)
-                    .filter(|column| column.binding != arms[0].binding)
-                    .collect();
-            }
+    let mut ranked = false;
+    if let Some(leading) = orderings.first().filter(|_| !windowed) {
+        if let Some(node) = search_node(current, &leading.expr, *limit, true, None) {
             current = plan.add(node, schema.clone());
             orderings = &orderings[1..];
             ranked = true;
@@ -527,12 +412,14 @@ fn resolve_query(
             schema.clone(),
         )
     };
-    if ranked || !orderings.is_empty() {
+    // A `limit` cuts a total order: with no key written it is the tie
+    // rule's alone (RFC, `Cut`), over pattern rows and group rows alike.
+    if ranked || !orderings.is_empty() || limit.is_some() {
         let bound: Vec<IROrdering> = orderings
             .iter()
             .map(|ordering| IROrdering {
                 expr: bind_order_key(&ordering.expr, return_exprs, grouped),
-                descending: ordering.descending,
+                ..ordering.clone()
             })
             .filter(|ordering| !matches!(ordering.expr, IRExpr::Literal(_, _)))
             .collect();
@@ -541,7 +428,7 @@ fn resolve_query(
             order_keys(&ordering.expr, &mut keys);
         }
         let tiebreak = sort_tiebreak(
-            &scope_tiebreaks(plan, current, source)?,
+            &tie_rule(plan, current, source, false, written_columns)?,
             order_by,
             return_exprs,
             grouped,
@@ -575,18 +462,25 @@ fn resolve_query(
 /// starts from the `OuterReference`, so its first op may filter or expand.
 fn resolve_pipeline(
     plan: &mut LogicalPlan,
-    ops: &[IROp],
+    ops: &[PatternStep],
     source: &dyn PlanSource,
     next_binding: &mut u16,
     seed: Option<LogicalId>,
 ) -> Result<LogicalId, PlanError> {
+    // The pattern block's one join order, the written one: the state this
+    // planner explores; a join enumeration charges each order it considers.
+    if let Some(work) = source.query_work() {
+        work.explore(1)?;
+    }
     let mut current: Option<LogicalId> = seed;
     for op in ops {
+        if let Some(work) = source.query_work() {
+            work.step()?;
+        }
         let node = match op {
-            IROp::NodeScan {
+            PatternStep::NodeScan {
                 variable,
                 type_name,
-                filters,
             } => {
                 let NodeTypeSpec {
                     table,
@@ -615,9 +509,8 @@ fn resolve_pipeline(
                     },
                     schema.clone(),
                 );
-                let filtered = filter_over(plan, scan, filters, schema.clone());
                 match current {
-                    None => filtered,
+                    None => scan,
                     Some(left) => {
                         let joined = join_schema(
                             &schema_of(plan, left)?,
@@ -625,22 +518,19 @@ fn resolve_pipeline(
                             &schema,
                             Some(variable.as_str()),
                         );
-                        plan.add(
-                            LogicalNode::CrossJoin {
-                                left,
-                                right: filtered,
-                            },
-                            joined,
-                        )
+                        plan.add(LogicalNode::CrossJoin { left, right: scan }, joined)
                     }
                 }
             }
-            IROp::Filter(filter) => {
+            PatternStep::Filter {
+                pred: filter,
+                fails,
+            } => {
                 let input = bound(current, "filter")?;
                 let schema = schema_of(plan, input)?;
-                filter_over(plan, input, std::slice::from_ref(filter), schema)
+                filter_over(plan, input, std::slice::from_ref(filter), *fails, schema)
             }
-            IROp::Expand {
+            PatternStep::Expand {
                 src_var,
                 dst_var,
                 edges,
@@ -648,7 +538,6 @@ fn resolve_pipeline(
                 dst_type,
                 min_hops,
                 max_hops,
-                dst_filters,
                 edge_binding,
             } => {
                 let input = bound(current, "expand")?;
@@ -675,7 +564,7 @@ fn resolve_pipeline(
                     },
                     schema.clone(),
                 );
-                let destination = plan.add(
+                plan.add(
                     LogicalNode::TableScan {
                         input: Some(expand),
                         spec: Box::new(ScanSpec {
@@ -691,14 +580,112 @@ fn resolve_pipeline(
                             runtime_filter: None,
                         }),
                     },
+                    schema,
+                )
+            }
+            PatternStep::Rank {
+                key,
+                binding,
+                window,
+                recall,
+                ..
+            } => {
+                let input = bound(current, "ranking")?;
+                let schema = schema_of(plan, input)?;
+                // A search over the ranked binding's scan, or rows that
+                // already carry their exact distance, which the key reads.
+                let (ranked, score) = match search_node(input, key, *window, false, *recall) {
+                    Some(node) => (plan.add(node, schema.clone()), rank_score(binding)),
+                    None => (input, key.clone()),
+                };
+                // The window: the rows of the `k` nearest targets, in
+                // distance order with ties to the smaller identity.
+                let targets = window.ok_or_else(|| {
+                    PlanError::Internal("a `nearest` ranking step has no window".to_string())
+                })?;
+                let mut keys = Vec::new();
+                order_keys(&score, &mut keys);
+                let tiebreak = scope_tiebreaks(plan, ranked, source)?
+                    .into_iter()
+                    .map(|(column, _)| column)
+                    .filter(|column| column.binding == *binding)
+                    .collect();
+                let sorted = plan.add(
+                    LogicalNode::Sort {
+                        input: ranked,
+                        keys,
+                        order_by: vec![IROrdering::new(score, false)],
+                        fetch: None,
+                        tiebreak,
+                    },
                     schema.clone(),
                 );
-                filter_over(plan, destination, dst_filters, schema)
+                plan.add(
+                    LogicalNode::TargetCut {
+                        input: sorted,
+                        binding: binding.clone(),
+                        targets,
+                    },
+                    schema,
+                )
             }
-            IROp::AntiJoin {
+            PatternStep::Score {
+                binding,
+                type_name,
+                property,
+                kind,
+                query,
+            } => {
+                let input = bound(current, "score")?;
+                let schema = schema_of(plan, input)?;
+                // `distance` scores each row from its own vector. `bm25`
+                // scores each matching document during its corpus pass and
+                // looks a row up by its identity, so the population reads
+                // no text.
+                let mut reads = match kind {
+                    omnigraph_compiler::ir::core::ScoreKind::Bm25 => {
+                        vec![ColumnRef::property(binding, IDENTITY_MEMBER)]
+                    }
+                    omnigraph_compiler::ir::core::ScoreKind::Distance => {
+                        let mut reads = vec![ColumnRef::property(binding, property)];
+                        reads_of_expr(query, &mut reads);
+                        reads
+                    }
+                };
+                reads.dedup();
+                plan.add(
+                    LogicalNode::Score {
+                        input,
+                        binding: binding.clone(),
+                        type_name: type_name.clone(),
+                        property: property.clone(),
+                        kind: *kind,
+                        query: query.clone(),
+                        reads,
+                    },
+                    schema,
+                )
+            }
+            PatternStep::Let { name, value } => {
+                let input = bound(current, "let")?;
+                let schema = schema_of(plan, input)?;
+                let mut reads = Vec::new();
+                reads_of_expr(value, &mut reads);
+                plan.add(
+                    LogicalNode::Let {
+                        input,
+                        name: name.clone(),
+                        value: value.clone(),
+                        reads,
+                    },
+                    schema,
+                )
+            }
+            PatternStep::AntiJoin {
                 outer_var,
                 inner,
                 predicate,
+                fails,
             } => {
                 let input = bound(current, "anti-join")?;
                 let schema = schema_of(plan, input)?;
@@ -715,14 +702,314 @@ fn resolve_pipeline(
                         inner,
                         outer_var: outer_var.clone(),
                         predicate: predicate.clone(),
+                        fails: *fails,
                     },
                     schema,
+                )
+            }
+            PatternStep::Union {
+                arms,
+                bindings,
+                outer_var,
+            } => {
+                // Arms that read the enclosing scope each start from its
+                // rows: the first from the correlated read's own leaf, the
+                // others from leaves of their own over the same rows.
+                let mut seeds: Vec<Option<LogicalId>> = Vec::with_capacity(arms.len());
+                if let Some(outer_var) = outer_var {
+                    let first = bound(current, "correlated union")?;
+                    let schema = schema_of(plan, first)?;
+                    seeds.push(Some(first));
+                    for _ in 1..arms.len() {
+                        seeds.push(Some(plan.add(
+                            LogicalNode::OuterReference {
+                                outer_var: outer_var.clone(),
+                            },
+                            schema.clone(),
+                        )));
+                    }
+                } else {
+                    seeds.resize(arms.len(), None);
+                }
+                let mut folded: Option<LogicalId> = None;
+                for (arm, seed) in arms.iter().zip(seeds) {
+                    let arm = resolve_pipeline(plan, arm, source, next_binding, seed)?;
+                    folded = Some(match folded {
+                        None => arm,
+                        Some(left) => {
+                            let schema = schema_of(plan, left)?;
+                            plan.add(
+                                LogicalNode::Union {
+                                    left,
+                                    right: arm,
+                                    bindings: bindings.clone(),
+                                },
+                                schema,
+                            )
+                        }
+                    });
+                }
+                let union =
+                    folded.ok_or_else(|| PlanError::Internal("a union has no arm".to_string()))?;
+                match current {
+                    _ if outer_var.is_some() => union,
+                    None => union,
+                    Some(left) => {
+                        let joined = join_schema(
+                            &schema_of(plan, left)?,
+                            None,
+                            &schema_of(plan, union)?,
+                            None,
+                        );
+                        plan.add(LogicalNode::CrossJoin { left, right: union }, joined)
+                    }
+                }
+            }
+            PatternStep::Correlate {
+                outer_var,
+                inner,
+                read,
+                fails,
+            } => {
+                let seed = match outer_var {
+                    Some(outer_var) => {
+                        let input = bound(current, "correlate")?;
+                        let schema = schema_of(plan, input)?;
+                        Some(plan.add(
+                            LogicalNode::OuterReference {
+                                outer_var: outer_var.clone(),
+                            },
+                            schema,
+                        ))
+                    }
+                    None => None,
+                };
+                let inner_root = resolve_pipeline(plan, inner, source, next_binding, seed)?;
+                let tiebreak = correlate_tiebreak(plan, inner_root, read, source)?;
+                let mut reads = Vec::new();
+                for expr in read.exprs().chain(read.limit_expr.iter()) {
+                    reads_of_expr(expr, &mut reads);
+                }
+                let schema = schema_of(plan, inner_root)?;
+                let correlated = outer_var.is_some().then_some(()).and(current);
+                let node = plan.add(
+                    LogicalNode::Correlate {
+                        input: correlated,
+                        inner: inner_root,
+                        outer_var: outer_var.clone(),
+                        read: Box::new(read.clone()),
+                        tiebreak,
+                        reads,
+                        fails: *fails,
+                    },
+                    schema,
+                );
+                match (current, outer_var) {
+                    (Some(left), None) => {
+                        let joined = join_schema(
+                            &schema_of(plan, left)?,
+                            None,
+                            &schema_of(plan, node)?,
+                            None,
+                        );
+                        plan.add(LogicalNode::CrossJoin { left, right: node }, joined)
+                    }
+                    _ => node,
+                }
+            }
+            PatternStep::Fuse {
+                arms,
+                target,
+                target_type,
+                k,
+                weights,
+                outer_var,
+            } => {
+                // Partitioned per outer row, each arm starts from the outer
+                // rows, the first from the correlated read's own leaf, the
+                // others from leaves of their own over the same rows, as a
+                // correlated union's arms do; each arm is a correlated read
+                // yielding its rows per outer row in its rank order.
+                let mut seeds: Vec<Option<LogicalId>> = Vec::with_capacity(arms.len());
+                match outer_var {
+                    Some(outer_var) => {
+                        let first = bound(current, "partitioned fusion")?;
+                        let schema = schema_of(plan, first)?;
+                        seeds.push(Some(first));
+                        for _ in 1..arms.len() {
+                            seeds.push(Some(plan.add(
+                                LogicalNode::OuterReference {
+                                    outer_var: outer_var.clone(),
+                                },
+                                schema.clone(),
+                            )));
+                        }
+                    }
+                    None if current.is_some() => {
+                        return Err(PlanError::Internal(
+                            "an `rrf` drawn after other elements, which the shaper refuses"
+                                .to_string(),
+                        ));
+                    }
+                    None => seeds.resize(arms.len(), None),
+                }
+                let mut inputs = Vec::with_capacity(arms.len());
+                for (arm, seed) in arms.iter().zip(seeds) {
+                    let root = resolve_pipeline(plan, &arm.steps, source, next_binding, seed)?;
+                    let input = match outer_var {
+                        Some(_) => root,
+                        None => ranked_arm(plan, root, target, arm.rank, source)?,
+                    };
+                    inputs.push(FuseInput {
+                        input,
+                        rank: arm.rank,
+                    });
+                }
+                let mut reads = Vec::new();
+                for expr in k.iter().chain(weights.iter()) {
+                    reads_of_expr(expr, &mut reads);
+                }
+                let NodeTypeSpec { schema, .. } = source.node_type(target_type)?;
+                plan.add(
+                    LogicalNode::Fuse {
+                        arms: inputs,
+                        target: target.clone(),
+                        k: k.clone(),
+                        weights: weights.clone(),
+                        reads,
+                        partition: outer_var.clone(),
+                    },
+                    schema,
+                )
+            }
+            PatternStep::Optional {
+                outer_var,
+                inner,
+                fails,
+            } => {
+                let input = bound(current, "optional")?;
+                let schema = schema_of(plan, input)?;
+                let outer = plan.add(
+                    LogicalNode::OuterReference {
+                        outer_var: outer_var.clone(),
+                    },
+                    schema,
+                );
+                let inner = resolve_pipeline(plan, inner, source, next_binding, Some(outer))?;
+                let joined = schema_of(plan, inner)?;
+                plan.add(
+                    LogicalNode::OptionalJoin {
+                        input,
+                        inner,
+                        outer_var: outer_var.clone(),
+                        fails: *fails,
+                    },
+                    joined,
                 )
             }
         };
         current = Some(node);
     }
     current.ok_or_else(|| PlanError::Internal("a GQ pipeline starts with a scan".to_string()))
+}
+
+/// A fusion arm's root, whose rows arrive in the arm's rank order: a
+/// `nearest` window's `TargetCut` (distance, then the target's identity) and
+/// an ordered read's `Correlate` (its keys, then its tie rule) as the arm's
+/// steps planned them; a score's rows (an exact `distance` or `bm25`, or a
+/// nested fusion) sorted by the score in its kind's direction, then the
+/// target's identity, so each target's rows are adjacent at its rank.
+fn ranked_arm(
+    plan: &mut LogicalPlan,
+    root: LogicalId,
+    target: &str,
+    rank: ArmRank,
+    source: &dyn PlanSource,
+) -> Result<LogicalId, PlanError> {
+    let Some(score) = arm_score(target, rank) else {
+        return Ok(root);
+    };
+    if rank == ArmRank::Nearest {
+        return Ok(root);
+    }
+    let schema = schema_of(plan, root)?;
+    let mut keys = Vec::new();
+    order_keys(&score.expr, &mut keys);
+    let tiebreak = scope_tiebreaks(plan, root, source)?
+        .into_iter()
+        .map(|(column, _)| column)
+        .filter(|column| column.binding == target)
+        .collect();
+    Ok(plan.add(
+        LogicalNode::Sort {
+            input: root,
+            keys,
+            order_by: vec![score],
+            fetch: None,
+            tiebreak,
+        },
+        schema,
+    ))
+}
+
+/// The score a fusion arm ranks its target by, in its kind's direction:
+/// `_distance` ascending (`F32`), an exact `bm25`'s `_score` descending
+/// (`F64`), a nested fusion's `_rrf` descending (`F64`); `None` for an
+/// ordered read, ranked by its own order.
+pub(crate) fn arm_score(target: &str, rank: ArmRank) -> Option<IROrdering> {
+    let (column, descending) = rank.score()?;
+    let scalar = match rank {
+        ArmRank::Nearest | ArmRank::Distance => omnigraph_compiler::types::ScalarType::F32,
+        ArmRank::Bm25 | ArmRank::Fused | ArmRank::Ordered => {
+            omnigraph_compiler::types::ScalarType::F64
+        }
+    };
+    Some(IROrdering::new(
+        IRExpr::PropAccess {
+            variable: target.to_string(),
+            property: column.to_string(),
+            ty: omnigraph_compiler::types::ExprType::from_prop(
+                &omnigraph_compiler::types::PropType::scalar(scalar, false),
+            ),
+        },
+        descending,
+    ))
+}
+
+/// The columns a correlated read's tie rule reads after its `order` keys:
+/// over its pattern's rows, every column of its pattern in column order
+/// ([`tie_rule`], its own unreturned bindings counting where they are
+/// bound, since its rows hold them until its projection); over its groups,
+/// each reference key by its identity, then each value key by its column of
+/// the read's `values`, each in column order.
+fn correlate_tiebreak(
+    plan: &LogicalPlan,
+    inner: LogicalId,
+    read: &crate::read_shape::InnerRead,
+    source: &dyn PlanSource,
+) -> Result<Vec<ColumnRef>, PlanError> {
+    let candidates = tie_rule(plan, inner, source, true, &[])?;
+    let Some(group) = &read.group else {
+        return Ok(candidates.into_iter().map(|(column, _)| column).collect());
+    };
+    let mut out = Vec::new();
+    for key in group {
+        if let IRExpr::Variable(name, _) = &key.expr {
+            out.extend(
+                candidates
+                    .iter()
+                    .filter(|(column, _)| column.binding == *name)
+                    .map(|(column, _)| column.clone()),
+            );
+        }
+    }
+    for key in group {
+        match &key.expr {
+            IRExpr::Aggregate { .. } | IRExpr::Variable(_, _) => {}
+            _ => out.push(ColumnRef::property(&read.values, &key.column)),
+        }
+    }
+    Ok(out)
 }
 
 fn bound(current: Option<LogicalId>, op: &str) -> Result<LogicalId, PlanError> {
@@ -742,6 +1029,7 @@ fn filter_over(
     plan: &mut LogicalPlan,
     input: LogicalId,
     filters: &[IRExpr],
+    fails: bool,
     schema: SchemaRef,
 ) -> LogicalId {
     let mut conjuncts: Vec<IRExpr> = Vec::new();
@@ -753,7 +1041,14 @@ fn filter_over(
     if conjuncts.is_empty() {
         input
     } else {
-        plan.add(LogicalNode::Filter { input, conjuncts }, schema)
+        plan.add(
+            LogicalNode::Filter {
+                input,
+                conjuncts,
+                fails,
+            },
+            schema,
+        )
     }
 }
 
@@ -780,7 +1075,13 @@ pub(crate) fn gq_conjunct(conjunct: &IRExpr) -> Predicate {
 
 /// The node a leading `order` search function becomes; `None` leaves the
 /// expression to `Sort`, which then reads its columns like any other.
-fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<LogicalNode> {
+fn search_node(
+    input: LogicalId,
+    expr: &IRExpr,
+    limit: Option<u64>,
+    leads: bool,
+    recall: Option<f64>,
+) -> Option<LogicalNode> {
     match expr {
         IRExpr::Nearest {
             variable,
@@ -797,97 +1098,19 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
                 query: query.as_ref().clone(),
                 k: limit,
                 reads,
-            })
-        }
-        IRExpr::Bm25 { field, query, .. } => {
-            let IRExpr::PropAccess {
-                variable,
-                property,
-                ty: _,
-            } = field.as_ref()
-            else {
-                return None;
-            };
-            let mut reads = Vec::new();
-            reads_of_expr(query, &mut reads);
-            Some(LogicalNode::TextSearch {
-                input,
-                binding: variable.clone(),
-                property: property.clone(),
-                query: query.as_ref().clone(),
-                reads,
-            })
-        }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-            ..
-        } => {
-            let arms = [search_target(primary)?, search_target(secondary)?];
-            let mut reads = Vec::new();
-            for arm in [primary, secondary] {
-                search_arm_reads(arm, &mut reads);
-            }
-            if let Some(k) = k {
-                reads_of_expr(k, &mut reads);
-            }
-            Some(LogicalNode::RankFuse {
-                input,
-                arms: Box::new(arms),
-                k: k.as_deref().cloned(),
-                limit,
-                reads,
-                row_tiebreak: Vec::new(),
+                leads,
+                recall,
             })
         }
         _ => None,
     }
 }
 
-fn search_target(expr: &IRExpr) -> Option<SearchArm> {
-    match expr {
-        IRExpr::Nearest {
-            variable,
-            property,
-            query,
-            ..
-        } => Some(SearchArm {
-            binding: variable.clone(),
-            property: property.clone(),
-            kind: RankKind::Nearest,
-            query: query.as_ref().clone(),
-        }),
-        IRExpr::Bm25 { field, query, .. } => match field.as_ref() {
-            IRExpr::PropAccess {
-                variable,
-                property,
-                ty: _,
-            } => Some(SearchArm {
-                binding: variable.clone(),
-                property: property.clone(),
-                kind: RankKind::Bm25,
-                query: query.as_ref().clone(),
-            }),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// A search arm reads only its query arguments: Lance ranks on the target
-/// column itself and appends the score column the query sorts on.
-fn search_arm_reads(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
-    match expr {
-        IRExpr::Nearest { query, .. } | IRExpr::Bm25 { query, .. } => reads_of_expr(query, out),
-        other => reads_of_expr(other, out),
-    }
-}
-
-pub(crate) fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
+/// The distance column a `nearest` scan appends under `binding`.
+pub(crate) fn rank_score(binding: &str) -> IRExpr {
     IRExpr::PropAccess {
         variable: binding.to_string(),
-        property: kind.score().0.to_string(),
+        property: omnigraph_compiler::query::value::DISTANCE_COLUMN.to_string(),
         ty: omnigraph_compiler::types::ExprType::from_prop(
             &omnigraph_compiler::types::PropType::scalar(
                 omnigraph_compiler::types::ScalarType::F32,
@@ -897,30 +1120,10 @@ pub(crate) fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
     }
 }
 
-/// The fused score a `RankFuse` appends under its primary arm's binding,
-/// the key the query's `Sort` leads with (RFC 0047 §Total order).
-fn fused_score(binding: &str) -> IRExpr {
-    IRExpr::PropAccess {
-        variable: binding.to_string(),
-        property: omnigraph_compiler::query::ast::RRF_COLUMN.to_string(),
-        ty: omnigraph_compiler::types::ExprType::from_prop(
-            &omnigraph_compiler::types::PropType::scalar(
-                omnigraph_compiler::types::ScalarType::F64,
-                false,
-            ),
-        ),
-    }
-}
-
 pub(crate) fn contains_aggregate(expr: &IRExpr) -> bool {
-    match expr {
-        IRExpr::Aggregate { .. } => true,
-        IRExpr::Binary { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
-        IRExpr::Not(inner, _)
-        | IRExpr::IsNull { expr: inner, .. }
-        | IRExpr::Cast { expr: inner, .. } => contains_aggregate(inner),
-        _ => false,
-    }
+    let mut found = false;
+    expr.visit_nodes(|node| found |= matches!(node, IRExpr::Aggregate { .. }));
+    found
 }
 
 /// The `Aggregate` node's items (group keys, plain aggregates, and each
@@ -957,79 +1160,78 @@ fn split_aggregate_return(
 }
 
 fn hoist_aggregates(expr: &IRExpr, grouped: &mut Vec<IRProjection>) -> IRExpr {
-    match expr {
-        IRExpr::Aggregate { .. } => {
-            let ty = expr.ty().clone();
-            let column = match grouped.iter().find(|p| p.expr == *expr) {
-                Some(projection) => projection.column.clone(),
-                None => {
-                    let column = expr.to_string();
-                    grouped.push(IRProjection {
-                        expr: expr.clone(),
-                        alias: None,
-                        column: column.clone(),
-                        ty: ty.clone(),
-                    });
-                    column
-                }
-            };
-            IRExpr::AliasRef(column, ty)
+    omnigraph_compiler::stack::deep(|| {
+        match expr {
+            IRExpr::Aggregate { .. } => {
+                let ty = expr.ty().clone();
+                let column = match grouped.iter().find(|p| p.expr == *expr) {
+                    Some(projection) => projection.column.clone(),
+                    None => {
+                        let column = expr.to_string();
+                        grouped.push(IRProjection {
+                            expr: expr.clone(),
+                            alias: None,
+                            column: column.clone(),
+                            ty: ty.clone(),
+                        });
+                        column
+                    }
+                };
+                IRExpr::AliasRef(column, ty)
+            }
+            // Under any operator: unary `-`, a call and arithmetic alike.
+            other => other
+                .try_map_children(|child| {
+                    Ok::<_, std::convert::Infallible>(hoist_aggregates(child, grouped))
+                })
+                .unwrap_or_else(|never| match never {}),
         }
-        IRExpr::Binary {
-            left,
-            op,
-            right,
-            ty,
-        } => IRExpr::Binary {
-            left: Box::new(hoist_aggregates(left, grouped)),
-            op: *op,
-            right: Box::new(hoist_aggregates(right, grouped)),
-            ty: ty.clone(),
-        },
-        IRExpr::Not(inner, ty) => {
-            IRExpr::Not(Box::new(hoist_aggregates(inner, grouped)), ty.clone())
-        }
-        IRExpr::IsNull {
-            expr: inner,
-            negated,
-            ty,
-        } => IRExpr::IsNull {
-            expr: Box::new(hoist_aggregates(inner, grouped)),
-            negated: *negated,
-            ty: ty.clone(),
-        },
-        IRExpr::Cast { expr: inner, ty } => IRExpr::Cast {
-            expr: Box::new(hoist_aggregates(inner, grouped)),
-            ty: ty.clone(),
-        },
-        other => other.clone(),
-    }
+    })
 }
 
-/// The user's keys, then every group key the user did not write, ascending.
+/// The user's keys, then the tie rule over group rows: every group key the
+/// user did not write, ascending, the references (by identity) first and
+/// the values after them, each in column order. An aggregate column follows
+/// nothing, since the keys already tell two groups apart.
 fn with_group_keys(
     order_by: &[IROrdering],
     return_exprs: &[IRProjection],
     aggregates: &[Option<crate::aggregate::AggregateSpec>],
 ) -> Vec<IROrdering> {
     let mut keys = order_by.to_vec();
-    for (projection, aggregate) in return_exprs.iter().zip(aggregates) {
-        if aggregate.is_some() {
-            continue;
-        }
+    let groups = return_exprs
+        .iter()
+        .zip(aggregates)
+        .filter(|(_, aggregate)| aggregate.is_none())
+        .map(|(projection, _)| projection);
+    let (references, values): (Vec<_>, Vec<_>) =
+        groups.partition(|projection| is_reference_expr(&projection.expr));
+    for projection in references.into_iter().chain(values) {
         let column = result_column(projection);
         let written = keys.iter().any(|key| match &key.expr {
             IRExpr::AliasRef(alias, _) => *alias == column,
             expr => *expr == projection.expr,
         });
         if !written {
-            keys.push(IROrdering {
-                expr: IRExpr::AliasRef(column, projection.ty.clone()),
-                descending: false,
-            });
+            keys.push(IROrdering::new(
+                IRExpr::AliasRef(column, projection.ty.clone()),
+                false,
+            ));
         }
     }
     keys
+}
+
+/// Whether `expr` is a reference column: a node or edge variable.
+pub(crate) fn is_reference_expr(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::Variable(
+            _,
+            omnigraph_compiler::types::ExprType::Node { .. }
+                | omnigraph_compiler::types::ExprType::Edge { .. }
+        )
+    )
 }
 
 /// A key the type checker bound to a `return` item (T42, RFC
@@ -1087,6 +1289,34 @@ fn visible_scope(plan: &LogicalPlan, id: LogicalId) -> Vec<&LogicalNode> {
     nodes
 }
 
+/// The names bound inside the inner trees of the correlated reads `id`
+/// sees that the reads do not return: their rows leave without them.
+fn correlated_hidden(plan: &LogicalPlan, id: LogicalId) -> HashSet<String> {
+    let mut hidden = HashSet::new();
+    for node in visible_scope(plan, id) {
+        let LogicalNode::Correlate { inner, read, .. } = node else {
+            continue;
+        };
+        let returned: HashSet<&str> = read.references().collect();
+        for inner_node in visible_scope(plan, *inner) {
+            let names: Vec<&String> = match inner_node {
+                LogicalNode::TableScan { spec, .. } => spec.binding.iter().collect(),
+                LogicalNode::Expand {
+                    dst, edge_binding, ..
+                } => std::iter::once(dst).chain(edge_binding).collect(),
+                _ => Vec::new(),
+            };
+            hidden.extend(
+                names
+                    .into_iter()
+                    .filter(|name| !returned.contains(name.as_str()))
+                    .cloned(),
+            );
+        }
+    }
+    hidden
+}
+
 /// Candidate identity keys: every binding the query declares in
 /// binding-name order, then the bindings the lowering made up (anonymous
 /// endpoints, cycle temps), whose identities only order rows a reader cannot
@@ -1121,8 +1351,12 @@ fn scope_tiebreaks(
             _ => {}
         }
     }
-    let mut bindings: Vec<_> = bindings.into_iter().collect();
-    bindings.sort_by_key(|(binding, _)| is_fresh_variable(binding));
+    let hidden = correlated_hidden(plan, id);
+    let mut bindings: Vec<_> = bindings
+        .into_iter()
+        .filter(|(binding, _)| !hidden.contains(binding))
+        .collect();
+    bindings.sort_by_key(|(binding, _)| plan.made_up(binding));
     let mut out = Vec::new();
     for (binding, (id_column, selected_edge)) in bindings {
         if selected_edge {
@@ -1136,29 +1370,222 @@ fn scope_tiebreaks(
     Ok(out)
 }
 
-/// Bindings visible to a filter, excluding correlated inner scopes.
-fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
-    let mut bindings = BTreeSet::new();
-    for node in visible_scope(plan, id) {
-        match node {
-            LogicalNode::TableScan { spec, .. } => bindings.extend(spec.binding.iter().cloned()),
-            LogicalNode::Expand {
-                dst, edge_binding, ..
+/// The tie rule's columns over the rows `id` produces (RFC, `Order`): the
+/// identity of every reference column the read names, in column order, the
+/// order its pattern introduces them (a traversal's destination, then its
+/// edge; a selected edge's `@type` before its `@id`), then every other
+/// column in column order: a correlated read's or a union's value columns
+/// by value, and the names the lowering made up by identity. Those are an
+/// anonymous end, which declares no column, and an inlined read's
+/// unreturned bindings, which stand for the values the read computes from
+/// them. With `own`, the rows are an inline read's own, which hold its
+/// unreturned bindings as columns until its projection, so every name
+/// counts where it is bound. `written` is the read's written column order
+/// ([`ReadShape::written_columns`]), empty for an inline read's own rows.
+/// Each entry carries the physical column that recognizes a user key over
+/// it.
+fn tie_rule(
+    plan: &LogicalPlan,
+    id: LogicalId,
+    source: &dyn PlanSource,
+    own: bool,
+    written: &[String],
+) -> Result<Vec<(ColumnRef, String)>, PlanError> {
+    let mut columns = TieColumns::default();
+    columns.walk(plan, id, source)?;
+    let (mut named, rest): (Vec<_>, Vec<_>) = columns
+        .entries
+        .into_iter()
+        .partition(|entry| own || entry.is_named(plan));
+    // The named references come in written column order, which the plan's
+    // steps need not keep: an `optional` or a `union` runs after the
+    // scope's traversals.
+    named.sort_by_key(|entry| {
+        written
+            .iter()
+            .position(|name| name == entry.binding())
+            .unwrap_or(usize::MAX)
+    });
+    named.extend(rest);
+    let mut out = Vec::new();
+    for entry in named {
+        match entry {
+            TieColumn::Identity {
+                binding,
+                id_column,
+                selected,
             } => {
-                bindings.insert(dst.clone());
-                bindings.extend(edge_binding.iter().cloned());
+                if selected {
+                    out.push((
+                        ColumnRef::property(&binding, EDGE_TYPE_MEMBER),
+                        EDGE_TYPE_COLUMN.to_string(),
+                    ));
+                }
+                out.push((ColumnRef::property(&binding, IDENTITY_MEMBER), id_column));
             }
-            _ => {}
+            TieColumn::Value { binding, column } => {
+                out.push((ColumnRef::property(&binding, &column), column));
+            }
         }
     }
-    bindings.into_iter().collect()
+    Ok(out)
+}
+
+/// One column of a read's rows as the tie rule orders it.
+#[derive(Debug, Clone)]
+enum TieColumn {
+    Identity {
+        binding: String,
+        id_column: String,
+        selected: bool,
+    },
+    /// A value column of a correlated read or a union, `binding.column`.
+    Value { binding: String, column: String },
+}
+
+impl TieColumn {
+    /// A reference the query names, which leads the rule.
+    fn is_named(&self, plan: &LogicalPlan) -> bool {
+        matches!(self, Self::Identity { binding, .. } if !plan.made_up(binding))
+    }
+
+    fn binding(&self) -> &str {
+        match self {
+            Self::Identity { binding, .. } | Self::Value { binding, .. } => binding,
+        }
+    }
+}
+
+/// The columns of a subtree's rows in column order, each name once.
+#[derive(Default)]
+struct TieColumns {
+    entries: Vec<TieColumn>,
+    seen: HashSet<String>,
+}
+
+impl TieColumns {
+    fn push(&mut self, entry: TieColumn) {
+        let key = match &entry {
+            TieColumn::Identity { binding, .. } => binding.clone(),
+            TieColumn::Value { binding, column } => format!("{binding}.{column}"),
+        };
+        if self.seen.insert(key) {
+            self.entries.push(entry);
+        }
+    }
+
+    fn identity(&mut self, binding: &str, id_column: &str, selected: bool) {
+        self.push(TieColumn::Identity {
+            binding: binding.to_string(),
+            id_column: id_column.to_string(),
+            selected,
+        });
+    }
+
+    /// Inputs before the node, so a name enters where the pattern binds it;
+    /// a correlated block adds no column, a correlated read only what it
+    /// returns, a union only its reference and value columns.
+    fn walk(
+        &mut self,
+        plan: &LogicalPlan,
+        id: LogicalId,
+        source: &dyn PlanSource,
+    ) -> Result<(), PlanError> {
+        let Some(node) = plan.node(id) else {
+            return Ok(());
+        };
+        match node {
+            LogicalNode::TableScan { input, spec } => {
+                if let Some(input) = input {
+                    self.walk(plan, *input, source)?;
+                }
+                if let Some(binding) = &spec.binding {
+                    self.identity(binding, spec.columns.id, false);
+                }
+            }
+            LogicalNode::Expand {
+                input,
+                dst,
+                dst_type,
+                edges,
+                edge_binding,
+                ..
+            } => {
+                self.walk(plan, *input, source)?;
+                let id_column = source.node_type(dst_type)?.columns.id;
+                self.identity(dst, id_column, false);
+                if let Some(edge) = edge_binding {
+                    self.identity(edge, id_column, edges.named().is_none());
+                }
+            }
+            LogicalNode::AntiJoin { input, .. } => self.walk(plan, *input, source)?,
+            // A fusion's rows are its targets: each arm's other names stay
+            // in the arm.
+            LogicalNode::Fuse { arms, target, .. } => {
+                let mut arm = TieColumns::default();
+                if let Some(first) = arms.first() {
+                    arm.walk(plan, first.input, source)?;
+                }
+                for entry in arm.entries {
+                    if matches!(&entry, TieColumn::Identity { binding, .. } if binding == target) {
+                        self.push(entry);
+                    }
+                }
+            }
+            LogicalNode::Correlate {
+                input, inner, read, ..
+            } => {
+                if let Some(input) = input {
+                    self.walk(plan, *input, source)?;
+                }
+                let mut own = TieColumns::default();
+                own.walk(plan, *inner, source)?;
+                for column in &read.columns {
+                    match &column.expr {
+                        IRExpr::Variable(name, _) => {
+                            if let Some(entry) =
+                                own.entries.iter().find(|entry| entry.binding() == name)
+                            {
+                                self.push(entry.clone());
+                            }
+                        }
+                        _ => self.push(TieColumn::Value {
+                            binding: read.values.clone(),
+                            column: column.column.clone(),
+                        }),
+                    }
+                }
+            }
+            LogicalNode::Union { left, bindings, .. } => {
+                // Every arm binds the same columns under the first arm's
+                // names: the leftmost arm's give their kind and order.
+                let mut arm = TieColumns::default();
+                arm.walk(plan, *left, source)?;
+                for entry in arm.entries {
+                    let leaves = match &entry {
+                        TieColumn::Identity { binding, .. } => bindings.contains(binding),
+                        TieColumn::Value { .. } => true,
+                    };
+                    if leaves {
+                        self.push(entry);
+                    }
+                }
+            }
+            other => {
+                for input in other.inputs() {
+                    self.walk(plan, input, source)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The metadata columns a sort appends after `keys` so its order is total;
 /// none for group rows, when every returned expression is a key (equal rows
 /// are indistinguishable), or for an individual column already used as a key.
 fn sort_tiebreak(
-    candidates: &[(ColumnRef, &'static str)],
+    candidates: &[(ColumnRef, String)],
     keys: &[IROrdering],
     returns: &[IRProjection],
     aggregate: bool,
@@ -1196,7 +1623,7 @@ fn sort_tiebreak(
                 matches!(
                     expr,
                     IRExpr::PropAccess { variable, property , ty: _}
-                        if variable == &column.binding && property.as_str() == *physical
+                        if variable == &column.binding && property == physical
                 )
             })
         })
@@ -1207,69 +1634,62 @@ fn sort_tiebreak(
 /// Every column an expression reads. `count($v)` reads the identity alone;
 /// an alias, a parameter and a literal read nothing.
 pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
-    match expr {
-        IRExpr::Binary { left, right, .. } => {
-            reads_of_expr(left, out);
-            reads_of_expr(right, out);
-        }
-        IRExpr::Not(inner, _)
-        | IRExpr::IsNull { expr: inner, .. }
-        | IRExpr::Cast { expr: inner, .. } => reads_of_expr(inner, out),
-        IRExpr::PropAccess {
-            variable,
-            property,
-            ty: _,
-        } => {
-            out.push(ColumnRef::property(variable, property));
-        }
-        IRExpr::Variable(variable, _) => out.push(ColumnRef::entity(variable)),
-        IRExpr::Nearest {
-            variable,
-            property,
-            query,
+    omnigraph_compiler::stack::deep(|| {
+        // A lexical predicate reads its binding's identity: the exact lexical
+        // scan reads the field from the table itself and answers each row by its
+        // identity, so its input never carries the field for it.
+        if let IRExpr::Call {
+            func: omnigraph_compiler::ir::expr::ScalarFunc::MatchTerms { .. },
+            args,
             ..
-        } => {
-            out.push(ColumnRef::property(variable, property));
-            reads_of_expr(query, out);
+        } = expr
+            && let Some(IRExpr::PropAccess { variable, .. }) = args.first()
+        {
+            out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
+            args[1..].iter().for_each(|arg| reads_of_expr(arg, out));
+            return;
         }
-        IRExpr::Search { field, query, .. }
-        | IRExpr::MatchText { field, query, .. }
-        | IRExpr::Bm25 { field, query, .. } => {
-            reads_of_expr(field, out);
-            reads_of_expr(query, out);
-        }
-        IRExpr::Fuzzy {
-            field,
-            max_edits,
-            query,
-            ..
-        } => {
-            reads_of_expr(field, out);
-            reads_of_expr(query, out);
-            if let Some(max_edits) = max_edits {
-                reads_of_expr(max_edits, out);
+        match expr {
+            IRExpr::Binary { left, right, .. } => {
+                reads_of_expr(left, out);
+                reads_of_expr(right, out);
             }
-        }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-            ..
-        } => {
-            reads_of_expr(primary, out);
-            reads_of_expr(secondary, out);
-            if let Some(k) = k {
-                reads_of_expr(k, out);
+            IRExpr::Not(inner, _)
+            | IRExpr::IsNull { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. }
+            | IRExpr::Cast { expr: inner, .. } => reads_of_expr(inner, out),
+            IRExpr::Call { args, .. } => args.iter().for_each(|arg| reads_of_expr(arg, out)),
+            IRExpr::PropAccess {
+                variable,
+                property,
+                ty: _,
+            } => {
+                out.push(ColumnRef::property(variable, property));
             }
-        }
-        IRExpr::Aggregate { func, arg, .. } => match (func, arg.as_ref()) {
-            (AggFunc::Count, IRExpr::Variable(variable, _)) => {
-                out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
+            IRExpr::Variable(variable, _) => out.push(ColumnRef::entity(variable)),
+            IRExpr::Nearest {
+                variable,
+                property,
+                query,
+                ..
+            } => {
+                out.push(ColumnRef::property(variable, property));
+                reads_of_expr(query, out);
             }
-            _ => reads_of_expr(arg, out),
-        },
-        IRExpr::AliasRef(_, _) | IRExpr::Param(_, _) | IRExpr::Literal(_, _) => {}
-    }
+            IRExpr::Aggregate { func, arg, .. } => match (func, arg.as_ref()) {
+                (AggFunc::Count, IRExpr::Variable(variable, ty)) => {
+                    // An edge over several types is identified by its type and
+                    // its id together.
+                    if matches!(ty, ExprType::Edge { type_name, .. } if type_name.contains('|')) {
+                        out.push(ColumnRef::property(variable, EDGE_TYPE_MEMBER));
+                    }
+                    out.push(ColumnRef::property(variable, IDENTITY_MEMBER));
+                }
+                _ => reads_of_expr(arg, out),
+            },
+            IRExpr::AliasRef(_, _) | IRExpr::Param(_, _) | IRExpr::Literal(_, _) => {}
+        }
+    })
 }
 
 fn scan(
@@ -1485,11 +1905,12 @@ pub(crate) fn rewrite_with(
     let mut fired = Vec::new();
     let query = is_query_plan(plan);
     for pass in PassId::of_stage(PassStage::Rewrite) {
+        charge_pass(source)?;
         let applied = match pass {
             PassId::Resolve => true,
             PassId::PredicatePushdown => {
                 if query {
-                    place_query_filters(plan, source, tracer)
+                    crate::placement::place_conjuncts(plan, source, tracer)
                 } else {
                     resume_pushdown(plan)
                 }
@@ -1544,6 +1965,10 @@ pub(crate) fn physical_plan_with(
     tracer: &mut Tracer,
 ) -> Result<Optimized, PlanError> {
     let query = is_query_plan(plan);
+    // Every physical and finalizing pass, charged before the stage runs.
+    for _ in PassId::of_stage(PassStage::Physical).chain(PassId::of_stage(PassStage::Finalize)) {
+        charge_pass(source)?;
+    }
     let before = plan
         .schema(plan.root())
         .cloned()
@@ -1650,10 +2075,13 @@ fn key_set_trees(
 ) -> Result<HashMap<LogicalId, KeySetTree>, PlanError> {
     let mut trees = HashMap::new();
     for (id, node) in plan.live() {
+        // A block that can fail stays correlated (`key_set_tree`); the
+        // type checker's flag says which.
         if let LogicalNode::AntiJoin {
             inner,
             outer_var,
             predicate,
+            fails: false,
             ..
         } = node
             && let Some(tree) = key_set_tree(plan, *inner, outer_var, predicate, source)?
@@ -1666,32 +2094,6 @@ fn key_set_trees(
 
 /// The nodes of the pipeline under `root` that constrain its rows: every
 /// node reachable from `root` without entering an `AntiJoin`'s inner tree.
-/// Whether a traversal of the top-level pipeline under `root` connects
-/// bindings `a` and `b`, through any chain of `Expand`s.
-fn traversal_connects(plan: &PhysicalPlan, root: NodeId, a: &str, b: &str) -> bool {
-    let edges: Vec<(&str, &str)> = top_level(plan, root)
-        .into_iter()
-        .filter_map(|id| match plan.node(id) {
-            Some(PhysicalNode::Expand { src, dst, .. }) => Some((src.as_str(), dst.as_str())),
-            _ => None,
-        })
-        .collect();
-    let mut reached = vec![a];
-    let mut grew = true;
-    while grew {
-        grew = false;
-        for (src, dst) in &edges {
-            for (from, to) in [(src, dst), (dst, src)] {
-                if reached.contains(from) && !reached.contains(to) {
-                    reached.push(to);
-                    grew = true;
-                }
-            }
-        }
-    }
-    reached.contains(&b)
-}
-
 fn top_level(plan: &PhysicalPlan, root: NodeId) -> Vec<NodeId> {
     let mut nodes = Vec::new();
     let mut pending = vec![root];
@@ -1706,82 +2108,6 @@ fn top_level(plan: &PhysicalPlan, root: NodeId) -> Vec<NodeId> {
         }
     }
     nodes
-}
-
-/// Validate every fusion's canonical downstream identity keys against both arms.
-///
-/// # Errors
-/// Returns an error for a missing arm root or a key list that differs from
-/// either arm's visible identities, excluding the primary fused binding.
-pub fn validate_rank_fuse_row_tiebreaks(plan: &PhysicalPlan) -> Result<(), PlanError> {
-    for (id, node) in plan.live() {
-        let PhysicalNode::RankFuse {
-            arms, row_tiebreak, ..
-        } = node
-        else {
-            continue;
-        };
-        for (arm_index, arm) in arms.iter().enumerate() {
-            let expected = expected_rank_fuse_row_tiebreaks(plan, arm.input, &arms[0].binding)?;
-            if row_tiebreak != &expected {
-                return Err(PlanError::Internal(format!(
-                    "rank fuse {id} arm {arm_index}: incomplete or noncanonical row_tiebreak; expected {:?}, found {:?}",
-                    tiebreak_text(&expected),
-                    tiebreak_text(row_tiebreak),
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn expected_rank_fuse_row_tiebreaks(
-    plan: &PhysicalPlan,
-    arm_root: NodeId,
-    fused_binding: &str,
-) -> Result<Vec<ColumnRef>, PlanError> {
-    if plan.node(arm_root).is_none() {
-        return Err(PlanError::Internal(format!(
-            "rank fuse arm root {arm_root} is missing"
-        )));
-    }
-    let mut bindings = BTreeMap::<String, bool>::new();
-    for id in top_level(plan, arm_root) {
-        match plan.node(id) {
-            Some(PhysicalNode::Scan { spec, .. }) => {
-                if let Some(binding) = &spec.binding {
-                    bindings.entry(binding.clone()).or_insert(false);
-                }
-            }
-            Some(PhysicalNode::Expand {
-                dst,
-                edges,
-                edge_binding,
-                ..
-            }) => {
-                bindings.entry(dst.clone()).or_insert(false);
-                if let Some(binding) = edge_binding {
-                    let selected = edges.named().is_none();
-                    bindings
-                        .entry(binding.clone())
-                        .and_modify(|prior| *prior |= selected)
-                        .or_insert(selected);
-                }
-            }
-            _ => {}
-        }
-    }
-    bindings.remove(fused_binding);
-    let mut bindings: Vec<_> = bindings.into_iter().collect();
-    bindings.sort_by_key(|(binding, _)| is_fresh_variable(binding));
-    let mut keys = Vec::new();
-    for (binding, selected) in bindings {
-        if selected {
-            keys.push(ColumnRef::property(&binding, EDGE_TYPE_MEMBER));
-        }
-        keys.push(ColumnRef::property(&binding, IDENTITY_MEMBER));
-    }
-    Ok(keys)
 }
 
 /// Query and diff lowering preserve the declared root schema. Merge roots
@@ -1841,230 +2167,6 @@ fn and_filter(existing: Option<Predicate>, added: Predicate) -> Predicate {
     }
 }
 
-/// Stage 1, pass 2 on a query plan, per scope (the top-level tree and each
-/// `not { … }` inner tree): adjacent `Filter` nodes coalesce, each conjunct moves
-/// into its `placement_target` scan or onto its `join_target`, an emptied node goes.
-fn place_query_filters(
-    plan: &mut LogicalPlan,
-    source: &dyn PlanSource,
-    tracer: &mut Tracer,
-) -> bool {
-    let mut fired = false;
-    let mut scopes = vec![plan.root()];
-    while let Some(root) = scopes.pop() {
-        let mut filters = Vec::new();
-        let mut scans: HashMap<String, LogicalId> = HashMap::new();
-        let mut dependent_scans: HashMap<String, LogicalId> = HashMap::new();
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            match plan.node(id) {
-                Some(LogicalNode::Filter { input, .. }) => {
-                    filters.push(id);
-                    stack.push(*input);
-                }
-                Some(LogicalNode::TableScan { input, spec }) => {
-                    if let Some(binding) = &spec.binding
-                        && !spec.table.is_catalogue()
-                    {
-                        if input.is_some() {
-                            dependent_scans.insert(binding.clone(), id);
-                        } else {
-                            scans.insert(binding.clone(), id);
-                        }
-                    }
-                    stack.extend(*input);
-                }
-                Some(LogicalNode::AntiJoin { input, inner, .. }) => {
-                    scopes.push(*inner);
-                    stack.push(*input);
-                }
-                Some(node) => stack.extend(node.inputs()),
-                None => {}
-            }
-        }
-        filters.sort_unstable();
-        coalesce_filters(plan, &filters);
-        for filter_id in filters {
-            let Some(LogicalNode::Filter { input, conjuncts }) = plan.node(filter_id).cloned()
-            else {
-                continue;
-            };
-            let mut residual = Vec::with_capacity(conjuncts.len());
-            let mut moved: Vec<(LogicalId, Vec<IRExpr>)> = Vec::new();
-            for conjunct in conjuncts {
-                let target = placement_target(&conjunct, &scans, &dependent_scans, source);
-                match target.and_then(|target| plan.node_mut(target)) {
-                    Some(LogicalNode::TableScan { spec, .. }) => {
-                        spec.filter = Some(and_filter(spec.filter.take(), gq_conjunct(&conjunct)));
-                        tracer.absorb(&conjunct);
-                        fired = true;
-                    }
-                    _ => match join_target(plan, input, &conjunct) {
-                        Some(join) if join != input => {
-                            match moved.iter_mut().find(|(target, _)| *target == join) {
-                                Some((_, onto)) => onto.push(conjunct),
-                                None => moved.push((join, vec![conjunct])),
-                            }
-                        }
-                        _ => residual.push(conjunct),
-                    },
-                }
-            }
-            for (join, conjuncts) in moved {
-                if filter_onto_join(plan, join, &conjuncts) {
-                    fired = true;
-                } else {
-                    residual.extend(conjuncts);
-                }
-            }
-            if residual.is_empty() {
-                plan.splice_out(filter_id, input);
-            } else if let Some(LogicalNode::Filter { conjuncts, .. }) = plan.node_mut(filter_id) {
-                *conjuncts = residual;
-            }
-        }
-    }
-    fired
-}
-
-/// Adjacent `Filter` nodes of one scope become one node, the lower node's
-/// conjuncts first as the match block wrote them, a repeated conjunct kept
-/// once; `filters` is in ascending id order, so a chain collapses bottom-up.
-fn coalesce_filters(plan: &mut LogicalPlan, filters: &[LogicalId]) {
-    for &filter_id in filters {
-        while let Some(LogicalNode::Filter { input: child, .. }) = plan.node(filter_id) {
-            let child = *child;
-            let Some(LogicalNode::Filter {
-                input: grandchild,
-                conjuncts: lower,
-            }) = plan.node(child).cloned()
-            else {
-                break;
-            };
-            let Some(LogicalNode::Filter { conjuncts, .. }) = plan.node_mut(filter_id) else {
-                break;
-            };
-            let mut merged: Vec<IRExpr> = Vec::with_capacity(lower.len() + conjuncts.len());
-            for conjunct in lower.into_iter().chain(std::mem::take(conjuncts)) {
-                if !merged.contains(&conjunct) {
-                    merged.push(conjunct);
-                }
-            }
-            *conjuncts = merged;
-            plan.splice_out(child, grandchild);
-        }
-    }
-}
-
-/// Where one conjunct of a scope goes, if anywhere: a search conjunct to the
-/// scan of its field's binding (exact membership on dependent scans too), a
-/// scalar conjunct on one binding to the read that can evaluate it.
-fn placement_target(
-    filter: &IRExpr,
-    scans: &HashMap<String, LogicalId>,
-    dependent_scans: &HashMap<String, LogicalId>,
-    source: &dyn PlanSource,
-) -> Option<LogicalId> {
-    if let Some(field) = search_filter_field(filter) {
-        let IRExpr::PropAccess { variable, .. } = field else {
-            return None;
-        };
-        let mut reads = Vec::new();
-        reads_of_expr(filter, &mut reads);
-        if reads.iter().any(|read| read.binding != *variable) {
-            return None;
-        }
-        return scans.get(variable).copied().or_else(|| {
-            dependent_scan_filter_pushable(filter, variable, source)
-                .then(|| dependent_scans.get(variable).copied())
-                .flatten()
-        });
-    }
-    let mut reads = Vec::new();
-    reads_of_expr(filter, &mut reads);
-    let mut bindings: Vec<&str> = reads.iter().map(|read| read.binding.as_str()).collect();
-    bindings.sort_unstable();
-    bindings.dedup();
-    let [binding] = bindings.as_slice() else {
-        return None;
-    };
-    if !source.filter_pushable(filter) {
-        return None;
-    }
-    scans
-        .get(*binding)
-        .or_else(|| dependent_scans.get(*binding))
-        .copied()
-}
-
-/// Only a `CrossJoin` whose two sides together, neither alone, bind every
-/// binding a scalar `conjunct` reads; `None` for any other conjunct, one that
-/// also reads an `Expand` destination above that join included.
-fn join_target(plan: &LogicalPlan, mut id: LogicalId, conjunct: &IRExpr) -> Option<LogicalId> {
-    if search_filter_field(conjunct).is_some() {
-        return None;
-    }
-    let mut reads = Vec::new();
-    reads_of_expr(conjunct, &mut reads);
-    if reads.is_empty() {
-        return None;
-    }
-    let binds = |id: LogicalId| {
-        let bound = scope_bindings(plan, id);
-        reads.iter().all(|read| bound.contains(&read.binding))
-    };
-    loop {
-        id = match plan.node(id)? {
-            LogicalNode::CrossJoin { left, right } => {
-                if binds(*left) {
-                    *left
-                } else if binds(*right) {
-                    *right
-                } else {
-                    return binds(id).then_some(id);
-                }
-            }
-            LogicalNode::Filter { input, .. }
-            | LogicalNode::Expand { input, .. }
-            | LogicalNode::TableScan {
-                input: Some(input), ..
-            }
-            | LogicalNode::AntiJoin { input, .. }
-                if binds(*input) =>
-            {
-                *input
-            }
-            _ => return None,
-        };
-    }
-}
-
-/// `conjuncts` on `join` itself: into the `Filter` already there, else a new
-/// one between `join` and its one consumer; `false`, and the plan untouched,
-/// when `join` has no single consumer or no schema.
-fn filter_onto_join(plan: &mut LogicalPlan, join: LogicalId, conjuncts: &[IRExpr]) -> bool {
-    let Some(parent) = plan.parent_of(join) else {
-        return false;
-    };
-    if let Some(LogicalNode::Filter {
-        conjuncts: held, ..
-    }) = plan.node_mut(parent)
-    {
-        for conjunct in conjuncts {
-            if !held.contains(conjunct) {
-                held.push(conjunct.clone());
-            }
-        }
-        return true;
-    }
-    let Some(schema) = plan.schema(join).cloned() else {
-        return false;
-    };
-    let filter = filter_over(plan, join, conjuncts, schema);
-    plan.redirect_input(parent, join, filter);
-    true
-}
-
 /// A filtered `CrossJoin`'s sides, swapped when a `contains` searches only the
 /// left scan's text for the right's and the right's known rows are no more:
 /// the right side streams through the engine's needle filter.
@@ -2104,35 +2206,6 @@ fn searched_side_right(
         (right, left)
     } else {
         (left, right)
-    }
-}
-
-/// A dependent scan evaluates one-binding scalar predicates and exact text
-/// membership. Fuzzy and ranked retrieval retain their existing execution
-/// contract; a dependent read must not create a top-k window per input batch.
-fn dependent_scan_filter_pushable(filter: &IRExpr, binding: &str, source: &dyn PlanSource) -> bool {
-    let mut reads = Vec::new();
-    reads_of_expr(filter, &mut reads);
-    if reads.iter().any(|read| read.binding != binding) {
-        return false;
-    }
-    match filter.comparison_parts().map(|(left, _, _)| left) {
-        Some(IRExpr::Search { field, .. } | IRExpr::MatchText { field, .. }) => {
-            matches!(field.as_ref(), IRExpr::PropAccess { variable, .. } if variable == binding)
-        }
-        Some(IRExpr::Fuzzy { .. }) => false,
-        _ => source.filter_pushable(filter),
-    }
-}
-
-/// The field of a full-text conjunct (`search`, `fuzzy`, `match_text`), the
-/// call as the left operand of the `= true` comparison the compiler builds.
-fn search_filter_field(filter: &IRExpr) -> Option<&IRExpr> {
-    match filter.comparison_parts()?.0 {
-        IRExpr::Search { field, .. }
-        | IRExpr::Fuzzy { field, .. }
-        | IRExpr::MatchText { field, .. } => Some(field.as_ref()),
-        _ => None,
     }
 }
 
@@ -2223,7 +2296,11 @@ fn projection_pushdown(
             demands.entry(binding).or_default().identity = true;
         }
     }
+    let elided = elide_endpoint_scans(plan, &demands);
     for (id, binding, node_type) in scans {
+        if elided.contains(&id) {
+            continue;
+        }
         let demand = demands.get(&binding);
         let whole_object = demand.map_or_else(
             || {
@@ -2268,6 +2345,53 @@ fn projection_pushdown(
     Ok(true)
 }
 
+/// Drop a dependent scan that only names a traversal's end: its binding is
+/// the `Expand`'s destination, nothing reads a property or the whole entity
+/// of it, and no filter, fragment scope or access path narrows it. The
+/// expansion already carries the destination's identity, and every edge's
+/// end exists at the snapshot it was read from (`write:6`, `merge:3`), and
+/// is of the destination's type (the type checker resolves each edge member
+/// against it), so the scan would find exactly one row for each input row
+/// and add no column anything reads. A fixed rule over the plan's own
+/// demand: it reads no statistic.
+fn elide_endpoint_scans(
+    plan: &mut LogicalPlan,
+    demands: &HashMap<String, Demand>,
+) -> HashSet<LogicalId> {
+    let candidates: Vec<(LogicalId, LogicalId)> = plan
+        .live()
+        .filter_map(|(id, node)| {
+            let LogicalNode::TableScan {
+                input: Some(input),
+                spec,
+            } = node
+            else {
+                return None;
+            };
+            let binding = spec.binding.as_ref()?;
+            let Some(LogicalNode::Expand { dst, .. }) = plan.node(*input) else {
+                return None;
+            };
+            let unread = demands
+                .get(binding)
+                .is_none_or(|demand| !demand.entity && demand.properties.is_empty());
+            (dst == binding
+                && unread
+                && spec.filter.is_none()
+                && spec.runtime_filter.is_none()
+                && spec.fragments.is_none()
+                && spec.access.is_none())
+            .then_some((id, *input))
+        })
+        .collect();
+    let mut elided = HashSet::new();
+    for (scan, expand) in candidates {
+        plan.splice_out(scan, expand);
+        elided.insert(scan);
+    }
+    elided
+}
+
 /// What one binding's scan must read, gathered from every node of the tree.
 /// `identity` is the id column, read only when something keys rows by it.
 #[derive(Debug, Default)]
@@ -2287,16 +2411,81 @@ fn identity_reads(node: &LogicalNode) -> Vec<String> {
         } => spec.binding.iter().cloned().collect(),
         LogicalNode::Expand { src, dst, .. } => vec![src.clone(), dst.clone()],
         LogicalNode::AntiJoin { outer_var, .. } => vec![outer_var.clone()],
-        LogicalNode::Nearest { binding, .. } | LogicalNode::TextSearch { binding, .. } => {
-            vec![binding.clone()]
+        // A group keyed by a reference groups by its identity.
+        LogicalNode::Correlate { read, .. } => read
+            .group
+            .iter()
+            .flatten()
+            .filter_map(|key| match &key.expr {
+                IRExpr::Variable(name, _) => Some(name.clone()),
+                _ => None,
+            })
+            .collect(),
+        LogicalNode::Nearest { binding, .. } => vec![binding.clone()],
+        // A full-text call a `Filter` or a `let` evaluates is membership of
+        // the row's identity in the call's matches.
+        LogicalNode::Filter { conjuncts, .. } => {
+            let mut out = Vec::new();
+            conjuncts
+                .iter()
+                .for_each(|conjunct| lexical_bindings(conjunct, &mut out));
+            out
+        }
+        LogicalNode::Let { value, .. } => {
+            let mut out = Vec::new();
+            lexical_bindings(value, &mut out);
+            out
         }
         _ => Vec::new(),
     }
 }
 
-/// The columns one node reads through query bindings. A `RankFuse` reads its
-/// targets whole in both arms: the arms' batches concatenate under one
-/// schema, so a pruned target column in one arm would break the other.
+/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`,
+/// `match_terms`).
+pub(crate) fn has_lexical_call(expr: &IRExpr) -> bool {
+    let mut bindings = Vec::new();
+    lexical_bindings(expr, &mut bindings);
+    !bindings.is_empty()
+}
+
+/// The binding of every full-text call (`search`, `fuzzy`, `match_text`,
+/// `match_terms`) in `expr`, whose field is that binding's property.
+fn lexical_bindings(expr: &IRExpr, out: &mut Vec<String>) {
+    omnigraph_compiler::stack::deep(|| {
+        if let Some(field) = expr.lexical_predicate_field() {
+            if let IRExpr::PropAccess { variable, .. } = field
+                && !out.contains(variable)
+            {
+                out.push(variable.clone());
+            }
+            return;
+        }
+        match expr {
+            IRExpr::Binary { left, right, .. } => {
+                lexical_bindings(left, out);
+                lexical_bindings(right, out);
+            }
+            IRExpr::Not(inner, _)
+            | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. }
+            | IRExpr::IsNull { expr: inner, .. } => lexical_bindings(inner, out),
+            IRExpr::Call { args, .. } => args.iter().for_each(|arg| lexical_bindings(arg, out)),
+            // The predicates themselves were taken above.
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(..)
+            | IRExpr::Param(..)
+            | IRExpr::Literal(..)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(..) => {}
+        }
+    })
+}
+
+/// The columns one node reads through query bindings. A `Fuse` reads its
+/// target whole in every arm: each target leaves with the columns of the
+/// first arm that selected it, under one schema, so a pruned target column
+/// in one arm would break the others.
 fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
     let mut out = Vec::new();
     match node {
@@ -2320,6 +2509,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
         LogicalNode::Filter {
             input: _,
             conjuncts,
+            ..
         } => {
             for conjunct in conjuncts {
                 reads_of_expr(conjunct, &mut out);
@@ -2353,41 +2543,68 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             query: _,
             k: _,
             reads,
-        }
-        | LogicalNode::TextSearch {
-            input: _,
-            binding: _,
-            property: _,
-            query: _,
-            reads,
+            leads: _,
+            recall: _,
         }
         | LogicalNode::Aggregate {
             input: _,
             reads,
             return_exprs: _,
         } => out.extend(reads.iter().cloned()),
-        LogicalNode::RankFuse {
-            input: _,
-            arms,
+        LogicalNode::Fuse {
+            arms: _,
+            target,
             k: _,
-            limit: _,
+            weights: _,
             reads,
-            row_tiebreak,
+            partition: _,
         } => {
-            out.extend(arms.iter().map(|arm| ColumnRef::entity(&arm.binding)));
+            out.push(ColumnRef::entity(target));
             out.extend(reads.iter().cloned());
-            out.extend(row_tiebreak.iter().cloned());
         }
         LogicalNode::AntiJoin {
             input: _,
             inner: _,
             outer_var: _,
             predicate,
+            ..
         } => {
             if let Some(arg) = predicate.left.arg() {
                 reads_of_expr(arg, &mut out);
             }
             reads_of_expr(&predicate.right, &mut out);
+        }
+        LogicalNode::TargetCut {
+            input: _,
+            binding,
+            targets: _,
+        } => out.push(ColumnRef::property(binding, IDENTITY_MEMBER)),
+        LogicalNode::Score {
+            input: _,
+            binding: _,
+            type_name: _,
+            property: _,
+            kind: _,
+            query: _,
+            reads,
+        } => out.extend(reads.iter().cloned()),
+        LogicalNode::Let {
+            input: _,
+            name: _,
+            value: _,
+            reads,
+        } => out.extend(reads.iter().cloned()),
+        LogicalNode::Correlate {
+            input: _,
+            inner: _,
+            outer_var: _,
+            read: _,
+            tiebreak,
+            reads,
+            ..
+        } => {
+            out.extend(reads.iter().cloned());
+            out.extend(tiebreak.iter().cloned());
         }
         LogicalNode::MetadataCount {
             spec: _,
@@ -2405,6 +2622,17 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             edge_binding: _,
         }
         | LogicalNode::OuterReference { outer_var: _ }
+        | LogicalNode::OptionalJoin {
+            input: _,
+            inner: _,
+            outer_var: _,
+            fails: _,
+        }
+        | LogicalNode::Union {
+            left: _,
+            right: _,
+            bindings: _,
+        }
         | LogicalNode::Join {
             left: _,
             right: _,
@@ -2443,7 +2671,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
 }
 
 fn predicate_reads(predicate: &Predicate, out: &mut Vec<ColumnRef>) {
-    match predicate {
+    omnigraph_compiler::stack::deep(|| match predicate {
         Predicate::Gq {
             reads,
             text: _,
@@ -2454,7 +2682,7 @@ fn predicate_reads(predicate: &Predicate, out: &mut Vec<ColumnRef>) {
             predicate_reads(right, out);
         }
         Predicate::IdAfter { .. } | Predicate::VersionWindow { .. } => {}
-    }
+    })
 }
 
 /// Pass 6: a return column only the output reads leaves its binding's scan
@@ -2490,15 +2718,24 @@ fn materialize_returns_late(
         return Ok(false);
     };
     let return_exprs = return_exprs.clone();
-    if physical
-        .live()
-        .any(|(_, node)| matches!(node, PhysicalNode::Aggregate { .. }))
-    {
+    // A union's and a fusion's arms bind one name through several scans,
+    // and an optional leaves its names' row addresses null on the rows it
+    // kept without a match: none hydrates a return column by one binding's
+    // address.
+    if physical.live().any(|(_, node)| {
+        matches!(
+            node,
+            PhysicalNode::Aggregate { .. }
+                | PhysicalNode::Union { .. }
+                | PhysicalNode::Fuse { .. }
+                | PhysicalNode::OptionalJoin { .. }
+                | PhysicalNode::Score { .. }
+                | PhysicalNode::Let { .. }
+                | PhysicalNode::Correlate { .. }
+        )
+    }) {
         return Ok(false);
     }
-    let fused = physical
-        .live()
-        .any(|(_, node)| matches!(node, PhysicalNode::RankFuse { .. }));
     let Some(returned) = logical_return_projection(logical) else {
         return Ok(false);
     };
@@ -2519,18 +2756,7 @@ fn materialize_returns_late(
         if logical_id == returned {
             continue;
         }
-        match node {
-            LogicalNode::RankFuse {
-                reads,
-                row_tiebreak,
-                ..
-            } => reads
-                .iter()
-                .chain(row_tiebreak.iter())
-                .cloned()
-                .for_each(&mut keep),
-            node => node_reads(node).into_iter().for_each(&mut keep),
-        }
+        node_reads(node).into_iter().for_each(&mut keep);
     }
     let mut candidates: BTreeMap<String, Vec<HydratedColumn>> = BTreeMap::new();
     for (position, item) in return_exprs.iter().enumerate() {
@@ -2576,21 +2802,8 @@ fn materialize_returns_late(
             })
             .map(|(scan, _)| scan)
             .collect();
-        let ranked_arms = fused
-            && scans.len() == 2
-            && scans.iter().all(|scan| {
-                matches!(
-                    physical.node(*scan),
-                    Some(PhysicalNode::Scan {
-                        ranked: Some(_),
-                        ..
-                    })
-                )
-            });
-        let scan = match scans[..] {
-            [scan] => scan,
-            [scan, _] if ranked_arms => scan,
-            _ => continue,
+        let [scan] = scans[..] else {
+            continue;
         };
         let Some(PhysicalNode::Scan {
             spec,
@@ -2601,7 +2814,7 @@ fn materialize_returns_late(
         else {
             continue;
         };
-        if ranked.is_some() && !ranked_arms {
+        if ranked.is_some() {
             continue;
         }
         let Some(projection) = spec.projection.as_ref() else {
@@ -2801,11 +3014,9 @@ struct Lowering<'a> {
 }
 
 /// What a leading search function became in the physical plan: the score
-/// keys the query's `Sort` leads with, one per ranked scan or the fused
-/// score column a `RankFuse` appends.
+/// keys the query's `Sort` leads with, one per ranked scan.
 enum Ranking {
     Scores(Vec<IROrdering>),
-    Fused(IROrdering),
 }
 
 impl Lowering<'_> {
@@ -2836,22 +3047,6 @@ impl Lowering<'_> {
             )));
         }
         self.unmark(scan);
-        let mut access = access;
-        access.eligibility = match access.kind {
-            RankKind::Nearest => Eligibility::BeforeScoring,
-            RankKind::Bm25 => {
-                let type_key = match self.physical.node(scan) {
-                    Some(PhysicalNode::Scan { spec, .. }) => spec.table.type_key.clone(),
-                    _ => String::new(),
-                };
-                match self.source.full_text_coverage(&type_key, &access.property) {
-                    FullTextCoverage::Full => Eligibility::BeforeScoring,
-                    FullTextCoverage::Partial | FullTextCoverage::Absent => {
-                        Eligibility::AfterScoring
-                    }
-                }
-            }
-        };
         match self.physical.node_mut(scan) {
             Some(PhysicalNode::Scan { ranked, .. }) if ranked.is_none() => {
                 *ranked = Some(access);
@@ -2940,20 +3135,7 @@ impl Lowering<'_> {
         binding: &str,
         scan: NodeId,
         feeds: Vec<NodeId>,
-        on_empty: EmptyEligible,
     ) -> Result<Prefilter, PlanError> {
-        let coverage_admits = feeds.iter().all(|feed| match self.physical.node(*feed) {
-            Some(PhysicalNode::Scan {
-                spec,
-                ranked: Some(ranked),
-                ..
-            }) if ranked.kind == RankKind::Bm25 => {
-                self.source
-                    .full_text_coverage(&spec.table.type_key, &ranked.property)
-                    == FullTextCoverage::Full
-            }
-            _ => true,
-        });
         let ranked_type = match self.physical.node(scan) {
             Some(PhysicalNode::Scan { spec, .. }) => spec.table.node_type_name(),
             _ => None,
@@ -2969,8 +3151,6 @@ impl Lowering<'_> {
                 ranked_type,
                 hops: Vec::new(),
                 feeds,
-                on_empty,
-                coverage_admits,
             });
         }
         let mut introduced_by_scan = false;
@@ -3013,8 +3193,6 @@ impl Lowering<'_> {
             ranked_type,
             hops,
             feeds,
-            on_empty,
-            coverage_admits,
         })
     }
 
@@ -3120,9 +3298,15 @@ impl Lowering<'_> {
     }
 
     /// The `Sort` a query's return runs under (RFC 0047 §One total order): the
-    /// ranking's score keys then the user's; over an aggregate, or a `distinct`
-    /// return with or without a ranking, the user's keys then every group key.
-    fn sort_keys(&self, input: NodeId, order_by: &[IROrdering]) -> Option<Vec<IROrdering>> {
+    /// ranking's score keys then the user's; over group rows (an aggregate or
+    /// a `distinct` return, with or without a ranking), the user's keys then
+    /// the tie rule's group keys ([`with_group_keys`]).
+    fn sort_keys(
+        &self,
+        input: NodeId,
+        order_by: &[IROrdering],
+        fetch: Option<usize>,
+    ) -> Option<Vec<IROrdering>> {
         let aggregate_at = |id: NodeId| match self.physical.node(id) {
             Some(PhysicalNode::Aggregate {
                 return_exprs,
@@ -3135,24 +3319,19 @@ impl Lowering<'_> {
             Some(PhysicalNode::Projection { input: below, .. }) => aggregate_at(*below),
             _ => None,
         });
-        let Some(ranking) = &self.ranking else {
-            return Some(match grouped {
-                Some((return_exprs, aggregates)) if aggregates.iter().all(Option::is_none) => {
-                    with_group_keys(order_by, return_exprs, aggregates)
-                }
-                _ => order_by.to_vec(),
-            });
-        };
         if let Some((return_exprs, aggregates)) = grouped {
-            if order_by.is_empty() {
+            // A search leads no sort of groups: with nothing written and no
+            // `limit` they leave unordered.
+            if self.ranking.is_some() && order_by.is_empty() && fetch.is_none() {
                 return None;
             }
             return Some(with_group_keys(order_by, return_exprs, aggregates));
         }
-        let mut keys = match ranking {
-            Ranking::Scores(scores) => scores.clone(),
-            Ranking::Fused(fused) => vec![fused.clone()],
+        let Some(ranking) = &self.ranking else {
+            return Some(order_by.to_vec());
         };
+        let Ranking::Scores(scores) = ranking;
+        let mut keys = scores.clone();
         keys.extend(order_by.iter().cloned());
         Some(keys)
     }
@@ -3211,7 +3390,7 @@ impl Lowering<'_> {
                 ..
             } => {
                 let lowered = self.lower(*input)?;
-                let Some(order_by) = self.sort_keys(lowered, order_by) else {
+                let Some(order_by) = self.sort_keys(lowered, order_by, *fetch) else {
                     return Ok(lowered);
                 };
                 self.tracer.record(&[Role::Sort], Rule::Lower, &[]);
@@ -3231,13 +3410,36 @@ impl Lowering<'_> {
                     filters: Vec::new(),
                 }))
             }
-            LogicalNode::Filter { input, conjuncts } => {
-                if let Some(LogicalNode::CrossJoin { left, right }) = logical.node(*input) {
+            LogicalNode::Filter {
+                input,
+                conjuncts,
+                fails,
+            } => {
+                // Conjuncts that cannot fail commute, so they may run as the
+                // join's filters in any order. A node holding one that can
+                // fail filters above the join, left to right as written: a
+                // conjunct written after it must not narrow the rows it sees.
+                if !*fails
+                    && let Some(LogicalNode::CrossJoin { left, right }) = logical.node(*input)
+                {
+                    // A conjunct holding a full-text operand stays in a
+                    // `Filter` above the join, the one operator that reads
+                    // full-text calls as membership.
+                    let (lexical, joined): (Vec<IRExpr>, Vec<IRExpr>) =
+                        conjuncts.iter().cloned().partition(has_lexical_call);
                     let (left, right) =
-                        searched_side_right(logical, self.source, *left, *right, conjuncts);
+                        searched_side_right(logical, self.source, *left, *right, &joined);
                     let left_lowered = self.lower(left)?;
                     let right_lowered = self.lower(right)?;
-                    return self.filtered_cross_join(left_lowered, right_lowered, conjuncts);
+                    let join = self.filtered_cross_join(left_lowered, right_lowered, &joined)?;
+                    if lexical.is_empty() {
+                        return Ok(join);
+                    }
+                    self.tracer.record(&[Role::Filter], Rule::Lower, &[]);
+                    return Ok(self.physical.add(PhysicalNode::Filter {
+                        input: join,
+                        filters: lexical,
+                    }));
                 }
                 let lowered = self.lower(*input)?;
                 self.tracer.record(&[Role::Filter], Rule::Lower, &[]);
@@ -3329,6 +3531,7 @@ impl Lowering<'_> {
                 inner,
                 outer_var,
                 predicate,
+                ..
             } => {
                 let lowered = self.lower(*input)?;
                 let key_set = self.key_sets.get(&id);
@@ -3367,6 +3570,53 @@ impl Lowering<'_> {
                     strategy,
                 }))
             }
+            LogicalNode::Union {
+                left,
+                right,
+                bindings,
+            } => {
+                let left = self.lower(*left)?;
+                let right = self.lower(*right)?;
+                Ok(self.physical.add(PhysicalNode::Union {
+                    left,
+                    right,
+                    bindings: bindings.clone(),
+                }))
+            }
+            LogicalNode::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+                ..
+            } => {
+                let lowered = self.lower(*input)?;
+                let inner = self.lower(*inner)?;
+                self.csr_cached = true;
+                Ok(self.physical.add(PhysicalNode::OptionalJoin {
+                    input: lowered,
+                    inner,
+                    outer_var: outer_var.clone(),
+                }))
+            }
+            LogicalNode::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                tiebreak,
+                ..
+            } => {
+                let lowered = input.map(|input| self.lower(input)).transpose()?;
+                let inner = self.lower(*inner)?;
+                self.tracer.record(&[Role::Projection], Rule::Lower, &[]);
+                Ok(self.physical.add(PhysicalNode::Correlate {
+                    input: lowered,
+                    inner,
+                    outer_var: outer_var.clone(),
+                    read: read.clone(),
+                    tiebreak: tiebreak.clone(),
+                }))
+            }
             LogicalNode::OuterReference { outer_var } => {
                 Ok(self.physical.add(PhysicalNode::OuterReference {
                     outer_var: outer_var.clone(),
@@ -3378,21 +3628,32 @@ impl Lowering<'_> {
                 property,
                 query,
                 k,
+                leads,
+                recall,
                 ..
             } => {
                 let lowered = self.lower(*input)?;
                 let fetch = k.and_then(|k| usize::try_from(k).ok());
                 let access = RankedAccess {
-                    kind: RankKind::Nearest,
-                    score: rank_score(binding, RankKind::Nearest),
+                    score: rank_score(binding),
                     property: property.clone(),
                     query: query.clone(),
                     fetch,
-                    nprobes: self.source.ann_nprobes(),
-                    scope: RankScope::Order,
+                    // `recall: 1` searches every partition: no probe cap, so
+                    // the scan is exhaustive. Any other bound is resolved by
+                    // the session's effort settings.
+                    nprobes: if *recall == Some(1.0) {
+                        None
+                    } else {
+                        self.source.ann_nprobes()
+                    },
+                    scope: if *leads {
+                        RankScope::Order
+                    } else {
+                        RankScope::Window
+                    },
                     overfetch: fetch.map(OverfetchRung::ladder).unwrap_or_default(),
                     prefilter: None,
-                    eligibility: Eligibility::BeforeScoring,
                     policy: Some(NearestPolicy::DEFAULT),
                 };
                 let (score, scan) = self.rank(lowered, binding, access)?;
@@ -3401,13 +3662,7 @@ impl Lowering<'_> {
                     matches!(self.physical.node(*id), Some(PhysicalNode::Expand { src, .. }) if src == binding)
                 });
                 if expanded_from {
-                    let prefilter = self.prefilter(
-                        &top,
-                        binding,
-                        scan,
-                        vec![scan],
-                        EmptyEligible::ProvenEmpty,
-                    )?;
+                    let prefilter = self.prefilter(&top, binding, scan, vec![scan])?;
                     if let Some(PhysicalNode::Scan {
                         ranked: Some(ranked),
                         ..
@@ -3416,141 +3671,32 @@ impl Lowering<'_> {
                         ranked.prefilter = Some(prefilter);
                     }
                 }
-                self.ranking = Some(Ranking::Scores(vec![score]));
-                Ok(lowered)
-            }
-            LogicalNode::TextSearch {
-                input,
-                binding,
-                property,
-                query,
-                ..
-            } => {
-                let lowered = self.lower(*input)?;
-                let access = RankedAccess {
-                    kind: RankKind::Bm25,
-                    score: rank_score(binding, RankKind::Bm25),
-                    property: property.clone(),
-                    query: query.clone(),
-                    fetch: None,
-                    nprobes: None,
-                    scope: RankScope::Order,
-                    overfetch: Vec::new(),
-                    prefilter: None,
-                    eligibility: Eligibility::BeforeScoring,
-                    policy: None,
-                };
-                let (score, scan) = self.rank(lowered, binding, access)?;
-                if let Some(PhysicalNode::Scan {
-                    ranked: Some(ranked),
-                    ..
-                }) = self.physical.node(scan)
-                {
-                    let eligibility = ranked.eligibility;
-                    self.tracer.record(
-                        &[Role::Search, Role::Scan],
-                        Rule::RankBm25Scan { eligibility },
-                        &[Role::Search],
-                    );
+                if *leads {
+                    self.ranking = Some(Ranking::Scores(vec![score]));
                 }
-                self.ranking = Some(Ranking::Scores(vec![score]));
                 Ok(lowered)
             }
-            LogicalNode::RankFuse {
-                input,
+            LogicalNode::Fuse {
                 arms,
+                target,
                 k,
-                limit,
-                row_tiebreak,
+                weights,
+                partition,
                 ..
             } => {
-                let primary = self.lower(*input)?;
-                let secondary = self.physical.duplicate(primary).ok_or_else(|| {
-                    PlanError::Internal("the rrf arm subtree has a tombstone".to_string())
-                })?;
-                let limit = limit.and_then(|limit| usize::try_from(limit).ok());
-                let [primary_arm, secondary_arm] = arms.as_ref();
-                if primary_arm.binding != secondary_arm.binding
-                    && traversal_connects(
-                        &self.physical,
-                        primary,
-                        &primary_arm.binding,
-                        &secondary_arm.binding,
-                    )
-                {
-                    // The type checker refuses these arms (`T59`): one
-                    // traversal cannot start at both ranked bindings.
-                    return Err(PlanError::Internal(format!(
-                        "`rrf()` ranks `${}` and `${}`, which one traversal connects; the type checker refuses those arms",
-                        primary_arm.binding, secondary_arm.binding
-                    )));
-                }
-                let mut lowered_arms = Vec::with_capacity(2);
-                let mut bm25_scans = Vec::new();
-                let mut primary_scan = None;
-                for (root, arm, scope) in [
-                    (primary, primary_arm, RankScope::Primary),
-                    (secondary, secondary_arm, RankScope::Secondary),
-                ] {
-                    let access = RankedAccess {
-                        kind: arm.kind,
-                        score: rank_score(&arm.binding, arm.kind),
-                        property: arm.property.clone(),
-                        query: arm.query.clone(),
-                        fetch: match arm.kind {
-                            RankKind::Nearest => Some(limit.unwrap_or(RRF_NEAREST_ARM_K)),
-                            RankKind::Bm25 => None,
-                        },
-                        nprobes: match arm.kind {
-                            RankKind::Nearest => self.source.ann_nprobes(),
-                            RankKind::Bm25 => None,
-                        },
-                        scope,
-                        overfetch: Vec::new(),
-                        prefilter: None,
-                        eligibility: Eligibility::BeforeScoring,
-                        policy: match arm.kind {
-                            RankKind::Nearest => Some(NearestPolicy::DEFAULT),
-                            RankKind::Bm25 => None,
-                        },
-                    };
-                    let (_, scan) = self.rank(root, &arm.binding, access)?;
-                    if arm.kind == RankKind::Bm25 {
-                        bm25_scans.push(scan);
-                    }
-                    primary_scan.get_or_insert(scan);
-                    lowered_arms.push(RankArm {
-                        input: root,
-                        binding: arm.binding.clone(),
-                        kind: arm.kind,
+                let mut lowered = Vec::with_capacity(arms.len());
+                for arm in arms {
+                    lowered.push(FuseArm {
+                        input: self.lower(arm.input)?,
+                        rank: arm.rank,
                     });
                 }
-                let feeds = if primary_arm.binding == secondary_arm.binding {
-                    bm25_scans
-                } else {
-                    Vec::new()
-                };
-                let primary_scan = primary_scan
-                    .ok_or_else(|| PlanError::Internal("an rrf has two arms".to_string()))?;
-                let prefilter = self.prefilter(
-                    &top_level(&self.physical, primary),
-                    &primary_arm.binding,
-                    primary_scan,
-                    feeds,
-                    EmptyEligible::Postfilter,
-                )?;
-                let [primary_arm, secondary_arm] = <[RankArm; 2]>::try_from(lowered_arms)
-                    .map_err(|_| PlanError::Internal("an rrf has two arms".to_string()))?;
-                self.ranking = Some(Ranking::Fused(IROrdering {
-                    expr: fused_score(&primary_arm.binding),
-                    descending: true,
-                }));
-                Ok(self.physical.add(PhysicalNode::RankFuse {
-                    arms: [primary_arm, secondary_arm],
+                Ok(self.physical.add(PhysicalNode::Fuse {
+                    arms: lowered,
+                    target: target.clone(),
                     k: k.clone(),
-                    limit,
-                    prefilter,
-                    row_tiebreak: row_tiebreak.clone(),
+                    weights: weights.clone(),
+                    partition: partition.clone(),
                 }))
             }
             LogicalNode::Ordered { input, keys } => {
@@ -3564,6 +3710,49 @@ impl Lowering<'_> {
                         "no operator sorts by {keys:?}; the input declares {declared:?}"
                     )))
                 }
+            }
+            LogicalNode::Score {
+                input,
+                binding,
+                type_name,
+                property,
+                kind,
+                query,
+                ..
+            } => {
+                let lowered = self.lower(*input)?;
+                Ok(self.physical.add(PhysicalNode::Score {
+                    input: lowered,
+                    binding: binding.clone(),
+                    type_name: type_name.clone(),
+                    property: property.clone(),
+                    kind: *kind,
+                    query: query.clone(),
+                }))
+            }
+            LogicalNode::Let {
+                input, name, value, ..
+            } => {
+                let lowered = self.lower(*input)?;
+                self.tracer.record(&[Role::Filter], Rule::Lower, &[]);
+                Ok(self.physical.add(PhysicalNode::Let {
+                    input: lowered,
+                    name: name.clone(),
+                    value: value.clone(),
+                }))
+            }
+            LogicalNode::TargetCut {
+                input,
+                binding,
+                targets,
+            } => {
+                let lowered = self.lower(*input)?;
+                self.tracer.record(&[Role::Limit], Rule::Lower, &[]);
+                Ok(self.physical.add(PhysicalNode::TargetCut {
+                    input: lowered,
+                    binding: binding.clone(),
+                    targets: usize::try_from(*targets).unwrap_or(usize::MAX),
+                }))
             }
             LogicalNode::Limit { input, rows } => {
                 self.limit = Some(*rows);
@@ -4288,10 +4477,6 @@ fn variable_offset_width(data_type: &DataType) -> u64 {
     }
 }
 
-/// The candidates a nearest arm of an `rrf()` asks for when the query has
-/// no limit.
-pub(crate) const RRF_NEAREST_ARM_K: usize = 100;
-
 /// The order a node's output leaves in, from the operator's definition and
 /// its inputs' orders (`input`): each kind's `order:` token in the
 /// `physical_nodes!` declaration ([`PhysicalNode::order`]).
@@ -4516,6 +4701,19 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
+            PhysicalNode::TargetCut { input, .. }
+            | PhysicalNode::Score { input, .. }
+            | PhysicalNode::Let { input, .. } => {
+                let input = props(plan, *input)?;
+                Properties {
+                    schema: input.schema.clone(),
+                    ordering: ordering.clone(),
+                    rows: input.rows,
+                    work_bytes: input.work_bytes,
+                    retained_limit: None,
+                    sources: Vec::new(),
+                }
+            }
             PhysicalNode::Page { input, rows, .. } | PhysicalNode::Limit { input, rows } => {
                 let input = props(plan, *input)?;
                 let page_rows = u64::try_from(*rows).unwrap_or(u64::MAX);
@@ -4595,9 +4793,22 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
+            PhysicalNode::Correlate { input, inner, .. } => {
+                let input = props(plan, input.unwrap_or(*inner))?;
+                Properties {
+                    schema: input.schema.clone(),
+                    ordering: ordering.clone(),
+                    rows: Estimate::Unknown,
+                    work_bytes: Estimate::Unknown,
+                    retained_limit: None,
+                    sources: Vec::new(),
+                }
+            }
             PhysicalNode::Filter { input, .. }
             | PhysicalNode::Expand { input, .. }
-            | PhysicalNode::AntiJoin { input, .. } => {
+            | PhysicalNode::AntiJoin { input, .. }
+            | PhysicalNode::OptionalJoin { input, .. }
+            | PhysicalNode::Union { left: input, .. } => {
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),
@@ -4635,12 +4846,12 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
-            PhysicalNode::RankFuse { arms, .. } => {
+            PhysicalNode::Fuse { arms, .. } => {
                 let input = props(plan, arms[0].input)?;
                 Properties {
                     schema: input.schema.clone(),
                     ordering: None,
-                    rows: input.rows,
+                    rows: Estimate::Unknown,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
                     sources: Vec::new(),

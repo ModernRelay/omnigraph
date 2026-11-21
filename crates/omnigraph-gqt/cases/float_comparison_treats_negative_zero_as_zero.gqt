@@ -1,0 +1,150 @@
+# issue: none
+# notes: A comparison treats `-0.0` and `0.0` as equal, as IEEE 754 does, whether
+# notes: the filter runs in the scan or in memory behind a `let` that can fail, so a
+# notes: `let` never changes which rows a `where` keeps. The zero-divisor test
+# notes: follows comparison (`E2`). The fixed value order keeps the two apart: a
+# notes: sort puts `-0.0` before `0.0` and `distinct` keeps both.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    score: F64?
+    rating: F32?
+}
+edge Knows: Person -> Person { weight: F64? }
+
+--- seed
+{"type":"Person","data":{"handle":"p1","score":1.5,"rating":1.5}}
+{"type":"Person","data":{"handle":"p2","score":0.0,"rating":0.0}}
+{"type":"Person","data":{"handle":"p5","score":-0.0,"rating":-0.0}}
+{"type":"Person","data":{"handle":"p6","score":2.0,"rating":2.0}}
+{"edge":"Knows","from":"p1","to":"p2","data":{"weight":-0.0}}
+{"edge":"Knows","from":"p1","to":"p6","data":{"weight":1.0}}
+
+--- query
+query not_zero_in_the_scan() {
+    match { $p: Person }
+    where $p.score != 0.0
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"p1"}
+{"p.handle":"p6"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query not_zero_behind_a_let_that_can_fail() {
+    match { $p: Person, let $x = $p.score - 2.0 }
+    where $p.score != 0.0
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"p1"}
+{"p.handle":"p6"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query below_zero_behind_a_let_that_can_fail() {
+    match { $p: Person, let $x = $p.score - 2.0 }
+    where $p.score < 0.0
+    return { $p.handle }
+}
+
+--- expect unordered
+
+--- expect shape
+p.handle: String
+
+--- query
+query equal_to_negative_zero() {
+    match { $p: Person }
+    where $p.score = -0.0
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"p2"}
+{"p.handle":"p5"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query in_a_list_behind_a_let_that_can_fail() {
+    match { $p: Person, let $x = $p.rating * 2.0 }
+    where $p.rating in [0.0]
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"p2"}
+{"p.handle":"p5"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query an_edge_weight_of_negative_zero_equals_zero() {
+    match { $a: Person, $a $k:knows $b, let $w = $k.weight + 1.0 }
+    where $k.weight = 0.0
+    return { $b.handle }
+}
+
+--- expect unordered
+{"b.handle":"p2"}
+
+--- expect shape
+b.handle: String
+
+--- query
+query the_sort_puts_negative_zero_first() {
+    match { $p: Person }
+    return { $p.handle }
+    order { $p.score, $p.handle }
+}
+
+--- expect ordered
+{"p.handle":"p5"}
+{"p.handle":"p2"}
+{"p.handle":"p1"}
+{"p.handle":"p6"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query distinct_keeps_both_zeros() {
+    match { $p: Person }
+    where $p.score <= 0.0
+    return distinct { $p.score }
+}
+
+--- expect unordered
+{"p.score":0.0}
+{"p.score":-0.0}
+
+--- expect shape
+p.score: F64?
+
+--- query
+query a_negative_zero_divisor_is_a_zero_divisor() {
+    match { $p: Person }
+    where $p.handle = "p5"
+    return { 1.0 / $p.score as r }
+}
+
+--- expect error: E2

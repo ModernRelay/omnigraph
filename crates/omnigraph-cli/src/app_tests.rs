@@ -271,7 +271,7 @@ async fn handled_lint_failure_allows_a_following_successful_invocation() {
     std::fs::write(&schema, "node Person {\n    slug: String @key\n}\n").unwrap();
     for (source, expected) in [
         (
-            "query broken($slug: String) { update Person set { missing: \"nope\" } where slug = $slug }",
+            "query broken($slug: String) { match { $x: Person } where $x.slug = $slug  update $x set { missing: \"nope\" } }",
             1,
         ),
         (
@@ -851,7 +851,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
             for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
                 let receipt = if command == "load" {
                     json!({"branch":"main", "base_branch":null, "branch_created":false,
-                        "mode":"append", "nodes":[{"name":"Document", "entities_loaded":1}],
+                        "mode":"insert", "nodes":[{"name":"Document", "entities_loaded":1}],
                         "edges":[], "total_entities":1, "embedding_generation":null,
                         "actor_id":null, "commit":commit})
                 } else {
@@ -883,7 +883,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                                         branch: "main".into(),
                                         from: None,
                                         data: data.clone(),
-                                        mode: CliLoadMode::Append,
+                                        mode: CliLoadMode::Insert,
                                         settings: Vec::new(),
                                         json,
                                     },
@@ -1016,7 +1016,7 @@ async fn transfer_receipt_delivery_failure_keeps_write_evidence_without_replay()
                         branch: "main".into(),
                         from: None,
                         data,
-                        mode: CliLoadMode::Append,
+                        mode: CliLoadMode::Insert,
                         settings: Vec::new(),
                         json: true,
                     },
@@ -1060,7 +1060,7 @@ async fn mutation_scope_delivery_failure_precedes_writable_open() {
     use crate::commands::query::{GraphScope, run_mutate};
 
     for source in [
-        "query add() { insert Person { slug: \"new\" } }",
+        "query add() { replace Person { slug: \"new\" } }",
         "branch create review",
     ] {
         for fault in [OutputFault::AfterPrefix, OutputFault::Flush] {
@@ -1533,14 +1533,17 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                 .join("graph.omni")
                 .to_string_lossy()
                 .into_owned();
-            omnigraph::db::Omnigraph::init(&uri, "node Person { slug: String @key }\n")
-                .await
-                .unwrap();
+            omnigraph::db::Omnigraph::init(
+                &uri,
+                "node Person { slug: String @key @index(fulltext) }\n",
+            )
+            .await
+            .unwrap();
             let client = GraphClient::embedded_test(uri.clone(), None);
             client
                 .mutate(
                     None,
-                    "query add() { insert Person { slug: \"one\" } }",
+                    "query add() { replace Person { slug: \"one\" } }",
                     None,
                     None,
                     None,
@@ -1905,7 +1908,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             };
             let error = crate::admission::scope(graph.mutate(
                 None,
-                "query add() { insert Person { slug: \"never-written\" } }",
+                "query add() { replace Person { slug: \"never-written\" } }",
                 None,
                 None,
                 None,
@@ -1977,7 +1980,7 @@ async fn base_opens_a_graph_shallow_clone_and_leaves_the_base_unchanged() {
     omnigraph::db::Omnigraph::init(&base, "node Person { slug: String @key }")
         .await
         .unwrap();
-    let insert = |slug: &str| format!("query add() {{ insert Person {{ slug: \"{slug}\" }} }}");
+    let insert = |slug: &str| format!("query add() {{ replace Person {{ slug: \"{slug}\" }} }}");
     let (seeded, _, _) = run_cli(&[
         "omnigraph",
         "mutate",
@@ -2104,7 +2107,7 @@ async fn stats_that_cannot_be_written_fails_after_the_mutation_committed() {
         "--stats",
         stats.to_str().unwrap(),
         "-e",
-        "query add() { insert Person { slug: \"a\" } }",
+        "query add() { replace Person { slug: \"a\" } }",
         "--json",
     ])
     .await;

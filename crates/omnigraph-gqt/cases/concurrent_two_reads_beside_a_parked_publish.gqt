@@ -18,7 +18,7 @@ node Person {
 {"type":"Person","data":{"name":"bob"}}
 
 --- concurrent scripted
-w1: query add_carol() { insert Person { name: "carol" } }
+w1: query add_carol() { replace Person { name: "carol" } }
 r1: query all_a() { match { $p: Person } return { $p.name } }
 r2: query all_b() { match { $p: Person } return { $p.name } }
 order: w1 park put __manifest/_versions/, r1 start, r2 start, r1, r2, w1 put __manifest/_versions/, w1

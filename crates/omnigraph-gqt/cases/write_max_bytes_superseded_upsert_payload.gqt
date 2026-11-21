@@ -23,8 +23,8 @@ node Doc {
 --- mutate
 set write_max_bytes = 30000;
 query upsert_twice($payload: Blob) {
-    insert Doc { slug: "same", content: $payload, note: "first" }
-    insert Doc { slug: "same", content: $payload, note: "second" }
+    replace Doc { slug: "same", content: $payload, note: "first" }
+    replace Doc { slug: "same", content: $payload, note: "second" }
 }
 
 --- params

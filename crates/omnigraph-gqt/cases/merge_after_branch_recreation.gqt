@@ -28,14 +28,14 @@ branch create feature;
 
 --- mutate branch: feature
 query add_carol() {
-    insert Person { name: "carol", age: 50 }
+    replace Person { name: "carol", age: 50 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query add_dave() {
-    insert Person { name: "dave", age: 60 }
+    replace Person { name: "dave", age: 60 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -63,14 +63,16 @@ branch create feature;
 
 --- mutate branch: feature
 query recreated_source_deletes_bob() {
-    delete Person where name = "bob"
+    match { $x: Person } where $x.name = "bob"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: old_child
 query old_child_changes_alice() {
-    update Person set { age: 31 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0

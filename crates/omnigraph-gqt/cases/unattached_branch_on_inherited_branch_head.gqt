@@ -26,7 +26,7 @@ branch create feature
 
 --- mutate branch: feature
 query root_bob() as unattached branch {
-    insert Person { name: "bob", age: 41 }
+    replace Person { name: "bob", age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -35,7 +35,7 @@ query root_bob() as unattached branch {
 
 --- mutate
 query add_carol_on_main() {
-    insert Person { name: "carol", age: 52 }
+    replace Person { name: "carol", age: 52 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -55,14 +55,14 @@ p.name: String
 
 --- mutate branch: main
 query child_on_wrong_target() as unattached branch on "${r}" {
-    insert Person { name: "forbidden", age: 99 }
+    replace Person { name: "forbidden", age: 99 }
 }
 
 --- expect error: is not the recorded target
 
 --- mutate
 query child_dave() as unattached branch on "${r}" {
-    insert Person { name: "dave", age: 63 }
+    replace Person { name: "dave", age: 63 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -85,7 +85,7 @@ p.name: String
 
 --- mutate branch: feature
 query add_erin_on_feature() {
-    insert Person { name: "erin", age: 27 }
+    replace Person { name: "erin", age: 27 }
 }
 
 --- expect affected: nodes=1 edges=0

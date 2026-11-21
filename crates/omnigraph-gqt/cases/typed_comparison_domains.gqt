@@ -1,5 +1,6 @@
 # issue: none
 # notes: Literal narrowing is chosen once from exact representability; parameters use their declared domain.
+# notes: A float literal is F64 even when whole, so an integer compared with one is cast to F64 and never narrows it.
 # notes: Pushed node, edge and return comparisons agree, including F32 rounding and signed/U64 membership.
 
 --- runner
@@ -30,56 +31,50 @@ edge Link: Number -> Number {
 {"edge":"Link","from":"a","to":"b","data":{"n":9007199254740993,"f":0.1}}
 
 --- query
-set engine = v2;
 query integer_node_literal() {
-    match { $x: Number $x.n > 9007199254740992.0 }
+    match { $x: Number } where $x.n > 9007199254740992.0
     return { $x.key }
 }
 --- expect unordered
-{"x.key":"a"}
 --- expect shape
 x.key: String
 --- expect plan
 scan Number as $x: filter reads [x.n]
-cast 9007199254740992.0: F64 -> I64
-no cast $x.n
+cast $x.n: I64 -> F64
+no cast 9007199254740992.0
 type $x.n: I64
 
 --- query
-set engine = v2;
 query integer_edge_literal() {
-    match { $x: Number $x $e:link $y $e.n > 9007199254740992.0 }
+    match { $x: Number, $x $e:link $y } where $e.n > 9007199254740992.0
     return { $x.key }
 }
 --- expect unordered
-{"x.key":"a"}
 --- expect shape
 x.key: String
 --- expect plan
-cast 9007199254740992.0: F64 -> I64
-no cast $e.n
+cast $e.n: I64 -> F64
+no cast 9007199254740992.0
 type $e.n: I64
 
 --- query
-set engine = v2;
 query integer_projection_literal() {
     match { $x: Number }
     return { $x.key, $x.n > 9007199254740992.0 as above }
 }
 --- expect unordered
-{"x.key":"a","above":true}
+{"x.key":"a","above":false}
 {"x.key":"b","above":false}
 --- expect shape
 x.key: String
 above: Bool
 --- expect plan
-cast 9007199254740992.0: F64 -> I64
-no cast $x.n
+cast $x.n: I64 -> F64
+no cast 9007199254740992.0
 
 --- query
-set engine = v2;
 query f32_node_nonrepresentable_literal() {
-    match { $x: Number $x.f = 0.1 }
+    match { $x: Number } where $x.f = 0.1
     return { $x.key }
 }
 --- expect unordered
@@ -90,9 +85,8 @@ cast $x.f: F32 -> F64
 type 0.1: F64
 
 --- query
-set engine = v2;
 query f32_edge_nonrepresentable_literal() {
-    match { $x: Number $x $e:link $y $e.f = 0.1 }
+    match { $x: Number, $x $e:link $y } where $e.f = 0.1
     return { $x.key }
 }
 --- expect unordered
@@ -103,9 +97,8 @@ cast $e.f: F32 -> F64
 type 0.1: F64
 
 --- query
-set engine = v2;
 query f32_exact_literal() {
-    match { $x: Number $x.f = 0.10000000149011612 }
+    match { $x: Number } where $x.f = 0.10000000149011612
     return { $x.key }
 }
 --- expect unordered
@@ -117,9 +110,8 @@ cast 0.10000000149011612: F64 -> F32
 no cast $x.f
 
 --- query
-set engine = v2;
 query declared_f64_parameter($bound: F64) {
-    match { $x: Number $x.f = $bound }
+    match { $x: Number } where $x.f = $bound
     return { $x.key }
 }
 --- params
@@ -132,9 +124,8 @@ cast $x.f: F32 -> F64
 type $bound: F64
 
 --- query
-set engine = v2;
 query declared_f64_parameter($bound: F64) {
-    match { $x: Number $x.f = $bound }
+    match { $x: Number } where $x.f = $bound
     return { $x.key }
 }
 --- params
@@ -148,9 +139,8 @@ cast $x.f: F32 -> F64
 type $bound: F64
 
 --- query
-set engine = v2;
 query declared_f32_parameter($bound: F32) {
-    match { $x: Number $x.f = $bound }
+    match { $x: Number } where $x.f = $bound
     return { $x.key }
 }
 --- params
@@ -165,9 +155,8 @@ no cast $bound
 type $bound: F32
 
 --- query
-set engine = v2;
 query integer_fractional_literal() {
-    match { $x: Number $x.small > 2.5 }
+    match { $x: Number } where $x.small > 2.5
     return { $x.key }
 }
 --- expect unordered
@@ -179,9 +168,8 @@ cast $x.small: I32 -> F64
 type 2.5: F64
 
 --- query
-set engine = v2;
 query unsigned_negative_parameter($bound: I64) {
-    match { $x: Number $x.u > $bound }
+    match { $x: Number } where $x.u > $bound
     return { $x.key }
 }
 --- params
@@ -196,39 +184,37 @@ cast $x.u: U64 -> exact_integer
 cast $bound: I64 -> exact_integer
 
 --- query
-set engine = v2;
-query signed_list_exact_literal() {
+query signed_list_float_literal() {
     match { $x: Number }
-    return { $x.key, $x.ns contains 9007199254740992.0 as member }
+    return { $x.key, 9007199254740992.0 in $x.ns as member }
 }
 --- expect unordered
-{"x.key":"a","member":false}
+{"x.key":"a","member":true}
 {"x.key":"b","member":true}
 --- expect shape
 x.key: String
 member: Bool
 --- expect plan
-cast 9007199254740992.0: F64 -> I64
-no cast $x.ns
+cast $x.ns: [I64] -> [F64]
+no cast 9007199254740992.0
 
 --- query
-set engine = v2;
-query literal_list_exact_narrowing() {
+query literal_list_of_whole_floats() {
     match { $x: Number }
     return { $x.key, $x.n in [9007199254740992.0] as member }
 }
 --- expect unordered
-{"x.key":"a","member":false}
+{"x.key":"a","member":true}
 {"x.key":"b","member":true}
 --- expect shape
 x.key: String
 member: Bool
 --- expect plan
-cast [9007199254740992.0]: [F64] -> [I64]
-no cast $x.n
+cast $x.n: I64 -> F64
+type [9007199254740992.0]: [F64]
+no cast [9007199254740992.0]
 
 --- query
-set engine = v2;
 query literal_list_one_common_domain() {
     match { $x: Number }
     return { $x.key, $x.n in [9007199254740992.0, 1.5] as member }
@@ -244,10 +230,9 @@ cast $x.n: I64 -> F64
 type [9007199254740992.0, 1.5]: [F64]
 
 --- query
-set engine = v2;
 query unsigned_list_negative_needle($needle: I64) {
     match { $x: Number }
-    return { $x.key, $x.us contains $needle as member }
+    return { $x.key, $needle in $x.us as member }
 }
 --- params
 {"needle":-1}
@@ -262,9 +247,8 @@ cast $x.us: [U64] -> [exact_integer]
 cast $needle: I64 -> exact_integer
 
 --- query
-set engine = v2;
 query f32_list_nonrepresentable_needle() {
-    match { $x: Number $x.fs contains 0.1 }
+    match { $x: Number } where 0.1 in $x.fs
     return { $x.key }
 }
 --- expect unordered
@@ -275,7 +259,6 @@ cast $x.fs: [F32] -> [F64]
 type 0.1: F64
 
 --- query
-set engine = v2;
 query parameter_rounding_before_widening($small: F32, $wide: F64) {
     match { $x: Number }
     return { $x.key, $small = $wide as rounded }

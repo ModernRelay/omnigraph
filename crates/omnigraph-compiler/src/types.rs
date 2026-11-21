@@ -39,6 +39,71 @@ pub fn check_datetime_literal(value: &str) -> Result<(), String> {
     ))
 }
 
+/// The day a `Date` literal names, as days since the Unix epoch: the one
+/// parse the type checker and every writer and reader of a `Date` literal
+/// share, [`check_date_literal`] in front of Arrow's `Utf8 -> Date32` cast.
+///
+/// # Errors
+///
+/// The refusal message naming `value`.
+pub fn date_literal_days(value: &str) -> Result<i32, String> {
+    check_date_literal(value)?;
+    cast_date_literal_days(value)
+}
+
+/// The bare Arrow `Utf8 -> Date32` cast, a time-bearing string read as its
+/// UTC day. [`date_literal_days`] fronts it with the check; a reader of ids
+/// that old writers derived through this very cast calls it bare.
+///
+/// # Errors
+///
+/// The refusal message naming `value`.
+pub fn cast_date_literal_days(value: &str) -> Result<i32, String> {
+    use arrow_array::{Array, Date32Array, StringArray};
+    let raw = StringArray::from(vec![Some(value)]);
+    let casted = arrow_cast::cast::cast(&raw, &DataType::Date32)
+        .map_err(|e| format!("invalid Date literal '{value}': {e}"))?;
+    let out = casted
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .ok_or_else(|| "Date32 cast produced unexpected array".to_string())?;
+    if out.is_null(0) {
+        return Err(format!("invalid Date literal '{value}'"));
+    }
+    Ok(out.value(0))
+}
+
+/// The instant a `DateTime` literal names, as milliseconds since the Unix
+/// epoch: the one parse the type checker and every writer and reader of a
+/// `DateTime` literal share. A signed extended year is parsed as an ISO
+/// local date-time in UTC; every other string goes through Arrow's
+/// `Utf8 -> Date64` cast.
+///
+/// # Errors
+///
+/// The refusal message naming `value`.
+pub fn datetime_literal_millis(value: &str) -> Result<i64, String> {
+    use arrow_array::{Array, Date64Array, StringArray};
+    if value.starts_with(['+', '-']) {
+        return ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"]
+            .iter()
+            .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+            .map(|datetime| datetime.and_utc().timestamp_millis())
+            .ok_or_else(|| format!("invalid DateTime literal '{value}'"));
+    }
+    let raw = StringArray::from(vec![Some(value)]);
+    let casted = arrow_cast::cast::cast(&raw, &DataType::Date64)
+        .map_err(|e| format!("invalid DateTime literal '{value}': {e}"))?;
+    let out = casted
+        .as_any()
+        .downcast_ref::<Date64Array>()
+        .ok_or_else(|| "Date64 cast produced unexpected array".to_string())?;
+    if out.is_null(0) {
+        return Err(format!("invalid DateTime literal '{value}'"));
+    }
+    Ok(out.value(0))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarType {
     String,
@@ -146,6 +211,12 @@ impl ScalarType {
                 Self::String | Self::Bool | Self::Date | Self::DateTime
             )
     }
+
+    /// A type a `List` may hold: every scalar but `Vector` and `Blob`, as
+    /// the schema's list types admit.
+    pub(crate) fn is_list_element(&self) -> bool {
+        self.is_orderable()
+    }
 }
 
 impl std::fmt::Display for ScalarType {
@@ -168,11 +239,31 @@ impl std::fmt::Display for ScalarType {
     }
 }
 
-/// The index a one-column `@index` or `@key` declaration builds on a node
-/// property: a scalar BTREE, a full-text inverted index or a vector index.
+/// The one-column index declaration a node property carries, the strongest
+/// of its annotations: a `@key` alone, an explicit `@index` (property-level
+/// or body-level, with or without a `@key`), or `@index(fulltext, ...)`.
+/// [`PropType::index_kinds`] reads it beside the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IndexDeclaration {
+    /// `@key` and no explicit `@index`.
+    Key,
+    /// An explicit `@index`.
+    Index,
+    /// `@index(fulltext, ...)`.
+    FullText,
+}
+
+/// One index a one-column `@index` or `@key` declaration builds on a node
+/// property (the GQ 3 RFC, section 4, "Scalar indexes"): a
+/// BTREE for equality, ranges and order, a BITMAP for an enum or `Bool`, a
+/// LABEL_LIST for a list's `in`, an NGRAM for a String's `contains`, the
+/// full-text inverted index, or a vector index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropIndexKind {
     Btree,
+    Bitmap,
+    LabelList,
+    NGram,
     FullText,
     Vector,
 }
@@ -232,32 +323,65 @@ impl PropType {
         self.enum_values.is_some()
     }
 
-    /// The index a one-column `@index`/`@key` declaration on a node property
-    /// of this type builds, `None` when the type is not indexable (a list or a
-    /// `Blob`). Enums are physically `String` but filtered by equality, so
-    /// they take a scalar BTREE, not a full-text index (Lance never consults
-    /// an inverted index for `=` or a range); free-text Strings take the
-    /// full-text index `search`, `fuzzy`, `match_text` and `bm25` read. The
-    /// one rule the type checker (`T27`) and index maintenance share.
-    pub fn index_kind(&self) -> Option<PropIndexKind> {
+    /// The indexes a one-column `declaration` on a node property of this type
+    /// builds, empty when the type is not indexable (a `Blob`, or a list of
+    /// vectors or Blobs). Each is derived acceleration (invariant 7); the
+    /// kinds follow the predicates Lance 13 answers per index
+    /// (docs/dev/lance.md, the scalar index rows):
+    ///
+    /// - an enum or `Bool` takes a BITMAP, which answers equality, `!=`,
+    ///   `in`, ranges and `is null` exactly, as a BTREE would, and no BTREE
+    ///   beside it, since nothing orders through an index;
+    /// - a list takes a LABEL_LIST, which answers `value in $x.list` exactly;
+    /// - a free-text String takes a BTREE for equality, `in`, ranges and
+    ///   `starts_with`; an explicit `@index` adds an NGRAM for `contains` (a
+    ///   candidate superset Lance rechecks), which a `@key` alone does without,
+    ///   since an identifier is matched by equality and its `contains` is
+    ///   answered by the scan; and only `@index(fulltext, ...)` adds the
+    ///   full-text index, since `match_terms` and `bm25` answer from the exact
+    ///   scan whatever is built;
+    /// - every other scalar takes a BTREE, and a vector its vector index,
+    ///   whatever the declaration.
+    ///
+    /// The one rule index maintenance and the declared full-text columns
+    /// share.
+    pub fn index_kinds(&self, declaration: IndexDeclaration) -> &'static [PropIndexKind] {
         if self.list {
-            return None;
+            return match self.scalar {
+                ScalarType::Vector(_) | ScalarType::Blob => &[],
+                _ => &[PropIndexKind::LabelList],
+            };
         }
         match self.scalar {
-            ScalarType::String if !self.is_enum() => Some(PropIndexKind::FullText),
-            ScalarType::Vector(_) => Some(PropIndexKind::Vector),
-            ScalarType::String
-            | ScalarType::DateTime
+            ScalarType::String if self.is_enum() => &[PropIndexKind::Bitmap],
+            ScalarType::String => match declaration {
+                IndexDeclaration::Key => &[PropIndexKind::Btree],
+                IndexDeclaration::Index => &[PropIndexKind::NGram, PropIndexKind::Btree],
+                IndexDeclaration::FullText => &[
+                    PropIndexKind::FullText,
+                    PropIndexKind::NGram,
+                    PropIndexKind::Btree,
+                ],
+            },
+            ScalarType::Bool => &[PropIndexKind::Bitmap],
+            ScalarType::Vector(_) => &[PropIndexKind::Vector],
+            ScalarType::DateTime
             | ScalarType::Date
             | ScalarType::I32
             | ScalarType::I64
             | ScalarType::U32
             | ScalarType::U64
             | ScalarType::F32
-            | ScalarType::F64
-            | ScalarType::Bool => Some(PropIndexKind::Btree),
-            ScalarType::Blob => None,
+            | ScalarType::F64 => &[PropIndexKind::Btree],
+            ScalarType::Blob => &[],
         }
+    }
+
+    /// Whether this is a free-text String: a String that is neither an enum
+    /// nor a list, the only type lexical search reads and a full-text index
+    /// covers.
+    pub fn is_free_text_string(&self) -> bool {
+        matches!(self.scalar, ScalarType::String) && !self.list && !self.is_enum()
     }
 
     pub fn to_arrow(&self) -> DataType {
@@ -314,14 +438,23 @@ pub enum ExprType {
         list: bool,
         nullable: bool,
     },
+    /// A node reference; `nullable` where an `optional` introduced it, so
+    /// a row it kept without a match holds no node.
     Node {
         type_name: String,
-    },
-    /// Internal exact comparison carrier, never a declared parameter or result.
-    ExactInteger {
-        list: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         nullable: bool,
     },
+    /// An edge reference column of the core IR; `type_name` may hold the
+    /// alternatives of an edge selector, joined by `|`; `nullable` as a
+    /// node's.
+    Edge {
+        type_name: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        nullable: bool,
+    },
+    /// Internal exact comparison carrier, never a declared parameter or result.
+    ExactInteger { list: bool, nullable: bool },
 }
 
 impl ExprType {
@@ -335,15 +468,33 @@ impl ExprType {
 
     pub fn nullable(&self) -> bool {
         match self {
-            Self::Value { nullable, .. } | Self::ExactInteger { nullable, .. } => *nullable,
-            Self::Node { .. } => false,
+            Self::Value { nullable, .. }
+            | Self::ExactInteger { nullable, .. }
+            | Self::Node { nullable, .. }
+            | Self::Edge { nullable, .. } => *nullable,
+        }
+    }
+
+    /// A node reference of `type_name` that is never null.
+    pub fn node(type_name: impl Into<String>) -> Self {
+        Self::Node {
+            type_name: type_name.into(),
+            nullable: false,
+        }
+    }
+
+    /// An edge reference of `type_name` that is never null.
+    pub fn edge(type_name: impl Into<String>) -> Self {
+        Self::Edge {
+            type_name: type_name.into(),
+            nullable: false,
         }
     }
 
     pub fn is_list(&self) -> bool {
         match self {
             Self::Value { list, .. } | Self::ExactInteger { list, .. } => *list,
-            Self::Node { .. } => false,
+            Self::Node { .. } | Self::Edge { .. } => false,
         }
     }
 
@@ -365,7 +516,22 @@ impl ExprType {
             (Self::ExactInteger { list: left, .. }, Self::ExactInteger { list: right, .. }) => {
                 left == right
             }
-            (Self::Node { type_name: left }, Self::Node { type_name: right }) => left == right,
+            (
+                Self::Node {
+                    type_name: left, ..
+                },
+                Self::Node {
+                    type_name: right, ..
+                },
+            )
+            | (
+                Self::Edge {
+                    type_name: left, ..
+                },
+                Self::Edge {
+                    type_name: right, ..
+                },
+            ) => left == right,
             _ => false,
         }
     }
@@ -388,7 +554,14 @@ impl ExprType {
                 enum_values: None,
             }
             .display_name(),
-            Self::Node { type_name } => type_name.clone(),
+            Self::Node {
+                type_name,
+                nullable,
+            } => format!("{type_name}{}", if *nullable { "?" } else { "" }),
+            Self::Edge {
+                type_name,
+                nullable,
+            } => format!("edge {type_name}{}", if *nullable { "?" } else { "" }),
             Self::ExactInteger { list, nullable } => format!(
                 "{}{}",
                 if *list {
@@ -417,7 +590,7 @@ impl ExprType {
                 }
                 .to_arrow(),
             ),
-            Self::Node { type_name: _ } => None,
+            Self::Node { .. } | Self::Edge { .. } => None,
             Self::ExactInteger { list, .. } => Some(if *list {
                 DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
                     "item",

@@ -6,7 +6,8 @@ blocking jobs one by one admits a job that never ran, and the list itself
 lives on a settings page that nothing reviews. `ci.yml`'s `ci_gate` job needs
 every blocking job, runs with `if: always()`, and hands this script their
 results (`NEEDS_JSON`, the `needs` context as JSON), the event (`EVENT_NAME`,
-`EVENT_REF`) and the classifier's `run_full_ci` output (`RUN_FULL_CI`). `JOBS`
+`EVENT_REF`) and the classifier's `run_full_ci` and `run_gqt` outputs
+(`RUN_FULL_CI`, `RUN_GQT`). `JOBS`
 mirrors each job's own `if:` condition: a `skipped` result is accepted exactly
 when that condition would have been false on this event, `success` is
 accepted, `failure` and `cancelled` are refused whether or not the job could
@@ -29,6 +30,7 @@ FULL_CI = "full_ci"
 PR_QUEUE_FULL_CI = "pr_queue_full_ci"
 PR_QUEUE_MAIN_PUSH_FULL_CI = "pr_queue_main_push_full_ci"
 AUDIT_EVENTS = "audit_events"
+GQT = "gqt"
 
 # Job id → when the job runs, read off its `if:` in ci.yml. ALWAYS: no condition.
 JOBS = {
@@ -41,13 +43,14 @@ JOBS = {
     "lint": PR_QUEUE_MAIN_PUSH_FULL_CI,
     "test": FULL_CI,
     "storage_upgrade_compatibility": ALWAYS,
+    "cross_edition": GQT,
     "test_aws_feature": ALWAYS,
 }
 EVENTS = ("pull_request", "merge_group", "push", "workflow_dispatch")
 RESULTS = ("success", "failure", "cancelled", "skipped")
 
 
-def expected(rule: str, event: str, ref: str, run_full_ci: str) -> bool:
+def expected(rule: str, event: str, ref: str, run_full_ci: str, run_gqt: str = "") -> bool:
     """Whether a job under `rule` runs on this event, per its `if:` in ci.yml."""
     gated = event in ("pull_request", "merge_group")
     full = run_full_ci == "true"
@@ -55,6 +58,8 @@ def expected(rule: str, event: str, ref: str, run_full_ci: str) -> bool:
         return True
     if rule == FULL_CI:
         return full
+    if rule == GQT:
+        return run_gqt == "true"
     if rule == PR_QUEUE_FULL_CI:
         return gated and full
     if rule == PR_QUEUE_MAIN_PUSH_FULL_CI:
@@ -64,7 +69,7 @@ def expected(rule: str, event: str, ref: str, run_full_ci: str) -> bool:
     raise ValueError(f"unknown rule {rule!r}")
 
 
-def judge(needs_json: str, event: str, ref: str, run_full_ci: str) -> list[str]:
+def judge(needs_json: str, event: str, ref: str, run_full_ci: str, run_gqt: str) -> list[str]:
     """Reasons the gate is red; empty when every blocking job reported as it must."""
     failures: list[str] = []
     if event not in EVENTS:
@@ -97,13 +102,19 @@ def judge(needs_json: str, event: str, ref: str, run_full_ci: str) -> list[str]:
         failures.append("classify_changes: did not succeed, so run_full_ci is unknown")
     if run_full_ci not in ("true", "false"):
         failures.append(f"run_full_ci is {run_full_ci!r}, not 'true' or 'false'")
+    if run_gqt not in ("true", "false"):
+        failures.append(f"run_gqt is {run_gqt!r}, not 'true' or 'false'")
+    elif run_full_ci == "true" and run_gqt != "true":
+        failures.append("run_gqt is 'false' where run_full_ci is 'true', which also sets it")
     if failures:
         return failures
     for job, result in results.items():
         if result in ("failure", "cancelled"):
             failures.append(f"{job}: {result}")
-        elif result == "skipped" and expected(JOBS[job], event, ref, run_full_ci):
-            failures.append(f"{job}: skipped on {event} with run_full_ci={run_full_ci}, where it must run")
+        elif result == "skipped" and expected(JOBS[job], event, ref, run_full_ci, run_gqt):
+            failures.append(
+                f"{job}: skipped on {event} with run_full_ci={run_full_ci} and run_gqt={run_gqt}, where it must run"
+            )
     return failures
 
 
@@ -113,12 +124,12 @@ def self_test() -> None:
         base.update(over)
         return json.dumps({job: {"result": result} for job, result in base.items()})
 
-    def ok(needs: str, event: str, ref: str, full: str) -> None:
-        verdict = judge(needs, event, ref, full)
+    def ok(needs: str, event: str, ref: str, full: str, gqt: str | None = None) -> None:
+        verdict = judge(needs, event, ref, full, full if gqt is None else gqt)
         assert verdict == [], (event, ref, full, verdict)
 
-    def red(fragment: str, needs: str, event: str, ref: str, full: str) -> None:
-        verdict = judge(needs, event, ref, full)
+    def red(fragment: str, needs: str, event: str, ref: str, full: str, gqt: str | None = None) -> None:
+        verdict = judge(needs, event, ref, full, full if gqt is None else gqt)
         assert any(fragment in line for line in verdict), (fragment, event, ref, full, verdict)
 
     pr = ("pull_request", "refs/pull/1/merge")
@@ -126,7 +137,14 @@ def self_test() -> None:
     main = ("push", "refs/heads/main")
     tag = ("push", "refs/tags/v1.2.3")
     dispatch = ("workflow_dispatch", "refs/heads/feature")
-    docs = {"graph_vocabulary_guard": "skipped", "fmt": "skipped", "lint": "skipped", "test": "skipped"}
+    docs = {
+        "graph_vocabulary_guard": "skipped",
+        "fmt": "skipped",
+        "lint": "skipped",
+        "test": "skipped",
+        "cross_edition": "skipped",
+    }
+    cases_only = {k: v for k, v in docs.items() if k != "cross_edition"}
 
     ok(results(graph_vocabulary_guard="skipped"), *pr, "true")
     ok(results(), *pr, "true")
@@ -149,6 +167,14 @@ def self_test() -> None:
         if rule == ALWAYS and job != "classify_changes":
             red(f"{job}: skipped", results(graph_vocabulary_guard="skipped", **{job: "skipped"}), *pr, "true")
             red(f"{job}: skipped", results(**docs, **{job: "skipped"}), *pr, "false")
+    ok(results(**cases_only), *pr, "false", "true")
+    red("cross_edition: skipped", results(**docs), *pr, "false", "true")
+    red("cross_edition: skipped", results(**cases_only, cross_edition="skipped"), *queue, "false", "true")
+    red("cross_edition: skipped", results(graph_vocabulary_guard="skipped", cross_edition="skipped"), *pr, "true")
+    red("run_gqt is 'maybe'", results(graph_vocabulary_guard="skipped"), *pr, "true", "maybe")
+    red("run_gqt is 'false' where run_full_ci", results(graph_vocabulary_guard="skipped"), *pr, "true", "false")
+    assert expected(GQT, "push", "refs/heads/main", "false", "true")
+    assert not expected(GQT, "pull_request", "refs/pull/1/merge", "false", "false")
     red("classify_changes: did not succeed", results(classify_changes="skipped"), *pr, "")
     red("classify_changes: did not succeed", results(classify_changes="failure"), *pr, "")
 
@@ -198,12 +224,16 @@ def main(argv: list[str]) -> int:
     event = os.environ.get("EVENT_NAME", "")
     ref = os.environ.get("EVENT_REF", "")
     run_full_ci = os.environ.get("RUN_FULL_CI", "")
-    failures = judge(needs_json, event, ref, run_full_ci)
+    run_gqt = os.environ.get("RUN_GQT", "")
+    failures = judge(needs_json, event, ref, run_full_ci, run_gqt)
     for failure in failures:
         print(f"::error::CI Gate: {failure}")
     if failures:
         return 1
-    print(f"ok: {len(JOBS)} blocking jobs reported as required on {event} ({ref}, run_full_ci={run_full_ci})")
+    print(
+        f"ok: {len(JOBS)} blocking jobs reported as required on {event} "
+        f"({ref}, run_full_ci={run_full_ci}, run_gqt={run_gqt})"
+    )
     return 0
 
 

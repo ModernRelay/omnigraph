@@ -1,4 +1,5 @@
 pub mod catalogue;
+pub mod historical;
 pub mod schema_ir;
 pub mod schema_plan;
 pub mod schema_shape;
@@ -9,8 +10,12 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{CompilerError, Result};
-use crate::schema::ast::{Cardinality, Constraint, ConstraintBound, SchemaDecl, SchemaFile};
-use crate::types::{PropType, ScalarType};
+use crate::schema::analysis::{AnalyzerProfile, FullTextAnalysis, FullTextScorer};
+use crate::schema::ast::{
+    Cardinality, Constraint, ConstraintBound, PropDecl, SchemaDecl, SchemaFile,
+};
+use crate::schema::vector::VectorDistance;
+use crate::types::{IndexDeclaration, PropIndexKind, PropType, ScalarType};
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -32,6 +37,9 @@ pub struct Catalog {
     /// `node_types`, so schema apply, validation and stored identity never
     /// see them.
     pub catalogue: HashMap<String, NodeType>,
+    /// Set only on the catalog a read at an earlier commit plans against
+    /// ([`Catalog::at_commit`]): the commit and what it leaves out.
+    pub historical: Option<Arc<historical::HistoricalView>>,
 }
 
 impl Catalog {
@@ -77,29 +85,93 @@ pub struct NodeType {
     pub key: Option<Vec<String>>,
     /// Uniqueness constraints (each entry is a list of property names)
     pub unique_constraints: Vec<Vec<String>>,
-    /// Index declarations (each entry is a list of property names)
+    /// Index declarations (each entry is a list of property names); a `@key`
+    /// adds its columns here too
     pub indices: Vec<Vec<String>>,
+    /// The one-column index declaration of each property that carries one,
+    /// the strongest of its annotations ([`IndexDeclaration`]): what
+    /// [`Self::property_index_kinds`] builds for it.
+    pub index_declarations: HashMap<String, IndexDeclaration>,
     /// Value range constraints
     pub range_constraints: Vec<RangeConstraint>,
     /// Regex check constraints
     pub check_constraints: Vec<CheckConstraint>,
     /// Maps @embed target property -> its source text property + recorded model.
     pub embed_sources: HashMap<String, EmbedSource>,
+    /// The full-text analysis each property's `@index(fulltext, ...)` declares,
+    /// as written; a property declares a full-text index exactly when it is
+    /// here. A lexical field absent here takes `english_v1` and ranks with
+    /// `bm25_v1`.
+    pub full_text_analysis: HashMap<String, FullTextAnalysis>,
+    /// The analyzer fingerprint of each lexical field
+    /// ([`Self::is_lexical_field`]). Only a catalog built from accepted IR
+    /// carries them, since the fingerprint binds the property's stable
+    /// identity.
+    pub full_text_fingerprints: HashMap<String, String>,
+    /// The distance each vector property declares beyond `l2`; a vector
+    /// property absent here is `l2` ([`Self::vector_distance`]).
+    pub vector_distances: HashMap<String, VectorDistance>,
     pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
 }
 
 impl NodeType {
-    /// Whether `property` carries a declared full-text index: a one-column
-    /// `@index` or `@key` on a free-text String property
-    /// ([`PropType::index_kind`]). A composite declaration builds no
-    /// property index.
-    pub fn has_full_text_index(&self, property: &str) -> bool {
-        self.indices
-            .iter()
-            .any(|columns| matches!(columns.as_slice(), [column] if column == property))
-            && self.properties.get(property).and_then(PropType::index_kind)
-                == Some(crate::types::PropIndexKind::FullText)
+    /// The distance `property`'s vectors are scored, ranked and indexed by:
+    /// the declared one, `l2` when it declares none.
+    pub fn vector_distance(&self, property: &str) -> VectorDistance {
+        self.vector_distances
+            .get(property)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The profile a lexical read of `property` applies, and its full-text
+    /// index when one is built: the declared one, `english_v1` when it
+    /// declares none. `None` for a property that is not a lexical field.
+    pub fn full_text_profile(&self, property: &str) -> Option<AnalyzerProfile> {
+        self.is_lexical_field(property)
+            .then(|| FullTextAnalysis::resolved(self.full_text_analysis.get(property)).profile())
+    }
+
+    /// The scorer `property`'s full-text index declares: the default unless it
+    /// says otherwise.
+    pub fn full_text_scorer(&self, property: &str) -> FullTextScorer {
+        self.full_text_analysis
+            .get(property)
+            .map(|analysis| analysis.scorer)
+            .unwrap_or_default()
+    }
+
+    /// Whether `match_terms` and `bm25` read `property`: a free-text String
+    /// with a one-column `@key`, `@index` or `@index(fulltext, ...)`. The
+    /// exact lexical scan answers it whether or not a full-text index is
+    /// built ([`Self::builds_full_text_index`]). A composite declaration
+    /// builds no property index.
+    pub fn is_lexical_field(&self, property: &str) -> bool {
+        self.index_declarations.contains_key(property)
+            && self
+                .properties
+                .get(property)
+                .is_some_and(PropType::is_free_text_string)
+    }
+
+    /// Whether index maintenance builds a full-text index on `property`: it
+    /// declares `@index(fulltext, ...)` ([`PropType::index_kinds`]).
+    pub fn builds_full_text_index(&self, property: &str) -> bool {
+        self.property_index_kinds(property)
+            .contains(&PropIndexKind::FullText)
+    }
+
+    /// The indexes index maintenance builds for `property`'s one-column
+    /// declaration, empty when it carries none.
+    pub fn property_index_kinds(&self, property: &str) -> &'static [PropIndexKind] {
+        match (
+            self.index_declarations.get(property),
+            self.properties.get(property),
+        ) {
+            (Some(declaration), Some(prop_type)) => prop_type.index_kinds(*declaration),
+            _ => &[],
+        }
     }
 
     /// Backward-compatible accessor: returns the first (and typically only) key property name.
@@ -184,8 +256,25 @@ pub struct EdgeType {
     pub unique_constraints: Vec<Vec<String>>,
     /// Index declarations on edge properties
     pub indices: Vec<Vec<String>>,
+    /// The analyzer fingerprint of each property with a full-text index. An
+    /// edge property declares no analysis, so it takes `english_v1` and
+    /// `bm25_v1`. Only a catalog built from accepted IR carries them.
+    pub full_text_fingerprints: HashMap<String, String>,
+    /// The distance each vector property declares beyond `l2`.
+    pub vector_distances: HashMap<String, VectorDistance>,
     pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
+}
+
+impl EdgeType {
+    /// The distance `property`'s vectors are measured by: the declared one,
+    /// `l2` when it declares none.
+    pub fn vector_distance(&self, property: &str) -> VectorDistance {
+        self.vector_distances
+            .get(property)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 impl Catalog {
@@ -197,6 +286,75 @@ impl Catalog {
             return self.edge_types.get(key);
         }
         None
+    }
+
+    /// The members of the object `return { $k }` projects for an edge
+    /// binding of `type_name` (its selection's types joined by `|`), each
+    /// with the column of the binding's rows it reads: `@id`, `@src` and
+    /// `@dst`, then `@type` where the binding can match more than one edge
+    /// type, then the properties every selected type declares with one type,
+    /// except `Blob` and `Vector`, in the first type's declared order. `None`
+    /// names an unknown edge type.
+    pub fn edge_object_members(&self, type_name: &str) -> Option<Vec<(String, Field)>> {
+        let mut names: Vec<String> = Vec::new();
+        for name in type_name.split('|') {
+            let edge = self.lookup_edge_by_name(name)?;
+            if !names.contains(&edge.name) {
+                names.push(edge.name.clone());
+            }
+        }
+        let first = self.lookup_edge_by_name(names.first()?)?;
+        let columns = self.system_columns;
+        let mut members = vec![
+            (
+                "@id".to_string(),
+                Field::new(columns.id, DataType::Utf8, false),
+            ),
+            (
+                "@src".to_string(),
+                Field::new(columns.src, DataType::Utf8, false),
+            ),
+            (
+                "@dst".to_string(),
+                Field::new(columns.dst, DataType::Utf8, false),
+            ),
+        ];
+        if names.len() > 1 {
+            members.push((
+                crate::traversal::EDGE_TYPE_META.to_string(),
+                Field::new(crate::traversal::EDGE_TYPE_COLUMN, DataType::Utf8, false),
+            ));
+        }
+        for field in first.arrow_schema.fields() {
+            let name = field.name();
+            if !first.properties.contains_key(name) {
+                continue;
+            }
+            let Some(prop) = crate::traversal::common_edge_property(self, &names, name) else {
+                continue;
+            };
+            if matches!(prop.scalar, ScalarType::Blob | ScalarType::Vector(_)) {
+                continue;
+            }
+            members.push((
+                name.clone(),
+                Field::new(name, prop.to_arrow(), prop.nullable),
+            ));
+        }
+        Some(members)
+    }
+
+    /// The Arrow fields of [`Self::edge_object_members`]' object, each under
+    /// its member name.
+    pub fn edge_object_fields(&self, type_name: &str) -> Option<arrow_schema::Fields> {
+        Some(
+            self.edge_object_members(type_name)?
+                .into_iter()
+                .map(|(member, field)| {
+                    Field::new(member, field.data_type().clone(), field.is_nullable())
+                })
+                .collect(),
+        )
     }
 
     pub fn is_identity_bound(&self) -> bool {
@@ -352,6 +510,55 @@ fn normalize_edge_name(name: &str) -> String {
     name.to_lowercase()
 }
 
+/// The one-column index declaration of each property, the strongest of its
+/// annotations: a one-column `@key` alone, an explicit one-column `@index`
+/// (property-level or body-level) or `@index(fulltext, ...)`. A composite key
+/// or index declares no property index.
+fn one_column_index_declarations<'a>(
+    key: Option<&[String]>,
+    explicit_indices: &[Vec<String>],
+    full_text: impl IntoIterator<Item = &'a String>,
+) -> HashMap<String, IndexDeclaration> {
+    let mut declarations = HashMap::new();
+    if let Some([property]) = key {
+        declarations.insert(property.clone(), IndexDeclaration::Key);
+    }
+    for columns in explicit_indices {
+        if let [property] = columns.as_slice() {
+            declarations.insert(property.clone(), IndexDeclaration::Index);
+        }
+    }
+    for property in full_text {
+        declarations.insert(property.clone(), IndexDeclaration::FullText);
+    }
+    declarations
+}
+
+/// The distances `properties` declare beyond `l2`, by property name.
+fn declared_distances(properties: &[PropDecl]) -> HashMap<String, VectorDistance> {
+    properties
+        .iter()
+        .filter_map(|property| {
+            property
+                .distance
+                .and_then(VectorDistance::declared)
+                .map(|distance| (property.name.clone(), distance))
+        })
+        .collect()
+}
+
+/// The distances accepted `properties` record, by property name.
+fn ir_distances(properties: &[schema_ir::PropertyIR]) -> HashMap<String, VectorDistance> {
+    properties
+        .iter()
+        .filter_map(|property| {
+            property
+                .distance
+                .map(|distance| (property.name.clone(), distance))
+        })
+        .collect()
+}
+
 fn bound_to_literal(b: &ConstraintBound) -> LiteralValue {
     match b {
         ConstraintBound::Integer(n) => LiteralValue::Integer(*n),
@@ -423,6 +630,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             let mut key: Option<Vec<String>> = None;
             let mut unique_constraints = Vec::new();
             let mut indices = Vec::new();
+            let mut explicit_indices = Vec::new();
             let mut range_constraints = Vec::new();
             let mut check_constraints = Vec::new();
 
@@ -438,6 +646,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     }
                     Constraint::Index(cols) => {
                         indices.push(cols.clone());
+                        explicit_indices.push(cols.clone());
                     }
                     Constraint::Range { property, min, max } => {
                         range_constraints.push(RangeConstraint {
@@ -464,6 +673,19 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 ));
             }
             let arrow_schema = Arc::new(Schema::new(fields));
+            let full_text_analysis: HashMap<String, FullTextAnalysis> = node
+                .properties
+                .iter()
+                .filter_map(|prop| {
+                    crate::schema::analysis::declared_analysis(&prop.annotations)
+                        .map(|analysis| (prop.name.clone(), analysis))
+                })
+                .collect();
+            let index_declarations = one_column_index_declarations(
+                key.as_deref(),
+                &explicit_indices,
+                full_text_analysis.keys(),
+            );
 
             node_types.insert(
                 node.name.clone(),
@@ -474,9 +696,13 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     key,
                     unique_constraints,
                     indices,
+                    index_declarations,
                     range_constraints,
                     check_constraints,
                     embed_sources,
+                    full_text_analysis,
+                    full_text_fingerprints: HashMap::new(),
+                    vector_distances: declared_distances(&node.properties),
                     blob_properties,
                     arrow_schema,
                 },
@@ -565,6 +791,8 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     key,
                     unique_constraints,
                     indices: edge_indices,
+                    full_text_fingerprints: HashMap::new(),
+                    vector_distances: declared_distances(&edge.properties),
                     blob_properties,
                     arrow_schema: Arc::new(Schema::new(fields)),
                 },
@@ -580,6 +808,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
         system_columns,
         identity: CatalogIdentity::SourceUnbound,
         catalogue: catalogue::catalogue_node_types(system_columns),
+        historical: None,
     })
 }
 
@@ -639,6 +868,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
         let mut key = None;
         let mut unique_constraints = Vec::new();
         let mut indices = Vec::new();
+        let mut explicit_indices = Vec::new();
         let mut range_constraints = Vec::new();
         let mut check_constraints = Vec::new();
         for constraint in &node.constraints {
@@ -679,7 +909,10 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
             match schema_ir::physical_constraint_from_ir(constraint, system_columns) {
                 Constraint::Key(_) => unreachable!("@key handled in stable property-id order"),
                 Constraint::Unique(columns) => unique_constraints.push(columns),
-                Constraint::Index(columns) => indices.push(columns),
+                Constraint::Index(columns) => {
+                    explicit_indices.push(columns.clone());
+                    indices.push(columns);
+                }
                 Constraint::Range { property, min, max } => {
                     range_constraints.push(RangeConstraint {
                         property,
@@ -692,6 +925,30 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 }
             }
         }
+        let full_text_analysis: HashMap<String, FullTextAnalysis> = node
+            .properties
+            .iter()
+            .filter_map(|property| {
+                property
+                    .full_text
+                    .map(|analysis| (property.name.clone(), analysis))
+            })
+            .collect();
+        let index_declarations = one_column_index_declarations(
+            key.as_deref(),
+            &explicit_indices,
+            full_text_analysis.keys(),
+        );
+        // Every lexical field has a profile, so every one has a fingerprint.
+        let full_text_fingerprints: HashMap<String, String> = node
+            .properties
+            .iter()
+            .filter(|property| {
+                index_declarations.contains_key(&property.name)
+                    && property.prop_type.is_free_text_string()
+            })
+            .map(|property| (property.name.clone(), property.full_text_fingerprint()))
+            .collect();
         let mut fields = vec![Field::new(system_columns.id, DataType::Utf8, false)];
         fields.extend(node.properties.iter().map(|property| {
             Field::new(
@@ -713,9 +970,13 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 key,
                 unique_constraints,
                 indices,
+                index_declarations,
                 range_constraints,
                 check_constraints,
                 embed_sources,
+                full_text_analysis,
+                full_text_fingerprints,
+                vector_distances: ir_distances(&node.properties),
                 blob_properties,
                 arrow_schema: Arc::new(Schema::new(fields)),
             },
@@ -845,7 +1106,19 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 properties,
                 key,
                 unique_constraints,
+                full_text_fingerprints: edge
+                    .properties
+                    .iter()
+                    .filter(|property| {
+                        indices
+                            .iter()
+                            .any(|columns| matches!(columns.as_slice(), [c] if *c == property.name))
+                            && property.prop_type.is_free_text_string()
+                    })
+                    .map(|property| (property.name.clone(), property.full_text_fingerprint()))
+                    .collect(),
                 indices,
+                vector_distances: ir_distances(&edge.properties),
                 blob_properties,
                 arrow_schema: Arc::new(Schema::new(fields)),
             },
@@ -860,6 +1133,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
         system_columns,
         identity: CatalogIdentity::Bound(Arc::new(ir.clone())),
         catalogue: catalogue::catalogue_node_types(system_columns),
+        historical: None,
     })
 }
 

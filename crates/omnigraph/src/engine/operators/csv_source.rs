@@ -580,7 +580,7 @@ mod tests {
     use arrow_array::RecordBatch;
     use futures::StreamExt;
     use omnigraph_compiler::catalog::build_catalog;
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     use omnigraph_compiler::schema::parser::parse_schema;
 
     use super::super::fixtures;

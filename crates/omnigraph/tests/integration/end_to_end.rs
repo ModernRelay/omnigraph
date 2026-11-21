@@ -306,7 +306,7 @@ async fn append_adds_rows() {
     let batch2 = r#"{"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
 
     db.load_jsonl(batch1, LoadMode::Overwrite).await.unwrap();
-    db.load_jsonl(batch2, LoadMode::Append).await.unwrap();
+    db.load_jsonl(batch2, LoadMode::Insert).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Person").await.unwrap();
@@ -423,7 +423,7 @@ async fn query_treats_missing_nullable_param_as_null() {
     let db = init_and_load(&dir).await;
     let query = r#"
         query optional_name($name: String?) {
-            match { $p: Person { name: $name } }
+            match { $p: Person } where $p.name = $name
             return { $p.name }
         }
     "#;
@@ -620,10 +620,8 @@ edge WorksAt: Person -> Company
 "#;
     let queries = r#"
 query unemployed() {
-    match {
-        $p: Person
-        not { $p worksAt $_ }
-    }
+    match { $p: Person }
+    where not exists { $p worksAt $_ }
     return { $p.name }
 }
 "#;
@@ -960,7 +958,8 @@ async fn mutation_update_key_property_rejected() {
 
     let queries = r#"
 query rename_person($old_name: String, $new_name: String) {
-    update Person set { name: $new_name } where name = $old_name
+    match { $x: Person } where $x.name = $old_name
+    update $x set { name: $new_name }
 }
 "#;
 
@@ -974,7 +973,11 @@ query rename_person($old_name: String, $new_name: String) {
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("@key"), "error should mention @key: {}", err);
+    assert!(
+        err.contains("T93") && err.contains("a key property"),
+        "error should name the key property: {}",
+        err
+    );
 }
 
 // ─── Blob support ────────────────────────────────────────────────────────────
@@ -997,33 +1000,35 @@ query all_docs() {
 }
 
 query get_doc($title: String) {
-    match { $d: Document { title: $title } }
+    match { $d: Document } where $d.title = $title
     return { $d.title }
 }
 
 query get_doc_clause($title: String) {
-    match { $d: Document
-        $d.title = $title }
+    match { $d: Document }
+    where $d.title = $title
     return { $d.title }
 }
 "#;
 
 const BLOB_MUTATIONS: &str = r#"
 query insert_doc($title: String, $content: Blob) {
-    insert Document { title: $title, content: $content }
+    replace Document { title: $title, content: $content }
 }
 
 query update_doc_content($title: String, $content: Blob) {
-    update Document set { content: $content } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { content: $content }
 }
 
 query clear_doc_content($title: String, $content: Blob?) {
-    update Document set { content: $content } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { content: $content }
 }
 
 query insert_then_clear_doc_content($title: String, $content: Blob, $cleared: Blob?) {
-    insert Document { title: $title, content: $content }
-    update Document set { content: $cleared } where title = $title
+    replace Document { title: $title, content: $content }
+    replace Document { title: $title, content: $cleared }
 }
 "#;
 
@@ -1034,7 +1039,7 @@ fn null_blob_params(title: &str, names: &[&str]) -> ParamMap {
     for name in names {
         map.insert(
             name.to_string(),
-            omnigraph_compiler::query::ast::Literal::Null,
+            omnigraph_compiler::query::value::Literal::Null,
         );
     }
     map
@@ -1241,7 +1246,7 @@ async fn blob_read_returns_bytes() {
         }
     })
     .to_string();
-    db.load_jsonl(&metacharacter_row, LoadMode::Append)
+    db.load_jsonl(&metacharacter_row, LoadMode::Insert)
         .await
         .unwrap();
 
@@ -1260,7 +1265,7 @@ async fn blob_read_returns_bytes() {
         }
     })
     .to_string();
-    db.load_jsonl(&large_row, LoadMode::Append).await.unwrap();
+    db.load_jsonl(&large_row, LoadMode::Insert).await.unwrap();
 
     let readme_cell = node_blob_cell("Document", "readme", "content");
     let readme = db
@@ -1499,7 +1504,7 @@ async fn blob_read_returns_bytes() {
 
     db.load_jsonl(
         r#"{"type":"Document","data":{"title":"etag-bump"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -1798,7 +1803,7 @@ node Person {
 "#;
     let queries = r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1809,11 +1814,11 @@ query insert_person($name: String, $age: I32) {
         let mut p = omnigraph_compiler::ir::ParamMap::new();
         p.insert(
             "name".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("Old".to_string()),
+            omnigraph_compiler::query::value::Literal::String("Old".to_string()),
         );
         p.insert(
             "age".to_string(),
-            omnigraph_compiler::query::ast::Literal::Integer(300),
+            omnigraph_compiler::query::value::Literal::Integer(300),
         );
         p
     })
@@ -1834,7 +1839,8 @@ node Person {
 "#;
     let queries = r#"
 query set_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    match { $x: Person } where $x.name = $name
+    update $x set { age: $age }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1851,11 +1857,11 @@ query set_age($name: String, $age: I32) {
         let mut p = omnigraph_compiler::ir::ParamMap::new();
         p.insert(
             "name".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("Alice".to_string()),
+            omnigraph_compiler::query::value::Literal::String("Alice".to_string()),
         );
         p.insert(
             "age".to_string(),
-            omnigraph_compiler::query::ast::Literal::Integer(300),
+            omnigraph_compiler::query::value::Literal::Integer(300),
         );
         p
     })
@@ -1875,7 +1881,7 @@ node Order {
 "#;
     let queries = r#"
 query insert_order($code: String) {
-    insert Order { code: $code }
+    replace Order { code: $code }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1886,7 +1892,7 @@ query insert_order($code: String) {
         let mut p = omnigraph_compiler::ir::ParamMap::new();
         p.insert(
             "code".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+            omnigraph_compiler::query::value::Literal::String("invalid".to_string()),
         );
         p
     })
@@ -1907,7 +1913,8 @@ node Order {
 "#;
     let queries = r#"
 query set_label($code: String, $label: String) {
-    update Order set { label: $label } where code = $code
+    match { $x: Order } where $x.code = $code
+    update $x set { label: $label }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1924,11 +1931,11 @@ query set_label($code: String, $label: String) {
         let mut p = omnigraph_compiler::ir::ParamMap::new();
         p.insert(
             "code".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("ABC-123".to_string()),
+            omnigraph_compiler::query::value::Literal::String("ABC-123".to_string()),
         );
         p.insert(
             "label".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+            omnigraph_compiler::query::value::Literal::String("invalid".to_string()),
         );
         p
     })
@@ -2001,13 +2008,14 @@ node Article {
 "#;
     let mutations = r#"
 query insert_article($slug: String, $attachment: Blob, $summary: String, $rating: I32) {
-    insert Article { slug: $slug, attachment: $attachment, summary: $summary, rating: $rating }
+    replace Article { slug: $slug, attachment: $attachment, summary: $summary, rating: $rating }
 }
 query update_summary($slug: String, $summary: String) {
-    update Article set { summary: $summary } where slug = $slug
+    match { $x: Article } where $x.slug = $slug
+    update $x set { summary: $summary }
 }
 query get_article($slug: String) {
-    match { $a: Article { slug: $slug } }
+    match { $a: Article } where $a.slug = $slug
     return { $a.slug, $a.summary, $a.rating }
 }
 "#;
@@ -2131,7 +2139,7 @@ async fn blob_update_null_round_trip() {
     let mut insert_then_clear = null_blob_params("ok-computer", &["cleared"]);
     insert_then_clear.insert(
         "content".to_string(),
-        omnigraph_compiler::query::ast::Literal::String("base64:AQID".to_string()),
+        omnigraph_compiler::query::value::Literal::String("base64:AQID".to_string()),
     );
     let result = mutate_main(
         &db,
@@ -2465,7 +2473,7 @@ async fn assert_graph_root_refuses_overlapping_bases(
             "data": {"title": "seed", "content": "base64:AQID"},
         })
         .to_string(),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2552,7 +2560,7 @@ async fn assert_graph_root_refuses_overlapping_bases(
                 },
             })
             .to_string(),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap_err();
@@ -2573,13 +2581,16 @@ async fn assert_graph_root_refuses_overlapping_bases(
     );
     assert!(db.shares_runtime_owner(&denied));
     assert!(matches!(
-        denied.load_jsonl(&row, LoadMode::Merge).await.unwrap_err(),
+        denied
+            .load_jsonl(&row, LoadMode::Replace)
+            .await
+            .unwrap_err(),
         OmniError::ExternalBlobPolicy { .. }
     ));
     assert_eq!(graph_state(graph_uri).await, before);
     // The old admitted view keeps its allow-list; the replacement denies new
     // external ingestion without changing the old policy or graph ownership.
-    db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&row, LoadMode::Replace).await.unwrap();
 }
 
 // ─── Regression: blob load with external file URI ────────────────────────────
@@ -2742,7 +2753,7 @@ async fn blob_load_external_file_uri() {
     let probes = MergeWriteProbes::default();
     with_merge_write_probes(
         probes.clone(),
-        db.load_jsonl(&duplicate_source_rows, LoadMode::Append),
+        db.load_jsonl(&duplicate_source_rows, LoadMode::Insert),
     )
     .await
     .unwrap();
@@ -2838,7 +2849,8 @@ async fn update_edge_type_returns_error_not_panic() {
     // execute_update must not panic with HashMap key-not-found.
     let mutations = r#"
 query update_edge($from: String) {
-    update Knows set { since: "2025-01-01" } where from = $from
+    match { $x: Knows } where $x.@src = $from
+    update $x set { since: "2025-01-01" }
 }
 "#;
     let result = mutate_main(
@@ -2862,7 +2874,7 @@ async fn date_literal_with_quote_is_escaped() {
     // This tests that literal_to_sql escapes Date/DateTime values.
     let queries = r#"
 query filter_date($d: String) {
-    match { $p: Person { name: $d } }
+    match { $p: Person } where $p.name = $d
     return { $p.name }
 }
 "#;
@@ -2886,7 +2898,7 @@ async fn append_mode_manifest_row_count_is_total() {
     let db = init_and_load(&dir).await; // Overwrite: 4 persons
 
     let extra = r#"{"type": "Person", "data": {"name": "Eve", "age": 22}}"#;
-    db.load_jsonl(extra, LoadMode::Append).await.unwrap();
+    db.load_jsonl(extra, LoadMode::Insert).await.unwrap();
 
     let snap = snapshot_main(&db).await.unwrap();
     let entry = snap.dataset("node:Person").unwrap();
@@ -3039,10 +3051,8 @@ node Doc {
 
     let queries = r#"
 query docs_with_tag($tag: String) {
-    match {
-        $d: Doc
-        $d.tags contains $tag
-    }
+    match { $d: Doc }
+    where $tag in $d.tags
     return { $d.slug }
 }
 "#;

@@ -29,9 +29,9 @@ edge Knows: Person -> Person {
 
 --- query
 query nearest_projected($v: Vector(2)) {
-    match { $p: Person }
-    return { $p.name, nearest($p.embedding, $v) as score }
-    order { nearest($p.embedding, $v), nearest($p.embedding, $v) }
+    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $v, k: 2) as $distance }
+    return { $p.name, $distance as score }
+    order { $distance, $distance }
     limit 2
 }
 
@@ -48,9 +48,9 @@ score: F32
 
 --- query
 query nearest_projected_default_name($v: Vector(2)) {
-    match { $p: Person }
-    return { $p.name, nearest($p.embedding, $v) }
-    order { nearest($p.embedding, $v), nearest($p.embedding, $v) }
+    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $v, k: 1) as $distance }
+    return { $p.name, $distance as _distance }
+    order { $distance, $distance }
     limit 1
 }
 
@@ -58,17 +58,17 @@ query nearest_projected_default_name($v: Vector(2)) {
 {"v": [0.0, 1.0]}
 
 --- expect ordered
-{"p.name": "B", "p._distance": 0}
+{"p.name": "B", "_distance": 0}
 
 --- expect shape
 p.name: String
-p._distance: F32
+_distance: F32
 
 --- query
 query bm25_projected($q: String) {
-    match { $p: Person }
-    return { $p.name, bm25($p.bio, $q) }
-    order { bm25($p.bio, $q) desc, bm25($p.bio, $q) desc }
+    match { let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.bio, $q) as $score }
+    return { $p.name, $score as _score }
+    order { $score desc, $score desc }
     limit 3
 }
 
@@ -76,18 +76,18 @@ query bm25_projected($q: String) {
 {"q": "needle"}
 
 --- expect ordered
-{"p.name": "A", "p._score": 0.2292043}
-{"p.name": "B", "p._score": 0.21978495}
+{"_score":0.229204242827,"p.name":"A"}
+{"_score":0.219784890382,"p.name":"B"}
 
 --- expect shape
 p.name: String
-p._score: F32
+_score: F64
 
 --- query
 query nearest_projected_no_match($v: Vector(2)) {
-    match { $p: Person { name: "absent" } }
-    return { $p.name, nearest($p.embedding, $v) as score }
-    order { nearest($p.embedding, $v) }
+    match { let $pop = { match { $p: Person } where $p.name = "absent" return { $p } }, from nearest($pop, $p.embedding, $v, k: 2) as $distance }
+    return { $p.name, $distance as score }
+    order { $distance }
     limit 2
 }
 
@@ -102,9 +102,9 @@ score: F32
 
 --- query
 query bm25_projected_no_match($q: String) {
-    match { $p: Person { name: "absent" } }
-    return { $p.name, bm25($p.bio, $q) as score }
-    order { bm25($p.bio, $q) desc }
+    match { let $pop = { match { $p: Person } where $p.name = "absent" return { $p } }, from bm25($pop, $p.bio, $q) as $score }
+    return { $p.name, $score as score }
+    order { $score desc }
     limit 3
 }
 
@@ -115,7 +115,7 @@ query bm25_projected_no_match($q: String) {
 
 --- expect shape
 p.name: String
-score: F32
+score: F64
 
 --- query
 query nearest_projected_without_retrieval($v: Vector(2)) {
@@ -128,7 +128,7 @@ query nearest_projected_without_retrieval($v: Vector(2)) {
 --- params
 {"v": [1.0, 0.0]}
 
---- expect error: T33: `nearest` in `return` must repeat the retrieval stated as the leading `order` key
+--- expect error: T65: `nearest` is a relation function; a ranking is drawn with `from`, and its score is a column
 
 --- query
 query nearest_projected_other_query($v: Vector(2)) {
@@ -141,7 +141,7 @@ query nearest_projected_other_query($v: Vector(2)) {
 --- params
 {"v": [1.0, 0.0]}
 
---- expect error: T33: `nearest` in `return` must repeat the retrieval stated as the leading `order` key
+--- expect error: T65: `nearest` is a relation function; a ranking is drawn with `from`, and its score is a column
 
 --- query
 query nearest_projected_under_aggregate($v: Vector(2)) {
@@ -152,13 +152,13 @@ query nearest_projected_under_aggregate($v: Vector(2)) {
 --- params
 {"v": [1.0, 0.0]}
 
---- expect error: T32: `nearest` under `max` in `return`
+--- expect error: T65: `nearest` is a relation function; a ranking is drawn with `from`, and its score is a column
 
 --- query
 query rrf_projected($q: String, $v: Vector(2)) {
-    match { $p: Person }
-    return { $p.name, rrf(nearest($p.embedding, $v), bm25($p.bio, $q)) as fused }
-    order { rrf(nearest($p.embedding, $v), bm25($p.bio, $q)), rrf(nearest($p.embedding, $v), bm25($p.bio, $q)) }
+    match { let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.embedding, $v, k: 3), bm25($all, $p.bio, $q), k: 60) as $score, $p: Person }
+    return { $p.name, $score as fused }
+    order { $score desc, $score }
     limit 3
 }
 
@@ -176,13 +176,19 @@ fused: F64
 --- query
 query search_projected($q: String) {
     match { $p: Person }
-    return { $p.name, search($p.bio, $q) as hit }
+    return { $p.name, match_terms($p.bio, terms($q, mode: any)) as hit }
 }
 
 --- params
 {"q": "needle"}
 
---- expect error: T35: `search` cannot be projected in `return`
+--- expect unordered
+{"hit":true,"p.name":"A"}
+{"hit":true,"p.name":"B"}
+
+--- expect shape
+p.name: String
+hit: Bool
 
 --- query
 query alias_projected_again() {
@@ -191,16 +197,16 @@ query alias_projected_again() {
     limit 1
 }
 
---- expect error: T36: `s` cannot be projected in `return`
+--- expect error: Q018: `s` is a bare name, which is not a value in a read: a property is `$x.s`, a parameter `$s`, a string `"s"`; a bare name is a return alias in `order` only
 
 --- query
 query nearest_projected_through_traversal($v: Vector(2)) {
     match {
-        $p: Person
-        $p knows $f
+      let $pop = { match { $p: Person, $f: Person, $p knows $f } return { $p, $f } },
+      from nearest($pop, $p.embedding, $v, k: 3) as $distance,
     }
-    return { $f.name, nearest($p.embedding, $v) as score }
-    order { nearest($p.embedding, $v), $f.name }
+    return { $f.name, $distance as score }
+    order { $distance, $f.name }
     limit 3
 }
 
@@ -217,9 +223,9 @@ score: F32
 
 --- query
 query nearest_ordered_plain_projection($v: Vector(2)) {
-    match { $p: Person }
+    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $v, k: 2) as $distance }
     return { $p.name }
-    order { nearest($p.embedding, $v) }
+    order { $distance }
     limit 2
 }
 

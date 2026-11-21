@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::SYSTEM_COLUMNS_V3;
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
-use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
+use omnigraph_compiler::query::value::{AggFunc, CompOp, Literal};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
 use omnigraph_compiler::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 use omnigraph_planner::optimizer::resolve;
+use omnigraph_planner::read_shape::{PatternStep, ReadShape};
 use omnigraph_planner::{
     AccessPath, AdjacencyProof, Bounds, ExpandMode, ExpandPolicy, ExpandStatistics, FragmentStat,
     LogicalNode, LogicalPlan, MemorySource, NodeTypeSpec, Operation, PhysicalNode, PhysicalPlan,
@@ -86,15 +87,14 @@ fn node_type(type_name: &str, row_count: Option<u64>) -> NodeTypeSpec {
     }
 }
 
-fn scan(variable: &str) -> IROp {
+fn scan(variable: &str) -> PatternStep {
     scan_of(variable, "T")
 }
 
-fn scan_of(variable: &str, type_name: &str) -> IROp {
-    IROp::NodeScan {
+fn scan_of(variable: &str, type_name: &str) -> PatternStep {
+    PatternStep::NodeScan {
         variable: variable.to_string(),
         type_name: type_name.to_string(),
-        filters: vec![],
     }
 }
 
@@ -121,7 +121,7 @@ fn prop(variable: &str, property: &str) -> IRExpr {
     }
 }
 
-fn projection(expr: IRExpr, pipeline: &[IROp]) -> IRProjection {
+fn projection(expr: IRExpr, pipeline: &[PatternStep]) -> IRProjection {
     let ty = match &expr {
         IRExpr::Aggregate { signature, .. } => signature.result.clone(),
         IRExpr::Literal(Literal::String(_), _) => {
@@ -131,12 +131,12 @@ fn projection(expr: IRExpr, pipeline: &[IROp]) -> IRProjection {
             let name = pipeline
                 .iter()
                 .find_map(|op| match op {
-                    IROp::NodeScan {
+                    PatternStep::NodeScan {
                         variable: bound,
                         type_name,
                         ..
                     } if bound == variable => Some(type_name),
-                    IROp::Expand {
+                    PatternStep::Expand {
                         dst_var, dst_type, ..
                     } if dst_var == variable => Some(dst_type),
                     _ => None,
@@ -144,6 +144,7 @@ fn projection(expr: IRExpr, pipeline: &[IROp]) -> IRProjection {
                 .expect("fixture return variable is bound");
             ExprType::Node {
                 type_name: name.clone(),
+                nullable: false,
             }
         }
         IRExpr::PropAccess { property, .. } => property_type(property),
@@ -170,8 +171,19 @@ fn projection(expr: IRExpr, pipeline: &[IROp]) -> IRProjection {
     }
 }
 
-fn ir(pipeline: Vec<IROp>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -> Operation {
-    Operation::Query(Box::new(QueryIR {
+/// The explain node below a plan's root cut: its `Limit` (a physical
+/// `Page`) and the `Sort` the tie rule (or the query's `order`) puts under
+/// it.
+fn under_cut(json: &serde_json::Value) -> &serde_json::Value {
+    let mut node = json;
+    while matches!(node["node"].as_str(), Some("Limit" | "Page" | "Sort")) {
+        node = &node["inputs"][0];
+    }
+    node
+}
+
+fn ir(pipeline: Vec<PatternStep>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -> Operation {
+    Operation::Query(Box::new(ReadShape {
         name: "q".to_string(),
         params: vec![],
         return_exprs: returns
@@ -185,9 +197,14 @@ fn ir(pipeline: Vec<IROp>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -> Opera
             .map(|expr| IROrdering {
                 expr,
                 descending: false,
+                nulls_first: None,
             })
             .collect(),
         limit: Some(10),
+        limit_param: None,
+        written_columns: Vec::new(),
+        made_up: Default::default(),
+        work: Default::default(),
     }))
 }
 
@@ -225,8 +242,8 @@ fn object_columns() -> BTreeSet<String> {
     columns
 }
 
-fn expand(src: &str, dst: &str, dst_filters: Vec<IRExpr>) -> IROp {
-    IROp::Expand {
+fn expand(src: &str, dst: &str) -> PatternStep {
+    PatternStep::Expand {
         src_var: src.to_string(),
         dst_var: dst.to_string(),
         edges: EdgeSelection::Named(EdgeMember {
@@ -238,8 +255,15 @@ fn expand(src: &str, dst: &str, dst_filters: Vec<IRExpr>) -> IROp {
         min_hops: 1,
         max_hops: Some(1),
         edge_binding: None,
-        dst_filters,
     }
+}
+
+/// The `where` conjuncts `preds` as filter steps, in order.
+fn filters(preds: Vec<IRExpr>) -> Vec<PatternStep> {
+    preds
+        .into_iter()
+        .map(|pred| PatternStep::Filter { pred, fails: false })
+        .collect()
 }
 
 use crate::fixture_bounds;
@@ -310,7 +334,7 @@ fn access_paths(plan: &PhysicalPlan) -> (Vec<AccessPath>, serde_json::Value) {
         })
         .collect();
     let json = plan.to_json();
-    let destination = &json["inputs"][0]["inputs"][0];
+    let destination = &under_cut(&json)["inputs"][0];
     let access = if destination["node"] == "HashJoin" {
         assert_eq!(destination["fallback"], "id_lookup");
         serde_json::json!("hash_join")
@@ -340,3 +364,56 @@ mod logical;
 
 #[path = "../query_plan/edge_selections.rs"]
 mod edge_selections;
+
+/// The planner charges the read's plan budget as it plans
+/// (`omnigraph_compiler::budget`): one unit per shape step it resolves and
+/// per join order it explores, and the shape's size for each pass. A read
+/// planned past its budget is refused with `T70` by the charge that passes
+/// it, with at most twice the budget's planning done: a shape of more steps
+/// than the budget stops in resolution, a smaller one in the pass that
+/// passes it.
+#[test]
+fn a_plan_past_its_budget_stops_within_twice_the_budget() {
+    use omnigraph_compiler::budget::WorkRecord;
+    use omnigraph_compiler::query::value::BinaryOp;
+    use omnigraph_planner::{Unrouted, plan_query};
+    for budget in [256usize, 1024, 4096] {
+        for steps in [2 * budget, budget / 4] {
+            let mut pipeline = vec![scan("a")];
+            pipeline.extend((0..steps).map(|i| PatternStep::Filter {
+                pred: IRExpr::binary(
+                    prop("a", "slug"),
+                    BinaryOp::Compare(CompOp::Eq),
+                    IRExpr::Literal(Literal::String(i.to_string()), property_type("slug")),
+                ),
+                fails: false,
+            }));
+            let Operation::Query(mut query) = ir(pipeline, vec![prop("a", "slug")], vec![]) else {
+                unreachable!("a read")
+            };
+            query.work = WorkRecord::fresh(budget as u64);
+            let refused = futures::executor::block_on(plan_query(&query, &source(), &bounds()))
+                .expect_err("planned past its budget");
+            let Unrouted::UnsupportedQuery { diagnostic } = refused else {
+                panic!("{budget}/{steps}: {refused:?}");
+            };
+            assert_eq!(diagnostic.code.as_str(), "T70", "{}", diagnostic.message);
+            let message = &diagnostic.message;
+            let total: usize = message
+                .split(" work units at ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("no total in {message}"));
+            assert!(
+                (budget + 1..=2 * budget).contains(&total),
+                "{budget}/{steps}: {message}"
+            );
+            assert!(
+                message.contains(&format!("(planning {total})")),
+                "{message}"
+            );
+            assert!(message.contains("planning `q` grew the most"), "{message}");
+        }
+    }
+}

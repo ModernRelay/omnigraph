@@ -637,6 +637,25 @@ pub fn spawn_server_with_cluster(cluster_dir: &Path) -> TestServer {
     spawn_server_process(command)
 }
 
+/// Cluster boot with `RUST_MIN_STACK` removed from the server's environment,
+/// so its runtime threads get the stack the binary itself chooses rather
+/// than the test runner's, and with `envs` set.
+pub fn spawn_server_with_cluster_default_stack(
+    cluster_dir: &Path,
+    envs: &[(&str, &str)],
+) -> TestServer {
+    let mut command = server_process();
+    command
+        .arg("--cluster")
+        .arg(cluster_dir)
+        .arg("--unauthenticated")
+        .env_remove("RUST_MIN_STACK");
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    spawn_server_process(command)
+}
+
 /// Cluster boot with the server process's cwd set explicitly — used to prove
 /// rule 0 never touches the cwd omnigraph.yaml search.
 pub fn spawn_server_with_cluster_in(cluster_dir: &Path, cwd: &Path) -> TestServer {
@@ -1017,7 +1036,7 @@ node Person {
         root.join("people.gq"),
         r#"
 query find_person($name: String) {
-  match { $p: Person { name: $name } }
+  match { $p: Person } where $p.name = $name
   return { $p.name, $p.age }
 }
 "#,
@@ -1146,7 +1165,7 @@ node Service {
         root.join("services.gq"),
         r#"
 query find_service($name: String) {
-  match { $s: Service { name: $name } }
+  match { $s: Service } where $s.name = $name
   return { $s.name }
 }
 "#,
@@ -1329,7 +1348,7 @@ pub fn merge_managed_blob(graph: &Path, title: &str, bytes: &[u8]) {
             .await
             .unwrap();
         session_over(db)
-            .load_jsonl(&data, omnigraph::loader::LoadMode::Merge)
+            .load_jsonl(&data, omnigraph::loader::LoadMode::Replace)
             .await
             .unwrap();
     });

@@ -29,6 +29,8 @@ CASES = (
     "genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup",
     "genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history",
     "genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history",
+    "genuine_edition_2_storage_upgrade_names_every_one_way_schema_construct",
+    "genuine_edition_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor",
 )
 ENGINE_CASES = (
     "a_fresh_graph_is_already_current_and_nothing_is_written",
@@ -229,11 +231,13 @@ echo "OMNIGRAPH_LANCE11_BIN=$lance11_bin" >> "$GITHUB_ENV\""""
 RELEASE_TOKENS = (
     'echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"',
     'echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV"',
+    'echo "OMNIGRAPH_EDITION_2_RELEASE_BIN=$edition2_dir/omnigraph" >> "$GITHUB_ENV"',
 )
 RELEASE_SCRIPT = """\
 set -euo pipefail
 v6_dir="$RUNNER_TEMP/omnigraph-v010"
 v011_dir="$RUNNER_TEMP/omnigraph-v011"
+edition2_dir="$RUNNER_TEMP/omnigraph-edition-2"
 # The installer downloads the official archive and verifies its
 # SHA256 before extraction. An exact VERSION never falls back to edge.
 # A failed download leaves nothing behind, so each release gets three
@@ -255,8 +259,13 @@ install_release v0.11.0 "$v011_dir"
 test -x "$v011_dir/omnigraph"
 [[ "$("$v011_dir/omnigraph" --version)" == "omnigraph 0.11.0" ]] \\
   || { echo "::error::the release storage upgrade requires the genuine v0.11.0 CLI"; exit 1; }
+install_release edge-20261118-fd4d61f "$edition2_dir"
+test -x "$edition2_dir/omnigraph"
+[[ "$("$edition2_dir/omnigraph" --version)" == "omnigraph 0.15.1-edge+fd4d61f" ]] \\
+  || { echo "::error::the one-way journeys require the published edition-2 CLI"; exit 1; }
 echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
-echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV\""""
+echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV"
+echo "OMNIGRAPH_EDITION_2_RELEASE_BIN=$edition2_dir/omnigraph" >> "$GITHUB_ENV\""""
 
 
 def scope_script(scope: str) -> str:
@@ -316,7 +325,7 @@ def validate(workflow: str, table: dict | None = None) -> list[str]:
     if LANCE11_SCRIPT not in scripts:
         failures.append("storage compatibility requires the exact genuine Lance 11 build script")
     if RELEASE_SCRIPT not in scripts:
-        failures.append("storage compatibility requires the exact released v0.10.0 and v0.11.0 install script")
+        failures.append("storage compatibility requires the exact released v0.10.0, v0.11.0 and edition-2 install script")
     for scope in SCOPES:
         if scope_script(scope) not in scripts:
             failures.append(f"storage compatibility requires the exact fail-closed {scope} command and log check")
@@ -525,7 +534,7 @@ class GuardTests(unittest.TestCase):
                 self.assertIn(f"storage compatibility is missing {token!r}", failures)
 
     def test_removed_or_altered_release_install_line_fails(self):
-        exact = ["storage compatibility requires the exact released v0.10.0 and v0.11.0 install script"]
+        exact = ["storage compatibility requires the exact released v0.10.0, v0.11.0 and edition-2 install script"]
         job = self.storage_job()
         lines = RELEASE_SCRIPT.splitlines()
         block = "".join(f"          {line}\n" for line in lines)

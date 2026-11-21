@@ -125,6 +125,164 @@ async fn mutation_does_not_create_run_branch() {
     );
 }
 
+/// A write group whose selection is a traversal runs it against the write's
+/// snapshot: when it selects no row the write stages nothing and publishes no
+/// commit, and when it selects rows it publishes exactly one.
+#[tokio::test]
+async fn traversal_selection_publishes_once_or_not_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    let query = "query age_friends($name: String) { \
+                 match { $p: Person, $p knows $f } where $p.name = $name \
+                 update $f set { age: 1 } }";
+    let head = head_commit_id(uri).await;
+
+    let none = db
+        .mutate_with_receipt(
+            "main",
+            query,
+            "age_friends",
+            &params(&[("$name", "Nobody")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (none.result.affected_nodes, none.result.affected_edges),
+        (0, 0)
+    );
+    assert!(
+        none.commit.is_none(),
+        "an empty selection publishes nothing"
+    );
+    assert_eq!(head_commit_id(uri).await, head);
+
+    let some = db
+        .mutate_with_receipt("main", query, "age_friends", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(some.result.affected_nodes, 2, "Alice knows Bob and Charlie");
+    let commit = some.commit.expect("an effectful selection publishes once");
+    assert_eq!(commit.parent_commit_id.as_deref(), Some(head.as_str()));
+    assert_eq!(head_commit_id(uri).await, commit.graph_commit_id);
+}
+
+/// An update that changes no stored value stages nothing, so a write of
+/// only such updates publishes no commit, while it still reports the entities
+/// it selected. Equality is the fixed value order: a null equals a null and
+/// `-0.0` differs from `0.0`. Covered: the sole update's column patch, an
+/// update whose value reads the row, two updates of one selection (the
+/// pending-union path), an edge update, and a selection where only some rows
+/// change, which stages and publishes just those.
+#[tokio::test]
+async fn an_update_that_changes_no_stored_value_publishes_nothing() {
+    use base64::Engine as _;
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    n: I64?
+    x: F64?
+    tags: [String]?
+    emb: Vector(3)?
+    note: String?
+    file: Blob?
+}
+edge Cites: Doc -> Doc { w: I64? }
+"#;
+    const WRITES: &str = r#"
+query same_scalars() {
+    match { $d: Doc } where $d.slug = "d1"
+    update $d set { n: 1, x: 0.0, tags: ["a"], emb: [1.0, 2.0, 3.0], note: null }
+}
+query copy_n() {
+    match { $d: Doc } where $d.slug = "d1"
+    update $d set { n: $d.n }
+}
+query two_statements() {
+    match { $d: Doc } where $d.slug = "d1"
+    update $d set { n: 1 }
+    update $d set { note: null }
+}
+query same_weight() {
+    match { $a: Doc, $a $k:cites $b }
+    update $k set { w: 5 }
+}
+query negative_zero() {
+    match { $d: Doc } where $d.slug = "d1"
+    update $d set { x: -0.0 }
+}
+query every_n_one() {
+    match { $d: Doc }
+    update $d set { n: 1 }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+    let file = format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(vec![7_u8; 64])
+    );
+    let data = [
+        serde_json::json!({"type": "Doc", "data": {"slug": "d1", "n": 1, "x": 0.0,
+            "tags": ["a"], "emb": [1.0, 2.0, 3.0], "file": file}}),
+        serde_json::json!({"type": "Doc", "data": {"slug": "d2", "n": 2}}),
+        serde_json::json!({"edge": "Cites", "from": "d1", "to": "d2", "data": {"w": 5}}),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    db.load_jsonl(&data, LoadMode::Overwrite).await.unwrap();
+
+    for (name, nodes, edges) in [
+        ("same_scalars", 1, 0),
+        ("copy_n", 1, 0),
+        ("two_statements", 2, 0),
+        ("same_weight", 0, 1),
+    ] {
+        let head = head_commit_id(uri).await;
+        let receipt = db
+            .mutate_with_receipt("main", WRITES, name, &params(&[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            (receipt.result.affected_nodes, receipt.result.affected_edges),
+            (nodes, edges),
+            "{name} reports the entities it selected"
+        );
+        assert!(
+            receipt.commit.is_none(),
+            "{name} changes no stored value and publishes nothing"
+        );
+        assert_eq!(head_commit_id(uri).await, head, "{name} moved the head");
+    }
+
+    // `-0.0` is a different stored value from `0.0`.
+    let head = head_commit_id(uri).await;
+    let receipt = db
+        .mutate_with_receipt("main", WRITES, "negative_zero", &params(&[]))
+        .await
+        .unwrap();
+    let commit = receipt.commit.expect("-0.0 over 0.0 changes the value");
+    assert_eq!(commit.parent_commit_id.as_deref(), Some(head.as_str()));
+
+    // Only d2 changes: the write publishes once and reports both selected.
+    let head = head_commit_id(uri).await;
+    let receipt = db
+        .mutate_with_receipt("main", WRITES, "every_n_one", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(receipt.result.affected_nodes, 2);
+    let commit = receipt.commit.expect("d2's n changes");
+    assert_eq!(commit.parent_commit_id.as_deref(), Some(head.as_str()));
+    let again = db
+        .mutate_with_receipt("main", WRITES, "every_n_one", &params(&[]))
+        .await
+        .unwrap();
+    assert!(again.commit.is_none(), "a repeat of it changes nothing");
+}
+
 /// A failed mutation (validation error mid-query) leaves the target branch's
 /// observable state unchanged. There is nothing for cleanup to delete.
 #[tokio::test]
@@ -599,7 +757,7 @@ async fn repeated_loads_do_not_accumulate_branches() {
             r#"{{"type":"Person","data":{{"name":"p{}","age":{}}}}}"#,
             i, i
         );
-        db.load_jsonl(&payload, LoadMode::Append).await.unwrap();
+        db.load_jsonl(&payload, LoadMode::Insert).await.unwrap();
     }
 
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
@@ -623,53 +781,68 @@ async fn public_branch_apis_accept_former_system_names() {
 /// their scope local to the staged-write coverage.
 const STAGED_QUERIES: &str = r#"
 query insert_two_persons($a_name: String, $a_age: I32, $b_name: String, $b_age: I32) {
-    insert Person { name: $a_name, age: $a_age }
-    insert Person { name: $b_name, age: $b_age }
+    replace Person { name: $a_name, age: $a_age }
+    replace Person { name: $b_name, age: $b_age }
 }
 
 query insert_then_update_same_person(
     $name: String, $insert_age: I32, $update_age: I32
 ) {
-    insert Person { name: $name, age: $insert_age }
-    update Person set { age: $update_age } where name = $name
+    replace Person { name: $name, age: $insert_age }
+    replace Person { name: $name, age: $update_age }
 }
 
 query insert_two_friends($from: String, $a: String, $b: String) {
-    insert Knows { from: $from, to: $a }
-    insert Knows { from: $from, to: $b }
+    insert Knows { @src: $from, @dst: $a }
+    insert Knows { @src: $from, @dst: $b }
 }
 
 query person_with_two_friends($name: String, $age: I32, $a: String, $b: String) {
-    insert Person { name: $name, age: $age }
-    insert Knows { from: $name, to: $a }
-    insert Knows { from: $name, to: $b }
+    replace Person { name: $name, age: $age }
+    insert Knows { @src: $name, @dst: $a }
+    insert Knows { @src: $name, @dst: $b }
 }
 
 query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
-    insert Person { name: $name, age: $age }
-    delete Person where name = $victim
+    match { $x: Person } where $x.name = $victim
+    replace Person { name: $name, age: $age }
+    delete $x
 }
 
 query update_then_filter_by_old_value(
     $first_name: String, $first_new_age: I32,
-    $second_threshold: I32, $second_new_age: I32
+    $second_threshold: I32, $second_new_age: I32, $third_new_age: I32
 ) {
-    update Person set { age: $first_new_age } where name = $first_name
-    update Person set { age: $second_new_age } where age > $second_threshold
+    match { $x: Person } where $x.name = $first_name
+    update $x set { age: $first_new_age }
+    match { $x: Person } where $x.age > $second_threshold
+    update $x set { age: $second_new_age }
+    match { $x: Person } where $x.age > $second_threshold
+    update $x set { age: $third_new_age }
+}
+
+query update_three_times_in_one_group(
+    $name: String, $first_age: I32, $second_age: I32, $third_age: I32
+) {
+    match { $x: Person } where $x.name = $name
+    update $x set { age: $first_age }
+    update $x set { age: $second_age }
+    update $x set { age: $third_age }
 }
 
 query delete_two_persons($first: String, $second: String) {
-    delete Person where name = $first
-    delete Person where name = $second
+    match { $x: Person } where $x.name = $first or $x.name = $second
+    delete $x
 }
 
 query delete_overlapping_persons($name: String, $threshold: I32) {
-    delete Person where name = $name
-    delete Person where age > $threshold
+    match { $x: Person } where $x.name = $name or $x.age > $threshold
+    delete $x
 }
 
 query update_age_by_name($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    match { $x: Person } where $x.name = $name
+    update $x set { age: $age }
 }
 "#;
 
@@ -677,7 +850,9 @@ fn bulk_insert_mutation(rows: usize) -> String {
     let mut query = String::with_capacity(rows * 48);
     query.push_str("query bulk_insert() {\n");
     for row in 0..rows {
-        query.push_str(&format!("    insert Thing {{ key: \"mutation-{row}\" }}\n"));
+        query.push_str(&format!(
+            "    replace Thing {{ key: \"mutation-{row}\" }}\n"
+        ));
     }
     query.push_str("}\n");
     query
@@ -844,8 +1019,8 @@ async fn keyed_bytes_summed_across_tables_refuse_mutation_and_every_load_door_be
         db.mutate(
             "main",
             r#"query wide($payload: String) {
-                insert Thing { key: "one", payload: $payload }
-                insert Other { key: "two", payload: $payload }
+                replace Thing { key: "one", payload: $payload }
+                replace Other { key: "two", payload: $payload }
             }"#,
             "wide",
             &params(&[("$payload", &payload)]),
@@ -868,7 +1043,7 @@ async fn keyed_bytes_summed_across_tables_refuse_mutation_and_every_load_door_be
         serde_json::json!({"type":"Other","data":{"key":"two","payload":payload}}),
     );
     drop(payload);
-    for mode in [LoadMode::Append, LoadMode::Merge] {
+    for mode in [LoadMode::Insert, LoadMode::Replace] {
         for strict in [false, true] {
             let outcome = if strict {
                 with_stage_write_probes(probes.clone(), db.load_graph_batch("main", &input, mode))
@@ -910,8 +1085,8 @@ async fn keyed_bytes_summed_across_tables_refuse_mutation_and_every_load_door_be
         .mutate(
             "main",
             r#"query small() {
-            insert Thing { key: "one", payload: "fits" }
-            insert Other { key: "two", payload: "fits" }
+            replace Thing { key: "one", payload: "fits" }
+            replace Other { key: "two", payload: "fits" }
         }"#,
             "small",
             &params(&[]),
@@ -969,12 +1144,12 @@ edge LinkZ: Zed -> Zed { n: I32? }
             let error = if strict {
                 with_stage_write_probes(
                     probes.clone(),
-                    db.load_graph_batch("main", input, LoadMode::Append),
+                    db.load_graph_batch("main", input, LoadMode::Insert),
                 )
                 .await
                 .err()
             } else {
-                with_stage_write_probes(probes.clone(), db.load_jsonl(input, LoadMode::Append))
+                with_stage_write_probes(probes.clone(), db.load_jsonl(input, LoadMode::Insert))
                     .await
                     .err()
             };
@@ -1030,9 +1205,9 @@ async fn write_max_bytes_checks_inline_and_repeated_external_payloads_before_rea
     let read_probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let source = r#"set write_max_bytes = 8191;
         query mixed($uri: String, $inline: Blob) {
-            insert Document { title: "one", content: $uri }
-            insert Document { title: "two", content: $uri }
-            insert Image { title: "three", content: $inline }
+            replace Document { title: "one", content: $uri }
+            replace Document { title: "two", content: $uri }
+            replace Image { title: "three", content: $inline }
         }"#;
     use base64::Engine as _;
     let inline = format!(
@@ -1105,7 +1280,7 @@ async fn write_max_bytes_checks_inline_and_repeated_external_payloads_before_rea
 #[tokio::test(start_paused = true)]
 async fn load_csv_source_read_is_bounded_by_the_deadline() {
     use omnigraph::loader::{CSV_SOURCE_READ_DEADLINE, CsvLoadRequest, LoadMode};
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     const SCHEMA: &str = "node Person { id: I64 @key name: String }";
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("people.csv");
@@ -1133,7 +1308,7 @@ async fn load_csv_source_read_is_bounded_by_the_deadline() {
     let request = CsvLoadRequest {
         source: source.clone(),
         target: LoadTarget::Node("Person".to_string()),
-        mode: LoadMode::Append,
+        mode: LoadMode::Insert,
         delimiter: b',',
         header: true,
         columns: None,
@@ -1183,7 +1358,7 @@ async fn load_csv_source_read_is_bounded_by_the_deadline() {
 async fn load_csv_refuses_a_source_replaced_between_probe_and_read() {
     use omnigraph::instrumentation::{ExternalPayloadReadHold, with_external_payload_read_held};
     use omnigraph::loader::{CsvLoadRequest, LoadMode};
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     const SCHEMA: &str = "node Person { id: I64 @key name: String }";
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("people.csv");
@@ -1263,7 +1438,7 @@ async fn load_csv_refuses_a_source_replaced_between_probe_and_read() {
 async fn explain_load_answers_the_plan_without_reading_the_source() {
     use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
     use omnigraph::settings::{SettingId, SettingValue, Source};
-    use omnigraph_compiler::query::ast::{FileBody, LoadStmt};
+    use omnigraph_compiler::query::file::{FileBody, LoadStmt};
     use omnigraph_compiler::query::parser::parse_query;
     const SCHEMA: &str = "node Person { id: I64 @key name: String }";
     let dir = tempfile::tempdir().unwrap();
@@ -1353,7 +1528,7 @@ async fn explain_load_answers_the_plan_without_reading_the_source() {
     );
 
     let (result, _) = db
-        .explain_load("main", &parse_explain("append"))
+        .explain_load("main", &parse_explain("insert"))
         .await
         .unwrap();
     assert_eq!(route(&result.to_rust_json().unwrap()), "executor");
@@ -1394,7 +1569,7 @@ async fn explain_load_answers_the_plan_without_reading_the_source() {
 async fn load_csv_statement_probes_and_reads_its_source_once() {
     use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
     use omnigraph::loader::{CsvLoadRequest, LoadMode};
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     const SCHEMA: &str = "node Person { id: I64 @key name: String }";
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("people.csv");
@@ -1419,8 +1594,8 @@ async fn load_csv_statement_probes_and_reads_its_source_once() {
     );
 
     for (mode, expected_rows, payload_reads) in [
-        (LoadMode::Append, 2, 1),
-        (LoadMode::Merge, 2, 1),
+        (LoadMode::Insert, 2, 1),
+        (LoadMode::Replace, 2, 1),
         (LoadMode::Overwrite, 2, 2),
     ] {
         let request = CsvLoadRequest {
@@ -1461,7 +1636,7 @@ async fn load_csv_statement_probes_and_reads_its_source_once() {
 #[tokio::test]
 async fn load_csv_overwrite_admits_compact_keys_under_default_memory() {
     use omnigraph::loader::CsvLoadRequest;
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     use std::io::Write;
 
     const ROWS: usize = 400_000;
@@ -1525,7 +1700,7 @@ async fn load_csv_overwrite_admits_compact_keys_under_default_memory() {
 async fn load_csv_overwrite_from_many_slices_keeps_source_order() {
     use omnigraph::instrumentation::with_csv_slice_bytes;
     use omnigraph::loader::CsvLoadRequest;
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     use std::io::Write;
 
     const ROWS: usize = 2_000;
@@ -1622,7 +1797,7 @@ async fn load_csv_overwrite_from_many_slices_keeps_source_order() {
 async fn load_csv_overwrite_refuses_a_first_record_longer_than_the_head_range() {
     use omnigraph::instrumentation::with_csv_slice_bytes;
     use omnigraph::loader::CsvLoadRequest;
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
 
     const HEAD_RANGE: usize = 64 * 1024;
     let source_dir = tempfile::tempdir().unwrap();
@@ -1684,7 +1859,8 @@ async fn mutation_update_row_cap_accepts_limit_and_rejects_one_over_pre_effect()
     const SCHEMA: &str = "node Thing { key: String @key marked: Bool? }\n";
     const UPDATE_ALL: &str = r#"
 query update_all() {
-    update Thing set { marked: true } where key != ""
+    match { $x: Thing } where $x.key != ""
+    update $x set { marked: true }
 }
 "#;
 
@@ -1763,8 +1939,8 @@ query update_all() {
 }
 
 /// Blob descriptors do not represent their payload allocation. An update that
-/// carries a Blob (here, beside a second statement on the type, it rewrites
-/// whole rows) must consult `BlobFile::size()` against its remaining byte
+/// carries a Blob (here, beside a second statement on the type, an insert
+/// whose selection matches nothing, it rewrites whole rows) must consult `BlobFile::size()` against its remaining byte
 /// budget before calling `BlobFile::read`; the scoped payload-read probe makes
 /// this a structural assertion rather than inferring it from the eventual
 /// error. Alone, the same update patches `note` (issue #1264): it keeps the
@@ -1778,15 +1954,21 @@ node Document {
     content: Blob?
     note: String?
 }
+node Marker {
+    name: String @key
+}
 "#;
     const UPDATE: &str = r#"
 query update_note($note: String) {
-    update Document set { note: $note } where title = "wide"
-    update Document set { note: $note } where title = "nobody"
+    match { $x: Document } where $x.title = "wide"
+    update $x set { note: $note }
+    match { $m: Marker } where $m.name = "nobody"
+    replace Document { title: "never" }
 }
 
 query patch_note($note: String) {
-    update Document set { note: $note } where title = "wide"
+    match { $x: Document } where $x.title = "wide"
+    update $x set { note: $note }
 }
 "#;
 
@@ -1918,7 +2100,8 @@ query patch_note($note: String) {
 
     const REPLACE: &str = r#"
 query replace_content($c: Blob) {
-    update Document set { content: $c } where title = "wide"
+    match { $x: Document } where $x.title = "wide"
+    update $x set { content: $c }
 }
 "#;
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
@@ -1952,7 +2135,7 @@ query replace_content($c: Blob) {
 }
 
 /// A predicate update that rewrites whole rows (here beside a second
-/// statement on the type) carries many rows' Blob cells: it reads the managed
+/// statement on the type, an insert whose selection matches nothing) carries many rows' Blob cells: it reads the managed
 /// ones in one batched read and the external one through its admitted object,
 /// and rewrites each exactly; the null stays null and the external becomes
 /// managed. The same update alone patches `note` (issue #1264) and reads no
@@ -1968,15 +2151,21 @@ node Document {
     content: Blob?
     note: String?
 }
+node Marker {
+    name: String @key
+}
 "#;
     const UPDATE: &str = r#"
 query update_shelf($note: String) {
-    update Document set { note: $note } where shelf = "a"
-    update Document set { note: $note } where title = "nobody"
+    match { $x: Document } where $x.shelf = "a"
+    update $x set { note: $note }
+    match { $m: Marker } where $m.name = "nobody"
+    replace Document { title: "never", shelf: "never" }
 }
 
 query patch_shelf($note: String) {
-    update Document set { note: $note } where shelf = "a"
+    match { $x: Document } where $x.shelf = "a"
+    update $x set { note: $note }
 }
 "#;
 
@@ -2354,6 +2543,296 @@ async fn blob_put_carries_siblings_by_value_and_never_reads_its_target() {
     );
 }
 
+/// An assignment that reads a Blob from its group's row copies the cell the
+/// row selects, read at the write's snapshot: a managed cell's bytes, an
+/// external reference's object (materialized as managed bytes by the keyed
+/// write, under the graph's external Blob policy), and a null cell as null,
+/// in `update`, `insert`, `upsert` and `replace`. A write over several rows
+/// reads each source column's chosen cells in one batched read, and only the
+/// cells a row chooses; their bytes are charged to `write_max_bytes` before
+/// any is read; two rows giving one entity two different Blobs are `E4`.
+/// Each write publishes once. A ranged source is the next test's.
+#[tokio::test]
+async fn blob_read_from_a_row_copies_the_cell_its_row_selects() {
+    use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+edge Feeds: Document -> Document {
+    content: Blob?
+}
+"#;
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("sources");
+    std::fs::create_dir(&source_dir).unwrap();
+    let object = source_dir.join("object.bin");
+    std::fs::write(&object, b"external object").unwrap();
+    let object_uri = url::Url::from_file_path(&object).unwrap().to_string();
+    let allow = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(&source_dir).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_path = root.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(allow)
+            .unwrap(),
+    );
+    let node = |title: &str, content: Option<&str>| {
+        serde_json::json!({"type": "Document", "data": {"title": title, "content": content}})
+            .to_string()
+    };
+    let edge = |from: &str, to: &str| {
+        serde_json::json!({"edge": "Feeds", "from": from, "to": to, "data": {}}).to_string()
+    };
+    let rows = [
+        node("managed", Some("base64:bWFuYWdlZA==")),
+        node("external", Some(&object_uri)),
+        node("empty", None),
+        node("s1", Some("base64:b25l")),
+        node("s2", Some("base64:dHdv")),
+        node("s3", Some("base64:dGhyZWU=")),
+        node("t1", Some("base64:b2xk")),
+        node("t2", Some("base64:b2xk")),
+        node("t3", Some("base64:b2xk")),
+        node("target", Some("base64:b2xk")),
+        edge("s1", "t1"),
+        edge("s2", "t2"),
+        edge("s3", "t3"),
+    ]
+    .join("\n");
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+    let cell = |title: &str| node_blob_cell("Document", title, "content");
+    let version = || async { snapshot_main(&db).await.unwrap().graph_manifest_version() };
+    let copy = |source: &str, statement: &str| {
+        format!(
+            "query copy() {{ match {{ $s: Document }} where $s.title = \"{source}\" {statement} }}"
+        )
+    };
+
+    // Several rows: one batched read of the source column, one payload per
+    // chosen cell, one publication.
+    let before = version().await;
+    let probes = MergeWriteProbes::default();
+    let result = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            "query fan() { match { $s: Document, $s feeds $t } update $t set { content: $s.content } }",
+            "fan",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 3);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 1);
+    assert_eq!(probes.blob_payload_read_calls(), 3);
+    assert_eq!(version().await, before + 1);
+    for (target, bytes) in [("t1", &b"one"[..]), ("t2", b"two"), ("t3", b"three")] {
+        assert_eq!(
+            read_managed_blob_bytes(&db, "main", cell(target)).await,
+            bytes
+        );
+    }
+
+    // A managed cell, in each statement.
+    for (statement, title) in [
+        (
+            "match { $t: Document } where $t.title = \"target\" update $t set { content: $s.content }",
+            "target",
+        ),
+        (
+            "insert Document { title: \"inserted\", content: $s.content }",
+            "inserted",
+        ),
+        (
+            "upsert Document { title: \"upserted\", content: $s.content }",
+            "upserted",
+        ),
+        (
+            "replace Document { title: \"replaced\", content: $s.content }",
+            "replaced",
+        ),
+    ] {
+        let source = if statement.starts_with("match") {
+            "query copy() { match { $s: Document, $t: Document } where $s.title = \"managed\" and $t.title = \"target\" update $t set { content: $s.content } }".to_string()
+        } else {
+            copy("managed", statement)
+        };
+        mutate_main(&db, &source, "copy", &params(&[]))
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+        assert_eq!(
+            read_managed_blob_bytes(&db, "main", cell(title)).await,
+            b"managed",
+            "{statement}"
+        );
+    }
+
+    // An external reference: the keyed write materializes its object.
+    mutate_main(
+        &db,
+        &copy(
+            "external",
+            "replace Document { title: \"from-external\", content: $s.content }",
+        ),
+        "copy",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_managed_blob_bytes(&db, "main", cell("from-external")).await,
+        b"external object"
+    );
+
+    // A null cell writes null; `coalesce` passes over it, reading only the
+    // cell it chooses.
+    let probes = MergeWriteProbes::default();
+    with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            "query copy() { match { $e: Document, $m: Document, $t: Document } where $e.title = \"empty\" and $m.title = \"managed\" and $t.title = \"t1\" update $t set { content: coalesce($e.content, $m.content) } }",
+            "copy",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(probes.blob_payload_read_calls(), 1);
+    assert_eq!(
+        read_managed_blob_bytes(&db, "main", cell("t1")).await,
+        b"managed"
+    );
+    mutate_main(
+        &db,
+        "query copy() { match { $s: Document, $t: Document } where $s.title = \"empty\" and $t.title = \"t1\" update $t set { content: $s.content } }",
+        "copy",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    let cleared = db
+        .read_blob_at(ReadTarget::branch("main"), cell("t1"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&cleared, OmniError::Manifest(error) if error.kind == omnigraph::error::ManifestErrorKind::NotFound),
+        "{cleared:?}"
+    );
+
+    // The chosen bytes are charged before any is read.
+    let before = version().await;
+    let probes = MergeWriteProbes::default();
+    let refused = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            "set write_max_bytes = 10;\nquery fan() { match { $s: Document, $s feeds $t } update $t set { content: $s.content } }",
+            "fan",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            OmniError::ResourceLimitExceeded {
+                limit: 10,
+                actual: 11,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(version().await, before);
+
+    // Two different Blobs for one entity are `E4`, and nothing publishes.
+    let two = mutate_main(
+        &db,
+        "query two() { match { $s: Document, $t: Document } where $t.title = \"target\" and ($s.title = \"s1\" or $s.title = \"s2\") update $t set { content: $s.content } }",
+        "two",
+        &params(&[]),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        two.contains("E4") && two.contains("two different Blob values for `content`"),
+        "{two}"
+    );
+    assert_eq!(version().await, before);
+}
+
+/// A Blob read from a row whose cell holds a ranged external reference is
+/// refused, without naming its URI and before anything publishes: its
+/// whole-object spelling would widen it. No public write path creates one,
+/// so the fixture writes it raw.
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+async fn blob_read_from_a_row_refuses_a_ranged_external_source() {
+    let copy = |source: &str, statement: &str| {
+        format!(
+            "query copy() {{ match {{ $s: Document }} where $s.title = \"{source}\" {statement} }}"
+        )
+    };
+    let ranged_dir = tempfile::tempdir().unwrap();
+    let ranged_uri = ranged_dir.path().to_str().unwrap();
+    let ranged_db = Omnigraph::init(
+        ranged_uri,
+        "node Document {\n    title: String @key\n    content: Blob?\n}\n",
+    )
+    .await
+    .unwrap();
+    helpers::seed_ranged_external_blob_row(&ranged_db, ranged_uri).await;
+    let ranged_db = helpers::session(ranged_db);
+    let before = snapshot_main(&ranged_db)
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    let refused = mutate_main(
+        &ranged_db,
+        &copy(
+            "ranged",
+            "replace Document { title: \"copy\", content: $s.content }",
+        ),
+        "copy",
+        &params(&[]),
+    )
+    .await
+    .unwrap_err();
+    let message = refused.to_string();
+    assert!(
+        matches!(&refused, OmniError::Manifest(error) if error.kind == omnigraph::error::ManifestErrorKind::BadRequest),
+        "{refused:?}"
+    );
+    assert!(
+        message.contains("ranged external Blob descriptor (offset 4, length 8)"),
+        "{message}"
+    );
+    assert!(!message.contains("s3://"), "{message}");
+    assert_eq!(
+        snapshot_main(&ranged_db)
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        before
+    );
+}
+
 /// Under a denying policy a put or clear that must carry a stored external
 /// reference fails with `StoredExternalBlobDenied` naming that sibling, on a
 /// node and on an edge, without effect. A row holding two such cells is
@@ -2375,7 +2854,8 @@ edge Attachment: Document -> Document {
 "#;
     const CLEAR_BOTH: &str = r#"
 query clear_both($content: Blob?, $preview: Blob?) {
-    update Document set { content: $content, preview: $preview } where title = "by-update"
+    match { $x: Document } where $x.title = "by-update"
+    update $x set { content: $content, preview: $preview }
 }
 "#;
 
@@ -2471,7 +2951,7 @@ query clear_both($content: Blob?, $preview: Blob?) {
             "from": "by-load", "to": "by-update",
             "data": {"payload": "base64:bmV3", "thumb": null}}),
     );
-    db.load_jsonl(&whole_rows, LoadMode::Merge)
+    db.load_jsonl(&whole_rows, LoadMode::Replace)
         .await
         .expect("a merge load of the whole row never reads the stored cells");
     for cell in [node("content"), edge("payload")] {
@@ -2484,7 +2964,7 @@ query clear_both($content: Blob?, $preview: Blob?) {
     for name in ["content", "preview"] {
         nulls.insert(
             name.to_string(),
-            omnigraph_compiler::query::ast::Literal::Null,
+            omnigraph_compiler::query::value::Literal::Null,
         );
     }
     db.mutate("main", CLEAR_BOTH, "clear_both", &nulls)
@@ -2506,19 +2986,26 @@ node Document {
     content: Blob?
     note: String?
 }
+node Marker {
+    name: String @key
+}
 "#;
     const MUTATIONS: &str = r#"
 query update_note($note: String) {
-    update Document set { note: $note } where title = "doc"
+    match { $x: Document } where $x.title = "doc"
+    update $x set { note: $note }
 }
 
 query update_note_beside_another($note: String) {
-    update Document set { note: $note } where title = "doc"
-    update Document set { note: $note } where title = "nobody"
+    match { $x: Document } where $x.title = "doc"
+    update $x set { note: $note }
+    match { $m: Marker } where $m.name = "nobody"
+    replace Document { title: "never" }
 }
 
 query set_content($c: Blob?) {
-    update Document set { content: $c } where title = "doc"
+    match { $x: Document } where $x.title = "doc"
+    update $x set { content: $c }
 }
 "#;
 
@@ -2669,7 +3156,7 @@ query set_content($c: Blob?) {
     let mut null_params = omnigraph_compiler::ir::ParamMap::new();
     null_params.insert(
         "c".to_string(),
-        omnigraph_compiler::query::ast::Literal::Null,
+        omnigraph_compiler::query::value::Literal::Null,
     );
     let result = db
         .mutate("main", MUTATIONS, "set_content", &null_params)
@@ -2717,20 +3204,13 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
         )
         .await
         .expect_err("D₂ must reject mixed insert+delete");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected Manifest error, got {err:?}");
-    };
     assert!(
-        manifest_err.message.contains("inserts/updates and deletes"),
-        "unexpected error message: {}",
-        manifest_err.message,
+        err.to_string().contains("T76"),
+        "the type checker refuses the mixed write: {err}"
     );
     assert!(
-        manifest_err
-            .message
-            .contains("split into separate mutations"),
-        "error message should direct user to split: {}",
-        manifest_err.message,
+        err.to_string().contains("split it into separate mutations"),
+        "error message should direct user to split: {err}"
     );
 
     // No I/O — counts unchanged, branches unchanged.
@@ -2742,13 +3222,10 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
-/// Overlapping delete predicates within one query must NOT double-count
-/// `affected_*`. Deletes stage (they no longer inline-commit), so both
-/// statements scan the same unchanged committed snapshot; counting each
-/// predicate independently over-reports when they overlap. The contract —
-/// matching the old inline path, where each delete committed before the next
-/// ran — is the DISTINCT count of rows removed (= what the combined
-/// `(p1) OR (p2)` staged delete actually removes).
+/// Overlapping delete predicates must NOT double-count `affected_*`: the
+/// contract is the DISTINCT count of rows removed. Two delete groups on one
+/// type are refused (`T91`), so the predicates are one group's disjunction
+/// `(p1) OR (p2)`, and its node and cascaded edge counts are distinct.
 ///
 /// Fixture: Alice(30), Bob(25), Charlie(35), Diana(28); Knows Alice→Bob,
 /// Alice→Charlie, Bob→Diana; WorksAt Alice→Acme, Bob→Globex. `name = "Alice"`
@@ -2805,8 +3282,10 @@ async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_stag
     const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\nedge WorksAt: Person -> Company\n";
     const TABLES: [&str; 2] = ["node:Person", "node:Company"];
     const CLEAR: &str = r#"query clear() {
-        delete Person where name != ""
-        delete Company where name != ""
+        match { $x: Person } where $x.name != ""
+        delete $x
+        match { $x: Company } where $x.name != ""
+        delete $x
     }"#;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2879,7 +3358,7 @@ async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_stag
         probes.clone(),
         db.load_jsonl(
             "{\"type\":\"Person\",\"data\":{\"name\":\"small\"}}",
-            LoadMode::Append,
+            LoadMode::Insert,
         ),
     )
     .await
@@ -2897,7 +3376,7 @@ async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_stag
     let removed = db
         .mutate(
             "main",
-            r#"query one() { delete Person where name = "small" }"#,
+            r#"query one() { match { $x: Person } where $x.name = "small"  delete $x }"#,
             "one",
             &params(&[]),
         )
@@ -2944,7 +3423,7 @@ edge Right: Hub -> Leaf
     let error = db
         .mutate(
             "main",
-            r#"query drop_hub() { delete Hub where name = "hub" }"#,
+            r#"query drop_hub() { match { $x: Hub } where $x.name = "hub"  delete $x }"#,
             "drop_hub",
             &params(&[]),
         )
@@ -2976,7 +3455,7 @@ edge Right: Hub -> Leaf
     let accepted = db
         .mutate(
             "main",
-            r#"query add() { insert Leaf { name: "after" } }"#,
+            r#"query add() { replace Leaf { name: "after" } }"#,
             "add",
             &params(&[]),
         )
@@ -2986,17 +3465,13 @@ edge Right: Hub -> Leaf
     assert_eq!(count_rows(&db, "node:Leaf").await, 2);
 }
 
-/// The overlap-exclusion filter must use SQL `IS NOT TRUE`, not `NOT`: a prior
-/// delete predicate referencing a nullable column must NOT drop a later
-/// statement's matching row just because that column is NULL (SQL UNKNOWN).
-/// With `NOT (age > 30)`, a row with NULL `age` makes the clause UNKNOWN and the
-/// row is filtered out of `deleted_ids` — skipping its cascade (orphaned edges),
-/// or, if it is the only match, leaving the node undeleted. This is a data bug,
-/// not just a miscount.
+/// A delete disjunct over a nullable column must not drop a row another
+/// disjunct matches just because that column is NULL (SQL UNKNOWN): the row
+/// must be deleted and its edges cascaded, never orphaned.
 ///
 /// Data: Charlie (age 35), Zoe (age NULL); Knows Zoe→Charlie. The query deletes
-/// `age > 30` (Charlie) then `name = "Zoe"`. Zoe must still be deleted and her
-/// edge cascaded despite the prior `age > 30` evaluating to UNKNOWN for her.
+/// `age > 30 or name = "Zoe"`. Zoe must still be deleted and her edge cascaded
+/// despite `age > 30` evaluating to UNKNOWN for her.
 #[tokio::test]
 async fn delete_dedup_filter_does_not_drop_null_column_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -3016,8 +3491,8 @@ edge Knows: Person -> Person
 
     let q = r#"
 query del_age_then_name($threshold: I32, $name: String) {
-    delete Person where age > $threshold
-    delete Person where name = $name
+    match { $x: Person } where $x.age > $threshold or $x.name = $name
+    delete $x
 }
 "#;
     let r = db
@@ -3044,10 +3519,9 @@ query del_age_then_name($threshold: I32, $name: String) {
     assert_eq!(r.affected_edges, 1, "Zoe→Charlie, counted once");
 }
 
-/// `insert Person 'X'; update Person where name='X' set age=...` — both
-/// ops produce content on `node:Person` and coalesce into one
-/// `stage_keyed_write` at end-of-query. The accumulator's last-write-wins
-/// dedupe (during `prepare_pending_table`) ensures the update's value
+/// Two keyed inserts of one person in one write both produce content on
+/// `node:Person` and coalesce into one `stage_keyed_write` at end-of-query.
+/// The pending image keeps the later version, so the second upsert's value
 /// wins. Single Lance commit per table per query.
 #[tokio::test]
 async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
@@ -3068,7 +3542,7 @@ async fn mixed_insert_and_update_on_same_person_coalesces_to_one_merge() {
         )
         .await
         .unwrap();
-    assert_eq!(result.affected_nodes, 2, "1 insert + 1 update reported");
+    assert_eq!(result.affected_nodes, 2, "two upserts reported");
 
     // The end-state row carries the update value (last-write-wins via
     // end-of-query dedupe), proving the staged merge_insert ran with the
@@ -3240,7 +3714,7 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
 {"edge": "Knows", "from": "Mallory", "to": "Ghost"}
 "#;
     let err = db
-        .load_jsonl(bad, LoadMode::Append)
+        .load_jsonl(bad, LoadMode::Insert)
         .await
         .expect_err("RI violation must fail the load");
     let OmniError::Manifest(manifest_err) = err else {
@@ -3266,7 +3740,7 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
 
     // Second load against the same tables — succeeds (no HEAD drift).
     let good = r#"{"type": "Person", "data": {"name": "Pat", "age": 55}}"#;
-    db.load_jsonl(good, LoadMode::Append).await.unwrap();
+    db.load_jsonl(good, LoadMode::Insert).await.unwrap();
     assert_eq!(
         count_rows(&db, "node:Person").await,
         pre_persons + 1,
@@ -3355,7 +3829,7 @@ edge WorksAt: Person -> Company @card(0..1)
 {"edge": "WorksAt", "from": "Alice", "to": "Bigco"}
 "#;
     let err = db
-        .load_jsonl(bad, LoadMode::Append)
+        .load_jsonl(bad, LoadMode::Insert)
         .await
         .expect_err("cardinality violation must fail the load");
     let OmniError::Manifest(manifest_err) = err else {
@@ -3372,7 +3846,7 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(mid_works, pre_works);
 
     let good = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}"#;
-    db.load_jsonl(good, LoadMode::Append).await.unwrap();
+    db.load_jsonl(good, LoadMode::Insert).await.unwrap();
     assert_eq!(
         count_rows(&db, "edge:WorksAt").await,
         pre_works + 1,
@@ -3429,51 +3903,64 @@ edge WorksAt: Person -> Company @card(0..1)
 
 // ─── Chained-mutation correctness — pinned coverage ─────────────────────────
 
-/// Chained `update` ops in one query must respect each previous op's
-/// view of the rows. Without merge-shadow semantics on
-/// `scan_with_pending`, the second update sees the stale committed value
-/// (the first update's row still appears in the Lance scan because the
-/// pending side hasn't committed), the predicate matches it, and the
-/// end-of-query dedupe-last-wins step ends up applying the second update
-/// to a row whose pending value should have shielded it.
-///
-/// Concretely: Alice starts at age=30 in TEST_DATA. Op-1 sets Alice to
-/// age=99. Op-2 updates anyone with age > 50 to age=10. After op-1,
-/// Alice's logical value is age=99 — within op-2's predicate. So op-2
-/// SHOULD update Alice to age=10. The interesting case is: op-2 must
-/// see Alice at age=99 (op-1's pending value), not age=30 (committed).
-/// If the helper unioned without shadowing, op-2 would also match the
-/// stale committed Alice (age=30 doesn't trigger the predicate, but the
-/// row would appear twice and dedupe could pick either). The test
-/// asserts both ends: Alice ends at age=10, the publisher publishes
-/// once.
+/// Repeated `update`s of one row in one write (#925). Every group of a
+/// write selects on its one snapshot, so the issue's chain of groups, a
+/// later one re-selecting the rows an earlier one updated, is refused at
+/// type check (`T91`) and publishes nothing. Several statements over one
+/// group's selection each see the version the statement before wrote: the
+/// write's pending rows hold one current version per id, so three updates
+/// of Alice stage three successive versions, end at the last, count three
+/// and publish once, where the pending table that kept every version
+/// matched Alice twice in the third statement.
 #[tokio::test]
-async fn chained_updates_with_overlapping_predicate_respects_intermediate_value() {
+async fn chained_updates_with_overlapping_predicate_respects_intermediate_value_issue_925() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
 
     let pre_version = version_main(&db).await.unwrap();
 
-    db.mutate(
-        "main",
-        STAGED_QUERIES,
-        "update_then_filter_by_old_value",
-        &mixed_params(
-            &[("$first_name", "Alice")],
-            &[
-                ("$first_new_age", 99),
-                ("$second_threshold", 50),
-                ("$second_new_age", 10),
-            ],
-        ),
-    )
-    .await
-    .unwrap();
+    let refused = db
+        .mutate(
+            "main",
+            STAGED_QUERIES,
+            "update_then_filter_by_old_value",
+            &mixed_params(
+                &[("$first_name", "Alice")],
+                &[
+                    ("$first_new_age", 99),
+                    ("$second_threshold", 50),
+                    ("$second_new_age", 10),
+                    ("$third_new_age", 77),
+                ],
+            ),
+        )
+        .await
+        .expect_err("a later group re-selecting the type an earlier group changed");
+    assert!(refused.to_string().contains("T91"), "{refused}");
+    assert_eq!(
+        version_main(&db).await.unwrap(),
+        pre_version,
+        "a refusal publishes nothing"
+    );
 
-    // After op-1: Alice = 99. After op-2 (where age > 50): Alice
-    // matches (99 > 50) → set to 10. End state: Alice = 10.
+    let result = db
+        .mutate(
+            "main",
+            STAGED_QUERIES,
+            "update_three_times_in_one_group",
+            &mixed_params(
+                &[("$name", "Alice")],
+                &[("$first_age", 99), ("$second_age", 10), ("$third_age", 77)],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.affected_nodes, 3,
+        "each statement updates Alice once"
+    );
     let batches = read_table(&db, "node:Person").await;
-    let mut alice_age: Option<i32> = None;
+    let mut alice_ages = Vec::new();
     for batch in &batches {
         let names = batch
             .column_by_name("name")
@@ -3489,14 +3976,14 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
             .unwrap();
         for i in 0..batch.num_rows() {
             if names.is_valid(i) && names.value(i) == "Alice" && ages.is_valid(i) {
-                alice_age = Some(ages.value(i));
+                alice_ages.push(ages.value(i));
             }
         }
     }
     assert_eq!(
-        alice_age,
-        Some(10),
-        "chained-update final value must reflect the second update applied to op-1's pending value"
+        alice_ages,
+        vec![77],
+        "one Alice, at the last statement's value"
     );
 
     // One manifest version bump: the graph commit rides the same publish CAS
@@ -3509,14 +3996,10 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
     );
 }
 
-/// Two `delete` ops on the same node table in one query. Pre-fix,
-/// op-2's `open_table_for_mutation` went through
-/// `open_for_mutation_on_branch` which trips `ensure_expected_version`
-/// (Lance HEAD has advanced past the manifest's pinned version after
-/// op-1's inline-commit, but the manifest hasn't moved). Post-fix,
-/// `open_table_for_mutation` reopens via `inline_committed[table_key]`
-/// at the post-delete Lance version. Test asserts both deletes succeed
-/// in one query, both rows are gone, manifest version advances by 1.
+/// One `delete` of two rows on one node table: both rows are gone and the
+/// manifest version advances by 1. Two delete groups on one type are
+/// refused (`T91`, every group selects on the write's one snapshot), so the
+/// two names are one group's disjunction.
 #[tokio::test]
 async fn multi_statement_delete_on_same_node_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -3564,53 +4047,41 @@ async fn multi_statement_delete_on_same_node_table() {
     }
 }
 
-/// Cascade-then-explicit variant: deleting a node cascades to its
-/// edges, advancing Lance HEAD on the edge table. A subsequent
-/// `delete <Edge>` op in the same query must reopen at the
-/// post-cascade-commit version of the edge table — not trip
-/// `ensure_expected_version` against the manifest's pinned version.
+/// Deleting a node cascades to its edges, so a later group selecting that
+/// edge type would read it on the write's snapshot, before the cascade:
+/// it is refused at type check (`T91`) and nothing is deleted.
 #[tokio::test]
 async fn cascade_delete_node_then_explicit_delete_edge_on_same_table() {
     const QUERY: &str = r#"
 query cascade_then_explicit($name: String, $other: String) {
-    delete Person where name = $name
-    delete Knows where from = $other
+    match { $x: Person } where $x.name = $name
+    delete $x
+    match { $x: Knows } where $x.@src = $other
+    delete $x
 }
 "#;
 
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
-
-    // TEST_DATA seeds three Knows edges:
-    //   Alice → Bob, Alice → Charlie (cascade target — should be deleted by op-1)
-    //   Bob → Diana                  (explicit target — should be deleted by op-2)
-    // After both ops, all three edges must be gone. A weaker assertion
-    // (just "count decreased") would pass even if op-2 silently no-op'd
-    // — Bob→Diana would survive. The exact-count check makes both ops
-    // independently observable.
     let pre_knows = count_rows(&db, "edge:Knows").await;
     assert_eq!(
         pre_knows, 3,
         "fixture invariant: TEST_DATA seeds 3 Knows edges"
     );
+    let pre_version = version_main(&db).await.unwrap();
 
-    db.mutate(
-        "main",
-        QUERY,
-        "cascade_then_explicit",
-        &params(&[("$name", "Alice"), ("$other", "Bob")]),
-    )
-    .await
-    .expect("cascade-then-explicit-delete on same edge table must succeed");
-
-    // Both ops landed: cascade removed Alice→Bob and Alice→Charlie;
-    // explicit removed Bob→Diana. Anything > 0 means one op silently
-    // did nothing (the bug we're guarding against).
-    let post_knows = count_rows(&db, "edge:Knows").await;
-    assert_eq!(
-        post_knows, 0,
-        "both cascade + explicit delete must complete (Bob→Diana would survive if op-2 no-op'd)",
-    );
+    let error = db
+        .mutate(
+            "main",
+            QUERY,
+            "cascade_then_explicit",
+            &params(&[("$name", "Alice"), ("$other", "Bob")]),
+        )
+        .await
+        .expect_err("a group selecting the edge type an earlier group's cascade changes");
+    assert!(error.to_string().contains("T91"), "{error}");
+    assert_eq!(count_rows(&db, "edge:Knows").await, pre_knows);
+    assert_eq!(version_main(&db).await.unwrap(), pre_version);
 }
 
 /// A node delete's cascade reads the edge table through
@@ -3622,8 +4093,7 @@ query cascade_then_explicit($name: String, $other: String) {
 /// appended since are matched. Either way: an edge whose
 /// deleted endpoint sits in the last chunk is found, an edge with both
 /// endpoints deleted (first chunk as `src`, last chunk as `dst`) is counted
-/// once, and a later `delete <Edge>` statement that selects that edge again
-/// skips it by its recorded row address.
+/// once.
 /// The scale symptom, peak RSS, is guarded by the `heavy-repro:` tests in
 /// `integration/repro_issue_1442.rs`.
 #[tokio::test]
@@ -3633,9 +4103,9 @@ node Doc { slug: String @key }
 edge Link: Doc -> Doc
 ";
     const QUERY: &str = r#"
-query drop_docs($first: String) {
-    delete Doc where slug != "keep"
-    delete Link where from = $first
+query drop_docs() {
+    match { $d: Doc } where $d.slug != "keep"
+    delete $d
 }
 "#;
     let removed = 2 * 8_192 + 5;
@@ -3662,7 +4132,7 @@ query drop_docs($first: String) {
             serde_json::json!({"edge":"Link","from":from,"to":to}).to_string()
         };
         for (from, to) in [("keep", last.as_str()), (first.as_str(), last.as_str())] {
-            db.load_jsonl(&append(from, to), LoadMode::Append)
+            db.load_jsonl(&append(from, to), LoadMode::Insert)
                 .await
                 .unwrap();
         }
@@ -3670,25 +4140,20 @@ query drop_docs($first: String) {
             db.ensure_indices_as(None).await.unwrap();
         }
         for (from, to) in [("keep", middle.as_str()), ("keep", "keep")] {
-            db.load_jsonl(&append(from, to), LoadMode::Append)
+            db.load_jsonl(&append(from, to), LoadMode::Insert)
                 .await
                 .unwrap();
         }
 
         let result = db
-            .mutate(
-                "main",
-                QUERY,
-                "drop_docs",
-                &params(&[("$first", first.as_str())]),
-            )
+            .mutate("main", QUERY, "drop_docs", &params(&[]))
             .await
             .expect("a cascade over several removed-id chunks must succeed");
         assert_eq!(result.affected_nodes, removed, "indexed: {indexed}");
         assert_eq!(
             result.affected_edges, 3,
-            "keep->{last}, {first}->{last} and keep->{middle} are cascaded once each; \
-             the explicit delete adds nothing (indexed: {indexed})"
+            "keep->{last}, {first}->{last} and keep->{middle} are cascaded once each \
+             (indexed: {indexed})"
         );
         assert_eq!(count_rows(&db, "node:Doc").await, 1);
         assert_eq!(
@@ -3719,8 +4184,8 @@ edge Knows: Person -> Person @card(2..)
 "#;
     const MIN_CARD_QUERY: &str = r#"
 query add_person($name: String, $friend: String) {
-    insert Person { name: $name }
-    insert Knows { from: $name, to: $friend }
+    replace Person { name: $name }
+    insert Knows { @src: $name, @dst: $friend }
 }
 "#;
 
@@ -3760,7 +4225,7 @@ query add_person($name: String, $friend: String) {
     );
 }
 
-/// `LoadMode::Merge` on edges must NOT double-count the committed
+/// `LoadMode::Replace` on edges must NOT double-count the committed
 /// edge AND its updated pending replacement. Build a custom
 /// schema where WorksAt has @card(0..1). Seed Alice with one WorksAt to
 /// Acme. Then Merge-load the SAME edge id (so it's an update, not an
@@ -3796,7 +4261,7 @@ edge WorksAt: Person -> Company @card(0..1)
     // would trip @card(0..1). With merge dedupe, Alice has 1 WorksAt.
     let merge_data = r#"{"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Bigco", "data": {}}
 "#;
-    db.load_jsonl(merge_data, LoadMode::Merge)
+    db.load_jsonl(merge_data, LoadMode::Replace)
         .await
         .expect("Merge update must dedupe the committed edge by id");
 
@@ -3844,7 +4309,7 @@ edge WorksAt: Person -> Company @card(0..1)
     let dup_data = r#"{"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Acme", "data": {}}
 {"edge": "WorksAt", "id": "w1", "from": "Alice", "to": "Bigco", "data": {}}
 "#;
-    db.load_jsonl(dup_data, LoadMode::Merge)
+    db.load_jsonl(dup_data, LoadMode::Replace)
         .await
         .expect("Merge load with within-input dup ids must dedupe pending count");
 
@@ -3853,11 +4318,13 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
 
-/// A blob-table insert followed by a non-blob update must remain one
-/// full-schema merge stream. The update reads the just-inserted pending row,
-/// copies its logical blob column through, and replaces the pending row under
-/// the existing last-write-wins shadow semantics. This used to produce a
-/// partial update batch and fail schema validation at the second op.
+/// A Blob-assigning update followed by a non-Blob update of the same row in
+/// one group must remain one full-schema merge stream. The second update reads
+/// the pending row the first wrote, copies its logical Blob column through,
+/// and replaces the pending row under the last-write-wins shadow semantics.
+/// This used to produce a partial update batch and fail schema validation at
+/// the second op. (A later group cannot re-select a row an earlier group
+/// wrote: every group selects on the write's one snapshot, `T91`.)
 #[tokio::test]
 async fn blob_table_insert_then_non_blob_update_preserves_full_schema() {
     use omnigraph::loader::LoadMode;
@@ -3870,18 +4337,19 @@ node Document {
 }
 "#;
     const BLOB_QUERIES: &str = r#"
-query insert_then_update_note(
+query assign_blob_then_update_note(
     $title: String, $blob: String, $note: String
 ) {
-    insert Document { title: $title, content: $blob }
-    update Document set { note: $note } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { content: $blob }
+    update $x set { note: $note }
 }
 
-query insert_then_replace_blob(
+query upsert_then_replace_blob(
     $title: String, $first: String, $second: String
 ) {
-    insert Document { title: $title, content: $first }
-    update Document set { content: $second } where title = $title
+    replace Document { title: $title, content: $first }
+    replace Document { title: $title, content: $second }
 }
 "#;
 
@@ -3910,11 +4378,12 @@ query insert_then_replace_blob(
             .unwrap(),
     );
 
-    // Keep one committed blob row as well as the just-inserted pending row so
+    // Keep one committed blob row beside the row the two updates rewrite so
     // the table has the real blob-v2 physical representation while this query
     // exercises the pending union.
     db.load_jsonl(
-        r#"{"type":"Document","data":{"title":"seed","content":"base64:AQID"}}"#,
+        r#"{"type":"Document","data":{"title":"seed","content":"base64:AQID"}}
+{"type":"Document","data":{"title":"letter"}}"#,
         LoadMode::Overwrite,
     )
     .await
@@ -3924,7 +4393,7 @@ query insert_then_replace_blob(
         .mutate(
             "main",
             BLOB_QUERIES,
-            "insert_then_update_note",
+            "assign_blob_then_update_note",
             &params(&[
                 ("$title", "letter"),
                 ("$blob", "base64:BAUG"),
@@ -3932,10 +4401,10 @@ query insert_then_replace_blob(
             ]),
         )
         .await
-        .expect("blob-table insert + non-blob update must share a full-schema merge batch");
+        .expect("a Blob update + non-blob update must share a full-schema merge batch");
     assert_eq!(
         result.affected_nodes, 2,
-        "one insert plus one pending-row update"
+        "one Blob update plus one pending-row update"
     );
 
     let blob = read_managed_blob_bytes(
@@ -3950,7 +4419,7 @@ query insert_then_replace_blob(
         .query(
             ReadTarget::branch("main"),
             r#"query get_doc($title: String) {
-                match { $d: Document { title: $title } }
+                match { $d: Document } where $d.title = $title
                 return { $d.title, $d.note }
             }"#,
             "get_doc",
@@ -3966,7 +4435,7 @@ query insert_then_replace_blob(
 
     // Mutation coalescing is last-write-wins before URI admission. The first
     // pending value is deliberately outside the allow base; because the
-    // update replaces it in the same query, it must cause no policy check,
+    // second upsert replaces it in the same query, it must cause no policy check,
     // HEAD, or payload read. Only the surviving URI is copied.
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
     let result = omnigraph::instrumentation::with_merge_write_probes(
@@ -3974,7 +4443,7 @@ query insert_then_replace_blob(
         db.mutate(
             "main",
             BLOB_QUERIES,
-            "insert_then_replace_blob",
+            "upsert_then_replace_blob",
             &params(&[
                 ("$title", "last-wins"),
                 (
@@ -4001,8 +4470,9 @@ query insert_then_replace_blob(
 }
 
 /// Two Blob properties interleaved with scalars: an update assigns one Blob and
-/// carries the other, on a committed row and on a row the same mutation
-/// inserted. Carried bytes and scalars keep their values on both rows.
+/// carries the other, on the committed rows and, in a second statement of the
+/// same group, on the pending rows the first statement wrote. Carried bytes
+/// and scalars keep their values on both rows.
 #[tokio::test]
 async fn update_assigning_one_of_two_blobs_carries_the_other_byte_identical() {
     const SCHEMA: &str = r#"
@@ -4015,15 +4485,15 @@ node Doc {
 }
 "#;
     const MUTATIONS: &str = r#"
-query insert_then_set_first(
-    $slug: String, $a: Blob, $title: String, $b: Blob, $rank: I64, $first: Blob
-) {
-    insert Doc { slug: $slug, first: $a, title: $title, second: $b, rank: $rank }
-    update Doc set { first: $first } where rank > 0
+query set_first_twice($a: Blob, $first: Blob) {
+    match { $x: Doc } where $x.rank > 0
+    update $x set { first: $a }
+    update $x set { first: $first }
 }
 
 query clear_second($second: Blob?) {
-    update Doc set { second: $second } where rank > 0
+    match { $x: Doc } where $x.rank > 0
+    update $x set { second: $second }
 }
 "#;
     const SCALARS: &str = r#"
@@ -4041,7 +4511,8 @@ query scalars() {
             .unwrap(),
     );
     db.load_jsonl(
-        r#"{"type":"Doc","data":{"slug":"kept","first":"base64:AQID","title":"kept title","second":"base64:BAUG","rank":3}}"#,
+        r#"{"type":"Doc","data":{"slug":"kept","first":"base64:AQID","title":"kept title","second":"base64:BAUG","rank":3}}
+{"type":"Doc","data":{"slug":"fresh","first":"base64:AQID","title":"fresh title","second":"base64:CgsM","rank":7}}"#,
         LoadMode::Overwrite,
     )
     .await
@@ -4051,24 +4522,12 @@ query scalars() {
         .mutate(
             "main",
             MUTATIONS,
-            "insert_then_set_first",
-            &mixed_params(
-                &[
-                    ("$slug", "fresh"),
-                    ("$a", "base64:BwgJ"),
-                    ("$title", "fresh title"),
-                    ("$b", "base64:CgsM"),
-                    ("$first", "base64:DQ4P"),
-                ],
-                &[("$rank", 7)],
-            ),
+            "set_first_twice",
+            &params(&[("$a", "base64:BwgJ"), ("$first", "base64:DQ4P")]),
         )
         .await
         .unwrap();
-    assert_eq!(
-        result.affected_nodes, 3,
-        "one insert, then the committed row and the inserted row updated"
-    );
+    assert_eq!(result.affected_nodes, 4, "each statement updates both rows");
 
     let blob = async |slug: &str, property: &str| {
         read_managed_blob_bytes(
@@ -4099,7 +4558,7 @@ query scalars() {
     let mut null_second = omnigraph_compiler::ir::ParamMap::new();
     null_second.insert(
         "second".to_string(),
-        omnigraph_compiler::query::ast::Literal::Null,
+        omnigraph_compiler::query::value::Literal::Null,
     );
     let result = db
         .mutate("main", MUTATIONS, "clear_second", &null_second)
@@ -4238,7 +4697,7 @@ async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
 
     // load → must self-heal, not wedge with "incomplete prior delete".
     let row = r#"{"type":"Person","data":{"name":"Zoe","age":30}}"#;
-    db.load_as("feature", None, row, LoadMode::Merge, None)
+    db.load_as("feature", None, row, LoadMode::Replace, None)
         .await
         .expect("load onto a manifest-unreferenced fork must self-heal, not wedge");
 
@@ -4332,8 +4791,8 @@ async fn camelcase_mutation_predicate_updates_and_deletes() {
     db.load_jsonl(CC_DATA, LoadMode::Overwrite).await.unwrap();
 
     let m = r#"
-query set_status($repo: String, $st: String) { update Doc set { status: $st } where repoName = $repo }
-query del($repo: String) { delete Doc where repoName = $repo }
+query set_status($repo: String, $st: String) { match { $x: Doc } where $x.repoName = $repo  update $x set { status: $st } }
+query del($repo: String) { match { $x: Doc } where $x.repoName = $repo  delete $x }
 "#;
 
     let upd = db
@@ -4363,10 +4822,10 @@ query del($repo: String) { delete Doc where repoName = $repo }
     );
 }
 
-// #283 (pending side): a chained mutation whose 2nd op filters a camelCase
-// column must read op-1's staged rows through the pending DataFusion `MemTable`
-// (`SELECT … WHERE {filter}` via ctx.sql), which lowercases unquoted idents.
-// This is the path the single update/delete above does NOT exercise.
+// #283 (pending side): a second update of a camelCase-selected row in one
+// group must read op-1's staged row from the pending rows. Every group of a
+// write selects on its one snapshot (a later group re-selecting the type is
+// T91), so the second statement reads the pending row by identity.
 #[tokio::test]
 async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
     let dir = tempfile::tempdir().unwrap();
@@ -4378,8 +4837,9 @@ async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
     // camelCase column, so it must match op-1's pending row.
     let m = r#"
 query chain($repo: String) {
-    update Doc set { status: "stage1" } where repoName = $repo
-    update Doc set { status: "stage2" } where repoName = $repo
+    match { $x: Doc } where $x.repoName = $repo
+    update $x set { status: "stage1" }
+    update $x set { status: "stage2" }
 }
 "#;
     let r = db
@@ -4516,7 +4976,7 @@ async fn post_publish_fold_matches_fresh_reopen() {
 
 const FIND_PERSON_QUERY: &str = r#"
 query find_person($name: String) {
-    match { $p: Person { name: $name } }
+    match { $p: Person } where $p.name = $name
     return { $p.name }
 }
 "#;
@@ -4541,7 +5001,7 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
     let seed: String = (1..=40)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    db.load_jsonl(&seed, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&seed, LoadMode::Replace).await.unwrap();
 
     // Same-key updates: Lance Operation::Update rewrites these 15 rows into
     // new fragments that keep their original stable row ids (the overlap).
@@ -4553,7 +5013,7 @@ async fn filtered_read_after_merge_update_and_delete_keeps_row_ids_consistent() 
             )
         })
         .collect();
-    db.load_jsonl(&updates, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&updates, LoadMode::Replace).await.unwrap();
 
     // The delete adds a deletion vector, so the overlapping region no longer
     // densely tiles its id range — the shape lance#7444 choked on.
@@ -4597,13 +5057,13 @@ async fn filtered_read_after_append_and_delete_is_consistent() {
     let seed: String = (1..=40)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    db.load_jsonl(&seed, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&seed, LoadMode::Replace).await.unwrap();
 
     // Disjoint keys: plain inserts, no fragment rewrite, no id reuse.
     let more: String = (41..=55)
         .map(|i| format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"p{i}\",\"age\":{i}}}}}\n"))
         .collect();
-    db.load_jsonl(&more, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(&more, LoadMode::Replace).await.unwrap();
 
     mutate_main(
         &db,
@@ -5056,16 +5516,18 @@ async fn keyed_edge_delete_then_reinsert_spans_two_mutations() {
 
     const MUTATIONS: &str = r#"
 query seed_knows() {
-    insert Knows { from: "Alice", to: "Bob", since: "2020" }
+    insert Knows { @src: "Alice", @dst: "Bob", since: "2020" }
 }
 
 query replace_knows() {
-    delete Knows where from = "Alice"
-    insert Knows { from: "Alice", to: "Bob", since: "2021" }
+    match { $x: Knows } where $x.@src = "Alice"
+    delete $x
+    insert Knows { @src: "Alice", @dst: "Bob", since: "2021" }
 }
 
 query drop_knows() {
-    delete Knows where from = "Alice"
+    match { $x: Knows } where $x.@src = "Alice"
+    delete $x
 }
 "#;
     mutate_main(&db, MUTATIONS, "seed_knows", &params(&[]))
@@ -5075,11 +5537,7 @@ query drop_knows() {
     let err = mutate_main(&db, MUTATIONS, "replace_knows", &params(&[]))
         .await
         .expect_err("a mutation mixing a delete and an insert must be refused");
-    assert!(
-        err.to_string().contains("constructive or destructive"),
-        "got: {}",
-        err
-    );
+    assert!(err.to_string().contains("T76"), "got: {}", err);
 
     mutate_main(&db, MUTATIONS, "drop_knows", &params(&[]))
         .await
@@ -5092,12 +5550,11 @@ query drop_knows() {
     assert_eq!(count_rows(&db, "edge:Knows").await, 1);
 }
 
-/// Edge key immutability is enforced structurally: the typechecker refuses
-/// every edge update (T16; the mutation executor carries a second refusal
-/// behind it). A future edge-update feature must revisit the key-column
-/// rule when this pin goes red.
+/// Edge key immutability is enforced structurally: an edge's endpoints and
+/// key are its identity, and the type checker refuses an `update` that
+/// assigns one (`T93`), so nothing reaches the executor.
 #[tokio::test]
-async fn update_refuses_edge_types_pinning_key_immutability() {
+async fn update_refuses_an_edge_endpoint_pinning_key_immutability() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = helpers::session(Omnigraph::init(uri, EDGE_KEY_WRITE_SCHEMA).await.unwrap());
@@ -5106,16 +5563,16 @@ async fn update_refuses_edge_types_pinning_key_immutability() {
         .unwrap();
 
     const MUTATIONS: &str = r#"
-query set_since() {
-    update Knows set { since: "2021" } where from = "Alice"
+query move_edge() {
+    match { $x: Knows } where $x.@src = "Alice"
+    update $x set { @dst: "Bob" }
 }
 "#;
-    let err = mutate_main(&db, MUTATIONS, "set_since", &params(&[]))
+    let err = mutate_main(&db, MUTATIONS, "move_edge", &params(&[]))
         .await
-        .expect_err("update on an edge type must be refused");
+        .expect_err("an update of an edge's endpoint must be refused");
     assert!(
-        err.to_string()
-            .contains("update mutation for edge type `Knows` is not supported"),
+        err.to_string().contains("T93") && err.to_string().contains("an endpoint of `Knows`"),
         "got: {}",
         err
     );
@@ -5148,10 +5605,12 @@ node Doc {
 "#;
     const UPDATE: &str = r#"
 query bump($slug: String) {
-    update Doc set { score: 1 } where slug = $slug
+    match { $x: Doc } where $x.slug = $slug
+    update $x set { score: 1 }
 }
 query bump_all() {
-    update Doc set { score: 2 } where age >= 0
+    match { $x: Doc } where $x.age >= 0
+    update $x set { score: 2 }
 }
 "#;
 
@@ -5330,5 +5789,498 @@ query bump_all() {
         latest_update_mode(&db, "main", "node:Doc").await,
         Some(UpdateMode::RewriteColumns),
         "an update of every row patches the column"
+    );
+}
+
+/// `replace` and a `replace` load write the whole row on an existing key:
+/// every nullable property the statement or record omits becomes null, a
+/// managed Blob and a vector included, and an explicit `null` clears too. A
+/// missing required property is refused on an existing key as on a new one.
+/// Setting only named properties is `upsert`'s and `update`'s job
+/// (`upsert_keeps_omitted_blob_and_vector_issue_1278`). Pinned on main and on
+/// a branch, and across a reopen; the GQT case
+/// `issue_1278_replace_writes_the_whole_row.gqt` pins the scalar, list and
+/// vector rows of the mutation door.
+#[tokio::test]
+async fn replace_statement_and_load_write_the_whole_row_issue_1278() {
+    use arrow_array::cast::AsArray;
+    use base64::Engine as _;
+
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    title: String
+    n: I64?
+    tags: [String]?
+    emb: Vector(3)?
+    file: Blob?
+}
+"#;
+    const WRITES: &str = r#"
+query retitle($slug: String) {
+    replace Doc { slug: $slug, title: "retitled" }
+}
+"#;
+
+    fn full_row(slug: &str, byte: u8) -> String {
+        serde_json::json!({"type": "Doc", "data": {
+            "slug": slug,
+            "title": "full",
+            "n": 7,
+            "tags": ["a", "b"],
+            "emb": [1.0, 2.0, 3.0],
+            "file": format!(
+                "base64:{}",
+                base64::engine::general_purpose::STANDARD.encode(vec![byte; 300])
+            ),
+        }})
+        .to_string()
+    }
+
+    /// `(title, n, tags, emb)` presence per slug: the title's value and
+    /// whether each nullable column holds a value.
+    async fn row_state(db: &Omnigraph, branch: &str, slug: &str) -> (String, bool, bool, bool) {
+        let ds = open_pinned_dataset_for_test(db, branch, "node:Doc").await;
+        let batch = ds
+            .scan()
+            .project(&["slug", "title", "n", "tags", "emb"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let slugs = batch.column_by_name("slug").unwrap().as_string::<i32>();
+        let row = (0..batch.num_rows())
+            .find(|&row| slugs.value(row) == slug)
+            .unwrap_or_else(|| panic!("{branch}: no row {slug}"));
+        let title = batch.column_by_name("title").unwrap().as_string::<i32>();
+        (
+            title.value(row).to_string(),
+            batch.column_by_name("n").unwrap().is_valid(row),
+            batch.column_by_name("tags").unwrap().is_valid(row),
+            batch.column_by_name("emb").unwrap().is_valid(row),
+        )
+    }
+
+    async fn blob_is_null(db: &Omnigraph, branch: &str, slug: &str) -> bool {
+        match db
+            .read_blob_at(
+                ReadTarget::branch(branch),
+                node_blob_cell("Doc", slug, "file"),
+            )
+            .await
+        {
+            Ok(_) => false,
+            Err(error) => {
+                let text = error.to_string();
+                assert!(text.contains("is null for id"), "{branch}/{slug}: {text}");
+                true
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::session(Omnigraph::init(&uri, SCHEMA).await.unwrap());
+    let seed = [full_row("d1", 1), full_row("d2", 2), full_row("d3", 3)].join("\n");
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+
+    // The mutation door on main, the `replace` load on the branch.
+    let result = db
+        .mutate("main", WRITES, "retitle", &params(&[("$slug", "d1")]))
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    db.load_as(
+        "feature",
+        None,
+        r#"{"type":"Doc","data":{"slug":"d2","title":"merged"}}"#,
+        LoadMode::Replace,
+        None,
+    )
+    .await
+    .unwrap();
+    // An explicit null clears through the `replace` load too.
+    db.load_jsonl(
+        &serde_json::json!({"type": "Doc", "data": {
+            "slug": "d3", "title": "full", "n": 7, "tags": ["a", "b"],
+            "emb": null, "file": null,
+        }})
+        .to_string(),
+        LoadMode::Replace,
+    )
+    .await
+    .unwrap();
+
+    // A missing required property is refused on an existing key, by both doors,
+    // and moves nothing.
+    let error = db
+        .mutate(
+            "main",
+            "query untitled() { replace Doc { slug: \"d2\", n: 1 } }",
+            "untitled",
+            &params(&[]),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("T12"), "{error}");
+    let error = db
+        .load_jsonl(
+            r#"{"type":"Doc","data":{"slug":"d2","n":1}}"#,
+            LoadMode::Replace,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("title"), "{error}");
+
+    for reopened in [false, true] {
+        let db = if reopened {
+            helpers::session(Omnigraph::open(&uri).await.unwrap())
+        } else {
+            db.clone()
+        };
+        let when = if reopened {
+            "after a reopen"
+        } else {
+            "before a reopen"
+        };
+        assert_eq!(
+            row_state(&db, "main", "d1").await,
+            ("retitled".to_string(), false, false, false),
+            "{when}: the keyed insert nulls every omitted property"
+        );
+        assert!(blob_is_null(&db, "main", "d1").await, "{when}");
+        assert_eq!(
+            row_state(&db, "feature", "d2").await,
+            ("merged".to_string(), false, false, false),
+            "{when}: the `replace` load nulls every omitted property on the branch"
+        );
+        assert!(blob_is_null(&db, "feature", "d2").await, "{when}");
+        assert_eq!(
+            row_state(&db, "main", "d2").await,
+            ("full".to_string(), true, true, true),
+            "{when}: main keeps the row the branch replaced"
+        );
+        assert_eq!(
+            read_managed_blob_bytes(
+                &db,
+                ReadTarget::branch("main"),
+                node_blob_cell("Doc", "d2", "file")
+            )
+            .await,
+            vec![2_u8; 300],
+            "{when}"
+        );
+        assert_eq!(
+            row_state(&db, "main", "d3").await,
+            ("full".to_string(), true, true, false),
+            "{when}: an explicit null clears the vector"
+        );
+        assert!(
+            blob_is_null(&db, "main", "d3").await,
+            "{when}: and the Blob"
+        );
+    }
+}
+
+/// `upsert` on an existing key keeps every property it does not name, a
+/// managed Blob and a vector included, and an explicit `null` clears one; on
+/// a new key it creates, an omitted nullable property null. A second
+/// `upsert` of a key in the same write keeps what the first wrote. Pinned on
+/// main and on a branch, and across a reopen; the GQT case
+/// `issue_1278_upsert_keeps_omitted_properties.gqt` pins the scalar, list and
+/// vector rows.
+#[tokio::test]
+async fn upsert_keeps_omitted_blob_and_vector_issue_1278() {
+    use arrow_array::cast::AsArray;
+    use base64::Engine as _;
+
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    title: String
+    emb: Vector(3)?
+    file: Blob?
+}
+"#;
+    const WRITES: &str = r#"
+query retitle($slug: String) {
+    upsert Doc { slug: $slug, title: "retitled" }
+}
+query clear_file($slug: String) {
+    upsert Doc { slug: $slug, file: null }
+}
+query twice() {
+    upsert Doc { slug: "d4", title: "four" }
+    upsert Doc { slug: "d4", emb: [7.0, 8.0, 9.0] }
+}
+"#;
+
+    fn full_row(slug: &str, byte: u8) -> String {
+        serde_json::json!({"type": "Doc", "data": {
+            "slug": slug,
+            "title": "full",
+            "emb": [1.0, 2.0, 3.0],
+            "file": format!(
+                "base64:{}",
+                base64::engine::general_purpose::STANDARD.encode(vec![byte; 300])
+            ),
+        }})
+        .to_string()
+    }
+
+    /// `(title, emb)` of a row.
+    async fn row_state(db: &Omnigraph, branch: &str, slug: &str) -> (String, Option<Vec<f32>>) {
+        let ds = open_pinned_dataset_for_test(db, branch, "node:Doc").await;
+        let batch = ds
+            .scan()
+            .project(&["slug", "title", "emb"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let slugs = batch.column_by_name("slug").unwrap().as_string::<i32>();
+        let row = (0..batch.num_rows())
+            .find(|&row| slugs.value(row) == slug)
+            .unwrap_or_else(|| panic!("{branch}: no row {slug}"));
+        let title = batch.column_by_name("title").unwrap().as_string::<i32>();
+        let emb = batch.column_by_name("emb").unwrap().as_fixed_size_list();
+        let emb = emb.is_valid(row).then(|| {
+            emb.value(row)
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .values()
+                .to_vec()
+        });
+        (title.value(row).to_string(), emb)
+    }
+
+    async fn blob(db: &Omnigraph, branch: &str, slug: &str) -> Option<Vec<u8>> {
+        match db
+            .read_blob_at(
+                ReadTarget::branch(branch),
+                node_blob_cell("Doc", slug, "file"),
+            )
+            .await
+        {
+            Ok(_) => Some(
+                read_managed_blob_bytes(
+                    db,
+                    ReadTarget::branch(branch),
+                    node_blob_cell("Doc", slug, "file"),
+                )
+                .await,
+            ),
+            Err(error) => {
+                let text = error.to_string();
+                assert!(text.contains("is null for id"), "{branch}/{slug}: {text}");
+                None
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::session(Omnigraph::init(&uri, SCHEMA).await.unwrap());
+    let seed = [full_row("d1", 1), full_row("d2", 2), full_row("d3", 3)].join("\n");
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+
+    db.mutate("main", WRITES, "retitle", &params(&[("$slug", "d1")]))
+        .await
+        .unwrap();
+    db.mutate("feature", WRITES, "retitle", &params(&[("$slug", "d2")]))
+        .await
+        .unwrap();
+    db.mutate("main", WRITES, "clear_file", &params(&[("$slug", "d3")]))
+        .await
+        .unwrap();
+    let result = db
+        .mutate("main", WRITES, "twice", &params(&[]))
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 2);
+
+    // The load door: an `upsert` load keeps what a record omits, on main and
+    // on a branch; an explicit null clears; a new key without the required
+    // `title` is refused and publishes nothing, while an existing key needs
+    // no `title`.
+    db.load_jsonl(
+        &[full_row("d5", 5), full_row("d6", 6)].join("\n"),
+        LoadMode::Insert,
+    )
+    .await
+    .unwrap();
+    db.branch_create("loads").await.unwrap();
+    db.load_jsonl(
+        &[
+            r#"{"type":"Doc","data":{"slug":"d5","title":"loaded"}}"#,
+            r#"{"type":"Doc","data":{"slug":"d6","emb":[4.0,5.0,6.0],"file":null}}"#,
+        ]
+        .join("\n"),
+        LoadMode::Upsert,
+    )
+    .await
+    .unwrap();
+    db.load_as(
+        "loads",
+        None,
+        r#"{"type":"Doc","data":{"slug":"d6","title":"branch"}}"#,
+        LoadMode::Upsert,
+        None,
+    )
+    .await
+    .unwrap();
+    let head = head_commit_id(&uri).await;
+    let error = db
+        .load_jsonl(
+            r#"{"type":"Doc","data":{"slug":"d7","emb":[1.0,1.0,1.0]}}"#,
+            LoadMode::Upsert,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("title"), "{error}");
+    assert_eq!(
+        head_commit_id(&uri).await,
+        head,
+        "a refused upsert load publishes nothing"
+    );
+
+    for reopened in [false, true] {
+        let db = if reopened {
+            helpers::session(Omnigraph::open(&uri).await.unwrap())
+        } else {
+            db.clone()
+        };
+        let when = if reopened {
+            "after a reopen"
+        } else {
+            "before a reopen"
+        };
+        assert_eq!(
+            row_state(&db, "main", "d1").await,
+            ("retitled".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: upsert keeps the vector it does not name"
+        );
+        assert_eq!(
+            blob(&db, "main", "d1").await,
+            Some(vec![1_u8; 300]),
+            "{when}"
+        );
+        assert_eq!(
+            row_state(&db, "feature", "d2").await,
+            ("retitled".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: the same on a branch"
+        );
+        assert_eq!(
+            blob(&db, "feature", "d2").await,
+            Some(vec![2_u8; 300]),
+            "{when}"
+        );
+        assert_eq!(
+            row_state(&db, "main", "d2").await,
+            ("full".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: main keeps the row the branch changed"
+        );
+        assert_eq!(
+            row_state(&db, "main", "d3").await,
+            ("full".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: an explicit null clears only the Blob"
+        );
+        assert_eq!(blob(&db, "main", "d3").await, None, "{when}");
+        assert_eq!(
+            row_state(&db, "main", "d4").await,
+            ("four".to_string(), Some(vec![7.0, 8.0, 9.0])),
+            "{when}: a second upsert of a key in one write keeps the first's title"
+        );
+        assert_eq!(
+            blob(&db, "main", "d4").await,
+            None,
+            "{when}: created without a Blob"
+        );
+        assert_eq!(
+            row_state(&db, "main", "d5").await,
+            ("loaded".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: an upsert load keeps the vector its record omits"
+        );
+        assert_eq!(
+            blob(&db, "main", "d5").await,
+            Some(vec![5_u8; 300]),
+            "{when}: and the Blob"
+        );
+        assert_eq!(
+            row_state(&db, "main", "d6").await,
+            ("full".to_string(), Some(vec![4.0, 5.0, 6.0])),
+            "{when}: an upsert load without `title` on an existing key keeps it"
+        );
+        assert_eq!(blob(&db, "main", "d6").await, None, "{when}: null clears");
+        assert_eq!(
+            row_state(&db, "loads", "d6").await,
+            ("branch".to_string(), Some(vec![1.0, 2.0, 3.0])),
+            "{when}: an upsert load on a branch keeps the branch's row"
+        );
+        assert_eq!(
+            blob(&db, "loads", "d6").await,
+            Some(vec![6_u8; 300]),
+            "{when}"
+        );
+    }
+}
+
+/// `insert` on an existing key fails with `KeyConflict` and publishes
+/// nothing, whether the key is committed, staged by an earlier statement of
+/// the write, or met while another statement made its table an upsert; the
+/// message names `upsert` and `replace`. The GQT case
+/// `keyed_insert_refuses_an_existing_key.gqt` pins the rows.
+#[tokio::test]
+async fn insert_on_an_existing_key_publishes_nothing_issue_1278() {
+    const WRITES: &str = r#"
+query committed() {
+    insert Person { name: "Alice", age: 1 }
+}
+query same_write() {
+    insert Person { name: "Zed", age: 1 }
+    insert Person { name: "Zed", age: 2 }
+}
+query beside_a_replace() {
+    replace Person { name: "Bob", age: 99 }
+    insert Person { name: "Alice", age: 1 }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let head = head_commit_id(uri).await;
+    for name in ["committed", "same_write", "beside_a_replace"] {
+        let error = db
+            .mutate("main", WRITES, name, &params(&[]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OmniError::KeyConflict { .. }),
+            "{name}: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(
+            text.contains("`upsert`") && text.contains("`replace`"),
+            "{name}: {text}"
+        );
+        assert_eq!(head_commit_id(uri).await, head, "{name} published nothing");
+    }
+    // The load door: an `insert` load of an existing key fails the same way.
+    let error = db
+        .load_jsonl(
+            r#"{"type":"Person","data":{"name":"Alice","age":1}}"#,
+            LoadMode::Insert,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OmniError::KeyConflict { .. }),
+        "insert load: {error:?}"
+    );
+    assert_eq!(
+        head_commit_id(uri).await,
+        head,
+        "the insert load published nothing"
     );
 }

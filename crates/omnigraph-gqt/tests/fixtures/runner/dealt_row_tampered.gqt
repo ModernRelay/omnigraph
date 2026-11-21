@@ -12,7 +12,7 @@ node Chunk { slug: String @key n: I64 }
 {"type":"Chunk","data":{"slug":"seed","n":0}}
 
 --- concurrent
-writer x1: load generate: v1 seed: 42 mode: append
+writer x1: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -21,7 +21,7 @@ writer x1: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 3}
         n: {kind: ordinal, start: 100, step: 1}
-tamper: query drop_dealt() { delete Chunk where slug = "cw-000" }
+tamper: query drop_dealt() { match { $x: Chunk } where $x.slug = "cw-000" delete $x }
 --- expect
 writer: ok
 tamper: ok

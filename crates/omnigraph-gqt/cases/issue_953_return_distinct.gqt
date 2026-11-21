@@ -47,13 +47,9 @@ edge HasMember: Forum -> Person
 {"edge":"HasMember","from":"f3","to":"cyd"}
 
 --- query
-set engine = v2;
 query members_plain() {
-    match {
-        $f: Forum
-        $f hasMember $p
-        $f.title contains "graph"
-    }
+    match { $f: Forum, $f hasMember $p }
+    where contains($f.title, "graph")
     return { $p.name }
 }
 
@@ -69,13 +65,9 @@ query members_plain() {
 p.name: String
 
 --- query
-set engine = v2;
 query members_distinct() {
-    match {
-        $f: Forum
-        $f hasMember $p
-        $f.title contains "graph"
-    }
+    match { $f: Forum, $f hasMember $p }
+    where contains($f.title, "graph")
     return distinct { $p.name }
 }
 
@@ -88,7 +80,6 @@ query members_distinct() {
 p.name: String
 
 --- query
-set engine = v2;
 query nulls_collapse() {
     match { $p: Person }
     return distinct { $p.city }
@@ -102,13 +93,9 @@ query nulls_collapse() {
 p.city: String?
 
 --- query
-set engine = v2;
 query first_two_names() {
-    match {
-        $f: Forum
-        $f hasMember $p
-        $f.title contains "graph"
-    }
+    match { $f: Forum, $f hasMember $p }
+    where contains($f.title, "graph")
     return distinct { $p.name }
     order { $p.name asc }
     limit 2
@@ -122,7 +109,6 @@ query first_two_names() {
 p.name: String
 
 --- query
-set engine = v2;
 query ages_then_names() {
     match { $p: Person }
     return distinct { $p.age as age, $p.name as name }
@@ -140,13 +126,9 @@ age: I64
 name: String
 
 --- query
-set engine = v2;
 query members_as_nodes() {
-    match {
-        $f: Forum
-        $f hasMember $p
-        $f.title contains "graph"
-    }
+    match { $f: Forum, $f hasMember $p }
+    where contains($f.title, "graph")
     return distinct { $p }
     order { $p }
 }
@@ -161,7 +143,6 @@ query members_as_nodes() {
 p: Person
 
 --- query
-set engine = v2;
 query seniority() {
     match { $p: Person }
     return distinct { $p.age > 35 as senior }
@@ -175,26 +156,23 @@ query seniority() {
 senior: Bool
 
 --- query
-set engine = v2;
 query distinct_with_aggregate() {
     match { $p: Person }
     return distinct { $p.name, count($p) as n }
 }
 
---- expect error: `distinct` on an aggregated return
+--- expect error: T56: `return distinct` does not apply to an aggregated return
 
 --- query
-set engine = v2;
 query order_key_outside_projection() {
     match { $p: Person }
     return distinct { $p.name }
     order { $p.age }
 }
 
---- expect error: order key `$p.age` does not appear in return
+--- expect error: T42: an order key over grouped rows must be a return item or name its alias
 
 --- query
-set engine = v2;
 query projected_identity() {
     match { $p: Person }
     return distinct { $p.@id, $p.@id as id }
@@ -212,9 +190,8 @@ p.@id: String
 id: String
 
 --- query
-set engine = v2;
 query projected_endpoints() {
-    match { $f: Forum $f $e:hasMember $p }
+    match { $f: Forum, $f $e:hasMember $p }
     return distinct { $e.@src, $e.@dst as member }
     order { $e.@src, $e.@dst }
 }

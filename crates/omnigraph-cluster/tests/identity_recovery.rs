@@ -95,7 +95,7 @@ async fn identity_schema_apply_refuses_real_pending_data_recovery_without_effect
         let _failpoint = catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER.fire_always();
         let error = Box::pin(writer.mutate_as(
             "main",
-            "query add() { insert Person { name: \"interrupted\" } }",
+            "query add() { replace Person { name: \"interrupted\" } }",
             "add",
             &Default::default(),
             Some("principal:writer"),
@@ -214,7 +214,7 @@ async fn offline_recovery_reauthorizes_executor_and_preserves_original_and_fence
     let writer = session(Box::pin(Omnigraph::open(uri)).await.unwrap());
     Box::pin(writer.mutate(
         "main",
-        "query seed() { insert Person { name: \"Ada\" } }",
+        "query seed() { replace Person { name: \"Ada\" } }",
         "seed",
         &Default::default(),
     ))

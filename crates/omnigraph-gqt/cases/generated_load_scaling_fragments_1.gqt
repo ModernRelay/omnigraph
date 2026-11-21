@@ -27,7 +27,7 @@ tables:
       id: {kind: key, prefix: person-, width: 4}
       v: {kind: ordinal, start: 0, step: 1}
 
---- load generate: v1 seed: 7 mode: append
+--- load generate: v1 seed: 7 mode: insert
 tables:
   - kind: edge
     name: Knows

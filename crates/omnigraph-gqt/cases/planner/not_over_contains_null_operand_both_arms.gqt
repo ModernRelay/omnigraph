@@ -1,0 +1,119 @@
+# issue: none
+# notes: `contains` (substring and list membership) and `starts_with` are null on a null operand, property or parameter, on the pushed-down arm and
+# notes: on the in-memory arm alike, so `not` over them never selects the null row; `expect plan` pins that a single-binding filter ran in the scan and a two-binding filter ran as the residual.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String?
+    tags: [String]?
+}
+
+--- seed
+{"type":"Person","data":{"slug":"a","name":"alice","tags":["rust"]}}
+{"type":"Person","data":{"slug":"b","name":"bob","tags":["go"]}}
+{"type":"Person","data":{"slug":"c"}}
+
+--- query
+query pushed_not_contains() {
+    match { $p: Person } where not (contains($p.name, "li"))
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- expect plan
+pass predicate_pushdown
+scan Person as $p: filter reads [p.name]
+
+--- query
+query pushed_not_starts_with() {
+    match { $p: Person } where not (starts_with($p.name, "a"))
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query pushed_not_list_contains() {
+    match { $p: Person } where not ("rust" in $p.tags)
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query null_parameter_needle($needle: String?) {
+    match { $p: Person } where not (contains($p.name, $needle))
+    return { $p.slug }
+}
+
+--- params
+{"needle": null}
+
+--- expect unordered
+
+--- expect shape
+p.slug: String
+
+--- query
+query residual_not_contains() {
+    match { $p: Person, $q: Person }
+    where $q.slug = "a" and not (contains($p.name, $q.name))
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String
+
+--- expect plan
+scan Person as $p: no filter
+filter reads [p.name, q.name]
+
+--- query
+query residual_not_starts_with() {
+    match { $p: Person, $q: Person }
+    where $q.slug = "b" and not (starts_with($p.name, $q.name))
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query residual_not_list_contains() {
+    match { $p: Person, $q: Person }
+    where $q.slug = "a" and not ($q.name in $p.tags)
+    return { $p.slug }
+}
+
+--- expect unordered
+{"p.slug": "a"}
+{"p.slug": "b"}
+
+--- expect shape
+p.slug: String

@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-10-13
+updated: 2026-11-20
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -528,9 +528,10 @@ in Seams at an explicit step. A step is one of:
   `now()`. A bare node projection (`return { $p }`) is spelled with its node
   type name, `p: Person`: the column must be that type's node object, a struct
   whose fields are the identity column and the declared properties minus
-  `Blob` and `Vector`, in the catalog's order; it takes no `?` (the object is
-  never null), and bless spells a struct column back as the one node type
-  whose object it is. Otherwise the type is
+  `Blob` and `Vector`, in the catalog's order; it takes `?` where the column
+  holds a null object (a node an `optional` introduces, null where the
+  `optional` matched nothing), and bless spells a struct column back as the
+  one node type whose object it is, with `?` when a cell is null. Otherwise the type is
   a `.pg` `type_ref` (`schema.pest`) parsed by the product schema parser as
   the one property of a `node Shape { }` declaration the runner wraps around
   it; annotations, body constraints, `enum(...)` (its Arrow type is `Utf8`,
@@ -1684,11 +1685,11 @@ the iteration named. Every surface named here is public today.
 Every case owns its store, so cases run concurrently (Runner mechanics
 below); within a case, steps are strictly sequential, and a `--- concurrent`
 block is one step whose sessions overlap inside it. Cases needing
-process-global state stay Rust tests: the harness refuses a schema using
-`@embed` and a `nearest` over a string argument, both of which resolve an
-embedding provider from process environment variables
-(`EmbeddingClient::from_env`); a `nearest` over an explicit vector
-parameter stays in scope. Fault cases expressible by Faults at an explicit
+process-global state stay Rust tests: the harness refuses a `nearest` over
+a string argument, which resolves an embedding provider from process
+environment variables (`EmbeddingClient::from_env`); a `nearest` over an
+explicit vector parameter stays in scope, and so does a schema using
+`@embed`, since no load or write embeds. Fault cases expressible by Faults at an explicit
 step may use GQT; other failpoint cases stay Rust tests. Interleaved writers
 and transaction races with a named interleaving are `--- concurrent` blocks;
 randomized interleavings stay in the existing DST suites. Fault-enabled GQT
@@ -2806,3 +2807,17 @@ historical command and configuration descriptions are not migration aliases.
   `branch list`" as the only branch statement a query step holds, and "`${`
   in a quoted statement name parses and is refused by the runner's `${`
   fence" for a bound commit name in a branch control read.
+- 2026-11-20, a nullable node object: GQ 3 returns a node an `optional`
+  introduces whole, a null object where the `optional` matched nothing, so
+  the shape section's node line takes `?` as a scalar line does
+  (`c: Company?`), a line without it refuses a null object, and bless writes
+  `?` for a column holding one. Superseded: "it takes no `?` (the object is
+  never null)" in the shape section and "`Person?` is refused (the object is
+  never null)" in the 2026 shape-section entry.
+- 2026-11-20, `@embed` schemas: no load or write embeds, and a keyed write
+  that omits a required `@embed` vector is `T12`, so a schema using `@embed`
+  resolves no embedding provider and a case may declare one, in `--- schema`
+  and in `--- apply schema`; a `nearest` over a string still resolves one and
+  stays refused. Superseded in §Execution semantics: "the harness refuses a
+  schema using `@embed` and a `nearest` over a string argument, both of which
+  resolve an embedding provider from process environment variables".

@@ -17,7 +17,7 @@ graphs:
     queries: queries/            # discover every `query <name>` in queries/*.gq
 ```
 
-`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq`, a query that does not type-check against the graph's desired schema, or a duplicate query name across files fails `cluster validate`. A relative `queries` path must stay inside the config
+`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq`, a query that does not type-check against the graph's desired schema, or a duplicate query name fails `cluster validate` (`T83` within one file, `duplicate_query_name` across files). A relative `queries` path must stay inside the config
 directory: a `..` segment fails with `config_path_escape`, and a symbolic link
 on the path (or a symlinked discovered `.gq` file) fails with
 `config_path_symlink`. `cluster apply` publishes them to the content-addressed catalog, and the `--target` server type-checks and serves every applied query. Every applied query is listed.
@@ -42,15 +42,30 @@ omnigraph queries list --target prod --graph dev --json # a server's GET /graphs
 - `cluster validate --config .` checks desired `.gq` sources before apply.
   `queries validate` instead audits the **applied** registry against each
   applied schema without restarting the server; it cannot see unapplied source
-  edits. Registry drift or duplicate names quarantine the affected graph by
-  default while healthy graphs serve; startup is fatal when no healthy graph
-  remains or `--require-all-graphs` is set.
+  edits; it reports every failing query, parse and type refusals together,
+  each with its code, position, fix and byte edits. Each declaration of a
+  stored file compiles on its own: one that fails under the server's release
+  (after a binary upgrade, say) is unavailable with its own diagnostic, one
+  that calls it is unavailable naming it, and the others in the file serve,
+  while the graph serves: `queries list`, the MCP
+  `queries` tool and `GET /graphs/{graph_id}/queries` list it under
+  `unavailable` with its diagnostic, `GET /graphs` reports it per graph, and
+  invoking it answers 409 `stored_query_unavailable` with the same diagnostic.
+  `OMNIGRAPH_STRICT_STORED_QUERIES=1` instead quarantines the graph
+  (`invalid_stored_queries`); startup is fatal when no healthy graph remains
+  or `--require-all-graphs` is set. To upgrade across GQ 3: validate with the
+  new binary, rewrite the failing sources from their fixes (`omnigraph lint
+  --fix --config <dir>` applies them), and apply the rewritten registry in the
+  same step as the binary switch.
 - Both commands take a local cluster root `--target LOCAL_PATH`; `--graph` narrows the
   operation to one declared graph. `queries list` also takes a server or managed target,
   where `--graph` or the target's `default_graph` selects the graph and `--json`
   prints the route's body: its parameters carry `kind` (`string`, `int`, `list`
   with `item_kind`, `vector` with `vector_dim`, ...) rather than the root
-  form's GQ `type`.
+  form's GQ `type`. Both forms list a declared `default` (the human form as
+  `$k: I32 = 10`, JSON as `"default": 10`, and a declared `= null` as
+  `"default": null`; with no declared default the key is absent); a
+  parameter with neither `nullable` nor a `default` is required.
 - `queries` is distinct from `lint` — `lint` validates a single `.gq` file you point it at; `queries validate` validates the registry the server will actually serve.
 
 ## HTTP surface
@@ -58,7 +73,7 @@ omnigraph queries list --target prod --graph dev --json # a server's GET /graphs
 | Route | Gate | Purpose |
 |-------|------|---------|
 | `GET /graphs/{graph_id}/queries` | `read` | Typed tool catalog of the served queries. Graph-wide (branch-independent; `read` authorized against `main`). |
-| `POST /graphs/{graph_id}/queries/{query_name}` | `invoke_query` (+ `change` for a stored mutation) | Invoke a named query. Body carries params only — **never** `.gq` source. A stored mutation cannot target a `snapshot` (`400`); a param type error is a structured `400` naming the param. |
+| `POST /graphs/{graph_id}/queries/{query_name}` | `invoke_query` (+ `change` for a stored mutation) | Invoke a named query. Body carries `params`, `branch`, `snapshot` and `expect_mutation` only — **never** `.gq` source; any other key is a `400 bad_request` naming it. A stored mutation cannot target a `snapshot` (`400`); a param type error is a structured `400` naming the param. |
 
 The JSON body carries `params` and optionally `branch` (default `main`; the
 write target for a stored mutation) or `snapshot` (reads only); `branch` and
@@ -77,7 +92,7 @@ are omitted from JSON rows, and DateTime strings are UTC without a trailing
 ## Policy gating (`invoke_query`)
 
 - **`invoke_query`** is a per-graph Cedar action gating the whole stored-query invocation surface. Grant it like any other action (see [`server-policy.md`](server-policy.md)).
-- **Stored mutations are double-gated:** the caller needs `invoke_query` to reach the query **and** `change` for the write. An actor with `invoke_query` but not `change` gets `403` on a stored mutation.
+- **Stored mutations are double-gated:** the caller needs `invoke_query` to reach the query **and** `change` for the write, plus `read` on the branch when the write has a `match`. An actor with `invoke_query` but not `change` gets `403` on a stored mutation.
 - **Deny == unknown:** for a caller *lacking* `invoke_query`, a denial and an unknown query name return the **same 404** (identical body) — the catalog can't be probed. A caller who *holds* `invoke_query` may still get a `403` from the inner gate for a query it can't `read`/`change`, so existence is visible to grant-holders by design.
 - **Default-deny mode** (bearer tokens, no policy bundle) permits nothing
   (`read` only under the server's `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`), so

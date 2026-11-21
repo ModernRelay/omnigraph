@@ -1,0 +1,1 @@
+- Explain shows a `bm25` as a `Score` node; the `TextSearch` kind, a ranked scan's `eligibility` and `assumptions.full_text` are gone.

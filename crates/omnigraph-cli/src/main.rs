@@ -6,6 +6,8 @@ use color_eyre::eyre::Result;
 use tokio::runtime::Runtime;
 
 fn main() -> Result<std::process::ExitCode> {
+    // A query compiles and runs on the runtime's threads, with their default
+    // stacks: every walk over a deep query grows its own.
     let runtime = Runtime::new()?;
     // A refusal explains its fix without environment or source-location footers.
     color_eyre::config::HookBuilder::default()

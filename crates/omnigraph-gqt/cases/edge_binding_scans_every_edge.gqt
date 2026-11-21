@@ -1,0 +1,92 @@
+# issue: none
+# notes: `$k: E` in a read binds every edge of type `E`, the `Scan` of an
+# notes: edge type: one row per edge, parallel edges included, and a node
+# notes: with no edge of the type adds none. Its endpoints, properties and
+# notes: meta-fields read as an edge binding's do.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+}
+edge Knows: Person -> Person {
+    since: I32?
+}
+
+--- seed
+{"type":"Person","data":{"handle":"ada"}}
+{"type":"Person","data":{"handle":"bob"}}
+{"type":"Person","data":{"handle":"cy"}}
+{"type":"Person","data":{"handle":"dee"}}
+{"edge":"Knows","from":"ada","to":"bob","data":{"since":2019}}
+{"edge":"Knows","from":"ada","to":"bob","data":{"since":2023}}
+{"edge":"Knows","from":"bob","to":"cy","data":{"since":2021}}
+{"edge":"Knows","from":"cy","to":"cy"}
+
+--- query
+query every_edge() {
+    match { $k: Knows }
+    return { $k.@src, $k.@dst, $k.since }
+}
+
+--- expect unordered
+{"k.@dst":"bob","k.@src":"ada","k.since":2019}
+{"k.@dst":"bob","k.@src":"ada","k.since":2023}
+{"k.@dst":"cy","k.@src":"bob","k.since":2021}
+{"k.@dst":"cy","k.@src":"cy"}
+
+--- expect shape
+k.@src: String
+k.@dst: String
+k.since: I32?
+
+--- query
+query recent() {
+    match { $k: Knows }
+    where $k.since > 2020
+    return { $k.@src, $k.@dst }
+}
+
+--- expect unordered
+{"k.@dst":"bob","k.@src":"ada"}
+{"k.@dst":"cy","k.@src":"bob"}
+
+--- expect shape
+k.@src: String
+k.@dst: String
+
+--- query
+query counted() {
+    match { $k: Knows }
+    return { count($k.@src) as edges, count(distinct $k.@src) as sources }
+}
+
+--- expect unordered
+{"edges":4,"sources":3}
+
+--- expect shape
+edges: I64
+sources: I64
+
+--- query
+query first_two() {
+    match { $k: Knows }
+    return { $k.@src, $k.since }
+    order { $k.since desc }
+    limit 2
+}
+
+--- expect ordered
+{"k.@src":"ada","k.since":2023}
+{"k.@src":"bob","k.since":2021}
+
+--- expect shape
+k.@src: String
+k.since: I32?

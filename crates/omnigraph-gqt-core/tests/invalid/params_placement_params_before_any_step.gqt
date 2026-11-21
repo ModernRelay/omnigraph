@@ -14,5 +14,5 @@ node Person {
 --- params
 {"n":"bob"}
 --- mutate
-query add($n: String) { insert Person { name: $n, age: 2 } }
+query add($n: String) { replace Person { name: $n, age: 2 } }
 --- expect affected: nodes=1 edges=0

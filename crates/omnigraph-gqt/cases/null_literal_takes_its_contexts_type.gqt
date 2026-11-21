@@ -1,0 +1,118 @@
+# issue: none
+# notes: A `null` literal takes the type its context fixes (section 5 of the GQ 3 RFC): the other branch of `if`, the other
+# notes: arguments of `coalesce`, the property it is assigned to. Where nothing fixes its type it is `T7`, and `= null` and
+# notes: `!= null` are `T7` whose fix is `is null` and `is not null`.
+
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)?
+    payload: Blob?
+}
+node Collection {
+    slug: String @key
+    min_docs: I32
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+edge In: Doc -> Collection
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":0,"city":"Berlin"}}
+{"type":"Person","data":{"handle":"cy","name":"Cy","city":"Paris"}}
+
+--- query
+query ratio() {
+    match { $p: Person, let $n = coalesce($p.age, 0), let $t = 72, let $r = if($n > 0, $t / $n, null) }
+    return { $p.handle, $r }
+}
+
+--- expect unordered
+{"p.handle":"ada","r":2}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+r: I64?
+
+--- query
+query branches() {
+    match { $p: Person }
+    return { $p.handle, if($p.age > 30, null, "young") as band, coalesce(null, $p.city, null) as town }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob","band":"young","town":"Berlin"}
+{"p.handle":"cy","band":"young","town":"Paris"}
+
+--- expect shape
+p.handle: String
+band: String?
+town: String?
+
+--- mutate
+query clear_young() {
+    match { $p: Person } where $p.age < 30
+    update $p set { city: if($p.city = "Berlin", null, $p.city) }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query cities() { match { $p: Person } return { $p.handle, $p.city } }
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+{"p.handle":"cy","p.city":"Paris"}
+
+--- expect shape
+p.handle: String
+p.city: String?
+
+--- query
+query untyped() { match { $p: Person } return { $p.handle, null as nothing } }
+
+--- expect error: type error: T7: nothing fixes the type of this `null`
+
+--- query
+query both_null() { match { $p: Person } return { $p.handle, if($p.age > 30, null, null) as nothing } }
+
+--- expect error: type error: T7: nothing fixes the type of this `null`
+
+--- query
+query equals_null() { match { $p: Person } where $p.city = null return { $p.handle } }
+
+--- expect error: type error: T7: a comparison with `null` is null on every row
+
+--- query
+query differs_from_null() { match { $p: Person } where $p.city != null return { $p.handle } }
+
+--- expect error: type error: T7: a comparison with `null` is null on every row

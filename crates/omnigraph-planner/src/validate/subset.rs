@@ -3,12 +3,11 @@
 //! the declaration's typed lowering: one binding of one node type,
 //! eligibility over Boolean, integer and String properties, literals and
 //! parameters (a literal or parameter cast to the property's integer type
-//! included), an optional leading `bm25()` over a String property, direct
-//! property sort keys, a limit, and a projection of properties and the
-//! selected score.
+//! included), direct property sort keys, a limit, and a projection of
+//! properties.
 //!
 //! For a member, the validator builds the canonical chain from the typed IR
-//! (`Limit(n, Sort(K, Project(V, [Search(a)] Filter(p, Scan(C)))))`, leaf
+//! (`Limit(n, Sort(K, Project(V, Filter(p, Scan(C)))))`, leaf
 //! first), applies the optimizer's recorded rule applications one by one,
 //! each checked against its precondition and reconstructed by the validator,
 //! and requires the result to equal the candidate plan node for node. A
@@ -19,9 +18,10 @@
 
 use std::collections::BTreeSet;
 
+use crate::read_shape::{PatternStep, ReadShape};
 use omnigraph_compiler::catalog::NodeType;
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
-use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
+use omnigraph_compiler::query::value::{BinaryOp, CompOp, Literal};
 use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 use serde::{Deserialize, Serialize};
 
@@ -32,10 +32,7 @@ use crate::logical::{ColumnRef, IDENTITY_MEMBER, LogicalNode, LogicalPlan};
 use crate::mirror::{ExprMirror, OrderingMirror, ProjectionMirror};
 use crate::operation::TableSource;
 use crate::optimizer::ROW_ADDR;
-use crate::physical::{
-    Eligibility, HydratedColumn, PhysicalNode, PhysicalPlan, RankKind, RankScope, ScanInput,
-};
-use crate::source::FullTextCoverage;
+use crate::physical::{HydratedColumn, PhysicalNode, PhysicalPlan, ScanInput};
 
 /// A member of the exact fragment: its one binding and node type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +137,7 @@ impl Fragment<'_> {
 
     /// Whether `expr` is an admitted eligibility predicate.
     fn predicate(&self, expr: &IRExpr) -> bool {
-        match expr {
+        omnigraph_compiler::stack::deep(|| match expr {
             IRExpr::Binary {
                 left,
                 op: BinaryOp::And | BinaryOp::Or,
@@ -169,23 +166,7 @@ impl Fragment<'_> {
                     }
             }
             other => self.operand(other) == Some(Operand::Scalar(ScalarType::Bool)),
-        }
-    }
-
-    /// Whether `expr` is the leading `bm25()` the fragment admits: over a
-    /// String property of the binding, with a String literal or parameter.
-    fn bm25(&self, expr: &IRExpr) -> bool {
-        let IRExpr::Bm25 { field, query, .. } = expr else {
-            return false;
-        };
-        let IRExpr::PropAccess {
-            variable, property, ..
-        } = field.as_ref()
-        else {
-            return false;
-        };
-        self.property(variable, property) == Some(ScalarType::String)
-            && self.operand(query) == Some(Operand::Scalar(ScalarType::String))
+        })
     }
 }
 
@@ -197,35 +178,40 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
         return None;
     }
     let mut pipeline = ir.pipeline.iter();
-    let Some(IROp::NodeScan {
+    let Some(PatternStep::NodeScan {
         variable,
         type_name,
-        filters,
     }) = pipeline.next()
     else {
         return None;
     };
     let node_type = input.catalog.node_types.get(type_name)?;
+    // A predicate too deep to hand to the scan's filter planning is not a
+    // member: it is evaluated above the scan, and its derivation would hold
+    // mirrors no deeper walk may take apart.
+    let deep = |filter: &IRExpr| filter.depth() > omnigraph_compiler::stack::MAX_HANDED_OFF_DEPTH;
+    if ir
+        .pipeline
+        .iter()
+        .filter_map(|op| match op {
+            PatternStep::Filter { pred, .. } => Some(pred),
+            _ => None,
+        })
+        .any(deep)
+    {
+        return None;
+    }
     let fragment = Fragment {
         binding: variable,
         node_type,
     };
-    if !filters.iter().all(|filter| fragment.predicate(filter)) {
-        return None;
-    }
     for op in pipeline {
         match op {
-            IROp::Filter(filter) if fragment.predicate(filter) => {}
+            PatternStep::Filter { pred: filter, .. } if fragment.predicate(filter) => {}
             _ => return None,
         }
     }
-    let mut order = ir.order_by.iter();
-    let leading = ir.order_by.first().map(|key| &key.expr);
-    let ranked = leading.is_some_and(|lead| fragment.bm25(lead));
-    if ranked {
-        order.next();
-    }
-    for key in order {
+    for key in &ir.order_by {
         let IRExpr::PropAccess {
             variable, property, ..
         } = &key.expr
@@ -234,22 +220,12 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
         };
         fragment.property(variable, property)?;
     }
-    // The lowering makes a projected `bm25()` its score column; the
-    // declaration says which call it was.
-    let decl = input.checked.decl();
-    let written_lead = decl.order_clause.first().map(|key| &key.expr);
-    for (index, projection) in ir.return_exprs.iter().enumerate() {
+    for projection in &ir.return_exprs {
         let direct = match &projection.expr {
             IRExpr::PropAccess {
                 variable, property, ..
-            } if fragment.property(variable, property).is_some() => true,
-            _ => {
-                ranked
-                    && decl
-                        .return_clause
-                        .get(index)
-                        .is_some_and(|written| Some(&written.expr) == written_lead)
-            }
+            } => fragment.property(variable, property).is_some(),
+            _ => false,
         };
         if !direct {
             return None;
@@ -259,15 +235,6 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
         binding: variable.clone(),
         type_name: type_name.clone(),
     })
-}
-
-/// The ranking a scan of the chain carries: `bm25` over `property` with
-/// `query`, placing eligibility as declared.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChainRanking {
-    pub property: String,
-    pub query: ExprMirror,
-    pub eligibility: Eligibility,
 }
 
 /// One node of a member's chain, logical until a lowering rule marks it
@@ -281,16 +248,11 @@ pub enum ChainNode {
         binding: String,
         filter: Vec<ExprMirror>,
         projection: Option<Vec<String>>,
-        ranked: Option<ChainRanking>,
         lowered: bool,
     },
     Filter {
         conjuncts: Vec<ExprMirror>,
         lowered: bool,
-    },
-    Search {
-        property: String,
-        query: ExprMirror,
     },
     Projection {
         exprs: Vec<ProjectionMirror>,
@@ -320,7 +282,6 @@ pub enum ChainNode {
 pub(crate) enum Role {
     Scan,
     Filter,
-    Search,
     Projection,
     Sort,
     Limit,
@@ -332,7 +293,6 @@ impl ChainNode {
         match self {
             Self::Scan { .. } => Role::Scan,
             Self::Filter { .. } => Role::Filter,
-            Self::Search { .. } => Role::Search,
             Self::Projection { .. } => Role::Projection,
             Self::Sort { .. } => Role::Sort,
             Self::Limit { .. } => Role::Limit,
@@ -348,7 +308,6 @@ impl ChainNode {
             | Self::Sort { lowered, .. }
             | Self::Limit { lowered, .. } => *lowered,
             Self::Hydrate { .. } => true,
-            Self::Search { .. } => false,
         }
     }
 
@@ -359,7 +318,7 @@ impl ChainNode {
             | Self::Projection { lowered, .. }
             | Self::Sort { lowered, .. }
             | Self::Limit { lowered, .. } => *lowered = true,
-            Self::Search { .. } | Self::Hydrate { .. } => {}
+            Self::Hydrate { .. } => {}
         }
     }
 }
@@ -380,10 +339,6 @@ pub enum Rule {
     PruneScanColumns { columns: Vec<String> },
     /// A logical node becomes its physical operator unchanged; `at` `[node]`.
     Lower,
-    /// `Search(a, …Scan(C))` → a ranked physical scan of `C` by `a`,
-    /// placing eligibility before scoring only under recorded full
-    /// full-text coverage; `at` `[search, scan]`.
-    RankBm25Scan { eligibility: Eligibility },
     /// The physical `Limit(n > 0, …Projection(V, …Scan(C)))` reads each of
     /// `columns`, a bare property of the binding that `V` returns at its
     /// position and no other node reads, by row address above the limit:
@@ -416,13 +371,10 @@ pub struct Derivation {
 
 /// The canonical chain's roles for a plan shape: the optimizer and the
 /// validator number the arena the same way.
-pub(crate) fn canonical_roles(filter: bool, search: bool, sort: bool, limit: bool) -> Vec<Role> {
+pub(crate) fn canonical_roles(filter: bool, sort: bool, limit: bool) -> Vec<Role> {
     let mut roles = vec![Role::Scan];
     if filter {
         roles.push(Role::Filter);
-    }
-    if search {
-        roles.push(Role::Search);
     }
     roles.push(Role::Projection);
     if sort {
@@ -450,12 +402,11 @@ pub(crate) struct Tracer {
 impl Tracer {
     /// Start recording over the canonical chain of `plan`, a resolved
     /// logical plan, when it is one binding's chain:
-    /// `[Limit] [Sort] Projection [TextSearch] Filter* TableScan`.
+    /// `[Limit] [Sort] Projection Filter* TableScan`.
     pub(crate) fn for_plan(plan: &LogicalPlan) -> Self {
         let mut id = plan.root();
         let mut limit = false;
         let mut sort = false;
-        let mut search = false;
         let mut conjuncts: Vec<&IRExpr> = Vec::new();
         let mut projection = false;
         loop {
@@ -472,13 +423,10 @@ impl Tracer {
                     projection = true;
                     id = *input;
                 }
-                Some(LogicalNode::TextSearch { input, .. }) if projection && !search => {
-                    search = true;
-                    id = *input;
-                }
                 Some(LogicalNode::Filter {
                     input,
                     conjuncts: held,
+                    ..
                 }) if projection => {
                     for conjunct in held {
                         if !conjuncts.contains(&conjunct) {
@@ -495,7 +443,7 @@ impl Tracer {
                 _ => return Self::default(),
             }
         }
-        let roles = canonical_roles(!conjuncts.is_empty(), search, sort, limit);
+        let roles = canonical_roles(!conjuncts.is_empty(), sort, limit);
         Self {
             derivation: Some(Derivation::default()),
             current: roles
@@ -643,14 +591,13 @@ pub(crate) fn check(
     let mut arena = canonical(ir, plan, member, input)?;
     for step in &derivation.steps {
         budget.step()?;
-        apply(&mut arena, step, plan, member, input, budget)?;
+        apply(&mut arena, step, member, input, budget)?;
     }
     let reached: Vec<&ChainNode> = [
         Role::Hydrate,
         Role::Limit,
         Role::Sort,
         Role::Projection,
-        Role::Search,
         Role::Filter,
         Role::Scan,
     ]
@@ -683,10 +630,10 @@ pub(crate) fn check(
 
 /// The canonical chain of a member, from its checked IR: the scan of the
 /// pinned table, every conjunct in written order (a repeated one once), the
-/// leading `bm25()`, the projection, the sort of the remaining keys with the
+/// projection, the sort of the remaining keys with the
 /// identity tie-break the comparator requires, and the limit.
 fn canonical(
-    ir: &QueryIR,
+    ir: &ReadShape,
     plan: &PhysicalPlan,
     member: &Member,
     input: &AcceptInput<'_>,
@@ -696,39 +643,24 @@ fn canonical(
         .ok_or_else(|| invalid(format!("the plan records no pin of `{type_key}`")))?;
     let mut conjuncts: Vec<IRExpr> = Vec::new();
     for op in &ir.pipeline {
-        let filters: Vec<IRExpr> = match op {
-            IROp::NodeScan { filters, .. } => filters.clone(),
-            IROp::Filter(filter) => vec![filter.clone()],
-            _ => Vec::new(),
+        let PatternStep::Filter { pred: filter, .. } = op else {
+            continue;
         };
-        for conjunct in filters.into_iter().flat_map(IRExpr::into_conjuncts) {
+        for conjunct in filter.clone().into_conjuncts() {
             if !conjuncts.contains(&conjunct) {
                 conjuncts.push(conjunct);
             }
         }
     }
-    let mut keys: &[IROrdering] = &ir.order_by;
-    let search = match keys.first().map(|key| &key.expr) {
-        Some(IRExpr::Bm25 { field, query, .. }) => match field.as_ref() {
-            IRExpr::PropAccess { property, .. } => {
-                keys = &keys[1..];
-                Some(ChainNode::Search {
-                    property: property.clone(),
-                    query: mirror(query),
-                })
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    let sorted = search.is_some() || !ir.order_by.is_empty();
+    let keys: &[IROrdering] = &ir.order_by;
+    // A `limit` with no `order` cuts the tie rule's order: a sort too.
+    let sorted = !ir.order_by.is_empty() || ir.limit.is_some();
     let mut nodes = vec![ChainNode::Scan {
         type_key,
         version,
         binding: member.binding.clone(),
         filter: Vec::new(),
         projection: None,
-        ranked: None,
         lowered: false,
     }];
     if !conjuncts.is_empty() {
@@ -737,7 +669,6 @@ fn canonical(
             lowered: false,
         });
     }
-    nodes.extend(search);
     nodes.push(ChainNode::Projection {
         exprs: ir.return_exprs.iter().map(ProjectionMirror::from).collect(),
         lowered: false,
@@ -776,7 +707,7 @@ fn canonical(
 /// The identity tie-break of the canonical sort: the binding's id unless
 /// every returned expression is an order key (rows that tie are then
 /// indistinguishable) or the id is a key itself.
-fn canonical_tiebreak(ir: &QueryIR, member: &Member, input: &AcceptInput<'_>) -> Vec<ColumnRef> {
+fn canonical_tiebreak(ir: &ReadShape, member: &Member, input: &AcceptInput<'_>) -> Vec<ColumnRef> {
     let keys: Vec<String> = ir.order_by.iter().map(|key| key.expr.to_string()).collect();
     let covered = ir
         .return_exprs
@@ -843,7 +774,6 @@ fn demanded(arena: &Arena, member: &Member, input: &AcceptInput<'_>) -> BTreeSet
 fn apply(
     arena: &mut Arena,
     step: &Step,
-    plan: &PhysicalPlan,
     member: &Member,
     input: &AcceptInput<'_>,
     budget: &mut Budget,
@@ -861,13 +791,12 @@ fn apply(
                 binding,
                 mut filter,
                 projection,
-                ranked,
                 lowered: scan_lowered,
             } = arena.node(*scan, Role::Scan)?.clone()
             else {
                 unreachable!("the arena checked the role");
             };
-            if lowered || scan_lowered || ranked.is_some() {
+            if lowered || scan_lowered {
                 return Err(invalid(
                     "a filter is absorbed only between logical nodes".into(),
                 ));
@@ -902,7 +831,6 @@ fn apply(
                         binding,
                         filter,
                         projection,
-                        ranked,
                         lowered: false,
                     }),
                 ),
@@ -945,77 +873,11 @@ fn apply(
                 .map(ChainNode::role)
                 .ok_or_else(|| invalid(format!("no node {at} to lower")))?;
             let mut node = arena.node(*at, role)?.clone();
-            match (&mut node, role) {
-                (ChainNode::Search { .. }, _) => {
-                    return Err(invalid("a search lowers only into its ranked scan".into()));
-                }
-                (ChainNode::Sort { keys, .. }, Role::Sort) => {
-                    if arena.current.contains_key(&Role::Search) {
-                        return Err(invalid("the sort lowers after its ranking".into()));
-                    }
-                    let ranked = arena
-                        .current
-                        .get(&Role::Scan)
-                        .and_then(|index| arena.nodes[*index].as_ref())
-                        .and_then(|scan| match scan {
-                            ChainNode::Scan { ranked, .. } => ranked.clone(),
-                            _ => None,
-                        });
-                    if ranked.is_some() {
-                        keys.insert(
-                            0,
-                            OrderingMirror::from(&IROrdering {
-                                expr: crate::optimizer::rank_score(&member.binding, RankKind::Bm25),
-                                descending: RankKind::Bm25.score().1,
-                            }),
-                        );
-                    }
-                }
-                _ => {}
-            }
             if node.lowered() {
                 return Err(invalid(format!("the {role:?} is lowered twice")));
             }
             node.lower();
             vec![(role, Some(node))]
-        }
-        (Rule::RankBm25Scan { eligibility }, [search, scan]) => {
-            let ChainNode::Search { property, query } = arena.node(*search, Role::Search)?.clone()
-            else {
-                unreachable!("the arena checked the role");
-            };
-            let mut node = arena.node(*scan, Role::Scan)?.clone();
-            let ChainNode::Scan {
-                type_key,
-                ranked,
-                lowered,
-                ..
-            } = &mut node
-            else {
-                unreachable!("the arena checked the role");
-            };
-            if !*lowered || ranked.is_some() {
-                return Err(invalid("only a physical, unranked scan is ranked".into()));
-            }
-            let coverage =
-                plan.assumptions()
-                    .full_text
-                    .get(&crate::physical::Assumptions::full_text_key(
-                        type_key, &property,
-                    ));
-            if *eligibility == Eligibility::BeforeScoring
-                && coverage != Some(&FullTextCoverage::Full)
-            {
-                return Err(invalid(format!(
-                    "the bm25 scan filters before scoring under recorded coverage {coverage:?}"
-                )));
-            }
-            *ranked = Some(ChainRanking {
-                property,
-                query,
-                eligibility: *eligibility,
-            });
-            vec![(Role::Search, None), (Role::Scan, Some(node))]
         }
         (Rule::HydrateReturnColumns { columns }, [scan]) => {
             let mut node = arena.node(*scan, Role::Scan)?.clone();
@@ -1023,13 +885,12 @@ fn apply(
                 type_key,
                 filter,
                 projection: Some(read),
-                ranked: None,
                 lowered: true,
                 ..
             } = &mut node
             else {
                 return Err(invalid(
-                    "only a physical, unranked scan with a projection defers columns".into(),
+                    "only a physical scan with a projection defers columns".into(),
                 ));
             };
             let current = |role: Role| {
@@ -1176,52 +1037,54 @@ fn apply(
 /// properties, literals and bound parameters, a constant cast included (the
 /// scan translates a cast as the filter evaluates it).
 fn translatable(conjunct: &IRExpr, member: &Member, input: &AcceptInput<'_>) -> bool {
-    let Some(node_type) = input.catalog.node_types.get(&member.type_name) else {
-        return false;
-    };
-    fn operand(expr: &IRExpr, member: &Member, node_type: &NodeType) -> bool {
-        match expr {
-            IRExpr::PropAccess {
-                variable, property, ..
-            } => {
-                *variable == member.binding
-                    && node_type.properties.get(property).is_some_and(admitted)
+    omnigraph_compiler::stack::deep(|| {
+        let Some(node_type) = input.catalog.node_types.get(&member.type_name) else {
+            return false;
+        };
+        fn operand(expr: &IRExpr, member: &Member, node_type: &NodeType) -> bool {
+            match expr {
+                IRExpr::PropAccess {
+                    variable, property, ..
+                } => {
+                    *variable == member.binding
+                        && node_type.properties.get(property).is_some_and(admitted)
+                }
+                IRExpr::Literal(
+                    Literal::Bool(_) | Literal::String(_) | Literal::Integer(_) | Literal::Null,
+                    _,
+                )
+                | IRExpr::Param(_, _) => true,
+                IRExpr::Cast { expr, ty } => {
+                    admitted_type(ty).is_some()
+                        && matches!(
+                            expr.as_ref(),
+                            IRExpr::Literal(Literal::Integer(_), _) | IRExpr::Param(_, _)
+                        )
+                }
+                _ => false,
             }
-            IRExpr::Literal(
-                Literal::Bool(_) | Literal::String(_) | Literal::Integer(_) | Literal::Null,
-                _,
-            )
-            | IRExpr::Param(_, _) => true,
-            IRExpr::Cast { expr, ty } => {
-                admitted_type(ty).is_some()
-                    && matches!(
-                        expr.as_ref(),
-                        IRExpr::Literal(Literal::Integer(_), _) | IRExpr::Param(_, _)
-                    )
-            }
-            _ => false,
         }
-    }
-    match conjunct {
-        IRExpr::Binary {
-            left,
-            op: BinaryOp::And | BinaryOp::Or,
-            right,
-            ..
-        } => translatable(left, member, input) && translatable(right, member, input),
-        IRExpr::Not(inner, _) => translatable(inner, member, input),
-        IRExpr::IsNull { expr, .. } => operand(expr, member, node_type),
-        IRExpr::Binary {
-            left,
-            op:
-                BinaryOp::Compare(
-                    CompOp::Eq | CompOp::Ne | CompOp::Lt | CompOp::Le | CompOp::Gt | CompOp::Ge,
-                ),
-            right,
-            ..
-        } => operand(left, member, node_type) && operand(right, member, node_type),
-        other => operand(other, member, node_type),
-    }
+        match conjunct {
+            IRExpr::Binary {
+                left,
+                op: BinaryOp::And | BinaryOp::Or,
+                right,
+                ..
+            } => translatable(left, member, input) && translatable(right, member, input),
+            IRExpr::Not(inner, _) => translatable(inner, member, input),
+            IRExpr::IsNull { expr, .. } => operand(expr, member, node_type),
+            IRExpr::Binary {
+                left,
+                op:
+                    BinaryOp::Compare(
+                        CompOp::Eq | CompOp::Ne | CompOp::Lt | CompOp::Le | CompOp::Gt | CompOp::Ge,
+                    ),
+                right,
+                ..
+            } => operand(left, member, node_type) && operand(right, member, node_type),
+            other => operand(other, member, node_type),
+        }
+    })
 }
 
 /// The candidate plan as a chain, root first, or why it is none.
@@ -1316,6 +1179,12 @@ fn chain_of(
                                 .contains_key(&spec.table.type_key)
                     }
                 };
+                if ranked.is_some() {
+                    return Err(invalid(format!(
+                        "the scan of `{}` is ranked, which no member of the fragment is",
+                        spec.table.type_key
+                    )));
+                }
                 if !same_table
                     || hydrated_table.is_some_and(|table| *table != spec.table)
                     || spec.fragments.is_some()
@@ -1327,28 +1196,6 @@ fn chain_of(
                         spec.table.type_key
                     )));
                 }
-                let ranked = match ranked {
-                    None => None,
-                    Some(access)
-                        if access.kind == RankKind::Bm25
-                            && access.fetch.is_none()
-                            && access.nprobes.is_none()
-                            && access.scope == RankScope::Order
-                            && access.overfetch.is_empty()
-                            && access.prefilter.is_none() =>
-                    {
-                        Some(ChainRanking {
-                            property: access.property.clone(),
-                            query: mirror(&access.query),
-                            eligibility: access.eligibility,
-                        })
-                    }
-                    Some(_) => {
-                        return Err(invalid(
-                            "the scan's ranking is no exact bm25 retrieval".into(),
-                        ));
-                    }
-                };
                 (
                     ChainNode::Scan {
                         type_key: spec.table.type_key.clone(),
@@ -1360,7 +1207,6 @@ fn chain_of(
                             .map(|filter| filter.gq_filters().iter().map(mirror).collect())
                             .unwrap_or_default(),
                         projection: spec.projection.clone(),
-                        ranked,
                         lowered: true,
                     },
                     None,

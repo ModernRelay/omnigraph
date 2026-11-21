@@ -286,6 +286,37 @@ async fn linear_head(uri: &str) -> u64 {
         .version
 }
 
+/// The Person properties the ensure-indices cell declares beside `age`.
+const ENSURE_INDICES_PROPERTIES: &str = "age: I32? @index\n    status: enum(active, retired)? @index\n    nick: String? @index\n    bio: String? @index(fulltext)\n    labels: [String]? @index";
+
+/// After recovery and an index pass, every scalar kind the cell declared is
+/// built on Person in its own family: the crashed attempt left none half
+/// visible, and the pass built each.
+async fn assert_scalar_index_kinds_built(cell: &str, db: &Omnigraph) {
+    let ds = helpers::open_pinned_dataset_for_test(db, "main", "node:Person").await;
+    let indices = lance::index::DatasetIndexExt::load_indices(&ds)
+        .await
+        .unwrap();
+    for (column, expected) in [
+        ("age", &["BTree"][..]),
+        ("status", &["Bitmap"][..]),
+        ("nick", &["BTree", "NGram"][..]),
+        ("bio", &["BTree", "Inverted", "NGram"][..]),
+        ("labels", &["LabelList"][..]),
+    ] {
+        let field = ds.schema().field(column).unwrap().id;
+        let mut families: Vec<&str> = indices
+            .iter()
+            .filter(|index| index.fields == [field])
+            .filter_map(|index| index.index_details.as_ref())
+            .filter_map(|details| details.type_url.rsplit('.').next())
+            .map(|message| message.trim_end_matches("IndexDetails"))
+            .collect();
+        families.sort_unstable();
+        assert_eq!(families, expected, "{cell}: the indexes of Person.{column}");
+    }
+}
+
 /// A converging run leaves the Person pin a detached version that opens and
 /// the linear HEAD where the cell found it.
 async fn assert_pin_detached_and_head_unmoved(
@@ -414,7 +445,7 @@ async fn load_two(db: &Session, name: &str) -> omnigraph::error::Result<()> {
         "{{\"type\": \"Person\", \"data\": {{\"name\": \"{name}_a\", \"age\": 30}}}}\n\
          {{\"type\": \"Person\", \"data\": {{\"name\": \"{name}_b\", \"age\": 31}}}}"
     );
-    db.load_jsonl(&payload, LoadMode::Append).await.map(|_| ())
+    db.load_jsonl(&payload, LoadMode::Insert).await.map(|_| ())
 }
 
 fn upgrade_execute() -> SystemColumnUpgradeOptions {
@@ -618,7 +649,7 @@ async fn cleanup_retains_live_branch_staging_until_owner_recreation() {
             "feature",
             None,
             r#"{"type":"Person","data":{"name":"Grace","age":37}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
             None,
         )
         .await;
@@ -723,10 +754,13 @@ async fn run_cell(
     let knows_uri = table_uri(&db, "edge:Knows").await;
     let write_name = format!("m{index}_w");
 
-    // An index cell needs index work: a declared BTREE the schema apply
-    // records and leaves unbuilt.
+    // An index cell needs index work: declared indexes the schema apply
+    // records and leaves unbuilt, one of every scalar kind (a BTREE, an
+    // enum's BITMAP, a plain `@index` String's NGRAM and BTREE, an
+    // `@index(fulltext)` String's full text beside them, and a list's
+    // LABEL_LIST), so a crashed reconciliation stages them together.
     if writer == Writer::EnsureIndices {
-        db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index"))
+        db.apply_schema(&helpers::TEST_SCHEMA.replace("age: I32?", ENSURE_INDICES_PROPERTIES))
             .await
             .unwrap();
     }
@@ -751,11 +785,12 @@ async fn run_cell(
         }
     }
     // A full-text rebuild cell needs a built full-text index with rows
-    // behind it: a `String @index` Person property, one row carrying text,
+    // behind it: a `String @index(fulltext)` Person property, one row carrying text,
     // and the initial build.
     if writer == Writer::FtsRebuild {
         db.apply_schema(
-            &helpers::TEST_SCHEMA.replace("age: I32?", "age: I32?\n    city: String? @index"),
+            &helpers::TEST_SCHEMA
+                .replace("age: I32?", "age: I32?\n    city: String? @index(fulltext)"),
         )
         .await
         .unwrap();
@@ -763,7 +798,7 @@ async fn run_cell(
             &format!(
                 "{{\"type\": \"Person\", \"data\": {{\"name\": \"m{index}_fts\", \"city\": \"machine learning\"}}}}"
             ),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -1101,6 +1136,7 @@ async fn run_cell(
             .await
             .unwrap_or_else(|error| panic!("{cell}: index pass after recovery failed: {error}"));
         assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
+        assert_scalar_index_kinds_built(&cell, &fresh).await;
         fresh
             .ensure_indices_as(None)
             .await

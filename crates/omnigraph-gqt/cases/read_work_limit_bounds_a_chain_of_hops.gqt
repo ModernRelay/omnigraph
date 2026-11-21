@@ -1,0 +1,102 @@
+# issue: none
+# notes: Every read runs under `read_work_limit`, charged by the rows each
+# notes: expansion produces, every hop together, so a chain of single hops
+# notes: whose rows multiply fails with a typed error naming the setting,
+# notes: never a partial result. Under the default the same read runs. A
+# notes: hop range is charged every neighbor it examines, not only the two
+# notes: rows it returns, and a product every pair it forms, not only the
+# notes: three its filter keeps.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"a"}}
+{"type":"Person","data":{"handle":"b"}}
+{"type":"Person","data":{"handle":"c"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"a","to":"c"}
+{"edge":"Knows","from":"b","to":"a"}
+{"edge":"Knows","from":"b","to":"c"}
+{"edge":"Knows","from":"c","to":"a"}
+{"edge":"Knows","from":"c","to":"b"}
+
+--- query
+query chain() {
+    match { $p0: Person, $p0 knows $p1, $p1 knows $p2, $p2 knows $p3, $p3 knows $p4 }
+    where $p0.handle = "a"
+    return { count($p4) as n }
+}
+
+--- expect unordered
+{"n":16}
+
+--- expect shape
+n: I64
+
+--- query
+set read_work_limit = 10;
+query chain_over_its_budget() {
+    match { $p0: Person, $p0 knows $p1, $p1 knows $p2, $p2 knows $p3, $p3 knows $p4 }
+    where $p0.handle = "a"
+    return { count($p4) as n }
+}
+
+--- expect error: read_work_limit
+
+--- query
+query hop_range() {
+    match { $p0: Person, $p0 knows{1,4} $p1 }
+    where $p0.handle = "a"
+    return { count($p1) as n }
+}
+
+--- expect unordered
+{"n":2}
+
+--- expect shape
+n: I64
+
+--- query
+set read_work_limit = 5;
+query hop_range_over_its_budget() {
+    match { $p0: Person, $p0 knows{1,4} $p1 }
+    where $p0.handle = "a"
+    return { count($p1) as n }
+}
+
+--- expect error: read_work_limit
+
+--- query
+query product() {
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
+    where $p.handle < $q.handle
+    return { count($q) as n }
+}
+
+--- expect unordered
+{"n":3}
+
+--- expect shape
+n: I64
+
+--- query
+set read_work_limit = 8;
+query product_over_its_budget() {
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
+    where $p.handle < $q.handle
+    return { count($q) as n }
+}
+
+--- expect error: read_work_limit

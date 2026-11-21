@@ -46,10 +46,8 @@ query joins them:
 
 ```gq
 query jobs_naming_no_operator() {
-  match {
-    $j: Job
-    not { $o: @Operator $o.name = $j.uses }
-  }
+  match { $j: Job }
+  where not exists { $o: @Operator where $o.name = $j.uses }
   return { $j.name }
 }
 ```
@@ -65,8 +63,8 @@ See [Authorization and actors](../operations/policy.md).
 
 - `insert`, `update`, `delete` and `load` targeting an `@` type: the rows
   are the engine's.
-- `search`, `fuzzy`, `match_text`, `bm25`, `nearest` and `rrf` over a
-  catalogue binding: catalogue rows have no index. Scalar predicates,
+- `match_terms`, `bm25`, `nearest` and `rrf` over a catalogue binding:
+  catalogue properties declare no index (`T27` for the full-text calls). Scalar predicates,
   projection, aggregation, ordering, limits and joins work as on any type.
 - Under `og_catalog`: any stored type, any write, blob, branch, commit,
   snapshot, export, change feed or stored query.
@@ -116,24 +114,30 @@ binary's rows.
 | AntiJoin | [2] |
 | ClassifyThreeWay | [1] |
 | ContainsJoin | [2] |
+| Correlate | [1, 2] |
 | CrossJoin | [2] |
 | CsvSource | [0] |
 | DeltaSource | [0] |
 | Expand | [1] |
 | Filter | [1] |
 | FragmentWrite | [1] |
+| Fuse | [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] |
 | HashJoin | [2] |
 | HydrateByAddress | [1] |
 | HydrateColumns | [1] |
+| Let | [1] |
 | MetadataCount | [0] |
+| OptionalJoin | [2] |
 | OuterReference | [0] |
 | Page | [1] |
 | Projection | [1] |
-| RankFuse | [2] |
 | RowCompare | [1] |
 | Scan | [0, 1] |
+| Score | [1] |
 | Sort | [1] |
 | SortMergeJoin | [2] |
+| TargetCut | [1] |
+| Union | [2] |
 | Validate | [1] |
 <!-- /catalogue:operators -->
 
@@ -160,12 +164,13 @@ binary's rows.
 |---|---|---|---|
 | ann_nprobes | integer(0..) | 20 | request |
 | change_lineage | enum(off, on, verify) | on | request |
-| engine | enum(v2) | v2 | request |
 | explain_dump_dir | text |  | process |
 | history_release_bytes | integer(1024..=262144) | 262144 | request |
 | load_source_max_bytes | integer(1..) | 33554432 | request |
 | merge_lineage | enum(off, on, verify) | on | request |
+| plan_budget_limit | integer(1..=9223372036854775807) | 65536 | request |
 | query_memory_bytes | integer(1..) | 157286400 | request |
+| read_work_limit | integer(1..=9223372036854775807) | 100000000 | request |
 | rrf_plan | enum(auto, force_prefilter, force_postfilter) | auto | process |
 | stage_write_concurrency | integer(1..=64) | 8 | process |
 | traversal_work_limit | integer(1..=9223372036854775807) | 1000000 | request |
@@ -177,22 +182,27 @@ binary's rows.
 |---|---|
 | Aggregate | refused_by_name |
 | AntiJoin | refused_by_name |
+| Correlate | refused_by_name |
 | CsvSource | refused_by_name |
 | DeltaSource | refused_by_name |
 | Expand | refused_by_name |
 | Filter | routable |
 | FragmentWrite | refused_by_name |
+| Fuse | refused_by_name |
 | Join | routable |
+| Let | refused_by_name |
 | Limit | routable |
 | MergeClassify | routable |
 | MetadataCount | refused_by_name |
 | Nearest | refused_by_name |
+| OptionalJoin | refused_by_name |
 | OuterReference | refused_by_name |
 | Projection | routable |
-| RankFuse | refused_by_name |
 | RowDiff | routable |
+| Score | refused_by_name |
 | Sort | routable |
 | TableScan | routable |
-| TextSearch | refused_by_name |
+| TargetCut | refused_by_name |
+| Union | refused_by_name |
 | Validate | refused_by_name |
 <!-- /catalogue:logical_kinds -->

@@ -1,0 +1,173 @@
+# issue: none
+# notes: The exact lexical scan answers a field whose index declares an analyzer at every coverage
+# notes: state (the GQ 3 RFC, section 4, "Exact execution and qualified
+# notes: acceleration"): the analyzer is instantiated from the accepted schema whether or not an
+# notes: index exists, so `matches(indexed) = matches(unindexed) = matches(partially indexed)` and a
+# notes: declared but unbuilt index answers instead of refusing. `Doc.title` is indexed when the
+# notes: first steps run; the twins `t1` and `t4` are inserted after the build, into a fragment no
+# notes: segment covers, and are answered as their originals are, scoring what their originals
+# notes: score over the grown corpus. `Memo` holds no row when the index is built, so its rows have
+# notes: no postings at all. `english_v1` stems (`engine` matches `Engines`, `running` matches
+# notes: `runs`) and drops stop words. The statistics population of `bm25_v1` is the field corpus,
+# notes: before any graph or property filter, so a population narrowed by `year` leaves each
+# notes: surviving entity's score unchanged. The plan names the path: a `Score` over the
+# notes: population's scan, no ranked full-text scan. The reference interpreter applies no stemmer,
+# notes: so these steps have no reference comparison.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String? @index(fulltext, analyzer = "english_v1")
+    year: I64
+}
+node Memo {
+    slug: String @key
+    body: String? @index(fulltext, analyzer = "standard_folded_v1")
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"Graph Engines","year":2020}}
+{"type":"Doc","data":{"slug":"d2","title":"the graph of search","year":1999}}
+{"type":"Doc","data":{"slug":"d3","title":"Databases","year":2021}}
+{"type":"Doc","data":{"slug":"d4","title":"a search engine runs","year":2023}}
+{"type":"Doc","data":{"slug":"d5","year":2022}}
+
+--- query
+query ranked() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, "engine search") as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d4","score":1.150885884703}
+{"d.slug":"d1","score":0.69314718056}
+{"d.slug":"d2","score":0.69314718056}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect plan
+pipeline 0: Scan -> Score -> Projection => Sort
+
+--- query
+query ranked_after_2000() {
+    match { let $pop = { match { $d: Doc } where $d.year > 2000 return { $d } }, from bm25($pop, $d.title, "engine search") as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d4","score":1.150885884703}
+{"d.slug":"d1","score":0.69314718056}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- query
+query stemmed_every_term() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("running engines"))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d4"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query stemmed_within_one_edit() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("grapf", max_edits: 1))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- mutate
+query twins() {
+    replace Doc { slug: "t1", title: "Graph Engines", year: 2020 }
+    replace Doc { slug: "t4", title: "a search engine runs", year: 2023 }
+    replace Memo { slug: "m1", body: "Café au lait" }
+    replace Memo { slug: "m2", body: "cafes and bars" }
+    replace Memo { slug: "m3", body: "" }
+}
+
+--- expect ok
+
+--- query
+query ranked_partially_indexed() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, "engine search") as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d4","score":0.980677525051}
+{"d.slug":"t4","score":0.980677525051}
+{"d.slug":"d2","score":0.715668208087}
+{"d.slug":"d1","score":0.456188329068}
+{"d.slug":"t1","score":0.456188329068}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- query
+query stemmed_within_one_edit_partially_indexed() {
+    match { $d: Doc }
+    where match_terms($d.title, terms("grapf", max_edits: 1))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d2"}
+{"d.slug": "t1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query unbuilt_matches() {
+    match { $m: Memo }
+    where match_terms($m.body, terms("cafe", max_edits: 1))
+    return { $m.slug }
+}
+
+--- expect unordered
+{"m.slug": "m1"}
+{"m.slug": "m2"}
+
+--- expect shape
+m.slug: String
+
+--- query
+query unbuilt_ranks() {
+    match { let $pop = { match { $m: Memo } return { $m } }, from bm25($pop, $m.body, terms("cafe", max_edits: 1)) as $score }
+    return { $m.slug, $score }
+    order { $score desc, $m.slug }
+}
+
+--- expect ordered
+{"m.slug":"m1","score":0.182321556794}
+{"m.slug":"m2","score":0.091160778397}
+
+--- expect shape
+m.slug: String
+score: F64

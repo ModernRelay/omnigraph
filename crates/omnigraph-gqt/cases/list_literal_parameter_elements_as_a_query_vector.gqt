@@ -1,0 +1,97 @@
+# issue: none
+# notes: A vector literal may hold parameters: `nearest` and `distance` over
+# notes: `[$x, $y, 0.0]` rank as they do over a `Vector(3)` parameter bound to
+# notes: the same values, and the list's elements are counted against the
+# notes: field's dimension as a literal list's are.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(3)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","embedding":[0.0,1.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","embedding":[0.6,0.8,0.0]}}
+
+--- query
+query parameter_elements($x: F64, $y: F64) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from nearest($pop, $d.embedding, [$x, $y, 0.0], k: 2) as $s
+    }
+    return { $d.slug, $s }
+    order { $s asc, $d.slug asc }
+}
+
+--- params
+{"x": 0.0, "y": 1.0}
+
+--- expect ordered
+{"d.slug":"b","s":0.0}
+{"d.slug":"c","s":0.4}
+
+--- expect shape
+d.slug: String
+s: F32
+
+--- query
+query vector_parameter($q: Vector(3)) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from nearest($pop, $d.embedding, $q, k: 2) as $s
+    }
+    return { $d.slug, $s }
+    order { $s asc, $d.slug asc }
+}
+
+--- params
+{"q": [0.0, 1.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"b","s":0.0}
+{"d.slug":"c","s":0.4}
+
+--- expect shape
+d.slug: String
+s: F32
+
+--- query
+query distance_over_parameter_elements($x: F32) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from distance($pop, $d.embedding, [$x, 0.0, 0.0]) as $s
+    }
+    return { $d.slug, $s }
+    order { $s asc, $d.slug asc }
+}
+
+--- params
+{"x": 1.0}
+
+--- expect ordered
+{"d.slug":"a","s":0.0}
+{"d.slug":"c","s":0.8}
+{"d.slug":"b","s":2.0}
+
+--- expect shape
+d.slug: String
+s: F32
+
+--- query
+query too_few_elements($x: F64) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from nearest($pop, $d.embedding, [$x, 0.0], k: 2) as $s
+    }
+    return { $d.slug }
+}
+
+--- expect error: T15: `Doc.embedding` is Vector(3); the query vector has 2 elements

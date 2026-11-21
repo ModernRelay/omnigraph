@@ -1,0 +1,80 @@
+# issue: 921
+# red_on: e2503203c: `insert Link { from: "a", to: "b" }` against `node Link` and `edge Link` fails with `T11: type `Link` has no property `from``, because the insert's target resolves to the node type whenever both namespaces hold the name.
+# notes: A node type and an edge type may share a name; an insert's endpoint assignments make it an edge insert, and an insert without them a node insert. A delete names a bound edge variable, whose type the traversal already fixed.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Link {
+    name: String @key
+}
+
+edge Link: Link -> Link {
+    weight: I32?
+}
+
+--- seed
+{"type":"Link","data":{"name":"a"}}
+{"type":"Link","data":{"name":"b"}}
+
+--- mutate
+query link_edge() {
+    insert Link { @src: "a", @dst: "b", weight: 3 }
+}
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query link_node() {
+    replace Link { name: "c" }
+}
+--- expect affected: nodes=1 edges=0
+
+--- query
+query edges() {
+    match { $x: Link, $y: Link, $x $e:link $y }
+    return { $x.name, $y.name, $e.weight }
+}
+--- expect unordered
+{"x.name":"a","y.name":"b","e.weight":3}
+--- expect shape
+x.name: String
+y.name: String
+e.weight: I32?
+
+--- query
+query nodes() {
+    match { $x: Link }
+    return { $x.name }
+}
+--- expect unordered
+{"x.name":"a"}
+{"x.name":"b"}
+{"x.name":"c"}
+--- expect shape
+x.name: String
+
+--- mutate
+query unlink() {
+    match { $x: Link, $y: Link, $x $e:link $y } where $x.name = "a"
+    delete $e
+}
+--- expect affected: nodes=0 edges=1
+
+--- query
+query edges_after_delete() {
+    match { $x: Link, $y: Link, $x $e:link $y }
+    return { $x.name, $y.name }
+}
+--- expect unordered
+--- expect shape
+x.name: String
+y.name: String

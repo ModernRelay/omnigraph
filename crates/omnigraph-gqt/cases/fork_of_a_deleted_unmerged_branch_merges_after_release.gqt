@@ -37,7 +37,8 @@ branch create s from b
 
 --- mutate branch: s
 query set_bob_on_s() {
-    update Person set { age: 3 } where name = "bob"
+    match { $x: Person } where $x.name = "bob"
+    update $x set { age: 3 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -49,7 +50,8 @@ branch create t from s
 
 --- mutate branch: t
 query set_carol_on_t() {
-    update Person set { age: 5 } where name = "carol"
+    match { $x: Person } where $x.name = "carol"
+    update $x set { age: 5 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -57,7 +59,8 @@ query set_carol_on_t() {
 --- loop $i 1 5
 --- mutate branch: b
 query bump_alice($n: I32) {
-    update Person set { age: $n } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: $n }
 }
 --- params
 {"n": ${i}}

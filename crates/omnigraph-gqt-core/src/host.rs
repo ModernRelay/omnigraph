@@ -7,12 +7,13 @@ use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::storage::StorageAdapter;
+use omnigraph_compiler::ir::core::CoreRead;
 use omnigraph_compiler::{ParamMap, QueryResult};
 use serde_json::Value;
 
 use crate::concurrent::{ConcurrentStep, Pass, permutation};
 use crate::runner_config::SeamDirective;
-use crate::{Case, Item, QueryStep, Step, StepFail};
+use crate::{Case, Item, ReferenceRefusal, Step, StepFail};
 
 /// The most workers one label of a block declares on a host with a scripted
 /// clock (the plain host, the DST runner); a measuring host sets its own.
@@ -46,9 +47,9 @@ pub fn admit_workers_within(
     Ok(())
 }
 
-/// The admission of a host without the DST runner's gate and without the
-/// reference engine: no seam, no scripted block, no `same as v1` expect, and
-/// no block over the worker bound `bound` gives it on `host`.
+/// The admission of a host without the DST runner's gate: no seam, no
+/// scripted block, and no block over the worker bound `bound` gives it on
+/// `host`.
 pub fn admit_ungated_case(
     case: &Case,
     host: &str,
@@ -61,19 +62,6 @@ pub fn admit_ungated_case(
         );
     }
     admit_workers_within(case, host, bound)?;
-    if case.items.iter().any(|item| {
-        let steps = match item {
-            Item::Step(step) => std::slice::from_ref(step),
-            Item::Loop { steps, .. } => steps,
-        };
-        steps
-            .iter()
-            .any(|step| matches!(step, Step::Query(query) if query.same_as_v1))
-    }) {
-        return Err(
-            "unsupported_environment: this executor cannot compare the reference engine".into(),
-        );
-    }
     Ok(())
 }
 
@@ -127,13 +115,31 @@ pub trait ExecutionHost: Sync {
         .boxed()
     }
 
-    fn reference_query<'a>(
+    /// Whether this host holds a step's `--- expect plan` against the plan
+    /// it ran. A physical-layout variant (`gq_layout_tests.rs`) does not: a
+    /// plan claim names the access path of the case's own layout, while the
+    /// rows, shapes and refusals hold under every layout.
+    fn checks_plans(&self) -> bool {
+        true
+    }
+
+    /// Whether this host compares every read step with the core reference
+    /// interpreter: the GQT runner on the direct engine does; DST, served
+    /// and measuring executors run the case without it.
+    fn compares_reference(&self) -> bool {
+        false
+    }
+
+    /// The core reference interpreter's outcome for `read` over `target`
+    /// of the case session: its rows, or its refusal. `Err` is a failure to
+    /// reach the interpreter at all (the export, the host).
+    fn reference_rows<'a>(
         &'a self,
         _session: &'a Session,
-        _step: &'a QueryStep,
-        _target: ReadTarget,
+        _read: &'a CoreRead,
+        _target: &'a ReadTarget,
         _params: &'a ParamMap,
-    ) -> BoxFuture<'a, Result<QueryResult, String>> {
+    ) -> BoxFuture<'a, Result<Result<Vec<Value>, ReferenceRefusal>, String>> {
         futures::future::ready(Err(
             "unsupported_environment: reference comparison requires the GQT runner".into(),
         ))

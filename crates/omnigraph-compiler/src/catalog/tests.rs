@@ -155,6 +155,7 @@ fn test_edge_lookup_handles_non_ascii_leading_character() {
                     name: "name".to_string(),
                     prop_type: PropType::scalar(ScalarType::String, false),
                     annotations: vec![],
+                    distance: None,
                 }],
                 constraints: vec![],
                 source_constraints: vec![],
@@ -282,4 +283,55 @@ title: String
     let catalog = build_catalog(&schema).unwrap();
     let signal = &catalog.node_types["Signal"];
     assert!(signal.indices.contains(&vec!["slug".to_string()]));
+}
+
+/// What a String's one-column declaration builds: a `@key` alone a BTREE, an
+/// explicit `@index` (with a `@key` or in the body form) an NGRAM and a
+/// BTREE, and only `@index(fulltext, ...)` a full-text index beside them.
+/// Every one is a lexical field. Another type builds the same kinds whatever
+/// the declaration. The catalog built from accepted IR agrees.
+#[test]
+fn string_index_kinds_follow_the_declaration() {
+    use crate::catalog::schema_ir::{SchemaIdentityDomain, initialize_schema_ir};
+    use crate::catalog::schema_shape::compile_schema_shape;
+    use crate::types::PropIndexKind::{Bitmap, Btree, FullText, NGram};
+    let input = r#"
+node Doc {
+slug: String @key
+title: String @index
+body: String @index(fulltext)
+note: String
+kind: enum(a, b) @index
+@index(note)
+}
+node Tag {
+n: I32 @index
+code: String @key @index
+}
+"#;
+    let schema = parse_schema(input).unwrap();
+    let domain = SchemaIdentityDomain::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap();
+    let ir = initialize_schema_ir(domain, &compile_schema_shape(&schema).unwrap())
+        .unwrap()
+        .schema_ir;
+    for catalog in [
+        build_catalog(&schema).unwrap(),
+        build_catalog_from_ir(&ir).unwrap(),
+    ] {
+        let doc = &catalog.node_types["Doc"];
+        assert_eq!(doc.property_index_kinds("slug"), &[Btree]);
+        assert_eq!(doc.property_index_kinds("title"), &[NGram, Btree]);
+        assert_eq!(doc.property_index_kinds("body"), &[FullText, NGram, Btree]);
+        assert_eq!(doc.property_index_kinds("note"), &[NGram, Btree]);
+        assert_eq!(doc.property_index_kinds("kind"), &[Bitmap]);
+        for property in ["slug", "title", "body", "note"] {
+            assert!(doc.is_lexical_field(property), "{property}");
+            assert_eq!(doc.builds_full_text_index(property), property == "body");
+        }
+        assert!(!doc.is_lexical_field("kind"));
+        let tag = &catalog.node_types["Tag"];
+        assert_eq!(tag.property_index_kinds("code"), &[NGram, Btree]);
+        assert!(tag.is_lexical_field("code") && !tag.builds_full_text_index("code"));
+        assert_eq!(tag.property_index_kinds("n"), &[Btree]);
+    }
 }

@@ -3,7 +3,7 @@ use crate::helpers;
 use crate::helpers::*;
 use arrow_array::{Array, Int32Array};
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
 
@@ -14,7 +14,7 @@ async fn wildcard_reads_refuse_historical_targets_issue_659() {
     let version = version_main(&db).await.unwrap();
     let snapshot = snapshot_id(&db, "main").await.unwrap();
     let source = r#"query neighbors() {
-        match { $p: Person { name: "Alice" } $f: Person $p * $f }
+        match { $p: Person, $f: Person, $p * $f } where $p.name = "Alice"
         return { $f.name }
     }"#;
     assert_eq!(
@@ -82,13 +82,13 @@ async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_a
         .unwrap();
     db.load_jsonl(
         r#"{"edge":"Likes","from":"Alice","to":"Charlie"}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
     let captured = version_main(&db).await.unwrap();
     let selected = r#"query neighbors() {
-        match { $p: Person { name: "Alice" } $p $e:(knows | likes) $f }
+        match { $p: Person, $p $e:(knows | likes) $f } where $p.name = "Alice"
         return { $e.@type as edge_type, $f.name }
     }"#;
     assert_eq!(
@@ -100,7 +100,7 @@ async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_a
     );
     db.load_jsonl(
         r#"{"edge":"Likes","from":"Alice","to":"Bob"}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -137,7 +137,7 @@ async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_a
         for route in routes {
             let db = with_traversal(&db, route);
             let query = format!(
-                "query missing() {{ match {{ $p: Person {{ name: \"Alice\" }} $p {pattern} $f }} return {{ $f.@id }} }}"
+                "query missing() {{ match {{ $p: Person, $p {pattern} $f }} where $p.name = \"Alice\" return {{ $f.@id }} }}"
             );
             let error = db
                 .run_query_at(before, &query, "missing", &ParamMap::new())
@@ -166,9 +166,7 @@ async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_a
 
 const ALL_PERSONS_QUERY: &str = r#"
 query all_persons() {
-    match {
-        $p: Person
-    }
+    match { $p: Person }
     return { $p.name, $p.age }
     order { $p.name asc }
 }
@@ -176,10 +174,8 @@ query all_persons() {
 
 const FRIENDS_QUERY: &str = r#"
 query friends_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
+    where $p.name = $name
     return { $f.name }
     order { $f.name asc }
 }
@@ -187,10 +183,8 @@ query friends_of($name: String) {
 
 const UNEMPLOYED_QUERY: &str = r#"
 query unemployed() {
-    match {
-        $p: Person
-        not { $p worksAt $_ }
-    }
+    match { $p: Person }
+    where not exists { $p worksAt $_ }
     return { $p.name }
     order { $p.name asc }
 }
@@ -198,10 +192,8 @@ query unemployed() {
 
 const FILTERED_QUERY: &str = r#"
 query older_than($min_age: I32) {
-    match {
-        $p: Person
-        $p.age > $min_age
-    }
+    match { $p: Person }
+    where $p.age > $min_age
     return { $p.name, $p.age }
     order { $p.name asc }
 }
@@ -209,9 +201,8 @@ query older_than($min_age: I32) {
 
 const GET_PERSON_QUERY: &str = r#"
 query get_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.name, $p.age }
 }
 "#;
@@ -305,7 +296,7 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"Alice"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -398,13 +389,16 @@ async fn historical_query_resolves_rename_by_identity_but_rejects_reincarnation(
     );
 }
 
-/// A historical query binds a current property by its stable property id, as
-/// it binds a type by its table identity. A same-name re-add is a new property
-/// lifetime and must not read the dropped one's values; a rename since and an
-/// addition since have no column of the current lifetime under the current
-/// name. Each refuses as BadRequest instead of answering from another lifetime.
+/// A read at an earlier commit sees the schema accepted there (RFC GQ 3, A2),
+/// through stable identities: a property renamed since reads under its
+/// current name, a whole node holds the properties the commit holds, and
+/// naming one the commit does not hold (added since, or dropped and added
+/// again as a new property) is a type error naming the commit, before
+/// anything runs. Both historical doors decide the same shape, the bound plan
+/// records it, and replay at the same commit agrees.
+/// `issue_1058_a_read_at_a_commit_sees_its_own_schema.gqt` holds the rows.
 #[tokio::test]
-async fn historical_query_binds_properties_by_identity_not_name() {
+async fn historical_query_binds_properties_by_identity_issue_1058() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = session(
@@ -425,12 +419,13 @@ async fn historical_query_binds_properties_by_identity_not_name() {
             "\n",
             r#"{"edge":"Knows","from":"Alice","to":"Bob","data":{"since":2020}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
     let before = version_main(&db).await.unwrap();
     let before_snapshot = db.resolve_snapshot("main").await.unwrap();
+    let commit = before_snapshot.as_str().to_string();
 
     db.apply_schema(
         "node Person {\n    name: String @key\n    note: String?\n    remark: String? @rename_from(\"memo\")\n}\n\
@@ -451,43 +446,42 @@ async fn historical_query_binds_properties_by_identity_not_name() {
     .await
     .unwrap();
 
-    let note = "query q() { match { $p: Person { name: \"Alice\" } } return { $p.note } }";
+    let note = "query q() { match { $p: Person } where $p.name = \"Alice\" return { $p.note } }";
     let live = query_main(&db, note, "q", &ParamMap::new()).await.unwrap();
     assert!(
         collect_column_strings(live.batches(), "p.note").is_empty(),
         "the re-added property starts empty on the live branch"
     );
 
-    let missing = |property: &str, owner: &str| {
-        format!("property '{property}' of {owner} does not exist at this snapshot")
+    let absent = |owner: &str, property: &str, why: &str| {
+        format!("`{owner}` has no property `{property}` at commit `{commit}`: {why}")
+    };
+    let again = |property: &str| {
+        format!(
+            "the `{property}` that commit holds was dropped since, and `{property}` was added again as a new property"
+        )
     };
     for (source, expected) in [
-        (note.to_string(), missing("note", "node type 'Person'")),
+        (note.to_string(), absent("Person", "note", &again("note"))),
         (
-            "query q() { match { $p: Person\n $p.note = \"secret\" } return { $p.name } }"
+            "query q() { match { $p: Person } where $p.note = \"secret\" return { $p.name } }"
                 .to_string(),
-            missing("note", "node type 'Person'"),
-        ),
-        (
-            "query q() { match { $p: Person } return { $p.name, $p.remark } }".to_string(),
-            "property 'remark' of node type 'Person' is named 'memo' at this snapshot; \
-             a historical query cannot read a property across a rename"
-                .to_string(),
+            absent("Person", "note", &again("note")),
         ),
         (
             "query q() { match { $p: Person } return { $p.name, $p.age } }".to_string(),
-            missing("age", "node type 'Person'"),
+            absent("Person", "age", "it was added after that commit"),
         ),
         (
-            "query q() { match { $p: Person $p $k:knows $f } return { $f.name, $k.since } }"
+            "query q() { match { $p: Person, $p $k:knows $f } return { $f.name, $k.since } }"
                 .to_string(),
-            missing("since", "edge type 'Knows'"),
+            absent("Knows", "since", &again("since")),
         ),
     ] {
         let at_version = db
             .run_query_at(before, &source, "q", &ParamMap::new())
             .await
-            .expect_err("a property lifetime absent at the snapshot must refuse");
+            .expect_err("a property lifetime absent at the commit must refuse");
         let at_snapshot = db
             .query(
                 ReadTarget::Snapshot(before_snapshot.clone()),
@@ -496,52 +490,107 @@ async fn historical_query_binds_properties_by_identity_not_name() {
                 &ParamMap::new(),
             )
             .await
-            .expect_err("a property lifetime absent at the snapshot must refuse");
-        for error in [at_version, at_snapshot] {
+            .expect_err("a property lifetime absent at the commit must refuse");
+        let explained = db
+            .explain_query(
+                ReadTarget::Snapshot(before_snapshot.clone()),
+                &source,
+                "q",
+                &ParamMap::new(),
+            )
+            .await
+            .expect_err("the shape is fixed before planning");
+        for error in [at_version, at_snapshot, explained] {
             assert!(
-                matches!(
-                    error,
-                    OmniError::Manifest(ref error)
-                        if error.kind == ManifestErrorKind::BadRequest
-                            && error.message == expected
-                ),
-                "{source}: expected BadRequest {expected:?}; got {error:?}"
+                matches!(error, OmniError::Compiler(_))
+                    && error.to_string().contains("T6")
+                    && error.to_string().contains(&expected),
+                "{source}: expected T6 {expected:?}; got {error:?}"
             );
         }
     }
 
-    let whole_node = db
-        .run_query_at(
-            before,
-            "query q() { match { $p: Person } return { $p } }",
+    let renamed = "query q() { match { $p: Person } where $p.remark = \"kept\" return { $p.name, $p.remark } }";
+    let whole = "query q() { match { $p: Person } return { $p } order { $p.name asc } }";
+    for result in [
+        db.run_query_at(before, renamed, "q", &ParamMap::new())
+            .await
+            .unwrap(),
+        db.query(
+            ReadTarget::Snapshot(before_snapshot.clone()),
+            renamed,
             "q",
             &ParamMap::new(),
         )
         .await
-        .expect_err("a whole node reads every current property");
-    assert!(
-        matches!(
-            whole_node,
-            OmniError::Manifest(ref error)
-                if error.kind == ManifestErrorKind::BadRequest
-                    && error.message.contains(" at this snapshot")
-        ),
-        "{whole_node:?}"
-    );
+        .unwrap(),
+    ] {
+        assert_eq!(
+            collect_column_strings(result.batches(), "p.remark"),
+            vec!["kept".to_string()],
+            "a property renamed since reads under its current name through its identity"
+        );
+    }
+    let rows = |result: &omnigraph_compiler::result::QueryResult| {
+        let serde_json::Value::Array(rows) = result.to_rust_json().unwrap() else {
+            panic!("rows")
+        };
+        rows
+    };
+    let expected = serde_json::json!([
+        {"p": {"@id": "Alice", "name": "Alice", "remark": "kept"}},
+        {"p": {"@id": "Bob", "name": "Bob"}},
+    ]);
+    let at_version = db
+        .run_query_at(before, whole, "q", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(serde_json::Value::Array(rows(&at_version)), expected);
 
-    let names = db
-        .run_query_at(
-            before,
-            "query q() { match { $p: Person } return { $p.name } order { $p.name asc } }",
+    let inspected = db
+        .query_inspected(
+            ReadTarget::Snapshot(before_snapshot.clone()),
+            whole,
             "q",
             &ParamMap::new(),
         )
         .await
         .unwrap();
+    assert_eq!(serde_json::Value::Array(rows(&inspected.result)), expected);
+    let envelope = omnigraph_planner::ReplayEnvelope::new(
+        whole,
+        "q",
+        inspected.plan.clone(),
+        &inspected.evidence,
+        inspected.catalog.clone(),
+    )
+    .to_bytes();
+    let replayed = db
+        .replay_bound_plan(ReadTarget::Snapshot(before_snapshot.clone()), &envelope)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::Value::Array(rows(&replayed.result)), expected);
     assert_eq!(
-        collect_column_strings(names.batches(), "p.name"),
-        vec!["Alice".to_string(), "Bob".to_string()],
-        "a property kept under its own name and lifetime still reads at the snapshot"
+        replayed.result.schema(),
+        inspected.result.schema(),
+        "replay at the same commit answers the shape the bound plan recorded"
+    );
+
+    let catalog = db
+        .query_catalog(ReadTarget::Snapshot(before_snapshot.clone()))
+        .await
+        .unwrap();
+    let person = &catalog.node_types["Person"];
+    let mut held: Vec<&str> = person.properties.keys().map(String::as_str).collect();
+    held.sort_unstable();
+    assert_eq!(held, ["name", "remark"]);
+    assert_eq!(catalog.historical().unwrap().commit(), commit);
+    assert!(
+        db.query_catalog("main")
+            .await
+            .unwrap()
+            .historical()
+            .is_none()
     );
 }
 
@@ -755,7 +804,7 @@ async fn negation_insert_shrinks_antijoin_result() {
         &db,
         r#"
 query hire($from: String, $to: String) {
-    insert WorksAt { from: $from, to: $to }
+    insert WorksAt { @src: $from, @dst: $to }
 }
 "#,
         "hire",
@@ -799,7 +848,8 @@ async fn negation_delete_edge_grows_antijoin_result() {
         &db,
         r#"
 query fire($from: String) {
-    delete WorksAt where from = $from
+    match { $x: WorksAt } where $x.@src = $from
+    delete $x
 }
 "#,
         "fire",
@@ -906,11 +956,8 @@ async fn multi_hop_traversal_historical_version() {
 
     let fof_query = r#"
 query fof($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $mid
-        $mid knows $f
-    }
+    match { $p: Person, $p knows $mid, $mid knows $f }
+    where $p.name = $name
     return { $f.name }
     order { $f.name asc }
 }

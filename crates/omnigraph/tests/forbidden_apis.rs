@@ -342,6 +342,8 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "entity_at"),
     ("db/omnigraph.rs", "snapshot_at_graph_manifest_version"),
     ("db/omnigraph.rs", "export_jsonl"),
+    ("db/omnigraph.rs", "export_jsonl_at"),
+    ("db/omnigraph.rs", "query_catalog"),
     ("db/omnigraph.rs", "export_jsonl_to_writer"),
     ("db/omnigraph.rs", "export_jsonl_unordered_to_writer"),
     ("db/omnigraph.rs", "graph_index"),
@@ -913,8 +915,8 @@ gateway_surfaces! {
         "count_rows", "count_rows_with_staged",
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
         "scan_update_matches",
-        "first_row_id_for_filter", "table_state", "has_btree_index",
-        "has_fts_index", "has_fts_postings", "has_vector_index", "root_uri", "dataset_uri", "scan_stream",
+        "first_row_id_for_filter", "table_state", "has_btree_index", "has_scalar_index",
+        "has_fts_index", "has_fts_postings", "has_vector_index_for", "root_uri", "dataset_uri", "scan_stream",
         "scan_stream_bounded", "scan_stream_for_rewrite_bounded",
         "scan_proven_insert_delta_bounded",
         "preflight_external_blob_uris", "prepare_keyed_write_batch_with_preflight",
@@ -944,7 +946,7 @@ gateway_surfaces! {
         "commit_staged_detached",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::Exact("detached full-text declaration of a schema-declared index")) => [
-        "commit_full_text_declarations",
+        "commit_full_text_declarations", "commit_full_text_redeclarations",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::ReadOrPure => [
         "session", "validate_initial_empty_table",
@@ -959,8 +961,8 @@ gateway_surfaces! {
         "count_rows", "promotion_check",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "scan_update_matches", "count_rows_with_staged",
-        "has_btree_index", "has_fts_index", "has_fts_postings",
-        "has_vector_index", "first_row_id_for_filter",
+        "has_btree_index", "has_scalar_index", "has_fts_index", "has_fts_postings",
+        "has_vector_index_for", "first_row_id_for_filter",
         "with_external_blob_policy", "preflight_external_blob_uris", "external_source",
         "preflight_persisted_blob_selection", "prepare_keyed_write_batch_with_preflight",
         "prepare_overwrite_blob_references_with_preflight",
@@ -993,7 +995,7 @@ gateway_surfaces! {
         "commit_staged_detached",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::Exact("detached full-text declaration of a schema-declared index")) => [
-        "commit_full_text_declarations",
+        "commit_full_text_declarations", "commit_full_text_redeclarations",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::EphemeralScratch) => [
         "append_or_create_batch", "create_empty_dataset", "write_dataset",
@@ -1003,6 +1005,7 @@ gateway_surfaces! {
         "covers_no_fragment", "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments",
         "user_indices_for_column",
         "has_btree_index_on", "has_fts_index_on", "has_fts_postings_on", "has_vector_index_on",
+        "has_scalar_index_on",
         "current_fragments", "is_btree_index", "key_column_coverage", "key_column_uncovered_tail",
         "key_column_covered_fragments",
     ],
@@ -1132,17 +1135,17 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 42, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 43, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".into_arc()", 7, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", "SnapshotHandle::new(", 5, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::from_expr(", 1, WriteProtocol::Composed("staged delete primitive")),
     ("table_store.rs", ".extend_deletions(", 1, WriteProtocol::Composed("staged delete primitive over row addresses its caller's scan captured: Lance's DeleteBuilder after its scan")),
     ("table_store.rs", "InsertBuilder::new(", 4, WriteProtocol::Composed("staged insert primitive, and the branch-merge scratch append of `append_or_create_batch`, written uncommitted and committed through `commit_builder` so the scratch commit carries the same timeout policy")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
     ("table_store.rs", "commit_builder(", 4, WriteProtocol::Composed("staged commit primitive, and the branch-merge scratch append's commit")),
-    ("table_store.rs", ".create_index_builder(", 6, WriteProtocol::Composed("staged index primitive, RFC 0067 whole-rebuild fold and untrained full-text declaration")),
-    ("table_store.rs", ".execute_uncommitted(", 12, WriteProtocol::Composed("staged physical primitive, and the branch-merge scratch append's write")),
+    ("table_store.rs", ".create_index_builder(", 7, WriteProtocol::Composed("staged index primitive (BTREE, BITMAP, LABEL_LIST, NGRAM, full text, vector), RFC 0067 whole-rebuild fold and untrained full-text declaration")),
+    ("table_store.rs", ".execute_uncommitted(", 13, WriteProtocol::Composed("staged physical primitive, and the branch-merge scratch append's write")),
     ("table_store.rs", ".delete(", 1, WriteProtocol::Composed("discard of a refused overwrite's own uncommitted fragment files under the dataset's `data/`, named by the finished writers' transactions and referenced by no manifest; a file that stays is logged and left to cleanup, the refusal still wins")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached rename-only system-column effect")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_changes_with_intent_and_expected(", 1, SYSTEM_COLUMNS_V9),
@@ -1154,7 +1157,9 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached index batch")),
     ("exec/staging.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
-    ("exec/staging.rs", ".dataset()", 2, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
+    // The third is the read-only probe of the ids an `insert` staged on a
+    // table another statement made an upsert.
+    ("exec/staging.rs", ".dataset()", 3, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
     ("exec/mutation.rs", "commit_updates_on_branch_with_expected(", 1, MUTATION_V9),
     ("loader/mod.rs", "commit_updates_on_branch_with_expected(", 1, LOAD_V9),
     ("exec/merge.rs", "commit_updates_on_branch_with_expected(", 1, MERGE_V9),
@@ -1202,6 +1207,9 @@ durable_calls! {
     // Blob live-branch recheck: lists the table's refs to prove a vanished
     // fork before the incarnation refusal; read-only access to the handle.
     ("blob.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
+    // An `upsert` that omits properties reads which stored columns are Blobs
+    // before it fills the omitted cells; read-only schema access.
+    ("exec/keep_omitted.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     ("exec/blob_write.rs", ".dataset()", 4, WriteProtocol::ReadOnlyAccess),
     // A delete cascade plans its edge-table reads from the edge table's index
     // coverage (`validate::RemovalEdgeReads`); read-only metadata access.
@@ -3599,14 +3607,14 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_io_probes",
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_memory_limit",
     "instrumentation.rs: omnigraph_core::instrumentation::with_query_memory_probes",
-    "instrumentation.rs: omnigraph_core::instrumentation::with_rrf_gate_subset_drop",
     "instrumentation.rs: omnigraph_core::instrumentation::with_stage_write_probes",
     "lib.rs: lance_access::object_store_seam",
     "lib.rs: lance_access::store_registry as dst_lance_store_registry",
     "lib.rs: omnigraph_core::dst_clock",
     "lib.rs: omnigraph_core::dst_gate",
     "lib.rs: omnigraph_core::dst_ids",
-    "lib.rs: omnigraph_core::fts_compat::ANALYZER_GENERATION as FTS_ANALYZER_GENERATION",
+    "lib.rs: omnigraph_core::fts_analysis::measured as fts_measured_analysis",
+    "lib.rs: omnigraph_core::fts_compat::CERTIFICATE_FORMAT_VERSION as FTS_CERTIFICATE_FORMAT_VERSION",
     "seams.rs: omnigraph_core::seams::Behavior",
     "seams.rs: omnigraph_core::seams::Counted",
     "seams.rs: omnigraph_core::seams::Decide",
@@ -4552,6 +4560,7 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
                 "db/omnigraph/export.rs".to_string(),
                 1
             ),
+            ("managed_blob_payloads", "exec/blob_copy.rs".to_string(), 1),
             ("managed_blob_payloads", "table_store.rs".to_string(), 1),
             ("read_blobs", "table_store.rs".to_string(), 1),
             ("take_blobs", "blob.rs".to_string(), 1),
@@ -5193,21 +5202,19 @@ fn split_crate_test_util_is_enabled_only_by_dev_dependencies() {
         violations.is_empty(),
         "a production build enables a split crate's `test-util`, so the \
          `cfg(any(test, feature = \"test-util\"))` code compiles into it; enable it from \
-         [dev-dependencies] only (`REGULAR_TEST_UTIL_ENABLES` names the two test crates \
-         exempt):\n  {}",
+         [dev-dependencies] only:\n  {}",
         violations.join("\n  ")
     );
 }
 
 /// The engine facade fences the split crates only while every other crate reaches
-/// them through `omnigraph`; the reference engine reads them directly because it
-/// may not depend on the engine.
+/// them through `omnigraph`.
 #[test]
 fn split_crates_are_dependencies_of_the_engine_only() {
     let violations = split_crate_dependents(&workspace_manifests());
     assert!(
         violations.is_empty(),
-        "a crate other than the engine or the reference engine depends on omnigraph-core or \
+        "a crate other than the engine depends on omnigraph-core or \
          omnigraph-catalog directly and bypasses the engine facade; depend on `omnigraph` \
          instead:\n  {}",
         violations.join("\n  ")
@@ -5234,20 +5241,10 @@ fn split_crate_dependents_pin_resolves_renames_and_workspace_aliases() {
             "[package]\nname = \"omnigraph-catalog\"\n[dependencies]\nomnigraph-core = { path = \"../core\" }\n",
         ),
     ];
-    let reference = manifest(
-        "reference/Cargo.toml",
-        "[package]\nname = \"omnigraph-reference-engine\"\n[dependencies]\n\
-         omnigraph-core = { path = \"../core\" }\nomnigraph-catalog = { path = \"../catalog\" }\n",
-    );
     assert_eq!(
-        split_crate_dependents(&[
-            root.clone(),
-            allowed[0].clone(),
-            allowed[1].clone(),
-            reference
-        ]),
+        split_crate_dependents(&[root.clone(), allowed[0].clone(), allowed[1].clone()]),
         Vec::<String>::new(),
-        "the engine and the reference engine may depend on both split crates and the catalog on core"
+        "the engine may depend on both split crates and the catalog on core"
     );
     let offenders = [
         manifest(
@@ -5281,271 +5278,9 @@ fn split_crate_dependents_pin_resolves_renames_and_workspace_aliases() {
     );
 }
 
-/// The frozen engine v1 GQT's `expect same as v1` compares engine v2 against.
-const REFERENCE_ENGINE: &str = "omnigraph-reference-engine";
-
-/// v1 reaches no production build while GQT alone names it and it names
-/// neither v2's engine nor its planner. It is not in `GUARDED_CRATES`: it is
-/// test-only, and its own Lance scan copy would trip the production chokepoints.
-#[test]
-fn reference_engine_is_a_dependency_of_gqt_only() {
-    let violations = reference_engine_edges(&workspace_manifests());
-    assert!(
-        violations.is_empty(),
-        "only omnigraph-gqt may depend on omnigraph-reference-engine, and the reference \
-         engine may depend on neither omnigraph-engine nor omnigraph-planner (v1 is \
-         independent of the production engine and planner; the compiler, core and catalog \
-         crates are shared):\n  {}",
-        violations.join("\n  ")
-    );
-}
-
-#[test]
-fn reference_engine_edges_pin_resolves_renames_and_workspace_aliases() {
-    let manifest = |label: &str, text: &str| (label.to_string(), text.to_string());
-    let root = manifest(
-        "Cargo.toml",
-        "[workspace]\nmembers = []\n[workspace.dependencies]\n\
-         planner = { package = \"omnigraph-planner\", path = \"crates/planner\" }\n",
-    );
-    let allowed = [
-        manifest(
-            "gqt/Cargo.toml",
-            "[package]\nname = \"omnigraph-gqt\"\n[dependencies]\n\
-             omnigraph-reference-engine = { path = \"../reference\" }\n\
-             omnigraph = { package = \"omnigraph-engine\", path = \"../engine\" }\n",
-        ),
-        manifest(
-            "reference/Cargo.toml",
-            "[package]\nname = \"omnigraph-reference-engine\"\n[dependencies]\n\
-             omnigraph-core = { path = \"../core\" }\nomnigraph-catalog = { path = \"../catalog\" }\n",
-        ),
-    ];
-    assert_eq!(
-        reference_engine_edges(&[root.clone(), allowed[0].clone(), allowed[1].clone()]),
-        Vec::<String>::new(),
-        "GQT may depend on the reference engine, and the reference engine on the split crates"
-    );
-    let declared_root = manifest(
-        "Cargo.toml",
-        "[workspace]\nmembers = []\n[workspace.dependencies]\n\
-         v1 = { package = \"omnigraph-reference-engine\", path = \"crates/reference\" }\n",
-    );
-    let inheriting_gqt = manifest(
-        "gqt/Cargo.toml",
-        "[package]\nname = \"omnigraph-gqt\"\n[dependencies]\nv1 = { workspace = true }\n",
-    );
-    assert_eq!(
-        reference_engine_edges(&[
-            declared_root.clone(),
-            inheriting_gqt.clone(),
-            allowed[1].clone()
-        ]),
-        Vec::<String>::new(),
-        "a root [workspace.dependencies] declaration consumed only by GQT is no violation"
-    );
-    let inheriting_server = manifest(
-        "server/Cargo.toml",
-        "[package]\nname = \"server\"\n[dependencies]\nv1 = { workspace = true }\n",
-    );
-    assert_eq!(
-        reference_engine_edges(&[declared_root, inheriting_gqt, inheriting_server]),
-        ["server/Cargo.toml: [dependencies] `v1` depends on omnigraph-reference-engine"],
-        "the same declaration consumed outside GQT is refused at the consumer"
-    );
-    let offenders = [
-        manifest(
-            "server/Cargo.toml",
-            "[package]\nname = \"server\"\n[dev-dependencies]\n\
-             v1 = { package = \"omnigraph-reference-engine\", path = \"../reference\" }\n",
-        ),
-        manifest(
-            "dst/Cargo.toml",
-            "[package]\nname = \"dst\"\n[target.'cfg(unix)'.dependencies]\n\
-             omnigraph-reference-engine = { path = \"../reference\" }\n",
-        ),
-        manifest(
-            "reference/Cargo.toml",
-            "[package]\nname = \"omnigraph-reference-engine\"\n[dependencies]\n\
-             omnigraph = { package = \"omnigraph-engine\", path = \"../engine\" }\n\
-             [dev-dependencies]\nplanner = { workspace = true }\n",
-        ),
-    ];
-    assert_eq!(
-        reference_engine_edges(&[
-            root,
-            offenders[0].clone(),
-            offenders[1].clone(),
-            offenders[2].clone()
-        ]),
-        [
-            "server/Cargo.toml: [dev-dependencies] `v1` depends on omnigraph-reference-engine",
-            "dst/Cargo.toml: [target.cfg(unix).dependencies] `omnigraph-reference-engine` depends on omnigraph-reference-engine",
-            "reference/Cargo.toml: [dependencies] `omnigraph` depends on omnigraph-engine",
-            "reference/Cargo.toml: [dev-dependencies] `planner` depends on omnigraph-planner",
-        ],
-        "a dev, per-target or renamed dependency on the reference engine outside GQT, and a \
-         plain or workspace-aliased engine or planner dependency of the reference engine, are refused"
-    );
-}
-
-/// Every dependency on the reference engine outside GQT, and every dependency
-/// of the reference engine on the engine or the planner.
-fn reference_engine_edges(manifests: &[(String, String)]) -> Vec<String> {
-    let mut violations = Vec::new();
-    for (label, name, section, key, package) in dependency_entries(manifests) {
-        let named_outside_gqt =
-            package == REFERENCE_ENGINE && name.as_deref() != Some("omnigraph-gqt");
-        let reaches_v2 = name.as_deref() == Some(REFERENCE_ENGINE)
-            && matches!(package.as_str(), "omnigraph-engine" | "omnigraph-planner");
-        if named_outside_gqt || reaches_v2 {
-            violations.push(format!("{label}: [{section}] `{key}` depends on {package}"));
-        }
-    }
-    violations
-}
-
-/// Every dependency table entry of every package as `(label, package name,
-/// section, key, resolved package)`, `package =` renames and `workspace = true`
-/// aliases resolved. A `[workspace.dependencies]` declaration consumes nothing.
-fn dependency_entries(
-    manifests: &[(String, String)],
-) -> Vec<(String, Option<String>, String, String, String)> {
-    let parsed = manifests
-        .iter()
-        .map(|(label, text)| {
-            let value = toml::from_str::<toml::Value>(text)
-                .unwrap_or_else(|error| panic!("{label} is not TOML: {error}"));
-            (label.as_str(), value)
-        })
-        .collect::<Vec<_>>();
-    let sections = ["dependencies", "build-dependencies", "dev-dependencies"];
-    let workspace_packages = parsed
-        .iter()
-        .filter_map(|(_, manifest)| {
-            manifest
-                .get("workspace")?
-                .get("dependencies")?
-                .as_table()
-                .cloned()
-        })
-        .flatten()
-        .map(|(key, spec)| {
-            let package = spec
-                .get("package")
-                .and_then(toml::Value::as_str)
-                .unwrap_or(&key)
-                .to_string();
-            (key, package)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut entries = Vec::new();
-    for (label, manifest) in &parsed {
-        let name = manifest
-            .get("package")
-            .and_then(|package| package.get("name"))
-            .and_then(toml::Value::as_str)
-            .map(str::to_string);
-        let mut tables = Vec::new();
-        for section in sections {
-            if let Some(table) = manifest.get(section).and_then(toml::Value::as_table) {
-                tables.push((section.to_string(), table.clone()));
-            }
-        }
-        for (target, spec) in manifest
-            .get("target")
-            .and_then(toml::Value::as_table)
-            .into_iter()
-            .flatten()
-        {
-            for section in sections {
-                if let Some(table) = spec.get(section).and_then(toml::Value::as_table) {
-                    tables.push((format!("target.{target}.{section}"), table.clone()));
-                }
-            }
-        }
-        for (section, table) in tables {
-            for (key, spec) in &table {
-                let inherited = spec.get("workspace").and_then(toml::Value::as_bool) == Some(true);
-                let package = spec
-                    .get("package")
-                    .and_then(toml::Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| {
-                        inherited
-                            .then(|| workspace_packages.get(key).cloned())
-                            .flatten()
-                    })
-                    .unwrap_or_else(|| key.to_string());
-                entries.push((
-                    label.to_string(),
-                    name.clone(),
-                    section.clone(),
-                    key.clone(),
-                    package,
-                ));
-            }
-        }
-    }
-    entries
-}
-
-/// v1 is independent of the production engine and planner: its source never
-/// names the engine's modules (`engine::`) or the planner crate.
-#[test]
-fn reference_engine_source_names_neither_the_engine_nor_the_planner() {
-    let files = sibling_crate_files(&engine_src_root(), REFERENCE_ENGINE)
-        .into_iter()
-        .map(|(label, path)| {
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("failed to read {label}: {error}"));
-            (label, text)
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        files.iter().any(|(label, _)| label.ends_with("/lib.rs")),
-        "the walk found no reference-engine source: {files:?}"
-    );
-    let hits = v2_mentions(&files);
-    assert!(
-        hits.is_empty(),
-        "the reference engine names v2's code; v1 reads through omnigraph-catalog and \
-         omnigraph-core only:\n  {}",
-        hits.join("\n  ")
-    );
-    let fixture = [(
-        "fixture.rs".to_string(),
-        "use crate::query;\nuse omnigraph::engine::lower;\nuse omnigraph_planner::Plan;\n"
-            .to_string(),
-    )];
-    assert_eq!(
-        v2_mentions(&fixture),
-        [
-            "fixture.rs:2 names `engine::`",
-            "fixture.rs:3 names `omnigraph_planner`"
-        ],
-        "the lexical scan flags both spellings and nothing else"
-    );
-}
-
-/// Each `(label, text)` line that names `engine::` or `omnigraph_planner`.
-fn v2_mentions(files: &[(String, String)]) -> Vec<String> {
-    let mut hits = Vec::new();
-    for (label, text) in files {
-        for (index, line) in text.lines().enumerate() {
-            for needle in ["engine::", "omnigraph_planner"] {
-                if line.contains(needle) {
-                    hits.push(format!("{label}:{} names `{needle}`", index + 1));
-                }
-            }
-        }
-    }
-    hits
-}
-
 /// Every dependency table entry outside the engine that resolves to a split crate,
 /// `package =` renames and `workspace = true` aliases included; the catalog's own
-/// dependency on core and the reference engine's on both are the other permitted edges.
+/// dependency on core is the other permitted edge.
 fn split_crate_dependents(manifests: &[(String, String)]) -> Vec<String> {
     let parsed = manifests
         .iter()
@@ -5581,7 +5316,7 @@ fn split_crate_dependents(manifests: &[(String, String)]) -> Vec<String> {
             .get("package")
             .and_then(|package| package.get("name"))
             .and_then(toml::Value::as_str);
-        if name == Some("omnigraph-engine") || name == Some(REFERENCE_ENGINE) {
+        if name == Some("omnigraph-engine") {
             continue;
         }
         let mut tables = Vec::new();
@@ -5880,10 +5615,7 @@ fn test_util_violations(manifests: &[(String, String)]) -> Vec<String> {
                             .any(|feature| feature.as_str() == Some("test-util"))
                     });
                 let package = package_of(key, spec);
-                let exempt = package_name(manifest).is_some_and(|name| {
-                    REGULAR_TEST_UTIL_ENABLES.contains(&(name.as_str(), package.as_str()))
-                });
-                if !dev && enables && crates.contains(&package) && !exempt {
+                if !dev && enables && crates.contains(&package) {
                     violations.push(format!("{label}: [{section}] `{key}` enables test-util"));
                 }
             }
@@ -5952,8 +5684,10 @@ fn test_util_pin_follows_local_features_and_inherited_aliases() {
 const SPLIT_CRATE_PACKAGES: &[&str] = &["omnigraph-core", "omnigraph-catalog"];
 
 /// Crates outside the split whose own `test-util` gates a test seam
-/// (`omnigraph-cluster`: `read_serving_snapshot_with_display_root`).
-const TEST_UTIL_SEAM_PACKAGES: &[&str] = &["omnigraph-cluster"];
+/// (`omnigraph-cluster`: `read_serving_snapshot_with_display_root`) or a
+/// test-only module (`omnigraph-compiler`: `arbitrary`, the generated laws'
+/// shared generators).
+const TEST_UTIL_SEAM_PACKAGES: &[&str] = &["omnigraph-cluster", "omnigraph-compiler"];
 
 #[test]
 fn test_util_pin_covers_the_cluster_seam() {
@@ -5983,67 +5717,5 @@ fn test_util_pin_covers_the_cluster_seam() {
             "server/Cargo.toml: [dependencies] `omnigraph-cluster` enables test-util",
             "server/Cargo.toml: [features] `helpers` enables `omnigraph-cluster/test-util`",
         ]
-    );
-}
-
-/// The only regular `test-util` enables, `(enabler, enabled)`: both enablers are
-/// unpublished test crates, and `reference_engine_is_a_dependency_of_gqt_only`
-/// keeps the reference engine out of every other dependency graph.
-const REGULAR_TEST_UTIL_ENABLES: &[(&str, &str)] = &[
-    ("omnigraph-reference-engine", "omnigraph-catalog"),
-    ("omnigraph-gqt", "omnigraph-engine"),
-];
-
-#[test]
-fn test_util_pin_allows_only_the_two_test_crate_enables() {
-    let manifest = |label: &str, text: &str| (label.to_string(), text.to_string());
-    let catalog = manifest(
-        "catalog/Cargo.toml",
-        "[package]\nname = \"omnigraph-catalog\"\n[features]\ntest-util = []\n",
-    );
-    let engine = manifest(
-        "engine/Cargo.toml",
-        "[package]\nname = \"omnigraph-engine\"\n[features]\n\
-         test-util = [\"omnigraph-catalog/test-util\"]\n\
-         [dependencies]\nomnigraph-catalog = { path = \"../catalog\" }\n",
-    );
-    let reference = manifest(
-        "reference/Cargo.toml",
-        "[package]\nname = \"omnigraph-reference-engine\"\n[dependencies]\n\
-         omnigraph-catalog = { path = \"../catalog\", features = [\"test-util\"] }\n",
-    );
-    let gqt = manifest(
-        "gqt/Cargo.toml",
-        "[package]\nname = \"omnigraph-gqt\"\n[dependencies]\n\
-         omnigraph = { package = \"omnigraph-engine\", path = \"../engine\", features = [\"test-util\"] }\n",
-    );
-    assert_eq!(
-        test_util_violations(&[catalog.clone(), engine.clone(), reference, gqt]),
-        Vec::<String>::new(),
-        "the reference engine may enable the catalog's test-util and GQT the engine's"
-    );
-    let swapped_reference = manifest(
-        "reference/Cargo.toml",
-        "[package]\nname = \"omnigraph-reference-engine\"\n[dependencies]\n\
-         omnigraph = { package = \"omnigraph-engine\", path = \"../engine\", features = [\"test-util\"] }\n",
-    );
-    let swapped_gqt = manifest(
-        "gqt/Cargo.toml",
-        "[package]\nname = \"omnigraph-gqt\"\n[dependencies]\n\
-         omnigraph-catalog = { path = \"../catalog\", features = [\"test-util\"] }\n",
-    );
-    let server = manifest(
-        "server/Cargo.toml",
-        "[package]\nname = \"server\"\n[dependencies]\n\
-         omnigraph = { package = \"omnigraph-engine\", path = \"../engine\", features = [\"test-util\"] }\n",
-    );
-    assert_eq!(
-        test_util_violations(&[catalog, engine, swapped_reference, swapped_gqt, server]),
-        [
-            "reference/Cargo.toml: [dependencies] `omnigraph` enables test-util",
-            "gqt/Cargo.toml: [dependencies] `omnigraph-catalog` enables test-util",
-            "server/Cargo.toml: [dependencies] `omnigraph` enables test-util",
-        ],
-        "each allowance names one enabler and one enabled crate, and every other crate is refused"
     );
 }

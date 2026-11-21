@@ -236,7 +236,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
             .arg(temp.path().join("seed.jsonl"))
             .args([
                 "--mode",
-                "merge",
+                "replace",
                 "--target",
                 KEYED_SERVER_NAME,
                 "--graph",
@@ -282,7 +282,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         "node Person { name: String @key age: I32? bio: String? }\n",
     )
     .unwrap();
-    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
+    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.bio } }\n").unwrap();
     fs::write(
         temp.path().join("tools.pg"),
         "node Tool { name: String @key }\n",
@@ -602,7 +602,7 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             "node Person { name: String @key age: I32? bio: String? }\n",
         )
         .unwrap();
-        fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
+        fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.bio } }\n").unwrap();
         let output = output_success(
             cli()
                 .args([
@@ -760,7 +760,7 @@ fn cluster_e2e_apply_schema_query_and_noop_each_have_exact_receipts() {
     )
     .unwrap();
     fs::write(temp.path().join("people.gq"),
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.bio } }\n").unwrap();
     let evolved = apply_cluster_fixture(temp.path());
     assert_ne!(first["result"]["id"], evolved["result"]["id"]);
     let schema = output_success(
@@ -774,6 +774,196 @@ fn cluster_e2e_apply_schema_query_and_noop_each_have_exact_receipts() {
     let repeated = apply_cluster_fixture(temp.path());
     assert!(repeated["result"]["graphs"].as_object().unwrap().is_empty());
     assert_ne!(repeated["result"]["id"], evolved["result"]["id"]);
+
+    // A schema change needs an actor the installed policy grants
+    // `schema_apply`, as apply does.
+    let plan_as = |root: &std::path::Path, json: bool| {
+        let mut command = cli();
+        command
+            .args(["--as", "act-cluster-test", "cluster", "plan", "--target"])
+            .arg(root)
+            .arg("--config")
+            .arg(root);
+        if json {
+            command.arg("--json");
+        }
+        output_success(&mut command)
+    };
+    // A comment-only edit converges with no graph publication: the graph
+    // keeps its accepted source and head, the ledger records the configured
+    // text's digest beside the unchanged contract, and the next plan sees no
+    // difference.
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let shown = |graph: &std::path::Path| {
+        stdout_string(&output_success(
+            cli().args(["schema", "show", "--target"]).arg(graph),
+        ))
+    };
+    let commits = |graph: &std::path::Path| {
+        stdout_string(&output_success(
+            cli()
+                .args(["commit", "list", "--json", "--target"])
+                .arg(graph),
+        ))
+    };
+    let (accepted, history) = (shown(&graph), commits(&graph));
+    let state = |root: &std::path::Path| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(root.join("__cluster/state.json")).unwrap()).unwrap()
+    };
+    let contract = state(temp.path())["applied_revision"]["schema_contracts"]["knowledge"].clone();
+    let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        format!("// reviewed by the data team\n{schema}"),
+    )
+    .unwrap();
+    let plan = parse_stdout_json(&plan_as(temp.path(), true));
+    let change = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["resource"] == "schema.knowledge")
+        .unwrap();
+    assert_eq!(change["text_only"], true, "{plan}");
+    let configured = change["after_digest"].clone();
+    let text_only = apply_cluster_fixture(temp.path());
+    assert_eq!(
+        text_only["result"]["graphs"]["knowledge"]["result"]["NoOp"]["contract"], contract,
+        "{text_only}"
+    );
+    assert_eq!((shown(&graph), commits(&graph)), (accepted, history));
+    assert!(!shown(&graph).contains("reviewed"));
+    let achieved = state(temp.path());
+    assert_eq!(
+        achieved["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        configured
+    );
+    assert_eq!(
+        achieved["applied_revision"]["schema_contracts"]["knowledge"],
+        contract
+    );
+    let plan = cluster_json(temp.path(), "plan");
+    assert!(plan["changes"].as_array().unwrap().is_empty(), "{plan}");
+
+    // A real change after it publishes the configured text, comment included.
+    fs::write(
+        temp.path().join("people.pg"),
+        format!(
+            "// reviewed by the data team\n{}",
+            schema.replace("bio: String?", "bio: String? nickname: String?")
+        ),
+    )
+    .unwrap();
+    let real = apply_cluster_fixture(temp.path());
+    assert!(
+        real["result"]["graphs"]["knowledge"]["result"]["Committed"]["commit"].is_object(),
+        "{real}"
+    );
+    let stored = shown(&graph);
+    assert!(
+        stored.contains("reviewed by the data team") && stored.contains("nickname"),
+        "{stored}"
+    );
+}
+
+/// A stored query in edition-2 text is refused at deployment; `lint --fix
+/// --config` respells the configuration directory's query files against
+/// each graph's schema, and `cluster apply` through the running server, the
+/// route a user registers a stored query by, registers and serves it.
+#[test]
+fn cluster_e2e_lint_fix_respells_a_stored_query_that_apply_then_serves() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    fs::write(temp.path().join("live.policy.yaml"), "version: 1\ngroups:\n  operators: [act-live]\nrules:\n  - id: operator\n    allow:\n      actors: { group: operators }\n      actions: [config_manage]\n").unwrap();
+    fs::write(temp.path().join("graph.policy.yaml"), "version: 1\ngroups:\n  operators: [act-live]\nrules:\n  - id: operator\n    allow:\n      actors: { group: operators }\n      actions: [schema_apply, read, change, invoke_query]\n").unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        "version: 1\nmetadata:\n  name: lint-fix\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: [./people.gq, ./reports/]\npolicies:\n  operators:\n    file: ./live.policy.yaml\n    applies_to: [cluster]\n  graph_operators:\n    file: ./graph.policy.yaml\n    applies_to: [knowledge]\n",
+    )
+    .unwrap();
+    fs::create_dir(temp.path().join("reports")).unwrap();
+    fs::write(
+        temp.path().join("reports/adults.gq"),
+        "query adults() { match { $p: Person } where $p.age >= 18 return { $p.name } }\n",
+    )
+    .unwrap();
+    let root = format!("file://{}", temp.path().display());
+    bootstrap_cluster_fixture(temp.path(), &root);
+    let server = spawn_server_with_cluster_env(
+        temp.path(),
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-live":"live-deployment-token"}"#,
+        )],
+    );
+    fs::write(
+        temp.path().join("seed.jsonl"),
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}\n",
+    )
+    .unwrap();
+    output_success(
+        cli()
+            .envs(server.credential("live-deployment-token"))
+            .args(["load", "--data"])
+            .arg(temp.path().join("seed.jsonl"))
+            .args([
+                "--mode",
+                "replace",
+                "--target",
+                KEYED_SERVER_NAME,
+                "--graph",
+                "knowledge",
+            ]),
+    );
+
+    // The stored query as edition 2 wrote it: refused before deployment.
+    let edition_2 = "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name $p.age }\n}\n";
+    fs::write(temp.path().join("people.gq"), edition_2).unwrap();
+    let refused = parse_stdout_json(&output_failure(
+        cli()
+            .args(["cluster", "validate", "--config"])
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert!(
+        refused["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "query_parse_error"),
+        "{refused}"
+    );
+
+    let fixed = parse_stdout_json(&output_success(
+        cli()
+            .args(["lint", "--fix", "--config"])
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(fixed["status"], "ok", "{fixed}");
+    assert_eq!(
+        (&fixed["fixed"], &fixed["unchanged"]),
+        (&1.into(), &1.into())
+    );
+    let files = fixed["files"].as_array().unwrap();
+    let people = files
+        .iter()
+        .find(|f| f["query_path"].as_str().unwrap().ends_with("people.gq"))
+        .unwrap();
+    assert_eq!(people["fix"]["graphs"], serde_json::json!(["knowledge"]));
+    assert_eq!(people["fix"]["written"], true);
+    assert_eq!(
+        people["fix"]["applied"],
+        serde_json::json!({"Q010": 1, "Q016": 1}),
+        "{people}"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("people.gq")).unwrap(),
+        "query find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name, $p.age }\n}\n"
+    );
+
+    live_apply(temp.path(), &server, "live-deployment-token");
+    assert_live_person_query(&server);
 }
 
 #[test]
@@ -840,7 +1030,7 @@ fn cluster_e2e_destroyed_graph_is_not_silently_recreated() {
     fs::write(
         temp.path().join("people.gq"),
         "query find_person($name: String) {
-  match { $p: Person { name: $name } }
+  match { $p: Person } where $p.name = $name
   return { $p.name }
 }
 ",
@@ -900,7 +1090,7 @@ fn cluster_e2e_declared_graph_removal_deletes_owned_storage() {
                 "mutate",
                 "seed",
                 "-e",
-                "query seed() { insert Service { name: \"Deleted\" } }",
+                "query seed() { replace Service { name: \"Deleted\" } }",
                 "--target",
             ])
             .arg(&graph),
@@ -1140,7 +1330,7 @@ fn live_graph_removal_deletes_owned_storage(
         "--graph",
         "tools",
         "-e",
-        "query seed() { insert Tool { name: \"Retained\" } }",
+        "query seed() { replace Tool { name: \"Retained\" } }",
         "--json",
     ]));
     let snapshot = live_snapshot(server, "tools");
@@ -1164,7 +1354,7 @@ fn live_graph_removal_deletes_owned_storage(
         "--graph",
         "retired",
         "-e",
-        "query seed() { insert Tool { name: \"Deleted\" } }",
+        "query seed() { replace Tool { name: \"Deleted\" } }",
         "--json",
     ]));
     assert!(live_get(server, "/graphs/retired/commits")["commits"].is_array());
@@ -1569,7 +1759,7 @@ fn live_policy_mutation(server: &TestServer, name: &str) -> assert_cmd::Command 
         "--graph",
         "knowledge",
         "-e",
-        "query policy_probe($name: String) { insert Person { name: $name } }",
+        "query policy_probe($name: String) { replace Person { name: $name } }",
         "--params",
         &serde_json::json!({"name":name}).to_string(),
         "--json",
@@ -1609,7 +1799,7 @@ fn live_policy_assert_granted_row(server: &TestServer) {
         "--graph",
         "knowledge",
         "-e",
-        "query policy_read($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+        "query policy_read($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }",
         "--params",
         r#"{"name":"PolicyGranted"}"#,
         "--json",
@@ -1926,7 +2116,7 @@ fn bindings_nearest(server: &TestServer, expected: &str) {
     let response = graph_http_client().post(format!("{}/graphs/bindings/query", server.base_url))
         .bearer_auth("live-deployment-token")
         .timeout(std::time::Duration::from_secs(10))
-        .json(&serde_json::json!({"query":"query nearest_docs($q: String) { match { $d: SearchDoc } return { $d.name } order { nearest($d.embedding, $q) } limit 1 }", "name":"nearest_docs", "params":{"q":"same-query-text"}}))
+        .json(&serde_json::json!({"query":"query nearest_docs($q: String) { match { let $pop = { match { $d: SearchDoc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance } return { $d.name } order { $distance } limit 1 }", "name":"nearest_docs", "params":{"q":"same-query-text"}}))
         .send().unwrap();
     let status = response.status();
     let body: serde_json::Value = response.json().unwrap();

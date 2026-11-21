@@ -16,9 +16,9 @@ node Person {
 branch create feature
 --- expect ok
 --- concurrent scripted
-w1: query add_bob() { insert Person { name: "bob" } }
-w2: query add_carol() { insert Person { name: "carol" } }
-w3 on feature: query add_dave() { insert Person { name: "dave" } }
+w1: query add_bob() { replace Person { name: "bob" } }
+w2: query add_carol() { replace Person { name: "carol" } }
+w3 on feature: query add_dave() { replace Person { name: "dave" } }
 r1: query all() { match { $p: Person } return { $p.name } }
 order: w2 park put nodes/, w3 park put _versions/, w1, w2 put nodes/, r1 start, r1, w2, w3 put _versions/, w3
 --- expect

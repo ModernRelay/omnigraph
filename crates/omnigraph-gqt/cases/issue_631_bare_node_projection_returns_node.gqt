@@ -38,10 +38,8 @@ result columns [p: Person]
 
 --- query
 query friend_of_alice() {
-    match {
-        $p: Person { name: "alice" }
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
+    where $p.name = "alice"
     return { $p.name, $f }
 }
 
@@ -57,10 +55,7 @@ result columns [p.name: String, f: Person]
 
 --- query
 query friends_per_person() {
-    match {
-        $p: Person
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
     return { $p, count($f) as friends }
 }
 

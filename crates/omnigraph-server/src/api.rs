@@ -8,7 +8,32 @@
 
 pub use omnigraph_api_types::*;
 
-use crate::queries::StoredQuery;
+use crate::queries::{StoredQuery, UnavailableQuery};
+
+/// Project a stored query the server does not serve into its listing
+/// entry: its name and its refusal.
+pub fn unavailable_query_output(query: &UnavailableQuery) -> UnavailableQueryOutput {
+    UnavailableQueryOutput {
+        name: query.name.clone(),
+        error: query.refusal(),
+        diagnostic: query.diagnostic.as_ref().map(DiagnosticOutput::from),
+    }
+}
+
+/// Every stored query of a served graph that fails to compile under this
+/// release, by name.
+pub fn unavailable_queries(handle: &crate::GraphHandle) -> Vec<UnavailableQueryOutput> {
+    handle
+        .queries
+        .as_ref()
+        .map(|registry| {
+            registry
+                .unavailable()
+                .map(unavailable_query_output)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Project a loaded stored query into its catalog entry (typed params,
 /// MCP tool name, read/mutate flag, description/instruction).

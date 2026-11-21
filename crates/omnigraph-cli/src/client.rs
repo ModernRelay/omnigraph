@@ -23,7 +23,7 @@ use omnigraph_api_types::{
     schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
+use omnigraph_compiler::query::file::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::result::QueryResult;
 use reqwest::header::{CONTENT_RANGE, RANGE};
@@ -545,7 +545,6 @@ impl GraphClient {
             id.refuse_from_request()?;
             given.set(*id, value)?;
             match id {
-                SettingId::Engine => request.engine = Some(given.engine()),
                 SettingId::MergeLineage => request.merge_lineage = Some(given.merge_lineage()),
                 SettingId::ChangeLineage => request.change_lineage = Some(given.change_lineage()),
                 SettingId::AnnNprobes => {
@@ -554,6 +553,12 @@ impl GraphClient {
                 SettingId::TraversalWorkLimit => {
                     request.traversal_work_limit =
                         Some(given.get(SettingId::TraversalWorkLimit).parse()?)
+                }
+                SettingId::ReadWorkLimit => {
+                    request.read_work_limit = Some(given.get(SettingId::ReadWorkLimit).parse()?)
+                }
+                SettingId::PlanBudgetLimit => {
+                    request.plan_budget_limit = Some(given.get(SettingId::PlanBudgetLimit).parse()?)
                 }
                 SettingId::WriteMaxBytes => {
                     request.write_max_bytes = Some(given.get(SettingId::WriteMaxBytes).parse()?)
@@ -1736,7 +1741,7 @@ impl GraphClient {
         &self,
         branch: Option<&str>,
         query_source: &str,
-        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        stmt: omnigraph_compiler::query::file::LoadStmt,
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
         settings: &[(SettingId, SettingValue)],
         stderr: &mut dyn Write,
@@ -2127,7 +2132,7 @@ impl GraphClient {
         &self,
         target: ReadTarget,
         query_source: &str,
-        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        stmt: omnigraph_compiler::query::file::LoadStmt,
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<ReadOutput> {
@@ -2149,7 +2154,7 @@ impl GraphClient {
         &self,
         target: ReadTarget,
         query_source: &str,
-        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        stmt: omnigraph_compiler::query::file::LoadStmt,
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<EngineRead> {
@@ -3722,7 +3727,7 @@ mod tests {
                                 "main",
                                 None,
                                 file.path().to_str().unwrap(),
-                                CliLoadMode::Append,
+                                CliLoadMode::Insert,
                                 &[],
                                 &mut std::io::sink(),
                             )

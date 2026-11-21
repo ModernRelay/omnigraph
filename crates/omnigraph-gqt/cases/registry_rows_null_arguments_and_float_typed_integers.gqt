@@ -1,0 +1,84 @@
+# issue: none
+# notes: Two rules of the registry's scalar rows, found by the scalar
+# notes: evaluators law. A row is null where any argument is null, before its
+# notes: domain is checked: `left`'s negative count, `substring`'s negative
+# notes: length and `round`'s digits outside I32 do not refuse a row whose
+# notes: other argument is null. A number is a value of its declared type: an
+# notes: integer literal typed as a float (`cast(0, F64)`) is that float, so
+# notes: `abs` and `floor` return floats and `cast` to String writes `3.0`. Zero to a
+# notes: negative power is not finite (`E3`), not the kernel's untyped refusal. A
+# notes: String read as a Bool can fail (`E6`), so a return item holding one is
+# notes: computed under `limit 0` too.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node P {
+    k: String @key
+    s: String?
+    n: I64?
+    f: F64?
+    big: I64?
+}
+
+--- seed
+{"type":"P","data":{"k":"a","s":"abc","f":1.25,"big":1}}
+{"type":"P","data":{"k":"b","n":-1,"big":3000000000}}
+
+--- query
+query null_before_the_domain() {
+  match { $p: P }
+  return { $p.k, left($p.s, $p.n) as l, right($p.s, $p.n) as r, substring($p.s, 1, $p.n) as sub, round($p.f, digits: $p.big) as rd }
+}
+
+--- expect unordered
+{"p.k":"a","rd":1.3}
+{"p.k":"b"}
+
+--- expect shape
+p.k: String
+l: String?
+r: String?
+sub: String?
+rd: F64?
+
+--- query
+query float_typed_integers() {
+  match { $p: P } where $p.k = "a"
+  return { abs(cast(0, F64)) as a, floor(cast(-3, F64)) as f, cast(cast(3, F64), String) as s, round(cast(2, F64), digits: 1) as rd }
+}
+
+--- expect unordered
+{"a":0.0,"f":-3.0,"rd":2.0,"s":"3.0"}
+
+--- expect shape
+a: F64
+f: F64
+s: String
+rd: F64
+
+--- query
+query zero_to_a_negative_power($z: F64) {
+  match { $p: P } where $p.k = "a"
+  return { power($z, (-1)) as x }
+}
+
+--- params
+{"z": -0.0}
+
+--- expect error: E3
+
+--- query
+query string_to_bool_can_fail() {
+  match { $p: P }
+  return distinct { cast($p.s, Bool) as b }
+  limit 0
+}
+
+--- expect error: E6

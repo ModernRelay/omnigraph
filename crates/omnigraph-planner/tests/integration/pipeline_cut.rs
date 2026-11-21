@@ -8,11 +8,11 @@
 use std::collections::BTreeSet;
 
 use omnigraph_compiler::ir::{IRExpr, SubqueryPredicate};
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::{ExprType, PropType, ScalarType};
 use omnigraph_planner::{
-    AntiJoinStrategy, EmptyEligible, KeyJoinKind, NodeId, PhysicalNode, PhysicalNodeKind,
-    PhysicalPlan, Prefilter, RankArm, RankKind,
+    AntiJoinStrategy, ArmRank, FuseArm, KeyJoinKind, NodeId, PhysicalNode, PhysicalNodeKind,
+    PhysicalPlan,
 };
 
 fn leaf(plan: &mut PhysicalPlan) -> NodeId {
@@ -21,12 +21,8 @@ fn leaf(plan: &mut PhysicalPlan) -> NodeId {
     })
 }
 
-fn arm(input: NodeId, kind: RankKind) -> RankArm {
-    RankArm {
-        input,
-        binding: "d".to_string(),
-        kind,
-    }
+fn arm(input: NodeId, rank: ArmRank) -> FuseArm {
+    FuseArm { input, rank }
 }
 
 fn truth() -> IRExpr {
@@ -83,21 +79,42 @@ fn multi_input_samples(plan: &mut PhysicalPlan) -> Vec<PhysicalNode> {
             aggregate: None,
             strategy: AntiJoinStrategy::Correlated,
         },
-        PhysicalNode::RankFuse {
-            arms: [
-                arm(leaf(plan), RankKind::Nearest),
-                arm(leaf(plan), RankKind::Bm25),
+        PhysicalNode::OptionalJoin {
+            input: k,
+            inner: l,
+            outer_var: "o".to_string(),
+        },
+        PhysicalNode::Union {
+            left: k,
+            right: l,
+            bindings: vec!["o".to_string()],
+        },
+        PhysicalNode::Correlate {
+            input: Some(k),
+            inner: l,
+            outer_var: Some("o".to_string()),
+            read: Box::new(omnigraph_planner::InnerRead {
+                values: "v".to_string(),
+                group: None,
+                columns: Vec::new(),
+                order_by: Vec::new(),
+                limit: Some(1),
+                limit_param: None,
+                window: None,
+                limit_expr: None,
+            }),
+            tiebreak: Vec::new(),
+        },
+        PhysicalNode::Fuse {
+            arms: vec![
+                arm(leaf(plan), ArmRank::Nearest),
+                arm(leaf(plan), ArmRank::Bm25),
+                arm(leaf(plan), ArmRank::Ordered),
             ],
+            target: "d".to_string(),
             k: None,
-            limit: None,
-            prefilter: Prefilter {
-                ranked_type: "Doc".to_string(),
-                hops: Vec::new(),
-                feeds: Vec::new(),
-                on_empty: EmptyEligible::Postfilter,
-                coverage_admits: true,
-            },
-            row_tiebreak: Vec::new(),
+            weights: None,
+            partition: None,
         },
     ]
 }

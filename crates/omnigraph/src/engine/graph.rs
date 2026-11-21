@@ -73,216 +73,6 @@ impl<'a> EmbeddingResolver<'a> {
     }
 }
 
-/// The fusion's output schema: the arm's columns, then the fused score.
-pub(super) fn fused_schema(
-    arm: &arrow_schema::SchemaRef,
-    fused_score: &str,
-) -> arrow_schema::SchemaRef {
-    let mut fields: Vec<arrow_schema::FieldRef> = arm.fields().iter().cloned().collect();
-    fields.push(Arc::new(arrow_schema::Field::new(
-        fused_score,
-        arrow_schema::DataType::Float64,
-        false,
-    )));
-    Arc::new(arrow_schema::Schema::new(fields))
-}
-
-/// Fuse arms sorted by search score and identity; BM25 arms must be uncapped.
-/// Rank each entity once, sum `1 / (k + rank)` over the arms that hold it,
-/// and emit every one of its rows with that sum in `fused_score`; the
-/// `Sort` above orders by the sum and the query's `limit` cuts rows there
-/// (RFC 0047 §Total order).
-pub(super) fn fuse_arms(
-    primary_batch: &RecordBatch,
-    secondary_batch: &RecordBatch,
-    rrf: &RrfMode,
-    id_col_name: &str,
-    fused_score: &str,
-    memory: &WorkMemory,
-) -> Result<RecordBatch> {
-    let work = memory
-        .child("fuse_arms")
-        .map_err(|error| memory.error(error))?;
-    let memory = &work;
-    memory.check().map_err(|error| memory.error(error))?;
-    let rows = primary_batch
-        .num_rows()
-        .saturating_add(secondary_batch.num_rows());
-    memory
-        .entries::<(String, usize)>(rows.saturating_mul(5))
-        .map_err(|error| memory.error(error))?;
-    let id_bytes = [primary_batch, secondary_batch]
-        .into_iter()
-        .filter_map(|batch| batch.column_by_name(id_col_name))
-        .map(|column| column.get_array_memory_size())
-        .sum::<usize>();
-    memory
-        .string(id_bytes.saturating_mul(6))
-        .map_err(|error| memory.error(error))?;
-    let primary_ids = extract_id_column_by_name(primary_batch, id_col_name)?;
-    let secondary_ids = extract_id_column_by_name(secondary_batch, id_col_name)?;
-
-    let mut primary_rank: HashMap<String, usize> = HashMap::new();
-    let mut primary_unique: Vec<String> = Vec::new();
-    for id in &primary_ids {
-        memory.check().map_err(|error| memory.error(error))?;
-        if !primary_rank.contains_key(id) {
-            primary_rank.insert(id.clone(), primary_unique.len());
-            primary_unique.push(id.clone());
-        }
-    }
-    let mut secondary_rank: HashMap<String, usize> = HashMap::new();
-    let mut secondary_unique: Vec<String> = Vec::new();
-    for id in &secondary_ids {
-        memory.check().map_err(|error| memory.error(error))?;
-        if !secondary_rank.contains_key(id) {
-            secondary_rank.insert(id.clone(), secondary_unique.len());
-            secondary_unique.push(id.clone());
-        }
-    }
-
-    let mut all_ids: Vec<String> = primary_unique;
-    for id in &secondary_unique {
-        if !primary_rank.contains_key(id) {
-            all_ids.push(id.clone());
-        }
-    }
-
-    let k = rrf.k as f64;
-    let scored: Vec<(String, f64)> = all_ids
-        .iter()
-        .map(|id| {
-            let p = primary_rank
-                .get(id)
-                .map(|&r| 1.0 / (k + r as f64 + 1.0))
-                .unwrap_or(0.0);
-            let s = secondary_rank
-                .get(id)
-                .map(|&r| 1.0 / (k + r as f64 + 1.0))
-                .unwrap_or(0.0);
-            (id.clone(), p + s)
-        })
-        .collect();
-
-    let mut primary_rows: HashMap<String, Vec<u32>> = HashMap::new();
-    for (i, id) in primary_ids.iter().enumerate() {
-        primary_rows.entry(id.clone()).or_default().push(i as u32);
-    }
-    let mut secondary_rows: HashMap<String, Vec<u32>> = HashMap::new();
-    for (i, id) in secondary_ids.iter().enumerate() {
-        secondary_rows.entry(id.clone()).or_default().push(i as u32);
-    }
-
-    build_fused_batch(
-        &scored,
-        primary_batch,
-        &primary_rows,
-        secondary_batch,
-        &secondary_rows,
-        fused_score,
-        memory,
-    )
-}
-
-pub(super) fn extract_id_column_by_name(
-    batch: &RecordBatch,
-    col_name: &str,
-) -> Result<Vec<String>> {
-    let col = batch.column_by_name(col_name).ok_or_else(|| {
-        OmniError::manifest(format!("batch missing '{}' column for RRF", col_name))
-    })?;
-    let ids = col
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest(format!("'{}' column is not Utf8", col_name)))?;
-    Ok((0..ids.len()).map(|i| ids.value(i).to_string()).collect())
-}
-
-/// Gather primary rows, then secondary-only rows, in scored entity order
-/// within each arm, preserving each entity's row order and fused score.
-fn build_fused_batch(
-    scored: &[(String, f64)],
-    primary_batch: &RecordBatch,
-    primary_rows: &HashMap<String, Vec<u32>>,
-    secondary_batch: &RecordBatch,
-    secondary_rows: &HashMap<String, Vec<u32>>,
-    fused_score: &str,
-    memory: &WorkMemory,
-) -> Result<RecordBatch> {
-    let work = memory
-        .child("build_fused_batch")
-        .map_err(|error| memory.error(error))?;
-    let memory = &work;
-    memory.check().map_err(|error| memory.error(error))?;
-    let empty = || RecordBatch::new_empty(fused_schema(&primary_batch.schema(), fused_score));
-    if scored.is_empty() {
-        return Ok(empty());
-    }
-
-    let selected_rows = |id| match (primary_rows.get(id), secondary_rows.get(id)) {
-        (Some(rows), _) => Some((0, rows)),
-        (None, Some(rows)) => Some((1, rows)),
-        (None, None) => None,
-    };
-    let mut counts = [0usize; 2];
-    for (id, _) in scored {
-        memory.check().map_err(|error| memory.error(error))?;
-        if let Some((arm, rows)) = selected_rows(id) {
-            counts[arm] = counts[arm].saturating_add(rows.len());
-        }
-    }
-    let rows = counts[0].saturating_add(counts[1]);
-    memory
-        .entries::<RecordBatch>(2)
-        .map_err(|error| memory.error(error))?;
-    memory
-        .entries::<u32>(rows)
-        .map_err(|error| memory.error(error))?;
-    memory
-        .entries::<f64>(rows)
-        .map_err(|error| memory.error(error))?;
-    let mut arms = counts.map(|count| {
-        (
-            Vec::<u32>::with_capacity(count),
-            Vec::<f64>::with_capacity(count),
-        )
-    });
-    for (id, score) in scored {
-        memory.check().map_err(|error| memory.error(error))?;
-        let Some((arm, rows)) = selected_rows(id) else {
-            continue;
-        };
-        let (indices, scores) = &mut arms[arm];
-        indices.extend_from_slice(rows);
-        scores.extend(std::iter::repeat_n(*score, rows.len()));
-    }
-
-    let schema = fused_schema(&primary_batch.schema(), fused_score);
-    let mut row_slices = Vec::with_capacity(2);
-    for (batch, (indices, scores)) in [primary_batch, secondary_batch].into_iter().zip(arms) {
-        if indices.is_empty() {
-            continue;
-        }
-        let gathered = memory
-            .take(batch, &UInt32Array::from(indices))
-            .map_err(|error| memory.error(error))?;
-        let mut columns = gathered.columns().to_vec();
-        columns.push(Arc::new(arrow_array::Float64Array::from(scores)));
-        row_slices.push(
-            RecordBatch::try_new(Arc::clone(&schema), columns)
-                .map_err(OmniError::arrow_internal)?,
-        );
-    }
-
-    if row_slices.is_empty() {
-        return Ok(empty());
-    }
-
-    memory
-        .concat(&schema, &row_slices)
-        .map_err(|error| memory.error(error))
-}
-
 /// Lazily provides the in-memory CSR graph index, building it on first use and
 /// memoizing for the rest of the query. Indexed-mode Expand never asks for it,
 /// so a query that is entirely index-served and has no AntiJoin never pays the
@@ -933,13 +723,9 @@ where
         })?;
     u32::try_from(src_ids.len())
         .map_err(|_| OmniError::manifest_internal("expand source ordinal exceeds UInt32"))?;
-    // A bound source is a node the frontier holds, and a node's id is never
-    // null: a null here is an integrity fault, refused rather than dropped.
-    if src_ids.null_count() > 0 {
-        return Err(OmniError::manifest_internal(format!(
-            "bound expand frontier has a null '{src_name}'"
-        )));
-    }
+    // A null source is a node an `optional` left null on a row with no
+    // match: it reaches nothing, so its row takes no group and expands to
+    // no pair (`Expand` over a null reference, the GQ 3 RFC, section 2).
     // The source groups, each group's wide rows (`group_starts` into
     // `group_rows`, in row order) and one owned key per group.
     super::operators::KeyGroups::charge(&source_memory, src_ids.len())
@@ -1292,6 +1078,10 @@ where
     };
     let budgeted = step.budgeted();
     let max = step.max_hops;
+    // The single hop returns a self-loop's start node; every other range
+    // never returns its start, through a cycle (the start is visited from
+    // the first hop) or a self-loop.
+    let single_hop = min_hops == 1 && max == 1;
 
     let mut active = match start_indexed {
         Some((datasets, pushdown)) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
@@ -1545,6 +1335,11 @@ where
                     ActiveExpandSource::Indexed(src) => src.interner.ids(),
                     ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => dst_idx.ids(),
                 };
+                // Every neighbor examined is read work, the hops that end
+                // below `min_hops` or at a visited node included.
+                memory
+                    .charge_produced((fwd.len() + rev.len()) as u64)
+                    .map_err(|error| memory.error(error))?;
                 // Admit what this node's neighbours can add before the walk.
                 let before = memory.charged();
                 memory
@@ -1569,6 +1364,7 @@ where
                         added = added.saturating_add(WorkMemory::entry_bytes::<u32>());
                     }
                     if hop >= min_hops
+                        && (single_hop || !is_self)
                         && (neighbor as usize) < ids.len()
                         && seen_dst.insert(source_node_key(i, neighbor))
                     {

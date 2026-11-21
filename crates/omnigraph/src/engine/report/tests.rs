@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, StringArray};
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::settings::SessionSettings;
-use omnigraph_planner::{AccessPath, NodeId, PhysicalNode, PhysicalPlan, RankKind, RankScope};
+use omnigraph_planner::{AccessPath, NodeId, PhysicalNode, PhysicalPlan, RankScope};
 
 use super::{ExecutionReport, Ran, ReportRow, RowStatus};
 use crate::Session;
@@ -55,8 +55,7 @@ async fn graph(dir: &tempfile::TempDir, schema: &str, seed: &[&str]) -> Session 
     let db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
         .await
         .unwrap();
-    let settings = SessionSettings::default().with("engine", "v2").unwrap();
-    let db = Session::from_defaults(Arc::new(db), settings);
+    let db = Session::from_defaults(Arc::new(db), SessionSettings::default());
     db.load_jsonl(&seed.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
@@ -66,7 +65,7 @@ async fn graph(dir: &tempfile::TempDir, schema: &str, seed: &[&str]) -> Session 
 async fn run(db: &Session, source: &str, name: &str, params: &ParamMap) -> (usize, Captured) {
     let (result, run) = captured(db.query(ReadTarget::branch("main"), source, name, params)).await;
     let rows = result.unwrap().num_rows();
-    (rows, run.expect("the query ran on engine v2"))
+    (rows, run.expect("the query ran"))
 }
 
 fn text(name: &str, value: &str) -> ParamMap {
@@ -140,57 +139,42 @@ const PEOPLE_SEED: &[&str] = &[
 
 const PEOPLE_QUERIES: &str = r#"
 query older_pairs() {
-    match {
-        $p: Person
-        $q: Person
-        $p.age > $q.age
-    }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
+    where $p.age > $q.age
     return { $p.name, $q.name }
 }
 query older_likers() {
-    match {
-        $p: Person
-        $q: Person
-        $p likes $d
-        $p.age > $q.age
-    }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs, $p likes $d }
+    where $p.age > $q.age
     return { $p.name, $q.name, $d.title }
 }
 query older_than_likers_of_d0_or_bob() {
-    match {
-        $p: Person
-        $q: Person
-        $q likes $d
-        $p.age > $q.age
-        $d.title = "d0" or $p.name = "bob"
-    }
+    match { $p: Person, let $qs = { match { $q: Person, $d: Doc, $q likes $d } return { $q, $d } }, from $qs }
+    where $p.age > $q.age and ($d.title = "d0" or $p.name = "bob")
     return { $p.name, $q.name, $d.title }
 }
 query liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
 }
 query likes_nothing() {
-    match { $p: Person not { $p likes $d } }
+    match { $p: Person } where not exists { $d: Doc, $p likes $d }
     return { $p.name }
 }
 query nobody_older() {
-    match {
-        $p: Person
-        not {
-            $q: Person
-            $q.age > $p.age
-        }
+    match { $p: Person }
+    where not exists {
+        $q: Person
+        where $q.age > $p.age
     }
     return { $p.name }
 }
 query skips_d1() {
-    match {
-        $p: Person
-        not {
-            $p likes $d
-            $d: Doc { title: "d1" }
-        }
+    match { $p: Person }
+    where not exists {
+        $p likes $d,
+        $d: Doc
+        where $d.title = "d1"
     }
     return { $p.name }
 }
@@ -373,29 +357,20 @@ const CITATION_SEED: &[&str] = &[
 ];
 
 const CITED: &str = r#"query cited() {
-    match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-    }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
+    where contains($p.text, $m.number)
     return { $m.mid, $p.pid }
 }"#;
 
 const CITED_PASSAGE_FIRST: &str = r#"query cited() {
-    match {
-        $p: Passage
-        $m: Matter
-        $p.text contains $m.number
-    }
+    match { $p: Passage, let $ms = { match { $m: Matter } return { $m } }, from $ms }
+    where contains($p.text, $m.number)
     return { $m.mid, $p.pid }
 }"#;
 
 const OLDER_PAIRS: &str = r#"query older_pairs() {
-    match {
-        $p: Person
-        $q: Person
-        $p.age > $q.age
-    }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
+    where $p.age > $q.age
     return { $p.name, $q.name }
 }"#;
 
@@ -616,12 +591,8 @@ async fn a_text_contains_join_filters_its_right_scan_and_pairs_only_the_found_pa
 
 /// `m2`'s pair fails the second filter, which only `m1` and `p9` can pass.
 const CITED_BY_M1: &str = r#"query cited() {
-    match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-        $m.mid = "m1" or $p.pid = "p9"
-    }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
+    where contains($p.text, $m.number) and ($m.mid = "m1" or $p.pid = "p9")
     return { $m.mid, $p.pid }
 }"#;
 
@@ -948,7 +919,7 @@ async fn an_aggregate_is_one_datafusion_operator_and_the_result_keeps_the_return
     .await;
     let result = result.unwrap();
     assert_eq!(result.num_rows(), 3);
-    let run = run.expect("the query ran on engine v2");
+    let run = run.expect("the query ran");
     assert_covers(&run);
     let aggregate = node_id(&run.plan, |node| {
         matches!(node, PhysicalNode::Aggregate { .. })
@@ -985,30 +956,30 @@ fn doc_seed() -> Vec<String> {
 
 const DOC_QUERIES: &str = r#"
 query by_text($t: String) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.slug }
-    order { bm25($d.text, $t) }
+    order { $score desc }
     limit 3
 }
-query fused($t: String, $q: Vector(4)) {
-    match { $d: Doc }
+query fused($q: Vector(4)) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, [1.0, 0.0, 0.0, 0.0], k: 3), k: 60) as $score, $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    order { $score desc }
     limit 3
 }
-query fused_then_slug($t: String, $q: Vector(4)) {
-    match { $d: Doc }
+query fused_then_slug($q: Vector(4)) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, [1.0, 0.0, 0.0, 0.0], k: 3), k: 60) as $score, $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)), $d.slug }
+    order { $score desc, $d.slug }
     limit 3
 }
 query nearest_with_edge($q: Vector(4)) {
     match {
-        $d: Doc
-        $d knows $t
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
     }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 "#;
@@ -1019,18 +990,17 @@ async fn doc_graph(dir: &tempfile::TempDir) -> Session {
     graph(dir, DOC_SCHEMA, &seed).await
 }
 
+/// An exact `bm25` is a `Score` over its population's scan, then a sort,
+/// a projection and a limit, one operator each.
 #[tokio::test]
-async fn a_ranked_scan_a_sort_a_projection_and_a_limit_build_one_operator_each() {
+async fn a_score_a_sort_a_projection_and_a_limit_build_one_operator_each() {
     let dir = tempfile::tempdir().unwrap();
     let db = doc_graph(&dir).await;
     let (rows, run) = run(&db, DOC_QUERIES, "by_text", &text("t", "needle")).await;
     assert_eq!(rows, 3);
     assert_covers(&run);
-    let scan = node_id(&run.plan, |node| {
-        node.ranked()
-            .is_some_and(|ranked| ranked.kind == RankKind::Bm25)
-    });
-    assert_eq!(operator(&run, scan), "ScanExec");
+    let score = node_id(&run.plan, |node| matches!(node, PhysicalNode::Score { .. }));
+    assert_eq!(operator(&run, score), "ScoreExec");
     let sort = node_id(&run.plan, |node| matches!(node, PhysicalNode::Sort { .. }));
     assert_eq!(
         operator(&run, sort),
@@ -1070,7 +1040,7 @@ async fn a_hydrating_top_k_builds_one_operator_above_its_limit() {
         &ParamMap::new(),
     ))
     .await;
-    let run = run.expect("the query ran on engine v2");
+    let run = run.expect("the query ran");
     let batch = result.unwrap().concat_batches().unwrap();
     let texts: Vec<&str> = batch
         .column(1)
@@ -1101,25 +1071,37 @@ async fn a_hydrating_top_k_builds_one_operator_above_its_limit() {
     }
 }
 
+/// A fusion is one operator over its arms, each `nearest` arm the same
+/// window operators it runs standing alone: its ranked scan, the sort of its
+/// candidates and its target cut.
 #[tokio::test]
-async fn a_rank_fuse_is_one_operator_over_two_arm_scans() {
+async fn a_fuse_is_one_operator_over_its_arm_windows() {
     let dir = tempfile::tempdir().unwrap();
     let db = doc_graph(&dir).await;
-    let mut params = text("t", "needle");
-    params.extend(vector("q", &[0.0, 0.0, 0.0, 0.0]));
+    let params = vector("q", &[0.0, 0.0, 0.0, 0.0]);
     let (rows, run) = run(&db, DOC_QUERIES, "fused", &params).await;
     assert_eq!(rows, 3);
     assert_covers(&run);
-    let fuse = node_id(&run.plan, |node| {
-        matches!(node, PhysicalNode::RankFuse { .. })
-    });
-    assert_eq!(operator(&run, fuse), "RankFuseExec");
+    let fuse = node_id(&run.plan, |node| matches!(node, PhysicalNode::Fuse { .. }));
+    assert_eq!(operator(&run, fuse), "FuseExec");
     assert_eq!(row(&run, fuse).status, RowStatus::Executed);
-    for scope in [RankScope::Primary, RankScope::Secondary] {
-        let scan = node_id(&run.plan, |node| {
-            node.ranked().is_some_and(|ranked| ranked.scope == scope)
-        });
-        assert_eq!(operator(&run, scan), "ScanExec", "{scope:?}");
+    let arms = run.plan.node(fuse).unwrap().inputs();
+    assert_eq!(arms.len(), 2);
+    for arm in arms {
+        assert_eq!(operator(&run, arm), "TargetCutExec");
+    }
+    let scans: Vec<_> = run
+        .plan
+        .live()
+        .filter(|(_, node)| {
+            node.ranked()
+                .is_some_and(|ranked| ranked.scope == RankScope::Window)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(scans.len(), 2, "one window scan per arm");
+    for scan in scans {
+        assert_eq!(operator(&run, scan), "ScanExec");
     }
     let limit = node_id(&run.plan, |node| matches!(node, PhysicalNode::Limit { .. }));
     assert_eq!(operator(&run, limit), "LimitExec");
@@ -1168,7 +1150,6 @@ async fn an_overfetch_rerun_appends_an_attempt_to_every_row() {
 /// itself, outside the tree, so that sort's spills reach the report only
 /// through the Expand's own row: a pass that spilled adds one `spill` entry
 /// for the node, and its row and attempts stay what they are without one.
-/// The entry is there as well when a `Limit` stops the Expand early.
 /// The sort writes zstd files, so the bytes spilled are fewer than the
 /// payload bytes of the rows spilled even though every payload is noise that
 /// compresses only to about four fifths.
@@ -1217,10 +1198,8 @@ edge Knows: Person -> Person {
     .await;
     let source = r#"
 query pairs() {
-    match {
-        $p: Person { name: "a" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a"
     return { max($e.payload) as last }
 }
 "#;
@@ -1275,40 +1254,66 @@ query pairs() {
             assert!(run.report.spills(row.id).is_empty(), "{row:?}");
         }
     }
+}
 
-    // A `Limit` above the Expand stops it once one row is out. The sort
-    // spilled all its input before it emitted that row, and the report is
-    // read while the Expand's cancelled worker may still be winding down, so
-    // the spill must already be on the row then.
-    let limited = r#"
-query first() {
-    match {
-        $p: Person { name: "a" }
-        $p $e:knows $q
-    }
-    return { $e.payload }
-    limit 1
+const LEXICAL_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    body: String @index(fulltext)
 }
 "#;
-    let (rows, stopped) = crate::instrumentation::with_query_memory_limit(
-        16 * MIB,
-        self::run(&db, limited, "first", &ParamMap::new()),
-    )
-    .await;
-    assert_eq!(rows, 1);
-    let expand = node_id(&stopped.plan, |node| {
-        matches!(node, PhysicalNode::Expand { .. })
-    });
-    assert_eq!(row(&stopped, expand).attempts[0].drained, Some(false));
-    let spills = stopped.report.spills(expand);
-    let [(0, spilled)] = spills.as_slice() else {
-        panic!(
-            "one spill entry for the Expand below the Limit: {:#?}",
-            stopped.report
-        );
+
+const LEXICAL_SEED: &[&str] = &[
+    r#"{"type":"Doc","data":{"slug":"a","body":"graph engines run"}}"#,
+    r#"{"type":"Doc","data":{"slug":"b","body":"vector search"}}"#,
+    r#"{"type":"Doc","data":{"slug":"c","body":"the and of"}}"#,
+];
+
+/// The exact lexical scan runs inside its node's operator, when the operator
+/// first runs: the report's `lexical` entry for the node counts the rows the
+/// scan read and the tokens they analyzed to (`english_v1` drops every word
+/// of "the and of"), for a `match_terms` filter and for an exact `bm25`
+/// alike. A node that never runs, below a `Limit` of 0, scans nothing.
+#[tokio::test]
+async fn the_exact_lexical_scan_runs_in_its_operator_and_reports_rows_and_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph(&dir, LEXICAL_SCHEMA, LEXICAL_SEED).await;
+    let source = r#"
+query filtered($q: String) {
+    match { $d: Doc } where match_terms($d.body, terms($q, mode: any))
+    return { $d.slug }
+}
+query ranked($q: String) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $q) as $score }
+    return { $d.slug, $score }
+    order { $score desc }
+}
+query nothing($q: String) {
+    match { $d: Doc } where match_terms($d.body, terms($q, mode: any))
+    return { $d.slug }
+    limit 0
+}
+"#;
+    let scanned = |run: &Captured, wanted: fn(&PhysicalNode) -> bool| {
+        let id = node_id(&run.plan, wanted);
+        run.report.lexical_scans(id)
     };
-    assert!(
-        spilled.spill_count > 0 && spilled.spilled_rows > 0 && spilled.spilled_bytes > 0,
-        "{spilled:?}"
-    );
+    let (rows, filtered) = run(&db, source, "filtered", &text("q", "engine")).await;
+    assert_eq!(rows, 1);
+    let found = scanned(&filtered, |node| {
+        matches!(node, PhysicalNode::Filter { .. })
+    });
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].1.rows, found[0].1.tokens), (3, 5));
+
+    let (rows, ranked) = run(&db, source, "ranked", &text("q", "vector")).await;
+    assert_eq!(rows, 1);
+    let found = scanned(&ranked, |node| matches!(node, PhysicalNode::Score { .. }));
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].1.rows, found[0].1.tokens), (3, 5));
+
+    let (rows, nothing) = run(&db, source, "nothing", &text("q", "engine")).await;
+    assert_eq!(rows, 0);
+    let found = scanned(&nothing, |node| matches!(node, PhysicalNode::Filter { .. }));
+    assert!(found.is_empty(), "{found:?}");
 }

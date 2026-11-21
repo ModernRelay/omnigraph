@@ -22,6 +22,9 @@ pub(crate) struct VersionOutput {
     /// The full commit a packaged build was compiled from; null otherwise.
     pub(crate) commit: Option<&'static str>,
     pub(crate) http_contract: &'static str,
+    /// The query language this binary compiles, `gq3`; a binary before the
+    /// GQ 3 break names none.
+    pub(crate) query_language: &'static str,
     /// Versions of the machine-readable CLI command contracts.
     pub(crate) protocols: ProtocolVersionsOutput,
     pub(crate) internal_schema: InternalSchemaOutput,
@@ -64,6 +67,7 @@ impl VersionOutput {
             channel: omnigraph_api_types::build::RELEASE_CHANNEL,
             commit: omnigraph_api_types::build::SOURCE_COMMIT,
             http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
+            query_language: omnigraph_compiler::QUERY_LANGUAGE,
             protocols: ProtocolVersionsOutput {
                 studio: crate::targets::STUDIO_PROTOCOL,
                 target: crate::targets::TARGET_PROTOCOL,
@@ -92,6 +96,7 @@ pub(crate) fn write_version(
     writeln!(stdout, "omnigraph {}", output.version)?;
     writeln!(stdout, "{}", output.internal_schema.line())?;
     writeln!(stdout, "http-contract {}", output.http_contract)?;
+    writeln!(stdout, "query-language {}", output.query_language)?;
     if let Some(commit) = output.commit {
         writeln!(stdout, "commit {commit}")?;
     }

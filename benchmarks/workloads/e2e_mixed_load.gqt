@@ -7,7 +7,7 @@ environments:
   - target: omnigraph-engine
     storage: local-filesystem
 
---- load generate: v1 seed: 0 mode: merge branch: main
+--- load generate: v1 seed: 0 mode: replace branch: main
 tables:
   - kind: node
     name: Chunk

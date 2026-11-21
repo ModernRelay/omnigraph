@@ -13,6 +13,7 @@ use omnigraph::db::{
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+use omnigraph_compiler::schema::analysis::AnalyzerProfile;
 use omnigraph_compiler::schema::ast::Cardinality;
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 use omnigraph_core::graph_commit_id::intent_nonce;
@@ -26,7 +27,7 @@ async fn warmed_wildcard_rechecks_members_after_schema_apply_issue_659() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let source = r#"query neighbor_since() {
-        match { $p: Person { name: "Alice" } $f: Person $p $e:* $f }
+        match { $p: Person, $f: Person, $p $e:* $f } where $p.name = "Alice"
         return { $f.name, $e.since }
     }"#;
     assert_eq!(
@@ -246,7 +247,7 @@ async fn long_lived_handle_uses_the_schema_catalog_bound_to_its_write_token() {
 
     let mutation = r#"
 query insert_with_nickname($name: String, $age: I32, $nickname: String) {
-    insert Person { name: $name, age: $age, nickname: $nickname }
+    replace Person { name: $name, age: $age, nickname: $nickname }
 }
 "#;
     let inserted = stale_handle
@@ -267,7 +268,7 @@ query insert_with_nickname($name: String, $age: I32, $nickname: String) {
         .load(
             "main",
             r#"{"type":"Person","data":{"name":"loaded-after-schema","age":32,"nickname":"fresh"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect("load parsing and validation must use the same token-bound catalog");
@@ -282,7 +283,7 @@ query insert_with_nickname($name: String, $age: I32, $nickname: String) {
     stale_handle.branch_create("target").await.unwrap();
     let project_mutation = r#"
 query insert_project($name: String) {
-    insert Project { name: $name }
+    replace Project { name: $name }
 }
 "#;
     stale_handle
@@ -359,7 +360,7 @@ async fn stale_handle_branch_delete_gates_tables_added_by_schema_apply() {
         .load(
             "target",
             r#"{"type":"Project","data":{"name":"pending-index"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -764,14 +765,52 @@ async fn apply_schema_noop_returns_not_applied() {
     assert_eq!(db.list_commits(None).await.unwrap(), before_commits);
     assert_eq!(db.schema_contract_digest(), result.contract);
 
-    // Source bytes are part of the accepted contract even when the typed schema
-    // has no migration steps. This Rust owner checks publication and table pins,
-    // which the query-level logic-test format does not expose.
-    let desired = format!("// Deployment source revision\n{TEST_SCHEMA}\n");
-    assert!(db.plan_schema(&desired).await.unwrap().steps.is_empty());
-    let changed = db.apply_schema(&desired).await.unwrap();
+    // A desired source whose accepted identity is unchanged (a comment, an
+    // explicit `l2`, layout) plans no step and publishes nothing: the stored
+    // source stays the accepted one, which an older binary re-parses on open.
+    // This Rust owner checks publication and table pins, which the
+    // query-level logic-test format does not expose.
+    for desired in [
+        format!("// Deployment source revision\n{TEST_SCHEMA}\n"),
+        format!("\n{TEST_SCHEMA}\n\n"),
+    ] {
+        assert!(db.plan_schema(&desired).await.unwrap().steps.is_empty());
+        let unchanged = db.apply_schema(&desired).await.unwrap();
+        assert!(unchanged.supported && !unchanged.applied);
+        assert!(unchanged.steps.is_empty());
+        assert!(unchanged.commit.is_none());
+        assert_eq!(unchanged.contract, result.contract);
+        assert_eq!(
+            unchanged.graph_manifest_version,
+            before.graph_manifest_version()
+        );
+        let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        assert_eq!(
+            after.graph_manifest_version(),
+            before.graph_manifest_version()
+        );
+        assert_eq!(db.list_commits(None).await.unwrap(), before_commits);
+        let after_contract = omnigraph_catalog::ManifestCoordinator::read_schema_contract_at(
+            uri,
+            None,
+            after.graph_manifest_version(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_contract.source, before_contract.source);
+        assert_eq!(after_contract.head, before_contract.head);
+        assert_eq!(db.schema_source().as_str(), TEST_SCHEMA);
+        assert_eq!(db.schema_contract_digest(), result.contract);
+    }
+
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(reopened.schema_source().as_str(), TEST_SCHEMA);
+    assert_eq!(reopened.schema_contract_digest(), result.contract);
+
+    // A source change that does change the accepted identity publishes it.
+    let desired = format!("{TEST_SCHEMA}\nnode Spare {{ name: String @key }}\n");
+    let changed = reopened.apply_schema(&desired).await.unwrap();
     assert!(changed.supported && changed.applied);
-    assert!(changed.steps.is_empty());
     assert_eq!(
         changed.commit.as_ref().unwrap().parent_commit_id.as_deref(),
         Some(before_commits[0].graph_commit_id.as_str())
@@ -780,63 +819,11 @@ async fn apply_schema_noop_returns_not_applied() {
         changed.contract.source_hash,
         format!("{:x}", Sha256::digest(desired.as_bytes()))
     );
-    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    assert_eq!(
-        after.graph_manifest_version(),
-        before.graph_manifest_version() + 1
-    );
-    assert_eq!(
-        changed.graph_manifest_version,
-        after.graph_manifest_version()
-    );
-    assert_eq!(
-        db.list_commits(None).await.unwrap().len(),
-        before_commits.len() + 1
-    );
-    assert_eq!(after.datasets().count(), before.datasets().count());
-    for entry in before.datasets() {
-        assert!(entry.same_registration(after.dataset(&entry.type_key).unwrap()));
-    }
-    let after_contract = omnigraph_catalog::ManifestCoordinator::read_schema_contract_at(
-        uri,
-        None,
-        after.graph_manifest_version(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(after_contract.source, desired);
-    assert_eq!(after_contract.ir, before_contract.ir);
-    assert_eq!(after_contract.head, before_contract.head);
-    assert_eq!(
-        changed.contract.schema_ir_hash,
-        after_contract.head.schema_ir_hash
-    );
-    assert_eq!(
-        changed.contract.schema_identity_domain,
-        after_contract.head.schema_identity_domain
-    );
-    assert_eq!(
-        changed.contract.schema_identity_version,
-        after_contract.head.schema_identity_version
-    );
-    assert_eq!(db.schema_source().as_str(), desired);
-    assert_eq!(db.schema_contract_digest(), changed.contract);
-
-    let reopened = Omnigraph::open(uri).await.unwrap();
     assert_eq!(reopened.schema_source().as_str(), desired);
     let repeated = reopened.apply_schema(&desired).await.unwrap();
     assert!(!repeated.applied);
     assert!(repeated.commit.is_none());
     assert_eq!(repeated.contract, changed.contract);
-    assert_eq!(reopened.schema_contract_digest(), changed.contract);
-    assert_eq!(
-        repeated.graph_manifest_version,
-        after.graph_manifest_version()
-    );
-    assert_eq!(
-        reopened.list_commits(None).await.unwrap(),
-        db.list_commits(None).await.unwrap()
-    );
     reopened.branch_create("feature").await.unwrap();
     assert_eq!(
         Omnigraph::open_read_only(uri)
@@ -845,6 +832,27 @@ async fn apply_schema_noop_returns_not_applied() {
             .schema_contract_digest(),
         changed.contract,
         "reading accepted contract identity does not require a single branch"
+    );
+
+    // An explicit `l2` is the omitted distance: the same accepted identity,
+    // so the apply publishes nothing and the stored source keeps no
+    // `distance` an older binary cannot parse.
+    let vectors = tempfile::tempdir().unwrap();
+    let vectors_uri = vectors.path().to_str().unwrap();
+    let omitted = "node Doc { slug: String @key emb: Vector(2) }\n";
+    let db = Omnigraph::init(vectors_uri, omitted).await.unwrap();
+    let head = db.list_commits(None).await.unwrap();
+    let explicit = omitted.replace("Vector(2)", "Vector(2, distance = \"l2\")");
+    let result = db.apply_schema(&explicit).await.unwrap();
+    assert!(!result.applied && result.commit.is_none());
+    assert_eq!(db.list_commits(None).await.unwrap(), head);
+    assert_eq!(
+        Omnigraph::open(vectors_uri)
+            .await
+            .unwrap()
+            .schema_source()
+            .as_str(),
+        omitted
     );
 }
 
@@ -947,7 +955,7 @@ async fn prepared_schema_receipt_reconciles_its_own_publication_after_restart_an
     );
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"After publication"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1254,7 +1262,7 @@ async fn prepared_schema_rejects_a_different_root_and_stale_predecessor_without_
 
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Intervening writer"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1281,7 +1289,7 @@ async fn prepared_schema_rejects_a_different_root_and_stale_predecessor_without_
     replacement
         .load_jsonl(
             r#"{"type":"Person","data":{"name":"Replacement graph"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -1368,7 +1376,7 @@ async fn prepared_schema_noop_is_bound_to_exact_source_and_live_authority() {
     // does not. Reconciliation must not invent a fresh no-op certificate.
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Later head"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1916,17 +1924,16 @@ node Tag {
                 );
             }
         }
-        // A dropped property takes its own index with it (the drop's
-        // Project removes it); every other index keeps its coverage.
+        // A dropped property takes its own indexes with it (the drop's
+        // Project removes them); every other index keeps its coverage.
         let (_, dropped_id, _) = field(fields_before, dropped);
         let surviving = coverage_before
             .iter()
             .filter(|(fields, _)| fields != &[*dropped_id])
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(
-            surviving.len(),
-            coverage_before.len() - 1,
+        assert!(
+            surviving.len() < coverage_before.len(),
             "{table}: the dropped column was indexed before the apply"
         );
         assert_eq!(
@@ -2036,17 +2043,19 @@ node Tag {
             "data": {"title": "new", "score": 6, "summary": "fresh", "thumb": "base64:VGh1bWI="},
         })
         .to_string(),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
     let writes = r#"
 query set_summary($title: String, $summary: String) {
-    update Document set { summary: $summary } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { summary: $summary }
 }
 
 query set_strength($name: String, $strength: I32) {
-    update Tag set { strength: $strength } where name = $name
+    match { $x: Tag } where $x.name = $name
+    update $x set { strength: $strength }
 }
 "#;
     mutate_main(
@@ -2067,26 +2076,20 @@ query set_strength($name: String, $strength: I32) {
     .unwrap();
     let reads = r#"
 query scored($min: I32) {
-    match {
-        $d: Document
-        $d.score >= $min
-    }
+    match { $d: Document }
+    where $d.score >= $min
     return { $d.title }
 }
 
 query summarized() {
-    match {
-        $d: Document
-        $d.summary != ""
-    }
+    match { $d: Document }
+    where $d.summary != ""
     return { $d.title }
 }
 
 query strong($min: I32) {
-    match {
-        $t: Tag
-        $t.strength >= $min
-    }
+    match { $t: Tag }
+    where $t.strength >= $min
     return { $t.name }
 }
 "#;
@@ -2488,7 +2491,7 @@ async fn apply_schema_rejects_a_card_minimum_edge_from_an_existing_node_type() {
     let err = db
         .load_jsonl(
             r#"{"type":"Team","data":{"name":"core"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .expect_err("a Team written without its LedBy edge is below @card(1..1)");
@@ -2539,14 +2542,14 @@ async fn relaxing_edge_cardinality_applies_as_metadata_issue_1403() {
          {\"edge\":\"ChunkFromTranscript\",\"from\":\"c-all\",\"to\":\"t1\",\"data\":{}}\n\
          {\"edge\":\"ChunkFromWebPage\",\"from\":\"c-all\",\"to\":\"w1\",\"data\":{}}\n\
          {\"edge\":\"ChunkFromLinkedInPost\",\"from\":\"c-all\",\"to\":\"l1\",\"data\":{}}",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("a chunk with one edge of every source kind meets @card(1..1)");
 
     // The reported refusal: a web-page chunk lacks the other two sources.
     let err = db
-        .load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Append)
+        .load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Insert)
         .await
         .expect_err("@card(1..1) on every source edge needs all three");
     assert!(
@@ -2605,13 +2608,13 @@ async fn relaxing_edge_cardinality_applies_as_metadata_issue_1403() {
     );
     assert!(after.graph_manifest_version() > before.graph_manifest_version());
 
-    db.load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Append)
+    db.load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Insert)
         .await
         .expect("a chunk with only its real source loads under @card(0..1)");
     let qr = query_main(
         &db,
-        "query sources() { match { $c: Chunk { slug: \"c-web\" } $c chunkFromWebPage $w } \
-         return { $c.source_kind, $w.slug } }",
+        "query sources() { match { $c: Chunk, $c chunkFromWebPage $w } \
+         where $c.slug = \"c-web\" return { $c.source_kind, $w.slug } }",
         "sources",
         &params(&[]),
     )
@@ -2629,7 +2632,7 @@ async fn relaxing_edge_cardinality_applies_as_metadata_issue_1403() {
                 web_page_chunk("c-ok", "w3"),
                 web_page_chunk("c-two", "w4")
             ),
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .expect_err("two web-page sources exceed @card(0..1)");
@@ -2642,7 +2645,7 @@ async fn relaxing_edge_cardinality_applies_as_metadata_issue_1403() {
     assert_eq!(db.list_commits(None).await.unwrap().len(), commits);
     let qr = query_main(
         &db,
-        "query ok() { match { $c: Chunk { slug: \"c-ok\" } } return { $c.slug } }",
+        "query ok() { match { $c: Chunk } where $c.slug = \"c-ok\" return { $c.slug } }",
         "ok",
         &params(&[]),
     )
@@ -3096,7 +3099,7 @@ node Pair {
 "#;
     let mutation = r#"
 query put_pair($aaaa: String, $zzzz: String, $label: String) {
-    insert Pair { aaaa: $aaaa, zzzz: $zzzz, label: $label }
+    replace Pair { aaaa: $aaaa, zzzz: $zzzz, label: $label }
 }
 "#;
 
@@ -3108,7 +3111,7 @@ query put_pair($aaaa: String, $zzzz: String, $label: String) {
     );
     db.load_jsonl(
         r#"{"type":"Pair","data":{"alpha":"A","zeta":"Z","label":"before"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -3340,7 +3343,7 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
 
     // The deferred declarations are not dropped: after data arrives, the
     // explicit reconciler materializes every buildable index without error.
-    db.load_jsonl(r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#, LoadMode::Merge, )
+    db.load_jsonl(r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#, LoadMode::Replace, )
     .await
     .expect("loading a Doc with an embedding must succeed");
     db.ensure_indices_as(None)
@@ -3363,7 +3366,7 @@ async fn index_only_constraint_apply_touches_no_table_data() {
     let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d1","n":1}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("load a Doc");
@@ -3421,7 +3424,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d1","body":"Deep Learning"}}
 {"type":"Doc","data":{"slug":"d2","body":"deep dive"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3429,7 +3432,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
         let db = &db;
         async move {
             let source = format!(
-                "query docs($q: String) {{ match {{ $d: Doc search($d.{column}, $q) }} return {{ $d.slug }} }}"
+                "query docs($q: String) {{ match {{ $d: Doc }} where match_terms($d.{column}, terms($q, mode: any)) return {{ $d.slug }} }}"
             );
             first_column_sorted(
                 &query_main(db, &source, "docs", &params(&[("q", "deep")]))
@@ -3448,13 +3451,14 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
                 .unwrap()
                 .iter()
                 .filter(|index| index.fields.contains(&field))
+                .filter(|index| omnigraph_core::dataset_index::is_full_text_index(index))
                 .map(|index| index.fragment_bitmap.as_ref().map(|bitmap| bitmap.len()))
                 .collect::<Vec<_>>()
         }
     };
 
     // Declaring the full-text index publishes its analyzer with the contract.
-    let declared = "node Doc {\n    slug: String @key\n    body: String @index\n}\n";
+    let declared = "node Doc {\n    slug: String @key\n    body: String @index(fulltext)\n}\n";
     let before = db
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -3480,14 +3484,14 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
 
     // Renaming the column keeps its segment (no second declaration), and an
     // added full-text property gets its own.
-    let evolved = "node Doc {\n    slug: String @key\n    text: String @rename_from(\"body\") @index\n    summary: String? @index\n}\n";
+    let evolved = "node Doc {\n    slug: String @key\n    text: String @rename_from(\"body\") @index(fulltext)\n    summary: String? @index(fulltext)\n}\n";
     assert!(db.apply_schema(evolved).await.unwrap().applied);
     assert_eq!(segments("text").await, [Some(0)]);
     assert_eq!(segments("summary").await, [Some(0)]);
     assert_eq!(search("text").await, ["d1", "d2"]);
     db.load_jsonl(
         r#"{"type":"Doc","data":{"slug":"d3","text":"Shallow","summary":"Deep Learning"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3498,6 +3502,281 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
     assert_eq!(segments("text").await, [Some(2)]);
     assert_eq!(search("text").await, ["d1", "d2"]);
     assert_eq!(search("summary").await, ["d3"]);
+}
+
+// Changing a full-text field's profile is a schema change applied in place
+// (the GQ 3 RFC, section 4, Schema: Text): the column's
+// segments are replaced in the apply's publication by one built with the
+// profile and certified with the field's analyzer fingerprint, so a
+// certificate of the old analysis does not establish the new one; the
+// reconciler rebuilds the postings once, with the profile. An index without
+// `analyzer` is `english_v1`, so writing that profile out, or dropping it,
+// changes no index. A rename keeps the fingerprint and the index. A reader
+// that holds no schema (a raw scan filter) accepts any certified analysis.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = |column: &str, index: &str, rename: &str| {
+        format!("node Doc {{\n    slug: String @key\n    {column}: String {rename}{index}\n}}\n")
+    };
+    let db = helpers::session(
+        Omnigraph::init(uri, &schema("body", "@index(fulltext)", ""))
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","body":"Runners were RUNNING"}}
+{"type":"Doc","data":{"slug":"d2","body":"Café crème"}}"#,
+        LoadMode::Replace,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+    let search = |column: &'static str, term: &'static str| {
+        let db = &db;
+        async move {
+            let source = format!(
+                "query docs($q: String) {{ match {{ $d: Doc }} where match_terms($d.{column}, terms($q, mode: any)) return {{ $d.slug }} }}"
+            );
+            first_column_sorted(
+                &query_main(db, &source, "docs", &params(&[("q", term)]))
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+    // The segments over `column`: UUID and covered fragment count.
+    let segments = |column: &'static str| {
+        let db = &db;
+        async move {
+            let ds = open_pinned_dataset_for_test(db, "main", "node:Doc").await;
+            let field = ds.schema().field(column).unwrap().id;
+            let indices = ds.load_indices().await.unwrap();
+            let segments = indices
+                .iter()
+                .filter(|index| index.fields == [field])
+                .filter(|index| omnigraph_core::dataset_index::is_full_text_index(index))
+                .cloned()
+                .collect::<Vec<_>>();
+            (ds, segments)
+        }
+    };
+    let fingerprint = |column: &str| {
+        db.catalog().node_types["Doc"]
+            .full_text_fingerprints
+            .get(column)
+            .cloned()
+    };
+    let rebuild_required = |result: omnigraph_core::error::Result<()>| {
+        matches!(
+            result,
+            Err(omnigraph_core::error::OmniError::FullTextIndexRebuildRequired { .. })
+        )
+    };
+    // Qualify `index` for a field declaring `fingerprint` with `profile`, as
+    // a binary whose native pipeline has parity with the profile analyzer
+    // would; this binary's has none (no NFC step), so it refuses every one.
+    let qualify = async |dataset: &lance::Dataset,
+                         index: &lance_table::format::IndexMetadata,
+                         fingerprint: &str,
+                         profile: AnalyzerProfile| {
+        let native = omnigraph_core::fts_analysis::measured(profile)
+            .unwrap()
+            .native
+            .clone();
+        assert!(rebuild_required(
+            omnigraph_core::fts_compat::verify_index(dataset, index, fingerprint, profile).await
+        ));
+        omnigraph_core::fts_compat::verify_index_against(
+            dataset,
+            index,
+            fingerprint,
+            profile,
+            &omnigraph_core::fts_analysis::MeasuredAnalysis {
+                analyzer: native.clone(),
+                native,
+            },
+        )
+        .await
+    };
+
+    // An index without `analyzer` is `english_v1`: it stems and folds, and
+    // its certificate names that profile's fingerprint.
+    assert_eq!(search("body", "run").await, ["d1"]);
+    assert_eq!(search("body", "cafe").await, ["d2"]);
+    let (edition_2, edition_2_segments) = segments("body").await;
+    assert_eq!(edition_2_segments.len(), 1);
+    let default_english = fingerprint("body").expect("every full-text field has a fingerprint");
+    qualify(
+        &edition_2,
+        &edition_2_segments[0],
+        &default_english,
+        AnalyzerProfile::EnglishV1,
+    )
+    .await
+    .unwrap();
+
+    // Declaring `standard_v1` replaces the segment by an untrained one built
+    // with the profile and certified for the field's fingerprint.
+    let result = db
+        .apply_schema(&schema(
+            "body",
+            r#"@index(fulltext, analyzer = "standard_v1")"#,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert!(result.applied);
+    assert!(result.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::ChangeFullTextAnalysis { property_name, .. } if property_name == "body"
+    )));
+    let standard = fingerprint("body").expect("a declared profile has a fingerprint");
+    let (declared, declared_segments) = segments("body").await;
+    assert_eq!(declared_segments.len(), 1);
+    assert_ne!(declared_segments[0].uuid, edition_2_segments[0].uuid);
+    assert_eq!(
+        declared_segments[0]
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.len()),
+        Some(0),
+        "the replacement carries the analyzer without postings"
+    );
+    qualify(
+        &declared,
+        &declared_segments[0],
+        &standard,
+        AnalyzerProfile::StandardV1,
+    )
+    .await
+    .unwrap();
+    // A certificate of the old analysis does not establish the new one, nor
+    // the new one the old.
+    assert!(rebuild_required(
+        qualify(
+            &edition_2,
+            &edition_2_segments[0],
+            &standard,
+            AnalyzerProfile::StandardV1
+        )
+        .await
+    ));
+    assert!(rebuild_required(
+        qualify(
+            &declared,
+            &declared_segments[0],
+            &default_english,
+            AnalyzerProfile::EnglishV1
+        )
+        .await
+    ));
+    // `standard_v1` lowercases but neither stems nor folds.
+    assert_eq!(search("body", "run").await, Vec::<String>::new());
+    assert_eq!(search("body", "running").await, ["d1"]);
+    assert_eq!(search("body", "cafe").await, Vec::<String>::new());
+    assert_eq!(search("body", "CAFÉ").await, ["d2"]);
+
+    // The reconciler builds the postings once, with the profile.
+    db.ensure_indices_as(None).await.unwrap();
+    let (built, built_segments) = segments("body").await;
+    assert_eq!(built_segments.len(), 1);
+    assert_eq!(
+        built_segments[0]
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.len()),
+        Some(1)
+    );
+    qualify(
+        &built,
+        &built_segments[0],
+        &standard,
+        AnalyzerProfile::StandardV1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(search("body", "run").await, Vec::<String>::new());
+    assert_eq!(search("body", "running").await, ["d1"]);
+
+    // A rename keeps the fingerprint, so the index and its proof stay.
+    let renamed = schema(
+        "text",
+        r#"@index(fulltext, analyzer = "standard_v1")"#,
+        r#"@rename_from("body") "#,
+    );
+    assert!(db.apply_schema(&renamed).await.unwrap().applied);
+    assert_eq!(fingerprint("text"), Some(standard.clone()));
+    let (_, renamed_segments) = segments("text").await;
+    assert_eq!(renamed_segments[0].uuid, built_segments[0].uuid);
+    assert_eq!(search("text", "running").await, ["d1"]);
+
+    // Changing the profile replaces the index again; `english_v1` stems and
+    // folds.
+    let english = schema("text", r#"@index(fulltext, analyzer = "english_v1")"#, "");
+    assert!(db.apply_schema(&english).await.unwrap().applied);
+    let english_fingerprint = fingerprint("text").unwrap();
+    assert_ne!(english_fingerprint, standard);
+    assert_eq!(english_fingerprint, default_english);
+    let (changed, changed_segments) = segments("text").await;
+    assert_eq!(changed_segments.len(), 1);
+    assert_ne!(changed_segments[0].uuid, built_segments[0].uuid);
+    qualify(
+        &changed,
+        &changed_segments[0],
+        &english_fingerprint,
+        AnalyzerProfile::EnglishV1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(search("text", "run").await, ["d1"]);
+    assert_eq!(search("text", "cafe").await, ["d2"]);
+
+    // Dropping the written `english_v1` leaves the field `english_v1`: the
+    // declaration changes, and the fingerprint and the index stay.
+    db.apply_schema(&schema("text", "@index(fulltext)", ""))
+        .await
+        .unwrap();
+    assert_eq!(fingerprint("text"), Some(english_fingerprint.clone()));
+    let (removed, removed_segments) = segments("text").await;
+    assert_eq!(removed_segments.len(), 1);
+    assert_eq!(removed_segments[0].uuid, changed_segments[0].uuid);
+    qualify(
+        &removed,
+        &removed_segments[0],
+        &english_fingerprint,
+        AnalyzerProfile::EnglishV1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(search("text", "run").await, ["d1"]);
+
+    // A plain `@index` declares no full-text index: the apply withdraws the
+    // declaration, the built index stays as it is, writes declare no new
+    // segment, an index pass neither rebuilds nor removes it, and no answer
+    // changes, since the exact scan answers `match_terms` either way.
+    db.apply_schema(&schema("text", "@index", ""))
+        .await
+        .unwrap();
+    let doc = &db.catalog().node_types["Doc"];
+    assert!(doc.is_lexical_field("text") && !doc.builds_full_text_index("text"));
+    assert_eq!(fingerprint("text"), Some(english_fingerprint.clone()));
+    let left = |segments: Vec<lance_table::format::IndexMetadata>| {
+        segments.iter().map(|index| index.uuid).collect::<Vec<_>>()
+    };
+    assert_eq!(left(segments("text").await.1), [changed_segments[0].uuid]);
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d3","text":"runs"}}"#,
+        LoadMode::Replace,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(left(segments("text").await.1), [changed_segments[0].uuid]);
+    assert_eq!(search("text", "run").await, ["d1", "d3"]);
+    assert_eq!(search("text", "cafe").await, ["d2"]);
 }
 
 // Enum widening (iss-enum-widening-migration): adding variants to an enum is
@@ -3513,7 +3792,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     let db = helpers::session(Omnigraph::init(uri, v1).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t1","status":"todo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("load a Ticket with an original variant");
@@ -3554,14 +3833,14 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     // The NEW variant is accepted on the write path...
     db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t2","status":"blocked"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("new variant must be accepted after widening");
     // ...an original variant still is...
     db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t3","status":"done"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("original variant must remain accepted");
@@ -3570,7 +3849,7 @@ async fn enum_widening_apply_is_metadata_only_and_accepts_new_variant() {
     let err = db
         .load_jsonl(
             r#"{"type":"Ticket","data":{"slug":"t4","status":"bogus"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await;
     assert!(err.is_err(), "out-of-set enum value must still be rejected");
@@ -3596,7 +3875,7 @@ async fn enum_narrowing_apply_is_refused() {
     // The graph stays healthy and writable on the original schema.
     db.load_jsonl(
         r#"{"type":"Ticket","data":{"slug":"t1","status":"doing"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("graph must remain writable after a refused narrowing");
@@ -3713,7 +3992,7 @@ async fn schema_settlement_fences_only_the_original_candidate_and_repeats_its_ow
         );
         db.load_jsonl(
             r#"{"type":"Person","data":{"name":"Later write"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3742,7 +4021,10 @@ async fn schema_settlement_proves_foreign_occupancy_but_missing_evidence_stays_u
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = init_and_load(&dir).await;
-        let desired = format!("{TEST_SCHEMA}\n// original deployment\n");
+        let desired = TEST_SCHEMA.replace(
+            "node Company {",
+            "node Company @description(\"original deployment\") {",
+        );
         let original = db.prepare_schema_apply_as(&desired, None).await.unwrap();
         let fence = db
             .prepare_schema_settlement_as(&original, None)
@@ -3758,7 +4040,10 @@ async fn schema_settlement_proves_foreign_occupancy_but_missing_evidence_stays_u
                 .await
                 .unwrap();
         } else {
-            let foreign = format!("{TEST_SCHEMA}\n// unrelated schema\n");
+            let foreign = TEST_SCHEMA.replace(
+                "node Company {",
+                "node Company @description(\"unrelated schema\") {",
+            );
             db.apply_schema(&foreign).await.unwrap();
         }
         let candidate_version = original.base_manifest_version() + 1;
@@ -3789,7 +4074,7 @@ async fn schema_settlement_proves_foreign_occupancy_but_missing_evidence_stays_u
         assert!(db.apply_prepared_schema_as(&original, None).await.is_err());
         db.load_jsonl(
             r#"{"type":"Person","data":{"name":"Later write"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3854,7 +4139,7 @@ async fn schema_settlement_noop_refuses_stale_authority_without_a_fence() {
     db.branch_delete("other").await.unwrap();
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Later"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3956,7 +4241,7 @@ async fn issue_721_backfilled_nullable_property_promotes_to_required_unique() {
     db.load_jsonl(
         "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
          {\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-2\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("backfilled rows load");
@@ -3969,19 +4254,19 @@ async fn issue_721_backfilled_nullable_property_promotes_to_required_unique() {
 
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"c"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect_err("a missing required value must be rejected after promotion");
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"d","ref":"D-1"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect_err("a duplicate unique value must be rejected after promotion");
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"e","ref":"D-3"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("a distinct value is accepted");
@@ -3996,7 +4281,7 @@ async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
     db.load_jsonl(
         "{\"type\":\"Decision\",\"data\":{\"slug\":\"a\",\"ref\":\"D-1\"}}\n\
          {\"type\":\"Decision\",\"data\":{\"slug\":\"b\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4013,7 +4298,7 @@ async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
 
     db.load_jsonl(
         "{\"type\":\"Decision\",\"data\":{\"slug\":\"b\",\"ref\":\"D-1\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4029,7 +4314,7 @@ async fn issue_721_promotion_refuses_while_a_null_or_duplicate_remains() {
     // The previous schema stays usable: a null is still accepted.
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"z"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("failed validation leaves the accepted schema in force");
@@ -4043,7 +4328,7 @@ async fn issue_721_promoted_table_still_evolves_and_reopens() {
     let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"a","ref":"D-1"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4063,14 +4348,14 @@ async fn issue_721_promoted_table_still_evolves_and_reopens() {
     reopened
         .load_jsonl(
             r#"{"type":"Decision","data":{"slug":"c","note":"n"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect_err("a reopened graph still requires ref");
     reopened
         .load_jsonl(
             r#"{"type":"Decision","data":{"slug":"d","ref":"D-9","note":"n"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect("a complete row loads");
@@ -4084,7 +4369,7 @@ async fn issue_721_promotion_tightens_the_lance_column() {
     let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Decision","data":{"slug":"a","ref":"D-1"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -4181,12 +4466,12 @@ async fn issue_721_deleted_null_row_is_purged_by_promotion() {
             .map(|i| format!(r#"{{"type":"Decision","data":{{"slug":"s{i}","ref":"D-{i}"}}}}"#))
             .collect::<Vec<_>>();
         rows.push(r#"{"type":"Decision","data":{"slug":"gone"}}"#.to_string());
-        db.load_jsonl(&rows.join("\n"), LoadMode::Merge)
+        db.load_jsonl(&rows.join("\n"), LoadMode::Replace)
             .await
             .unwrap();
         mutate_main(
             &db,
-            "query rm($slug: String) { delete Decision where slug = $slug }",
+            "query rm($slug: String) { match { $x: Decision } where $x.slug = $slug  delete $x }",
             "rm",
             &params(&[("slug", "gone")]),
         )
@@ -4243,7 +4528,7 @@ async fn issue_721_deleted_null_row_is_purged_by_promotion() {
             .expect("optimize succeeds");
         db.load_jsonl(
             r#"{"type":"Decision","data":{"slug":"d","ref":"D-new","note":"n"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect("a write after the later change succeeds");
@@ -4278,7 +4563,7 @@ async fn issue_721_promotion_with_a_rename_in_the_same_apply() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
-        db.load_jsonl(rows, LoadMode::Merge).await.unwrap();
+        db.load_jsonl(rows, LoadMode::Replace).await.unwrap();
         let plan = db.plan_schema(renamed).await.unwrap();
         assert!(plan.supported, "{plan:?}");
         match refusal {
@@ -4296,19 +4581,19 @@ async fn issue_721_promotion_with_a_rename_in_the_same_apply() {
                     .expect("the renamed promotion applies");
                 db.load_jsonl(
                     r#"{"type":"Decision","data":{"slug":"c"}}"#,
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .expect_err("code is required");
                 db.load_jsonl(
                     r#"{"type":"Decision","data":{"slug":"c","code":"D-2"}}"#,
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .expect_err("code is unique");
                 db.load_jsonl(
                     r#"{"type":"Decision","data":{"slug":"c","code":"D-3"}}"#,
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .expect("a distinct code loads");
@@ -4339,7 +4624,7 @@ async fn issue_721_unique_on_a_property_added_in_the_same_apply() {
         let uri = dir.path().to_str().unwrap();
         let db = helpers::session(Omnigraph::init(uri, ISSUE_721_V1).await.unwrap());
         if let Some(rows) = rows {
-            db.load_jsonl(rows, LoadMode::Merge).await.unwrap();
+            db.load_jsonl(rows, LoadMode::Replace).await.unwrap();
         }
         let plan = db.plan_schema(desired).await.unwrap();
         assert!(plan.supported, "{plan:?}");
@@ -4351,13 +4636,13 @@ async fn issue_721_unique_on_a_property_added_in_the_same_apply() {
 
         db.load_jsonl(
             r#"{"type":"Decision","data":{"slug":"c","ref":"D-1","code":"X"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect("a first code loads");
         db.load_jsonl(
             r#"{"type":"Decision","data":{"slug":"d","ref":"D-1","code":"X"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect_err("the new @unique rejects a duplicate key");
@@ -4378,7 +4663,7 @@ async fn issue_721_edge_property_promotes_to_required() {
         "{\"type\":\"P\",\"data\":{\"slug\":\"a\"}}\n\
          {\"type\":\"P\",\"data\":{\"slug\":\"b\"}}\n\
          {\"edge\":\"Cites\",\"from\":\"a\",\"to\":\"b\",\"data\":{}}",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -4392,7 +4677,7 @@ async fn issue_721_edge_property_promotes_to_required() {
         "{\"type\":\"P\",\"data\":{\"slug\":\"a\"}}\n\
          {\"type\":\"P\",\"data\":{\"slug\":\"b\"}}\n\
          {\"edge\":\"Cites\",\"from\":\"a\",\"to\":\"b\",\"data\":{\"why\":\"x\"}}",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -4401,8 +4686,209 @@ async fn issue_721_edge_property_promotes_to_required() {
         .expect("a backfilled edge property promotes");
     db.load_jsonl(
         "{\"edge\":\"Cites\",\"from\":\"b\",\"to\":\"a\",\"data\":{}}",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect_err("an edge without why is refused");
+}
+
+// A vector field's distance changes in place (the GQ 3 RFC
+// section 4, Schema: Vectors): the apply is metadata-only, reads score and
+// rank by the new distance from the exact scan while the index on disk was
+// built for the old one, which is never used, and the reconciler rebuilds the
+// index with the new distance. A zero vector stored while the field was `l2`
+// drops its row from `distance` and `nearest` alike once the field is
+// `cosine`, before and after the rebuild, and new zero vectors are refused.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn vector_distance_change_is_applied_in_place_and_serves_exactly_until_the_rebuild() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+
+    const QUERIES: &str = r#"
+query scored($q: Vector(4)) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from distance($pop, $d.embedding, $q) as $distance,
+    }
+    return { $d.slug, $distance as distance }
+    order { $distance }
+}
+query ranked($q: Vector(4)) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from nearest($pop, $d.embedding, $q, k: 2) as $distance,
+    }
+    return { $d.slug, $distance as distance }
+    order { $distance }
+}
+query ranked_all($q: Vector(4)) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from nearest($pop, $d.embedding, $q, k: 5) as $distance,
+    }
+    return { $d.slug, $distance as distance }
+    order { $distance }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema =
+        |ty: &str| format!("node Doc {{\n    slug: String @key\n    embedding: {ty}? @index\n}}\n");
+    let db = helpers::session(Omnigraph::init(uri, &schema("Vector(4)")).await.unwrap());
+    // Every norm is a power of two, so each path is exact in F32; `c` is a
+    // zero vector, which `l2` admits.
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"a","embedding":[1.0,1.0,1.0,1.0]}}
+{"type":"Doc","data":{"slug":"b","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d","embedding":[-2.0,-2.0,-2.0,-2.0]}}
+{"type":"Doc","data":{"slug":"e","embedding":[0.0,0.0,0.0,-4.0]}}"#,
+        LoadMode::Replace,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+
+    // The vector indexes on `embedding`, by the metric their statistics name.
+    let index_metrics = || {
+        let db = &db;
+        async move {
+            let ds = open_pinned_dataset_for_test(db, "main", "node:Doc").await;
+            let field = ds.schema().field("embedding").unwrap().id;
+            let mut metrics = Vec::new();
+            for index in ds.load_indices().await.unwrap().iter() {
+                if index.fields != [field] {
+                    continue;
+                }
+                fn metric(value: &serde_json::Value) -> Option<String> {
+                    match value {
+                        serde_json::Value::Object(map) => map
+                            .get("metric_type")
+                            .and_then(|metric| metric.as_str())
+                            .map(str::to_ascii_lowercase)
+                            .or_else(|| map.values().find_map(metric)),
+                        serde_json::Value::Array(items) => items.iter().find_map(metric),
+                        _ => None,
+                    }
+                }
+                let stats: serde_json::Value =
+                    serde_json::from_str(&ds.index_statistics(&index.name).await.unwrap()).unwrap();
+                metrics.push(metric(&stats).unwrap_or_else(|| panic!("{stats}")));
+            }
+            (ds.version().version, metrics)
+        }
+    };
+    // The rows of `name` and whether its scan searched an IVF partition.
+    let run = |name: &'static str| {
+        let db = &db;
+        async move {
+            let probes = QueryIoProbes::default();
+            let result = with_query_io_probes(probes.clone(), async {
+                query_main(db, QUERIES, name, &vector_param("$q", &[1.0; 4])).await
+            })
+            .await
+            .unwrap();
+            let batch = result.concat_batches().unwrap();
+            let slugs = batch
+                .column_by_name("d.slug")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap()
+                .clone();
+            let distances = batch
+                .column_by_name("distance")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap()
+                .clone();
+            let rows = (0..batch.num_rows())
+                .map(|row| (slugs.value(row).to_string(), distances.value(row)))
+                .collect::<Vec<_>>();
+            let indexed = !probes
+                .ann_rung_partitions_searched
+                .lock()
+                .unwrap()
+                .is_empty();
+            (rows, indexed)
+        }
+    };
+    let rows = |expected: &[(&str, f32)]| {
+        expected
+            .iter()
+            .map(|(slug, distance)| (slug.to_string(), *distance))
+            .collect::<Vec<_>>()
+    };
+
+    // `l2`: the sum of squared differences, the zero vector included; the
+    // index is built for `l2` and `nearest` searches it.
+    let l2 = rows(&[("a", 0.0), ("b", 3.0), ("c", 4.0), ("e", 28.0), ("d", 36.0)]);
+    let (l2_version, metrics) = index_metrics().await;
+    assert_eq!(metrics, ["l2"]);
+    assert_eq!(run("scored").await.0, l2);
+    assert_eq!(run("ranked").await, (l2[..2].to_vec(), true));
+
+    // The apply is one in-place step that writes no table: the dataset keeps
+    // its version and its `l2` index.
+    let result = db
+        .apply_schema(&schema(r#"Vector(4, distance = "cosine")"#))
+        .await
+        .unwrap();
+    assert!(result.applied);
+    assert_eq!(
+        result.steps,
+        vec![SchemaMigrationStep::ChangeVectorDistance {
+            type_kind: SchemaTypeKind::Node,
+            type_name: "Doc".to_string(),
+            property_name: "embedding".to_string(),
+            from: omnigraph_compiler::schema::vector::VectorDistance::L2,
+            to: omnigraph_compiler::schema::vector::VectorDistance::Cosine,
+        }]
+    );
+    assert_eq!(index_metrics().await, (l2_version, vec!["l2".to_string()]));
+
+    // `cosine` from the exact scan: the `l2` index is never used, and the
+    // zero vector stored under `l2` drops from `distance` and `nearest`.
+    let cosine = rows(&[("a", 0.0), ("b", 0.5), ("e", 1.5), ("d", 2.0)]);
+    assert_eq!(run("scored").await.0, cosine);
+    assert_eq!(run("ranked").await, (cosine[..2].to_vec(), false));
+    assert_eq!(run("ranked_all").await, (cosine.clone(), false));
+
+    // The reconciler replaces the index with one built for `cosine`, which
+    // `nearest` then searches; the answers do not change.
+    db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(index_metrics().await.1, ["cosine"]);
+    assert_eq!(run("scored").await.0, cosine);
+    assert_eq!(run("ranked").await, (cosine[..2].to_vec(), true));
+    assert_eq!(run("ranked_all").await.0, cosine);
+    // Nothing is left to build.
+    let (_, metrics_before) = index_metrics().await;
+    db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(index_metrics().await.1, metrics_before);
+
+    // A new zero vector is refused on every write path; nothing changes.
+    let (version, _) = index_metrics().await;
+    let refused = db
+        .load_jsonl(
+            r#"{"type":"Doc","data":{"slug":"z","embedding":[0.0,-0.0,0.0,0.0]}}"#,
+            LoadMode::Replace,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("Doc.embedding declares the cosine distance"),
+        "{refused}"
+    );
+    assert_eq!(index_metrics().await.0, version);
+    assert_eq!(run("scored").await.0, cosine);
+
+    // Back to `l2`: the zero vector scores again, exactly, until the rebuild.
+    db.apply_schema(&schema("Vector(4)")).await.unwrap();
+    assert_eq!(run("scored").await.0, l2);
+    assert_eq!(run("ranked").await, (l2[..2].to_vec(), false));
+    db.ensure_indices_as(None).await.unwrap();
+    assert_eq!(index_metrics().await.1, ["l2"]);
+    assert_eq!(run("ranked").await, (l2[..2].to_vec(), true));
 }

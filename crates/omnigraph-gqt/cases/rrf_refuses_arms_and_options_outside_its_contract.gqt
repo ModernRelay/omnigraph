@@ -1,0 +1,192 @@
+# issue: none
+# notes: The type checker holds `rrf` to its contract (the GQ 3 RFC, section 4, Fusion and
+# notes: Errors): 2 to 16 arms, `k` in 1..=1000000, each weight in (0, 1000000] with one weight per arm, no two
+# notes: arms with the same population, field and query (`weights` expresses emphasis), and every arm over one
+# notes: node column of one name and type (the fused target would be a pair). Each bound is admitted where it
+# notes: holds: 16 arms, `k: 1`, `k: 1000000` and a weight of 1000000 run. Two `nearest` arms whose queries
+# notes: differ are distinct arms: from [0, 0] the window of 2 is d0, d1; from [1, 0] it is d1, then d0
+# notes: (tied with d2 at distance 1, the smaller identity), so d0 and d1 tie and d2 is selected by
+# notes: neither; a weight of 1000000 on the second arm puts its first target, d1, first.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(2) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d0","embedding":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","embedding":[2.0,0.0]}}
+
+--- query
+query duplicate_arms() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [0.0, 0.0], k: 2)) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect error: type error: T75: `rrf` arms 1 and 2 rank the same population, field and query
+
+--- query
+query two_columns() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      let $other = { match { $e: Doc } return { $e } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($other, $e.embedding, [1.0, 0.0], k: 2)) as $s,
+    }
+    return { $d.slug }
+    order { $s desc }
+}
+
+--- expect error: type error: T75: `rrf` arm 2 ranks `$e`
+
+--- query
+query zero_k() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), k: 0) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect error: type error: T71: `rrf`'s `k:` is an integer literal in 1..=1000000
+
+--- query
+query oversized_k() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), k: 1000001) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect error: type error: T71: `rrf`'s `k:` is an integer literal in 1..=1000000
+
+--- query
+query smallest_k() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), k: 1) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d0"}
+{"d.slug":"d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query largest_k() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), k: 1000000) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d0"}
+{"d.slug":"d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query weights_of_another_length() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), weights: [1.0]) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect error: type error: T75: `weights` has 1 entries for 2 arms
+
+--- query
+query zero_weight() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), weights: [1.0, 0.0]) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect error: type error: T71: a weight is in (0, 1000000], got 0
+
+--- query
+query oversized_weight() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), weights: [1.0, 1000001.0]) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect error: type error: T71: a weight is in (0, 1000000], got 1000001
+
+--- query
+query largest_weight() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), weights: [1.0, 1000000.0]) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d1"}
+{"d.slug":"d0"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query sixteen_arms() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), nearest($all, $d.embedding, [2.0, 0.0], k: 2), nearest($all, $d.embedding, [3.0, 0.0], k: 2), nearest($all, $d.embedding, [4.0, 0.0], k: 2), nearest($all, $d.embedding, [5.0, 0.0], k: 2), nearest($all, $d.embedding, [6.0, 0.0], k: 2), nearest($all, $d.embedding, [7.0, 0.0], k: 2), nearest($all, $d.embedding, [8.0, 0.0], k: 2), nearest($all, $d.embedding, [9.0, 0.0], k: 2), nearest($all, $d.embedding, [10.0, 0.0], k: 2), nearest($all, $d.embedding, [11.0, 0.0], k: 2), nearest($all, $d.embedding, [12.0, 0.0], k: 2), nearest($all, $d.embedding, [13.0, 0.0], k: 2), nearest($all, $d.embedding, [14.0, 0.0], k: 2), nearest($all, $d.embedding, [15.0, 0.0], k: 2)) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d1"}
+{"d.slug":"d2"}
+{"d.slug":"d0"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query seventeen_arms() {
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, [0.0, 0.0], k: 2), nearest($all, $d.embedding, [1.0, 0.0], k: 2), nearest($all, $d.embedding, [2.0, 0.0], k: 2), nearest($all, $d.embedding, [3.0, 0.0], k: 2), nearest($all, $d.embedding, [4.0, 0.0], k: 2), nearest($all, $d.embedding, [5.0, 0.0], k: 2), nearest($all, $d.embedding, [6.0, 0.0], k: 2), nearest($all, $d.embedding, [7.0, 0.0], k: 2), nearest($all, $d.embedding, [8.0, 0.0], k: 2), nearest($all, $d.embedding, [9.0, 0.0], k: 2), nearest($all, $d.embedding, [10.0, 0.0], k: 2), nearest($all, $d.embedding, [11.0, 0.0], k: 2), nearest($all, $d.embedding, [12.0, 0.0], k: 2), nearest($all, $d.embedding, [13.0, 0.0], k: 2), nearest($all, $d.embedding, [14.0, 0.0], k: 2), nearest($all, $d.embedding, [15.0, 0.0], k: 2), nearest($all, $d.embedding, [16.0, 0.0], k: 2)) as $s,
+    }
+    return { $d.slug }
+    order { $s desc, $d.slug }
+}
+
+--- expect error: type error: T75: `rrf` takes 2 to 16 arms, got 17

@@ -46,10 +46,8 @@ n: I64
 
 --- query
 query older_than_27() {
-    match {
-        $p: Person
-        $p.age > 27
-    }
+    match { $p: Person }
+    where $p.age > 27
     return { $p.name as name, $p.age as age }
 }
 

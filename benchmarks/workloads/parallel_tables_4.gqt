@@ -9,10 +9,14 @@ environments:
 
 --- mutate
 query update_tables() {
-    update T0 set { value: 1 } where key = "row"
-    update T1 set { value: 1 } where key = "row"
-    update T2 set { value: 1 } where key = "row"
-    update T3 set { value: 1 } where key = "row"
+    match { $x: T0 } where $x.key = "row"
+    update $x set { value: 1 }
+    match { $x: T1 } where $x.key = "row"
+    update $x set { value: 1 }
+    match { $x: T2 } where $x.key = "row"
+    update $x set { value: 1 }
+    match { $x: T3 } where $x.key = "row"
+    update $x set { value: 1 }
 }
 --- expect affected: nodes=4 edges=0
 

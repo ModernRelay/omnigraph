@@ -22,7 +22,7 @@ branch create b0
 
 --- foreach $name a b
 --- mutate branch: b0
-query insert_person($name: String) { insert Person { name: $name } }
+query insert_person($name: String) { replace Person { name: $name } }
 --- params
 {"name": "${name}"}
 --- expect affected: nodes=1 edges=0
@@ -40,11 +40,11 @@ query main_people() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- mutate
-query insert_on_main() { insert Tag { name: "m" } }
+query insert_on_main() { replace Tag { name: "m" } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b0
-query insert_on_b0() { insert Person { name: "c" } }
+query insert_on_b0() { replace Person { name: "c" } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate

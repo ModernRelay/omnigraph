@@ -65,7 +65,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "queries",
         title: "List stored queries",
-        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run a stored read with `query` and a stored mutation with `mutate`, each passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused.",
+        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`, `default` when one is declared; `item_kind` for lists, `vector_dim` for vectors). A parameter with neither `nullable` nor a `default` is required; an omitted one with a `default` binds it. Run a stored read with `query` and a stored mutation with `mutate`, each passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused. `unavailable` lists the stored queries whose source fails to compile under the server's release, each with its `diagnostic`; invoking one answers `stored_query_unavailable` with it, and the operator rewrites its source from the printed fix.",
         input: graph_schema,
         output: Some(queries_output_schema),
         effect: Effect::Read,
@@ -73,7 +73,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "query",
         title: "Run a read",
-        description: "Run a read: GQ source you write in `query`, or a stored read by `name` (see `queries`), with `params` keyed by the declared parameter names. Call `schema` before writing source. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; with source, `name` picks one declared query when it declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Source may also be `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` or `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; or `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations, stored mutations and branch writes are refused here; `mutate` runs them. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist.",
+        description: "Run a read: GQ source you write in `query`, or a stored read by `name` (see `queries`), with `params` keyed by the declared parameter names. Call `schema` before writing source. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person } where $p.age >= $min return { $p.name } }`) and pass the values in `params`; with source, `name` picks one declared query when it declares several. Reads `branch` (default `main`) or a `snapshot`, never both. A ranking (`nearest`, `bm25`, `distance`, `rrf`) is drawn with `from` over a population and named with `as` (`from nearest($pop, $d.embedding, $q, k: 10) as $distance`); `nearest` requires its window `k`, and `limit` is a separate cut. Source may also be `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` or `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; or `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations, stored mutations and branch writes are refused here; `mutate` runs them. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist.",
         input: query_schema,
         output: None,
         effect: Effect::Read,
@@ -177,7 +177,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "load",
         title: "Load NDJSON",
-        description: "Load NDJSON records (`{\"type\": \"<Type>\", \"data\": {...}}` per line) into `branch` (default `main`) as one commit. `mode`: `merge` upserts by key, `append` refuses an existing key, `overwrite` replaces the supplied types. Without `from` the branch must exist; with `from` a missing branch is created from it. The whole call must fit in 64 KiB; split larger loads into separate commits.",
+        description: "Load NDJSON records (`{\"type\": \"<Type>\", \"data\": {...}}` per line) into `branch` (default `main`) as one commit. `mode`: `insert` refuses an existing key, `upsert` sets the properties a record names and keeps the others, `replace` writes the whole row, `overwrite` replaces the supplied types; a retried load uses `upsert` or `replace`. Without `from` the branch must exist; with `from` a missing branch is created from it. The whole call must fit in 64 KiB; split larger loads into separate commits.",
         input: load_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
@@ -502,7 +502,7 @@ pub(super) fn load_schema() -> Value {
         json!({
             "branch": text_schema("Branch to load into. Defaults to `main`."),
             "from": text_schema("Create `branch` from this branch when it does not exist."),
-            "mode": {"type": "string", "enum": ["merge", "append", "overwrite"], "description": "How existing keys are handled."},
+            "mode": {"type": "string", "enum": ["insert", "upsert", "replace", "overwrite"], "description": "What a record does to an existing key: `insert` fails on one, `upsert` sets the properties the record names, `replace` writes the whole row, `overwrite` makes each type exactly the batch's rows."},
             "data": text_schema("NDJSON: one `{\"type\": \"<Type>\", \"data\": {...}}` record per line."),
         }),
         &["mode", "data"],
@@ -664,12 +664,26 @@ pub(super) fn queries_output_schema() -> Value {
                         "item_kind": kind,
                         "vector_dim": {"type": "integer"},
                         "nullable": {"type": "boolean"},
+                        "default": {"description": "The declared default, which an omitted parameter binds; present as `null` when the default is `null`, absent when none is declared."},
                     },
                     "required": ["name", "kind", "nullable"],
                 }},
             },
             "required": ["name", "tool_name", "mutation", "params"],
-        }}},
+        }},
+        "unavailable": {
+            "description": "Stored queries whose source fails to compile under the server's release, so the server does not serve them; absent when there are none.",
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "error": {"type": "string"},
+                    "diagnostic": {"type": "object", "description": "The refusal: its `code`, `position`, `expected`, `fix` and `suggestion` byte edits against the stored source."},
+                },
+                "required": ["name", "error"],
+            },
+        }},
         "required": ["queries"],
     })
 }

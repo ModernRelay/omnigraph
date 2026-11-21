@@ -1,0 +1,91 @@
+# issue: none
+# notes: A search-only order over a pipeline with a second, unranked binding sorts by the score and tie-breaks on every scope binding's id, which the planner reads for the scan; a search order on a traversal destination roots its component there and ranks the reached documents only (d000, the global nearest, is not reached).
+# notes: An `rrf` whose arms rank two bindings one traversal connects is refused at type checking (T75) in both declaration orders: the fused target would be a pair.
+# red_on: 2026-09-23, task 0226 tree before the one-pass tie-break: step 1 failed with `the planned tie-break column 'z.__id' is not in the sort input` (the tie-break was derived at lowering, after projection pushdown); step 2 failed with `column 'd._distance' not found for ordering` instead of a planning refusal.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+}
+node Zone {
+    name: String @key
+}
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d002","embedding":[2.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d003","embedding":[3.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d004","embedding":[4.0,0.0,0.0,0.0]}}
+{"type":"Zone","data":{"name":"z1"}}
+{"type":"Person","data":{"name":"p1"}}
+{"edge":"Knows","from":"p1","to":"d003"}
+{"edge":"Knows","from":"p1","to":"d004"}
+
+--- query
+query connected_rrf_d_first($q: Vector(4)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, let $pop2 = { match { $t: Doc } return { $t } }, from rrf(nearest($pop, $d.embedding, $q, k: 1), nearest($pop2, $t.embedding, $q, k: 1)) as $score, $d: Doc, $t: Doc, $p: Person, $p knows $d, $p knows $t }
+    return { $d.slug, $t.slug }
+    order { $score desc }
+    limit 1
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+--- expect error: T75: `rrf` arm 2 ranks `$t` (node Doc), arm 1 ranks `$d` (node Doc); the fused target would be a pair
+
+--- query
+query connected_rrf_t_first($q: Vector(4)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, let $pop2 = { match { $t: Doc } return { $t } }, from rrf(nearest($pop, $d.embedding, $q, k: 1), nearest($pop2, $t.embedding, $q, k: 1)) as $score, $t: Doc, $d: Doc, $p: Person, $p knows $d, $p knows $t }
+    return { $d.slug, $t.slug }
+    order { $score desc }
+    limit 1
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+--- expect error: T75: `rrf` arm 2 ranks `$t` (node Doc), arm 1 ranks `$d` (node Doc); the fused target would be a pair
+
+--- query
+query search_only_order_with_an_unranked_binding($q: Vector(4)) {
+    match { let $pop = { match { $c: Doc, let $zs = { match { $z: Zone } return { $z } }, from $zs } return { $c, $z } }, from nearest($pop, $c.embedding, $q, k: 3) as $distance }
+    return { $c.slug, $z.name }
+    order { $distance }
+    limit 3
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+--- expect ordered
+{"c.slug":"d000","z.name":"z1"}
+{"c.slug":"d001","z.name":"z1"}
+{"c.slug":"d002","z.name":"z1"}
+--- expect shape
+c.slug: String
+z.name: String
+--- expect plan
+sort tiebreak [$c, $z]
+
+--- query
+query nearest_on_a_traversal_destination($q: Vector(4)) {
+    match { let $pop = { match { $p: Person, $d: Doc, $p knows $d } return { $p, $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
+    return { $d.slug }
+    order { $distance }
+    limit 1
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0]}
+--- expect ordered
+{"d.slug":"d003"}
+--- expect shape
+d.slug: String
+--- expect plan
+scan Doc as $d: ranked nearest fetch 1

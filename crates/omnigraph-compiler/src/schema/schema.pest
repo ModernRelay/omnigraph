@@ -23,7 +23,14 @@ edge_decl = { "edge" ~ type_name ~ ":" ~ type_name ~ "->" ~ type_name ~ cardinal
 // @card(0..1), @card(1..), @card(0..)
 cardinality = { "@card" ~ "(" ~ integer ~ ".." ~ integer? ~ ")" }
 
-prop_decl = { ident ~ ":" ~ type_ref ~ annotation* }
+prop_decl = { ident ~ ":" ~ type_ref ~ (index_annotation | annotation)* }
+
+// A property's full-text index with its analysis options:
+// `@index(fulltext)`, `@index(fulltext, analyzer = "english_v1", scorer = "none")`.
+// Tried before a body constraint, so `@index(fulltext)` after a property is
+// that property's index, never a body-level index on a property `fulltext`.
+index_annotation = { "@index" ~ "(" ~ index_kind ~ ("," ~ annotation_kwarg)* ~ ")" }
+index_kind = @{ "fulltext" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 // Body-level constraints: @key(name), @unique(a, b), @index(a, b), @range(age, 0..200), @check(code, "regex")
 body_constraint = { "@" ~ constraint_name ~ "(" ~ constraint_args ~ ")" }
@@ -41,7 +48,7 @@ type_ref = { core_type ~ "?"? }
 core_type = { list_type | enum_type | vector_type | base_type }
 list_type = { "[" ~ base_type ~ "]" }
 enum_type = { "enum" ~ "(" ~ enum_value ~ ("," ~ enum_value)* ~ ")" }
-vector_type = { "Vector" ~ "(" ~ integer ~ ")" }
+vector_type = { "Vector" ~ "(" ~ integer ~ ("," ~ annotation_kwarg)* ~ ")" }
 enum_value = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
 
 base_type = { "String" | "Blob" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date" }

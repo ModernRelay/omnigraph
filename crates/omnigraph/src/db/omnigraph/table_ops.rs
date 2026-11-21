@@ -6,6 +6,7 @@ use crate::table_store::{RefreshedIndex, TableStore};
 use futures::{StreamExt, TryStreamExt};
 use lance::index::DatasetIndexExt;
 use omnigraph_compiler::types::PropIndexKind;
+use omnigraph_core::dataset_index::ScalarIndexFamily;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
     let (resolved, catalog) = db.capture_current_read_view().await?;
@@ -99,6 +100,9 @@ pub struct BuiltIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BuiltIndexKind {
     Btree,
+    Bitmap,
+    LabelList,
+    NGram,
     FullText,
     Vector,
 }
@@ -107,8 +111,22 @@ impl BuiltIndexKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Btree => "btree",
+            Self::Bitmap => "bitmap",
+            Self::LabelList => "label_list",
+            Self::NGram => "ngram",
             Self::FullText => "full_text",
             Self::Vector => "vector",
+        }
+    }
+}
+
+impl From<ScalarIndexFamily> for BuiltIndexKind {
+    fn from(family: ScalarIndexFamily) -> Self {
+        match family {
+            ScalarIndexFamily::BTree => Self::Btree,
+            ScalarIndexFamily::Bitmap => Self::Bitmap,
+            ScalarIndexFamily::LabelList => Self::LabelList,
+            ScalarIndexFamily::NGram => Self::NGram,
         }
     }
 }
@@ -369,7 +387,18 @@ async fn maintain_indices_for_branch(
             }
             IndexMaintenanceMode::RebuildFullText => {
                 let node = &catalog.node_types[type_name];
-                plan_full_text_rebuild(&table_key, &node.properties, &node.indices, &ds).await?
+                let declared: Vec<String> = declared_full_text_columns(&catalog, &table_key)?
+                    .into_iter()
+                    .map(|column| column.column)
+                    .collect();
+                plan_full_text_rebuild(
+                    &table_key,
+                    &node.properties,
+                    &declared,
+                    &|column| full_text_build(node, column),
+                    &ds,
+                )
+                .await?
             }
         };
         if !work.pending.is_empty() {
@@ -409,7 +438,14 @@ async fn maintain_indices_for_branch(
                 // Ensure only builds edge id/src/dst BTREEs; edge declarations
                 // must not introduce FTS during migration. Existing physical
                 // edge FTS inventory is still replaced for SDK reads.
-                plan_full_text_rebuild(&table_key, &edge.properties, &[], &ds).await?
+                plan_full_text_rebuild(
+                    &table_key,
+                    &edge.properties,
+                    &[],
+                    &|column| edge_full_text_build(edge, column),
+                    &ds,
+                )
+                .await?
             }
         };
         if work.needs_commit() {
@@ -616,7 +652,7 @@ async fn maintain_indices_for_branch(
                     ds,
                     staged,
                     &witness,
-                    &declared_full_text_columns(&catalog, &target.table_key),
+                    &declared_full_text_columns(&catalog, &target.table_key)?,
                 )
                 .await?;
             let state = db
@@ -679,7 +715,7 @@ async fn maintain_indices_for_branch(
     if mode == IndexMaintenanceMode::RebuildFullText && graph_commit_id.is_some() {
         for target in &targets {
             for spec in &work_by_table[&target.table_key].specs {
-                if let crate::storage_layer::IndexBuildSpec::FullText { column } = spec {
+                if let crate::storage_layer::IndexBuildSpec::FullText { column, .. } = spec {
                     rebuilt_indexes.push(RebuiltFullTextIndex {
                         type_key: target.table_key.clone(),
                         property: column.clone(),
@@ -697,10 +733,13 @@ async fn maintain_indices_for_branch(
                     crate::storage_layer::IndexBuildSpec::BTree { column, .. } => {
                         (column, BuiltIndexKind::Btree)
                     }
-                    crate::storage_layer::IndexBuildSpec::FullText { column } => {
+                    crate::storage_layer::IndexBuildSpec::Scalar { column, family } => {
+                        (column, BuiltIndexKind::from(*family))
+                    }
+                    crate::storage_layer::IndexBuildSpec::FullText { column, .. } => {
                         (column, BuiltIndexKind::FullText)
                     }
-                    crate::storage_layer::IndexBuildSpec::Vector { column } => {
+                    crate::storage_layer::IndexBuildSpec::Vector { column, .. } => {
                         (column, BuiltIndexKind::Vector)
                     }
                 };
@@ -711,10 +750,10 @@ async fn maintain_indices_for_branch(
                 .unwrap_or_default()
                 .into_iter()
                 .map(|index| {
-                    let kind = if index.vector {
-                        BuiltIndexKind::Vector
-                    } else {
-                        BuiltIndexKind::Btree
+                    let kind = match index.family {
+                        _ if index.vector => BuiltIndexKind::Vector,
+                        Some(family) => BuiltIndexKind::from(family),
+                        None => BuiltIndexKind::Btree,
                     };
                     (index.column, kind, BuiltIndexAction::Refreshed)
                 });
@@ -744,7 +783,7 @@ fn full_text_columns(specs: &[crate::storage_layer::IndexBuildSpec]) -> Vec<&str
     specs
         .iter()
         .filter_map(|spec| match spec {
-            crate::storage_layer::IndexBuildSpec::FullText { column } => Some(column.as_str()),
+            crate::storage_layer::IndexBuildSpec::FullText { column, .. } => Some(column.as_str()),
             _ => None,
         })
         .collect()
@@ -782,6 +821,9 @@ pub(super) async fn append_deferred_full_text_indexes(
         .collect();
     let remedy = crate::error::FULL_TEXT_REBUILD_COMMAND.replace("<branch>", branch);
     for (name, index) in full_text {
+        if !full_text_index_serves_reads(index) {
+            continue;
+        }
         let coverage_unknown = indices
             .iter()
             .any(|segment| segment.name == name && segment.fragment_bitmap.is_none());
@@ -812,30 +854,96 @@ pub(super) async fn append_deferred_full_text_indexes(
     Ok(())
 }
 
+/// Whether a read uses the full-text index `index`. None does: the exact
+/// lexical scan answers every lexical call until a read is admitted to a
+/// certified index (lance-fences.md, full-text compatibility). An index no
+/// read uses is no pending work, so maintenance never recommends the
+/// full-text rebuild for it, a step binaries before this release cannot
+/// read back.
+fn full_text_index_serves_reads(_index: &lance_table::format::IndexMetadata) -> bool {
+    false
+}
+
 /// The columns of `table_key` that carry a declared full-text index: every
-/// one-column `@index`/`@key` node property [`PropType::index_kind`] maps to
-/// full text, the same rule the index builder follows. Edges declare none.
+/// node property declaring `@index(fulltext, ...)`, the one declaration
+/// [`PropType::index_kinds`] gives full text, the same rule the index builder
+/// follows. Edges declare none.
 /// Every detached commit a writer publishes declares them
 /// (`TableStore::commit_staged_detached`).
-pub(crate) fn declared_full_text_columns(catalog: &Catalog, table_key: &str) -> Vec<String> {
+pub(crate) fn declared_full_text_columns(
+    catalog: &Catalog,
+    table_key: &str,
+) -> Result<Vec<crate::storage_layer::FullTextColumn>> {
     let Some(node_type) = table_key
         .strip_prefix("node:")
         .and_then(|type_name| catalog.node_types.get(type_name))
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let mut columns: Vec<String> = node_type
+    let mut columns: Vec<&String> = node_type
         .indices
         .iter()
         .filter_map(|index_cols| match index_cols.as_slice() {
-            [property] if node_type.has_full_text_index(property) => Some(property),
+            [property] if node_type.builds_full_text_index(property) => Some(property),
             _ => None,
         })
-        .cloned()
         .collect();
     columns.sort();
     columns.dedup();
     columns
+        .into_iter()
+        .map(|column| {
+            Ok(crate::storage_layer::FullTextColumn {
+                column: column.clone(),
+                analysis: full_text_build(node_type, column)?,
+            })
+        })
+        .collect()
+}
+
+/// The analysis `column`'s full-text segments are built with: the profile its
+/// accepted schema applies, with the fingerprint the certificate records.
+pub(crate) fn full_text_build(
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    column: &str,
+) -> Result<crate::storage_layer::FullTextBuild> {
+    let missing = || {
+        OmniError::manifest_internal(format!(
+            "`{}.{column}` carries no full-text profile and fingerprint in its accepted schema",
+            node_type.name
+        ))
+    };
+    Ok(crate::storage_layer::FullTextBuild {
+        profile: node_type.full_text_profile(column).ok_or_else(missing)?,
+        fingerprint: node_type
+            .full_text_fingerprints
+            .get(column)
+            .cloned()
+            .ok_or_else(missing)?,
+    })
+}
+
+/// The analysis an edge property's full-text segments are built with: an
+/// edge property declares none, so it is `english_v1`, with the fingerprint
+/// its accepted schema records.
+pub(crate) fn edge_full_text_build(
+    edge_type: &omnigraph_compiler::catalog::EdgeType,
+    column: &str,
+) -> Result<crate::storage_layer::FullTextBuild> {
+    let fingerprint = edge_type
+        .full_text_fingerprints
+        .get(column)
+        .cloned()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "`{}.{column}` carries no full-text fingerprint in its accepted schema",
+                edge_type.name
+            ))
+        })?;
+    Ok(crate::storage_layer::FullTextBuild {
+        profile: omnigraph_compiler::schema::analysis::AnalyzerProfile::DEFAULT,
+        fingerprint,
+    })
 }
 
 /// Whether a vector column currently has at least one non-null vector — the
@@ -875,11 +983,14 @@ pub(super) struct IndexWorkStatus {
 /// zero commits and must NOT become publication targets).
 ///
 /// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
-/// each one-column `@index`/`@key` property, the index `PropType::index_kind`
-/// assigns: a scalar BTREE for enums and orderable scalars
-/// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector
-/// index. Edges get BTree only (id, src, dst). This helper and the builder
-/// share `PropType::index_kind` so they cannot drift — see its doc comment.
+/// each one-column `@index`/`@key` property, the indexes
+/// `PropType::index_kinds` assigns its declaration: a BITMAP for enums and
+/// `Bool`, a LABEL_LIST for lists, for free-text Strings a BTREE (a `@key`
+/// alone), NGRAM and BTREE (`@index`) or FTS, NGRAM and BTREE
+/// (`@index(fulltext, ...)`), a BTREE for the other orderable scalars
+/// (DateTime/Date/numeric), or a Vector index. Edges get BTree only (id, src,
+/// dst). This helper and the builder share `PropType::index_kinds` so they
+/// cannot drift — see its doc comment.
 #[derive(Default)]
 pub(super) struct PlannedIndexWork {
     pub(super) specs: Vec<crate::storage_layer::IndexBuildSpec>,
@@ -908,23 +1019,19 @@ impl PlannedIndexWork {
 
 /// Full rebuilds use schema declarations plus the actual physical inventory.
 /// An externally named FTS index on a supported property is still replaced;
-/// names and the table writer version are not compatibility evidence.
+/// names and the table writer version are not compatibility evidence. So is
+/// a full-text index the schema no longer declares on a free-text String (a
+/// plain `@index` whose earlier build gave it full text): the rebuild replaces
+/// what exists, never removes it, and builds full text anew only for
+/// `declared` columns.
 async fn plan_full_text_rebuild(
     table_key: &str,
     properties: &HashMap<String, PropType>,
-    declarations: &[Vec<String>],
+    declared: &[String],
+    build: &(dyn Fn(&str) -> Result<crate::storage_layer::FullTextBuild> + Sync),
     ds: &SnapshotHandle,
 ) -> Result<PlannedIndexWork> {
-    let mut columns = BTreeSet::new();
-    for declaration in declarations {
-        if let [column] = declaration.as_slice()
-            && properties
-                .get(column)
-                .is_some_and(|property| property.index_kind() == Some(PropIndexKind::FullText))
-        {
-            columns.insert(column.clone());
-        }
-    }
+    let mut columns: BTreeSet<String> = declared.iter().cloned().collect();
 
     let dataset = ds.dataset();
     let store = dataset
@@ -978,7 +1085,7 @@ async fn plan_full_text_rebuild(
         let Some(field) = field.filter(|field| {
             properties
                 .get(&field.name)
-                .is_some_and(|property| property.index_kind() == Some(PropIndexKind::FullText))
+                .is_some_and(PropType::is_free_text_string)
         }) else {
             return Err(OmniError::manifest(format!(
                 "cannot rebuild full-text index '{}' on {}: only single, non-list, \
@@ -997,8 +1104,13 @@ async fn plan_full_text_rebuild(
     Ok(PlannedIndexWork {
         specs: columns
             .into_iter()
-            .map(|column| crate::storage_layer::IndexBuildSpec::FullText { column })
-            .collect(),
+            .map(|column| {
+                Ok(crate::storage_layer::IndexBuildSpec::FullText {
+                    analysis: build(&column)?,
+                    column,
+                })
+            })
+            .collect::<Result<_>>()?,
         pending: Vec::new(),
         refresh: false,
     })
@@ -1038,42 +1150,83 @@ async fn plan_index_work_node(
             continue;
         }
         let prop_name = &index_cols[0];
-        let Some(prop_type) = node_type.properties.get(prop_name) else {
-            continue;
-        };
-        match prop_type.index_kind() {
-            // An untrained segment only declares the analyzer
-            // (`TableStore::commit_staged_detached`); the postings are built
-            // here once no segment covers a fragment.
-            Some(PropIndexKind::FullText) => {
-                if !db.storage().has_fts_postings(ds, prop_name).await? {
-                    work.push_spec(crate::storage_layer::IndexBuildSpec::FullText {
-                        column: prop_name.clone(),
-                    });
-                }
-            }
-            Some(PropIndexKind::Vector) => {
-                if !db.storage().has_vector_index(ds, prop_name).await? {
-                    if vector_column_trainable(db, ds, prop_name).await? {
-                        work.push_spec(crate::storage_layer::IndexBuildSpec::Vector {
+        let kinds = node_type.property_index_kinds(prop_name);
+        for kind in kinds {
+            match kind {
+                // An untrained segment only declares the analyzer
+                // (`TableStore::commit_staged_detached`); the postings are
+                // built here once no segment covers a fragment.
+                PropIndexKind::FullText => {
+                    if !db.storage().has_fts_postings(ds, prop_name).await? {
+                        work.push_spec(crate::storage_layer::IndexBuildSpec::FullText {
                             column: prop_name.clone(),
+                            analysis: full_text_build(node_type, prop_name)?,
                         });
-                    } else {
-                        work.pending.push(PendingIndex {
-                            type_key: table_key.to_string(),
-                            property: prop_name.clone(),
-                            reason: "property has no non-null vectors to train on yet".to_string(),
+                    }
+                }
+                // A vector index is built for the field's declared distance;
+                // one built for another distance (the field's distance
+                // changed) is never used, so it is built anew, replacing the
+                // old one.
+                PropIndexKind::Vector => {
+                    let distance = node_type.vector_distance(prop_name);
+                    if !db
+                        .storage()
+                        .has_vector_index_for(ds, prop_name, distance)
+                        .await?
+                    {
+                        if vector_column_trainable(db, ds, prop_name).await? {
+                            work.push_spec(crate::storage_layer::IndexBuildSpec::Vector {
+                                column: prop_name.clone(),
+                                distance,
+                            });
+                        } else {
+                            work.pending.push(PendingIndex {
+                                type_key: table_key.to_string(),
+                                property: prop_name.clone(),
+                                reason: "property has no non-null vectors to train on yet"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+                // A free-text String's BTREE is named explicitly: a full-text
+                // index takes the default name, whether built in the same
+                // batch or before (a plain `@index` built full text before
+                // only `@index(fulltext, ...)` did), and a replacing build
+                // under that name would remove it.
+                PropIndexKind::Btree => {
+                    if !db.storage().has_btree_index(ds, prop_name).await? {
+                        let free_text = node_type
+                            .properties
+                            .get(prop_name)
+                            .is_some_and(PropType::is_free_text_string);
+                        let name = free_text.then(|| {
+                            crate::table_store::scalar_index_name(
+                                prop_name,
+                                ScalarIndexFamily::BTree,
+                            )
+                        });
+                        work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
+                            column: prop_name.clone(),
+                            name,
+                        });
+                    }
+                }
+                PropIndexKind::Bitmap | PropIndexKind::LabelList | PropIndexKind::NGram => {
+                    let family = match kind {
+                        PropIndexKind::Bitmap => ScalarIndexFamily::Bitmap,
+                        PropIndexKind::LabelList => ScalarIndexFamily::LabelList,
+                        _ => ScalarIndexFamily::NGram,
+                    };
+                    if !db.storage().has_scalar_index(ds, prop_name, family).await? {
+                        work.push_spec(crate::storage_layer::IndexBuildSpec::Scalar {
+                            column: prop_name.clone(),
+                            family,
                         });
                     }
                 }
             }
-            Some(PropIndexKind::Btree) if !db.storage().has_btree_index(ds, prop_name).await? => {
-                work.push_spec(crate::storage_layer::IndexBuildSpec::BTree {
-                    column: prop_name.clone(),
-                    name: None,
-                });
-            }
-            Some(PropIndexKind::Btree) | None => {}
         }
     }
     Ok(work)

@@ -17,8 +17,8 @@ use crate::validate::ValidationSummary;
 /// 3: the physical `ContainsJoin` node kind was added, and a physical
 /// `CrossJoin` may carry `filters`, the conjuncts it tests on its pairs.
 /// Version 4: `Expand` carries typed `edges`, `src_type` and per-member
-/// `versions` instead of one `edge_type`, `direction` and `version`; Sort
-/// and RankFuse declare exact metadata tie-break keys, including edge type.
+/// `versions` instead of one `edge_type`, `direction` and `version`; `Sort`
+/// declares exact metadata tie-break keys, including edge type.
 /// Version 5: `pipelines` entries carry identity, pipeline `id` and
 /// `depends_on`, with `source`, `operators` and `sink` as objects whose `id`
 /// joins the `physical_plan` nodes; the additive `logical_plan_initial`
@@ -31,7 +31,11 @@ use crate::validate::ValidationSummary;
 /// Version 8: the write node kind `DeltaSource` was added (a write's staged
 /// delta of one table, the leaf under its `Validate`), and `operation`
 /// carries `write` and `committed` for a write.
-pub const EXPLAIN_VERSION: u32 = 8;
+/// Version 9 (GQ 3): the node kind `RankFuse` was removed and `Fuse` added,
+/// a fusion of 2 to 16 arm subtrees, each naming how it ranks its targets,
+/// and the node kinds `TargetCut`, `Score`, `Let`, `Union`, `OptionalJoin`
+/// and `Correlate` were added, and `TextSearch` was removed.
+pub const EXPLAIN_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EntrySummary {

@@ -211,6 +211,12 @@ is the commit a packaged build was compiled from; a plain source build reports
 it as null and prints no `commit` line. The server reports the same commit as
 `source_version` on `GET /healthz`.
 
+A binary that speaks GQ 3 also prints `query-language gq3` after the
+`http-contract` line, `"query_language": "gq3"` in `--json` and on `GET
+/healthz`. An earlier binary prints no query-language line, so the two tell
+apart even where their versions and contract numbers agree
+([Upgrading queries to GQ 3](queries/upgrading-to-gq3.md)).
+
 `internal_schema.writes` is the storage format of a graph this binary
 creates, and the one `omnigraph upgrade` converts a graph to; `serves` is the
 range of formats it opens. A graph it opens keeps its own format, apart from

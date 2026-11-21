@@ -200,6 +200,8 @@ impl PairBuffer {
             DataFusionError::Internal("cross join pairs before a right batch".into())
         })?;
         let count = self.right_rows.len();
+        // Every pair formed is read work, the ones the filters drop included.
+        self.charge.charge_produced(count as u64)?;
         let work = self.charge.child(OUTPUT)?;
         work.entries::<u32>(count.saturating_mul(2))?;
         let indices = UInt32Array::from_iter_values(self.left_rows.drain(..));
@@ -218,7 +220,7 @@ impl PairBuffer {
         let bytes = std::mem::take(&mut self.bytes);
         let output = hconcat_batches(&left_rows, &right_rows).map_err(external)?;
         let output = conform(output, &self.declared).map_err(external)?;
-        let kept = match conjoined_mask(&output, &self.filters, &self.params)? {
+        let kept = match conjoined_mask(&output, &self.filters, &self.params, None)? {
             None => output,
             Some(mask) => {
                 work.grow(bytes)?;
@@ -273,7 +275,7 @@ mod tests {
     use std::time::Duration;
 
     use datafusion::execution::memory_pool::MemoryPool;
-    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::query::value::{CompOp, Literal};
 
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures::StreamExt;

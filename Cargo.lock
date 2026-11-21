@@ -5461,15 +5461,19 @@ name = "omnigraph-compiler"
 version = "0.16.1"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "arrow-ipc",
  "arrow-json",
  "arrow-schema",
  "arrow-select",
+ "chrono",
  "pest",
  "pest_derive",
+ "proptest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "stacker",
  "thiserror",
  "ulid",
 ]
@@ -5567,7 +5571,9 @@ dependencies = [
  "lance-namespace",
  "lance-select",
  "lance-table",
+ "lance-tokenizer",
  "libc",
+ "libm",
  "object_store 0.14.2",
  "omnigraph-catalog",
  "omnigraph-compiler",
@@ -5592,6 +5598,7 @@ dependencies = [
  "toml",
  "tracing",
  "ulid",
+ "unicode-normalization",
  "url",
 ]
 
@@ -5607,8 +5614,10 @@ dependencies = [
  "omnigraph-dst",
  "omnigraph-engine",
  "omnigraph-gqt-core",
- "omnigraph-reference-engine",
+ "omnigraph-reference",
  "omnigraph-storage",
+ "proptest",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5697,27 +5706,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "omnigraph-reference-engine"
+name = "omnigraph-reference"
 version = "0.16.1"
 dependencies = [
- "arrow-array",
- "arrow-cast",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
- "chrono",
- "datafusion",
- "futures",
- "lance",
- "lance-datafusion",
- "lance-index",
- "omnigraph-catalog",
+ "frostem",
+ "libm",
  "omnigraph-compiler",
- "omnigraph-core",
- "sha2 0.10.9",
- "tokio",
- "tracing",
+ "proptest",
+ "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]

@@ -8,7 +8,6 @@ members = [
     "crates/omnigraph-catalog",
     "crates/omnigraph-planner",
     "crates/omnigraph",
-    "crates/omnigraph-reference-engine",
     "crates/omnigraph-cli",
     "crates/omnigraph-api-types",
     "crates/omnigraph-cluster",
@@ -20,6 +19,7 @@ members = [
     "crates/omnigraph-dst",
     "crates/omnigraph-gqt",
     "crates/omnigraph-gqt-core",
+    "crates/omnigraph-reference",
     "crates/omnigraph-gqt-served",
     "skills",
     "tools/omnigraph-vocabulary-guard",
@@ -40,7 +40,7 @@ arrow-cast = { version = "58", features = ["prettyprint"] }
 arrow-ord = "58"
 arrow-string = "58"
 
-datafusion = { version = "54", default-features = false, features = ["nested_expressions", "string_expressions"] }
+datafusion = { version = "54", default-features = false, features = ["math_expressions", "nested_expressions", "string_expressions", "unicode_expressions"] }
 datafusion-physical-plan = "54"
 datafusion-physical-expr = "54"
 datafusion-execution = "54"
@@ -75,7 +75,13 @@ lance-table = "=13.0.0"
 lance-tokenizer = "=13.0.0"
 frostem = { version = "=1.20260821.3", default-features = false }
 stop-words = { version = "=0.10.0", default-features = false }
+# The exact lexical scan's NFC (every profile normalizes before it tokenizes):
+# a change to its Unicode data changes which values match and their scores,
+# so it needs the same audit as the analyzer pins above.
 unicode-normalization = "=0.1.25"
+# `bm25_v1` computes its IDF with this `log1p` (the GQ 3 RFC,
+# section 4); a change moves scores in their last bits and needs review.
+libm = "=0.2.16"
 
 ulid = "1"
 futures = "0.3"
@@ -84,6 +90,9 @@ async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pest = "2"
 pest_derive = "2"
+# Stack growth for walks as deep as a query's expressions (already in the
+# graph through cedar-policy-core).
+stacker = "0.1.24"
 thiserror = "2"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
 clap = { version = "4.6", features = ["derive"] }
@@ -142,6 +151,26 @@ debug = 0
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Lance 13's NGRAM index lowercases a value before ASCII folding
+# (`TEXT_PREPPER`), so a character that lowercases to itself and folds to
+# capitals (`™` to `TM`) yields a trigram
+# with capitals, which `ngram_to_token` maps with wrapping `u8` arithmetic.
+# A release build wraps, alike on build and search, and the recheck keeps
+# rows exact; overflow checks and a `debug_assert!` panic in a debug build.
+# lance-index's arithmetic is built here as a release build builds it, so
+# every profile runs the code that ships. Drop this at the bump whose
+# prepper folds before lowercasing, when
+# `lance_surface_guards.rs::ngram_maps_a_folded_capital_trigram_by_wrapping`
+# goes red.
+[profile.dev.package.lance-index]
+opt-level = 2
+overflow-checks = false
+debug-assertions = false
+
+[profile.dst.package.lance-index]
+overflow-checks = false
+debug-assertions = false
 
 [profile.release]
 opt-level = 2

@@ -9,7 +9,7 @@ use omnigraph::instrumentation::{
 };
 use omnigraph::loader::LoadMode;
 
-use super::{Session, params, query_main, session, with_setting};
+use super::{Session, params, query_main, session};
 
 const SCHEMA: &str = r#"
 node Account {
@@ -22,20 +22,14 @@ edge AccountTransferAccount: Account -> Account {
 
 const QUERY: &str = r#"
 query top_senders() {
-    match {
-        $src: Account
-        $src $t:accountTransferAccount $dst
-    }
+    match { $src: Account, $src $t:accountTransferAccount $dst }
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
     order { sent desc, $src.accountId }
     limit 20
 }
 
 query first_transfers() {
-    match {
-        $src: Account
-        $src $t:accountTransferAccount $dst
-    }
+    match { $src: Account, $src $t:accountTransferAccount $dst }
     return { $src.accountId, $dst.accountId, $t.@id as edge_id, $t.amount }
     order { $src.accountId, $dst.accountId, $t.@id }
     limit 1025
@@ -83,7 +77,7 @@ pub async fn fixture(dir: &tempfile::TempDir, scale: usize, divisor: usize) -> S
                     .to_string(),
                 );
             }
-            db.load_jsonl(&lines.join("\n"), LoadMode::Append)
+            db.load_jsonl(&lines.join("\n"), LoadMode::Insert)
                 .await
                 .unwrap();
         }
@@ -134,7 +128,7 @@ pub async fn assert_streaming_contract(db: &Session, scale: usize, divisor: usiz
             (account(sender), count, (count as f64 * 2.0).to_bits())
         })
         .collect();
-    let v2 = with_setting(db, "engine", "v2");
+    let v2 = db.clone();
     let probes = QueryMemoryProbes::default();
     let result = with_query_memory_probes(
         probes.clone(),

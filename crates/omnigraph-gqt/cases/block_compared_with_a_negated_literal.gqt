@@ -1,0 +1,68 @@
+# issue: none
+# notes: A block compared with a right side that reads no column but is not a plain
+# notes: constant (a negated literal, arithmetic): it is evaluated over the outer rows,
+# notes: so it keeps its place under A3. Found by the generated engine-equals-reference
+# notes: law (law_engine_reference.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p0: I64?
+}
+edge Rel0: A -> A
+
+--- seed
+{"type":"A","data":{"k":"a","p0":0}}
+{"type":"A","data":{"k":"b","p0":-2}}
+{"type":"A","data":{"k":"c","p0":3}}
+{"edge":"Rel0","from":"a","to":"a"}
+{"edge":"Rel0","from":"b","to":"b"}
+{"edge":"Rel0","from":"c","to":"b"}
+
+--- query
+query q() {
+  match { $n1: A }
+  where (sum($n2.p0) { $n2: A, $n1 rel0 $n2 }) = (-0)
+  return { $n1.k as k }
+}
+
+--- expect unordered
+{"k":"a"}
+
+--- expect shape
+k: String
+
+--- query
+query q() {
+  match { $n1: A }
+  where (sum($n2.p0) { $n2: A, $n1 rel0 $n2 }) <= (1 - 3)
+  return { $n1.k as k }
+}
+
+--- expect unordered
+{"k":"b"}
+{"k":"c"}
+
+--- expect shape
+k: String
+
+--- query
+query q() {
+  match { $n1: A }
+  where (count { $n2: A, $n1 rel0 $n2 }) > (-1)
+  return { $n1.k as k }
+}
+
+--- expect unordered
+{"k":"a"}
+{"k":"b"}
+{"k":"c"}
+
+--- expect shape
+k: String

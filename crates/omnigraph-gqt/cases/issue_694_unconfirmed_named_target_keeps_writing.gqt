@@ -37,7 +37,7 @@ branch create donor
 
 --- mutate branch: donor
 query add_inherited_target_row() {
-    insert Person { name: "carol" }
+    replace Person { name: "carol" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -49,7 +49,7 @@ branch create target from donor
 
 --- mutate branch: source
 query add_source_row() {
-    insert Person { name: "bob" }
+    replace Person { name: "bob" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -80,7 +80,7 @@ p.name: String
 
 --- mutate branch: target
 query unrelated_write() {
-    insert Marker { name: "after_failure" }
+    replace Marker { name: "after_failure" }
 }
 
 --- expect affected: nodes=1 edges=0

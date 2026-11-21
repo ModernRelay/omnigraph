@@ -64,13 +64,18 @@ const BEHAVIOUR_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "physical.rs",
+        "node_can_fail",
+        "whether an expression a kind's fields hold can fail, for a cut of zero rows",
+    ),
+    (
+        "physical.rs",
         "PhysicalPlan::node_json",
         "the explain JSON of every kind's fields",
     ),
     (
         "ranking.rs",
         "planned_ranking",
-        "a Scan's ranked access and a RankFuse's arms",
+        "a Scan's ranked access and a Fuse's target",
     ),
     (
         "ranking.rs",
@@ -79,13 +84,18 @@ const BEHAVIOUR_SITES: &[(&str, &str, &str)] = &[
     ),
     (
         "validate/invariants.rs",
-        "check_policies",
-        "the declared policies of a Scan and a RankFuse",
+        "Requirements::check_row_cuts",
+        "the cuts of Limit, Scan and Sort justified against the query",
+    ),
+    (
+        "validate/placement.rs",
+        "tested",
+        "the conjuncts Scan, Filter, CrossJoin and ContainsJoin test, for the placement check",
     ),
     (
         "validate/invariants.rs",
-        "Requirements::check_row_cuts",
-        "the cuts of Limit, Scan and Sort justified against the query",
+        "plan_regions",
+        "the nested regions of OptionalJoin, Correlate, Union and TargetCut, and the scopes AntiJoin and Fuse leave unwalked",
     ),
     (
         "validate/source.rs",

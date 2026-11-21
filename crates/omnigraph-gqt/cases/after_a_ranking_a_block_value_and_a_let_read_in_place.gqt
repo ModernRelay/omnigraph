@@ -1,0 +1,69 @@
+# issue: none
+# notes: The elements and `where` after a ranking read a block's value and a `let` in
+# notes: place: a `where` comparing an `exists` block's value, and a `let` read after a
+# notes: ranking. Found by the generated engine-equals-reference law
+# notes: (law_engine_reference.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p0: I64?
+    v: Vector(3)?
+}
+edge Rel0: A -> A
+
+--- seed
+{"type":"A","data":{"k":"a","p0":0,"v":[1.0,0.0,0.0]}}
+{"type":"A","data":{"k":"b","p0":1,"v":[0.0,1.0,0.0]}}
+{"type":"A","data":{"k":"c","p0":2,"v":[0.0,0.0,1.0]}}
+{"edge":"Rel0","from":"a","to":"b"}
+
+--- query
+query q($qv: Vector(3)) {
+  match {
+    let $pop = { match { $d: A } return { $d } },
+    from nearest($pop, $d.v, $qv, k: 3) as $s
+  }
+  where (exists { $n: A, $d rel0 $n }) = false
+  return { $d.k as k }
+}
+
+--- params
+{"qv": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"k":"b"}
+{"k":"c"}
+
+--- expect shape
+k: String
+
+--- query
+query q($qv: Vector(3)) {
+  match {
+    let $pop = { match { $d: A } return { $d } },
+    from nearest($pop, $d.v, $qv, k: 3) as $s,
+    let $c = count { $n: A, $d rel0 $n },
+    let $x = $d.p0 + 1
+  }
+  where $c = 0 and $x > 1
+  return { $d.k as k, $c as c, $x as x }
+}
+
+--- params
+{"qv": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"c":0,"k":"b","x":2}
+{"c":0,"k":"c","x":3}
+
+--- expect shape
+k: String
+c: I64
+x: I64?

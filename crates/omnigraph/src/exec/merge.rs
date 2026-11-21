@@ -3722,11 +3722,11 @@ fn proven_fast_forward_needs_no_validation(
 }
 
 /// Whether new rows of `type_name` alone can break no constraint: no value,
-/// enum or non-key uniqueness constraint, and no edge type with a non-zero
-/// `@card` minimum from it. A source node inserted with no edge of such a type
-/// is below the minimum; a branch written by this binary cannot hold one, but
-/// a branch written before the minimum counted inserted nodes can, so the
-/// evaluator counts them.
+/// enum, `cosine` vector or non-key uniqueness constraint, and no edge type
+/// with a non-zero `@card` minimum from it. A source node inserted with no
+/// edge of such a type is below the minimum; a branch written by this binary
+/// cannot hold one, but a branch written before the minimum counted inserted
+/// nodes can, so the evaluator counts them.
 fn node_inserts_need_no_validation(catalog: &Catalog, type_name: &str) -> bool {
     let Some(node_type) = catalog.node_types.get(type_name) else {
         return false;
@@ -3738,6 +3738,10 @@ fn node_inserts_need_no_validation(catalog: &Catalog, type_name: &str) -> bool {
             .properties
             .values()
             .all(|property| property.enum_values.is_none())
+        && !node_type
+            .vector_distances
+            .values()
+            .any(|distance| distance.refuses_zero_vector())
         && !catalog
             .edge_types
             .values()
@@ -4544,11 +4548,14 @@ struct MergeChain {
     links: Vec<SnapshotHandle>,
     uuids: Vec<String>,
     witness: crate::table_store::StagingWitness,
-    declared_full_text: Vec<String>,
+    declared_full_text: Vec<crate::storage_layer::FullTextColumn>,
 }
 
 impl MergeChain {
-    fn new(witness: crate::table_store::StagingWitness, declared_full_text: Vec<String>) -> Self {
+    fn new(
+        witness: crate::table_store::StagingWitness,
+        declared_full_text: Vec<crate::storage_layer::FullTextColumn>,
+    ) -> Self {
         Self {
             links: Vec::new(),
             uuids: Vec::new(),
@@ -4685,7 +4692,10 @@ async fn publish_rewritten_merge_table(
     // target's linear HEAD untouched.
     let mut chain = MergeChain::new(
         target_txn.authority.staging_witness()?,
-        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
+        crate::db::omnigraph::table_ops::declared_full_text_columns(
+            &target_txn.catalog,
+            table_key,
+        )?,
     );
     for (payload, semantics) in [
         (&staged.inserts, KeyedWriteSemantics::StrictInsert),
@@ -5031,7 +5041,10 @@ async fn publish_proven_pure_insert_adopt(
     let schema: SchemaRef = Arc::new(proven.source.schema().into());
     let mut chain = MergeChain::new(
         target_txn.authority.staging_witness()?,
-        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
+        crate::db::omnigraph::table_ops::declared_full_text_columns(
+            &target_txn.catalog,
+            table_key,
+        )?,
     );
     let committed = commit_keyed_stream_chunks(
         target_db,
@@ -5113,7 +5126,10 @@ async fn publish_adopted_delta(
     // adapter keeps wide vector/blob rows streaming and batch-bounded.
     let mut chain = MergeChain::new(
         target_txn.authority.staging_witness()?,
-        crate::db::omnigraph::table_ops::declared_full_text_columns(&target_txn.catalog, table_key),
+        crate::db::omnigraph::table_ops::declared_full_text_columns(
+            &target_txn.catalog,
+            table_key,
+        )?,
     );
     if let Some(insert_table) = &delta.inserts {
         current_ds = commit_staged_keyed_chunks(

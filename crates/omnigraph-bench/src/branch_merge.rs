@@ -27,7 +27,7 @@ use omnigraph_compiler::SystemColumns;
 #[cfg(test)]
 use omnigraph_compiler::ir::ParamMap;
 #[cfg(test)]
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 #[cfg(test)]
 use omnigraph_compiler::schema::parser::parse_schema;
 #[cfg(test)]
@@ -1279,7 +1279,7 @@ fn mutation_queries(diverged_tables: usize) -> String {
         let ty = edge_type_name(table);
         writeln!(
             source,
-            "query del_{table}($c: String) {{\n    delete {ty} where cohort = $c\n}}\n"
+            "query del_{table}($c: String) {{\n    match {{ $x: {ty} }} where $x.cohort = $c\n    delete $x\n}}\n"
         )
         .expect("writing to String cannot fail");
     }
@@ -1387,7 +1387,7 @@ async fn load_base(db: &Session, plan: &BranchMergePlan) -> BranchMergeResult<us
                 ));
                 chunk.push('\n');
             }
-            db.load(MAIN_BRANCH, &chunk, LoadMode::Append)
+            db.load(MAIN_BRANCH, &chunk, LoadMode::Insert)
                 .await
                 .map_err(|error| {
                     fixture_error(format!(
@@ -1422,7 +1422,7 @@ async fn load_base(db: &Session, plan: &BranchMergePlan) -> BranchMergeResult<us
                 ));
                 chunk.push('\n');
             }
-            db.load(MAIN_BRANCH, &chunk, LoadMode::Append)
+            db.load(MAIN_BRANCH, &chunk, LoadMode::Insert)
                 .await
                 .map_err(|error| {
                     fixture_error(format!(
@@ -1481,7 +1481,7 @@ async fn prepare_reversible_updates(db: &Session, plan: &BranchMergePlan) -> Bra
                 ));
                 chunk.push('\n');
             }
-            db.load(MAIN_BRANCH, &chunk, LoadMode::Merge)
+            db.load(MAIN_BRANCH, &chunk, LoadMode::Replace)
                 .await
                 .map_err(|error| {
                     fixture_error(format!(
@@ -1565,7 +1565,7 @@ async fn diverge(
                     ));
                     chunk.push('\n');
                 }
-                db.load(branch, &chunk, LoadMode::Merge)
+                db.load(branch, &chunk, LoadMode::Replace)
                     .await
                     .map_err(|error| {
                         fixture_error(format!(
@@ -1619,7 +1619,7 @@ async fn diverge(
                 ));
                 chunk.push('\n');
             }
-            db.load(branch, &chunk, LoadMode::Append)
+            db.load(branch, &chunk, LoadMode::Insert)
                 .await
                 .map_err(|error| {
                     fixture_error(format!(
@@ -2320,7 +2320,7 @@ mod tests {
                 }]});
                 writeln!(
                     updates,
-                    "\n--- load generate: v1 seed: 0 mode: merge\n{}\n--- expect ok",
+                    "\n--- load generate: v1 seed: 0 mode: replace\n{}\n--- expect ok",
                     serde_json::to_string_pretty(&recipe).unwrap()
                 )
                 .unwrap();

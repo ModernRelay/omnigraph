@@ -29,11 +29,12 @@ use tower::ServiceExt;
 
 pub const MUTATION_QUERIES: &str = r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 
 query set_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    match { $x: Person } where $x.name = $name
+    update $x set { age: $age }
 }
 "#;
 
@@ -154,6 +155,24 @@ pub fn stored_query_registry(specs: &[(&str, &str, bool)]) -> QueryRegistry {
     .expect("specs parse and key==symbol")
 }
 
+/// [`stored_query_registry`], per query: an entry that fails to load is
+/// held unavailable with its refusal, as a served graph's registry is by
+/// default.
+pub fn stored_query_registry_per_query(specs: &[(&str, &str, bool)]) -> QueryRegistry {
+    QueryRegistry::from_specs_per_query(
+        specs
+            .iter()
+            .map(|(name, source, expose)| RegistrySpec {
+                name: name.to_string(),
+                source: source.to_string(),
+                expose: *expose,
+                tool_name: None,
+            })
+            .collect(),
+    )
+    .expect("no registry-wide failure")
+}
+
 pub async fn app_with_stored_queries(
     specs: &[(&str, &str, bool)],
     tokens: &[(&str, &str)],
@@ -218,8 +237,7 @@ rules:
       branch_scope: any
 "#;
 
-pub const FIND_PERSON_GQ: &str =
-    "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+pub const FIND_PERSON_GQ: &str = "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }";
 
 /// RFC-011 cluster-only: the single-graph convenience apps built by the
 /// `app_for_loaded_graph*` helpers serve the graph under the reserved id
@@ -1056,7 +1074,7 @@ pub async fn build_parity_graph() -> (tempfile::TempDir, PathBuf, PathBuf) {
             "feature",
             None,
             r#"{"type":"Person","data":{"name":"ParityEve","age":29}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
             None,
         )
         .await
@@ -1227,7 +1245,7 @@ pub async fn converged_cluster_dir(policies_yaml: &str) -> tempfile::TempDir {
     .unwrap();
     fs::write(
         temp.path().join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
     )
     .unwrap();
     fs::write(

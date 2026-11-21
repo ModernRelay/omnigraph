@@ -37,11 +37,12 @@ pub enum CaseErrorCode {
     SubstitutionPlacement,
     BatchBound,
     CorpusTimeout,
+    ReferenceSkip,
     Other,
 }
 
 impl CaseErrorCode {
-    pub const ALL: [CaseErrorCode; 29] = [
+    pub const ALL: [CaseErrorCode; 30] = [
         CaseErrorCode::LineEndings,
         CaseErrorCode::HeaderShape,
         CaseErrorCode::UnknownHeaderKey,
@@ -70,6 +71,7 @@ impl CaseErrorCode {
         CaseErrorCode::SubstitutionPlacement,
         CaseErrorCode::BatchBound,
         CaseErrorCode::CorpusTimeout,
+        CaseErrorCode::ReferenceSkip,
         CaseErrorCode::Other,
     ];
 
@@ -103,6 +105,7 @@ impl CaseErrorCode {
             CaseErrorCode::SubstitutionPlacement => "substitution_placement",
             CaseErrorCode::BatchBound => "batch_bound",
             CaseErrorCode::CorpusTimeout => "corpus_timeout",
+            CaseErrorCode::ReferenceSkip => "reference_skip",
             CaseErrorCode::Other => "invalid_case",
         }
     }
@@ -159,10 +162,10 @@ impl CaseErrorCode {
                 "an expect mode is ok, unordered, ordered, error: <needle>, affected: nodes=<N> edges=<M> or outcome: <word>"
             }
             CaseErrorCode::ExpectModeForStep => {
-                "an expect mode fits its step: rows modes on a read, `ok`, `error:` and `affected:` on a write, `outcome:` on a merge, `shape`, `plan` and `same as v1` on a read's rows expect"
+                "an expect mode fits its step: rows modes on a read, `ok`, `error:` and `affected:` on a write, `outcome:` on a merge, `shape` and `plan` on a read's rows expect"
             }
             CaseErrorCode::ExpectWithoutStep => {
-                "every `--- expect` follows the step it completes, and `shape`, `plan` and `same as v1` follow the expect they extend"
+                "every `--- expect` follows the step it completes, and `shape` and `plan` follow the expect they extend"
             }
             CaseErrorCode::MissingExpect => "every step is followed by its `--- expect` section",
             CaseErrorCode::MissingShape => {
@@ -191,6 +194,9 @@ impl CaseErrorCode {
             }
             CaseErrorCode::CorpusTimeout => {
                 "a case under the required corpus (the runner's `cases/`, not `cases_slow/`) declares `timeout_ms` of at most 10000"
+            }
+            CaseErrorCode::ReferenceSkip => {
+                "`--- reference skipped: <reason>` directly follows a query declaration step's last expect section, with a nonempty reason and no body"
             }
             CaseErrorCode::Other => "a rule the parser states in its message",
         }

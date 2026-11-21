@@ -11,7 +11,7 @@ use omnigraph_api_types::{
     BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, HTTP_API_CONTRACT,
     HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput, SchemaOutput,
 };
-use omnigraph_compiler::query::ast::{BranchCreateFrom, show_statement_name};
+use omnigraph_compiler::query::file::{BranchCreateFrom, show_statement_name};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -102,15 +102,15 @@ fn served_refusals(case: &Case, measured: Option<usize>) -> Result<(), String> {
         let ordinal = step.ordinal();
         match step {
             Step::Restart { .. } if no_op_restart(step, measured) => {}
-            Step::Restart { .. } | Step::Settings(_) | Step::Concurrent(_) => {
+            Step::Restart { .. }
+            | Step::Settings(_)
+            | Step::Concurrent(_)
+            | Step::ApplySchema(_) => {
                 refused.push(format!("step {ordinal} ({})", step_kind(step)));
             }
             Step::Query(query) => {
                 if query.plan.is_some() {
                     refused.push(format!("step {ordinal} (expect plan)"));
-                }
-                if query.same_as_v1 {
-                    refused.push(format!("step {ordinal} (expect same as v1)"));
                 }
             }
             Step::Control(control) => {
@@ -251,12 +251,13 @@ async fn execute_served_inner<H: ExecutionHost>(
                         });
                         Ok(())
                     }
-                    Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {
-                        Err(StepFail::new(
-                            step_label(ordinal, step_kind(step), binding),
-                            "unsupported_environment: refused by served admission".into(),
-                        ))
-                    }
+                    Step::Settings(_)
+                    | Step::Restart { .. }
+                    | Step::Concurrent(_)
+                    | Step::ApplySchema(_) => Err(StepFail::new(
+                        step_label(ordinal, step_kind(step), binding),
+                        "unsupported_environment: refused by served admission".into(),
+                    )),
                 };
                 host.measure_step_end(ordinal as u64);
                 host.record("assertion", || match &outcome {
@@ -490,7 +491,7 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
             .map_err(|error| format!("seed load failed: {error}")),
         Seed::Generated(generated) => {
             client
-                .load_generated(generated, MAIN_BRANCH, LoadMode::Append)
+                .load_generated(generated, MAIN_BRANCH, LoadMode::Insert)
                 .await
         }
     }?;
@@ -520,7 +521,7 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
             })?;
         if let Some(generated) = branches.recipe(&name)? {
             client
-                .load_generated(&generated, &name, LoadMode::Append)
+                .load_generated(&generated, &name, LoadMode::Insert)
                 .await
                 .map_err(|error| format!("branches fixture: load {name}: {error}"))?;
         }

@@ -1,5 +1,6 @@
+use crate::read_shape::ReadShape;
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::{LoadIR, QueryIR, WriteKind, WriteTableIR};
+use omnigraph_compiler::ir::{LoadIR, WriteKind, WriteTableIR};
 use serde::{Deserialize, Serialize};
 
 /// Where a table's rows come from: a pinned dataset in the graph's store,
@@ -151,7 +152,7 @@ pub enum Operation {
         target: Side,
     },
     /// A compiled GQ query, lowered directly without registry admission.
-    Query(Box<QueryIR>),
+    Query(Box<ReadShape>),
     /// A `load csv` statement, the first write plan: `tables` pins the
     /// target and every consulted table present in the transaction's base;
     /// `source_bytes` is the one source fact acceptance reads, its size.

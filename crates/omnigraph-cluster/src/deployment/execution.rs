@@ -1468,7 +1468,7 @@ pub async fn plan_captured_deployment(
                     format!("graph {graph} schema apply requires only main"),
                 ));
             }
-            change.migration = Some(migration);
+            change.set_schema_migration(Some(migration));
         }
     }
     annotate_plan_changes(&store, &mut changes, diagnostics.first())?;
@@ -2323,6 +2323,10 @@ async fn prepare_graphs(
                 )
                 .await
                 .map_err(|error| refusal("schema_preflight_failed", error.to_string()))?;
+            // A text-only change keeps the accepted identity: its intent is a
+            // no-op that publishes nothing, and the graph keeps its accepted
+            // source. The ledger then records the configured text's digest
+            // beside the unchanged contract.
             if intent.base_contract() != achieved {
                 return Err(refusal(
                     "applied_schema_drift",
@@ -2707,7 +2711,11 @@ fn validate_pending_input(
             || entry.intent.as_ref().is_some_and(|intent| {
                 intent.actor() != pending.authorization.authority.actor.as_deref()
                     || intent.base_contract() != &pending.authorization.base.schema_contracts[graph]
-                    || intent.desired_contract().source_hash != bundle.resources[&address].digest
+                    // A no-op intent keeps the accepted source; any other
+                    // publishes exactly the configured text.
+                    || (!intent.is_noop()
+                        && intent.desired_contract().source_hash
+                            != bundle.resources[&address].digest)
             })
         {
             return Err(refusal(

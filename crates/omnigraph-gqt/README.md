@@ -4,11 +4,12 @@ GQ describes operations; GQT describes the scenario and expectations; DST
 controls execution. This private test package is not shipped in release builds.
 Every `.gqt` file under `cases/`, including subdirectories, is one test
 in the complete corpus. Test names retain the path relative to `cases/`.
-Shared cases live directly under `cases/`; v2-specific cases live under
-`cases/v2/`, with plan assertions under `cases/v2/planner/`.
-These directories organize the corpus. Every case runs on engine v2, the one
-engine; a case's `set engine = v2;` line changes nothing, and discovery never
-selects an engine.
+Shared cases live directly under `cases/`, plan assertions under
+`cases/planner/` and catalogue reads under `cases/catalogue/`. These
+directories organize the corpus; discovery selects nothing by directory.
+A compiler refusal on its own is no case: every code's refusals, their
+printed fixes and repairs are rows of one table, the refusal law
+(`tests/integration/law_refusals.rs`).
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
@@ -110,14 +111,15 @@ in-process verdict and the same served verdict; `gqt_served_count.rs` totals
 the served and skipped cases and refuses an empty served set. A declared
 `omnigraph-server-dst` environment is refused at admission on every run: no
 runner implements it. The declared `storage` is recorded, not checked: no
-route reports the server's backend. Refused before any request, by name: `--- restart`,
+route reports the server's backend. Refused before any request, by name: `--- restart`, `--- apply schema`,
 `--- concurrent`, seam directives, settings steps and settings prefixes on a
-control or `show` step, `--- expect plan`, `--- expect same as v1`, the
+control or `show` step, `--- expect plan`, the
 `# traversal:` pin, the `# writer:` pin, and queries that need indices (`search`, `fuzzy`,
 `nearest`, `rrf`). The `--- expect shape` section is not judged under a
 server target: it holds the executor's Arrow schema against the compiler's,
-which no wire answer carries. `--server` is exclusive with `--store`, and a
-served run never blesses. `--server` selects exactly one `omnigraph-server`
+which no wire answer carries, and no step is compared with the reference
+interpreter, a property of the direct target. `--server` is exclusive with
+`--store`, and a served run never blesses. `--server` selects exactly one `omnigraph-server`
 environment (`--storage` picks when several are declared), since every pass
 would share the one graph. Parameters travel as the case spells them, or as
 its recipe generates them, and the server judges them, so a parameter error is
@@ -132,6 +134,11 @@ are not written to reports. The engine's existing backend admission rules
 still apply. Keep external queries outside `cases/`: corpus execution has no
 store argument and refuses a file without schema and seed.
 
+A `--- query` or `--- mutate` section runs its last declaration. The
+declarations before it, all reads, are the declared reads it calls, which
+resolve in the same source unit; a mutation declaration before the last
+refuses the case.
+
 One engine instance survives ordinary steps and expected errors. Only
 `--- restart` drops the engine and reopens the same storage. A case owns one
 session ([Session settings](../../docs/rfcs/2026-09-16-session-settings.md)) for
@@ -144,6 +151,30 @@ order, and that shape is derived, so a `show` step writes no `--- expect shape`
 section; a `process` setting in a case body refuses the case at parse time. GQ operations
 and GQT rows, shape, affected counts, errors and loop semantics are shared by
 both paths. Unordered row comparison preserves duplicate counts.
+
+An `expect error: <needle>` holds when the step fails and its error contains
+the needle; a compiler diagnostic renders with its code, `parse error: Q018: …`
+as `type error: T7: …` and `plan error: P002: …` do, so a case can name the
+code it expects. A compile that refuses a source for several independent
+reasons renders its first refusal; the needle matches that one, and the
+others ride the diagnostic's `further` list. Every expect-error step the
+compiler refuses is also held to fix convergence by the refusal law
+(`tests/integration/law_refusals.rs`): applying every machine-applicable
+suggestion of one pass at once shrinks the refusals and reaches a fixed point
+within three passes, and a step whose refusal prints such a fix is listed
+there with the text its fixes are meant to write, which the repair must
+equal. A `--- query` or `--- mutate` section the compiler refuses at
+parse is a step only under `expect error:` (any other expectation refuses the
+case with the parse error); it runs through the engine's door like any query
+and fails there with the same refusal.
+
+`--- apply schema` applies its body, the whole desired `.pg` schema, to the
+graph as `omnigraph schema apply` does, through the same session, and must
+succeed; it takes no expect section. Schema apply needs a graph with only
+`main`, so a case deletes its branches before the step. With `--- bind
+commit` and `--- query snapshot:`, it is how a case reads a commit made under
+an earlier schema. The served and per-step process paths refuse it by name,
+so a case that holds one declares no `omnigraph-server` environment.
 
 A write's commit id can be bound for the rest of the case (RFC "Unpublished
 graph commits"): `--- bind commit $name`, an empty section directly after the
@@ -216,7 +247,7 @@ id|firstName
 2|bob
 
 --- mutate branch: work
-load csv "person.csv" into node:Person mode append delimiter "|" header
+load csv "person.csv" into node:Person mode insert delimiter "|" header
 
 --- expect ok
 ```
@@ -237,8 +268,8 @@ single_scan`; `load validate value <table> [a, b]`; `load validate unique
 edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`; `load validate
 cardinality <edge> <from|to> <Node>`; `load validate retained_edges <node>
 <edge> <from|to>: access <delta|probe|scan>`; `load validate source_cardinality
-<node> <edge>: access <delta|probe|scan>`; `load write: <overwrite fragments|append strict_insert|
-merge upsert>`; `load executed: partitions <n> rows <m>`. The validate lines
+<node> <edge>: access <delta|probe|scan>`; `load write: <overwrite fragments|insert strict_insert|
+upsert upsert|replace upsert>`; `load executed: partitions <n> rows <m>`. The validate lines
 are the one `Validate` node's checks. Tables are qualified (`node:Person`, `edge:Knows`);
 an endpoint's referenced type is bare. A served environment refuses the
 section at admission, since the wire answer carries no plan.
@@ -258,7 +289,7 @@ An ordinary `--- seed` contains JSONL and loads with overwrite semantics.
 one table batch per commit in recipe order. Later steps reuse that recipe:
 
 ```yaml
---- load generate: v1 seed: 42 mode: merge branch: work
+--- load generate: v1 seed: 42 mode: replace branch: work
 tables:
   - kind: node
     name: Person
@@ -274,8 +305,9 @@ tables:
 --- expect ok
 ```
 
-The schema declares the types and keys. A load requires `mode: append` or
-`mode: merge`; `branch:` defaults to `main` and must already exist. Its expect
+The schema declares the types and keys. A load requires `mode: insert`,
+`mode: upsert` or `mode: replace` (`append` and `merge` are refused with
+`insert` and `replace` as their fixes); `branch:` defaults to `main` and must already exist. Its expect
 is `ok` or `error: <substring>`, with no params, affected-count, row or shape
 section. Table batches publish independently; a later failure does not undo
 earlier batches. A node batch therefore carries no edges, and a node type that
@@ -506,7 +538,7 @@ runner runs it as any free-running block.
 
 ```text
 --- concurrent scripted
-w1: query add_bob() { insert Person { name: "bob" } }
+w1: query add_bob() { replace Person { name: "bob" } }
 r1: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __manifest/_versions/, r1 start, r1, w1 put __manifest/_versions/
 --- expect
@@ -626,7 +658,7 @@ duration_seconds: 30
 sweep: { W: [1, 2, 4, 8, 16] }
 
 --- concurrent measured
-writer x${W}: load generate: v1 seed: 42 mode: append
+writer x${W}: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -635,7 +667,7 @@ writer x${W}: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 7}
         n: {kind: ordinal, start: 100000, step: 1}
-reader x4: query seeded_row() { match { $c: Chunk { slug: "seed-0017" } } return { $c.n } }
+reader x4: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-0017" return { $c.n } }
 --- expect
 writer: ok
 reader: ok
@@ -690,13 +722,18 @@ A `scan <Type>[ as $var]:` line selects the scans of that type (or the one
 bound to that binding) and claims one fact of each: `columns [..]` the exact
 columns it projects; `not columns [..]` columns it must not read; `filter
 reads [..]` a pushed filter reading exactly those columns (`binding.property`);
-`no filter` no pushed filter at all. `filter reads [..]` on its own states that
+`no filter` no pushed filter at all. `no scan <Type> as $var` states that no
+scan of that type binds `$var`: a traversal's end that nothing reads more of
+than its identity, which the expansion carries. `filter reads [..]` on its own states that
 an in-memory `Filter` node stays in the plan reading exactly those columns.
 `sort tiebreak [$a.@id, $e.@type, $e.@id]` states the exact ordered metadata
 keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;
-`sort no tiebreak` requires an empty list. `rank fuse row tiebreak [...]` checks
-the exact downstream keys of `RankFuse`, and `rank fuse no row tiebreak` requires
-none. Dropping a type key or swapping key order fails these assertions.
+`sort no tiebreak` requires an empty list. Dropping a type key or swapping key
+order fails these assertions. `fuse $d: arms [nearest, bm25]` states that a
+physical `Fuse` of `$d` ranks its arms as written, in order (`nearest`,
+`distance`, `bm25`, `ordered` or `rrf`), and fuses once; with ` per outer row`
+appended, the `Fuse` is partitioned per outer row of the correlated read
+holding it (an `rrf` whose arms read an outer name).
 `hydrate $d: columns [..]` states that a physical `HydrateColumns` fetches
 exactly those columns of `$d` by row address above the root limit (pass
 `late_materialization`); the `scan` lines keep reading the logical plan, whose
@@ -734,7 +771,7 @@ nullable, are accepted here but cannot be returned as public result columns.
 `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]` claims
 one entry of the document's `pipelines` by position: the physical plan cut at
 every node whose operator emits nothing before it has seen its whole input
-(`Sort`, `Aggregate`, `AntiJoin`, `RankFuse`, a costed multi-hop `Expand`)
+(`Sort`, `Aggregate`, `AntiJoin`, `Fuse`, a costed multi-hop `Expand`)
 and at a join's build side. The source is the entry's first node, the
 operators follow in run order, the sink is the node the pipeline drains into
 (a breaker by its name, a build side as `HashJoin(build)`, or the `consumer`)
@@ -814,12 +851,9 @@ csr`): the side of the node's declared switch the run took, read from the
 execution report of the same run (the last attempt of the node's row, joined
 to the explain row by the node's `id`); it fails when the run recorded no
 side on that node or another side. A `scan <Type>[ as $var]: ranked
-<nearest|bm25>[ fetch <n>][ nprobes <n>][ eligibility <placement>]` line
-claims the ranked access path of the scan, the candidates it asks the index
-for, on a `nearest` scan the probe cap the plan carries (`0` spells no cap,
-as the `ann_nprobes` setting does), and on a `bm25` scan where it applies its
-eligibility (`before_scoring` under full full-text coverage, else
-`after_scoring`). `validation scope <exact_subset|invariants_only>` claims
+nearest[ fetch <n>][ nprobes <n>]` line claims the ranked access path of the
+scan, the candidates it asks the index for and the probe cap the plan carries
+(`0` spells no cap, as the `ann_nprobes` setting does). `validation scope <exact_subset|invariants_only>` claims
 what acceptance checked of the plan, as the document's `validation` reports
 it; a failed planning step has no document and keeps its `expect error:`.
 Nothing is compared as rendered text, so a planner that reaches the same
@@ -827,8 +861,10 @@ facts by another route keeps the case green.
 
 A nearest ranked-scan line may end in `diagnostics present`, for example
 `scan Doc as $d: ranked nearest fetch 3 diagnostics present`. Every selected
-nearest scan must report at least one measured attempt; an RRF with two
-nearest arms must report both, while a BM25 sibling is not selected. A missing
+nearest scan must report at least one measured attempt; a fusion with two
+nearest arms must report both, while an exact arm's unranked scan of the same
+type is not selected. A `ranked` claim reads the ranked scans among the
+selected ones. A missing
 scan, missing report, or missing diagnostic fails the assertion. Other attempts
 may have no metrics, and their positions are never renumbered. The clause is
 refused on BM25 and takes no duration or counter value.
@@ -844,8 +880,10 @@ complete loss of metrics that these conditional checks alone would allow.
 
 A `scan <Type>[ as $var]: access sequential` line requires the recorded
 sequential choice. `access index_probe <physical-column>` requires a probe
-with that physical column in a leaf of `index_query`; it does not compare
-rendered search text, residuals or index names. `pass scan_access` records
+with that physical column in a leaf of `index_query`, and `access index_probe
+<physical-column> <family>` (`btree`, `bitmap`, `label_list`, `ngram`) one
+through an index of that family; neither compares rendered search text,
+residuals or index names. `pass scan_access` records
 completed finalization; `pass key_to_id` records a safe key narrowing.
 
 A `load csv` step may carry an `--- expect plan` section directly after its
@@ -871,8 +909,8 @@ load validate retained_edges <node-table> <edge-table> from|to: access delta|pro
 load validate source_cardinality <node-table> <edge-table>: access delta|probe|scan
 load validate removal <table>: scan|none
 load write: overwrite fragments
-load write: append strict_insert
-load write: merge upsert
+load write: insert strict_insert
+load write: replace upsert
 load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]
 load executed: partitions <n> rows <m>
 load executed <Node>: rows <m>
@@ -930,28 +968,94 @@ load executed: partitions 1 rows 2
 
 ## Reference comparison
 
-A query step may end with `--- expect same as v1`, directly after its
-`--- expect shape` or `--- expect plan`; the section has no body. The runner
-runs the step's query again on a copy of the case session carrying the frozen
-engine v1 (`omnigraph_reference_engine::ReferenceEngine`, the crate
-`omnigraph-reference-engine`, installed through `Session::with_read_executor`)
-and compares its rows with v2's, ordered or unordered as the step's
-`--- expect` says. The step's own rows expect still applies; the comparison is
-added to it.
+Every read step on the direct engine (`target: omnigraph-engine`) is also
+evaluated by the core reference interpreter
+(`omnigraph_reference::Interpreter`, the crate `omnigraph-reference`): the
+runner checks the step's query to its core IR again and evaluates it over the
+rows of the step's read target, a branch or a `snapshot:` commit, read
+through the engine's export. The step's own expect still applies; the
+comparison is added to it, and the rule depends on what the engine answered:
+
+| The engine | The reference must |
+|---|---|
+| returns rows | return the same rows, ordered or as bags as the step's `--- expect` compares them |
+| refuses a row with an `E` code (`E1` overflow, `E2` a zero divisor, `E3` a non-finite float) | refuse with the same code |
+| refuses input the query cannot read: a parameter value (an omitted required parameter, a null or out-of-range value, a window or constant outside its range), or a read target that does not resolve | refuse its input |
+| stops at one of its resource bounds (`query_memory_bytes`, `traversal_work_limit`, `read_work_limit`) | return rows, since it has no such bound |
+
+Any other pairing fails the step, and the failure prints both answers. A
+step the engine refuses at compile time (a `Q`, `T` or `P` diagnostic) has no
+core term and is not compared. Writes, `show` and the branch statements are
+not read steps, and the DST runner, the served runner and the benchmark
+executors do not compare: the comparison is a property of the direct target,
+not of the case.
+
+A step opts out only with a stated reason, in a `--- reference skipped:`
+section directly after its last expect section (`--- expect shape`,
+`--- expect plan` or `--- expect error:`):
 
 ```text
+--- query
+query operators() {
+    match { $o: @Operator }
+    return { $o.name }
+}
 --- expect unordered
+{"o.name": "Scan"}
 --- expect shape
-p.name: String
---- expect same as v1
+o.name: String
+--- reference skipped: the reference reads the branch's export, which carries no catalogue type's rows
 ```
 
-A v1 error, a v1 gate refusal included, or a row difference fails the step.
-The section is refused on a mutate step, an error expect, `show` and
-`branch list`. The DST runner skips the comparison. The reference answers
-`not { ... }` blocks only among the correlated blocks, and refuses count
-predicates and a string `nearest` argument, so a step using those carries no
-`expect same as v1`.
+The reason is required and printed, with the step and its line, under the
+case's result line whenever the case runs on the direct engine. The section is
+refused (`reference_skip`) without a reason, with a body, after a mutate or
+statement step and anywhere but directly after a query step's last expect,
+and at run time on a step the comparison does not reach (a compile-time
+refusal, a parameter the runner refuses), where it would say nothing.
+
+The interpreter evaluates each core operator of the RFC's operator table
+directly: nested loops, whole-table reads, no index, planner or cost model.
+It evaluates a field's analyzer profile as the RFC fixes it (NFC, the simple
+tokenizer, lowercasing, the English Snowball stemmer and `english_v1`'s stop
+list of each word and its stem, ASCII folding of Latin letters, refusing any
+other non-ASCII letter in a folded field) and `bm25_v1` in `F64`, at the type
+the checker gives the score. A step that scans a catalogue type, which the
+export does not carry, or whose data is beyond nested loops in the case's
+budget, opts out with that reason. When the RFC's semantics change, the
+interpreter changes in the same pull request.
+
+## Physical layouts
+
+Indexes, fragments and deletion vectors are derived state, so no case's
+rows may depend on them. `tests/gq_layout_tests.rs` (one libtest test per
+case, as `gq_logic_tests.rs`) re-runs every case that declares
+`target: omnigraph-engine` on the local filesystem with its seed stored in
+each physical layout (`omnigraph_gqt::Layout`):
+
+| Layout | The seeded graph |
+|---|---|
+| `a` | no index built; every read scans |
+| `b` | every index the schema declares built (`ensure_indices`) |
+| `c` | every index built, then the second half of the seed's keyed nodes written again (`load` merge), so their rows sit in fragments no index covers |
+| `d` | the second half and then the first quarter of the keyed nodes written again, leaving several fragments with deleted rows and their re-inserted copies, then every index built |
+
+Every step runs as in the corpus, the reference comparison included, and
+must keep the case's rows, shapes and refusals. A step's `--- expect plan`
+(and a load's or merge's plan expectation) is not held: it names the access
+path of the case's own layout. `OMNIGRAPH_GQT_LAYOUTS` picks the layouts,
+`a,b` when unset (the `GQ Logic Tests` gate); `GQT slow nightly` runs
+`a,b,c,d`. A case whose rows or refusal depend on its own layout opts out
+with a header naming the layouts and the reason, printed beside the result:
+
+```text
+# layout: skipped b, c, d: its refusal is the endpoint-set memory admission, estimated from index coverage
+```
+
+A difference found under a layout is a defect: a shrunk case pinned as a
+`hunt:` test (`tests/integration/layout_hunts.rs`) names it, and the corpus
+case it came from opts out of that layout with `hunt:` and the test's name in
+its reason until the fix lands.
 
 ## Run and reproduce
 
@@ -962,7 +1066,7 @@ Tokio from any directory; the commands below use crate-relative paths):
 cd crates/omnigraph-gqt
 cargo test -p omnigraph-gqt --locked
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --list
-cargo test -p omnigraph-gqt --test gq_logic_tests v2/planner/
+cargo test -p omnigraph-gqt --test gq_logic_tests planner/
 cargo test -p omnigraph-gqt --test gq_logic_tests -- --test-threads=2
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --target omnigraph-engine-dst --storage in-memory-object-store --seed 42
@@ -1262,19 +1366,6 @@ unset, empty, or `0` leaves it disabled. Other values, including non-UTF-8
 values, produce an `invalid_case` report before execution or rewriting.
 Replay ignores this variable and refuses saved blessing invocations.
 
-`OMNIGRAPH_GQ_ENGINE` names the initial `engine` setting for direct and
-DST case sessions, the baseline `reset engine` restores. It accepts only `v2`,
-empty or unset, all three meaning engine v2, the setting's one value; engine
-v1 is reached only through `--- expect same as v1`, never through this
-variable.
-
-Invocation reports freeze the engine in the worker input before clearing the
-worker environment, and replay uses the recorded value. An input without the
-field means `v2`. Engine input is covered by the report's input digest, and
-the executable and source identity checks still apply. Any other value, `v1`
-and non-UTF-8 values included, produces an `invalid_case` report before
-workers start, including on replay.
-
 `OMNIGRAPH_GQ_BLESS=1` is supported only for a case declaring one direct-engine
 environment. A subset selection cannot bless a multi-environment case. It rewrites a failing row or shape expectation and still returns
 failure until a subsequent run confirms it. DST cannot bless. The legacy
@@ -1282,12 +1373,11 @@ failure until a subsequent run confirms it. DST cannot bless. The legacy
 file invocations refuse that ambient override and take their timeout from the
 runner section. Ambient fault, entropy and pool overrides also refuse
 admission, including replay, as does a set settings variable
-(`OMNIGRAPH_ENGINE`, `OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`,
+(`OMNIGRAPH_RRF_PLAN`, `OMNIGRAPH_MERGE_LINEAGE`,
 `OMNIGRAPH_ANN_NPROBES`, `OMNIGRAPH_LOAD_CONCURRENCY`,
 `OMNIGRAPH_TRAVERSAL_WORK_LIMIT`, `OMNIGRAPH_HISTORY_RELEASE_BYTES`) and the retired
 `OMNIGRAPH_TRAVERSAL_MODE`, which names no setting any more. A case session
-never reads the environment (the runner's own `OMNIGRAPH_GQ_ENGINE` above is
-the one seed), so neither variable decides anything; the refusal keeps a stale
+never reads the environment, so neither variable decides anything; the refusal keeps a stale
 one in a CI environment from being mistaken for a live control, and keeps the
 retired name from lingering. A case that must run one value writes it in a
 `set` step.

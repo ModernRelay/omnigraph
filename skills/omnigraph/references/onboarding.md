@@ -205,11 +205,8 @@ edge Supports: Source -> Claim
 
 ```gq
 query sources_for_claim($claim: String) {
-  match {
-    $source: Source
-    $c: Claim { slug: $claim }
-    $source supports $c
-  }
+  match { $source: Source, $c: Claim, $source supports $c }
+  where $c.slug = $claim
   return { $source.title as source }
   order { source asc }
 }
@@ -241,10 +238,10 @@ told you or from files they point you to. Nodes and edges can share a file:
 ```
 
 ```bash
-omnigraph load --data seed.jsonl --mode merge --target ./graph.omni
+omnigraph load --data seed.jsonl --mode replace --target ./graph.omni
 ```
 
-`--mode` is required; `merge` upserts by key. See [data changes](data.md) for
+`--mode` is required; `replace` writes each record's whole row by key. See [data changes](data.md) for
 the other modes and for `mutate`.
 
 ## 6. Query it
@@ -266,7 +263,7 @@ positional argument, so they address the graph with `--target`:
 
 ```bash
 omnigraph load --data more.jsonl --from main --branch review/first-change \
-  --mode merge --target ./graph.omni
+  --mode replace --target ./graph.omni
 omnigraph branch diff review/first-change --into main --target ./graph.omni
 omnigraph branch merge review/first-change --into main --target ./graph.omni
 ```
@@ -419,7 +416,7 @@ before the server starts.
 mkdir served
 omnigraph cluster apply --target ./served --config . --json
 omnigraph cluster force-unlock <LOCK_ID> --target ./served
-omnigraph load --data seed.jsonl --mode merge --target ./served --graph knowledge
+omnigraph load --data seed.jsonl --mode replace --target ./served --graph knowledge
 omnigraph cluster force-unlock <LOCK_ID> --target ./served
 ```
 

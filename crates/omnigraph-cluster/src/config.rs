@@ -329,6 +329,128 @@ fn resolve_query_decls(
     registry
 }
 
+/// One graph's stored-query source files in a configuration directory:
+/// the graph's id, its schema file and every `.gq` file its `queries:`
+/// declares, each read as `cluster validate` reads it (declared files, the
+/// top-level `.gq` files of a declared directory, the files of an explicit
+/// map), deduplicated in path order. The files are named, not read: a file
+/// that does not parse is listed like any other, which is what lets
+/// `omnigraph lint --fix` respell the bundle that `cluster apply` then
+/// registers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredQueryFiles {
+    pub graph_id: String,
+    pub schema: PathBuf,
+    pub files: Vec<PathBuf>,
+}
+
+/// Every graph's [`StoredQueryFiles`] in the configuration directory
+/// `config_dir`, or the diagnostics of a `cluster.yaml` that does not parse
+/// or declares a path outside the directory or through a symbolic link.
+pub fn stored_query_files(config_dir: &Path) -> Result<Vec<StoredQueryFiles>, Vec<Diagnostic>> {
+    let parsed = parse_cluster_config(config_dir);
+    let raw = match parsed.raw {
+        Some(raw) if !has_errors(&parsed.diagnostics) => raw,
+        _ => return Err(parsed.diagnostics),
+    };
+    let mut diagnostics = Vec::new();
+    let mut entries = 0usize;
+    let mut out = Vec::new();
+    for (graph_id, graph) in &raw.graphs {
+        let setting = format!("graphs.{graph_id}.queries");
+        check_config_path(
+            config_dir,
+            &graph.schema,
+            &format!("graphs.{graph_id}.schema"),
+            &mut diagnostics,
+        );
+        let (declared, discover): (Vec<&Path>, bool) = match &graph.queries {
+            QueriesDecl::Explicit(map) => (map.values().map(|q| q.file.as_path()).collect(), false),
+            QueriesDecl::Discover(path) => (vec![path.as_path()], true),
+            QueriesDecl::DiscoverMany(paths) => {
+                (paths.iter().map(PathBuf::as_path).collect(), true)
+            }
+        };
+        let mut files = std::collections::BTreeSet::new();
+        for declared in declared {
+            if !check_config_path(config_dir, declared, &setting, &mut diagnostics) {
+                continue;
+            }
+            let resolved = resolve_config_path(config_dir, declared);
+            if !(discover && resolved.is_dir()) {
+                files.insert(resolved);
+                continue;
+            }
+            let listing = match fs::read_dir(&resolved) {
+                Ok(listing) => listing,
+                Err(err) => {
+                    diagnostics.push(Diagnostic::error(
+                        "query_dir_unreadable",
+                        &setting,
+                        format!(
+                            "could not list query directory '{}': {err}",
+                            resolved.display()
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            for entry in listing {
+                entries += 1;
+                if entries > MAX_CONFIG_DISCOVERY_ENTRIES {
+                    diagnostics.push(Diagnostic::error(
+                        "config_discovery_limit",
+                        &setting,
+                        format!(
+                            "query discovery exceeds {MAX_CONFIG_DISCOVERY_ENTRIES} paths/entries"
+                        ),
+                    ));
+                    return Err(diagnostics);
+                }
+                let path = match entry {
+                    Ok(entry) => entry.path(),
+                    Err(err) => {
+                        diagnostics.push(Diagnostic::error(
+                            "query_dir_unreadable",
+                            &setting,
+                            format!(
+                                "could not enumerate query directory '{}': {err}",
+                                resolved.display()
+                            ),
+                        ));
+                        break;
+                    }
+                };
+                if !path.extension().is_some_and(|ext| ext == "gq") {
+                    continue;
+                }
+                if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                    diagnostics.push(Diagnostic::error(
+                        "config_path_symlink",
+                        &setting,
+                        format!(
+                            "query file '{}' is a symbolic link; declare the target directly",
+                            path.display()
+                        ),
+                    ));
+                    continue;
+                }
+                files.insert(path);
+            }
+        }
+        out.push(StoredQueryFiles {
+            graph_id: graph_id.clone(),
+            schema: resolve_config_path(config_dir, &graph.schema),
+            files: files.into_iter().collect(),
+        });
+    }
+    if has_errors(&diagnostics) {
+        Err(diagnostics)
+    } else {
+        Ok(out)
+    }
+}
+
 pub(crate) fn parse_cluster_config(config_dir: &Path) -> ParsedConfig {
     parse_cluster_config_captured(config_dir, &mut SourceCapture::default())
 }
@@ -578,11 +700,30 @@ pub(crate) async fn observe_declared_graphs(
 
         match observe_live_graph(backend, &graph_uri).await {
             Ok(observation) => {
-                let schema_matches = observation.schema_digest == graph.schema_digest;
+                // The ledger realizes a text-only change by the unchanged
+                // contract: the configured text's digest sits beside the
+                // accepted identity, and the graph keeps its accepted source.
+                let realized = state
+                    .applied_revision
+                    .resources
+                    .get(&schema_address)
+                    .is_some_and(|schema| schema.digest == graph.schema_digest)
+                    && state
+                        .applied_revision
+                        .schema_contracts
+                        .as_ref()
+                        .and_then(|contracts| contracts.get(&graph.id))
+                        == Some(&observation.contract);
+                let schema_matches = observation.schema_digest == graph.schema_digest || realized;
+                let schema_digest = if realized {
+                    graph.schema_digest.clone()
+                } else {
+                    observation.schema_digest.clone()
+                };
                 state.applied_revision.resources.insert(
                     schema_address.clone(),
                     StateResource {
-                        digest: observation.schema_digest.clone(),
+                        digest: schema_digest.clone(),
                         applies_to: None,
                         embedding_provider: None,
                         embedding_profile: None,
@@ -596,7 +737,7 @@ pub(crate) async fn observe_declared_graphs(
                 let external_blob_policy = state_graph_external_blob_policy(state, &graph.id);
                 let graph_digest_value = graph_digest_with_external_blob_policy(
                     &graph.id,
-                    Some(&observation.schema_digest),
+                    Some(&schema_digest),
                     Some(&query_digests),
                     embedding_provider.as_deref(),
                     embedding_provider_digest.as_ref(),
@@ -685,6 +826,7 @@ pub(crate) async fn observe_declared_graphs(
 pub(crate) struct LiveGraphObservation {
     graph_manifest_version: u64,
     schema_digest: String,
+    contract: omnigraph::db::SchemaContractDigest,
 }
 
 pub(crate) async fn observe_live_graph(
@@ -705,6 +847,7 @@ pub(crate) async fn observe_live_graph(
     Ok(LiveGraphObservation {
         graph_manifest_version: snapshot.graph_manifest_version(),
         schema_digest: sha256_hex(schema_source.as_bytes()),
+        contract: db.schema_contract_digest(),
     })
 }
 
@@ -1427,7 +1570,7 @@ pub(crate) fn validate_query_source(
 
 fn stored_declarations(
     file: QueryFile,
-) -> Result<Vec<omnigraph_compiler::query::ast::QueryDecl>, String> {
+) -> Result<Vec<omnigraph_compiler::query::file::QueryDecl>, String> {
     if !file.settings.is_empty() {
         return Err(omnigraph_compiler::settings::STORED_QUERY_CARRIES_NO_SETTINGS.to_string());
     }

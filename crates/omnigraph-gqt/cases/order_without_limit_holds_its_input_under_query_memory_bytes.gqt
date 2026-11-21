@@ -21,7 +21,7 @@ node Item {
 --- seed
 {"type":"Item","data":{"id":"a","v":-100}}
 
---- load generate: v1 seed: 3 mode: append
+--- load generate: v1 seed: 3 mode: insert
 tables:
   - kind: node
     name: Item

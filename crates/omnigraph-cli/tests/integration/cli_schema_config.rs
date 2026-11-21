@@ -33,13 +33,15 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
     };
 
     // The first two lines keep their earlier text and position; the contract
-    // line follows them, then the commit of a packaged build.
+    // line follows them, then the query language, then the commit of a
+    // packaged build.
     let output = output_success(cli().arg("version"));
     let stdout = stdout_string(&output);
     let mut expected = vec![
         format!("omnigraph {version}"),
         format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
         format!("http-contract {HTTP_API_CONTRACT}"),
+        "query-language gq3".to_string(),
     ];
     expected.extend(commit.map(|commit| format!("commit {commit}")));
     assert_eq!(stdout.lines().collect::<Vec<_>>(), expected);
@@ -62,6 +64,7 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
             "channel": channel,
             "commit": commit,
             "http_contract": HTTP_API_CONTRACT,
+            "query_language": "gq3",
             "protocols": {"studio": 1, "target": 2, "credential": 2, "access": 2},
             "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
         }),
@@ -119,7 +122,7 @@ fn an_undelivered_failure_keeps_its_exit() {
                 "--target",
                 graph,
                 "-e",
-                "query add() { insert Person { name: \"Undelivered\", age: 1 } }",
+                "query add() { replace Person { name: \"Undelivered\", age: 1 } }",
                 "--json",
             ],
             2,
@@ -511,6 +514,7 @@ fn schema_plan_json_reports_supported_additive_change() {
     assert_eq!(payload["steps"][0]["type_kind"], "node");
     assert_eq!(payload["steps"][0]["type_name"], "Person");
     assert_eq!(payload["steps"][0]["property_name"], "nickname");
+    assert!(payload.get("one_way_constructs").is_none(), "{payload}");
 }
 
 #[test]
@@ -677,9 +681,14 @@ fn schema_apply_human_reports_noop() {
             .arg("--target")
             .arg(&graph),
     ));
-    assert!(stdout.contains("applied: yes"), "{stdout}");
-    assert!(stdout.contains("schema source updated"), "{stdout}");
-    assert!(!stdout.contains("no schema changes"), "{stdout}");
+    // A text change that keeps the accepted schema publishes nothing: the
+    // stored source an older binary re-parses stays as it was.
+    assert!(stdout.contains("applied: no"), "{stdout}");
+    assert!(stdout.contains("no schema changes"), "{stdout}");
+    let shown = stdout_string(&output_success(
+        cli().args(["schema", "show", "--target"]).arg(&graph),
+    ));
+    assert!(!shown.contains("Updated schema documentation"), "{shown}");
 
     let plan = stdout_string(&output_success(
         cli()
@@ -688,7 +697,77 @@ fn schema_apply_human_reports_noop() {
             .arg("--target")
             .arg(&graph),
     ));
-    assert!(plan.contains("no table migration steps"), "{plan}");
+    assert!(
+        plan.contains("no schema changes; an apply publishes nothing"),
+        "{plan}"
+    );
+}
+
+/// Every row of the one-way table is named by `schema plan` and `schema
+/// apply` before and as it is stored, with the line that says what it costs;
+/// a plan with no step names nothing, since its apply stores nothing.
+#[test]
+fn schema_plan_and_apply_name_each_one_way_construct() {
+    use omnigraph_compiler::schema::one_way::{ONE_WAY_CONSTRUCTS, ONE_WAY_NOTE};
+    for row in ONE_WAY_CONSTRUCTS {
+        let temp = tempdir().unwrap();
+        let graph = graph_path(temp.path());
+        let before = temp.path().join("before.pg");
+        let after = temp.path().join("after.pg");
+        fs::write(&before, row.before).unwrap();
+        fs::write(&after, row.after).unwrap();
+        output_success(cli().arg("init").arg("--schema").arg(&before).arg(&graph));
+        for command in ["plan", "apply"] {
+            let output = output_success(
+                cli()
+                    .args(["schema", command, "--json", "--schema"])
+                    .arg(&after)
+                    .arg("--target")
+                    .arg(&graph),
+            );
+            let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let named: Vec<_> = payload["one_way_constructs"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{} {command}: {payload}", row.id))
+                .iter()
+                .map(|c| c["construct"].as_str().unwrap())
+                .collect();
+            assert!(named.contains(&row.id), "{} {command}: {payload}", row.id);
+            assert_eq!(payload["one_way_note"], ONE_WAY_NOTE, "{payload}");
+        }
+    }
+
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let omitted = temp.path().join("omitted.pg");
+    let explicit = temp.path().join("explicit.pg");
+    fs::write(&omitted, "node Doc { slug: String @key emb: Vector(2) }\n").unwrap();
+    fs::write(
+        &explicit,
+        "node Doc { slug: String @key emb: Vector(2, distance = \"l2\") }\n",
+    )
+    .unwrap();
+    output_success(cli().arg("init").arg("--schema").arg(&omitted).arg(&graph));
+    for command in ["plan", "apply"] {
+        let output = output_success(
+            cli()
+                .args(["schema", command, "--json", "--schema"])
+                .arg(&explicit)
+                .arg("--target")
+                .arg(&graph),
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["step_count"], 0, "{payload}");
+        assert!(payload.get("one_way_constructs").is_none(), "{payload}");
+        assert!(payload.get("one_way_note").is_none(), "{payload}");
+        if command == "apply" {
+            assert_eq!(payload["applied"], false, "{payload}");
+        }
+    }
+    let shown = stdout_string(&output_success(
+        cli().args(["schema", "show", "--target"]).arg(&graph),
+    ));
+    assert!(!shown.contains("distance"), "{shown}");
 }
 
 #[test]

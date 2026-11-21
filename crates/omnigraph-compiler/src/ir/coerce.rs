@@ -2,7 +2,7 @@
 //! Cast nodes; execution never chooses a domain from bound parameter values.
 
 use crate::error::{CompilerError, Result};
-use crate::query::ast::{BinaryOp, CompOp, Literal};
+use crate::query::value::{BinaryOp, CompOp, Literal};
 use crate::types::{ExprType, ScalarType};
 
 use super::{BlockAggregateExpr, IRExpr, SubqueryPredicate, fold};
@@ -37,7 +37,7 @@ fn domain(ty: &ExprType) -> Option<Domain> {
     match ty {
         ExprType::Value { scalar, .. } => Some(Domain::Scalar(*scalar)),
         ExprType::ExactInteger { .. } => Some(Domain::Exact),
-        ExprType::Node { .. } => None,
+        ExprType::Node { .. } | ExprType::Edge { .. } => None,
     }
 }
 
@@ -156,13 +156,11 @@ pub fn comparison_types(
         left_domain
     } else if left_domain.numeric() && right_domain.numeric() {
         if right_literal.is_none()
-            && left_literal
-                .is_some_and(|value| literal_round_trips(value, left_domain, right_domain))
+            && left_literal.is_some_and(|value| literal_narrows(value, left_domain, right_domain))
         {
             right_domain
         } else if left_literal.is_none()
-            && right_literal
-                .is_some_and(|value| literal_round_trips(value, right_domain, left_domain))
+            && right_literal.is_some_and(|value| literal_narrows(value, right_domain, left_domain))
         {
             left_domain
         } else {
@@ -196,7 +194,8 @@ fn numeric_cast_shape(source: &ExprType, target: &ExprType) -> bool {
 }
 
 /// Literal narrowing is legal only when every value round-trips in its stored
-/// source domain. Parameter payloads never participate in this proof.
+/// source domain and a float literal stays a float. Parameter payloads never
+/// participate in this proof.
 pub fn cast_expr_allowed(expr: &IRExpr, target: &ExprType) -> bool {
     if cast_allowed(expr.ty(), target) {
         return true;
@@ -206,8 +205,21 @@ pub fn cast_expr_allowed(expr: &IRExpr, target: &ExprType) -> bool {
     else {
         return false;
     };
-    numeric_cast_shape(expr.ty(), target)
-        && literal_round_trips(value, source_domain, target_domain)
+    numeric_cast_shape(expr.ty(), target) && literal_narrows(value, source_domain, target_domain)
+}
+
+/// Whether a literal takes the other operand's domain: it must round-trip
+/// there, and a float literal never takes an integer domain. A float literal
+/// is `F64` even when its value is a whole number, so an integer compared
+/// with one is cast to `F64` (the GQ 3 RFC, section 2).
+fn literal_narrows(value: &Literal, source: Domain, target: Domain) -> bool {
+    let float_source = matches!(source, Domain::Scalar(ScalarType::F32 | ScalarType::F64));
+    let integer_target = matches!(
+        target,
+        Domain::Exact
+            | Domain::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64)
+    );
+    !(float_source && integer_target) && literal_round_trips(value, source, target)
 }
 
 fn cast(expr: IRExpr, ty: ExprType) -> Result<IRExpr> {
@@ -263,16 +275,20 @@ pub(super) fn boolean(expr: IRExpr) -> IRExpr {
 
 /// Coerce operands before folding, retaining Cast nodes for typed execution.
 pub fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> Result<IRExpr> {
-    let (left, op, right) = match op {
-        BinaryOp::And | BinaryOp::Or => (boolean(left), op, boolean(right)),
-        BinaryOp::Compare(op) => {
-            let op = resolved_operator(op, left.ty(), literal(&left), right.ty());
-            let (lt, rt) =
-                comparison_types(op, left.ty(), literal(&left), right.ty(), literal(&right))?;
-            (cast(left, lt)?, BinaryOp::Compare(op), cast(right, rt)?)
-        }
-    };
-    Ok(fold::binary(left, op, right))
+    crate::stack::deep(|| {
+        let (left, op, right) = match op {
+            BinaryOp::And | BinaryOp::Or => (boolean(left), op, boolean(right)),
+            // The checker widens arithmetic operands with explicit casts.
+            BinaryOp::Arith(_) => (left, op, right),
+            BinaryOp::Compare(op) => {
+                let op = resolved_operator(op, left.ty(), literal(&left), right.ty());
+                let (lt, rt) =
+                    comparison_types(op, left.ty(), literal(&left), right.ty(), literal(&right))?;
+                (cast(left, lt)?, BinaryOp::Compare(op), cast(right, rt)?)
+            }
+        };
+        Ok(fold::binary(left, op, right))
+    })
 }
 
 /// Apply the same comparison decision to a block's restricted aggregate side.
@@ -304,7 +320,7 @@ pub fn block(left: BlockAggregateExpr, op: CompOp, right: IRExpr) -> Result<Subq
 /// Round trips use the literal's already unified source domain. In particular,
 /// an Integer element inside an F64 list is an F64 value before narrowing.
 fn literal_round_trips(value: &Literal, source: Domain, target: Domain) -> bool {
-    match value {
+    crate::stack::deep(|| match value {
         Literal::Null => true,
         Literal::List(items) => items.iter().all(|item| {
             !matches!(item, Literal::List(_)) && literal_round_trips(item, source, target)
@@ -330,7 +346,7 @@ fn literal_round_trips(value: &Literal, source: Domain, target: Domain) -> bool 
             float_round_trips(value, target)
         }
         _ => false,
-    }
+    })
 }
 
 fn integer_round_trips(value: i128, target: Domain) -> bool {
@@ -369,7 +385,7 @@ fn float_round_trips(value: f64, target: Domain) -> bool {
 }
 
 /// `in` fixes the list role before overloaded `contains` dispatch sees a null.
-pub(super) fn in_list(list: IRExpr, needle: IRExpr) -> Result<IRExpr> {
+pub(crate) fn in_list(list: IRExpr, needle: IRExpr) -> Result<IRExpr> {
     let list = match list {
         IRExpr::Literal(Literal::Null, _) => {
             let domain =
@@ -464,7 +480,10 @@ mod tests {
             (I32, Literal::Integer(i128::from(i32::MAX) + 1), I64, I64),
             (U32, Literal::Integer(-1), I64, I64),
             (I64, Literal::Float(2_f64.powi(63)), F64, F64),
-            (I64, Literal::Float(-2_f64.powi(63)), F64, I64),
+            (I64, Literal::Float(-2_f64.powi(63)), F64, F64),
+            (I64, Literal::Float(9_007_199_254_740_992.0), F64, F64),
+            (I32, Literal::Float(3.0), F64, F64),
+            (U64, Literal::Float(1.0), F64, F64),
             (F32, Literal::Float(0.5), F64, F32),
             (F32, Literal::Float(0.1), F64, F64),
             (F32, Literal::Float(-0.0), F64, F32),
@@ -483,6 +502,11 @@ mod tests {
             assert_eq!(expression.ty(), &ty(Bool, false, true));
             if source != expected {
                 assert!(matches!(right, IRExpr::Cast { .. }));
+            }
+            // A float literal is never narrowed: the integer side is cast.
+            if source == F64 && expected == F64 && owner != F64 {
+                assert!(matches!(left, IRExpr::Cast { .. }));
+                assert!(matches!(right, IRExpr::Literal(..)));
             }
         }
     }
@@ -515,9 +539,11 @@ mod tests {
     #[test]
     fn numeric_lists_narrow_as_a_whole_in_the_unified_source_domain() {
         for (items, expected) in [
+            // A list holding a float literal is an `F64` list, whole
+            // values included: the needle is cast, the list is not narrowed.
             (
                 vec![Literal::Integer(2), Literal::Null, Literal::Float(3.0)],
-                ScalarType::I32,
+                ScalarType::F64,
             ),
             (
                 vec![Literal::Float(3.5), Literal::Integer(2)],
@@ -537,6 +563,23 @@ mod tests {
             assert_eq!(list.ty(), &ty(expected, true, false));
             assert_eq!(needle.ty(), &ty(expected, false, true));
         }
+        // An integer list narrows as a whole when every element fits.
+        let expression = compared(
+            lit(
+                Literal::List(vec![
+                    Literal::Integer(2),
+                    Literal::Null,
+                    Literal::Integer(3),
+                ]),
+                ScalarType::I64,
+                true,
+            ),
+            CompOp::Contains,
+            param("x", ScalarType::I32, false, true),
+        );
+        let (list, _, needle) = expression.comparison_parts().unwrap();
+        assert_eq!(list.ty(), &ty(ScalarType::I32, true, false));
+        assert_eq!(needle.ty(), &ty(ScalarType::I32, false, true));
         assert!(literal_round_trips(
             &Literal::List(vec![
                 Literal::Integer(9_007_199_254_740_993),
@@ -607,6 +650,15 @@ mod tests {
                 ty: target.clone(),
             };
             assert_eq!(cast.check_types().is_ok(), accepted);
+        }
+        // A whole float literal round-trips into an integer type, but a
+        // float literal is never narrowed to one.
+        for target in [ScalarType::I32, ScalarType::I64, ScalarType::U64] {
+            let cast = IRExpr::Cast {
+                expr: Box::new(lit(Literal::Float(3.0), ScalarType::F64, false)),
+                ty: ty(target, false, false),
+            };
+            assert!(cast.check_types().is_err());
         }
         let list = lit(
             Literal::List(vec![Literal::Float(0.5), Literal::Null]),
@@ -683,7 +735,7 @@ mod tests {
         )
         .unwrap();
         expression.check_types().unwrap();
-        let IRExpr::Cast { expr, .. } = expression else {
+        let IRExpr::Cast { expr, .. } = &expression else {
             panic!("expected Cast")
         };
         assert_eq!(expr.ty(), &ty(ScalarType::I64, false, true));

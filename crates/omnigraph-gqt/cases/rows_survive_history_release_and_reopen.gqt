@@ -32,7 +32,8 @@ branch create b
 --- loop $i 1 4
 --- mutate branch: b
 query bump_alice($n: I32) {
-    update Person set { age: $n } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: $n }
 }
 --- params
 {"n": ${i}}
@@ -40,7 +41,7 @@ query bump_alice($n: I32) {
 --- endloop
 
 --- mutate branch: b
-query releasing_publish() { insert Person { name: "carol", age: 1 } }
+query releasing_publish() { replace Person { name: "carol", age: 1 } }
 
 --- expect affected: nodes=1 edges=0
 
@@ -71,7 +72,7 @@ p.name: String
 p.age: I32
 
 --- mutate branch: b
-query write_after_reopen() { insert Person { name: "dave", age: 2 } }
+query write_after_reopen() { replace Person { name: "dave", age: 2 } }
 
 --- expect affected: nodes=1 edges=0
 

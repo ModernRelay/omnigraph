@@ -8,10 +8,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use omnigraph_compiler::ir::core::ScoreKind;
+use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 use omnigraph_compiler::ir::{
     BlockAggregateExpr, IRExpr, IROrdering, IRProjection, SubqueryPredicate,
 };
-use omnigraph_compiler::query::ast::{AggFunc, BinaryOp, CompOp, Literal};
+use omnigraph_compiler::query::syntax::ArithOp;
+use omnigraph_compiler::query::value::{AggFunc, BinaryOp, CompOp, Literal};
 use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::{
@@ -30,10 +33,11 @@ use crate::logical::{
 };
 use crate::operation::TableRef;
 use crate::physical::{
-    Assumptions, Eligibility, EmptyEligible, Estimate, Hop, HydratedBinding, NearestPolicy, NodeId,
-    OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankArm, RankKind,
-    RankScope, RankedAccess, ScanInput, StatisticSource,
+    Assumptions, Estimate, FuseArm, Hop, HydratedBinding, NearestPolicy, NodeId, OrderKey,
+    OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankScope, RankedAccess,
+    ScanInput, StatisticSource,
 };
+use crate::read_shape::{InnerRead, TargetWindow};
 use crate::source::SideId;
 use omnigraph_compiler::types::{AggSignature, ExprType};
 
@@ -267,6 +271,24 @@ pub enum NodeMirror {
         input: NodeId,
         rows: usize,
     },
+    TargetCut {
+        input: NodeId,
+        binding: String,
+        targets: usize,
+    },
+    Score {
+        input: NodeId,
+        binding: String,
+        type_name: String,
+        property: String,
+        kind: ScoreKindMirror,
+        query: ExprMirror,
+    },
+    Let {
+        input: NodeId,
+        name: String,
+        value: ExprMirror,
+    },
     Page {
         input: NodeId,
         rows: usize,
@@ -319,16 +341,33 @@ pub enum NodeMirror {
         aggregate: Option<AggregateSpec>,
         strategy: AntiJoinStrategy,
     },
+    OptionalJoin {
+        input: NodeId,
+        inner: NodeId,
+        outer_var: String,
+    },
+    Union {
+        left: NodeId,
+        right: NodeId,
+        bindings: Vec<String>,
+    },
     OuterReference {
         outer_var: String,
     },
-    #[serde(rename = "RankFuseWithTiebreak")]
-    RankFuse {
-        arms: [RankArm; 2],
+    Correlate {
+        input: Option<NodeId>,
+        inner: NodeId,
+        outer_var: Option<String>,
+        read: InnerReadMirror,
+        tiebreak: Vec<ColumnRef>,
+    },
+    Fuse {
+        arms: Vec<FuseArm>,
+        target: String,
         k: Option<ExprMirror>,
-        limit: Option<usize>,
-        prefilter: PrefilterMirror,
-        row_tiebreak: Vec<ColumnRef>,
+        weights: Option<ExprMirror>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partition: Option<String>,
     },
     Projection {
         input: NodeId,
@@ -441,6 +480,35 @@ impl From<&PhysicalNode> for NodeMirror {
                 input: *input,
                 rows: *rows,
             },
+            PhysicalNode::TargetCut {
+                input,
+                binding,
+                targets,
+            } => Self::TargetCut {
+                input: *input,
+                binding: binding.clone(),
+                targets: *targets,
+            },
+            PhysicalNode::Score {
+                input,
+                binding,
+                type_name,
+                property,
+                kind,
+                query,
+            } => Self::Score {
+                input: *input,
+                binding: binding.clone(),
+                type_name: type_name.clone(),
+                property: property.clone(),
+                kind: ScoreKindMirror::from(*kind),
+                query: ExprMirror::from(query),
+            },
+            PhysicalNode::Let { input, name, value } => Self::Let {
+                input: *input,
+                name: name.clone(),
+                value: ExprMirror::from(value),
+            },
             PhysicalNode::Page {
                 input,
                 rows,
@@ -532,21 +600,52 @@ impl From<&PhysicalNode> for NodeMirror {
                 aggregate: *aggregate,
                 strategy: *strategy,
             },
+            PhysicalNode::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                tiebreak,
+            } => Self::Correlate {
+                input: *input,
+                inner: *inner,
+                outer_var: outer_var.clone(),
+                read: InnerReadMirror::from(read.as_ref()),
+                tiebreak: tiebreak.clone(),
+            },
+            PhysicalNode::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+            } => Self::OptionalJoin {
+                input: *input,
+                inner: *inner,
+                outer_var: outer_var.clone(),
+            },
+            PhysicalNode::Union {
+                left,
+                right,
+                bindings,
+            } => Self::Union {
+                left: *left,
+                right: *right,
+                bindings: bindings.clone(),
+            },
             PhysicalNode::OuterReference { outer_var } => Self::OuterReference {
                 outer_var: outer_var.clone(),
             },
-            PhysicalNode::RankFuse {
+            PhysicalNode::Fuse {
                 arms,
+                target,
                 k,
-                limit,
-                prefilter,
-                row_tiebreak,
-            } => Self::RankFuse {
+                weights,
+                partition,
+            } => Self::Fuse {
                 arms: arms.clone(),
+                target: target.clone(),
                 k: k.as_ref().map(ExprMirror::from),
-                limit: *limit,
-                prefilter: PrefilterMirror::from(prefilter),
-                row_tiebreak: row_tiebreak.clone(),
+                weights: weights.as_ref().map(ExprMirror::from),
+                partition: partition.clone(),
             },
             PhysicalNode::Projection {
                 input,
@@ -680,6 +779,35 @@ impl TryFrom<NodeMirror> for PhysicalNode {
             NodeMirror::RowCompare { input } => Self::RowCompare { input },
             NodeMirror::ClassifyThreeWay { input } => Self::ClassifyThreeWay { input },
             NodeMirror::Limit { input, rows } => Self::Limit { input, rows },
+            NodeMirror::TargetCut {
+                input,
+                binding,
+                targets,
+            } => Self::TargetCut {
+                input,
+                binding,
+                targets,
+            },
+            NodeMirror::Score {
+                input,
+                binding,
+                type_name,
+                property,
+                kind,
+                query,
+            } => Self::Score {
+                input,
+                binding,
+                type_name,
+                property,
+                kind: ScoreKind::from(kind),
+                query: IRExpr::from(query),
+            },
+            NodeMirror::Let { input, name, value } => Self::Let {
+                input,
+                name,
+                value: IRExpr::from(value),
+            },
             NodeMirror::Page {
                 input,
                 rows,
@@ -768,19 +896,50 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 aggregate,
                 strategy,
             },
+            NodeMirror::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                tiebreak,
+            } => Self::Correlate {
+                input,
+                inner,
+                outer_var,
+                read: Box::new(InnerRead::from(read)),
+                tiebreak,
+            },
+            NodeMirror::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+            } => Self::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+            },
+            NodeMirror::Union {
+                left,
+                right,
+                bindings,
+            } => Self::Union {
+                left,
+                right,
+                bindings,
+            },
             NodeMirror::OuterReference { outer_var } => Self::OuterReference { outer_var },
-            NodeMirror::RankFuse {
+            NodeMirror::Fuse {
                 arms,
+                target,
                 k,
-                limit,
-                prefilter,
-                row_tiebreak,
-            } => Self::RankFuse {
+                weights,
+                partition,
+            } => Self::Fuse {
                 arms,
+                target,
                 k: k.map(IRExpr::from),
-                limit,
-                prefilter: Prefilter::from(prefilter),
-                row_tiebreak,
+                weights: weights.map(IRExpr::from),
+                partition,
             },
             NodeMirror::Projection {
                 input,
@@ -886,7 +1045,6 @@ impl From<ScanInputMirror> for ScanInput {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankedMirror {
-    pub kind: RankKind,
     pub property: String,
     pub query: ExprMirror,
     pub score: ExprMirror,
@@ -895,14 +1053,12 @@ pub struct RankedMirror {
     pub scope: RankScope,
     pub overfetch: Vec<OverfetchRung>,
     pub prefilter: Option<PrefilterMirror>,
-    pub eligibility: Eligibility,
     pub policy: Option<NearestPolicy>,
 }
 
 impl From<&RankedAccess> for RankedMirror {
     fn from(ranked: &RankedAccess) -> Self {
         Self {
-            kind: ranked.kind,
             property: ranked.property.clone(),
             query: ExprMirror::from(&ranked.query),
             score: ExprMirror::from(&ranked.score),
@@ -911,7 +1067,6 @@ impl From<&RankedAccess> for RankedMirror {
             scope: ranked.scope,
             overfetch: ranked.overfetch.clone(),
             prefilter: ranked.prefilter.as_ref().map(PrefilterMirror::from),
-            eligibility: ranked.eligibility,
             policy: ranked.policy,
         }
     }
@@ -920,7 +1075,6 @@ impl From<&RankedAccess> for RankedMirror {
 impl From<RankedMirror> for RankedAccess {
     fn from(mirror: RankedMirror) -> Self {
         Self {
-            kind: mirror.kind,
             property: mirror.property,
             query: IRExpr::from(mirror.query),
             score: IRExpr::from(mirror.score),
@@ -929,7 +1083,6 @@ impl From<RankedMirror> for RankedAccess {
             scope: mirror.scope,
             overfetch: mirror.overfetch,
             prefilter: mirror.prefilter.map(Prefilter::from),
-            eligibility: mirror.eligibility,
             policy: mirror.policy,
         }
     }
@@ -946,8 +1099,6 @@ pub struct PrefilterMirror {
     pub ranked_type: String,
     pub hops: Vec<HopMirror>,
     pub feeds: Vec<NodeId>,
-    pub on_empty: EmptyEligible,
-    pub coverage_admits: bool,
 }
 
 impl From<&Prefilter> for PrefilterMirror {
@@ -963,8 +1114,6 @@ impl From<&Prefilter> for PrefilterMirror {
                 })
                 .collect(),
             feeds: prefilter.feeds.clone(),
-            on_empty: prefilter.on_empty,
-            coverage_admits: prefilter.coverage_admits,
         }
     }
 }
@@ -982,8 +1131,6 @@ impl From<PrefilterMirror> for Prefilter {
                 })
                 .collect(),
             feeds: mirror.feeds,
-            on_empty: mirror.on_empty,
-            coverage_admits: mirror.coverage_admits,
         }
     }
 }
@@ -1097,7 +1244,7 @@ pub enum PredicateMirror {
 
 impl From<&Predicate> for PredicateMirror {
     fn from(predicate: &Predicate) -> Self {
-        match predicate {
+        omnigraph_compiler::stack::deep(|| match predicate {
             Predicate::IdAfter { id } => Self::IdAfter { id: id.clone() },
             Predicate::VersionWindow { from, to } => Self::VersionWindow {
                 from: *from,
@@ -1116,13 +1263,13 @@ impl From<&Predicate> for PredicateMirror {
                 text: text.clone(),
                 filter: ExprMirror::from(&filter.0),
             },
-        }
+        })
     }
 }
 
 impl From<PredicateMirror> for Predicate {
     fn from(mirror: PredicateMirror) -> Self {
-        match mirror {
+        omnigraph_compiler::stack::deep(|| match mirror {
             PredicateMirror::IdAfter { id } => Self::IdAfter { id },
             PredicateMirror::VersionWindow { from, to } => Self::VersionWindow { from, to },
             PredicateMirror::And { left, right } => Self::And {
@@ -1138,7 +1285,7 @@ impl From<PredicateMirror> for Predicate {
                 text,
                 filter: GqFilter(IRExpr::from(filter)),
             },
-        }
+        })
     }
 }
 
@@ -1148,6 +1295,166 @@ pub enum BinaryOpMirror {
     Compare(CompOpMirror),
     And,
     Or,
+    Arith(ArithOpMirror),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArithOpMirror {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+impl From<ArithOp> for ArithOpMirror {
+    fn from(op: ArithOp) -> Self {
+        match op {
+            ArithOp::Add => Self::Add,
+            ArithOp::Sub => Self::Sub,
+            ArithOp::Mul => Self::Mul,
+            ArithOp::Div => Self::Div,
+            ArithOp::Rem => Self::Rem,
+        }
+    }
+}
+
+impl From<ArithOpMirror> for ArithOp {
+    fn from(mirror: ArithOpMirror) -> Self {
+        match mirror {
+            ArithOpMirror::Add => Self::Add,
+            ArithOpMirror::Sub => Self::Sub,
+            ArithOpMirror::Mul => Self::Mul,
+            ArithOpMirror::Div => Self::Div,
+            ArithOpMirror::Rem => Self::Rem,
+        }
+    }
+}
+
+/// An exact `Score`'s kind in a saved plan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreKindMirror {
+    #[default]
+    Distance,
+    Bm25,
+}
+
+impl From<ScoreKind> for ScoreKindMirror {
+    fn from(kind: ScoreKind) -> Self {
+        match kind {
+            ScoreKind::Distance => Self::Distance,
+            ScoreKind::Bm25 => Self::Bm25,
+        }
+    }
+}
+
+impl From<ScoreKindMirror> for ScoreKind {
+    fn from(kind: ScoreKindMirror) -> Self {
+        match kind {
+            ScoreKindMirror::Distance => Self::Distance,
+            ScoreKindMirror::Bm25 => Self::Bm25,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "func", rename_all = "snake_case")]
+pub enum ScalarFuncMirror {
+    If,
+    Coalesce,
+    Concat,
+    MatchTerms { all: bool },
+    List,
+    Lower,
+    Upper,
+    Trim,
+    LTrim,
+    RTrim,
+    Length,
+    Left,
+    Right,
+    Substring,
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Sqrt,
+    Exp,
+    Ln,
+    Log10,
+    Power,
+    Size,
+    Cast,
+}
+
+impl From<ScalarFunc> for ScalarFuncMirror {
+    fn from(func: ScalarFunc) -> Self {
+        match func {
+            ScalarFunc::If => Self::If,
+            ScalarFunc::Coalesce => Self::Coalesce,
+            ScalarFunc::Concat => Self::Concat,
+            ScalarFunc::MatchTerms { mode } => Self::MatchTerms {
+                all: mode == TermsMode::All,
+            },
+            ScalarFunc::List => Self::List,
+            ScalarFunc::Lower => Self::Lower,
+            ScalarFunc::Upper => Self::Upper,
+            ScalarFunc::Trim => Self::Trim,
+            ScalarFunc::LTrim => Self::LTrim,
+            ScalarFunc::RTrim => Self::RTrim,
+            ScalarFunc::Length => Self::Length,
+            ScalarFunc::Left => Self::Left,
+            ScalarFunc::Right => Self::Right,
+            ScalarFunc::Substring => Self::Substring,
+            ScalarFunc::Abs => Self::Abs,
+            ScalarFunc::Floor => Self::Floor,
+            ScalarFunc::Ceil => Self::Ceil,
+            ScalarFunc::Round => Self::Round,
+            ScalarFunc::Sqrt => Self::Sqrt,
+            ScalarFunc::Exp => Self::Exp,
+            ScalarFunc::Ln => Self::Ln,
+            ScalarFunc::Log10 => Self::Log10,
+            ScalarFunc::Power => Self::Power,
+            ScalarFunc::Size => Self::Size,
+            ScalarFunc::Cast => Self::Cast,
+        }
+    }
+}
+
+impl From<ScalarFuncMirror> for ScalarFunc {
+    fn from(mirror: ScalarFuncMirror) -> Self {
+        match mirror {
+            ScalarFuncMirror::If => Self::If,
+            ScalarFuncMirror::Coalesce => Self::Coalesce,
+            ScalarFuncMirror::Concat => Self::Concat,
+            ScalarFuncMirror::MatchTerms { all } => Self::MatchTerms {
+                mode: if all { TermsMode::All } else { TermsMode::Any },
+            },
+            ScalarFuncMirror::List => Self::List,
+            ScalarFuncMirror::Lower => Self::Lower,
+            ScalarFuncMirror::Upper => Self::Upper,
+            ScalarFuncMirror::Trim => Self::Trim,
+            ScalarFuncMirror::LTrim => Self::LTrim,
+            ScalarFuncMirror::RTrim => Self::RTrim,
+            ScalarFuncMirror::Length => Self::Length,
+            ScalarFuncMirror::Left => Self::Left,
+            ScalarFuncMirror::Right => Self::Right,
+            ScalarFuncMirror::Substring => Self::Substring,
+            ScalarFuncMirror::Abs => Self::Abs,
+            ScalarFuncMirror::Floor => Self::Floor,
+            ScalarFuncMirror::Ceil => Self::Ceil,
+            ScalarFuncMirror::Round => Self::Round,
+            ScalarFuncMirror::Sqrt => Self::Sqrt,
+            ScalarFuncMirror::Exp => Self::Exp,
+            ScalarFuncMirror::Ln => Self::Ln,
+            ScalarFuncMirror::Log10 => Self::Log10,
+            ScalarFuncMirror::Power => Self::Power,
+            ScalarFuncMirror::Size => Self::Size,
+            ScalarFuncMirror::Cast => Self::Cast,
+        }
+    }
 }
 
 impl From<BinaryOp> for BinaryOpMirror {
@@ -1156,6 +1463,7 @@ impl From<BinaryOp> for BinaryOpMirror {
             BinaryOp::Compare(op) => Self::Compare(CompOpMirror::from(op)),
             BinaryOp::And => Self::And,
             BinaryOp::Or => Self::Or,
+            BinaryOp::Arith(op) => Self::Arith(ArithOpMirror::from(op)),
         }
     }
 }
@@ -1166,6 +1474,7 @@ impl From<BinaryOpMirror> for BinaryOp {
             BinaryOpMirror::Compare(op) => Self::Compare(CompOp::from(op)),
             BinaryOpMirror::And => Self::And,
             BinaryOpMirror::Or => Self::Or,
+            BinaryOpMirror::Arith(op) => Self::Arith(ArithOp::from(op)),
         }
     }
 }
@@ -1189,69 +1498,75 @@ pub enum BlockAggregateExprMirror {
 
 impl From<&BlockAggregateExpr> for BlockAggregateExprMirror {
     fn from(expr: &BlockAggregateExpr) -> Self {
-        let mut current = expr;
-        let mut casts = Vec::new();
-        let mut mirror = loop {
-            match current {
-                BlockAggregateExpr::CountRows { ty } => break Self::CountRows { ty: ty.clone() },
-                BlockAggregateExpr::Aggregate {
-                    func,
-                    arg,
-                    signature,
-                } => {
-                    break Self::Aggregate {
-                        func: (*func).into(),
-                        arg: Box::new(ExprMirror::from(arg.as_ref())),
-                        signature: signature.clone(),
-                    };
+        omnigraph_compiler::stack::deep(|| {
+            let mut current = expr;
+            let mut casts = Vec::new();
+            let mut mirror = loop {
+                match current {
+                    BlockAggregateExpr::CountRows { ty } => {
+                        break Self::CountRows { ty: ty.clone() };
+                    }
+                    BlockAggregateExpr::Aggregate {
+                        func,
+                        arg,
+                        signature,
+                    } => {
+                        break Self::Aggregate {
+                            func: (*func).into(),
+                            arg: Box::new(ExprMirror::from(arg.as_ref())),
+                            signature: signature.clone(),
+                        };
+                    }
+                    BlockAggregateExpr::Cast { expr, ty } => {
+                        casts.push(ty);
+                        current = expr;
+                    }
                 }
-                BlockAggregateExpr::Cast { expr, ty } => {
-                    casts.push(ty);
-                    current = expr;
-                }
-            }
-        };
-        for ty in casts.into_iter().rev() {
-            mirror = Self::Cast {
-                expr: Box::new(mirror),
-                ty: ty.clone(),
             };
-        }
-        mirror
+            for ty in casts.into_iter().rev() {
+                mirror = Self::Cast {
+                    expr: Box::new(mirror),
+                    ty: ty.clone(),
+                };
+            }
+            mirror
+        })
     }
 }
 
 impl From<BlockAggregateExprMirror> for BlockAggregateExpr {
     fn from(mirror: BlockAggregateExprMirror) -> Self {
-        let mut current = mirror;
-        let mut casts = Vec::new();
-        let mut expr = loop {
-            match current {
-                BlockAggregateExprMirror::CountRows { ty } => break Self::CountRows { ty },
-                BlockAggregateExprMirror::Aggregate {
-                    func,
-                    arg,
-                    signature,
-                } => {
-                    break Self::Aggregate {
-                        func: func.into(),
-                        arg: Box::new(IRExpr::from(*arg)),
+        omnigraph_compiler::stack::deep(|| {
+            let mut current = mirror;
+            let mut casts = Vec::new();
+            let mut expr = loop {
+                match current {
+                    BlockAggregateExprMirror::CountRows { ty } => break Self::CountRows { ty },
+                    BlockAggregateExprMirror::Aggregate {
+                        func,
+                        arg,
                         signature,
-                    };
+                    } => {
+                        break Self::Aggregate {
+                            func: func.into(),
+                            arg: Box::new(IRExpr::from(*arg)),
+                            signature,
+                        };
+                    }
+                    BlockAggregateExprMirror::Cast { expr, ty } => {
+                        casts.push(ty);
+                        current = *expr;
+                    }
                 }
-                BlockAggregateExprMirror::Cast { expr, ty } => {
-                    casts.push(ty);
-                    current = *expr;
-                }
-            }
-        };
-        for ty in casts.into_iter().rev() {
-            expr = Self::Cast {
-                expr: Box::new(expr),
-                ty,
             };
-        }
-        expr
+            for ty in casts.into_iter().rev() {
+                expr = Self::Cast {
+                    expr: Box::new(expr),
+                    ty,
+                };
+            }
+            expr
+        })
     }
 }
 
@@ -1264,11 +1579,11 @@ pub struct SubqueryPredicateMirror {
 
 impl From<&SubqueryPredicate> for SubqueryPredicateMirror {
     fn from(predicate: &SubqueryPredicate) -> Self {
-        Self {
+        omnigraph_compiler::stack::deep(|| Self {
             left: BlockAggregateExprMirror::from(&predicate.left),
             op: CompOpMirror::from(predicate.op),
             right: ExprMirror::from(&predicate.right),
-        }
+        })
     }
 }
 
@@ -1336,6 +1651,9 @@ pub enum AggFuncMirror {
     Avg,
     Min,
     Max,
+    Collect,
+    Stddev,
+    Percentile,
 }
 
 impl From<AggFunc> for AggFuncMirror {
@@ -1346,6 +1664,9 @@ impl From<AggFunc> for AggFuncMirror {
             AggFunc::Avg => Self::Avg,
             AggFunc::Min => Self::Min,
             AggFunc::Max => Self::Max,
+            AggFunc::Collect => Self::Collect,
+            AggFunc::Stddev => Self::Stddev,
+            AggFunc::Percentile => Self::Percentile,
         }
     }
 }
@@ -1358,6 +1679,9 @@ impl From<AggFuncMirror> for AggFunc {
             AggFuncMirror::Avg => Self::Avg,
             AggFuncMirror::Min => Self::Min,
             AggFuncMirror::Max => Self::Max,
+            AggFuncMirror::Collect => Self::Collect,
+            AggFuncMirror::Stddev => Self::Stddev,
+            AggFuncMirror::Percentile => Self::Percentile,
         }
     }
 }
@@ -1448,7 +1772,7 @@ impl From<&Literal> for LiteralMirror {
 
 impl From<LiteralMirror> for Literal {
     fn from(mirror: LiteralMirror) -> Self {
-        match mirror {
+        omnigraph_compiler::stack::deep(|| match mirror {
             LiteralMirror::Null => Self::Null,
             LiteralMirror::String(text) => Self::String(text),
             LiteralMirror::Integer(value) => Self::Integer(i128::from(value)),
@@ -1458,7 +1782,7 @@ impl From<LiteralMirror> for Literal {
             LiteralMirror::Date(text) => Self::Date(text),
             LiteralMirror::DateTime(text) => Self::DateTime(text),
             LiteralMirror::List(items) => Self::List(items.into_iter().map(Self::from).collect()),
-        }
+        })
     }
 }
 
@@ -1474,33 +1798,6 @@ pub enum ExprMirror {
         variable: String,
         property: String,
         query: Box<ExprMirror>,
-        ty: ExprType,
-    },
-    Search {
-        field: Box<ExprMirror>,
-        query: Box<ExprMirror>,
-        ty: ExprType,
-    },
-    Fuzzy {
-        field: Box<ExprMirror>,
-        query: Box<ExprMirror>,
-        max_edits: Option<Box<ExprMirror>>,
-        ty: ExprType,
-    },
-    MatchText {
-        field: Box<ExprMirror>,
-        query: Box<ExprMirror>,
-        ty: ExprType,
-    },
-    Bm25 {
-        field: Box<ExprMirror>,
-        query: Box<ExprMirror>,
-        ty: ExprType,
-    },
-    Rrf {
-        primary: Box<ExprMirror>,
-        secondary: Box<ExprMirror>,
-        k: Option<Box<ExprMirror>>,
         ty: ExprType,
     },
     Variable {
@@ -1519,6 +1816,10 @@ pub enum ExprMirror {
         func: AggFuncMirror,
         distinct: bool,
         arg: Box<ExprMirror>,
+        /// `percentile`'s fraction; absent for every other aggregate, so a
+        /// plan without one reads as it was written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fraction: Option<Box<ExprMirror>>,
         signature: AggSignature,
     },
     AliasRef {
@@ -1544,6 +1845,15 @@ pub enum ExprMirror {
         operand: Box<ExprMirror>,
         ty: ExprType,
     },
+    Neg {
+        operand: Box<ExprMirror>,
+        ty: ExprType,
+    },
+    Call {
+        func: ScalarFuncMirror,
+        args: Vec<ExprMirror>,
+        ty: ExprType,
+    },
 }
 
 fn boxed(expr: &IRExpr) -> Box<ExprMirror> {
@@ -1555,7 +1865,7 @@ fn unboxed(mirror: ExprMirror) -> Box<IRExpr> {
 
 impl From<&IRExpr> for ExprMirror {
     fn from(expr: &IRExpr) -> Self {
-        match expr {
+        omnigraph_compiler::stack::deep(|| match expr {
             IRExpr::PropAccess {
                 variable,
                 property,
@@ -1576,43 +1886,6 @@ impl From<&IRExpr> for ExprMirror {
                 query: boxed(query),
                 ty: ty.clone(),
             },
-            IRExpr::Search { field, query, ty } => Self::Search {
-                field: boxed(field),
-                query: boxed(query),
-                ty: ty.clone(),
-            },
-            IRExpr::Fuzzy {
-                field,
-                query,
-                max_edits,
-                ty,
-            } => Self::Fuzzy {
-                field: boxed(field),
-                query: boxed(query),
-                max_edits: max_edits.as_deref().map(boxed),
-                ty: ty.clone(),
-            },
-            IRExpr::MatchText { field, query, ty } => Self::MatchText {
-                field: boxed(field),
-                query: boxed(query),
-                ty: ty.clone(),
-            },
-            IRExpr::Bm25 { field, query, ty } => Self::Bm25 {
-                field: boxed(field),
-                query: boxed(query),
-                ty: ty.clone(),
-            },
-            IRExpr::Rrf {
-                primary,
-                secondary,
-                k,
-                ty,
-            } => Self::Rrf {
-                primary: boxed(primary),
-                secondary: boxed(secondary),
-                k: k.as_deref().map(boxed),
-                ty: ty.clone(),
-            },
             IRExpr::Variable(name, ty) => Self::Variable {
                 name: name.clone(),
                 ty: ty.clone(),
@@ -1629,11 +1902,13 @@ impl From<&IRExpr> for ExprMirror {
                 func,
                 distinct,
                 arg,
+                fraction,
                 signature,
             } => Self::Aggregate {
                 func: AggFuncMirror::from(*func),
                 distinct: *distinct,
                 arg: boxed(arg),
+                fraction: fraction.as_deref().map(boxed),
                 signature: signature.clone(),
             },
             IRExpr::AliasRef(alias, ty) => Self::AliasRef {
@@ -1664,13 +1939,22 @@ impl From<&IRExpr> for ExprMirror {
                 operand: boxed(expr),
                 ty: ty.clone(),
             },
-        }
+            IRExpr::Neg { expr, ty } => Self::Neg {
+                operand: boxed(expr),
+                ty: ty.clone(),
+            },
+            IRExpr::Call { func, args, ty } => Self::Call {
+                func: ScalarFuncMirror::from(*func),
+                args: args.iter().map(ExprMirror::from).collect(),
+                ty: ty.clone(),
+            },
+        })
     }
 }
 
 impl From<ExprMirror> for IRExpr {
     fn from(mirror: ExprMirror) -> Self {
-        match mirror {
+        omnigraph_compiler::stack::deep(|| match mirror {
             ExprMirror::PropAccess {
                 variable,
                 property,
@@ -1691,43 +1975,6 @@ impl From<ExprMirror> for IRExpr {
                 query: unboxed(*query),
                 ty,
             },
-            ExprMirror::Search { field, query, ty } => Self::Search {
-                field: unboxed(*field),
-                query: unboxed(*query),
-                ty,
-            },
-            ExprMirror::Fuzzy {
-                field,
-                query,
-                max_edits,
-                ty,
-            } => Self::Fuzzy {
-                field: unboxed(*field),
-                query: unboxed(*query),
-                max_edits: max_edits.map(|inner| unboxed(*inner)),
-                ty,
-            },
-            ExprMirror::MatchText { field, query, ty } => Self::MatchText {
-                field: unboxed(*field),
-                query: unboxed(*query),
-                ty,
-            },
-            ExprMirror::Bm25 { field, query, ty } => Self::Bm25 {
-                field: unboxed(*field),
-                query: unboxed(*query),
-                ty,
-            },
-            ExprMirror::Rrf {
-                primary,
-                secondary,
-                k,
-                ty,
-            } => Self::Rrf {
-                primary: unboxed(*primary),
-                secondary: unboxed(*secondary),
-                k: k.map(|inner| unboxed(*inner)),
-                ty,
-            },
             ExprMirror::Variable { name, ty } => Self::Variable(name, ty),
             ExprMirror::Param { name, ty } => Self::Param(name, ty),
             ExprMirror::Literal { value, ty } => Self::Literal(Literal::from(value), ty),
@@ -1735,11 +1982,13 @@ impl From<ExprMirror> for IRExpr {
                 func,
                 distinct,
                 arg,
+                fraction,
                 signature,
             } => Self::Aggregate {
                 func: AggFunc::from(func),
                 distinct,
                 arg: unboxed(*arg),
+                fraction: fraction.map(|p| unboxed(*p)),
                 signature,
             },
             ExprMirror::AliasRef { alias, ty } => Self::AliasRef(alias, ty),
@@ -1768,7 +2017,16 @@ impl From<ExprMirror> for IRExpr {
                 expr: unboxed(*operand),
                 ty,
             },
-        }
+            ExprMirror::Neg { operand, ty } => Self::Neg {
+                expr: unboxed(*operand),
+                ty,
+            },
+            ExprMirror::Call { func, args, ty } => Self::Call {
+                func: ScalarFunc::from(func),
+                args: args.into_iter().map(IRExpr::from).collect(),
+                ty,
+            },
+        })
     }
 }
 
@@ -1837,10 +2095,72 @@ impl From<ProjectionMirror> for IRProjection {
     }
 }
 
+/// A `Correlate`'s read: its group, columns, order and cut.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InnerReadMirror {
+    pub values: String,
+    pub group: Option<Vec<ProjectionMirror>>,
+    pub columns: Vec<ProjectionMirror>,
+    pub order_by: Vec<OrderingMirror>,
+    pub limit: Option<u64>,
+    pub limit_param: Option<String>,
+    pub window: Option<TargetWindowMirror>,
+    pub limit_expr: Option<ExprMirror>,
+}
+
+/// A `Correlate`'s `nearest` window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TargetWindowMirror {
+    pub binding: String,
+    pub targets: Option<u64>,
+    pub targets_param: Option<String>,
+}
+
+impl From<&InnerRead> for InnerReadMirror {
+    fn from(read: &InnerRead) -> Self {
+        Self {
+            values: read.values.clone(),
+            group: read.group.as_deref().map(projections),
+            columns: projections(&read.columns),
+            order_by: read.order_by.iter().map(OrderingMirror::from).collect(),
+            limit: read.limit,
+            limit_param: read.limit_param.clone(),
+            window: read.window.as_ref().map(|w| TargetWindowMirror {
+                binding: w.binding.clone(),
+                targets: w.targets,
+                targets_param: w.targets_param.clone(),
+            }),
+            limit_expr: read.limit_expr.as_ref().map(ExprMirror::from),
+        }
+    }
+}
+
+impl From<InnerReadMirror> for InnerRead {
+    fn from(mirror: InnerReadMirror) -> Self {
+        Self {
+            values: mirror.values,
+            group: mirror.group.map(projections_back),
+            columns: projections_back(mirror.columns),
+            order_by: mirror.order_by.into_iter().map(IROrdering::from).collect(),
+            limit: mirror.limit,
+            limit_param: mirror.limit_param,
+            window: mirror.window.map(|w| TargetWindow {
+                binding: w.binding,
+                targets: w.targets,
+                targets_param: w.targets_param,
+            }),
+            limit_expr: mirror.limit_expr.map(IRExpr::from),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderingMirror {
     pub expr: ExprMirror,
     pub descending: bool,
+    /// The written null placement; absent, the direction's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nulls_first: Option<bool>,
 }
 
 impl From<&IROrdering> for OrderingMirror {
@@ -1848,6 +2168,7 @@ impl From<&IROrdering> for OrderingMirror {
         Self {
             expr: ExprMirror::from(&ordering.expr),
             descending: ordering.descending,
+            nulls_first: ordering.nulls_first,
         }
     }
 }
@@ -1857,6 +2178,7 @@ impl From<OrderingMirror> for IROrdering {
         Self {
             expr: IRExpr::from(mirror.expr),
             descending: mirror.descending,
+            nulls_first: mirror.nulls_first,
         }
     }
 }
@@ -1876,9 +2198,6 @@ pub enum OrderKeyMirror {
     Identity {
         column: ColumnRef,
     },
-    Fused {
-        bindings: Vec<String>,
-    },
 }
 
 impl From<&OrderKey> for OrderKeyMirror {
@@ -1896,9 +2215,6 @@ impl From<&OrderKey> for OrderKeyMirror {
             },
             OrderKey::Identity(column) => Self::Identity {
                 column: column.clone(),
-            },
-            OrderKey::Fused { bindings } => Self::Fused {
-                bindings: bindings.clone(),
             },
         }
     }
@@ -1918,7 +2234,6 @@ impl From<OrderKeyMirror> for OrderKey {
                 nulls_first,
             },
             OrderKeyMirror::Identity { column } => Self::Identity(column),
-            OrderKeyMirror::Fused { bindings } => Self::Fused { bindings },
         }
     }
 }

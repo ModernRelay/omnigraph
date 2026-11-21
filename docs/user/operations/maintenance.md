@@ -63,7 +63,7 @@ Optimize runs beside live writers: a write that lands on a table while its
 compaction is staged fails the run with a read-set conflict, and the next run
 re-plans from the new state. A write prepared before an optimize published goes
 ahead, or prepares again once, holding writes off, if it changes a row the run
-moved; none reports a conflict for it. Lance compacts neighbouring fragments only when the
+moved; none reports a conflict for it. Lance compacts neighboring fragments only when the
 same indexes cover them, so a table whose index coverage was uneven before a run
 may coalesce fully only on the next run, after the rebuilt coverage is in place.
 
@@ -95,11 +95,10 @@ The next run checks coverage and plans remaining work. The report includes
 `input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
 and `artifact` outcomes. Neither of those last two can fail a published run.
 
-A served run also applies the server's
-[table ceilings and byte budget](recorded-operations.md#table-ceilings-and-the-byte-budget).
-A table over a ceiling is `deferred` with reason `resource_limit` on every run
-until a ceiling is raised or a direct run optimizes it, and does not set
-`resume_at`.
+A served run also applies the server's [table ceilings and byte
+budget](recorded-operations.md#table-ceilings-and-the-byte-budget). A table over
+a ceiling is `deferred` with reason `resource_limit` on every run until a
+ceiling is raised or a direct run optimizes it, and does not set `resume_at`.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
@@ -109,13 +108,10 @@ outcome) costs only its speedup. Optimize builds it after releasing the writer
 gates, and only when the run advanced an edge dataset or no artifact exists; a
 build skipped for its size is counted again, up to the limit, by each such run.
 
-Existing full-text indexes are preserved rather than incrementally merged.
-Unindexed rows remain searchable, but a growing uncovered tail can cost more to
-scan. Use `index rebuild --kind full-text` to refresh that coverage or migrate
-an old analyzer generation. Optimize reports uncovered full-text coverage under
-`pending_indexes` with this remedy. Deferred coverage alone creates no graph
-commit or maintenance work. A vector index whose property has no usable vectors
-also stays pending; run optimize again after loading or generating vectors.
+Existing full-text indexes are preserved, not merged. No query reads one, so
+their coverage is never pending and optimize never recommends the one-way
+[full-text rebuild](upgrade.md#query-language-gq-3). A vector index with no
+usable vectors stays pending; run optimize again once vectors exist.
 
 ## Build indexes
 
@@ -125,23 +121,24 @@ omnigraph index build --target ./cluster-root --graph knowledge \
   --branch review --json
 ```
 
-Up to four BTREEs build together across tables. A full-text or vector build runs alone.
-On any branch, `index build` builds every declared index a table lacks, such as
-those of a type whose first rows were loaded there, and rebuilds whole each
-BTREE or vector index that leaves rows uncovered. Every table publishes in one
-graph commit on that branch; other branches and snapshots keep their indexes,
-and a branch with nothing to do publishes nothing. The default branch is `main`.
-As with optimize, a write that lands on a table while its batch is staged fails
-the run with a read-set conflict; run the command again. A vector property with
-no vectors yet and full-text coverage stay pending: only `index rebuild --kind
-full-text` refreshes a full-text index's coverage, and queries match uncovered
-rows with the index's analyzer meanwhile. Pending covers only a vector
-property with nothing to train on; a rebuild that fails for any other reason,
-a storage failure for one, fails the command.
+On any branch, `index build` builds every declared index a table lacks and
+rebuilds whole, in its own kind, each BTREE, BITMAP, LABEL_LIST, NGRAM or vector
+index that leaves rows uncovered, and each vector index built for another
+[distance](../search/distances.md) than its property's. Every table publishes in
+one graph commit on that branch; other branches and snapshots keep their
+indexes, and a branch with nothing to do publishes nothing. The default branch
+is `main`. As with optimize, a write that lands on a table while its batch is
+staged fails the run with a read-set conflict; run it again. Vector properties
+with no vectors yet stay pending. Full-text coverage, which no query reads, is
+not pending, and the build never recommends `index rebuild --kind full-text`. A vector
+rebuild that fails for a reason other than nothing to train on, such as a
+storage failure, fails the command. Up to four BTREEs build at once across
+tables; a BITMAP, LABEL_LIST, NGRAM, full-text or vector build runs alone.
 
 JSON reports `branch`, `graph_commit_id` (null for a no-op), `indexes` with each
 `type_key`, `property` (the indexed column, `__id` for the identity index),
-`kind` (`btree`, `full_text` or `vector`) and `action` (`built` or `refreshed`),
+`kind` (`btree`, `bitmap`, `label_list`, `ngram`, `full_text` or `vector`) and
+`action` (`built` or `refreshed`),
 and `pending_indexes` with each `type_key`, `property` and `reason`.
 
 ## Rebuild full-text indexes
@@ -156,12 +153,15 @@ omnigraph index rebuild --kind full-text --target ./cluster-root \
 works for one release. Under a policy, the rebuild needs `maintain` on the
 selected branch.
 
-The command fully replaces text-search indexes from current entities using the
-engine's default English analyzer, including already indexed entities. It builds
+The command fully replaces text-search indexes from current entities, with
+each property's declared [analyzer](../search/analyzers.md) or else the
+default English one, including already indexed entities. It builds
 declared node full-text indexes and replaces existing physical full-text indexes
 on nodes or edges; it does not create edge-property indexes from declarations.
 External custom tokenizer settings are not preserved. Completed rebuilds warn
-on stderr, or in the JSON `warnings` array, that those settings were replaced.
+on stderr, or in the JSON `warnings` array, that those settings were replaced,
+and that binaries before this release refuse full-text reads on the graph from
+then on; such a binary's own `index rebuild --kind full-text` restores them.
 
 All rebuilt datasets become visible in one graph commit. JSON reports `branch`,
 `graph_commit_id`, and `rebuilt_indexes` with each `type_key` and `property`.
@@ -323,21 +323,20 @@ for tables with an `error`.
 
 ### Foreign versions
 
-Every Omnigraph table write is a detached Lance commit that a graph commit
-pins, so a table's linear Lance history ends where the table was created. The
+Every Omnigraph table write is a detached Lance commit that a graph commit pins,
+so a table's linear Lance history ends where the table was created. The
 registration records that point as its last linear version
-(`omnigraph.last_linear_version`). A linear commit above it came from
-something other than Omnigraph writing the table directory, such as a Lance
-client pointed at it. No read or write of the graph resolves the linear
-HEAD, so a foreign version changes no query result and blocks no writer, and
-no command adopts it. A confirmed cleanup run (`cleanup --keep N --confirm`,
-which also removes what its policy does not retain) lists these versions per
-table, under `foreign_versions` with `--json` and by name in the human report,
-and leaves them and their files in place. The preview without `--confirm`
-does not open the graph and lists nothing. Embedded hosts can read the same
-list from the read-only `Omnigraph::cleanup_plan`. To discard them,
-export the graph and load it into a new one; see
-[Troubleshooting](troubleshooting.md#foreign-versions).
+(`omnigraph.last_linear_version`). A linear commit above it came from something
+other than Omnigraph writing the table directory, such as a Lance client pointed
+at it. No read or write of the graph resolves the linear HEAD, so a foreign
+version changes no query result and blocks no writer, and no command adopts it.
+A confirmed cleanup run (`cleanup --keep N --confirm`, which also removes what
+its policy does not retain) lists these versions per table, under
+`foreign_versions` with `--json` and by name in the human report, and leaves
+them and their files in place. The preview without `--confirm` does not open the
+graph and lists nothing. Embedded hosts can read the same list from the read-
+only `Omnigraph::cleanup_plan`. To discard them, export the graph and load it
+into a new one; see [Troubleshooting](troubleshooting.md#foreign-versions).
 
 ## Suggested cadence
 

@@ -40,7 +40,7 @@ use crate::error::{OmniError, Result};
 pub(crate) struct OuterSlot(Mutex<Option<RecordBatch>>);
 
 impl OuterSlot {
-    fn fill(&self, batch: RecordBatch) {
+    pub(super) fn fill(&self, batch: RecordBatch) {
         *self
             .0
             .lock()
@@ -53,9 +53,18 @@ impl OuterSlot {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
+
+    /// The filled batch, left in place for every leaf that reads it: a
+    /// correlated union's arms each start from the same outer rows.
+    fn read(&self) -> Option<RecordBatch> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
-struct FilledSlot<'a>(&'a OuterSlot);
+pub(super) struct FilledSlot<'a>(pub(super) &'a OuterSlot);
 
 impl Drop for FilledSlot<'_> {
     fn drop(&mut self) {
@@ -125,7 +134,7 @@ impl ExecutionPlan for OuterReferenceExec {
         Ok(self
             .shape
             .stream(memory, &self.metrics, move |_reservation| async move {
-                slot.take().ok_or_else(|| {
+                slot.read().ok_or_else(|| {
                     external(OmniError::manifest_internal(
                         "OuterReference executed without its outer batch",
                     ))
@@ -209,7 +218,7 @@ pub(crate) fn tagged_schema(outer: &Schema, tag_column: &str) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-fn tag_batch(wide: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
+pub(super) fn tag_batch(wide: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let num_rows = wide.num_rows();
     let mut columns: Vec<ArrayRef> = wide.columns().to_vec();
     columns.push(Arc::new(UInt32Array::from_iter_values(0..num_rows as u32)));
@@ -365,7 +374,7 @@ impl ExecutionPlan for AntiJoinMaskExec {
                         let mut aggregate =
                             SubqueryAggregate::new(&predicate, aggregate_spec, &params, num_rows)
                                 .map_err(external)?;
-                        // The leaf takes the tagged batch when its stream is first
+                        // The leaf reads the tagged batch when its stream is first
                         // polled, so the guard lives until the stream ends.
                         slot.fill(tagged_batch);
                         let filled = FilledSlot(&slot);
@@ -384,7 +393,18 @@ impl ExecutionPlan for AntiJoinMaskExec {
                         .await;
                         drop(filled);
                         result?;
-                        let keep = aggregate.keep_mask().map_err(external)?;
+                        let keep = if aggregate.reads_outer_row() {
+                            let right = crate::engine::expr::evaluate_expr(
+                                &wide,
+                                &predicate.right,
+                                &params,
+                            )
+                            .map_err(external)?;
+                            aggregate.keep_mask_against(&right)
+                        } else {
+                            aggregate.keep_mask()
+                        }
+                        .map_err(external)?;
                         reservation.filter(&wide, &keep)
                     })
                     .await
@@ -435,6 +455,18 @@ async fn key_set_mask(
         },
     )
     .await?;
+    if aggregate.reads_outer_row() {
+        let right =
+            crate::engine::expr::evaluate_expr(wide, &predicate.right, params).map_err(external)?;
+        let groups = UInt32Array::from_iter_values(
+            row_groups
+                .into_iter()
+                .map(|group| group.unwrap_or(unmatched)),
+        );
+        return aggregate
+            .keep_rows_against(&groups, &right)
+            .map_err(external);
+    }
     let verdicts = aggregate.keep_mask().map_err(external)?;
     Ok(row_groups
         .into_iter()

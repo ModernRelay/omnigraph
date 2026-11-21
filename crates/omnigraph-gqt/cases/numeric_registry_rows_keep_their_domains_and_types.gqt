@@ -1,0 +1,364 @@
+# issue: none
+# notes: The registry's numeric rows (the GQ 3 RFC, section 2). `abs`, `floor`, `ceil` and
+# notes: `round` return their operand's type; `round` rounds half away from zero at
+# notes: `digits` decimal digits (0 when omitted; negative digits round to tens or
+# notes: hundreds), a float as `(x * 10^d).round() / 10^d`, so `2.675` at two digits is
+# notes: `2.68`. `sqrt`, `exp`, `ln`, `log10` and `power` return F64, an integer argument
+# notes: widened. Negative zero keeps its sign through `floor`, `ceil`, `round` and `sqrt`,
+# notes: and `abs` drops it (shown through `cast` to String, since a JSON row writes both
+# notes: zeros alike). A row is null where any argument is null. The smallest I32 and I64
+# notes: have no absolute value (`E1`), an integer `round` that leaves its type is `E1`, a
+# notes: float result that is not finite is `E3`, and an argument outside the row's domain
+# notes: (the root of a negative, the logarithm of zero, negative zero or a negative,
+# notes: `digits` outside I32 for a float, a negative base to a fractional power) is `E5`.
+# notes: A guard written before the row keeps the rows it refuses out. A type error names
+# notes: the row and the argument it cannot take.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node N {
+    k: String @key
+    i: I32?
+    l: I64?
+    f: F64?
+    g: F32?
+}
+
+--- seed
+{"type":"N","data":{"k":"pos","i":7,"l":1250,"f":2.5,"g":2.5}}
+{"type":"N","data":{"k":"neg","i":-7,"l":-1250,"f":-2.5,"g":-2.5}}
+{"type":"N","data":{"k":"half","i":0,"l":1249,"f":0.5,"g":-0.5}}
+{"type":"N","data":{"k":"negzero","i":0,"l":0,"f":-0.0,"g":-0.0}}
+{"type":"N","data":{"k":"frac","i":1,"l":1,"f":2.675,"g":1.75}}
+{"type":"N","data":{"k":"big","i":2147483647,"l":9223372036854775807,"f":1.5e15,"g":1e10}}
+{"type":"N","data":{"k":"min","i":-2147483648,"l":-9223372036854775808,"f":-1.5e15,"g":-1e10}}
+{"type":"N","data":{"k":"huge","f":1e308}}
+{"type":"N","data":{"k":"nulls"}}
+
+--- query
+query absolute_floor_ceil() {
+    match { $x: N } where $x.k != "min" and $x.k != "huge"
+    return {
+        $x.k,
+        abs($x.i) as ai, abs($x.l) as al, abs($x.f) as af, abs($x.g) as ag,
+        floor($x.f) as ff, ceil($x.f) as cf, floor($x.g) as fg, ceil($x.g) as cg,
+        floor($x.i) as fi, ceil($x.l) as cl
+    }
+}
+
+--- expect unordered
+{"af":0,"ag":0,"ai":0,"al":0,"cf":0,"cg":0,"cl":0,"ff":0,"fg":0,"fi":0,"x.k":"negzero"}
+{"af":0.5,"ag":0.5,"ai":0,"al":1249,"cf":1,"cg":0,"cl":1249,"ff":0,"fg":-1,"fi":0,"x.k":"half"}
+{"af":1500000000000000,"ag":10000000000,"ai":2147483647,"al":9223372036854775807,"cf":1500000000000000,"cg":10000000000,"cl":9223372036854775807,"ff":1500000000000000,"fg":10000000000,"fi":2147483647,"x.k":"big"}
+{"af":2.5,"ag":2.5,"ai":7,"al":1250,"cf":-2,"cg":-2,"cl":-1250,"ff":-3,"fg":-3,"fi":-7,"x.k":"neg"}
+{"af":2.5,"ag":2.5,"ai":7,"al":1250,"cf":3,"cg":3,"cl":1250,"ff":2,"fg":2,"fi":7,"x.k":"pos"}
+{"af":2.675,"ag":1.75,"ai":1,"al":1,"cf":3,"cg":2,"cl":1,"ff":2,"fg":1,"fi":1,"x.k":"frac"}
+{"x.k":"nulls"}
+
+--- expect shape
+x.k: String
+ai: I32?
+al: I64?
+af: F64?
+ag: F32?
+ff: F64?
+cf: F64?
+fg: F32?
+cg: F32?
+fi: I32?
+cl: I64?
+
+--- query
+query signed_zero_survives() {
+    match { $x: N } where $x.k = "negzero"
+    return {
+        cast($x.f, String) as raw,
+        cast(abs($x.f), String) as a,
+        cast(floor($x.f), String) as fl,
+        cast(ceil($x.f), String) as ce,
+        cast(round($x.f), String) as r,
+        cast(ceil(-0.5), String) as ce_half,
+        cast(round(-0.4), String) as r_small,
+        cast(sqrt($x.f), String) as sq
+    }
+}
+
+--- expect unordered
+{"a":"0.0","ce":"-0.0","ce_half":"-0.0","fl":"-0.0","r":"-0.0","r_small":"-0.0","raw":"-0.0","sq":"-0.0"}
+
+--- expect shape
+raw: String
+a: String
+fl: String
+ce: String
+r: String
+ce_half: String
+r_small: String
+sq: String
+
+--- query
+query round_half_away_from_zero() {
+    match { $x: N } where $x.k in ["pos", "neg", "half", "negzero", "frac", "nulls"]
+    return {
+        $x.k,
+        round($x.f) as r0,
+        round($x.f, digits: 1) as r1,
+        round($x.f, digits: 2) as r2,
+        round($x.g, digits: 0) as rg,
+        round($x.l, digits: -2) as rl,
+        round($x.i, digits: -1) as ri,
+        round($x.l, digits: 3) as rl_pos,
+        round($x.f, digits: $x.i) as r_by_i
+    }
+}
+
+--- expect unordered
+{"r0":-3,"r1":-2.5,"r2":-2.5,"r_by_i":0,"rg":-3,"ri":-10,"rl":-1300,"rl_pos":-1250,"x.k":"neg"}
+{"r0":0,"r1":0,"r2":0,"r_by_i":0,"rg":0,"ri":0,"rl":0,"rl_pos":0,"x.k":"negzero"}
+{"r0":1,"r1":0.5,"r2":0.5,"r_by_i":1,"rg":-1,"ri":0,"rl":1200,"rl_pos":1249,"x.k":"half"}
+{"r0":3,"r1":2.5,"r2":2.5,"r_by_i":2.5,"rg":3,"ri":10,"rl":1300,"rl_pos":1250,"x.k":"pos"}
+{"r0":3,"r1":2.7,"r2":2.68,"r_by_i":2.7,"rg":2,"ri":0,"rl":0,"rl_pos":1,"x.k":"frac"}
+{"x.k":"nulls"}
+
+--- expect shape
+x.k: String
+r0: F64?
+r1: F64?
+r2: F64?
+rg: F32?
+rl: I64?
+ri: I32?
+rl_pos: I64?
+r_by_i: F64?
+
+--- query
+query roots_logs_and_powers() {
+    match { $x: N } where $x.k in ["pos", "half", "frac", "nulls"]
+    return {
+        $x.k,
+        sqrt($x.f) as sf,
+        sqrt($x.l) as sl,
+        exp($x.f) as ef,
+        ln($x.f) as lf,
+        log10($x.l) as ll,
+        power($x.f, 2) as p2,
+        power($x.l, 0.5) as ph,
+        power(2, $x.i) as pi,
+        power($x.f, $x.i) as pfi
+    }
+}
+
+--- expect unordered
+{"ef":1.6487212707,"lf":-0.69314718056,"ll":3.096562438374,"p2":0.25,"pfi":1,"ph":35.341194094145,"pi":1,"sf":0.707106781187,"sl":35.341194094145,"x.k":"half"}
+{"ef":12.182493960703,"lf":0.916290731874,"ll":3.096910013008,"p2":6.25,"pfi":610.3515625,"ph":35.355339059327,"pi":128,"sf":1.581138830084,"sl":35.355339059327,"x.k":"pos"}
+{"ef":14.512349839591,"lf":0.983949380348,"ll":0,"p2":7.155625,"pfi":2.675,"ph":1,"pi":2,"sf":1.63554272338,"sl":1,"x.k":"frac"}
+{"x.k":"nulls"}
+
+--- expect shape
+x.k: String
+sf: F64?
+sl: F64?
+ef: F64?
+lf: F64?
+ll: F64?
+p2: F64?
+ph: F64?
+pi: F64?
+pfi: F64?
+
+--- query
+query exact_values() {
+    match { $x: N } where $x.k = "pos"
+    return { sqrt(16) as s, exp(0) as e, ln(1) as l, log10(1000) as t, power(2, 10) as p, power(4, -1) as q, power(-8, 3) as c }
+}
+
+--- expect unordered
+{"c":-512,"e":1,"l":0,"p":1024,"q":0.25,"s":4,"t":3}
+
+--- expect shape
+s: F64
+e: F64
+l: F64
+t: F64
+p: F64
+q: F64
+c: F64
+
+--- query
+query abs_of_the_smallest_i32() {
+    match { $x: N } where $x.k = "min"
+    return { abs($x.i) as a }
+}
+
+--- expect error: E1
+
+--- query
+query abs_of_the_smallest_i64() {
+    match { $x: N } where $x.k = "min"
+    return { abs($x.l) as a }
+}
+
+--- expect error: E1
+
+--- query
+query abs_of_a_float_never_overflows() {
+    match { $x: N } where $x.k = "min"
+    return { abs($x.f) as a, abs($x.g) as b }
+}
+
+--- expect unordered
+{"a":1500000000000000,"b":10000000000}
+
+--- expect shape
+a: F64
+b: F32
+
+--- query
+query integer_round_leaves_its_type() {
+    match { $x: N } where $x.k = "big"
+    return { round($x.i, digits: -1) as r }
+}
+
+--- expect error: E1
+
+--- query
+query float_round_overflows() {
+    match { $x: N } where $x.k = "huge"
+    return { round($x.f, digits: 1) as r }
+}
+
+--- expect error: E3
+
+--- query
+query round_digits_outside_i32() {
+    match { $x: N } where $x.k = "pos"
+    return { round($x.f, digits: 3000000000) as r }
+}
+
+--- expect error: E5
+
+--- query
+query sqrt_of_a_negative() {
+    match { $x: N } return { sqrt($x.f) as r }
+}
+
+--- expect error: E5
+
+--- query
+query ln_of_zero() {
+    match { $x: N } where $x.k = "negzero"
+    return { ln($x.l) as r }
+}
+
+--- expect error: E5
+
+--- query
+query ln_of_negative_zero() {
+    match { $x: N } where $x.k = "negzero"
+    return { ln($x.f) as r }
+}
+
+--- expect error: E5
+
+--- query
+query log10_of_a_negative() {
+    match { $x: N } where $x.k = "neg"
+    return { log10($x.i) as r }
+}
+
+--- expect error: E5
+
+--- query
+query exp_overflows() {
+    match { $x: N } where $x.k = "pos"
+    return { exp($x.l) as r }
+}
+
+--- expect error: E3
+
+--- query
+query power_overflows() {
+    match { $x: N } where $x.k = "huge"
+    return { power($x.f, 2) as r }
+}
+
+--- expect error: E3
+
+--- query
+query negative_base_to_a_fractional_power() {
+    match { $x: N } where $x.k = "neg"
+    return { power($x.f, 0.5) as r }
+}
+
+--- expect error: E5
+
+--- query
+query unguarded_root_in_where() {
+    match { $x: N } where sqrt($x.f) > 1.0
+    return { $x.k }
+}
+
+--- expect error: E5
+
+--- query
+query guarded_root_in_where() {
+    match { $x: N } where $x.f > 0 and sqrt($x.f) > 1.0
+    return { $x.k }
+}
+
+--- expect unordered
+{"x.k":"big"}
+{"x.k":"frac"}
+{"x.k":"huge"}
+{"x.k":"pos"}
+
+--- expect shape
+x.k: String
+
+--- query
+query guarded_root_inside_if() {
+    match { $x: N } where $x.k != "huge"
+    return { $x.k, if($x.f >= 0, sqrt($x.f), 0.0) as r }
+}
+
+--- expect unordered
+{"r":0,"x.k":"min"}
+{"r":0,"x.k":"neg"}
+{"r":0,"x.k":"negzero"}
+{"r":0,"x.k":"nulls"}
+{"r":0.707106781187,"x.k":"half"}
+{"r":1.581138830084,"x.k":"pos"}
+{"r":1.63554272338,"x.k":"frac"}
+{"r":38729833.462074168026,"x.k":"big"}
+
+--- expect shape
+x.k: String
+r: F64
+
+--- query
+query round_with_an_unknown_option() {
+    match { $x: N } return { round($x.f, places: 2) as r }
+}
+
+--- expect error: T71: `round` has no option `places`; it admits `digits`
+
+--- query
+query sqrt_over_a_string() {
+    match { $x: N } return { sqrt($x.k) as r }
+}
+
+--- expect error: T72: `sqrt` needs a number, got String
+
+--- query
+query round_with_float_digits() {
+    match { $x: N } return { round($x.f, digits: 1.5) as r }
+}
+
+--- expect error: T7: `round`'s `digits` is an I64, I32 or U32, got F64

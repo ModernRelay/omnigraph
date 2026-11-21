@@ -92,49 +92,19 @@ pub(super) fn check_split_returns(
                     })
                 }
                 (IRExpr::Aggregate { .. }, _) => false,
-                (
-                    IRExpr::Binary {
-                        left,
-                        op,
-                        right,
-                        ty,
-                    },
-                    IRExpr::Binary {
-                        left: actual_left,
-                        op: actual_op,
-                        right: actual_right,
-                        ty: actual_ty,
-                    },
-                ) => {
-                    pending.extend([
-                        (left.as_ref(), actual_left.as_ref()),
-                        (right.as_ref(), actual_right.as_ref()),
-                    ]);
-                    op == actual_op && ty == actual_ty
+                // Any other node keeps its head (operator, function, types)
+                // and its children pair up, under any operator: unary `-`
+                // and a call (`coalesce(sum(…), 0)`) as arithmetic.
+                _ if contains_aggregate(expected) => {
+                    let (want, got) = (expected.children(), actual.children());
+                    if expected.head() == actual.head() && want.len() == got.len() {
+                        pending.extend(want.into_iter().zip(got));
+                        true
+                    } else {
+                        false
+                    }
                 }
-                (IRExpr::Not(inner, ty), IRExpr::Not(actual_inner, actual_ty))
-                | (
-                    IRExpr::Cast { expr: inner, ty },
-                    IRExpr::Cast {
-                        expr: actual_inner,
-                        ty: actual_ty,
-                    },
-                ) => {
-                    pending.push((inner, actual_inner));
-                    ty == actual_ty
-                }
-                (
-                    IRExpr::IsNull { expr, negated, ty },
-                    IRExpr::IsNull {
-                        expr: actual_expr,
-                        negated: actual_negated,
-                        ty: actual_ty,
-                    },
-                ) => {
-                    pending.push((expr, actual_expr));
-                    negated == actual_negated && ty == actual_ty
-                }
-                _ => expected == actual && !contains_aggregate(expected),
+                _ => expected == actual,
             };
             if !same {
                 return Err(mismatch(

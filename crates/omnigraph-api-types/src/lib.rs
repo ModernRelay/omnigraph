@@ -11,10 +11,10 @@ use omnigraph::loader::{LoadExecuted, LoadMode, LoadOperatorExecuted, LoadReceip
 use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::query::ast::Param;
+use omnigraph_compiler::query::file::Param;
 use omnigraph_compiler::result::{QueryResult, Ranking, SearchFunction as ResultSearchFunction};
 use omnigraph_compiler::settings::{
-    ChangeLineage, Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
+    ChangeLineage, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
 };
 use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
@@ -168,10 +168,6 @@ pub mod query_file_refusals {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct SettingsRequest {
-    /// `engine`: `v1` or `v2`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(schema_with = engine_schema)]
-    pub engine: Option<Engine>,
     /// `merge_lineage`: `off`, `on` or `verify`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = merge_lineage_schema)]
@@ -191,6 +187,21 @@ pub struct SettingsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(schema_with = traversal_work_limit_schema)]
     pub traversal_work_limit: Option<i64>,
+    /// `read_work_limit`: how much work one read may do, the results its
+    /// expansions and joins produce, the pairs a product forms, the
+    /// neighbors a hop range examines and the tokens and term comparisons
+    /// of its exact lexical scans, at least `1`; an `i64` like
+    /// `traversal_work_limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = read_work_limit_schema)]
+    pub read_work_limit: Option<i64>,
+    /// `plan_budget_limit`: the largest plan budget a declaration may
+    /// declare with `@budget(plan = n)`, at least `1`; an `i64` like
+    /// `traversal_work_limit`. A served request may lower it, never raise
+    /// it past the server's ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(schema_with = plan_budget_limit_schema)]
+    pub plan_budget_limit: Option<i64>,
     /// `write_max_bytes`: independent row-data and Blob-payload allowances, at
     /// least `1`; a value raised above the default is held in memory as one
     /// typed batch at commit.
@@ -221,12 +232,6 @@ impl SettingsRequest {
     /// a session applies with source `request`.
     pub fn assignments(&self) -> Vec<(SettingId, SettingValue)> {
         let mut assignments = Vec::new();
-        if let Some(engine) = self.engine {
-            assignments.push((
-                SettingId::Engine,
-                SettingValue::Ident(engine.as_str().to_string()),
-            ));
-        }
         if let Some(merge_lineage) = self.merge_lineage {
             assignments.push((
                 SettingId::MergeLineage,
@@ -244,6 +249,12 @@ impl SettingsRequest {
         }
         if let Some(limit) = self.traversal_work_limit {
             assignments.push((SettingId::TraversalWorkLimit, SettingValue::Integer(limit)));
+        }
+        if let Some(limit) = self.read_work_limit {
+            assignments.push((SettingId::ReadWorkLimit, SettingValue::Integer(limit)));
+        }
+        if let Some(limit) = self.plan_budget_limit {
+            assignments.push((SettingId::PlanBudgetLimit, SettingValue::Integer(limit)));
         }
         if let Some(bytes) = self.write_max_bytes {
             assignments.push((SettingId::WriteMaxBytes, SettingValue::Integer(bytes)));
@@ -280,10 +291,6 @@ fn setting_schema(id: SettingId) -> utoipa::openapi::schema::Object {
     }
 }
 
-fn engine_schema() -> utoipa::openapi::schema::Object {
-    setting_schema(SettingId::Engine)
-}
-
 fn merge_lineage_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::MergeLineage)
 }
@@ -298,6 +305,14 @@ fn ann_nprobes_schema() -> utoipa::openapi::schema::Object {
 
 fn traversal_work_limit_schema() -> utoipa::openapi::schema::Object {
     setting_schema(SettingId::TraversalWorkLimit)
+}
+
+fn read_work_limit_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::ReadWorkLimit)
+}
+
+fn plan_budget_limit_schema() -> utoipa::openapi::schema::Object {
+    setting_schema(SettingId::PlanBudgetLimit)
 }
 
 fn write_max_bytes_schema() -> utoipa::openapi::schema::Object {
@@ -321,15 +336,23 @@ fn history_release_bytes_schema() -> utoipa::openapi::schema::Object {
 #[schema(as = LoadMode)]
 #[allow(dead_code)]
 enum LoadModeSchema {
-    /// Overwrite existing data.
+    /// Creates every record; a record whose key exists fails the load with
+    /// `key_conflict` and nothing publishes. `append` is refused with this
+    /// mode as its fix.
+    #[schema(rename = "insert")]
+    Insert,
+    /// Creates a record whose key is absent; on an existing key sets the
+    /// properties the record names and keeps the others.
+    #[schema(rename = "upsert")]
+    Upsert,
+    /// Creates a record whose key is absent; on an existing key writes the
+    /// whole row, a property the record omits becoming null. `merge` is
+    /// refused with this mode as its fix.
+    #[schema(rename = "replace")]
+    Replace,
+    /// Each type the batch holds becomes exactly the batch's rows of it.
     #[schema(rename = "overwrite")]
     Overwrite,
-    /// Append to existing data.
-    #[schema(rename = "append")]
-    Append,
-    /// Merge by id key (upsert).
-    #[schema(rename = "merge")]
-    Merge,
 }
 
 /// Logical graph entity namespace.
@@ -410,6 +433,7 @@ pub struct SnapshotOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BranchCreateRequest {
     /// Parent branch to fork from; the new branch starts at its head.
     /// Mutually exclusive with `from_commit`. Defaults to `main`.
@@ -496,6 +520,7 @@ pub struct BranchDeleteOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BranchMergeRequest {
     /// Source branch whose commits will be merged.
     pub source: String,
@@ -1219,8 +1244,7 @@ pub struct CommitChangesQuery {
     pub op: Vec<ChangeOp>,
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
-    /// Values are validated as session settings; `engine` does not change
-    /// change-feed execution.
+    /// Values are validated as session settings.
     #[serde(default)]
     pub set: Vec<String>,
 }
@@ -1349,14 +1373,14 @@ pub struct ChangeFeedQuery {
     pub op: Vec<ChangeOp>,
     /// Repeatable session setting, `name=value` in GQ spelling
     /// (`set=merge_lineage=off`); only `request`-scope settings are accepted.
-    /// Values are validated as session settings; `engine` does not change
-    /// change-feed execution.
+    /// Values are validated as session settings.
     #[serde(default)]
     pub set: Vec<String>,
 }
 
 /// Body for the change baseline handshake.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeBaselineRequest {
     /// Branch to capture. Defaults to `main`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1449,7 +1473,7 @@ pub struct QueryRequest {
     /// It requires the load's `change` permission before probing source metadata,
     /// reads no payload byte, and publishes nothing.
     #[schema(
-        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+        example = "query get_person($name: String) {\n    match { $p: Person }\n    where $p.name = $name\n    return { $p.name, $p.age }\n}"
     )]
     pub query: String,
     /// Name of the query to run when `query` declares multiple. Optional when
@@ -1770,12 +1794,13 @@ pub fn parse_blob_if_match<'a>(
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ChangeRequest {
-    /// GQ mutation source containing `insert`, `update`, or `delete` statements.
+    /// GQ mutation source containing `insert`, `upsert`, `replace`, `update` or
+    /// `delete` statements.
     /// May declare multiple named mutations; pick one with `name`. May instead
     /// be one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),
     /// sent with no `name`, `params`, or `branch`.
     #[schema(
-        example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
+        example = "query insert_person($name: String, $age: I32) {\n    replace Person { name: $name, age: $age }\n}"
     )]
     pub query: String,
     /// Name of the mutation to run when `query` declares multiple.
@@ -1796,6 +1821,7 @@ pub struct ChangeRequest {
 /// named in the path. The query source and name come from the registry,
 /// never the body; only the runtime inputs are supplied here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InvokeStoredQueryRequest {
     /// JSON object whose keys match the stored query's declared parameters.
     #[serde(default)]
@@ -1864,8 +1890,29 @@ pub struct ParamDescriptor {
     /// Dimension when `kind == vector`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_dim: Option<u32>,
-    /// `false` → the caller must supply it; `true` → optional.
+    /// Whether the parameter admits null.
     pub nullable: bool,
+    /// The declared default, the value an omitted parameter binds. A
+    /// parameter with neither `nullable` nor a `default` is required. The
+    /// key is absent when no default is declared and `null` when the
+    /// declared default is `null`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_value"
+    )]
+    #[schema(value_type = Option<Value>)]
+    pub default: Option<Value>,
+}
+
+/// A field whose presence carries meaning: present, whatever its value
+/// (`null` included), is `Some`; with `#[serde(default)]`, absent is
+/// `None`. Plain `Option<Value>` reads a present `null` as absent.
+pub fn present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// One entry in the stored-query catalog (`GET /queries`).
@@ -1884,11 +1931,32 @@ pub struct QueryCatalogEntry {
     pub params: Vec<ParamDescriptor>,
 }
 
+/// A stored query the server does not serve: its source fails to compile
+/// under the server's release. The graph stays served; invoking this query
+/// answers `stored_query_unavailable` with the same diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UnavailableQueryOutput {
+    /// Registry key / invoke path segment (`POST /queries/{name}`).
+    pub name: String,
+    /// The refusal's one-line rendering.
+    pub error: String,
+    /// The compiler's refusal: its code, position, fix and byte-range
+    /// edits against the stored source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<DiagnosticOutput>,
+}
+
 /// Response for `GET /queries`: every stored query in a graph's
-/// registry, each with typed parameters.
+/// registry, each with typed parameters, and every stored query the server
+/// does not serve because its source fails to compile, each with its
+/// refusal.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueriesCatalogOutput {
     pub queries: Vec<QueryCatalogEntry>,
+    /// Stored queries that fail to compile under this server's release,
+    /// by name; absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<UnavailableQueryOutput>,
 }
 
 /// Total map from a resolved scalar to its catalog kind. Exhaustive on
@@ -1907,7 +1975,35 @@ fn scalar_kind(scalar: ScalarType) -> ParamKind {
     }
 }
 
+/// A literal as the JSON value a caller passes for it: a date or datetime
+/// as its text, an integer as a number when it fits one exactly.
+pub fn literal_json(literal: &omnigraph_compiler::query::value::Literal) -> Value {
+    use omnigraph_compiler::query::value::Literal;
+    match literal {
+        Literal::Null => Value::Null,
+        Literal::String(text) | Literal::Date(text) | Literal::DateTime(text) => {
+            Value::String(text.clone())
+        }
+        Literal::Integer(n) => i64::try_from(*n)
+            .map(Value::from)
+            .or_else(|_| u64::try_from(*n).map(Value::from))
+            .unwrap_or_else(|_| Value::String(n.to_string())),
+        Literal::Float(f) => serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number),
+        Literal::Bool(b) => Value::Bool(*b),
+        Literal::List(items) => Value::Array(items.iter().map(literal_json).collect()),
+    }
+}
+
 pub fn param_descriptor(param: &Param) -> ParamDescriptor {
+    let default = param.default.as_ref().map(literal_json);
+    let descriptor = param_descriptor_kind(param);
+    ParamDescriptor {
+        default,
+        ..descriptor
+    }
+}
+
+fn param_descriptor_kind(param: &Param) -> ParamDescriptor {
     match PropType::from_param_type_name(&param.type_name, param.nullable) {
         Some(pt) if pt.list => ParamDescriptor {
             name: param.name.clone(),
@@ -1915,6 +2011,7 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
             item_kind: Some(scalar_kind(pt.scalar)),
             vector_dim: None,
             nullable: param.nullable,
+            default: None,
         },
         Some(pt) => {
             let (kind, vector_dim) = match pt.scalar {
@@ -1927,6 +2024,7 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
                 item_kind: None,
                 vector_dim,
                 nullable: param.nullable,
+                default: None,
             }
         }
         // Unreachable for a parsed query (every declared param type is
@@ -1938,6 +2036,7 @@ pub fn param_descriptor(param: &Param) -> ParamDescriptor {
             item_kind: None,
             vector_dim: None,
             nullable: param.nullable,
+            default: None,
         },
     }
 }
@@ -1951,6 +2050,49 @@ pub struct SchemaApplyOutput {
     pub graph_manifest_version: u64,
     #[schema(value_type = Vec<Value>)]
     pub steps: Vec<SchemaMigrationStep>,
+    /// The stored constructs a binary before this release refuses: after
+    /// this apply such a binary refuses the whole graph. Absent when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_way_constructs: Vec<OneWayConstructOutput>,
+    /// The consequence of `one_way_constructs`, present with them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_way_note: Option<String>,
+}
+
+/// A schema construct that a binary before this release refuses once a graph
+/// stores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct OneWayConstructOutput {
+    /// The construct's stable name, such as `vector_distance`.
+    pub construct: String,
+    pub description: String,
+    pub type_name: String,
+    pub property: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl From<omnigraph_compiler::schema::one_way::OneWayConstruct> for OneWayConstructOutput {
+    fn from(c: omnigraph_compiler::schema::one_way::OneWayConstruct) -> Self {
+        Self {
+            construct: c.construct,
+            description: c.description,
+            type_name: c.type_name,
+            property: c.property,
+            line: c.line,
+            column: c.column,
+        }
+    }
+}
+
+/// The two report fields of a set of one-way constructs: the constructs and,
+/// when there is one, the note.
+pub fn one_way_report(
+    constructs: Vec<omnigraph_compiler::schema::one_way::OneWayConstruct>,
+) -> (Vec<OneWayConstructOutput>, Option<String>) {
+    let note = (!constructs.is_empty())
+        .then(|| omnigraph_compiler::schema::one_way::ONE_WAY_NOTE.to_string());
+    (constructs.into_iter().map(Into::into).collect(), note)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1991,6 +2133,7 @@ impl From<omnigraph_compiler::SystemColumns> for SystemColumnsOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestRequest {
     /// Target branch. Defaults to `main`. Without `from`, the branch must
     /// already exist — a missing branch is a 404, never an implicit fork.
@@ -1999,7 +2142,9 @@ pub struct IngestRequest {
     /// creation is opt-in by presence of this field; omit it to require an
     /// existing branch.
     pub from: Option<String>,
-    /// How existing entities are handled. Defaults to `merge`.
+    /// What a record does to an existing key: `insert`, `upsert`, `replace`
+    /// or `overwrite`. Defaults to `replace`; `append` and `merge` are
+    /// refused with `insert` and `replace` as their fixes.
     #[schema(value_type = Option<LoadModeSchema>)]
     pub mode: Option<LoadMode>,
     /// NDJSON payload: one record per line, each shaped
@@ -2018,7 +2163,9 @@ pub struct GraphBatchLoadQuery {
     pub branch: Option<String>,
     /// Parent branch used to create a missing target branch.
     pub from: Option<String>,
-    /// How existing entities are handled. Defaults to `merge`.
+    /// What a record does to an existing key: `insert`, `upsert`, `replace`
+    /// or `overwrite`. Defaults to `replace`; `append` and `merge` are
+    /// refused with `insert` and `replace` as their fixes.
     #[param(value_type = Option<LoadModeSchema>)]
     pub mode: Option<LoadMode>,
 }
@@ -2332,6 +2479,10 @@ pub struct HealthOutput {
     pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
+    /// The query language this server compiles, `gq3`. A server before the
+    /// GQ 3 break omits the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_language: Option<String>,
 }
 
 /// The readiness witness of one replica (`GET /readyz`, RFC 0049): whether
@@ -2361,6 +2512,11 @@ pub struct ReadinessOutput {
     pub loading_graph_count: usize,
     /// Unavailable graphs outside startup, including closed transitions.
     pub blocked_graph_count: usize,
+    /// Stored queries of served graphs that fail to compile under this
+    /// release and are unavailable; `GET /graphs` names them with their
+    /// refusals.
+    #[serde(default)]
+    pub unavailable_query_count: usize,
     /// The bound on graceful shutdown, after which the process exits 2.
     pub shutdown_grace_seconds: u64,
 }
@@ -2492,6 +2648,10 @@ error_codes! {
     /// A known graph is not being served. The request did not start, so it
     /// may be retried once the graph is served again.
     GraphUnavailable = "graph_unavailable", [503];
+    /// The stored query's source fails to compile under this server's
+    /// release, so the server does not serve it; see `diagnostic`. Nothing
+    /// ran. The operator applies a rewritten registry.
+    StoredQueryUnavailable = "stored_query_unavailable", [409];
     /// The server failed. An error before any write took no effect; see the
     /// server log.
     Internal = "internal", [500];
@@ -2576,6 +2736,7 @@ impl ErrorCode {
             | Self::WriterFenced
             | Self::ExternalBlobSource
             | Self::ChangeFeedGap
+            | Self::StoredQueryUnavailable
             | Self::Internal => DispositionAction::Refresh,
         }
     }
@@ -2777,17 +2938,6 @@ pub struct FullTextIndexRebuildRequiredOutput {
     pub reason: String,
 }
 
-/// A full-text call read a declared full-text index that has no segment at
-/// the query's snapshot (HTTP 409), so no segment carries its analyzer. This
-/// is not a retryable conflict: an operator builds the branch's index
-/// (`omnigraph index build --branch <branch>`). Historical snapshots stay
-/// unchanged.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct FullTextIndexRequiredOutput {
-    /// The index's property as `Type.property`.
-    pub index: String,
-}
-
 /// A source position: 1-based line and column (in characters) and the byte
 /// offset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -2829,8 +2979,13 @@ pub struct SuggestionOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DiagnosticOutput {
     pub code: String,
+    /// Where the refused construct starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<PositionOutput>,
+    /// Where the refused construct ends (exclusive): with `position`, its
+    /// span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<PositionOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2840,17 +2995,42 @@ pub struct DiagnosticOutput {
     pub fix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<SuggestionOutput>,
+    /// Other source spans the refusal names: the first declaration of a
+    /// name a later one repeats.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedSpanOutput>,
+    /// The independent refusals the same compile pass found after this one,
+    /// in source order, each with its span and fix; each carries no further
+    /// list of its own. Applying every machine-applicable suggestion of this
+    /// diagnostic and its further ones at once is one repair pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(no_recursion)]
+    pub further: Vec<DiagnosticOutput>,
+}
+
+/// Another source span a refusal names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RelatedSpanOutput {
+    pub position: PositionOutput,
+    pub end: PositionOutput,
+    /// What stands there.
+    pub message: String,
+}
+
+fn position_output(at: omnigraph_compiler::Position) -> PositionOutput {
+    PositionOutput {
+        line: at.line,
+        column: at.column,
+        byte: at.byte,
+    }
 }
 
 impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
     fn from(diagnostic: &omnigraph_compiler::QueryDiagnostic) -> Self {
         Self {
             code: diagnostic.code.as_str().to_string(),
-            position: diagnostic.position.map(|at| PositionOutput {
-                line: at.line,
-                column: at.column,
-                byte: at.byte,
-            }),
+            position: diagnostic.position.map(position_output),
+            end: diagnostic.end.map(position_output),
             stage: diagnostic
                 .stage
                 .as_ref()
@@ -2883,6 +3063,16 @@ impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
                         })
                         .collect(),
                 }),
+            related: diagnostic
+                .related()
+                .iter()
+                .map(|r| RelatedSpanOutput {
+                    position: position_output(r.position),
+                    end: position_output(r.end),
+                    message: r.message.clone(),
+                })
+                .collect(),
+            further: diagnostic.further().iter().map(Self::from).collect(),
         }
     }
 }
@@ -3002,11 +3192,6 @@ pub struct ErrorOutput {
     /// preserves the closed [`ErrorCode`] contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_index_rebuild_required: Option<FullTextIndexRebuildRequiredOutput>,
-    /// Set with HTTP 409 when a full-text call reads a declared index that
-    /// has no segment at the query's snapshot. Building the index clears it;
-    /// retrying does not.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub full_text_index_required: Option<FullTextIndexRequiredOutput>,
     /// Set for a refused query: the diagnostics contract's code, position or
     /// stage, expectation and fix. `error` keeps the one-line rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3049,7 +3234,6 @@ impl ErrorOutput {
             change_diff_refusal: None,
             branch_start_refusal: None,
             full_text_index_rebuild_required: None,
-            full_text_index_required: None,
             diagnostic: None,
         }
     }
@@ -3085,6 +3269,7 @@ pub fn snapshot_payload(
 }
 
 pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyOutput {
+    let (one_way_constructs, one_way_note) = one_way_report(result.one_way_constructs);
     SchemaApplyOutput {
         uri: uri.to_string(),
         supported: result.supported,
@@ -3092,6 +3277,8 @@ pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyO
         step_count: result.steps.len(),
         graph_manifest_version: result.graph_manifest_version,
         steps: result.steps,
+        one_way_constructs,
+        one_way_note,
     }
 }
 
@@ -3697,6 +3884,11 @@ pub struct GraphInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<GraphStartupFailure>,
     pub action: GraphAvailabilityAction,
+    /// Stored queries of a served graph that fail to compile under this
+    /// server's release, each with its refusal; the graph serves every
+    /// other query. Absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_queries: Vec<UnavailableQueryOutput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -3768,6 +3960,40 @@ pub struct GraphDiscoveryOutput {
 
 #[cfg(test)]
 mod tests {
+    /// A declared `null` default and no default are different parameters:
+    /// the first may be omitted and binds null, the second (when not
+    /// nullable) is required. The catalog keeps them apart on the wire.
+    #[test]
+    fn a_null_default_survives_the_wire_apart_from_no_default() {
+        use super::{ParamDescriptor, ParamKind};
+        let param = |default| ParamDescriptor {
+            name: "x".into(),
+            kind: ParamKind::Int,
+            item_kind: None,
+            vector_dim: None,
+            nullable: true,
+            default,
+        };
+        for (default, wire) in [
+            (
+                Some(serde_json::Value::Null),
+                r#"{"name":"x","kind":"int","nullable":true,"default":null}"#,
+            ),
+            (
+                Some(serde_json::json!(3)),
+                r#"{"name":"x","kind":"int","nullable":true,"default":3}"#,
+            ),
+            (None, r#"{"name":"x","kind":"int","nullable":true}"#),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&param(default.clone())).unwrap(),
+                wire
+            );
+            let read: ParamDescriptor = serde_json::from_str(wire).unwrap();
+            assert_eq!(read.default, default, "{wire}");
+        }
+    }
+
     /// Every code says what it means and whether a server sends it, under
     /// which status; one that no HTTP response carries names the surface that
     /// sends it. The published enum lists every code once, in its wire
@@ -4086,18 +4312,19 @@ mod tests {
             .map(|spec| spec.name)
             .collect();
         let populated = SettingsRequest {
-            engine: Some(Engine::V2),
             merge_lineage: Some(MergeLineage::Off),
             change_lineage: Some(ChangeLineage::Off),
             ann_nprobes: Some(7),
             traversal_work_limit: Some(123),
+            read_work_limit: Some(456),
+            plan_budget_limit: Some(789),
             write_max_bytes: Some(4093),
             load_source_max_bytes: Some(8186),
             query_memory_bytes: Some(524288),
             history_release_bytes: Some(2048),
         };
         let expected = format!(
-            "{{\"{}\":\"v2\",\"{}\":\"off\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":4093,\"{}\":8186,\"{}\":524288,\"{}\":2048}}",
+            "{{\"{}\":\"off\",\"{}\":\"off\",\"{}\":7,\"{}\":123,\"{}\":456,\"{}\":789,\"{}\":4093,\"{}\":8186,\"{}\":524288,\"{}\":2048}}",
             request_rows[0],
             request_rows[1],
             request_rows[2],
@@ -4106,9 +4333,10 @@ mod tests {
             request_rows[5],
             request_rows[6],
             request_rows[7],
-            request_rows[8]
+            request_rows[8],
+            request_rows[9]
         );
-        assert_eq!(request_rows.len(), 9);
+        assert_eq!(request_rows.len(), 10);
         assert_eq!(serde_json::to_string(&populated).unwrap(), expected);
         assert_eq!(
             populated

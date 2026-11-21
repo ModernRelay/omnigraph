@@ -116,8 +116,10 @@ impl PhysicalExpr for GqProjectionExpr {
     /// of whether the input happens to contain any rows.
     fn return_field(&self, input_schema: &Schema) -> DfResult<FieldRef> {
         let field = match &self.projected {
+            // Null on a row an `optional` kept without a match, which
+            // `count($v)` does not count.
             Projected::Identity(variable) => {
-                Field::new(variable, arrow_schema::DataType::Utf8, false)
+                Field::new(variable, arrow_schema::DataType::Utf8, true)
             }
             Projected::Expression(_, ty) => {
                 self.ctx.declared_field(&self.text, ty).map_err(external)?

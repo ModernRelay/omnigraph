@@ -168,6 +168,134 @@ impl GroupsAccumulator for ExactGroupsAccumulator {
     }
 }
 
+/// `avg` over an integer argument: an exact total in the carrier and a row
+/// count, divided once when the group is emitted. Accumulating in `F64` made
+/// the mean depend on the order rows were summed in; this total does not.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(super) struct ExactIntegerAvgUdaf {
+    signature: Signature,
+    result: DataType,
+}
+
+impl ExactIntegerAvgUdaf {
+    pub(super) fn new(result: DataType) -> Self {
+        Self {
+            signature: Signature::exact(vec![EXACT_CARRIER], Volatility::Immutable),
+            result,
+        }
+    }
+}
+
+impl AggregateUDFImpl for ExactIntegerAvgUdaf {
+    fn name(&self) -> &str {
+        "exact_integer_avg"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(self.result.clone())
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        Ok(vec![
+            Arc::new(Field::new(
+                format!("{}[sum]", args.name),
+                EXACT_CARRIER,
+                true,
+            )),
+            Arc::new(Field::new(
+                format!("{}[count]", args.name),
+                DataType::UInt64,
+                true,
+            )),
+        ])
+    }
+
+    fn accumulator(&self, _: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(ExactAvgAccumulator {
+            sum: 0,
+            count: 0,
+            result: self.result.clone(),
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct ExactAvgAccumulator {
+    sum: i128,
+    count: u64,
+    result: DataType,
+}
+
+impl ExactAvgAccumulator {
+    fn add(&mut self, sum: i128, count: u64) -> Result<()> {
+        self.sum = self.sum.checked_add(sum).ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "`avg` total overflowed its exact integer carrier".into(),
+            )
+        })?;
+        self.count += count;
+        Ok(())
+    }
+}
+
+fn decimals(array: &ArrayRef) -> Result<&arrow_array::Decimal128Array> {
+    array
+        .as_any()
+        .downcast_ref::<arrow_array::Decimal128Array>()
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "`avg` over an integer reads its exact carrier".into(),
+            )
+        })
+}
+
+impl Accumulator for ExactAvgAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        for value in decimals(&values[0])?.iter().flatten() {
+            self.add(value, 1)?;
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let mean = (self.count > 0).then(|| self.sum as f64 / self.count as f64);
+        ScalarValue::Float64(mean).cast_to(&self.result)
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        Ok(vec![
+            ScalarValue::Decimal128(Some(self.sum), 38, 0),
+            ScalarValue::UInt64(Some(self.count)),
+        ])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        let sums = decimals(&states[0])?;
+        let counts = states[1]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "`avg` state holds its row count".into(),
+                )
+            })?;
+        for (sum, count) in sums.iter().zip(counts.iter()) {
+            if let (Some(sum), Some(count)) = (sum, count) {
+                self.add(sum, count)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

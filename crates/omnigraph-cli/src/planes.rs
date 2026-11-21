@@ -103,7 +103,7 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
             catalogue: false,
         },
         Command::Lint(args) => {
-            if args.schema.is_some() {
+            if args.schema.is_some() || args.config.is_some() {
                 Local
             } else {
                 Graph {
@@ -772,7 +772,7 @@ mod tests {
 
         let cases: &[(&[&str], bool)] = &[
             (&["mutate", "-e", "q"], true),
-            (&["load", "--data", "d.jsonl", "--mode", "append"], true),
+            (&["load", "--data", "d.jsonl", "--mode", "insert"], true),
             (&["rebuild-full-text-indexes"], true),
             (&["index", "build"], true),
             (&["index", "rebuild", "--kind", "full-text"], true),

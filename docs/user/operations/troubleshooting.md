@@ -33,7 +33,7 @@ for `not_retained`.
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
 | 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
 | 408 | The request body did not arrive before its deadline (`request_timeout`) | Send the request again; nothing was admitted |
-| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, a branch whose writer epoch refuses the writing process (`writer_fenced`), or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable |
+| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, a branch whose writer epoch refuses the writing process (`writer_fenced`), a commit no branch can start at (`branch_start_refusal`), or a stored query whose source fails to compile under this release (`stored_query_unavailable`, with its `diagnostic`) | Inspect structured details; not every conflict is retryable; rewrite an unavailable stored query from its fix |
 | 410 | Required change-feed history was reclaimed, or the commit a branch start names (`branch_start_refusal`, `not_retained`) | Capture and durably install a new baseline, then resume from its terminal cursor; start the branch at a retained commit |
 | 412 | Blob entity-tag or graph-commit precondition failed (`precondition_failed`), or `Omnigraph-If-Actor` named another actor than the credential (`actor_mismatch`) | For `precondition_failed`, refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit. For `actor_mismatch` nothing ran: use the named actor's credential or correct the header; retrying unchanged fails again |
 | 413 | Request or operation exceeded a bounded resource limit (`payload_too_large`) | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
@@ -68,10 +68,12 @@ available, `actual`. A change-feed `410` includes `change_feed_gap`; retrying
 the same cursor cannot recover its missing history.
 
 A `400` that refuses a query includes `diagnostic`: the stable code (`Q…`
-parse, `T…` typecheck), `position` (`line`, `column`, `byte`) for a parse
-refusal or `stage` (and `expression` when known) for a later one, `expected`,
-and `fix` when one exists. Act on the fix; a retry of the same source fails
-the same way. See [Diagnostics](../queries/diagnostics.md).
+parse, `T…` typecheck), `position` and `end` (`line`, `column`, `byte`) of
+the refused text, `stage` (and `expression` when known) for a refusal after
+parsing, `expected`, and `fix` when one exists; `further` holds the other
+refusals of the same compile, each in the same shape. Act on the fixes; a
+retry of the same source fails the same way. See
+[Diagnostics](../queries/diagnostics.md).
 
 ## Failed data-write commands
 
@@ -188,15 +190,10 @@ A `409` is not one universal retry signal:
   merging again.
 - A full-text incompatibility includes
   `full_text_index_rebuild_required: { "index": "…", "reason": "…" }` with
-  `code: "conflict"`. This condition persists until an operator rebuilds the
-  affected branch's indexes; do not automatically retry the same query. Follow
-  the [full-text upgrade procedure](upgrade.md#full-text-index-upgrade).
-- A full-text index with no part at the query's snapshot includes
-  `full_text_index_required: { "index": "Type.property" }` with
-  `code: "conflict"`. It persists until the branch's index is built
-  (`omnigraph index build --target <target> --branch <branch>`); do not retry
-  the same query. See
-  [Search indexes](../search/index.md#indexes).
+  `code: "conflict"`. Only a raw `contains_tokens` scan filter reads a
+  full-text index; no GQ query does. The condition persists until an operator
+  rebuilds the affected branch's indexes; do not automatically retry the same
+  read. Follow the [full-text upgrade procedure](upgrade.md#full-text-index-upgrade).
 - “Already initialized” means the target already contains a graph. Choose a new
   root or deliberately use the command's destructive option when appropriate.
 - `code: "writer_fenced"` means the branch's [writer epoch](#writer-epoch)
@@ -272,7 +269,9 @@ between graph roots.
   query, and policy resources come from applied state. Submit configuration
   changes with `cluster apply --target` for live activation.
 - By default one graph that cannot open is quarantined while healthy graphs
-  serve. Use `--require-all-graphs` when partial startup is unacceptable.
+  serve, and a stored query that fails to compile makes only itself unavailable
+  (`OMNIGRAPH_STRICT_STORED_QUERIES=1` quarantines its graph instead). Use
+  `--require-all-graphs` when partial startup is unacceptable.
 - `external_blob_base_overlaps_storage_root`: an `external_blobs` base lies
   inside, or contains, the cluster storage root that holds every graph and the
   applied state. For a new declaration, move the base to a sibling prefix before

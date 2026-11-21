@@ -7,30 +7,33 @@
 
 use std::cmp::Ordering;
 
-use crate::query::ast::{BinaryOp, CompOp, Literal};
+use crate::query::value::{BinaryOp, CompOp, Literal};
 
 use super::IRExpr;
 use crate::types::{ExprType, PropType, ScalarType};
 
 /// `left <op> right`, folded when both operands are literals.
 pub(super) fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> IRExpr {
-    if let (IRExpr::Literal(l, _), IRExpr::Literal(r, _)) = (&left, &right)
-        && let Some(value) = evaluate(op, l, r)
-    {
-        return IRExpr::Literal(
-            value,
-            ExprType::from_prop(&PropType::scalar(
-                ScalarType::Bool,
-                left.ty().nullable() || right.ty().nullable(),
-            )),
-        );
-    }
-    IRExpr::binary(left, op, right)
+    crate::stack::deep(|| {
+        if let (IRExpr::Literal(l, _), IRExpr::Literal(r, _)) = (&left, &right)
+            && !matches!(op, BinaryOp::Arith(_))
+            && let Some(value) = evaluate(op, l, r)
+        {
+            return IRExpr::Literal(
+                value,
+                ExprType::from_prop(&PropType::scalar(
+                    ScalarType::Bool,
+                    left.ty().nullable() || right.ty().nullable(),
+                )),
+            );
+        }
+        IRExpr::binary(left, op, right)
+    })
 }
 
 /// `not <inner>`, folded over a Boolean or null literal.
-pub(super) fn not(inner: IRExpr) -> IRExpr {
-    match inner {
+pub(crate) fn not(inner: IRExpr) -> IRExpr {
+    match &inner {
         IRExpr::Literal(Literal::Bool(value), ty) => IRExpr::Literal(
             Literal::Bool(!value),
             ExprType::from_prop(&PropType::scalar(ScalarType::Bool, ty.nullable())),
@@ -39,18 +42,18 @@ pub(super) fn not(inner: IRExpr) -> IRExpr {
             Literal::Null,
             ExprType::from_prop(&PropType::scalar(ScalarType::Bool, true)),
         ),
-        other => IRExpr::logical_not(other),
+        _ => IRExpr::logical_not(inner),
     }
 }
 
 /// `<expr> is null` / `is not null`, folded over any literal.
-pub(super) fn is_null(expr: IRExpr, negated: bool) -> IRExpr {
-    match expr {
+pub(crate) fn is_null(expr: IRExpr, negated: bool) -> IRExpr {
+    match &expr {
         IRExpr::Literal(literal, _) => IRExpr::Literal(
             Literal::Bool(matches!(literal, Literal::Null) != negated),
             ExprType::from_prop(&PropType::scalar(ScalarType::Bool, false)),
         ),
-        other => IRExpr::null_test(other, negated),
+        _ => IRExpr::null_test(expr, negated),
     }
 }
 
@@ -62,6 +65,8 @@ pub fn evaluate(op: BinaryOp, left: &Literal, right: &Literal) -> Option<Literal
         BinaryOp::And => kleene(left, right, false),
         BinaryOp::Or => kleene(left, right, true),
         BinaryOp::Compare(op) => compare(op, left, right),
+        // Arithmetic can refuse a row; its failure keeps its place (A3).
+        BinaryOp::Arith(_) => None,
     }
 }
 
@@ -83,7 +88,8 @@ fn kleene(left: &Literal, right: &Literal, absorbing: bool) -> Option<Literal> {
 
 /// A comparison with a null operand is null; list membership compares each
 /// element by `=`, lists compare by equality only, numbers across `Integer`
-/// and `Float`, floats in Arrow's total order.
+/// and `Float`, floats by IEEE comparison, so `-0.0 = 0.0` holds as it
+/// does when the engine evaluates it.
 fn compare(op: CompOp, left: &Literal, right: &Literal) -> Option<Literal> {
     if matches!(left, Literal::Null) || matches!(right, Literal::Null) {
         return Some(Literal::Null);
@@ -126,13 +132,15 @@ fn member(items: &[Literal], needle: &Literal) -> Option<Literal> {
 }
 
 /// The order of two scalar literals; `None` where the engine's parsers decide
-/// (Date, DateTime) or no order exists.
+/// (Date, DateTime) or no order exists, a NaN included. Floats compare as the
+/// engine compares them, `-0.0` equal to `0.0`; the total order that keeps
+/// them apart is grouping's, `distinct`'s and `order`'s, never a comparison's.
 fn ordering(left: &Literal, right: &Literal) -> Option<Ordering> {
     Some(match (left, right) {
         (Literal::Integer(l), Literal::Integer(r)) => l.cmp(r),
-        (Literal::Float(l), Literal::Float(r)) => l.total_cmp(r),
-        (Literal::Integer(l), Literal::Float(r)) => (*l as f64).total_cmp(r),
-        (Literal::Float(l), Literal::Integer(r)) => l.total_cmp(&(*r as f64)),
+        (Literal::Float(l), Literal::Float(r)) => l.partial_cmp(r)?,
+        (Literal::Integer(l), Literal::Float(r)) => (*l as f64).partial_cmp(r)?,
+        (Literal::Float(l), Literal::Integer(r)) => l.partial_cmp(&(*r as f64))?,
         (Literal::String(l), Literal::String(r)) => l.cmp(r),
         (Literal::Bool(l), Literal::Bool(r)) => l.cmp(r),
         _ => return None,
@@ -215,6 +223,22 @@ mod tests {
                 t.clone(),
             ),
             (
+                compared(Literal::Float(0.0), CompOp::Eq, Literal::Float(-0.0)),
+                t.clone(),
+            ),
+            (
+                compared(Literal::Float(-0.0), CompOp::Lt, Literal::Float(0.0)),
+                f.clone(),
+            ),
+            (
+                compared(
+                    Literal::List(vec![Literal::Float(-0.0)]),
+                    CompOp::Contains,
+                    Literal::Float(0.0),
+                ),
+                t.clone(),
+            ),
+            (
                 compared(Literal::Integer(1), CompOp::Gt, Literal::Null),
                 null.clone(),
             ),
@@ -268,10 +292,10 @@ mod tests {
                 t,
             ),
         ] {
-            let IRExpr::Literal(actual, _) = expression else {
+            let IRExpr::Literal(actual, _) = &expression else {
                 panic!("expected a folded literal")
             };
-            assert_eq!(actual, expected);
+            assert_eq!(actual, &expected);
         }
     }
 

@@ -5,8 +5,9 @@ use serde_json::Value;
 
 use crate::error::CompilerError;
 use crate::ir::ParamMap;
-use crate::query::ast::{Literal, Param, QueryDecl};
+use crate::query::file::{Param, QueryDecl};
 use crate::query::parser::parse_query;
+use crate::query::value::Literal;
 use crate::types::{check_date_literal, check_datetime_literal};
 
 const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
@@ -303,9 +304,10 @@ pub fn json_params_to_param_map(
     let object = match params {
         Some(Value::Object(object)) => object,
         Some(Value::Null) | None => {
-            // Still fill in Literal::Null for declared nullable params.
+            // Still fill in Literal::Null for declared nullable params; one
+            // with a default stays omitted, and binding applies the default.
             for param in query_params {
-                if param.nullable {
+                if param.nullable && param.default.is_none() {
                     map.insert(param.name.clone(), Literal::Null);
                 }
             }
@@ -344,9 +346,10 @@ pub fn json_params_to_param_map(
         };
     }
 
-    // Fill in Literal::Null for declared nullable params that were omitted.
+    // Fill in Literal::Null for declared nullable params that were omitted
+    // and declare no default; binding applies a declared default.
     for param in query_params {
-        if param.nullable && !map.contains_key(&param.name) {
+        if param.nullable && param.default.is_none() && !map.contains_key(&param.name) {
             map.insert(param.name.clone(), Literal::Null);
         }
     }
@@ -784,7 +787,7 @@ mod tests {
     use super::{
         JsonParamMode, ToParam, find_named_query, find_read_statement, json_params_to_param_map,
     };
-    use crate::query::ast::Literal;
+    use crate::query::value::Literal;
 
     #[test]
     fn js_mode_rejects_unsafe_integer_numbers() {
@@ -1096,6 +1099,36 @@ query q($tags: [String], $days: [Date]?, $due_at: DateTime) {
         let params = json_params_to_param_map(None, &query.params, JsonParamMode::Standard)
             .expect("None params should succeed with nullable declarations");
 
+        assert!(matches!(params.get("bio"), Some(Literal::Null)));
+    }
+
+    /// A parameter with a declared default stays omitted, with or without a
+    /// parameter object, so binding applies the default; an explicit null
+    /// is kept.
+    #[test]
+    fn defaulted_params_stay_omitted_for_binding() {
+        let query = find_named_query(
+            "query q($bio: String? = \"none\", $age: I32 = -1) { match { $u: User } return { $u } }",
+            "q",
+        )
+        .expect("query");
+        assert_eq!(
+            query.params[0].default,
+            Some(Literal::String("none".to_string()))
+        );
+        assert_eq!(query.params[1].default, Some(Literal::Integer(-1)));
+        for json in [None, Some(json!({}))] {
+            let params =
+                json_params_to_param_map(json.as_ref(), &query.params, JsonParamMode::Standard)
+                    .expect("omitted defaulted params");
+            assert!(params.is_empty(), "{params:?}");
+        }
+        let params = json_params_to_param_map(
+            Some(&json!({ "bio": null })),
+            &query.params,
+            JsonParamMode::Standard,
+        )
+        .expect("an explicit null");
         assert!(matches!(params.get("bio"), Some(Literal::Null)));
     }
 }

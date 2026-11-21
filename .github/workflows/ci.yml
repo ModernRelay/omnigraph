@@ -100,8 +100,12 @@ jobs:
           for path in "${changed[@]}"; do
             case "$path" in
               docs/user/queries/catalogue.md) run_full_ci=true ;;
-              docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc|changelog.d/*.md|changelog.d/release.json) ;;
-              README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
+              # The documented query texts (a guide's `gq` blocks, the README's) are
+              # parsed by GQT's query corpus test, which `run_gqt` runs.
+              docs/rfcs/*|docs/releases/*) ;;
+              docs/*.md|README.md) run_gqt=true ;;
+              docs/*.mdx|docs/*.rst|docs/*.adoc|changelog.d/*.md|changelog.d/release.json) ;;
+              AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
               crates/omnigraph-gqt/cases/*.gqt) run_gqt=true ;;
               Dockerfile|.dockerignore|docker/*|deploy/*) run_deployment=true ;;
@@ -890,7 +894,8 @@ jobs:
 
       # The genuine predecessors of the release route (`omnigraph upgrade`,
       # storage format 8 or 9 to 14): v0.11.0 writes stamp 9 and converts a
-      # v0.10.0 graph to stamp 8. The release assets are trusted exactly as
+      # v0.10.0 graph to stamp 8. The published edge build of main before the
+      # GQ 3 break is the edition-2 binary the one-way journeys read back with. The release assets are trusted exactly as
       # the `test` job's v0.9.0 and v0.10.0 installs trust them: `install.sh`
       # verifies the archive against the `.sha256` published beside it, and
       # no digest is pinned here.
@@ -899,6 +904,7 @@ jobs:
           set -euo pipefail
           v6_dir="$RUNNER_TEMP/omnigraph-v010"
           v011_dir="$RUNNER_TEMP/omnigraph-v011"
+          edition2_dir="$RUNNER_TEMP/omnigraph-edition-2"
           # The installer downloads the official archive and verifies its
           # SHA256 before extraction. An exact VERSION never falls back to edge.
           # A failed download leaves nothing behind, so each release gets three
@@ -920,8 +926,13 @@ jobs:
           test -x "$v011_dir/omnigraph"
           [[ "$("$v011_dir/omnigraph" --version)" == "omnigraph 0.11.0" ]] \
             || { echo "::error::the release storage upgrade requires the genuine v0.11.0 CLI"; exit 1; }
+          install_release edge-20261118-fd4d61f "$edition2_dir"
+          test -x "$edition2_dir/omnigraph"
+          [[ "$("$edition2_dir/omnigraph" --version)" == "omnigraph 0.15.1-edge+fd4d61f" ]] \
+            || { echo "::error::the one-way journeys require the published edition-2 CLI"; exit 1; }
           echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
           echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_EDITION_2_RELEASE_BIN=$edition2_dir/omnigraph" >> "$GITHUB_ENV"
 
       # The genuine stamp-13 predecessor for the main-build in-place route
       # (`omnigraph upgrade`, storage format 13 to 14). Keep this immutable:
@@ -1121,6 +1132,160 @@ jobs:
             || { echo "::error::exact v5↔v10 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
             || { echo "::error::v5↔v10 format fence matched the wrong test set"; exit 1; }
+
+  cross_edition:
+    name: Cross-Edition Comparison
+    needs: classify_changes
+    # Runs wherever GQT runs (engine input or the `.gqt` corpus), since its
+    # input is the corpus and the engine both.
+    if: needs.classify_changes.outputs.run_gqt == 'true'
+    runs-on: ubuntu-latest
+    # Two runner builds share one target directory (the pinned edition-2
+    # commit's `omnigraph-gqt`, then this tree's), then every case pair runs
+    # under the deterministic simulation twice per side. Measured cold on the
+    # first hosted run (2026-11-18): the two builds 45 minutes, each
+    # comparison pass 6.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
+
+      - name: Check the cross-edition comparator
+        run: python3 scripts/cross-edition.py --self-test
+
+      # The edition-2 side: the GQT runner of the merge base with main that
+      # the GQ 3 break was measured against. Keep it immutable: the edition-2
+      # engine is what every case is compared with, and a moving reference
+      # would compare edition 3 with itself (docs/dev/test-ownership.md, Cross-edition
+      # comparison).
+      - name: Build the edition-2 GQT runner and CLI
+        env:
+          EDITION_2_SOURCE_COMMIT: 42013036b50ecfff3d63f071f32db951be9cbd54
+        run: |
+          set -euo pipefail
+          e2_source="$RUNNER_TEMP/omnigraph-edition-2"
+          e2_bin="$RUNNER_TEMP/omnigraph-gqt-edition-2"
+          e2_cli="$RUNNER_TEMP/omnigraph-edition-2-cli"
+          git fetch --no-tags --depth=1 origin "$EDITION_2_SOURCE_COMMIT"
+          git worktree add --detach "$e2_source" "$EDITION_2_SOURCE_COMMIT"
+          test "$(git -C "$e2_source" rev-parse HEAD)" = "$EDITION_2_SOURCE_COMMIT"
+          # Run inside the predecessor checkout so its workspace configuration
+          # (the `tokio_unstable` cfg the simulation needs) applies.
+          (cd "$e2_source" && cargo build --locked \
+            --package omnigraph-gqt \
+            --package omnigraph-cli \
+            --bin omnigraph-gqt \
+            --bin omnigraph \
+            --target-dir "$GITHUB_WORKSPACE/target")
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph-gqt" "$e2_bin"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$e2_cli"
+          test -x "$e2_bin"
+          test -x "$e2_cli"
+          # The two commits' path packages share names and versions; remove
+          # both identities before the current runner links.
+          cargo clean --workspace --locked \
+            --manifest-path "$e2_source/Cargo.toml" \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cargo clean --workspace --locked \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          echo "EDITION_2_SOURCE_COMMIT=$EDITION_2_SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_EDITION_2_GQT_BIN=$e2_bin" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_EDITION_2_BIN=$e2_cli" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_EDITION_2_TREE=$e2_source" >> "$GITHUB_ENV"
+
+      - name: Build the current GQT runner
+        run: cargo build --locked --package omnigraph-gqt --bin omnigraph-gqt
+
+      - name: Compare every case both editions hold
+        run: |
+          set -euo pipefail
+          python3 scripts/cross-edition.py run \
+            --edition-2-runner "$OMNIGRAPH_EDITION_2_GQT_BIN" \
+            --current-runner target/debug/omnigraph-gqt \
+            --base-ref "$EDITION_2_SOURCE_COMMIT" \
+            --work "$RUNNER_TEMP/cross-edition" \
+            --jobs "$(nproc)"
+
+      # A second pass under `--measure`: store requests are deterministic
+      # under the simulation, so a step whose requests rose is a difference
+      # the table must name. Its own pass, since the measure ledger moves a
+      # concurrent block's park points.
+      - name: Compare every paired step's store requests
+        run: |
+          set -euo pipefail
+          python3 scripts/cross-edition.py run \
+            --edition-2-runner "$OMNIGRAPH_EDITION_2_GQT_BIN" \
+            --current-runner target/debug/omnigraph-gqt \
+            --base-ref "$EDITION_2_SOURCE_COMMIT" \
+            --work "$RUNNER_TEMP/cross-edition-measure" \
+            --jobs "$(nproc)" \
+            --measure
+
+      # The generated reads both editions express, run through the edition-2
+      # CLI and this tree's engine (docs/dev/test-ownership.md, Generated laws).
+      - name: Run the two-edition law
+        env:
+          OMNIGRAPH_REQUIRE_EDITION_2: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p omnigraph-gqt --test integration \
+            law_two_editions:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/two-editions.log"
+          grep -F "test law_two_editions::edition_2_and_edition_3_answer_generated_reads_alike ... ok" "$RUNNER_TEMP/two-editions.log"
+
+      # `omnigraph lint --fix`'s loop over every edition-2 text of the pinned
+      # tree: the printed fixes converge, and what they write has the typed
+      # IR of the hand rewrite in this tree or a row of
+      # crates/omnigraph-gqt/lint-fix-edition-2.tsv (docs/dev/test-ownership.md,
+      # Cross-edition comparison).
+      - name: Respell the edition-2 corpus with the printed fixes
+        env:
+          OMNIGRAPH_REQUIRE_EDITION_2: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p omnigraph-gqt --test integration \
+            fix_edition_2:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/lint-fix-edition-2.log"
+          grep -F "test fix_edition_2::printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite ... ok" "$RUNNER_TEMP/lint-fix-edition-2.log"
+
+      - name: Retain the cross-edition report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cross-edition-report
+          path: |
+            ${{ runner.temp }}/cross-edition/report.json
+            ${{ runner.temp }}/cross-edition-measure/report.json
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
 
   test_aws_feature:
     name: Test omnigraph-server --features aws
@@ -1798,7 +1963,7 @@ jobs:
   # only where the job's own `if:` was false (docs/dev/branch-protection.md).
   ci_gate:
     name: CI Gate
-    needs: [classify_changes, check_agents_md, workflow_action_pins, cargo_deny, graph_vocabulary_guard, fmt, lint, test, storage_upgrade_compatibility, test_aws_feature]
+    needs: [classify_changes, check_agents_md, workflow_action_pins, cargo_deny, graph_vocabulary_guard, fmt, lint, test, storage_upgrade_compatibility, cross_edition, test_aws_feature]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1815,4 +1980,5 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_REF: ${{ github.ref }}
           RUN_FULL_CI: ${{ needs.classify_changes.outputs.run_full_ci }}
+          RUN_GQT: ${{ needs.classify_changes.outputs.run_gqt }}
         run: python3 scripts/ci_gate.py

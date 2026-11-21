@@ -3,9 +3,9 @@
 
 use axum::body::Body;
 use axum::http::StatusCode;
+use omnigraph_server::AppState;
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
-use omnigraph_server::{AppState, ProcessDefaults};
 use serde_json::{Value, json};
 use serial_test::serial;
 
@@ -15,7 +15,7 @@ use crate::support::*;
 #[tokio::test(flavor = "multi_thread")]
 async fn stored_wildcard_keeps_both_authorization_gates_issue_659() {
     let source = r#"query neighbors() {
-        match { $p: Person { name: "Alice" } $f: Person $p * $f }
+        match { $p: Person, $f: Person, $p * $f } where $p.name = "Alice"
         return { $f.name }
     }"#;
     let (_temp, app) = app_with_stored_queries(
@@ -68,7 +68,7 @@ async fn signed_stored_invocation_requires_both_outer_and_inner_policy_permissio
         ),
         (
             "signed_insert",
-            "query signed_insert($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            "query signed_insert($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
             true,
         ),
     ]);
@@ -150,7 +150,7 @@ async fn server_boots_with_a_valid_stored_query_registry() {
     let graph = graph_path(temp.path());
     let registry = stored_query_registry(&[(
         "find_person",
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }",
         false,
     )]);
     let state = AppState::open_single_with_queries(
@@ -407,8 +407,140 @@ async fn parked_stored_invocation_requires_a_serving_transition_barrier() {
     }
 }
 
+/// A served graph whose stored query fails to compile stays served (the
+/// GQ 3 RFC, Compatibility): that query alone is unavailable. `GET /queries`
+/// lists it with its refusal (code, position, fix, byte edits), invoking it
+/// answers `stored_query_unavailable` with the same diagnostic, and the
+/// graph serves every other query.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_query_that_fails_to_compile_is_unavailable_and_the_graph_serves() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    std::fs::write(&policy_path, INVOKE_POLICY_YAML).unwrap();
+    let registry = stored_query_registry_per_query(&[
+        ("find_person", FIND_PERSON_GQ, true),
+        // A type refusal: no `Widget` in the schema.
+        (
+            "ghost",
+            "query ghost() { match { $w: Widget } return { $w.name } }",
+            true,
+        ),
+        // A parse refusal whose fix is machine-applicable: `==`, a habit
+        // the grammar refuses (`||` is an admitted spelling of `concat`).
+        (
+            "shout",
+            "query shout() { match { $p: Person } where $p.name == \"Alice\" return { $p.name } }",
+            true,
+        ),
+        // One file of three declarations, each available on its own: the
+        // one that compiles serves, the refused one carries its own
+        // diagnostic, and its caller is unavailable naming it.
+        ("fine_mate", MIXED_GQ, true),
+        ("old_mate", MIXED_GQ, true),
+        ("calls_old", MIXED_GQ, true),
+    ]);
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![("act-invoke".to_string(), "t-invoke".to_string())],
+        Some(&policy_path),
+        registry,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("the graph stays served: {err}"));
+    let app = omnigraph_server::build_app(state);
+
+    let (status, body) = json_response(&app, get_request(&g("/queries"), "t-invoke")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let served: Vec<&str> = body["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| q["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(served, ["find_person", "fine_mate"], "{body}");
+    let unavailable = body["unavailable"].as_array().expect("unavailable listed");
+    assert_eq!(unavailable.len(), 4, "{body}");
+    let old_mate = unavailable
+        .iter()
+        .find(|q| q["name"] == "old_mate")
+        .unwrap();
+    assert_eq!(old_mate["diagnostic"]["code"], "Q010", "{old_mate}");
+    assert_eq!(
+        old_mate["diagnostic"]["position"]["line"], 7,
+        "the refusal is placed in the file: {old_mate}"
+    );
+    let calls_old = unavailable
+        .iter()
+        .find(|q| q["name"] == "calls_old")
+        .unwrap();
+    assert!(calls_old["diagnostic"].is_null(), "{calls_old}");
+    assert!(
+        calls_old["error"].as_str().unwrap().contains("`old_mate`"),
+        "{calls_old}"
+    );
+    let ghost = unavailable.iter().find(|q| q["name"] == "ghost").unwrap();
+    assert!(
+        ghost["diagnostic"]["code"]
+            .as_str()
+            .unwrap()
+            .starts_with('T'),
+        "{ghost}"
+    );
+    assert!(ghost["diagnostic"]["position"]["line"].is_u64(), "{ghost}");
+    let shout = unavailable.iter().find(|q| q["name"] == "shout").unwrap();
+    assert_eq!(shout["diagnostic"]["code"], "Q014", "{shout}");
+    assert!(shout["diagnostic"]["fix"].is_string(), "{shout}");
+    assert!(
+        !shout["diagnostic"]["suggestion"]["edits"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the byte edits ride the listing: {shout}"
+    );
+    assert!(
+        shout["error"].as_str().unwrap().contains("error[Q014]"),
+        "{shout}"
+    );
+
+    // Invoking it answers the same refusal; nothing runs.
+    let (status, body) = json_response(&app, invoke_request("shout", "t-invoke", json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stored_query_unavailable", "{body}");
+    assert_eq!(body["diagnostic"], shout["diagnostic"], "{body}");
+    assert_eq!(body["disposition"]["effects"], "none", "{body}");
+
+    // The graph serves its other queries.
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({ "params": { "name": "Alice" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["row_count"], 1, "{body}");
+    // So does the declaration whose file mate is refused.
+    let (status, body) =
+        json_response(&app, invoke_request("fine_mate", "t-invoke", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["row_count"].as_u64().unwrap() > 0, "{body}");
+    let (status, body) =
+        json_response(&app, invoke_request("calls_old", "t-invoke", json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stored_query_unavailable", "{body}");
+}
+
+/// A stored-query file whose declarations compile one by one: a refused
+/// declaration (line 7) and its caller sit beside one that serves.
+const MIXED_GQ: &str = "query fine_mate() {\n  match { $p: Person }\n  return { $p.name }\n}\n\nquery old_mate() {\n  match { $p: Person { name: \"Alice\" } }\n  return { $p }\n}\n\nquery calls_old() {\n  match { from old_mate() }\n  return { $p.name }\n}\n";
+
+/// The strict registry keeps today's behavior: one stored query that fails
+/// to compile refuses the graph.
 #[tokio::test]
-async fn server_refuses_boot_on_type_broken_stored_query() {
+async fn a_strict_registry_refuses_boot_on_type_broken_stored_query() {
     // A stored query referencing a type not in the schema (`Widget`)
     // must abort boot, naming the offending query.
     let temp = init_loaded_graph().await;
@@ -439,11 +571,17 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
         msg.contains("schema check"),
         "error should mention the schema check: {msg}"
     );
+    // The type refusal carries its code and where it fails, as a parse
+    // refusal does.
+    assert!(
+        msg.contains("query 'ghost': error[T") && msg.contains(" at line 1, column "),
+        "error should carry the refusal's code and position: {msg}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_stored_read_returns_rows() {
-    const RANKED_PEOPLE_GQ: &str = "query ranked_people($q: String) { match { $p: Person } return { $p.name, bm25($p.name, $q) as relevance } order { bm25($p.name, $q) } limit 2 }";
+    const RANKED_PEOPLE_GQ: &str = "query ranked_people($q: String) { match { let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.name, $q) as $score } return { $p.name, $score as relevance } order { $score desc } limit 2 }";
     let (_temp, app) = app_with_stored_queries(
         &[
             ("find_person", FIND_PERSON_GQ, false),
@@ -692,7 +830,7 @@ async fn invoke_stored_mutation_double_gates_on_change() {
 
     let specs: &[(&str, &str, bool)] = &[(
         "add_person",
-        "query add_person($name: String) { insert Person { name: $name } }",
+        "query add_person($name: String) { replace Person { name: $name } }",
         false,
     )];
     let (_temp, app) = app_with_stored_queries(
@@ -804,6 +942,48 @@ async fn invoke_stored_query_bad_param_is_400() {
     assert_eq!(body["code"], "bad_request", "body: {body}");
 }
 
+/// A key the invocation body does not define is refused, never ignored: a
+/// misspelled `branch` would otherwise read `main`, a misspelled `params`
+/// would bind nothing, and a misspelled `expect_mutation` would skip the kind
+/// check. The refusal names the key and the keys the body accepts.
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_query_refuses_unknown_body_keys_issue_528() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    for (body, key) in [
+        (
+            json!({ "params": { "name": "Alice" }, "branchh": "main" }),
+            "branchh",
+        ),
+        (json!({ "paramz": { "name": "Alice" } }), "paramz"),
+        (
+            json!({ "params": { "name": "Alice" }, "expect_mutaton": true }),
+            "expect_mutaton",
+        ),
+    ] {
+        let (status, body) =
+            json_response(&app, invoke_request("find_person", "t-invoke", body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["code"], "bad_request", "body: {body}");
+        assert_eq!(body["disposition"]["effects"], "none", "body: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains(&format!("unknown field `{key}`")),
+            "the refusal names the key; body: {body}"
+        );
+        for accepted in ["params", "branch", "snapshot", "expect_mutation"] {
+            assert!(
+                error.contains(&format!("`{accepted}`")),
+                "the refusal names the accepted key {accepted}; body: {body}"
+            );
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
     use tower::ServiceExt;
@@ -813,7 +993,7 @@ async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
             ("find_person", FIND_PERSON_GQ, false),
             (
                 "add_person",
-                "query add_person($name: String) { insert Person { name: $name } }",
+                "query add_person($name: String) { replace Person { name: $name } }",
                 false,
             ),
         ],
@@ -911,7 +1091,12 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
             ("find_person", FIND_PERSON_GQ, true),
             (
                 "add_person",
-                "query add_person($name: String) { insert Person { name: $name } }",
+                "query add_person($name: String) { replace Person { name: $name } }",
+                true,
+            ),
+            (
+                "people_named",
+                "query people_named($note: String?, $name: String = \"Alice\") { match { $p: Person } where $p.name = $name return { $p.name } }",
                 true,
             ),
             (
@@ -948,6 +1133,19 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
     assert_eq!(fp["params"][0]["kind"], "string");
     let ap = entries.iter().find(|q| q["name"] == "add_person").unwrap();
     assert_eq!(ap["mutation"], true, "stored insert → mutation");
+    // A declared default is listed, so a defaulted parameter reads as one
+    // the caller may omit; a nullable one without a default carries none.
+    let named = entries
+        .iter()
+        .find(|q| q["name"] == "people_named")
+        .unwrap();
+    assert_eq!(
+        named["params"],
+        json!([
+            {"name":"note","kind":"string","nullable":true},
+            {"name":"name","kind":"string","nullable":false,"default":"Alice"}
+        ])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -984,7 +1182,7 @@ async fn list_queries_surfaces_query_description_and_instruction() {
     let described = "query described($name: String) \
         @description(\"Find a person by exact name.\") \
         @instruction(\"Use for exact lookups; prefer search for fuzzy matches.\") \
-        { match { $p: Person { name: $name } } return { $p.age } }";
+        { match { $p: Person } where $p.name = $name return { $p.age } }";
     let (_temp, app) = app_with_stored_queries(
         &[
             ("described", described, true),
@@ -1068,7 +1266,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
 
     let specs: &[(&str, &str, bool)] = &[(
         "add_person",
-        "query add_person($name: String) { insert Person { name: $name } }",
+        "query add_person($name: String) { replace Person { name: $name } }",
         false,
     )];
     let (_temp, app) =
@@ -1151,64 +1349,37 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
     assert_receipt_commit_matches_get(&app, &body, "t-full").await;
 }
 
-const OLDER_OR_NAMED_GQ: &str = "query older_or_named($name: String) { match { $p: Person  $p.age > 30 or $p.name = $name } return { $p.name } }";
+const OLDER_OR_NAMED_GQ: &str = "query older_or_named($name: String) { match { $p: Person } where ($p.age > 30 or $p.name = $name) return { $p.name } }";
 
-/// [`app_with_stored_queries`] with the process defaults every invocation's
-/// session starts from, seeded here instead of the process environment.
-async fn app_with_stored_queries_on_process_defaults(
-    specs: &[(&str, &str, bool)],
-    defaults: ProcessDefaults,
-) -> (tempfile::TempDir, axum::Router) {
-    let temp = init_loaded_graph().await;
-    let graph = graph_path(temp.path());
-    let policy_path = temp.path().join("policy.yaml");
-    std::fs::write(&policy_path, INVOKE_POLICY_YAML).unwrap();
-    let state = AppState::open_single_with_queries(
-        graph.to_string_lossy().to_string(),
-        vec![("act-invoke".to_string(), "t-invoke".to_string())],
-        Some(&policy_path),
-        stored_query_registry(specs),
-    )
-    .await
-    .unwrap()
-    .with_process_defaults(defaults);
-    (temp, omnigraph_server::build_app(state))
-}
-
-/// A stored query carries no `set engine`, so a compound predicate in it runs on
-/// the process default, v2, and answers the same under an explicit `OMNIGRAPH_ENGINE=v2`.
+/// A stored query whose predicate is a disjunction answers with the rows of
+/// both arms.
 #[tokio::test(flavor = "multi_thread")]
-async fn stored_read_with_a_compound_predicate_answers_on_the_process_engine() {
+async fn stored_read_with_a_compound_predicate_answers_both_arms() {
     let specs: &[(&str, &str, bool)] = &[("older_or_named", OLDER_OR_NAMED_GQ, false)];
-    let params = json!({ "params": { "name": "Bob" } });
-    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
-        (variable == "OMNIGRAPH_ENGINE").then(|| "v2".to_string())
-    })
-    .unwrap();
-    for defaults in [
-        ProcessDefaults::default(),
-        ProcessDefaults { settings, sources },
-    ] {
-        let (_temp, app) = app_with_stored_queries_on_process_defaults(specs, defaults).await;
-        let (status, body) = json_response(
-            &app,
-            invoke_request("older_or_named", "t-invoke", params.clone()),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert_eq!(
-            body["row_count"], 2,
-            "Charlie is older than 30 and Bob is named; body: {body}"
-        );
-        let mut names: Vec<&str> = body["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| row["p.name"].as_str().unwrap_or_default())
-            .collect();
-        names.sort_unstable();
-        assert_eq!(names, ["Bob", "Charlie"], "body: {body}");
-    }
+    let (_temp, app) =
+        app_with_stored_queries(specs, &[("act-invoke", "t-invoke")], INVOKE_POLICY_YAML).await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "older_or_named",
+            "t-invoke",
+            json!({ "params": { "name": "Bob" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["row_count"], 2,
+        "Charlie is older than 30 and Bob is named; body: {body}"
+    );
+    let mut names: Vec<&str> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["p.name"].as_str().unwrap_or_default())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Bob", "Charlie"], "body: {body}");
 }
 
 fn spec(name: &str, source: &str) -> RegistrySpec {
@@ -1230,7 +1401,7 @@ fn cluster_invoke(graph_id: &str, name: &str, body: Value) -> axum::http::Reques
         .unwrap()
 }
 
-/// A stored `where and = 1` or `as and` no longer parses, the registry refusal the cluster
+/// A stored `… where and = 1` statement or `as and` no longer parses, the registry refusal the cluster
 /// boot quarantines on and the import refuses; rewritten to `conj`, the registry imports,
 /// applies, boots under strict `require_all_graphs` with no quarantine, and serves.
 #[tokio::test(flavor = "multi_thread")]
@@ -1247,15 +1418,28 @@ async fn registry_rewritten_away_from_reserved_words_reloads_without_quarantine(
     let details: Vec<String> = errors.iter().map(ToString::to_string).collect();
     assert!(
         details.iter().any(|detail| {
-            detail.contains("stored query 'clear_flag'")
-                && detail.contains("`and` is a reserved word; a property of that name is written `$p.and` in a read and cannot be named bare in a mutation `where`")
+            detail.contains("stored query 'clear_flag'") && detail.contains("is not a statement")
+        }),
+        "{details:?}"
+    );
+    // The refusal carries what an upgrade rewrites from: its code, where it
+    // fails, and its fix with the byte-range edits (the alias and the order
+    // key renamed).
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("stored query 'by_and'")
+                && detail.contains("error[Q005] at line 1, column ")
+                && detail.contains("cannot be a return alias")
+                && detail.contains("edits: bytes ")
+                && detail.matches("\"and_\"").count() == 2
         }),
         "{details:?}"
     );
     assert!(
         details.iter().any(|detail| {
-            detail.contains("stored query 'by_and'")
-                && detail.contains("`and` is a reserved word and cannot be a return alias")
+            detail.contains("stored query 'clear_flag'")
+                && detail.contains("error[")
+                && detail.contains(" at line 1, column ")
         }),
         "{details:?}"
     );
@@ -1283,7 +1467,7 @@ graphs:
     std::fs::write(
         reserved.path().join("mutations.gq"),
         format!(
-            "query add_person($slug: String, $n: I64) {{ insert Person {{ slug: $slug, and: $n }} }}\n{reserved_where}\n"
+            "query add_person($slug: String, $n: I64) {{ replace Person {{ slug: $slug, and: $n }} }}\n{reserved_where}\n"
         ),
     )
     .unwrap();
@@ -1304,7 +1488,7 @@ graphs:
     assert!(
         parse_errors
             .iter()
-            .any(|message| message.contains("cannot be named bare in a mutation `where`"))
+            .any(|message| message.contains("is not a statement"))
             && parse_errors
                 .iter()
                 .any(|message| message.contains("cannot be a return alias")),
@@ -1320,7 +1504,7 @@ graphs:
     .unwrap();
     std::fs::write(
         rewritten.path().join("mutations.gq"),
-        "query add_person($slug: String, $n: I64) { insert Person { slug: $slug, conj: $n } }\nquery clear_flag() { update Person set { conj: 0 } where conj = 1 }\n",
+        "query add_person($slug: String, $n: I64) { replace Person { slug: $slug, conj: $n } }\nquery clear_flag() { match { $x: Person } where $x.conj = 1  update $x set { conj: 0 } }\n",
     )
     .unwrap();
     std::fs::write(

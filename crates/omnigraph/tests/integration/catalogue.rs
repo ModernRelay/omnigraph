@@ -47,14 +47,14 @@ async fn catalogue_scope_answers_every_type_without_a_store() {
         .unwrap();
     assert!(explained.num_rows() > 0);
     for (block, expected_rows) in [
-        ("not { $p: @Operator $p.name = $o.name }", 0),
+        ("not exists { $p: @Operator where $p.name = $o.name }", 0),
         (
-            "count { $p: @Operator $p.name = $o.name } = 1",
+            "count { $p: @Operator where $p.name = $o.name } = 1",
             operators.num_rows(),
         ),
     ] {
         let source = format!(
-            "query correlated() {{ match {{ $o: @Operator {block} }} return {{ $o.name }} }}"
+            "query correlated() {{ match {{ $o: @Operator }} where {block} return {{ $o.name }} }}"
         );
         let result = scope.query(&source, "correlated", &params).await.unwrap();
         assert_eq!(result.num_rows(), expected_rows, "{source}");
@@ -141,7 +141,7 @@ async fn catalogue_replay_requires_fingerprints_and_executable_scans() {
     }
 
     let query = r#"query selected_operator() {
-        match { $o: @Operator $o.name = "Scan" }
+        match { $o: @Operator } where $o.name = "Scan"
         return { $o.name }
     }"#;
     let filtered = db

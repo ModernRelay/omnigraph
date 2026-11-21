@@ -356,7 +356,7 @@ fn blob_get_honors_branch_and_immutable_snapshot_targets() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--branch")
             .arg("feature")
             .arg("--data")
@@ -374,7 +374,7 @@ fn blob_get_honors_branch_and_immutable_snapshot_targets() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&main_data)
             .arg("--target")
@@ -1046,7 +1046,9 @@ fn optimize_json_succeeds_on_local_graph() {
         &schema,
         fs::read_to_string(fixture("test.pg"))
             .unwrap()
-            .replace("age: I32?", "age: I32?\n    embedding: Vector(4)? @index"),
+            .replace("age: I32?", "age: I32?\n    embedding: Vector(4)? @index")
+            // The keys declare full text, which the rebuild below replaces.
+            .replace("name: String @key", "name: String @key @index(fulltext)"),
     )
     .unwrap();
     output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
@@ -1100,7 +1102,8 @@ fn optimize_json_succeeds_on_local_graph() {
     assert_eq!(
         rebuilt["warnings"],
         serde_json::json!([
-            "Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced."
+            "Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced.",
+            "Binaries before this release refuse full-text reads on this graph from now on; that binary's own `omnigraph index rebuild --kind full-text` restores them."
         ])
     );
     assert_eq!(
@@ -1132,7 +1135,11 @@ fn optimize_json_succeeds_on_local_graph() {
     let human = stdout_string(&human_output);
     let stderr = String::from_utf8(human_output.stderr).unwrap();
     assert!(
-        stderr.contains("warning: Full-text indexes were rebuilt with the default English analyzer; any previous custom tokenizer settings were replaced."),
+        stderr.contains("warning: Full-text indexes were rebuilt with each property's analyzer profile (english_v1 where none is declared); any previous custom tokenizer settings were replaced."),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: Binaries before this release refuse full-text reads on this graph from now on; that binary's own `omnigraph index rebuild --kind full-text` restores them."),
         "{stderr}"
     );
     assert!(
@@ -1185,8 +1192,9 @@ fn scan_access(graph: &std::path::Path, query: &std::path::Path, branch: &str) -
 }
 
 /// `index build` builds the declared indexes a branch lacks (a type whose
-/// first rows land on the branch) and refreshes a BTREE whose coverage lags
-/// the branch's new rows, in one publication on that branch only. Full-text
+/// first rows land on the branch) and refreshes each BTREE and NGRAM whose
+/// coverage lags the branch's new rows, in one publication on that branch
+/// only. Full-text
 /// coverage is reported pending with the rebuild that refreshes it, and a
 /// second run publishes nothing.
 #[test]
@@ -1194,11 +1202,17 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     let schema = temp.path().join("schema.pg");
+    // `Tag` carries each String declaration: a `@key` alone builds a BTREE, a
+    // plain `@index` an NGRAM and a BTREE, and `@index(fulltext)` its full
+    // text beside them. `Person.name` declares full text, whose coverage the
+    // feature row leaves lagging.
     fs::write(
         &schema,
         format!(
-            "{}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n}}\n",
-            fs::read_to_string(fixture("test.pg")).unwrap()
+            "{}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n    label: String? @index\n    body: String? @index(fulltext)\n}}\n",
+            fs::read_to_string(fixture("test.pg"))
+                .unwrap()
+                .replace("name: String @key", "name: String @key @index(fulltext)")
         ),
     )
     .unwrap();
@@ -1229,15 +1243,15 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
     fs::write(
         &rows,
         concat!(
-            "{\"type\":\"Tag\",\"data\":{\"slug\":\"graphs\",\"rank\":1}}\n",
-            "{\"type\":\"Tag\",\"data\":{\"slug\":\"search\",\"rank\":2}}\n",
+            "{\"type\":\"Tag\",\"data\":{\"slug\":\"graphs\",\"rank\":1,\"label\":\"g\",\"body\":\"graph text\"}}\n",
+            "{\"type\":\"Tag\",\"data\":{\"slug\":\"search\",\"rank\":2,\"label\":\"s\",\"body\":\"search text\"}}\n",
             "{\"type\":\"Person\",\"data\":{\"name\":\"Eve\",\"age\":41}}\n",
         ),
     )
     .unwrap();
     output_success(
         cli()
-            .args(["load", "--mode", "merge", "--branch", "feature", "--data"])
+            .args(["load", "--mode", "replace", "--branch", "feature", "--data"])
             .arg(&rows)
             .arg("--target")
             .arg(&graph),
@@ -1245,7 +1259,7 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
     let by_rank = temp.path().join("by_rank.gq");
     fs::write(
         &by_rank,
-        "explain query by_rank() {\n  match {\n    $t: Tag\n    $t.rank > 1\n  }\n  return { $t.slug }\n}\n",
+        "explain query by_rank() {\n  match { $t: Tag }\n  where $t.rank > 1\n  return { $t.slug }\n}\n",
     )
     .unwrap();
     assert_eq!(scan_access(&graph, &by_rank, "feature").0, "sequential");
@@ -1265,21 +1279,25 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
         built["indexes"],
         serde_json::json!([
             {"type_key": "node:Person", "property": "__id", "kind": "btree", "action": "refreshed"},
+            {"type_key": "node:Person", "property": "name", "kind": "btree", "action": "refreshed"},
+            {"type_key": "node:Person", "property": "name", "kind": "ngram", "action": "refreshed"},
             {"type_key": "node:Tag", "property": "__id", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "body", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "body", "kind": "ngram", "action": "built"},
+            {"type_key": "node:Tag", "property": "body", "kind": "full_text", "action": "built"},
+            {"type_key": "node:Tag", "property": "label", "kind": "btree", "action": "built"},
+            {"type_key": "node:Tag", "property": "label", "kind": "ngram", "action": "built"},
             {"type_key": "node:Tag", "property": "rank", "kind": "btree", "action": "built"},
-            {"type_key": "node:Tag", "property": "slug", "kind": "full_text", "action": "built"},
+            {"type_key": "node:Tag", "property": "slug", "kind": "btree", "action": "built"},
         ])
     );
-    let pending = built["pending_indexes"].as_array().unwrap();
-    assert_eq!(pending.len(), 1, "{built}");
-    assert_eq!(pending[0]["type_key"], "node:Person");
-    assert_eq!(pending[0]["property"], "name");
-    let reason = pending[0]["reason"].as_str().unwrap();
+    // `Person.name`'s full-text index lags the branch's rows, but no read
+    // uses it, so it is not pending and the one-way full-text rebuild is not
+    // recommended.
+    assert_eq!(built["pending_indexes"], serde_json::json!([]), "{built}");
     assert!(
-        reason.contains(
-            "omnigraph index rebuild --kind full-text --target <target> --branch feature"
-        ),
-        "{reason}"
+        !built.to_string().contains("rebuild --kind full-text"),
+        "{built}"
     );
     let commit_id = built["graph_commit_id"].as_str().unwrap();
     let commit = parse_stdout_json(&output_success(
@@ -1307,10 +1325,7 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
         human.contains("branch feature, 0 indexes built or refreshed"),
         "{human}"
     );
-    assert!(
-        human.contains("index pending on node type 'Person', property 'name'"),
-        "{human}"
-    );
+    assert!(!human.contains("index pending"), "{human}");
     assert!(
         human.contains("no-op; no graph commit published"),
         "{human}"
@@ -1614,12 +1629,13 @@ node Policy {
         &query_path,
         r#"
 query update_policy($slug: String, $name: String) {
-    update Policy set { name: $name } where slug = $slug
+    match { $x: Policy } where $x.slug = $slug
+    update $x set { name: $name }
 }
 
 query list_policies() {
     match { $p: Policy }
-    return { $p.name $p.effectiveTo }
+    return { $p.name, $p.effectiveTo }
 }
 "#,
     );
@@ -1655,12 +1671,12 @@ query list_policies() {
         serde_json::json!({
             "result": [
                 {
-                    "name": "name",
+                    "name": "p.name",
                     "kind": "string",
                     "nullable": true
                 },
                 {
-                    "name": "effectiveTo",
+                    "name": "p.effectiveTo",
                     "kind": "datetime",
                     "nullable": true
                 }
@@ -1693,7 +1709,8 @@ node Person {
         &query_path,
         r#"
 query broken($slug: String) {
-    update Person set { missing: "nope" } where slug = $slug
+    match { $x: Person } where $x.slug = $slug
+    update $x set { missing: "nope" }
 }
 "#,
     );
@@ -1928,7 +1945,8 @@ node Policy {
         &query_path,
         r#"
 query update_policy($slug: String, $name: String) {
-    update Policy set { name: $name } where slug = $slug
+    match { $x: Policy } where $x.slug = $slug
+    update $x set { name: $name }
 }
 "#,
     );
@@ -1970,7 +1988,8 @@ node Policy {
         &query_path,
         r#"
 query bad_update($slug: String) {
-    update Policy set { priority_level: "high" } where slug = $slug
+    match { $x: Policy } where $x.slug = $slug
+    update $x set { priority_level: "high" }
 }
 "#,
     );
@@ -1990,6 +2009,294 @@ query bad_update($slug: String) {
     assert!(stdout.contains(
         "INFO  Lint complete: 1 queries processed (1 error(s), 0 warning(s), 0 info item(s))"
     ));
+
+    // A file declaring one name twice is refused whole, with the code.
+    write_query_file(
+        &query_path,
+        "query twice() { match { $x: Policy } return { $x.slug } }\n\
+         query twice() { match { $x: Policy } return { $x.name } }\n",
+    );
+    let output = output_failure(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ERROR line 2, column 7: type error: T83: `twice` is declared twice"),
+        "{stdout}"
+    );
+}
+
+/// `lint --fix` over a directory applies the printed fixes to every `.gq`
+/// file below it and writes each changed file in place; a file holding a
+/// refusal with no fix, or one printed for review, is left as it was and
+/// listed, and the exit status says so. `--dry-run` writes nothing.
+#[test]
+fn lint_fix_rewrites_the_files_of_a_directory_in_place() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    write_file(
+        &schema_path,
+        "node Person {\n    name: String @key\n    age: I32?\n}\n",
+    );
+    let dir = temp.path().join("queries");
+    fs::create_dir_all(dir.join("nested")).unwrap();
+    let respelled = dir.join("respelled.gq");
+    let edition_2 = "mutation add($n: String) { insert Person { name: $n } }\n\
+                     query older() { match { $p: Person  $p.age > 30 } return { $p.name  $p.age } order { $p.age asc } }\n";
+    write_query_file(&respelled, edition_2);
+    let current = dir.join("nested/current.gq");
+    let compiles = "query names() { match { $p: Person } return { $p.name } }\n";
+    write_query_file(&current, compiles);
+
+    // `lint --json` reports each refusal with the fix and the byte-range
+    // edits `--fix` applies.
+    let report: Value = serde_json::from_slice(
+        &output_failure(
+            cli()
+                .args(["lint", "--json", "--query"])
+                .arg(&respelled)
+                .arg("--schema")
+                .arg(&schema_path),
+        )
+        .stdout,
+    )
+    .unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert!(!findings.is_empty(), "{report}");
+    for finding in findings {
+        assert!(finding["fix"].is_string(), "{finding}");
+        assert!(
+            !finding["suggestion"]["edits"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{finding}"
+        );
+    }
+    let unknown = dir.join("nested/unknown.gq");
+    let refused = "query ages() { match { $p: Person } return { $p.years } }\n";
+    write_query_file(&unknown, refused);
+    let paged = dir.join("paged.gq");
+    let review = "query page() { match { $p: Person } return { $p.name } offset 2 }\n";
+    write_query_file(&paged, review);
+    write_file(&dir.join("notes.txt"), "not a query");
+
+    let lint_fix = |extra: &[&str]| {
+        let mut command = cli();
+        command
+            .arg("lint")
+            .arg("--query")
+            .arg(&dir)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--fix")
+            .args(extra);
+        command
+    };
+
+    let dry = output_failure(&mut lint_fix(&["--dry-run"]));
+    assert_eq!(dry.status.code(), Some(1));
+    let stdout = stdout_string(&dry);
+    assert!(
+        stdout.contains(
+            "respelled.gq: 2 passes; L208 ×1, Q009 ×1, Q016 ×1, Q017 ×1 [dry run, not written]"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&respelled).unwrap(), edition_2);
+
+    let output = output_failure(&mut lint_fix(&["--json"]));
+    assert_eq!(output.status.code(), Some(1));
+    let run: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(run["status"], "error", "{run}");
+    assert_eq!(
+        (
+            &run["files_processed"],
+            &run["fixed"],
+            &run["unchanged"],
+            &run["unfixed"],
+            &run["written"]
+        ),
+        (
+            &Value::from(4),
+            &Value::from(1),
+            &Value::from(1),
+            &Value::from(2),
+            &Value::from(1)
+        ),
+        "{run}"
+    );
+    let file = |name: &str| {
+        run["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["query_path"].as_str().unwrap().ends_with(name))
+            .unwrap_or_else(|| panic!("{name} in {run}"))
+            .clone()
+    };
+    let fixed = file("respelled.gq");
+    assert_eq!(fixed["fix"]["status"], "fixed");
+    assert_eq!(fixed["fix"]["written"], true);
+    assert_eq!(fixed["fix"]["passes"], 2);
+    assert_eq!(
+        fixed["fix"]["applied"],
+        serde_json::json!({"L208": 1, "Q009": 1, "Q016": 1, "Q017": 1})
+    );
+    // The lint report is of the text written: it compiles.
+    assert_eq!(fixed["status"], "ok");
+    assert_eq!(fixed["queries_processed"], 2);
+    assert_eq!(
+        fs::read_to_string(&respelled).unwrap(),
+        "query add($n: String) { insert Person { name: $n } }\n\
+         query older() { match { $p: Person } where $p.age > 30 return { $p.name,  $p.age } order { $p.age } }\n"
+    );
+    assert_eq!(file("current.gq")["fix"]["status"], "unchanged");
+    let stuck = file("unknown.gq");
+    assert_eq!(stuck["fix"]["status"], "unfixed");
+    assert_eq!(stuck["fix"]["written"], false);
+    assert_eq!(stuck["fix"]["stopped_at_pass"], 0);
+    assert_eq!(stuck["fix"]["unfixed"][0]["code"], "T6");
+    assert_eq!(stuck["fix"]["unfixed"][0]["position"]["line"], 1);
+    let for_review = file("paged.gq");
+    assert_eq!(for_review["fix"]["status"], "unfixed");
+    assert_eq!(
+        for_review["fix"]["unfixed"][0]["suggestion"]["applicability"],
+        "needs_review"
+    );
+    for (path, text) in [(&current, compiles), (&unknown, refused), (&paged, review)] {
+        assert_eq!(fs::read_to_string(path).unwrap(), text);
+    }
+    assert_eq!(
+        fs::read_dir(&dir).unwrap().count(),
+        4,
+        "no temporary file is left beside the written one"
+    );
+
+    // Fixes printed for review apply when asked, and say so.
+    let output = output_failure(&mut lint_fix(&["--review-fixes"]));
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("paged.gq: 1 pass; Q015 ×1 [written]")
+            && stdout.contains("applied for review (read these changes): Q015 ×1"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("UNFIXED   ")
+            && stdout.contains("unknown.gq: a refusal prints no fix it can apply; nothing written")
+            && stdout.contains("error[T6] at line 1, column "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("4 files: 1 fixed, 2 unchanged, 1 unfixed, 0 not converging; 1 written"),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&paged).unwrap(),
+        "query page() { match { $p: Person } return { $p.name } }\n"
+    );
+    assert_eq!(fs::read_to_string(&unknown).unwrap(), refused);
+}
+
+/// `lint --fix` over one file prints lint's report of the fixed text with a
+/// `fix` field added; without `--fix`, lint reads one file and changes
+/// nothing, and `--fix`'s own flags require it.
+#[test]
+fn lint_fix_over_one_file_adds_the_fix_to_the_lint_report() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    write_file(&schema_path, "node Person {\n    name: String @key\n}\n");
+    let query_path = temp.path().join("queries.gq");
+    let edition_2 =
+        "query named($n: String) { match { $p: Person { name: $n } } return { $p.name } }\n";
+    write_query_file(&query_path, edition_2);
+
+    let unfixed = output_failure(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let report: Value = serde_json::from_slice(&unfixed.stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    assert!(report.get("fix").is_none(), "{report}");
+    assert_eq!(fs::read_to_string(&query_path).unwrap(), edition_2);
+
+    let output = output_success(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--fix")
+            .arg("--json"),
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "ok", "{report}");
+    assert_eq!(report["results"][0]["name"], "named");
+    assert_eq!(report["fix"]["status"], "fixed");
+    assert_eq!(report["fix"]["written"], true);
+    assert_eq!(report["fix"]["applied"], serde_json::json!({"Q010": 1}));
+    assert_eq!(
+        fs::read_to_string(&query_path).unwrap(),
+        "query named($n: String) { match { $p: Person } where $p.name = $n return { $p.name } }\n"
+    );
+
+    // A second run finds nothing to fix.
+    let again: Value = serde_json::from_slice(
+        &output_success(
+            cli()
+                .arg("lint")
+                .arg("--query")
+                .arg(&query_path)
+                .arg("--schema")
+                .arg(&schema_path)
+                .arg("--fix")
+                .arg("--json"),
+        )
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(again["fix"]["status"], "unchanged");
+    assert_eq!(again["fix"]["written"], false);
+
+    let directory = output_failure(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(temp.path())
+            .arg("--schema")
+            .arg(&schema_path),
+    );
+    assert!(
+        String::from_utf8_lossy(&directory.stderr).contains("is a directory"),
+        "{directory:?}"
+    );
+    for flag in ["--dry-run", "--review-fixes"] {
+        let refused = output_failure(
+            cli()
+                .arg("lint")
+                .arg("--query")
+                .arg(&query_path)
+                .arg("--schema")
+                .arg(&schema_path)
+                .arg(flag),
+        );
+        assert_eq!(refused.status.code(), Some(64), "{flag}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("--fix"),
+            "{flag}: {refused:?}"
+        );
+    }
 }
 
 #[test]
@@ -2073,7 +2380,7 @@ fn load_json_outputs_summary_for_main_branch() {
 }
 
 #[test]
-fn load_into_feature_branch_with_merge_mode_succeeds() {
+fn load_into_feature_branch_with_replace_mode_succeeds() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
@@ -2104,15 +2411,104 @@ fn load_into_feature_branch_with_merge_mode_succeeds() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .arg(&graph),
     );
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("branch feature"));
-    assert!(stdout.contains("with merge"));
+    assert!(stdout.contains("with replace"));
     assert!(stdout.contains("1 entities across 1 node types and 0 edge types"));
+}
+
+/// `--mode upsert` keeps the properties a record omits, `--mode replace`
+/// writes the whole entity and `--mode insert` fails on an existing key with
+/// nothing published; edition 2's `append` and `merge` are refused at
+/// argument parsing with the mode that now means what they meant.
+#[test]
+fn load_modes_are_the_write_statements_issue_1278() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let age_of = |name: &str| -> Value {
+        let payload = parse_stdout_json(&output_success(
+            cli()
+                .arg("query")
+                .arg("--target")
+                .arg(&graph)
+                .arg("-e")
+                .arg(format!(
+                    "query q() {{ match {{ $p: Person }} where $p.name = \"{name}\" return {{ $p.age }} }}"
+                ))
+                .arg("--json"),
+        ));
+        payload["rows"][0]["p.age"].clone()
+    };
+    let rows = temp.path().join("partial.jsonl");
+    write_jsonl(&rows, r#"{"type":"Person","data":{"name":"Alice"}}"#);
+    let load = |mode: &str| {
+        let mut command = cli();
+        command
+            .arg("load")
+            .arg("--data")
+            .arg(&rows)
+            .arg("--mode")
+            .arg(mode)
+            .arg("--target")
+            .arg(&graph);
+        command
+    };
+
+    let upserted = output_success(&mut load("upsert"));
+    assert!(stdout_string(&upserted).contains("with upsert"));
+    assert_eq!(age_of("Alice"), 30, "upsert keeps the age the record omits");
+
+    let refused = output_failure(&mut load("insert"));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("upsert"),
+        "an insert load of an existing key names `upsert`: {refused:?}"
+    );
+    assert_eq!(
+        age_of("Alice"),
+        30,
+        "the refused insert load changed nothing"
+    );
+
+    output_success(&mut load("replace"));
+    assert_eq!(
+        age_of("Alice"),
+        Value::Null,
+        "replace writes the whole entity, the omitted age null"
+    );
+
+    for (old, new) in [("append", "insert"), ("merge", "replace")] {
+        let refused = output_failure(&mut load(old));
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&format!("the load mode `{old}` was removed"))
+                && stderr.contains(&format!("write `{new}`")),
+            "{old}: {stderr}"
+        );
+        // Under `--json` the refusal is the coded error `load csv` and the
+        // HTTP route give, naming the mode, never a usage text.
+        let refused = output_failure(load(old).arg("--json"));
+        assert_eq!(refused.status.code(), Some(1), "{old}: {refused:?}");
+        let body: Value = serde_json::from_slice(&refused.stdout)
+            .unwrap_or_else(|e| panic!("{old}: {e}: {refused:?}"));
+        assert_eq!(body["code"], "bad_request", "{body}");
+        assert_eq!(body["disposition"]["effects"], "none", "{body}");
+        assert_eq!(body["diagnostic"]["code"], "Q004", "{body}");
+        assert_eq!(body["diagnostic"]["fix"], format!("--mode {new}"), "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("write `{new}`")),
+            "{body}"
+        );
+    }
 }
 
 #[test]
@@ -2255,7 +2651,7 @@ fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(&graph),
     );
@@ -2578,7 +2974,7 @@ fn query_format_arrow_writes_a_query_s_batches_unless_stdout_is_a_terminal_issue
         cli()
             .args(["mutate", "--target"])
             .arg(graph.path())
-            .args(["-e", "query add() { insert Person { name: \"Eve\" } }"]),
+            .args(["-e", "query add() { replace Person { name: \"Eve\" } }"]),
     );
     let arrow_query = |source: &str| {
         let mut command = cli_process();
@@ -2815,7 +3211,7 @@ fn csv_query_output_round_trips_through_load_csv() {
             .arg("--data")
             .arg(&rows)
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .arg(&source),
     );
@@ -2969,9 +3365,9 @@ fn ranked_read_reports_its_ranking_in_json_and_jsonl() {
         &queries,
         r#"
 query scored($q: String) {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.title, $q) as relevance }
-    order { bm25($d.title, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score }
+    return { $d.slug, $score as relevance }
+    order { $score desc }
     limit 2
 }
 "#,
@@ -3018,7 +3414,7 @@ fn change_json_outputs_affected_counts_and_persists() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     );
@@ -3068,7 +3464,7 @@ query insert_person($name: String, $age: I32) {
             .arg("--target")
             .arg(&graph)
             .arg("-e")
-            .arg("query no_match() { update Person set { age: 99 } where name = \"Nobody\" }")
+            .arg("query no_match() { match { $x: Person } where $x.name = \"Nobody\"  update $x set { age: 99 } }")
             .arg("--json"),
     ));
     assert_eq!(no_op["affected_nodes"], 0);
@@ -3085,7 +3481,7 @@ query insert_person($name: String, $age: I32) {
 /// door's refusal.
 #[test]
 fn explain_statement_answers_the_plan_as_rows() {
-    const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match {\n        $p: Person\n        $p.age > 30\n    }\n    return { $p.name }\n}\n";
+    const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match { $p: Person }\n    where $p.age > 30\n    return { $p.name }\n}\n";
 
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -3281,9 +3677,8 @@ fn load_statement_answers_the_executed_plan_beside_the_change() {
 /// older work, so this cannot claim whole-command no effects or exit 4.
 #[test]
 fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
-    const FIND_PERSON: &str =
-        "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
-    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+    const FIND_PERSON: &str = "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }";
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { match { $x: Person } where $x.name = $name  update $x set { age: $age } }";
 
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -3366,7 +3761,7 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
 /// stop even a conditional mutation before its data request is dispatched.
 #[test]
 fn remote_if_commit_fails_closed_against_an_older_server() {
-    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { match { $x: Person } where $x.name = $name  update $x set { age: $age } }";
 
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     for (status, headers) in [
@@ -3722,7 +4117,7 @@ fn a_policy_refused_served_load_reports_not_started() {
         vec![
             "load".to_string(),
             "--mode".into(),
-            "append".into(),
+            "insert".into(),
             "--data".into(),
             rows.to_string_lossy().into_owned(),
             "--branch".into(),
@@ -3795,7 +4190,7 @@ fn an_embedded_load_reports_its_fork_from_the_engine() {
     fs::write(&rows, "not valid graph NDJSON\n").unwrap();
     let load = |branch: &str| {
         cli()
-            .args(["load", "--mode", "append", "--data"])
+            .args(["load", "--mode", "insert", "--data"])
             .arg(&rows)
             .args(["--branch", branch, "--from", "main", "--json", "--target"])
             .arg(&graph)
@@ -3860,9 +4255,9 @@ fn data_write_outcomes_and_retry_permission_issue_466_issue_976() {
         vec!["mutate", "-e", "commit drop \"proposal\"", "--yes"],
         vec!["commit", "publish", "proposal"],
         vec!["commit", "drop", "proposal", "--yes"],
-        vec!["load", "--data", data, "--mode", "append"],
+        vec!["load", "--data", data, "--mode", "insert"],
         vec![
-            "load", "--data", data, "--mode", "merge", "--branch", "review", "--from", "main",
+            "load", "--data", data, "--mode", "replace", "--branch", "review", "--from", "main",
         ],
         vec![
             "blob", "put", "node", "Document", "readme", "content", "--file", data,
@@ -4320,7 +4715,7 @@ fn change_resolves_uri_and_default_branch_from_store_scope() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     );
@@ -4395,7 +4790,7 @@ fn read_supports_inline_query_string() {
             .arg("query")
             .arg("--target").arg(&repo)
             .arg("-e")
-            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
             .arg("--json"),
@@ -4419,7 +4814,7 @@ fn ordinary_client_setup_keeps_one_operator_config_across_discovery() {
     ];
     for &(verb, graph, flags, expected_format) in cases {
         let source = if verb == "mutate" {
-            r#"query q() { insert Person { name: "original-server" } }"#
+            r#"query q() { replace Person { name: "original-server" } }"#
         } else {
             "query q() { match { $p: Person } return { $p.name } }"
         };
@@ -4756,7 +5151,7 @@ fn as_on_a_served_write_asserts_the_actor() {
         &[
             "mutate",
             "-e",
-            "query add($name: String) { insert Person { name: $name } }",
+            "query add($name: String) { replace Person { name: $name } }",
             "--params",
             r#"{"name":"X"}"#,
         ],
@@ -4848,7 +5243,7 @@ fn commit_publish_and_drop_take_as_on_a_direct_graph_issue_1023() {
                 .arg(&graph)
                 .args(["--as", "act-author", "-e"])
                 .arg(format!(
-                    "query propose() as commit {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+                    "query propose() as commit {{ replace Person {{ name: \"{name}\", age: 33 }} }}"
                 ))
                 .arg("--json"),
         );
@@ -4927,7 +5322,9 @@ fn change_supports_inline_query_string() {
             .arg("--target")
             .arg(&repo)
             .arg("--query-string")
-            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg(
+                "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
+            )
             .arg("--params")
             .arg(r#"{"name":"Inline","age":42}"#)
             .arg("--json"),
@@ -4941,7 +5338,7 @@ fn change_supports_inline_query_string() {
             .arg("query")
             .arg("--target").arg(&repo)
             .arg("-e")
-            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
+            .arg("query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }")
             .arg("--params")
             .arg(r#"{"name":"Inline"}"#)
             .arg("--json"),
@@ -5164,7 +5561,7 @@ fn write_echoes_resolved_target_to_stderr() {
         init_graph(&graph);
         let data = fixture("test.jsonl");
         let mut load = cli();
-        load.args(["load", "--mode", "append", "--data"])
+        load.args(["load", "--mode", "insert", "--data"])
             .arg(&data)
             .arg("--target")
             .arg(&graph)
@@ -5184,7 +5581,7 @@ fn write_echoes_resolved_target_to_stderr() {
             .args([
                 "mutate",
                 "-e",
-                "query add() { insert Person { name: \"new\" } }",
+                "query add() { replace Person { name: \"new\" } }",
                 "--json",
                 "--target",
             ])
@@ -5593,7 +5990,7 @@ fn branch_merge_defaults_target_to_main() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(&graph),
     );
@@ -5896,7 +6293,7 @@ fn branch_merge_supports_explicit_target() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(&graph),
     );
@@ -5947,7 +6344,7 @@ fn branch_merge_delete_branch_retires_parent_with_live_child() {
             .arg("--branch")
             .arg("feature")
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--target")
             .arg(&graph),
     );
@@ -6220,7 +6617,7 @@ fn cli_refuses_a_missing_graph_as_not_found_before_any_write() {
             vec![
                 "load".as_ref(),
                 "--mode".as_ref(),
-                "append".as_ref(),
+                "insert".as_ref(),
                 "--data".as_ref(),
                 data.as_os_str(),
             ],
@@ -6392,7 +6789,7 @@ fn cli_fails_for_missing_schema_or_data_file() {
         let server = crate::support::managed_http::IntentApiFixture::graph(vec![]);
         let mut command = cli();
         command
-            .args(["load", "--mode", "append", "--data"])
+            .args(["load", "--mode", "insert", "--data"])
             .arg(&missing_data)
             .args(["--target"])
             .fixture_target(&server.origin)
@@ -7145,7 +7542,7 @@ fn direct_writes_to_a_cluster_graph_obey_its_applied_policy_issue_1414() {
         &mutation,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     );
@@ -7196,7 +7593,7 @@ query insert_person($name: String, $age: I32) {
         addressed(&mut load, by_store);
         load.arg("--data")
             .arg(&data)
-            .args(["--mode", "append", "--json"]);
+            .args(["--mode", "insert", "--json"]);
         with_actor(&mut load, actor);
         let mut mutate = cli();
         mutate.arg("mutate");
@@ -7254,7 +7651,7 @@ query insert_person($name: String, $age: I32) {
         .arg(&base)
         .arg("--data")
         .arg(temp.path().join("row-1.jsonl"))
-        .args(["--mode", "append", "--as", "act-outsider", "--json"]);
+        .args(["--mode", "insert", "--as", "act-outsider", "--json"]);
     let refused = load.output().unwrap();
     unlock_cluster_fixture(&root);
     assert!(!refused.status.success(), "{refused:?}");
@@ -7418,7 +7815,7 @@ fn changes_baseline_succeeds_and_prints_the_paired_cursor() {
             .arg("--data")
             .arg(&data)
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .arg(&graph),
     );

@@ -1,0 +1,1 @@
+- A `let` inside an `optional { … }` runs: it is a column of the optional's matches, null on a row with no match whatever it reads.

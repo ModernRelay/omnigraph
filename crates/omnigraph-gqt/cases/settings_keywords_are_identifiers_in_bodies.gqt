@@ -25,10 +25,7 @@ edge Show: Person -> Person
 
 --- query
 query keywords() {
-    match {
-        $a: Person
-        $a show $b
-    }
+    match { $a: Person, $a show $b }
     return { $a.set, $b.name }
 }
 

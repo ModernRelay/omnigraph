@@ -1,6 +1,6 @@
 # issue: none
 # notes: Without a header, `columns (…)` names the properties by position and the delimiter
-# notes: defaults to a comma; `mode merge` upserts by the `@key`, an empty field stores null,
+# notes: defaults to a comma; `mode replace` writes the whole row by the `@key`, an empty field stores null,
 # notes: a key repeated inside one file is refused by the `@unique` check, and `mode overwrite`
 # notes: replaces the whole type.
 
@@ -29,7 +29,7 @@ edge Link: Person -> Person {
 3,carol,52
 
 --- mutate
-load csv "people.csv" into node:Person mode append columns (id, name, age)
+load csv "people.csv" into node:Person mode insert columns (id, name, age)
 
 --- expect ok
 
@@ -55,7 +55,7 @@ id,name,age
 4,dave,19
 
 --- mutate
-load csv "repeated_key.csv" into node:Person mode merge header
+load csv "repeated_key.csv" into node:Person mode replace header
 
 --- expect error: @unique violation on Person.id
 
@@ -65,7 +65,7 @@ id,name,age
 4,dave,
 
 --- mutate
-load csv "merge.csv" into node:Person mode merge header
+load csv "merge.csv" into node:Person mode replace header
 
 --- expect ok
 
@@ -16527,7 +16527,7 @@ load csv "cross_batch_edge_duplicate.csv" into edge:Link mode overwrite header
 
 --- query
 query unchanged_after_cross_batch_edge_duplicate() {
-    match { $a: Person $a $e:link $b }
+    match { $a: Person, $a $e:link $b }
     return { count($e.key) as n }
 }
 

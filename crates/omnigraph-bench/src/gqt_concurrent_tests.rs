@@ -43,7 +43,7 @@ duration_seconds: 2
 sweep: { W: [1, 3] }
 
 --- concurrent measured
-writer x${W}: load generate: v1 seed: 42 mode: append
+writer x${W}: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -52,13 +52,13 @@ writer x${W}: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 5}
         n: {kind: ordinal, start: 1000, step: 1}
-reader x2: query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.n } }
+reader x2: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.n } }
 --- expect
 writer: ok
 reader: ok
 
 --- query branch: main
-query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.slug, $c.n } }
+query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.slug, $c.n } }
 --- expect unordered
 {"c.slug":"seed-07","c.n":7}
 --- expect shape
@@ -101,7 +101,7 @@ environments:
 
 const SEEDED_ROW: &str = r#"
 --- query branch: main
-query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.slug, $c.n } }
+query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.slug, $c.n } }
 --- expect unordered
 {"c.slug":"seed-07","c.n":7}
 --- expect shape
@@ -442,7 +442,7 @@ async fn concurrent_writes_runs_at_its_first_and_last_swept_worker_count() {
 async fn a_failed_statement_stops_every_worker_and_fails_the_repetition_unsettled() {
     let block = r#"--- concurrent measured
 lost on nosuch: query add() { insert Chunk { slug: "lost", n: 1 } }
-reader x2: query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.n } }
+reader x2: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.n } }
 --- expect
 lost: ok
 reader: ok
@@ -468,7 +468,7 @@ reader: ok
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dealt_stream_that_runs_out_fails_the_block_on_the_run_past_its_last_row() {
     let block = r#"--- concurrent measured
-writer: load generate: v1 seed: 42 mode: append
+writer: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -477,7 +477,7 @@ writer: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 5}
         n: {kind: ordinal, start: 1000, step: 1}
-reader: query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.n } }
+reader: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.n } }
 --- expect
 writer: ok
 reader: ok
@@ -495,7 +495,7 @@ reader: ok
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_acknowledged_row_missing_at_the_readback_fails_the_settled_repetition() {
     let block = r#"--- concurrent measured
-writer: load generate: v1 seed: 42 mode: append
+writer: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -504,7 +504,7 @@ writer: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 5}
         n: {kind: ordinal, start: 1000, step: 1}
-eraser: query erase() { delete Chunk where slug = "cw-00000" }
+eraser: query erase() { match { $c: Chunk } where $c.slug = "cw-00000" delete $c }
 --- expect
 writer: ok
 eraser: ok
@@ -529,7 +529,7 @@ eraser: ok
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_readback_looks_for_each_labels_rows_in_that_labels_key_column() {
     let block = r#"--- concurrent measured
-slugged: load generate: v1 seed: 42 mode: append
+slugged: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -538,7 +538,7 @@ slugged: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 5}
         n: {kind: ordinal, start: 1000, step: 1}
-coded: load generate: v1 seed: 43 mode: append
+coded: load generate: v1 seed: 43 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -577,7 +577,7 @@ coded: ok
 
 const BESIDE: &str = r#"
 --- concurrent
-extra xWORKERS: load generate: v1 seed: 9 mode: append
+extra xWORKERS: load generate: v1 seed: 9 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -600,7 +600,7 @@ n: I64
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_block_beside_the_measured_one_runs_once_under_the_bound_of_eight() {
     let measured = r#"--- concurrent measured
-reader x9: query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.n } }
+reader x9: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.n } }
 --- expect
 reader: ok
 "#;

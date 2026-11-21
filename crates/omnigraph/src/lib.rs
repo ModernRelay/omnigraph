@@ -27,10 +27,13 @@ pub(crate) use omnigraph_core::dst_gate;
 pub use omnigraph_core::dst_ids;
 #[cfg(not(feature = "dst"))]
 pub(crate) use omnigraph_core::dst_ids;
-/// The full-text analyzer generation this engine certifies indexes with: a
-/// term of the storage format a frozen benchmark fixture is keyed by (RFC
-/// 0039 §Fixture), beside the internal schema version it writes.
-pub use omnigraph_core::fts_compat::ANALYZER_GENERATION as FTS_ANALYZER_GENERATION;
+/// Each analyzer profile's measured fingerprints in this engine: with the
+/// certificate format, the terms of the storage format a frozen benchmark
+/// fixture is keyed by (RFC 0039 §Fixture), beside the internal schema version
+/// it writes, since a full-text index certificate records them.
+pub use omnigraph_core::fts_analysis::measured as fts_measured_analysis;
+/// The format of the full-text index certificate this engine writes.
+pub use omnigraph_core::fts_compat::CERTIFICATE_FORMAT_VERSION as FTS_CERTIFICATE_FORMAT_VERSION;
 pub mod embedding;
 pub(crate) mod engine;
 pub mod error;

@@ -33,7 +33,7 @@ id,name,nickname
 2,bob,bobby
 
 --- mutate
-load csv "undeclared.csv" into node:Person mode append header
+load csv "undeclared.csv" into node:Person mode insert header
 
 --- expect error: column `nickname` is not a declared property of node:Person
 
@@ -44,17 +44,17 @@ load csv "undeclared.csv" into node:Person mode append header
 2,bob,x
 
 --- mutate
-load csv "three_columns.csv" into node:Person mode append columns (id, name)
+load csv "three_columns.csv" into node:Person mode insert columns (id, name)
 
 --- expect error: `columns` names 2 columns, the source holds 3
 
 --- mutate
-load csv "three_columns.csv" into node:Person mode append columns (id, name, tags)
+load csv "three_columns.csv" into node:Person mode insert columns (id, name, tags)
 
 --- expect error: property 'tags' is a list; CSV defines no encoding for it
 
 --- mutate
-load csv "three_columns.csv" into node:Person mode append columns (id, name, v)
+load csv "three_columns.csv" into node:Person mode insert columns (id, name, v)
 
 --- expect error: property 'v' is a Vector; CSV defines no encoding for it
 
@@ -63,7 +63,7 @@ id,name
 x,bob
 
 --- mutate
-load csv "not_a_number.csv" into node:Person mode append header
+load csv "not_a_number.csv" into node:Person mode insert header
 
 --- expect error: load csv into node:Person
 
@@ -72,12 +72,12 @@ id,name
 2,
 
 --- mutate
-load csv "empty_name.csv" into node:Person mode append header
+load csv "empty_name.csv" into node:Person mode insert header
 
 --- expect error: record 1 has an empty field for non-nullable property 'name'
 
 --- mutate
-load csv "two_columns.csv" into node:Person mode append columns (from, name)
+load csv "two_columns.csv" into node:Person mode insert columns (from, name)
 
 --- expect error: column `from` names an endpoint, and node:Person is a node type
 
@@ -85,7 +85,7 @@ load csv "two_columns.csv" into node:Person mode append columns (from, name)
 1
 
 --- mutate
-load csv "one_column.csv" into edge:Knows mode append columns (from)
+load csv "one_column.csv" into edge:Knows mode insert columns (from)
 
 --- expect error: an edge file names its `to` endpoint column
 
@@ -93,7 +93,7 @@ load csv "one_column.csv" into edge:Knows mode append columns (from)
 1,99
 
 --- mutate
-load csv "dangling.csv" into edge:Knows mode append columns (from, to)
+load csv "dangling.csv" into edge:Knows mode insert columns (from, to)
 
 --- expect error: 99
 

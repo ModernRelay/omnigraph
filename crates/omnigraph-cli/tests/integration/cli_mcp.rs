@@ -546,7 +546,7 @@ fn mcp_lists_and_admits_write_tools_only_with_the_agents_consent() {
             2,
             "mutate",
             json!({
-                "query": "query add($name: String) { insert Person { name: $name } }",
+                "query": "query add($name: String) { replace Person { name: $name } }",
                 "params": {"name": name},
             }),
         );

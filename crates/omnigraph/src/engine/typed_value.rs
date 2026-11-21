@@ -7,17 +7,18 @@ use datafusion::scalar::ScalarValue;
 use omnigraph_compiler::ir::IRParam;
 use omnigraph_compiler::types::ExprType;
 
-use crate::error::{
-    missing_graph_property_at_snapshot, renamed_graph_property_at_snapshot,
-    unwitnessed_graph_property_at_snapshot,
-};
+use crate::error::{missing_graph_property_at_snapshot, unwitnessed_graph_property_at_snapshot};
 
-/// Fill omitted nullable declarations and refuse omitted required ones.
-/// Bound values, including the invocation's sampled clock, stay unchanged.
+/// Bind each omitted declaration to its declared default, an omitted
+/// nullable one without a default to null, and refuse an omitted required
+/// one. A supplied value, an explicit null included, and the invocation's
+/// sampled clock stay unchanged.
 pub(crate) fn fill_declared_params(params: &mut ParamMap, declared: &[IRParam]) -> Result<()> {
     for param in declared {
         if let Entry::Vacant(entry) = params.entry(param.declaration.name.clone()) {
-            if matches!(param.ty, ExprType::Value { nullable: true, .. }) {
+            if let Some(default) = &param.declaration.default {
+                entry.insert(default.clone());
+            } else if matches!(param.ty, ExprType::Value { nullable: true, .. }) {
                 entry.insert(Literal::Null);
             } else {
                 return Err(OmniError::manifest(format!(
@@ -30,8 +31,9 @@ pub(crate) fn fill_declared_params(params: &mut ParamMap, declared: &[IRParam]) 
     Ok(())
 }
 
-/// Validate every declaration at binding, including parameters the plan omits.
-/// The caller owns defaults and the single sampling of `now()`.
+/// Validate every declaration at binding, including parameters the plan omits
+/// and the defaults [`fill_declared_params`] bound. The caller owns the single
+/// sampling of `now()`.
 pub(crate) fn validate_params(params: &ParamMap, declared: &[IRParam]) -> Result<()> {
     fn dates(literal: &Literal) -> Result<()> {
         match literal {
@@ -336,12 +338,23 @@ fn check_cast_values(before: &ArrayRef, after: &ArrayRef) -> Result<()> {
 }
 
 pub(super) fn check_array_type(array: &ArrayRef, ty: &ExprType, name: &str) -> Result<()> {
+    check_array_type_of(array, ty, || name.to_string())
+}
+
+/// [`check_array_type`] naming the column only when it is violated: an
+/// expression's name is its rendering, which costs as much as its subtree.
+pub(super) fn check_array_type_of(
+    array: &ArrayRef,
+    ty: &ExprType,
+    name: impl FnOnce() -> String,
+) -> Result<()> {
     let expected = ty
         .to_arrow()
         .ok_or_else(|| OmniError::manifest_internal("value has no Arrow type"))?;
     if array.data_type() != &expected || !ty.nullable() && array.null_count() != 0 {
         return Err(OmniError::manifest_internal(format!(
-            "column '{name}' violates compiler type {}: Arrow {:?}, {} nulls",
+            "column '{}' violates compiler type {}: Arrow {:?}, {} nulls",
+            name(),
             ty.spelling(),
             array.data_type(),
             array.null_count()
@@ -433,13 +446,15 @@ fn check_stored_fields<'a>(
 /// A property is its persisted stable property id, never its name. Where the
 /// accepted contract was published with the opened version, its names name
 /// that version's columns, and a column that is not the declared lifetime is
-/// an integrity failure. A historical version is read under the current
-/// contract, so the column of the declared name may be a dropped property's
-/// (a same-name re-add) and the declared property may sit under an earlier
-/// name (a rename since) or nowhere (an addition since): each refuses like a
-/// type absent at the snapshot. A column written before 0.10 carries no id
-/// and proves no lifetime, so a historical version refuses it, as Blob reads
-/// do. System columns carry no id and resolve by name.
+/// an integrity failure. A historical read opens each table under its
+/// property view (`Snapshot::set_property_views`), so a property renamed
+/// since reads under its current name and a dropped property's column is
+/// hidden; a declared property the opened version does not hold refuses like
+/// a type absent at the snapshot, which only a commit whose schema was not
+/// recorded can reach, since the type checker refuses the others. A column
+/// written before 0.10 carries no id and proves no lifetime, so a historical
+/// version refuses it, as Blob reads do. System columns carry no id and
+/// resolve by name.
 fn stored_field<'s>(
     stored: &'s Schema,
     expected: &Field,
@@ -473,16 +488,9 @@ fn stored_field<'s>(
     if contract_covers {
         return Err(internal());
     }
-    let renamed = stored.fields().iter().find(|field| {
-        field
-            .metadata()
-            .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)
-            == Some(declared_id)
-    });
-    Err(OmniError::manifest(match renamed {
-        Some(field) => renamed_graph_property_at_snapshot(table, name, field.name()),
-        None => missing_graph_property_at_snapshot(table, name),
-    }))
+    Err(OmniError::manifest(missing_graph_property_at_snapshot(
+        table, name,
+    )))
 }
 
 /// A pushed filter consumes physical columns directly, so validate its stored
@@ -563,7 +571,34 @@ pub(super) fn validate_plan_values(
         aliases: HashMap<&'a str, &'a ExprType>,
         /// The score columns ranked scans and fusions append, by their
         /// `(binding, column)`: `F32` from Lance, `F64` for the fused sum.
-        scores: HashMap<(&'a str, &'a str), DataType>,
+        scores: HashMap<(&'a str, &'a str), (DataType, bool)>,
+    }
+    // A name an `optional` introduces is null on an outer row with no
+    // match, so its leaves may be typed nullable over a required property.
+    let mut optional_names: HashSet<&str> = HashSet::new();
+    for (_, node) in plan.live() {
+        if let PhysicalNode::OptionalJoin { inner, .. } = node {
+            let mut work = vec![*inner];
+            while let Some(id) = work.pop() {
+                let Some(node) = plan.node(id) else { continue };
+                match node {
+                    PhysicalNode::Scan { spec, .. } => {
+                        optional_names.extend(spec.binding.as_deref());
+                    }
+                    PhysicalNode::Expand {
+                        dst, edge_binding, ..
+                    } => {
+                        optional_names.insert(dst.as_str());
+                        optional_names.extend(edge_binding.as_deref());
+                    }
+                    PhysicalNode::Let { name, .. } => {
+                        optional_names.insert(name.as_str());
+                    }
+                    _ => {}
+                }
+                work.extend(node.inputs());
+            }
+        }
     }
     let mut pipelines = vec![(plan.root(), Owners::default(), Vec::new())];
     while let Some((root, mut owners, mut pending)) = pipelines.pop() {
@@ -603,7 +638,7 @@ pub(super) fn validate_plan_values(
                     if let Some(ranked) = ranked {
                         let valid = matches!(&ranked.score,
                         IRExpr::PropAccess { variable, property, ty: ExprType::Value { scalar: ScalarType::F32, list: false, nullable: false } }
-                        if Some(variable) == spec.binding.as_ref() && property == ranked.kind.score().0);
+                        if Some(variable) == spec.binding.as_ref() && property == omnigraph_compiler::query::value::DISTANCE_COLUMN);
                         if !valid {
                             return Err(OmniError::manifest_internal(
                                 "ranked score leaf disagrees with its scan producer",
@@ -611,20 +646,56 @@ pub(super) fn validate_plan_values(
                         }
                         if let Some(binding) = &spec.binding {
                             owners.scores.insert(
-                                (binding.as_str(), ranked.kind.score().0),
-                                DataType::Float32,
+                                (
+                                    binding.as_str(),
+                                    omnigraph_compiler::query::value::DISTANCE_COLUMN,
+                                ),
+                                (DataType::Float32, false),
                             );
                         }
                     }
                 }
-                PhysicalNode::RankFuse { arms, .. } => {
+                PhysicalNode::Score { binding, kind, .. } => {
+                    let (column, data_type) = omnigraph_planner::score_column(*kind);
+                    owners
+                        .scores
+                        .insert((binding.as_str(), column), (data_type, false));
+                }
+                // A `let`'s value is the `value` column of the binding the
+                // shaper made up for it.
+                PhysicalNode::Let { name, value, .. } => {
+                    if let Some(data_type) = value.ty().to_arrow() {
+                        owners.scores.insert(
+                            (name.as_str(), omnigraph_compiler::shape::read::LET_VALUE),
+                            (data_type, value.ty().nullable()),
+                        );
+                    }
+                }
+                PhysicalNode::Fuse { target, .. } => {
                     owners.scores.insert(
                         (
-                            arms[0].binding.as_str(),
-                            omnigraph_compiler::query::ast::RRF_COLUMN,
+                            target.as_str(),
+                            omnigraph_compiler::query::value::RRF_COLUMN,
                         ),
-                        DataType::Float64,
+                        (DataType::Float64, false),
                     );
+                }
+                // A correlated read's group columns and value columns are
+                // columns of its `values` binding, typed as computed.
+                PhysicalNode::Correlate { read, .. } => {
+                    for projection in read.group.iter().flatten().chain(&read.columns) {
+                        if let (Some(data_type), ExprType::Value { nullable, .. }) =
+                            (projection.ty.to_arrow(), &projection.ty)
+                        {
+                            // A union's arms share one `values` binding: a
+                            // column is nullable when any arm's is.
+                            owners
+                                .scores
+                                .entry((read.values.as_str(), projection.column.as_str()))
+                                .and_modify(|(_, known)| *known |= *nullable)
+                                .or_insert((data_type, *nullable));
+                        }
+                    }
                 }
                 PhysicalNode::MetadataCount { spec, return_exprs } => {
                     if let (Some(binding), Some(type_name)) =
@@ -678,8 +749,8 @@ pub(super) fn validate_plan_values(
             scores,
         } = owners;
         let property_type = |variable: &str, property: &str| -> Result<(DataType, bool)> {
-            if let Some(data_type) = scores.get(&(variable, property)) {
-                return Ok((data_type.clone(), false));
+            if let Some((data_type, nullable)) = scores.get(&(variable, property)) {
+                return Ok((data_type.clone(), *nullable));
             }
             if let Some(type_name) = bindings.get(variable) {
                 let node = catalog.query_node_type(type_name).ok_or_else(|| {
@@ -766,8 +837,16 @@ pub(super) fn validate_plan_values(
                     pending.push(conjunct);
                     pending.extend(residual);
                 }
-                PhysicalNode::AntiJoin { .. } => {}
-                PhysicalNode::RankFuse { k, .. } => pending.extend(k),
+                PhysicalNode::AntiJoin { .. }
+                | PhysicalNode::OptionalJoin { .. }
+                | PhysicalNode::Union { .. } => {}
+                PhysicalNode::Fuse { k, weights, .. } => {
+                    pending.extend(k);
+                    pending.extend(weights);
+                }
+                PhysicalNode::Score { query, .. } => pending.push(query),
+                PhysicalNode::Let { value, .. } => pending.push(value),
+                PhysicalNode::Correlate { read, .. } => pending.extend(read.exprs()),
                 PhysicalNode::Sort { order_by, .. } => {
                     pending.extend(order_by.iter().map(|ordering| &ordering.expr))
                 }
@@ -778,6 +857,7 @@ pub(super) fn validate_plan_values(
                 | PhysicalNode::RowCompare { .. }
                 | PhysicalNode::ClassifyThreeWay { .. }
                 | PhysicalNode::Limit { .. }
+                | PhysicalNode::TargetCut { .. }
                 | PhysicalNode::Page { .. }
                 | PhysicalNode::Expand { .. }
                 | PhysicalNode::OuterReference { .. }
@@ -808,8 +888,10 @@ pub(super) fn validate_plan_values(
                     ty,
                 } => {
                     let (data_type, nullable) = property_type(variable, property)?;
+                    let optional = optional_names.contains(variable.as_str());
                     if ty.to_arrow().as_ref() != Some(&data_type)
-                        || !matches!(ty, ExprType::Value { nullable: stored, .. } if *stored == nullable)
+                        || !matches!(ty, ExprType::Value { nullable: stored, .. }
+                            if *stored == nullable || optional && *stored)
                     {
                         return Err(OmniError::manifest_internal(format!(
                             "property {variable}.{property} leaf type {} disagrees with its catalog owner ({data_type}, nullable={nullable})",
@@ -817,16 +899,23 @@ pub(super) fn validate_plan_values(
                         )));
                     }
                 }
-                IRExpr::Variable(variable, ExprType::Node { type_name }) => {
+                IRExpr::Variable(variable, ExprType::Node { type_name, .. }) => {
                     if bindings.get(variable.as_str()).copied() != Some(type_name.as_str()) {
                         return Err(OmniError::manifest_internal(format!(
                             "node leaf {variable} type {type_name} disagrees with its binding owner"
                         )));
                     }
                 }
+                IRExpr::Variable(variable, ExprType::Edge { .. }) => {
+                    if !edge_bindings.contains_key(variable.as_str()) {
+                        return Err(OmniError::manifest_internal(format!(
+                            "edge leaf {variable} has no edge binding owner"
+                        )));
+                    }
+                }
                 IRExpr::Variable(_, _) => {
                     return Err(OmniError::manifest_internal(
-                        "node leaf carries a value type",
+                        "a reference leaf carries a value type",
                     ));
                 }
                 IRExpr::AliasRef(alias, ty) => {
@@ -843,52 +932,29 @@ pub(super) fn validate_plan_values(
                     query,
                     ty: _,
                 } => pending.push(query),
-                IRExpr::Search {
-                    field,
-                    query,
-                    ty: _,
-                }
-                | IRExpr::MatchText {
-                    field,
-                    query,
-                    ty: _,
-                }
-                | IRExpr::Bm25 {
-                    field,
-                    query,
-                    ty: _,
-                } => pending.extend([field.as_ref(), query.as_ref()]),
-                IRExpr::Fuzzy {
-                    field,
-                    query,
-                    max_edits,
-                    ty: _,
-                } => {
-                    pending.extend([field.as_ref(), query.as_ref()]);
-                    pending.extend(max_edits.as_deref());
-                }
-                IRExpr::Rrf {
-                    primary,
-                    secondary,
-                    k,
-                    ty: _,
-                } => {
-                    pending.extend([primary.as_ref(), secondary.as_ref()]);
-                    pending.extend(k.as_deref());
-                }
                 IRExpr::Aggregate {
                     func: _,
                     distinct: _,
                     arg,
+                    fraction,
                     signature: _,
+                } => {
+                    pending.push(arg);
+                    pending.extend(fraction.as_deref());
                 }
-                | IRExpr::Not(arg, _)
+                IRExpr::Not(arg, _)
                 | IRExpr::Cast { expr: arg, ty: _ }
+                | IRExpr::Neg { expr: arg, ty: _ }
                 | IRExpr::IsNull {
                     expr: arg,
                     negated: _,
                     ty: _,
                 } => pending.push(arg),
+                IRExpr::Call {
+                    func: _,
+                    args,
+                    ty: _,
+                } => pending.extend(args),
                 IRExpr::Binary {
                     left,
                     op: _,
@@ -898,9 +964,7 @@ pub(super) fn validate_plan_values(
             }
         }
         for filter in pushed_filters {
-            if !is_search_filter(filter)
-                && super::scan::ir_expr_to_df_expr(filter, params, None).is_none()
-            {
+            if super::scan::ir_expr_to_df_expr(filter, params, None).is_none() {
                 return Err(OmniError::manifest_internal(
                     "stored pushed filter cannot execute its recorded expression",
                 ));
@@ -914,7 +978,7 @@ pub(super) fn validate_plan_values(
 mod tests {
     use super::*;
     use crate::error::ManifestErrorKind;
-    use omnigraph_compiler::query::ast::Param;
+    use omnigraph_compiler::query::file::Param;
     use omnigraph_compiler::types::PropType;
 
     fn scalar(scalar: ScalarType, nullable: bool) -> ExprType {
@@ -980,6 +1044,7 @@ mod tests {
                         name: "unused".into(),
                         type_name: prop.display_name(),
                         nullable: false,
+                        default: None,
                     },
                     ty: ExprType::from_prop(&prop),
                 };
@@ -1015,6 +1080,7 @@ mod tests {
                     name: "unused".into(),
                     type_name: "Vector(2)".into(),
                     nullable,
+                    default: None,
                 },
                 ty: scalar(ScalarType::Vector(2), nullable),
             };
@@ -1045,6 +1111,7 @@ mod tests {
                     name: "unused".into(),
                     type_name: "Blob".into(),
                     nullable: !nullable,
+                    default: None,
                 },
                 ty: scalar(ScalarType::Blob, nullable),
             };
@@ -1150,9 +1217,12 @@ mod tests {
             refusal(&stored, "note"),
             "property 'note' of node type 'Doc' does not exist at this snapshot"
         );
+        // A rename since is resolved by the historical read's property view,
+        // which opens the table with `memo` named `remark`; a table read
+        // without it holds no `remark`.
         assert_eq!(
             refusal(&stored, "remark"),
-            "property 'remark' of node type 'Doc' is named 'memo' at this snapshot; a historical query cannot read a property across a rename"
+            "property 'remark' of node type 'Doc' does not exist at this snapshot"
         );
         assert_eq!(
             refusal(&stored, "age"),

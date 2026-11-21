@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - OmniGraph maintainers
 created: 2026-09-29
-updated: 2026-10-29
+updated: 2026-11-20
 discussion: https://github.com/ModernRelay/omnigraph/pull/799
 supersedes:
   - "0034"
@@ -1146,10 +1146,10 @@ with a counted OpenAI-compatible endpoint, successful embedding calls before and
 after the load matrix, and zero provider requests attributable to loads. The
 same test checks exact supplied vectors, durable Arrow nulls, required-vector
 refusal and unannotated loads; `parity_matrix` covers CLI load output.
-T11.embed remains incomplete: [RFC 0045](0045-gq-logic-tests.md)
-explicitly excludes `@embed` schemas, and GQT has no load step with outcome
+T11.embed remains incomplete: [RFC 0045](0045-gq-logic-tests.md) admits
+`@embed` schemas since 2026-11-20, but GQT has no load step with outcome
 expectations. Setup-only seed loading cannot supply that evidence. Changing
-those accepted format boundaries requires its own decision; this work adds no
+that format boundary requires its own decision; this work adds no
 GQT protocol, native-lifetime or automatic-generation qualification.
 
 E0 qualification extends engine `schema_apply.rs` and `detached_commit_matrix.rs`,
@@ -1664,3 +1664,7 @@ Before enabling an affected increment, its owners must implement and qualify:
   second durable operation record is introduced." for recorded operations
   only: one durable record is added, but no job queue or background poller. The sentence still holds for
   deployment. The body stands unchanged until acceptance.
+- 2026-11-20: RFC 0045 admits `@embed` schemas in GQT cases, since no load or
+  write embeds. Superseded in §Qualification: "[RFC 0045] explicitly excludes
+  `@embed` schemas"; T11.embed stays incomplete for want of a GQT load step
+  with outcome expectations.

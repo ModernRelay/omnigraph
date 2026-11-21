@@ -1209,7 +1209,7 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
     db.load(
         "feature",
         r#"{"type":"Person","data":{"name":"Eve","age":29}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -1667,7 +1667,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     let ingest = IngestRequest {
         branch: Some("feature-ingest".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}
 {"type":"Person","data":{"name":"Bob","age":26}}"#
             .to_string(),
@@ -1689,7 +1689,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(body["branch"], "feature-ingest");
     assert_eq!(body["base_branch"], "main");
     assert_eq!(body["branch_created"], true);
-    assert_eq!(body["mode"], "merge");
+    assert_eq!(body["mode"], "replace");
     assert_eq!(body["actor_id"], "act-andrew");
     assert_eq!(body["nodes"][0]["name"], "Person");
     assert_eq!(body["nodes"][0]["entities_loaded"], 2);
@@ -1722,7 +1722,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     let refused = IngestRequest {
         branch: Some("feature-refused".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Append),
+        mode: Some(LoadMode::Insert),
         data: r#"{"type":"Person","data":{"name":"Bob","age":26}}"#.to_string(),
     };
     let (status, body) = json_response(
@@ -1829,7 +1829,7 @@ async fn a_load_that_forks_a_branch_deleted_during_its_body_reports_the_fork() {
     let request = Request::builder()
         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
         .method(Method::POST)
-        .uri(g("/load/ndjson?branch=feature&from=main&mode=append"))
+        .uri(g("/load/ndjson?branch=feature&from=main&mode=insert"))
         .header("content-type", "application/x-ndjson")
         .body(body)
         .unwrap();
@@ -1886,7 +1886,7 @@ async fn ingest_existing_branch_skips_branch_create_policy_check() {
     let ingest = IngestRequest {
         branch: Some("feature".to_string()),
         from: Some("other-base".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -1915,7 +1915,7 @@ async fn ingest_without_from_returns_404_for_missing_branch_and_creates_nothing(
     let ingest = IngestRequest {
         branch: Some("feature-typo".to_string()),
         from: None,
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -1957,7 +1957,7 @@ async fn ingest_without_from_loads_into_existing_branch() {
     let ingest = IngestRequest {
         branch: Some("feature".to_string()),
         from: None,
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -1988,7 +1988,7 @@ async fn ingest_denies_missing_branch_without_branch_create_permission() {
     let ingest = IngestRequest {
         branch: Some("feature".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -2022,7 +2022,7 @@ async fn ingest_denies_when_actor_lacks_change_permission() {
     let ingest = IngestRequest {
         branch: Some("feature".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
     };
 
@@ -2052,7 +2052,7 @@ async fn ingest_rejects_payloads_over_32_mib() {
     let oversize = IngestRequest {
         branch: Some("feature".to_string()),
         from: Some("main".to_string()),
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: "x".repeat(33 * 1024 * 1024),
     };
 
@@ -2199,9 +2199,9 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE, SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
     };
     const ATOMIC: &str = r#"query atomic() {
-        insert Person { name: "Owned", age: 41 }
-        insert Company { name: "OwnedCo" }
-        insert WorksAt { from: "Owned", to: "OwnedCo" }
+        replace Person { name: "Owned", age: 41 }
+        replace Company { name: "OwnedCo" }
+        insert WorksAt { @src: "Owned", @dst: "OwnedCo" }
     }"#;
     const BATCH: &str = concat!(
         "{\"type\":\"Person\",\"data\":{\"name\":\"Owned\",\"age\":41}}\n",
@@ -2279,7 +2279,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         let before = db.list_commits(None).await.unwrap();
         let request = match door {
             "/mutate" => json_post(door, &json!({"query": ATOMIC})),
-            "/load" => json_post(door, &json!({"data": BATCH, "mode": "append"})),
+            "/load" => json_post(door, &json!({"data": BATCH, "mode": "insert"})),
             "/load/ndjson" => Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
                 .method(Method::POST)
@@ -2430,7 +2430,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
                 assert_eq!(status, StatusCode::NOT_FOUND, "the clear published");
             }
         } else {
-            let (status, rows) = json_response(&app, json_post("/query", &json!({"query": "query q() { match { $p: Person { name: \"Owned\" } $p worksAt $c } return { $p.name, $c.name } }"}))).await;
+            let (status, rows) = json_response(&app, json_post("/query", &json!({"query": "query q() { match { $p: Person, $p worksAt $c } where $p.name = \"Owned\" return { $p.name, $c.name } }"}))).await;
             assert_eq!(status, StatusCode::OK, "{rows}");
             assert_eq!(
                 rows["rows"],
@@ -2918,7 +2918,7 @@ async fn branch_statements_dispatch_to_their_route_bodies() {
 /// A `load csv` statement naming a source no base admits; the loaded test
 /// graph has no external Blob policy, so the served default, deny, applies.
 const LOAD_CSV_PEOPLE: &str =
-    "load csv \"s3://imports/people.csv\" into node:Person mode append header";
+    "load csv \"s3://imports/people.csv\" into node:Person mode insert header";
 
 /// Served `load csv` on `/mutate`, with and without the request `branch`:
 /// a graph without a policy denies the source before any byte is read, so
@@ -2930,7 +2930,7 @@ async fn load_csv_statement_is_denied_served_without_a_policy_and_moves_no_head(
     for request in [
         json!({"query": LOAD_CSV_PEOPLE}),
         json!({"query": LOAD_CSV_PEOPLE, "branch": "main"}),
-        json!({"query": "load csv \"file:///tmp/people.csv\" into node:Person mode append header"}),
+        json!({"query": "load csv \"file:///tmp/people.csv\" into node:Person mode insert header"}),
     ] {
         let (status, body) = json_response(&app, json_post("/mutate", &request)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {body}");
@@ -3270,16 +3270,62 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
             "{path}"
         );
 
+        // A source declaring the requested name twice is refused before the
+        // name selects either declaration.
+        let twice = json!({
+            field: "query find_person() { match { $p: Person } return { $p.name } }\nquery find_person() { match { $p: Person } return { $p.age } }",
+            "name": "find_person",
+            "branch": "main"
+        });
+        let (status, out) = json_response(&app, send(path, token, twice, expected_head)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+        let error: ErrorOutput = serde_json::from_value(out).unwrap();
+        let diagnostic = error
+            .diagnostic
+            .expect("a refused query carries its diagnostic");
+        assert_eq!(diagnostic.code, "T83", "{path}");
+        assert_eq!(
+            diagnostic.position.map(|at| (at.line, at.column)),
+            Some((2, 7)),
+            "{path}"
+        );
+
+        // A name holding a character outside ASCII is a typed `Q001` at the
+        // name, its column counted in characters: parse recovery once
+        // split the character, so `/query` answered 500 and `/mutate` closed
+        // the connection with no response.
+        for (text, column) in [
+            (
+                r#"query w() { insert Persön { name: "Nia", age: 20 } }"#,
+                20,
+            ),
+            ("query q() { match { $p: Persön } return { $p.name } }", 29),
+        ] {
+            let body = json!({field: text, "branch": "main"});
+            let (status, out) = json_response(&app, send(path, token, body, expected_head)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+            let error: ErrorOutput = serde_json::from_value(out).unwrap();
+            let diagnostic = error
+                .diagnostic
+                .expect("a refused query carries its diagnostic");
+            assert_eq!(diagnostic.code, "Q001", "{path}: {text}");
+            assert_eq!(
+                diagnostic.position.map(|at| (at.line, at.column)),
+                Some((1, column)),
+                "{path}: {text}"
+            );
+        }
+
         // A source nested past the bound is refused before the grammar
         // recurses over it; parsed, it would exhaust the worker's stack and
         // abort the server for every caller.
         let deep = format!(
-            "query q() {{ match {{ $p: Person {}$p.age > 1{} }} return {{ $p.name }} }}",
+            "query q() {{ match {{ $p: Person }} where {} and $p.age > 1 and {} return {{ $p.name }} }}",
             "(".repeat(100_000),
             ")".repeat(100_000)
         );
         let chain = format!(
-            "query q() {{ match {{ $p: Person {} }} return {{ $p.name }} }}",
+            "query q() {{ match {{ $p: Person }} where {} return {{ $p.name }} }}",
             vec!["$p.age > 1"; 50_000].join(" or ")
         );
         for source in [deep, chain] {
@@ -3313,7 +3359,7 @@ async fn propose_person(app: &axum::Router, name: &str) -> Value {
         json_post(
             "/mutate",
             &json!({"query": format!(
-                "query propose() as commit {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+                "query propose() as commit {{ replace Person {{ name: \"{name}\", age: 33 }} }}"
             )}),
         ),
     )
@@ -3440,7 +3486,7 @@ async fn commit_routes_list_publish_and_drop_unpublished_commits() {
         &app,
         json_post(
             "/mutate",
-            &json!({"query": "query add() { insert Person { name: \"Sol\", age: 34 } }"}),
+            &json!({"query": "query add() { replace Person { name: \"Sol\", age: 34 } }"}),
         ),
     )
     .await;
@@ -3478,7 +3524,7 @@ async fn sprout_person(app: &axum::Router, name: &str, base: Option<&str>) -> Va
         json_post(
             "/mutate",
             &json!({"query": format!(
-                "query sprout() as unattached branch{on} {{ insert Person {{ name: \"{name}\", age: 33 }} }}"
+                "query sprout() as unattached branch{on} {{ replace Person {{ name: \"{name}\", age: 33 }} }}"
             )}),
         ),
     )
@@ -3654,7 +3700,7 @@ async fn commit_routes_create_list_refuse_publish_and_drop_unattached_branches()
             json_post(
                 "/mutate",
                 &json!({"query": format!(
-                    "query sprout() as unattached branch on \"{id}\" {{ insert Person {{ name: \"Late\", age: 33 }} }}"
+                    "query sprout() as unattached branch on \"{id}\" {{ replace Person {{ name: \"Late\", age: 33 }} }}"
                 )}),
             ),
         )
@@ -3679,12 +3725,12 @@ async fn stored_unattached_mutation_keeps_its_clause_per_invocation() {
         &[
             (
                 "sprout_root",
-                "query sprout_root($name: String) as unattached branch { insert Person { name: $name, age: 33 } }",
+                "query sprout_root($name: String) as unattached branch { replace Person { name: $name, age: 33 } }",
                 true,
             ),
             (
                 "sprout_child",
-                "query sprout_child($name: String, $base: String) as unattached branch on $base { insert Person { name: $name, age: 33 } }",
+                "query sprout_child($name: String, $base: String) as unattached branch on $base { replace Person { name: $name, age: 33 } }",
                 true,
             ),
         ],
@@ -3931,6 +3977,8 @@ async fn request_budgets_stop_at_the_server_ceiling() {
     };
     for (setting, above) in [
         ("traversal_work_limit", "9223372036854775807"),
+        ("read_work_limit", "9223372036854775807"),
+        ("plan_budget_limit", "9223372036854775807"),
         ("query_memory_bytes", "1099511627776"),
         ("write_max_bytes", "1099511627776"),
         ("load_source_max_bytes", "1099511627776"),
@@ -3989,6 +4037,45 @@ async fn request_budgets_stop_at_the_server_ceiling() {
     )
     .await;
     assert_settings_refusal_needle(status, &body, "OMNIGRAPH_TRAVERSAL_WORK_LIMIT");
+}
+
+/// A declared `@budget(plan = n)` is admitted against the server's
+/// `plan_budget_limit`: above it the read is refused with `T89` before it
+/// is compiled, never clamped, and a request cannot raise the setting past
+/// the server's ceiling to admit it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_plan_budget_stops_at_the_server_ceiling() {
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_PLAN_BUDGET_LIMIT").then(|| "40".to_string())
+    })
+    .unwrap();
+    let (_temp, app) =
+        app_for_loaded_graph_with_process_defaults(ProcessDefaults { settings, sources }).await;
+    let read = |source: &str, settings: Value| {
+        json_post("/query", &json!({"query": source, "settings": settings}))
+    };
+    let within = "query q() @budget(plan = 40) { match { $p: Person } return { $p.name } }";
+    let above = "query q() @budget(plan = 41) { match { $p: Person } return { $p.name } }";
+    let (status, body) = json_response(&app, read(within, json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "at the ceiling: {body}");
+    let (status, body) = json_response(&app, read(above, json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("T89") && error.contains("`plan_budget_limit` = 40"),
+        "{body}"
+    );
+    // As every request budget: a request may raise the setting back toward
+    // the built-in default an operator lowered it from, and no further.
+    let (status, body) = json_response(&app, read(above, json!({"plan_budget_limit": 41}))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "raised back toward the default: {body}"
+    );
+    let (status, body) =
+        json_response(&app, read(above, json!({"plan_budget_limit": 65537}))).await;
+    assert_settings_refusal_needle(status, &body, "OMNIGRAPH_PLAN_BUDGET_LIMIT");
 }
 
 fn assert_settings_refusal_needle(status: StatusCode, body: &Value, needle: &str) {
@@ -4069,6 +4156,64 @@ async fn main_head_commit_id(app: &axum::Router) -> String {
         .as_str()
         .unwrap()
         .to_string()
+}
+
+/// Every JSON body refuses a key it does not define, before the handler runs:
+/// a misspelled optional key would otherwise fall back to its default (`main`,
+/// `merge`, the whole feed) and answer 200. The refusal names the key and the
+/// keys the body accepts, and nothing moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn json_bodies_refuse_unknown_keys_issue_528() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let head = main_head_commit_id(&app).await;
+    for (path, body, key, accepted) in [
+        (
+            "/branches",
+            json!({"name": "side", "form": "main"}),
+            "form",
+            "from_commit",
+        ),
+        (
+            "/branches/merge",
+            json!({"source": "main", "into": "main"}),
+            "into",
+            "delete_branch",
+        ),
+        (
+            "/changes/baseline",
+            json!({"branch": "main", "types": ["Person"]}),
+            "types",
+            "type",
+        ),
+        (
+            "/load",
+            json!({
+                "branch": "side",
+                "from": "main",
+                "load_mode": "append",
+                "data": "{\"type\": \"Person\", \"data\": {\"name\": \"Zed\", \"age\": 1}}"
+            }),
+            "load_mode",
+            "mode",
+        ),
+    ] {
+        let (status, body) = json_response(&app, json_post(path, &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["code"], "bad_request", "{path}: {body}");
+        assert_eq!(body["disposition"]["effects"], "none", "{path}: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains(&format!("unknown field `{key}`")),
+            "{path}: the refusal names the key; {body}"
+        );
+        assert!(
+            error.contains(&format!("`{accepted}`")),
+            "{path}: the refusal names the accepted keys; {body}"
+        );
+    }
+    assert_eq!(main_head_commit_id(&app).await, head, "nothing published");
+    let (_, branches) = get_json(&app, g("/branches")).await;
+    assert_eq!(branches["branches"], json!(["main"]), "no branch created");
 }
 
 /// `branch create <name>` then one insert on it, so a merge into `main`
@@ -4288,7 +4433,6 @@ async fn settings_show_all_lists_the_definition_in_order() {
     assert_eq!(
         body,
         show_output(&[
-            show_row("engine", "v2", "v2", "default", "request"),
             show_row("rrf_plan", "auto", "auto", "default", "process"),
             show_row(
                 "merge_lineage",
@@ -4313,6 +4457,14 @@ async fn settings_show_all_lists_the_definition_in_order() {
                 "default",
                 "request"
             ),
+            show_row(
+                "read_work_limit",
+                "100000000",
+                "100000000",
+                "default",
+                "request"
+            ),
+            show_row("plan_budget_limit", "65536", "65536", "default", "request"),
             show_row(
                 "write_max_bytes",
                 "33554432",
@@ -4419,7 +4571,7 @@ async fn settings_set_parameter_on_the_change_routes_follows_the_definition() {
 
     let cases: [(&str, Option<&str>); 6] = [
         ("set=merge_lineage=off", None),
-        ("set=engine=v2", None),
+        ("set=change_lineage=off", None),
         ("set=merge_lineage=both", Some(UNKNOWN_VALUE_NEEDLE)),
         (
             "set=stage_write_concurrency=8",
@@ -4459,18 +4611,13 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         &app,
         json_post(
             "/query",
-            &json!({"query": "set engine = v2;\nset merge_lineage = off;\nset change_lineage = off;\nreset all;\nshow all;"}),
+            &json!({"query": "set ann_nprobes = 3;\nset merge_lineage = off;\nset change_lineage = off;\nreset all;\nshow all;"}),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        body["rows"][0],
-        show_row("engine", "v2", "v2", "default", "request"),
-        "{body}"
-    );
-    assert_eq!(
-        body["rows"][2],
+        body["rows"][1],
         show_row(
             "merge_lineage",
             default_merge_lineage(),
@@ -4481,7 +4628,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         "{body}"
     );
     assert_eq!(
-        body["rows"][3],
+        body["rows"][2],
         show_row(
             "change_lineage",
             default_change_lineage(),
@@ -4492,7 +4639,7 @@ async fn settings_reset_all_at_the_http_door_returns_to_the_process_defaults() {
         "{body}"
     );
     assert_eq!(
-        body["rows"][4],
+        body["rows"][3],
         show_row("ann_nprobes", "5", "20", "env", "request"),
         "reset all returns to the process value, not the definition's: {body}"
     );
@@ -4554,13 +4701,13 @@ async fn write_max_bytes_request_override_reset_and_load_process_default() {
         let request = if path == "/load/ndjson" {
             Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .uri(g("/load/ndjson?branch=main&mode=insert"))
                 .method(Method::POST)
                 .header("content-type", "application/x-ndjson")
                 .body(Body::from(data.clone()))
                 .unwrap()
         } else {
-            json_post(path, &json!({"branch":"main","mode":"append","data":data}))
+            json_post(path, &json!({"branch":"main","mode":"insert","data":data}))
         };
         let (status, body) = json_response(&app, request).await;
         assert!(!status.is_success(), "{path}: {body}");
@@ -4575,6 +4722,92 @@ async fn write_max_bytes_request_override_reset_and_load_process_default() {
         status,
         StatusCode::OK,
         "a request may raise an environment default: {body}"
+    );
+}
+
+/// The HTTP load routes take the keyed write statements' names: `upsert`
+/// keeps what a record omits, `replace` writes the whole entity and `insert`
+/// refuses an existing key with nothing published; edition 2's `append` and
+/// `merge` are a 400 naming the mode that now means what they meant, before
+/// anything is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_routes_take_the_write_statement_modes_issue_1278() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let alice_age = |app: axum::Router| async move {
+        let (status, body) = json_response(
+            &app,
+            json_post(
+                "/query",
+                &json!({"query": "query q() { match { $p: Person } where $p.name = \"Alice\" return { $p.age } }"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["rows"][0]["p.age"].clone()
+    };
+    let data = json!({"type": "Person", "data": {"name": "Alice"}}).to_string();
+    let ndjson = |mode: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(&format!("/load/ndjson?branch=main&mode={mode}")))
+            .method(Method::POST)
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(data.clone()))
+            .unwrap()
+    };
+
+    let (status, body) = json_response(
+        &app,
+        json_post("/load", &json!({"mode": "upsert", "data": data})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mode"], "upsert");
+    assert_eq!(
+        alice_age(app.clone()).await,
+        30,
+        "upsert keeps the omitted age"
+    );
+
+    let head = main_head_commit_id(&app).await;
+    let (status, body) = json_response(&app, ndjson("insert")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.to_string().contains("`upsert`"), "{body}");
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "the refused insert published nothing"
+    );
+
+    let (status, body) = json_response(&app, ndjson("replace")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        alice_age(app.clone()).await,
+        Value::Null,
+        "replace nulls the omitted age"
+    );
+
+    let head = main_head_commit_id(&app).await;
+    for (old, new) in [("append", "insert"), ("merge", "replace")] {
+        for request in [
+            json_post("/load", &json!({"mode": old, "data": data})),
+            ndjson(old),
+        ] {
+            let (status, body) = json_response(&app, request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{old}: {body}");
+            assert_eq!(body["code"], "bad_request", "{old}: {body}");
+            let message = body["error"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(&format!("the load mode `{old}` was removed"))
+                    && message.contains(&format!("write `{new}`")),
+                "{old}: {body}"
+            );
+        }
+    }
+    assert_eq!(
+        main_head_commit_id(&app).await,
+        head,
+        "a refused mode published nothing"
     );
 }
 
@@ -4697,7 +4930,7 @@ async fn query_endpoint_runs_inline_read() {
     assert_eq!(body["rows"][0]["p.name"], "Alice");
 }
 
-const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match {\n        $p: Person\n        $p.age > 30\n    }\n    return { $p.name }\n}\n";
+const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match { $p: Person }\n    where $p.age > 30\n    return { $p.name }\n}\n";
 
 /// One tree of an `explain` answer, rebuilt from its pre-order rows: a node
 /// is its `detail` fields plus `node`, its children the rows one level deeper
@@ -4794,7 +5027,7 @@ async fn query_endpoint_answers_an_explain_load_statement_as_rows() {
         assert_eq!(validate["inputs"][0]["node"], "CsvSource", "{physical}");
         assert_eq!(explain_tree(&body, "logical")["node"], "FragmentWrite");
         assert_eq!(explain_plan_rows(&body, "route"), ["engine"], "{body}");
-        assert_eq!(explain_plan_rows(&body, "explain_version"), ["8"], "{body}");
+        assert_eq!(explain_plan_rows(&body, "explain_version"), ["9"], "{body}");
     }
     assert_eq!(
         main_head_commit_id(&app).await,
@@ -4937,9 +5170,9 @@ async fn query_endpoint_answers_an_explain_statement_as_rows() {
     );
 }
 
-const EXPLAIN_INSERT_PERSON: &str = "explain query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}\n";
+const EXPLAIN_INSERT_PERSON: &str = "explain query insert_person($name: String, $age: I32) {\n    replace Person { name: $name, age: $age }\n}\n";
 
-const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match {\n        $a: Person\n        $b: Person\n        $a.age > $b.age\n    }\n    return { $a.name, $b.name }\n}\n";
+const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match { $a: Person, let $bs = { match { $b: Person } return { $b } }, from $bs }\n    where $a.age > $b.age\n    return { $a.name, $b.name }\n}\n";
 
 /// The `explain` answer lists the lowered DataFusion tree after the physical
 /// tree: a filter over two bindings, which no scan can take, runs in the
@@ -5137,7 +5370,7 @@ async fn load_endpoint_loads_into_existing_branch() {
     let request = IngestRequest {
         branch: Some("main".to_string()),
         from: None,
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: r#"{"type":"Person","data":{"name":"Loaded","age":7}}"#.to_string(),
     };
     let response = app
@@ -5254,7 +5487,7 @@ node Plain { slug: String @key }
                 if path == "/load/ndjson" {
                     Request::builder()
                         .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                        .uri(g("/load/ndjson?branch=main&mode=merge"))
+                        .uri(g("/load/ndjson?branch=main&mode=replace"))
                         .method(Method::POST)
                         .header("content-type", "application/x-ndjson")
                         .body(Body::from(data.to_owned()))
@@ -5262,7 +5495,7 @@ node Plain { slug: String @key }
                 } else {
                     json_post(
                         path,
-                        &json!({"branch": "main", "mode": "merge", "data": data}),
+                        &json!({"branch": "main", "mode": "replace", "data": data}),
                     )
                 }
             };
@@ -5401,7 +5634,7 @@ async fn raw_graph_batch_load_publishes_mixed_declarations_in_one_commit() {
         .oneshot(
             Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .uri(g("/load/ndjson?branch=main&mode=insert"))
                 .method(Method::POST)
                 .header("content-type", "application/x-ndjson")
                 .body(Body::from(batch))
@@ -5507,7 +5740,7 @@ async fn invalid_raw_graph_batch_has_no_effect() {
         .oneshot(
             Request::builder()
                 .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .uri(g("/load/ndjson?branch=main&mode=append"))
+                .uri(g("/load/ndjson?branch=main&mode=insert"))
                 .method(Method::POST)
                 .header("content-type", "application/x-ndjson")
                 .body(Body::from(concat!(
@@ -5658,7 +5891,7 @@ async fn query_rows_omit_null_cells() {
     let (_temp, app) = app_for_loaded_graph().await;
 
     let request = QueryRequest {
-        query: "query knows_since() {\n    match {\n        $a: Person\n        $a $k:knows $b\n    }\n    return { $a.name, $k.since }\n}\n"
+        query: "query knows_since() {\n    match { $a: Person, $a $k:knows $b }\n    return { $a.name, $k.since }\n}\n"
             .to_string(),
         name: Some("knows_since".to_string()),
         params: None,
@@ -6444,9 +6677,9 @@ node Doc {
 "#;
     const EMBED_QUERY: &str = r#"
 query vector_search_string($q: String) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 "#;
@@ -6514,22 +6747,22 @@ query vector_search_string($q: String) {
     );
 }
 
-/// A ranked read's envelope reports its ranking: the fusion, the direction
-/// its score orders, that two `bm25` arms score every match, and both
-/// columns that read the fused score; since the object is compared whole, no
-/// parameter value appears. An unranked read carries none.
+/// A ranked read's envelope reports its ranking: the exact `bm25`, the
+/// direction its score orders, that it scores every match, and both columns
+/// that read the score; since the object is compared whole, no parameter
+/// value appears. An unranked read carries none.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_envelope_reports_its_ranking() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    title: String @index\n}\n";
     const QUERIES: &str = r#"
-query fused($a: String, $b: String) {
-    match { $d: Doc }
+query fused($a: String) {
+    match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.title, $a) as $score }
     return {
         $d.slug,
-        rrf(bm25($d.title, $a), bm25($d.title, $b)) as fused,
-        rrf(bm25($d.title, $a), bm25($d.title, $b)) as again
+        $score as fused,
+        $score as again
     }
-    order { rrf(bm25($d.title, $a), bm25($d.title, $b)) }
+    order { $score desc }
     limit 2
 }
 query unranked() {
@@ -6559,7 +6792,7 @@ query unranked() {
             &json!({
                 "query": QUERIES,
                 "name": "fused",
-                "params": {"a": "needle", "b": "guide"}
+                "params": {"a": "needle guide"}
             }),
         ),
     )
@@ -6568,7 +6801,7 @@ query unranked() {
     assert_eq!(
         body["ranking"],
         json!({
-            "by": "rrf",
+            "by": "bm25",
             "order": "descending",
             "exhaustive": true,
             "score_columns": ["fused", "again"]
@@ -6811,7 +7044,7 @@ async fn aggregate_mutation_memory_refusal_keeps_graph_and_admission_usable() {
         json_post(
             "/mutate",
             &json!({"query":
-                "query small() { insert First { name: \"ok\", payload: \"ok\" } }"
+                "query small() { replace First { name: \"ok\", payload: \"ok\" } }"
             }),
         ),
     )
@@ -6857,8 +7090,10 @@ async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
         (
             "/mutate",
             json!({"query": "query clear() {\n\
-                delete First where name != \"\"\n\
-                delete Second where name != \"\"\n\
+                match { $x: First } where $x.name != \"\"\n\
+                delete $x\n\
+                match { $y: Second } where $y.name != \"\"\n\
+                delete $y\n\
             }"}),
         ),
         (
@@ -6904,7 +7139,7 @@ async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
         &app,
         json_post(
             "/mutate",
-            &json!({"query": "query small() { insert First { name: \"ok\" } }"}),
+            &json!({"query": "query small() { replace First { name: \"ok\" } }"}),
         ),
     )
     .await;
@@ -6998,12 +7233,12 @@ async fn change_disjoint_table_concurrency_succeeds_under_branch_occ_gate() {
     // must reflect every insert.
     const PERSON_QUERY: &str = r#"
 query insert_p($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#;
     const COMPANY_QUERY: &str = r#"
 query insert_c($name: String) {
-    insert Company { name: $name }
+    replace Company { name: $name }
 }
 "#;
     const SEED_PERSONS: u64 = 4;
@@ -7185,7 +7420,7 @@ async fn ingest_per_actor_admission_cap_returns_429() {
                 ),
                 branch: Some("main".to_string()),
                 from: Some("main".to_string()),
-                mode: Some(omnigraph::loader::LoadMode::Merge),
+                mode: Some(omnigraph::loader::LoadMode::Replace),
             })
             .unwrap();
             let req = Request::builder()
@@ -8006,7 +8241,7 @@ async fn load_commit(app: &axum::Router, ndjson: &str) -> String {
     let request = IngestRequest {
         branch: Some("main".to_string()),
         from: None,
-        mode: Some(LoadMode::Merge),
+        mode: Some(LoadMode::Replace),
         data: ndjson.to_string(),
     };
     let (status, body) = json_response(
@@ -8746,7 +8981,7 @@ async fn removed_routes_and_legacy_query_fields_refuse_without_graph_effects() {
             .oneshot(json_post(
                 path,
                 &json!({
-                    "query": "mutation add() { insert Person { name: \"Unexpected\", age: 1 } }",
+                    "query": "mutation add() { replace Person { name: \"Unexpected\", age: 1 } }",
                     "data": "{\"type\":\"Person\",\"data\":{\"name\":\"Unexpected\",\"age\":1}}"
                 }),
             ))

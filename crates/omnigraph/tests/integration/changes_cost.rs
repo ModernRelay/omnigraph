@@ -81,7 +81,7 @@ node Company {
                     } else {
                         format!(r#"{{"type":"Company","data":{{"slug":"filler-{commit}"}}}}"#)
                     };
-                    db.load_with_receipt("main", &batch, LoadMode::Merge)
+                    db.load_with_receipt("main", &batch, LoadMode::Replace)
                         .await
                         .unwrap();
                 }
@@ -93,7 +93,7 @@ node Company {
                     db.load_with_receipt(
                         "main",
                         r#"{"type":"Person","data":{"name":"stale-index-tail","age":1}}"#,
-                        LoadMode::Merge,
+                        LoadMode::Replace,
                     )
                     .await
                     .unwrap();
@@ -121,7 +121,7 @@ node Company {
                     .load_with_receipt(
                         "main",
                         r#"{"type":"Person","data":{"name":"p00000","age":2}}"#,
-                        LoadMode::Merge,
+                        LoadMode::Replace,
                     )
                     .await
                     .unwrap();
@@ -214,7 +214,7 @@ node Document {
         db.load(
             "main",
             r#"{"type":"Document","data":{"slug":"seed"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -227,13 +227,13 @@ node Document {
             .collect::<Vec<_>>()
             .join("\n");
         let inserted = db
-            .load_with_receipt("main", &batch, LoadMode::Merge)
+            .load_with_receipt("main", &batch, LoadMode::Replace)
             .await
             .unwrap();
 
         let deleted = db.mutate_with_receipt(
             "main",
-            "query del() { delete Document where slug != \"\" }",
+            "query del() { match { $x: Document } where $x.slug != \"\"  delete $x }",
             "del",
             &ParamMap::new(),
         ).await.unwrap().commit.unwrap();
@@ -328,7 +328,7 @@ async fn changes_page_unproven_op_scan_term_grows_with_table_extent() {
                 } else {
                     format!(r#"{{"type":"Company","data":{{"slug":"filler-{commit}"}}}}"#)
                 };
-                db.load_with_receipt("main", &batch, LoadMode::Merge)
+                db.load_with_receipt("main", &batch, LoadMode::Replace)
                     .await
                     .unwrap();
             }
@@ -337,7 +337,7 @@ async fn changes_page_unproven_op_scan_term_grows_with_table_extent() {
             let deleted = db
                 .mutate_with_receipt(
                     "main",
-                    "query del() { delete Person where name = \"p00000\" }",
+                    "query del() { match { $x: Person } where $x.name = \"p00000\"  delete $x }",
                     "del",
                     &ParamMap::new(),
                 )
@@ -414,14 +414,14 @@ node Document {
                     )
                 })
                 .collect();
-            db.load_with_receipt("main", &batch.join("\n"), LoadMode::Merge)
+            db.load_with_receipt("main", &batch.join("\n"), LoadMode::Replace)
                 .await
                 .unwrap();
             let updated = db
                 .load_with_receipt(
                     "main",
                     r#"{"type":"Document","data":{"title":"d000","note":"revised","payload":"base64:QQ=="}}"#,
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .unwrap();
@@ -479,7 +479,7 @@ async fn change_feed_caught_up_poll_is_data_flat() {
             let batch: Vec<String> = (0..rows)
                 .map(|i| format!(r#"{{"type":"Person","data":{{"name":"p{i:05}","age":1}}}}"#))
                 .collect();
-            db.load_with_receipt("main", &batch.join("\n"), LoadMode::Merge)
+            db.load_with_receipt("main", &batch.join("\n"), LoadMode::Replace)
                 .await
                 .unwrap();
             let now = db
@@ -555,7 +555,7 @@ async fn change_feed_caught_up_poll_manifest_reads_are_flat_in_history() {
                 db.load_with_receipt(
                     "main",
                     &format!(r#"{{"type":"Person","data":{{"name":"p{i:05}","age":1}}}}"#),
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .unwrap();
@@ -632,7 +632,7 @@ async fn graph_diff_side_resolution_is_flat_in_live_branches() {
             db.load_with_receipt(
                 "main",
                 r#"{"type":"Person","data":{"name":"base","age":1}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -644,7 +644,7 @@ async fn graph_diff_side_resolution_is_flat_in_live_branches() {
                     "\n",
                     r#"{"type":"Person","data":{"name":"feature-two","age":3}}"#,
                 ),
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -748,7 +748,7 @@ async fn graph_diff_across_a_compaction_reads_data_flat_in_table_extent() {
                     })
                     .collect();
                 let receipt = db
-                    .load_with_receipt("main", &rows.join("\n"), LoadMode::Merge)
+                    .load_with_receipt("main", &rows.join("\n"), LoadMode::Replace)
                     .await
                     .unwrap();
                 from_commit = Some(receipt.commit.graph_commit_id.clone());
@@ -774,7 +774,7 @@ async fn graph_diff_across_a_compaction_reads_data_flat_in_table_extent() {
                     format!(r#"{{"type":"Person","data":{{"name":"p{index:06}","age":1}}}}"#)
                 })
                 .collect();
-            db.load_with_receipt("main", &updates.join("\n"), LoadMode::Merge)
+            db.load_with_receipt("main", &updates.join("\n"), LoadMode::Replace)
                 .await
                 .unwrap();
 
@@ -859,7 +859,7 @@ async fn change_feed_backlog_walk_grows_with_commits_examined() {
                 db.load_with_receipt(
                     "main",
                     &format!(r#"{{"type":"Person","data":{{"name":"b-{row}","age":1}}}}"#),
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .unwrap();
@@ -955,7 +955,7 @@ async fn change_feed_small_ceiling_poll_is_bounded_across_backlog_depths() {
                 db.load_with_receipt(
                     "main",
                     &format!(r#"{{"type":"Person","data":{{"name":"b-{row}","age":1}}}}"#),
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .unwrap();
@@ -1039,7 +1039,7 @@ async fn graph_diff_over_several_commits_reads_data_flat_in_table_extent() {
                     })
                     .collect();
                 let receipt = db
-                    .load_with_receipt("main", &rows.join("\n"), LoadMode::Merge)
+                    .load_with_receipt("main", &rows.join("\n"), LoadMode::Replace)
                     .await
                     .unwrap();
                 from_commit = Some(receipt.commit.graph_commit_id.clone());
@@ -1055,7 +1055,7 @@ async fn graph_diff_over_several_commits_reads_data_flat_in_table_extent() {
                             )
                         })
                         .collect();
-                    db.load_with_receipt(branch, &updates.join("\n"), LoadMode::Merge)
+                    db.load_with_receipt(branch, &updates.join("\n"), LoadMode::Replace)
                         .await
                         .unwrap();
                 }
@@ -1161,7 +1161,7 @@ async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
             .map(|index| format!(r#"{{"type":"Person","data":{{"name":"p{index:03}","age":0}}}}"#))
             .collect();
         let loaded = db
-            .load_with_receipt("main", &rows.join("\n"), LoadMode::Merge)
+            .load_with_receipt("main", &rows.join("\n"), LoadMode::Replace)
             .await
             .unwrap();
         db.branch_create("side-a").await.unwrap();
@@ -1169,7 +1169,7 @@ async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
         db.load_with_receipt(
             "side-a",
             r#"{"type":"Person","data":{"name":"p003","age":1}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -1177,7 +1177,7 @@ async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
             .load_with_receipt(
                 "side-a",
                 r#"{"type":"Person","data":{"name":"p001","age":1}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -1185,7 +1185,7 @@ async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
             .load_with_receipt(
                 "side-b",
                 r#"{"type":"Person","data":{"name":"p002","age":2}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -1333,7 +1333,7 @@ async fn diff_of_a_column_patch_commit_takes_row_identity_issue_1264() {
             .graph_commit_id;
         db.mutate(
             "main",
-            "query bump() { update Doc set { score: 3 } where age >= 32 }",
+            "query bump() { match { $x: Doc } where $x.age >= 32  update $x set { score: 3 } }",
             "bump",
             &ParamMap::new(),
         )

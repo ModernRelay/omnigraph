@@ -60,9 +60,14 @@ pub fn render_span(span: SourceSpan) -> SourceSpan {
 }
 
 pub fn decode_string_literal(raw: &str) -> Result<String> {
+    // A string takes single or double quotes, with the same escapes.
     let inner = raw
         .strip_prefix('"')
         .and_then(|inner| inner.strip_suffix('"'))
+        .or_else(|| {
+            raw.strip_prefix('\'')
+                .and_then(|inner| inner.strip_suffix('\''))
+        })
         .unwrap_or(raw);
 
     let mut decoded = String::with_capacity(inner.len());
@@ -78,6 +83,7 @@ pub fn decode_string_literal(raw: &str) -> Result<String> {
             .ok_or_else(|| CompilerError::Parse("unterminated escape sequence".to_string()))?;
         match escaped {
             '"' => decoded.push('"'),
+            '\'' => decoded.push('\''),
             '\\' => decoded.push('\\'),
             'n' => decoded.push('\n'),
             'r' => decoded.push('\r'),

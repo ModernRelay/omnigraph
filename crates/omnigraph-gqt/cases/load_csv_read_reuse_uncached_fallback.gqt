@@ -39,7 +39,7 @@ person-0001|person-0002|2
 
 --- mutate
 set query_memory_bytes = 3145728;
-load csv "knows_uncached.csv" into edge:Knows mode append delimiter "|" header
+load csv "knows_uncached.csv" into edge:Knows mode insert delimiter "|" header
 
 --- expect ok
 
@@ -49,17 +49,13 @@ person-0002|person-0003|3
 person-0003|person-0004|4
 
 --- mutate
-load csv "knows_admitted.csv" into edge:Knows mode append delimiter "|" header
+load csv "knows_admitted.csv" into edge:Knows mode insert delimiter "|" header
 
 --- expect ok
 
 --- query
 query loaded() {
-    match {
-        $a: Person
-        $b: Person
-        $a knows $b
-    }
+    match { $a: Person, $b: Person, $a knows $b }
     return { $a.id, $b.id }
 }
 
@@ -79,7 +75,7 @@ load csv "knows_uncached.csv" into edge:Knows mode overwrite delimiter "|" heade
 --- expect ok
 
 --- query
-query replaced_uncached() { match { $a: Person $a knows $b } return { count($b) as n } }
+query replaced_uncached() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n":2}
 --- expect shape
@@ -90,7 +86,7 @@ load csv "knows_admitted.csv" into edge:Knows mode overwrite delimiter "|" heade
 --- expect ok
 
 --- query
-query replaced_admitted() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+query replaced_admitted() { match { $a: Person, $a knows $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": "person-0002", "b.id": "person-0003"}
 {"a.id": "person-0003", "b.id": "person-0004"}

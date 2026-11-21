@@ -54,13 +54,14 @@ use lance_datafusion::exec::{
     collect_execution_metrics,
 };
 use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
-use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
+use lance_index::scalar::ScalarIndexParams;
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
 use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use omnigraph_compiler::SystemColumns;
+use omnigraph_compiler::schema::vector::VectorDistance;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::{num::NonZero, sync::Arc};
 
@@ -69,27 +70,28 @@ use crate::blob::{
     StorageRootConflict, nested_blob_field,
 };
 use crate::dataset_index::{
-    has_btree_index_on, has_fts_index_on, has_fts_postings_on, has_vector_index_on,
-    is_full_text_index, validate_full_text_demand, validate_full_text_scan,
+    ScalarIndexFamily, has_btree_index_on, has_fts_index_on, has_fts_postings_on,
+    has_scalar_index_on, has_vector_index_on, is_full_text_index, validate_full_text_demand,
+    validate_full_text_scan,
 };
 use crate::db::manifest::{TableVersionMetadata, open_dataset_entry};
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::seams::{decide_seam, skip};
 use crate::storage_layer::{
-    BLOB_READ_IO_BUFFER_BYTES, IndexBuildSpec, KEYED_WRITE_MAX_BYTES, KEYED_WRITE_MAX_ROWS,
-    KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
+    BLOB_READ_IO_BUFFER_BYTES, FullTextColumn, IndexBuildSpec, KEYED_WRITE_MAX_BYTES,
+    KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, PendingScanBudget, ProvenInsertChunk,
 };
 
 pub(crate) use crate::error::is_scratch_exhaustion;
 pub(crate) use omnigraph_core::dataset_index::FtsFilterDemand;
 pub use omnigraph_core::dataset_index::IndexCoverage;
-pub(crate) use omnigraph_core::fts_compat;
 #[cfg(test)]
 pub(crate) use omnigraph_core::staging::{
     STAGED_AGAINST_BRANCH_INCARNATION, STAGED_AGAINST_GRAPH_HEAD,
 };
 pub(crate) use omnigraph_core::staging::{StagedTransactionIdentity, StagingWitness};
+pub(crate) use omnigraph_core::{fts_analysis, fts_compat};
 
 /// Durable proof carried by an OmniGraph insertion-only transaction.
 ///
@@ -243,7 +245,6 @@ pub(crate) const PIPELINED_IO_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 /// ordered plan after `scan_stream_with` chose the ordinary Lance executor.
 pub(crate) struct ScanTuning<'a> {
     scanner: &'a mut Scanner,
-    full_text_columns: Option<HashSet<String>>,
     /// FTS-index demand of the typed filters set through this surface, unioned
     /// over every `filter_expr` call although Lance keeps only the last filter:
     /// a fail-closed over-approximation.
@@ -255,7 +256,6 @@ struct PreparedScan {
     scanner: Scanner,
     has_ordering: bool,
     has_sql_filter: bool,
-    full_text_columns: Option<HashSet<String>>,
     filter_demand: FtsFilterDemand,
 }
 
@@ -291,17 +291,14 @@ impl PreparedScan {
         }
         let mut tuning = ScanTuning {
             scanner: &mut scanner,
-            full_text_columns: None,
             filter_demand: FtsFilterDemand::default(),
         };
         configure(&mut tuning)?;
-        let full_text_columns = tuning.full_text_columns;
         let filter_demand = tuning.filter_demand;
         Ok(Self {
             scanner,
             has_ordering,
             has_sql_filter: filter.is_some(),
-            full_text_columns,
             filter_demand,
         })
     }
@@ -309,9 +306,9 @@ impl PreparedScan {
     /// The scanner, once its full-text reads are checked against `dataset`.
     async fn validated(self, dataset: &Dataset) -> Result<Scanner> {
         if self.has_sql_filter {
-            validate_full_text_scan(dataset, &self.scanner, self.full_text_columns).await?;
-        } else if self.full_text_columns.is_some() || !self.filter_demand.is_empty() {
-            validate_full_text_demand(dataset, self.full_text_columns, self.filter_demand).await?;
+            validate_full_text_scan(dataset, &self.scanner).await?;
+        } else if !self.filter_demand.is_empty() {
+            validate_full_text_demand(dataset, self.filter_demand).await?;
         }
         Ok(self.scanner)
     }
@@ -379,34 +376,28 @@ impl ScanTuning<'_> {
         self
     }
 
-    pub(crate) fn full_text_search(
-        &mut self,
-        query: FullTextSearchQuery,
-    ) -> std::result::Result<&mut Self, lance::Error> {
-        // Compound queries can mix explicit and omitted columns. Any omitted
-        // leaf allows Lance to search all FTS columns, not just named leaves.
-        let columns = if query.query.is_missing_column() {
-            HashSet::new()
-        } else {
-            query.columns()
-        };
-        self.scanner.full_text_search(query)?;
-        self.full_text_columns = Some(columns);
-        Ok(self)
-    }
-
-    /// A kNN over `column` by squared L2, the metric `nearest` promises.
-    /// Without an explicit metric Lance ranks by the metric of whatever
-    /// vector index covers the column; with one it searches an index of
-    /// another metric flat instead (Lance 13 `Scanner::create_plan`).
+    /// A kNN over `column` by `distance`, the field's declared distance,
+    /// which `nearest` promises. Without an explicit metric Lance ranks by
+    /// the metric of whatever vector index covers the column; with one it
+    /// searches an index of another metric flat instead (Lance 13
+    /// `Scanner::create_plan`), so an index built for another distance is
+    /// never used. A `cosine` index stores its vectors normalized and
+    /// searches them under L2, so its `_distance` is not the flat path's
+    /// value for the same row; a `cosine` search re-scores its candidates on
+    /// the stored vectors (`refine(1)`), whose value is the flat kNN's, so a
+    /// row's distance does not depend on index coverage.
     pub(crate) fn nearest(
         &mut self,
         column: &str,
         query: &dyn Array,
         limit: usize,
+        distance: VectorDistance,
     ) -> std::result::Result<&mut Self, lance::Error> {
         self.scanner.nearest(column, query, limit)?;
-        self.scanner.distance_metric(MetricType::L2);
+        self.scanner.distance_metric(metric_type(distance));
+        if distance == VectorDistance::Cosine {
+            self.scanner.refine(1);
+        }
         Ok(self)
     }
 
@@ -1080,6 +1071,12 @@ struct IndexLag {
     name: String,
     fields: Vec<i32>,
     vector: bool,
+    /// The scalar family a non-vector index is rebuilt in; `None` for a
+    /// vector index.
+    family: Option<ScalarIndexFamily>,
+    /// The distance a vector index ranks by exactly, which its fold keeps;
+    /// `None` for any other index.
+    distance: Option<VectorDistance>,
 }
 
 /// How many BTREE index builds may run at once in one maintenance pass
@@ -1196,6 +1193,89 @@ pub struct StagedIndexReconciliation {
 pub struct RefreshedIndex {
     pub column: String,
     pub vector: bool,
+    /// The family a rebuilt scalar index kept; `None` for a vector index.
+    pub family: Option<ScalarIndexFamily>,
+}
+
+/// The name the engine gives a BITMAP, LABEL_LIST or NGRAM index on
+/// `column`, and a String's BTREE beside its full-text index:
+/// `{column}_{family}`. A same-batch companion builder cannot see another's
+/// default name, so these are explicit.
+pub(crate) fn scalar_index_name(column: &str, family: ScalarIndexFamily) -> String {
+    format!("{column}_{}", family.as_str())
+}
+
+/// The Lance metric a field's declared distance names: Lance's `l2` is the
+/// sum of squared differences, its `cosine` is `1 - cos` and its `dot` is
+/// `1 - dot` (`lance_linalg::distance`), the values the RFC's table states.
+pub(crate) fn metric_type(distance: VectorDistance) -> MetricType {
+    match distance {
+        VectorDistance::L2 => MetricType::L2,
+        VectorDistance::Cosine => MetricType::Cosine,
+        VectorDistance::Dot => MetricType::Dot,
+    }
+}
+
+/// The distance a vector index segment scores every row of each partition
+/// it searches by exactly: IVF with unquantized vectors (IVF_FLAT) and the
+/// L2, cosine or dot metric, the only vector index the engine builds. `None`
+/// for a segment with quantized vectors (PQ, SQ, RQ), an HNSW graph or
+/// another metric, which approximate or rank differently, and for one whose
+/// details are empty: Lance infers missing details when it loads indices,
+/// and an empty value left after that is unknown, not the proto defaults
+/// (L2, no compression) it would decode to. Details carrying a field this
+/// Lance does not know are not exact either: the decoder drops the field,
+/// which may be a newer sub-index (an IVF_VAMANA_FLAT index adds
+/// `vamana_index_config`, lance#10318), so the re-encoded details must be
+/// as long as the stored ones.
+pub(crate) fn exact_vector_index_distance(index: &IndexMetadata) -> Option<VectorDistance> {
+    use lance_index::pb::{
+        VectorIndexDetails, VectorMetricType, vector_index_details::Compression,
+    };
+    let details = index.index_details.as_ref()?;
+    if details.value.is_empty() || !IndexDetails(details.clone()).is_vector() {
+        return None;
+    }
+    let decoded = details.to_msg::<VectorIndexDetails>().ok()?;
+    if prost::Message::encoded_len(&decoded) != details.value.len() {
+        return None;
+    }
+    if decoded.hnsw_index_config.is_some()
+        || !matches!(decoded.compression, None | Some(Compression::Flat(_)))
+    {
+        return None;
+    }
+    match VectorMetricType::try_from(decoded.metric_type).ok()? {
+        VectorMetricType::L2 => Some(VectorDistance::L2),
+        VectorMetricType::Cosine => Some(VectorDistance::Cosine),
+        VectorMetricType::Dot => Some(VectorDistance::Dot),
+        _ => None,
+    }
+}
+
+/// Whether every vector index segment keyed on `column` of `dataset` ranks
+/// exactly by `distance` ([`exact_vector_index_distance`]); true when no
+/// vector index covers the column, since Lance then scores every row flat.
+pub(crate) async fn vector_indexes_rank_exactly(
+    dataset: &Dataset,
+    column: &str,
+    distance: VectorDistance,
+) -> Result<bool> {
+    let Some(field) = dataset.schema().field(column) else {
+        return Ok(true);
+    };
+    let indices = dataset.load_indices().await.map_err(OmniError::storage)?;
+    Ok(indices
+        .iter()
+        .filter(|index| !is_system_index(index))
+        .filter(|index| index.fields.first() == Some(&field.id))
+        .filter(|index| {
+            index
+                .index_details
+                .as_ref()
+                .is_none_or(|details| IndexDetails(details.clone()).is_vector())
+        })
+        .all(|index| exact_vector_index_distance(index) == Some(distance)))
 }
 
 /// The segments one index batch adds and the segments they replace, all
@@ -1406,8 +1486,8 @@ async fn commit_detached(
 async fn full_text_columns_without_segment(
     base: &Dataset,
     effect: Option<&Operation>,
-    columns: &[String],
-) -> Result<Vec<String>> {
+    columns: &[FullTextColumn],
+) -> Result<Vec<FullTextColumn>> {
     let schema = match effect {
         Some(
             Operation::Overwrite { schema, .. }
@@ -1416,9 +1496,9 @@ async fn full_text_columns_without_segment(
         ) => schema,
         _ => base.schema(),
     };
-    let present: Vec<(&String, i32)> = columns
+    let present: Vec<(&FullTextColumn, i32)> = columns
         .iter()
-        .filter_map(|column| schema.field(column).map(|field| (column, field.id)))
+        .filter_map(|column| schema.field(&column.column).map(|field| (column, field.id)))
         .collect();
     if present.is_empty() || matches!(effect, Some(Operation::Overwrite { .. })) {
         return Ok(present
@@ -3340,7 +3420,10 @@ impl TableStore {
     /// One eligibility rule for optimize planning and execution. Full-text
     /// folding cannot establish analyzer proof; unknown kinds cannot be planned.
     pub(crate) fn can_fold_index(index: &IndexMetadata) -> bool {
-        !is_system_index(index) && index.index_details.is_some() && !is_full_text_index(index)
+        !is_system_index(index)
+            && index.index_details.is_some()
+            && !is_full_text_index(index)
+            && (Self::index_is_vector(index) || ScalarIndexFamily::of(index).is_some())
     }
 
     /// Whether a foldable index is a vector index.
@@ -3434,6 +3517,8 @@ impl TableStore {
                 name,
                 fields: segments[0].fields.clone(),
                 vector,
+                family: ScalarIndexFamily::of(segments[0]),
+                distance: exact_vector_index_distance(segments[0]),
             });
         }
         Ok(lag)
@@ -3474,7 +3559,18 @@ impl TableStore {
         specs: &[IndexBuildSpec],
         limit: &MaintenanceBudget,
     ) -> Result<StagedIndexReconciliation> {
-        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds, limit).await?;
+        // A vector column a spec builds anew (its index is missing or was
+        // built for another distance) is not also folded: the spec's index
+        // replaces every vector index on the column.
+        let rebuilt: HashSet<&str> = specs
+            .iter()
+            .filter_map(|spec| match spec {
+                IndexBuildSpec::Vector { column, .. } => Some(column.as_str()),
+                _ => None,
+            })
+            .collect();
+        let (mut batch, refreshed, skipped) =
+            Self::index_fold_batch_except(ds, &rebuilt, limit).await?;
         let mut vector_builds = 0;
         if !specs.is_empty() {
             let (created, builds) = Self::create_index_batch(ds, specs, limit).await?;
@@ -3502,7 +3598,25 @@ impl TableStore {
         ds: &Dataset,
         limit: &MaintenanceBudget,
     ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
-        let lag = Self::foldable_index_lag(ds).await?;
+        Self::index_fold_batch_except(ds, &HashSet::new(), limit).await
+    }
+
+    /// [`Self::index_fold_batch`] leaving out the indexes on `columns`.
+    async fn index_fold_batch_except(
+        ds: &Dataset,
+        columns: &HashSet<&str>,
+        limit: &MaintenanceBudget,
+    ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
+        let lag: Vec<IndexLag> = Self::foldable_index_lag(ds)
+            .await?
+            .into_iter()
+            .filter(|item| {
+                item.fields
+                    .first()
+                    .and_then(|id| ds.schema().field_by_id(*id))
+                    .is_none_or(|field| !columns.contains(field.name.as_str()))
+            })
+            .collect();
         if lag.is_empty() {
             return Ok((IndexBatch::default(), Vec::new(), Vec::new()));
         }
@@ -3529,17 +3643,30 @@ impl TableStore {
         let builds = items.iter().map(|(item, column, segments)| async move {
             let mut ds_clone = ds.clone();
             let columns = [column.as_str()];
+            // A BTREE rebuild shares the budget's width; any other family
+            // (BITMAP, LABEL_LIST, NGRAM) and a vector rebuild take all of
+            // it (`MaintenanceBudget::permit_for`).
             let kind = if item.vector {
                 IndexType::Vector
             } else {
-                IndexType::BTree
+                item.family
+                    .map(ScalarIndexFamily::index_type)
+                    .unwrap_or(IndexType::BTree)
             };
             let _permit = limit.permit_for(kind).await?;
             let built = if item.vector {
-                // Keep the index's partition count across folds.
+                // Keep the index's partition count: the engine builds one
+                // partition, but a partitioned index (Lance's split, or an
+                // explicit build) keeps its shape across folds.
+                // The fold keeps the index's distance; an index that is not
+                // an exact IVF_FLAT (one the engine never builds) is rebuilt
+                // by `l2`, and the reconciler replaces any index whose
+                // distance is not its field's.
                 let partitions = Self::vector_partition_count(ds, &item.name, segments).await?;
-                let params =
-                    lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
+                let params = lance::index::vector::VectorIndexParams::ivf_flat(
+                    partitions,
+                    metric_type(item.distance.unwrap_or_default()),
+                );
                 ds_clone
                     .create_index_builder(&columns, kind, &params)
                     .name(item.name.clone())
@@ -3547,10 +3674,18 @@ impl TableStore {
                     .execute_uncommitted()
                     .await
             } else {
+                // A scalar index is rebuilt in its own family; one of no
+                // known family is not foldable (`can_fold_index`).
+                let family = item.family.ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "lagging index '{}' has no scalar family to fold in",
+                        item.name
+                    ))
+                })?;
                 let params = ScalarIndexParams::default();
                 let _probe = crate::instrumentation::enter_index_build_probe().await;
                 ds_clone
-                    .create_index_builder(&columns, kind, &params)
+                    .create_index_builder(&columns, family.index_type(), &params)
                     .name(item.name.clone())
                     .replace(true)
                     .execute_uncommitted()
@@ -3603,6 +3738,7 @@ impl TableStore {
             refreshed.push(RefreshedIndex {
                 column,
                 vector: item.vector,
+                family: item.family,
             });
             new_indices.push(new_idx);
         }
@@ -3620,7 +3756,7 @@ impl TableStore {
         if let Some(filter) = &filter {
             let mut scanner = ds.scan();
             scanner.filter(filter).map_err(OmniError::storage)?;
-            validate_full_text_scan(ds, &scanner, None).await?;
+            validate_full_text_scan(ds, &scanner).await?;
         }
         ds.count_rows(filter).await.map_err(OmniError::storage)
     }
@@ -4854,7 +4990,7 @@ impl TableStore {
         ds: Arc<Dataset>,
         mut staged: StagedWrite,
         witness: &StagingWitness,
-        declared_full_text: &[String],
+        declared_full_text: &[FullTextColumn],
     ) -> Result<(Dataset, StagedTransactionIdentity)> {
         witness.stamp(&mut staged.transaction);
         let undeclared = full_text_columns_without_segment(
@@ -4884,7 +5020,7 @@ impl TableStore {
     pub async fn commit_full_text_declarations(
         &self,
         ds: Arc<Dataset>,
-        columns: &[String],
+        columns: &[FullTextColumn],
         witness: &StagingWitness,
     ) -> Result<Option<(Dataset, StagedTransactionIdentity)>> {
         let undeclared = full_text_columns_without_segment(&ds, None, columns).await?;
@@ -4898,43 +5034,106 @@ impl TableStore {
         Ok(Some((dataset, identity)))
     }
 
+    /// Commit, detached on `ds` under `witness`, the replacement of every
+    /// full-text segment on each column of `columns` by one untrained,
+    /// certified segment built with the column's analysis: the effect of a
+    /// schema apply that changes a column's analyzer. No segment of the old
+    /// analysis survives the commit, so no search on the column reads one;
+    /// the postings are rebuilt from rows off the critical path, by
+    /// `ensure_indices` once no segment covers a fragment.
+    pub async fn commit_full_text_redeclarations(
+        &self,
+        ds: Arc<Dataset>,
+        columns: &[FullTextColumn],
+        witness: &StagingWitness,
+    ) -> Result<(Dataset, StagedTransactionIdentity)> {
+        let mut declaration = self
+            .stage_full_text_segments(&ds, columns, true)
+            .await?
+            .ok_or_else(|| {
+                OmniError::manifest_internal("a full-text redeclaration named no column")
+            })?;
+        witness.stamp(&mut declaration);
+        let dataset = commit_detached(ds, declaration, None).await?;
+        let identity = self.transaction_identity(&dataset)?;
+        Ok((dataset, identity))
+    }
+
     /// The `CreateIndex` that gives every column of `columns` an untrained,
     /// certified full-text segment on `ds`: an empty fragment bitmap, no
-    /// postings, the engine's analyzer. `None` when `columns` is empty.
+    /// postings, the column's analysis. `None` when `columns` is empty.
     pub(crate) async fn stage_full_text_declarations(
         &self,
         ds: &Dataset,
-        columns: &[String],
+        columns: &[FullTextColumn],
+    ) -> Result<Option<Transaction>> {
+        self.stage_full_text_segments(ds, columns, false).await
+    }
+
+    /// [`Self::stage_full_text_declarations`], removing every existing
+    /// full-text segment on those columns when `replace_existing`.
+    async fn stage_full_text_segments(
+        &self,
+        ds: &Dataset,
+        columns: &[FullTextColumn],
+        replace_existing: bool,
     ) -> Result<Option<Transaction>> {
         let mut new_indices = Vec::new();
+        let mut fields = HashSet::new();
         for column in columns {
-            let params = InvertedIndexParams::default();
+            let name = column.column.as_str();
+            let params = fts_analysis::native_params(column.analysis.profile)?;
             let mut builder_ds = ds.clone();
             let mut segment = builder_ds
-                .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
+                .create_index_builder(&[name], IndexType::Inverted, &params)
                 .replace(true)
                 .train(false)
                 .execute_uncommitted()
                 .await
                 .map_err(|error| {
                     OmniError::storage_context(
-                        format!("declare the full-text index on '{column}'"),
+                        format!("declare the full-text index on '{name}'"),
                         error,
                     )
                 })?;
-            fts_compat::write_certificate(ds, &mut segment).await?;
+            fts_compat::write_certificate(
+                ds,
+                &mut segment,
+                &column.analysis.fingerprint,
+                column.analysis.profile,
+                fts_analysis::native_build(),
+            )
+            .await?;
+            fields.extend(segment.fields.iter().copied());
             new_indices.push(segment);
         }
-        Ok((!new_indices.is_empty()).then(|| {
+        if new_indices.is_empty() {
+            return Ok(None);
+        }
+        let removed_indices = if replace_existing && ds.manifest.index_section.is_some() {
+            ds.load_indices()
+                .await
+                .map_err(OmniError::storage)?
+                .iter()
+                .filter(|index| {
+                    is_full_text_index(index)
+                        && index.fields.iter().any(|field| fields.contains(field))
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Some(
             TransactionBuilder::new(
                 ds.manifest.version,
                 Operation::CreateIndex {
                     new_indices,
-                    removed_indices: Vec::new(),
+                    removed_indices,
                 },
             )
-            .build()
-        }))
+            .build(),
+        ))
     }
 
     /// The identity of the transaction a version records (RFC 0067), read
@@ -6139,11 +6338,12 @@ impl TableStore {
             }
         }
 
-        // #1385: independent BTREE builds overlap under `limit`; a full-text
-        // or vector build runs alone. Each builds from the same snapshot and
-        // the results join the batch in specification order, so the batch is
-        // the one a serial loop builds. Observing a build error in that order
-        // drops outstanding builds. Files they wrote remain unreferenced.
+        // Independent BTREE builds overlap under `limit`; any other kind (a
+        // BITMAP, LABEL_LIST, NGRAM, full-text or vector build) runs alone.
+        // Each builds from the same snapshot and the results join the batch
+        // in specification order, so the batch is the one a serial loop
+        // builds. Observing a build error in that order drops outstanding
+        // builds. Files they wrote remain unreferenced.
         let builds = specs.iter().map(|spec| async move {
             let (column, index_type) = spec.column_and_kind();
             let mut ds_clone = ds.clone();
@@ -6165,18 +6365,27 @@ impl TableStore {
                     let _probe = crate::instrumentation::enter_index_build_probe().await;
                     builder.replace(true).execute_uncommitted().await
                 }
-                IndexBuildSpec::FullText { column } => {
-                    let params = InvertedIndexParams::default();
+                IndexBuildSpec::Scalar { column, family } => {
+                    let params = ScalarIndexParams::default();
+                    ds_clone
+                        .create_index_builder(&[column.as_str()], family.index_type(), &params)
+                        .name(scalar_index_name(column, *family))
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await
+                }
+                IndexBuildSpec::FullText { column, analysis } => {
+                    let params = fts_analysis::native_params(analysis.profile)?;
                     ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
                         .replace(true)
                         .execute_uncommitted()
                         .await
                 }
-                IndexBuildSpec::Vector { column } => {
+                IndexBuildSpec::Vector { column, distance } => {
                     let params = lance::index::vector::VectorIndexParams::ivf_flat(
                         ENGINE_VECTOR_PARTITIONS,
-                        MetricType::L2,
+                        metric_type(*distance),
                     );
                     ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
@@ -6201,20 +6410,28 @@ impl TableStore {
         let mut new_names = std::collections::HashSet::with_capacity(specs.len());
         let mut vector_builds = 0usize;
         let mut full_text_fields = HashSet::new();
+        let mut vector_fields = HashSet::new();
         for (spec, mut new_idx) in specs.iter().zip(built) {
-            if matches!(spec, IndexBuildSpec::Vector { .. }) {
-                vector_builds += 1;
-            }
-
             if new_idx.dataset_version != read_version {
                 return Err(OmniError::manifest_internal(format!(
                     "staged index '{}' was built from dataset version {}, expected {}",
                     new_idx.name, new_idx.dataset_version, read_version
                 )));
             }
-            if matches!(spec, IndexBuildSpec::FullText { .. }) {
-                fts_compat::write_certificate(ds, &mut new_idx).await?;
+            if let IndexBuildSpec::FullText { analysis, .. } = spec {
+                fts_compat::write_certificate(
+                    ds,
+                    &mut new_idx,
+                    &analysis.fingerprint,
+                    analysis.profile,
+                    fts_analysis::native_build(),
+                )
+                .await?;
                 full_text_fields.extend(new_idx.fields.iter().copied());
+            }
+            if let IndexBuildSpec::Vector { .. } = spec {
+                vector_builds += 1;
+                vector_fields.extend(new_idx.fields.iter().copied());
             }
             if !new_names.insert(new_idx.name.clone()) {
                 return Err(OmniError::manifest_internal(format!(
@@ -6225,6 +6442,9 @@ impl TableStore {
             new_indices.push(new_idx);
         }
 
+        // A new vector index replaces every vector index on its column,
+        // whatever its name, so an index built for another distance is
+        // removed with it.
         let removed_indices: Vec<IndexMetadata> = existing_indices
             .iter()
             .filter(|idx| {
@@ -6234,6 +6454,9 @@ impl TableStore {
                             .fields
                             .iter()
                             .any(|field| full_text_fields.contains(field)))
+                    || (!is_system_index(idx)
+                        && Self::index_is_vector(idx)
+                        && idx.fields.iter().any(|field| vector_fields.contains(field)))
             })
             .cloned()
             .collect();
@@ -6299,7 +6522,7 @@ impl TableStore {
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
         if filter.is_some() {
-            validate_full_text_scan(ds, &scanner, None).await?;
+            validate_full_text_scan(ds, &scanner).await?;
         }
         let stream = scanner
             .try_into_stream()
@@ -6394,6 +6617,24 @@ impl TableStore {
 
         let scan_rows = account.next_scan_rows();
         let scan_bytes = account.next_scan_bytes();
+        // An identity equality on the merge key alone reaches Lance; the rest
+        // is rechecked on the row it returns, when the projection holds it.
+        let (filter, recheck) = match (filter, key_column) {
+            (Some(filter), Some(id_column)) => match split_identity_probe(&filter, id_column) {
+                Some((probe, recheck))
+                    if projection.is_none_or(|columns| {
+                        recheck
+                            .column_refs()
+                            .iter()
+                            .all(|column| columns.contains(&column.name.as_str()))
+                    }) =>
+                {
+                    (Some(probe), Some(recheck))
+                }
+                _ => (Some(filter), None),
+            },
+            (filter, _) => (filter, None),
+        };
         let mut stream =
             Self::scan_stream_with(committed_ds, projection, None, None, false, |scanner| {
                 if let Some(filter) = filter {
@@ -6411,6 +6652,10 @@ impl TableStore {
 
         let mut committed = Vec::new();
         while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+            let batch = match &recheck {
+                Some(recheck) => recheck_batch(batch, recheck)?,
+                None => batch,
+            };
             let batch = if let Some(key_col) = key_column
                 && !pending_keys.is_empty()
             {
@@ -7125,7 +7370,7 @@ impl TableStore {
         }
         scanner.with_fragments(combine_committed_with_staged(ds, staged));
         if filter.is_some() {
-            validate_full_text_scan(ds, &scanner, None).await?;
+            validate_full_text_scan(ds, &scanner).await?;
         }
         let count = scanner.count_rows().await.map_err(OmniError::storage)?;
         Ok(count as usize)
@@ -7133,6 +7378,16 @@ impl TableStore {
 
     pub async fn has_btree_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
         has_btree_index_on(ds, column).await
+    }
+
+    /// Whether `column` carries an index of `family`.
+    pub async fn has_scalar_index(
+        &self,
+        ds: &Dataset,
+        column: &str,
+        family: ScalarIndexFamily,
+    ) -> Result<bool> {
+        has_scalar_index_on(ds, column, family).await
     }
 
     pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
@@ -7143,8 +7398,19 @@ impl TableStore {
         has_fts_postings_on(ds, column).await
     }
 
-    pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        has_vector_index_on(ds, column).await
+    /// Whether every vector index on `column` is an exact IVF_FLAT built
+    /// for `distance` and at least one exists: an index built for another
+    /// distance is never used, so the reconciler builds one anew.
+    pub async fn has_vector_index_for(
+        &self,
+        ds: &Dataset,
+        column: &str,
+        distance: VectorDistance,
+    ) -> Result<bool> {
+        if !has_vector_index_on(ds, column).await? {
+            return Ok(false);
+        }
+        vector_indexes_rank_exactly(ds, column, distance).await
     }
 
     pub async fn create_empty_dataset(dataset_uri: &str, schema: &SchemaRef) -> Result<Dataset> {
@@ -7802,6 +8068,62 @@ fn collect_string_column_values(
 /// `column`, so a missing column here is a programmer error — error
 /// loudly instead of silently passing batches through (which would
 /// re-introduce the union semantics the caller asked us to avoid).
+/// Split a scan filter around an identity equality. `identity = v` (a
+/// literal) selects at most one row, so Lance is given that conjunct alone
+/// and probes the identity index; the other conjuncts are returned to be
+/// rechecked on the row it returns. Probing a second index as well (a key
+/// column's own BTREE beside the identity equality derived from it, or any
+/// other) would read that index's pages for a row the identity probe already
+/// decides; the rows are the same either way. `None` when the filter has no
+/// identity equality or nothing besides it.
+pub(crate) fn split_identity_probe(filter: &Expr, id_column: &str) -> Option<(Expr, Expr)> {
+    use datafusion::logical_expr::utils::{conjunction, split_conjunction};
+    use datafusion::logical_expr::{BinaryExpr, Operator};
+    let conjuncts = split_conjunction(filter);
+    let is_probe = |expr: &Expr| match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        }) => [(left, right), (right, left)]
+            .into_iter()
+            .any(|(column, value)| {
+                matches!(column.as_ref(), Expr::Column(column) if column.name == id_column)
+                    && matches!(value.as_ref(), Expr::Literal(..))
+            }),
+        _ => false,
+    };
+    let at = conjuncts.iter().position(|expr| is_probe(expr))?;
+    let rest = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != at)
+        .map(|(_, expr)| (*expr).clone());
+    let recheck = conjunction(rest)?;
+    Some((conjuncts[at].clone(), recheck))
+}
+
+/// The rows of `batch` `predicate` keeps (null rejects), the predicate
+/// evaluated as DataFusion evaluates a scan's refine filter.
+pub(crate) fn recheck_batch(batch: RecordBatch, predicate: &Expr) -> Result<RecordBatch> {
+    use datafusion::execution::context::ExecutionProps;
+    use datafusion::physical_expr::create_physical_expr;
+    let schema = datafusion::common::DFSchema::try_from(batch.schema().as_ref().clone())
+        .map_err(|error| OmniError::manifest_internal(format!("recheck schema: {error}")))?;
+    let predicate = create_physical_expr(predicate, &schema, &ExecutionProps::new())
+        .map_err(|error| OmniError::manifest_internal(format!("recheck predicate: {error}")))?;
+    let mask = predicate
+        .evaluate(&batch)
+        .and_then(|value| value.into_array(batch.num_rows()))
+        .map_err(|error| OmniError::manifest_internal(format!("recheck: {error}")))?;
+    let mask = mask
+        .as_any()
+        .downcast_ref::<arrow_array::BooleanArray>()
+        .ok_or_else(|| OmniError::manifest_internal("recheck is not a Boolean"))?;
+    arrow_select::filter::filter_record_batch(&batch, mask)
+        .map_err(|error| OmniError::manifest_internal(format!("recheck filter: {error}")))
+}
+
 fn filter_out_rows_where_string_in(
     batches: Vec<RecordBatch>,
     column: &str,

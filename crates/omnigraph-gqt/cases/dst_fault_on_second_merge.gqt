@@ -16,13 +16,13 @@ node Person {
 branch create source
 --- expect ok
 --- mutate branch: source
-query add() { insert Person { name: "bob" } }
+query add() { replace Person { name: "bob" } }
 --- expect affected: nodes=1 edges=0
 --- mutate
 branch merge source into main
 --- expect ok
 --- mutate branch: source
-query add_again() { insert Person { name: "carol" } }
+query add_again() { replace Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
 --- seam
 at: branch_merge.post_authority_capture

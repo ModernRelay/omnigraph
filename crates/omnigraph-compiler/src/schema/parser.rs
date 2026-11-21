@@ -14,7 +14,7 @@ use super::ast::*;
 
 #[derive(Parser)]
 #[grammar = "schema/schema.pest"]
-struct SchemaParser;
+pub(super) struct SchemaParser;
 
 pub fn parse_schema(input: &str) -> Result<SchemaFile> {
     parse_schema_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))
@@ -581,7 +581,7 @@ fn desugar_property_constraints(properties: &[PropDecl], constraints: &mut Vec<C
                 "unique" if ann.value.is_none() => {
                     constraints.push(Constraint::Unique(vec![prop.name.clone()]));
                 }
-                "index" if ann.value.is_none() => {
+                "index" if super::analysis::is_property_index_annotation(ann) => {
                     constraints.push(Constraint::Index(vec![prop.name.clone()]));
                 }
                 _ => {}
@@ -617,14 +617,16 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
             });
             if let Some(existing) = node.properties.iter().find(|p| p.name == iface_prop.name) {
                 // Property exists — verify type compatibility
-                if existing.prop_type != iface_prop.prop_type {
+                if existing.prop_type != iface_prop.prop_type
+                    || existing.distance != iface_prop.distance
+                {
                     return Err(CompilerError::Parse(format!(
                         "node {} property '{}' has type {} but interface {} declares it as {}",
                         node.name,
                         iface_prop.name,
-                        existing.prop_type.display_name(),
+                        declared_type_name(existing),
                         iface_name,
-                        iface_prop.prop_type.display_name()
+                        declared_type_name(iface_prop)
                     )));
                 }
             } else {
@@ -657,12 +659,14 @@ fn parse_prop_decl(pair: pest::iterators::Pair<Rule>) -> Result<PropDecl> {
         )));
     }
     let type_ref = inner.next().unwrap();
-    let prop_type = parse_type_ref(type_ref)?;
+    let (prop_type, distance) = parse_type_ref(type_ref)?;
 
     let mut annotations = Vec::new();
     for item in inner {
-        if let Rule::annotation = item.as_rule() {
-            annotations.push(parse_annotation(item)?);
+        match item.as_rule() {
+            Rule::annotation => annotations.push(parse_annotation(item)?),
+            Rule::index_annotation => annotations.push(parse_index_annotation(item)?),
+            _ => {}
         }
     }
 
@@ -670,10 +674,15 @@ fn parse_prop_decl(pair: pest::iterators::Pair<Rule>) -> Result<PropDecl> {
         name,
         prop_type,
         annotations,
+        distance,
     })
 }
 
-fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
+/// A property's type and, for a vector, the distance its options declare
+/// (`None` for `l2`, written or omitted).
+fn parse_type_ref(
+    pair: pest::iterators::Pair<Rule>,
+) -> Result<(PropType, Option<super::vector::VectorDistance>)> {
     let text = pair.as_str();
     let nullable = text.ends_with('?');
 
@@ -691,14 +700,15 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
         Rule::base_type => {
             let scalar = ScalarType::from_str_name(inner.as_str())
                 .ok_or_else(|| CompilerError::Parse(format!("unknown type: {}", inner.as_str())))?;
-            Ok(PropType::scalar(scalar, nullable))
+            Ok((PropType::scalar(scalar, nullable), None))
         }
         Rule::vector_type => {
-            let dim_text = inner
-                .into_inner()
+            let mut parts = inner.into_inner();
+            let dim_text = parts
                 .next()
                 .ok_or_else(|| CompilerError::Parse("Vector type missing dimension".to_string()))?
                 .as_str();
+            let distance = parse_vector_options(dim_text, parts)?;
             let dim = dim_text
                 .parse::<u32>()
                 .map_err(|e| CompilerError::Parse(format!("invalid Vector dimension: {}", e)))?;
@@ -714,7 +724,10 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
                     i32::MAX
                 )));
             }
-            Ok(PropType::scalar(ScalarType::Vector(dim), nullable))
+            Ok((
+                PropType::scalar(ScalarType::Vector(dim), nullable),
+                distance,
+            ))
         }
         Rule::list_type => {
             let element = inner.into_inner().next().ok_or_else(|| {
@@ -728,7 +741,7 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
                     "list of Blob is not supported".to_string(),
                 ));
             }
-            Ok(PropType::list_of(scalar, nullable))
+            Ok((PropType::list_of(scalar, nullable), None))
         }
         Rule::enum_type => {
             let mut values = Vec::new();
@@ -750,13 +763,74 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
                     "enum type cannot include duplicate values".to_string(),
                 ));
             }
-            Ok(PropType::enum_type(values, nullable))
+            Ok((PropType::enum_type(values, nullable), None))
         }
         other => Err(CompilerError::Parse(format!(
             "unexpected type rule: {:?}",
             other
         ))),
     }
+}
+
+/// A property's type as a refusal names it, its declared distance included.
+fn declared_type_name(property: &PropDecl) -> String {
+    match property.distance {
+        Some(distance) => format!(
+            "{} with distance \"{distance}\"",
+            property.prop_type.display_name()
+        ),
+        None => property.prop_type.display_name(),
+    }
+}
+
+/// The options of `Vector(<dim>, ...)`: `distance = "l2" | "cosine" | "dot"`
+/// and nothing else. Returns the declared distance as a shape records it,
+/// `None` for `l2`, written or omitted.
+fn parse_vector_options(
+    dim: &str,
+    options: pest::iterators::Pairs<Rule>,
+) -> Result<Option<super::vector::VectorDistance>> {
+    use super::vector::{DISTANCE_OPTION, VectorDistance};
+    let mut distance = None;
+    for option in options {
+        if option.as_rule() != Rule::annotation_kwarg {
+            continue;
+        }
+        let mut kw = option.into_inner();
+        let key = kw.next().unwrap().as_str();
+        let raw = kw.next().unwrap().as_str();
+        if key != DISTANCE_OPTION {
+            return Err(CompilerError::Parse(format!(
+                "Vector({dim}) has unknown option '{key} ='; it admits {DISTANCE_OPTION}"
+            )));
+        }
+        if distance.is_some() {
+            return Err(CompilerError::Parse(format!(
+                "Vector({dim}) repeats the option '{DISTANCE_OPTION}'"
+            )));
+        }
+        let names = VectorDistance::NAMES
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let name = raw
+            .starts_with('"')
+            .then(|| decode_string_literal(raw))
+            .transpose()?
+            .ok_or_else(|| {
+                CompilerError::Parse(format!(
+                    "Vector({dim}) {DISTANCE_OPTION} takes a quoted name: {names}"
+                ))
+            })?;
+        let parsed = VectorDistance::parse(&name).ok_or_else(|| {
+            CompilerError::Parse(format!(
+                "Vector({dim}) names the unknown distance \"{name}\"; the distances are {names}"
+            ))
+        })?;
+        distance = Some(parsed);
+    }
+    Ok(distance.and_then(VectorDistance::declared))
 }
 
 fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
@@ -785,6 +859,38 @@ fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
 
     Ok(Annotation {
         name,
+        value,
+        kwargs,
+    })
+}
+
+/// `@index(fulltext, key = "value", ...)` on a property: an `index` annotation
+/// whose value is the index kind, its options as keyword arguments. A repeated
+/// option is refused here, before the map would keep the last one.
+fn parse_index_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
+    let mut value = None;
+    let mut kwargs = std::collections::BTreeMap::new();
+    for arg in pair.into_inner() {
+        match arg.as_rule() {
+            Rule::index_kind => value = Some(arg.as_str().to_string()),
+            Rule::annotation_kwarg => {
+                let mut kw = arg.into_inner();
+                let key = kw.next().unwrap().as_str().to_string();
+                let raw = kw.next().unwrap().as_str();
+                if kwargs
+                    .insert(key.clone(), decode_string_literal(raw)?)
+                    .is_some()
+                {
+                    return Err(CompilerError::Parse(format!(
+                        "@index(fulltext, ...) repeats the option '{key}'"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Annotation {
+        name: "index".to_string(),
         value,
         kwargs,
     })
@@ -834,6 +940,15 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                         &prop.annotations,
                         &format!("property {}.{}", interface.name, prop.name),
                     )?;
+                    if prop.annotations.iter().any(|ann| {
+                        ann.name == "index"
+                            && ann.value.as_deref() == Some(super::analysis::FULL_TEXT_INDEX_KIND)
+                    }) {
+                        return Err(CompilerError::Parse(format!(
+                            "@index(fulltext) on interface property {}.{}: declare the full-text index on the implementing node's property",
+                            interface.name, prop.name
+                        )));
+                    }
                 }
             } // Interfaces have no type-level annotations
             SchemaDecl::Node(node) => {
@@ -866,6 +981,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                 for prop in &node.properties {
                     validate_property_annotations(prop, &node.name, &node.properties, false)?;
                 }
+                refuse_ambiguous_full_text_index(&node.name, &node.properties)?;
             }
             SchemaDecl::Edge(edge) => {
                 rename_from_annotation(&edge.annotations, &format!("edge {}", edge.name))?;
@@ -895,6 +1011,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                 for prop in &edge.properties {
                     validate_property_annotations(prop, &edge.name, &edge.properties, true)?;
                 }
+                refuse_ambiguous_full_text_index(&edge.name, &edge.properties)?;
             }
         }
     }
@@ -933,11 +1050,13 @@ fn validate_property_annotations(
     let mut embed_seen = false;
 
     for ann in &prop.annotations {
-        // List/vector/blob restrictions on property-level annotations
+        // List/vector/blob restrictions on property-level annotations. A
+        // list takes a plain `@index` (a LABEL_LIST serving `in`), never a
+        // full-text one.
         if prop.prop_type.list
             && (ann.name == "key"
                 || ann.name == "unique"
-                || ann.name == "index"
+                || (ann.name == "index" && ann.value.is_some())
                 || ann.name == "embed")
         {
             return Err(CompilerError::Parse(format!(
@@ -1010,11 +1129,17 @@ fn validate_property_annotations(
                 unique_seen = true;
             }
             "index" => {
-                if ann.value.is_some() {
-                    return Err(CompilerError::Parse(format!(
-                        "@index on {}.{} does not accept a value",
-                        type_name, prop.name
-                    )));
+                match ann.value.as_deref() {
+                    None => {}
+                    Some(super::analysis::FULL_TEXT_INDEX_KIND) => {
+                        validate_full_text_index(ann, prop, type_name, is_edge)?;
+                    }
+                    Some(_) => {
+                        return Err(CompilerError::Parse(format!(
+                            "@index on {}.{} does not accept a value",
+                            type_name, prop.name
+                        )));
+                    }
                 }
                 if index_seen {
                     return Err(CompilerError::Parse(format!(
@@ -1083,6 +1208,90 @@ fn validate_property_annotations(
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// `@index(fulltext)` after a property is that property's full-text index.
+/// On a type that also declares a property named `fulltext`, the same text
+/// also reads as a body-level index on that property, so it is refused rather
+/// than read either way: the fix is `@index` on the property it means.
+fn refuse_ambiguous_full_text_index(type_name: &str, properties: &[PropDecl]) -> Result<()> {
+    if !properties
+        .iter()
+        .any(|prop| prop.name == super::analysis::FULL_TEXT_INDEX_KIND)
+    {
+        return Ok(());
+    }
+    for prop in properties {
+        if prop.annotations.iter().any(|ann| {
+            ann.name == "index"
+                && ann.value.as_deref() == Some(super::analysis::FULL_TEXT_INDEX_KIND)
+                && ann.kwargs.is_empty()
+        }) {
+            return Err(CompilerError::Parse(format!(
+                "@index(fulltext) after {type_name}.{} is ambiguous because {type_name} declares a property named 'fulltext': write `@index` on the property the index is for",
+                prop.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `@index(fulltext, analyzer = "...", scorer = "...")`: a full-text index on
+/// a free-text String property, with options naming a known profile and
+/// scorer. Analysis is declared on node properties, the ones whose full-text
+/// index the engine builds.
+fn validate_full_text_index(
+    ann: &Annotation,
+    prop: &PropDecl,
+    type_name: &str,
+    is_edge: bool,
+) -> Result<()> {
+    use super::analysis::{AnalyzerProfile, FullTextScorer, admitted_profiles, admitted_scorers};
+    let target = format!("{}.{}", type_name, prop.name);
+    if prop.prop_type.scalar != ScalarType::String
+        || prop.prop_type.list
+        || prop.prop_type.is_enum()
+    {
+        let reason = if prop.prop_type.is_enum() {
+            "an enum takes a scalar index; write `@index`".to_string()
+        } else {
+            format!("{target} is not a free-text String")
+        };
+        return Err(CompilerError::Parse(format!(
+            "@index(fulltext) declares a full-text index, which needs a String property: {reason}"
+        )));
+    }
+    for (key, value) in &ann.kwargs {
+        match key.as_str() {
+            "analyzer" => {
+                if AnalyzerProfile::parse(value).is_none() {
+                    return Err(CompilerError::Parse(format!(
+                        "@index(fulltext) on {target} names the unknown analyzer \"{value}\"; the profiles are {}",
+                        admitted_profiles()
+                    )));
+                }
+            }
+            "scorer" => {
+                if FullTextScorer::parse(value).is_none() {
+                    return Err(CompilerError::Parse(format!(
+                        "@index(fulltext) on {target} names the unknown scorer \"{value}\"; the scorers are {}",
+                        admitted_scorers()
+                    )));
+                }
+            }
+            other => {
+                return Err(CompilerError::Parse(format!(
+                    "@index(fulltext) on {target} has unknown option '{other} ='; it admits analyzer and scorer"
+                )));
+            }
+        }
+    }
+    if is_edge && !ann.kwargs.is_empty() {
+        return Err(CompilerError::Parse(format!(
+            "@index(fulltext) on edge property {target} declares analysis; full-text analysis is declared on node properties, whose full-text index the engine builds"
+        )));
     }
     Ok(())
 }

@@ -26,7 +26,7 @@ branch create feature
 
 --- mutate branch: feature
 query propose_bob() as commit {
-    insert Person { name: "bob", age: 41 }
+    replace Person { name: "bob", age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -60,7 +60,7 @@ p.name: String
 
 --- mutate
 query add_carol_on_main() {
-    insert Person { name: "carol", age: 52 }
+    replace Person { name: "carol", age: 52 }
 }
 
 --- expect affected: nodes=1 edges=0

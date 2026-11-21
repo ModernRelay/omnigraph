@@ -29,6 +29,7 @@ use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilterBuilde
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance_table::format::Fragment;
 use omnigraph_compiler::SYSTEM_COLUMNS_LEGACY;
+use omnigraph_compiler::schema::vector::VectorDistance;
 
 /// A standalone Lance `Session` per test store (this binary is primitive-level
 /// and deliberately does not include the shared `helpers` module).
@@ -3252,6 +3253,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 },
                 IndexBuildSpec::FullText {
                     column: "body".to_string(),
+                    analysis: crate::storage_layer::FullTextBuild::for_test(),
                 },
                 // Second index on the SAME column: independent builders share
                 // one snapshot, so explicit names avoid an uncommitted-name
@@ -3262,6 +3264,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 },
                 IndexBuildSpec::Vector {
                     column: "embedding".to_string(),
+                    distance: VectorDistance::Cosine,
                 },
             ],
             &crate::table_store::MaintenanceBudget::default(),
@@ -3284,7 +3287,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
     assert!(!store.has_fts_index(&reopened, "body").await.unwrap());
     assert!(
         !store
-            .has_vector_index(&reopened, "embedding")
+            .has_vector_index_for(&reopened, "embedding", VectorDistance::Cosine)
             .await
             .unwrap()
     );
@@ -3305,7 +3308,20 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
         store.has_btree_index(&new_ds, "body").await.unwrap(),
         "the explicitly-named companion BTREE must land beside the FTS index"
     );
-    assert!(store.has_vector_index(&new_ds, "embedding").await.unwrap());
+    // The vector index is built for the spec's distance, and an index built
+    // for another distance does not count as the field's index.
+    assert!(
+        store
+            .has_vector_index_for(&new_ds, "embedding", VectorDistance::Cosine)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .has_vector_index_for(&new_ds, "embedding", VectorDistance::L2)
+            .await
+            .unwrap()
+    );
 
     // Metadata-only coverage cases, reusing this fixture's typed index
     // inventory. The synthetic empty segment borrows another index UUID;
@@ -3422,12 +3438,11 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             unsafe_count,
             "characterize stock v11 reading actual v10 postings"
         );
-        let guarded = TableStore::scan_stream_with(&old, None, None, None, false, |scan| {
-            scan.full_text_search(FullTextSearchQuery::new(term.into()))
-                .map_err(OmniError::storage)?;
-            Ok(())
-        })
-        .await;
+        // A read of the postings through the guarded scan surface: a
+        // `contains_tokens` filter.
+        let filter = format!("contains_tokens(text, '{term}')");
+        let guarded =
+            TableStore::scan_stream_with(&old, None, Some(&filter), None, false, |_| Ok(())).await;
         assert!(matches!(
             guarded,
             Err(OmniError::FullTextIndexRebuildRequired { .. })
@@ -3438,6 +3453,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             &old,
             &[IndexBuildSpec::FullText {
                 column: "text".into(),
+                analysis: crate::storage_layer::FullTextBuild::for_test(),
             }],
             &crate::table_store::MaintenanceBudget::default(),
         )
@@ -3460,25 +3476,71 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
         .unwrap();
     assert_eq!(rebuilt.version().version, 3);
     assert_eq!(rebuilt.load_indices().await.unwrap().len(), 1);
+    let build = crate::storage_layer::FullTextBuild::for_test();
+    let rebuilt_index = rebuilt.load_indices().await.unwrap()[0].clone();
     for term in ["organism", "university", "running"] {
-        let batches: Vec<_> =
-            TableStore::scan_stream_with(&rebuilt, None, None, None, false, |scan| {
-                scan.full_text_search(FullTextSearchQuery::new(term.into()))
-                    .map_err(OmniError::storage)?;
-                Ok(())
-            })
+        // The rebuilt postings hold every term the old ones lost.
+        let mut raw = rebuilt.scan();
+        raw.full_text_search(FullTextSearchQuery::new(term.into()))
+            .unwrap();
+        let raw_batches: Vec<_> = raw
+            .try_into_stream()
             .await
             .unwrap()
             .try_collect()
             .await
             .unwrap();
-        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(
+            raw_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1
+        );
+        // The guarded scan surface still refuses a raw filter: it names no
+        // field analysis, so no segment qualifies for it.
+        let filter = format!("contains_tokens(text, '{term}')");
+        match TableStore::scan_stream_with(&rebuilt, None, Some(&filter), None, false, |_| Ok(()))
+            .await
+        {
+            Err(OmniError::FullTextIndexRebuildRequired { reason, .. }) => {
+                assert!(reason.contains("names no field analysis"), "{reason}")
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("a raw token filter read a full-text segment"),
+        }
     }
+    // A binary whose native pipeline has parity qualifies the rebuilt
+    // segment for its field; the old one has no certificate at all.
+    let native = super::fts_analysis::measured(build.profile)
+        .unwrap()
+        .native
+        .clone();
+    let parity = super::fts_analysis::MeasuredAnalysis {
+        analyzer: native.clone(),
+        native,
+    };
+    super::fts_compat::verify_index_against(
+        &rebuilt,
+        &rebuilt_index,
+        &build.fingerprint,
+        build.profile,
+        &parity,
+    )
+    .await
+    .unwrap();
     assert_eq!(store.count_rows(&old, None).await.unwrap(), 3);
-    assert!(matches!(
-        super::fts_compat::verify_index(&old, &old_indices[0]).await,
-        Err(OmniError::FullTextIndexRebuildRequired { .. })
-    ));
+    match super::fts_compat::verify_index_against(
+        &old,
+        &old_indices[0],
+        &build.fingerprint,
+        build.profile,
+        &parity,
+    )
+    .await
+    {
+        Err(OmniError::FullTextIndexRebuildRequired { reason, .. }) => {
+            assert!(reason.contains("certificate is missing"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// Staged delete (Lance 7.0 `DeleteBuilder::execute_uncommitted`, lance#6658):
@@ -4415,6 +4477,7 @@ async fn index_fold_skips_only_a_vector_column_that_cannot_train() {
         vec![super::RefreshedIndex {
             column: "id".to_string(),
             vector: false,
+            family: Some(omnigraph_core::dataset_index::ScalarIndexFamily::BTree),
         }],
         "the lagging BTREE is still rebuilt"
     );

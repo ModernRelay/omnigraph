@@ -4,10 +4,11 @@ use std::hash::Hash;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::{
     DeltaClass, IRExpr, IROrdering, IRProjection, SubqueryPredicate, ValidateCheck,
 };
-use omnigraph_compiler::query::ast::LoadStmtMode;
+use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::traversal::EdgeSelection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,7 +16,6 @@ use serde_json::{Value, json};
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
 use crate::optimizer::gq_conjunct;
-use crate::physical::RankKind;
 use crate::source::SideId;
 
 /// The index of a node in a [`LogicalPlan`], distinct from a physical node id.
@@ -136,14 +136,14 @@ impl Predicate {
     }
 
     fn collect_gq_filters(&self, out: &mut Vec<IRExpr>) {
-        match self {
+        omnigraph_compiler::stack::deep(|| match self {
             Self::Gq { filter, .. } => out.push(filter.0.clone()),
             Self::And { left, right } => {
                 left.collect_gq_filters(out);
                 right.collect_gq_filters(out);
             }
             Self::IdAfter { .. } | Self::VersionWindow { .. } => {}
-        }
+        })
     }
 
     /// The one GQ conjunct this predicate is, when it is no conjunction.
@@ -261,23 +261,28 @@ macro_rules! logical_kinds {
 logical_kinds! {
     Aggregate => "Aggregate", RefusedByName;
     AntiJoin => "AntiJoin", RefusedByName;
+    Correlate => "Correlate", RefusedByName;
     CsvSource => "CsvSource", RefusedByName;
     DeltaSource => "DeltaSource", RefusedByName;
     Expand => "Expand", RefusedByName;
     Filter => "Filter", Routable;
     FragmentWrite => "FragmentWrite", RefusedByName;
+    Fuse => "Fuse", RefusedByName;
     Join => "Join", Routable;
+    Let => "Let", RefusedByName;
     Limit => "Limit", Routable;
     MergeClassify => "MergeClassify", Routable;
     MetadataCount => "MetadataCount", RefusedByName;
     Nearest => "Nearest", RefusedByName;
+    OptionalJoin => "OptionalJoin", RefusedByName;
     OuterReference => "OuterReference", RefusedByName;
     Projection => "Projection", Routable;
-    RankFuse => "RankFuse", RefusedByName;
     RowDiff => "RowDiff", Routable;
+    Score => "Score", RefusedByName;
     Sort => "Sort", Routable;
     TableScan => "TableScan", Routable;
-    TextSearch => "TextSearch", RefusedByName;
+    TargetCut => "TargetCut", RefusedByName;
+    Union => "Union", RefusedByName;
     Validate => "Validate", RefusedByName;
 }
 
@@ -286,8 +291,12 @@ logical_kinds! {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IndexQuery {
+    /// One index search: the index, its family (`btree`, `bitmap`,
+    /// `label_list`, `ngram`, or Lance's own name for another), the column
+    /// and the search Lance runs.
     Search {
         index: String,
+        family: String,
         column: String,
         search: String,
     },
@@ -324,9 +333,7 @@ impl IndexQuery {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeInput {
     Nearest,
-    FullText,
     EligibleIds,
-    SearchFilter,
     JoinFilter,
     DynamicExpression,
 }
@@ -499,19 +506,20 @@ impl FragmentWriteSpec {
     pub fn adapter(&self) -> &'static str {
         match self.mode {
             LoadStmtMode::Overwrite => "fragments",
-            LoadStmtMode::Append => "strict_insert",
-            LoadStmtMode::Merge => "upsert",
+            LoadStmtMode::Insert => "strict_insert",
+            // An `upsert` load fills the cells its records omit before it
+            // stages, so both keyed modes run the whole-row upsert adapter.
+            LoadStmtMode::Upsert | LoadStmtMode::Replace => "upsert",
         }
     }
 }
 
-/// One `nearest(...)` or `bm25(...)` arm of an `rrf()`, as the query wrote it.
+/// One arm of a [`LogicalNode::Fuse`]: the subtree whose rows it ranks, in
+/// the order `rank` states (`ArmRank`), each target at its first row.
 #[derive(Debug, Clone)]
-pub struct SearchArm {
-    pub binding: String,
-    pub property: String,
-    pub kind: RankKind,
-    pub query: IRExpr,
+pub struct FuseInput {
+    pub input: LogicalId,
+    pub rank: crate::read_shape::ArmRank,
 }
 
 #[derive(Debug, Clone)]
@@ -532,6 +540,9 @@ pub enum LogicalNode {
     Filter {
         input: LogicalId,
         conjuncts: Vec<IRExpr>,
+        /// A conjunct can fail where it is evaluated (the type checker's
+        /// flag, A3): the node keeps its place and nothing moves below it.
+        fails: bool,
     },
     /// The query's return expressions and their typed column demand.
     Projection {
@@ -540,8 +551,9 @@ pub enum LogicalNode {
         return_exprs: Vec<IRProjection>,
     },
     /// `keys` for the passes; `order_by`, `fetch` and `tiebreak` for the
-    /// engine's sort. `tiebreak` declares metadata columns in binding order;
-    /// a selected edge's concrete type precedes its id.
+    /// engine's sort. `tiebreak` declares the tie rule's columns in column
+    /// order (`optimizer::tie_rule`); a selected edge's concrete type
+    /// precedes its id.
     Sort {
         input: LogicalId,
         keys: Vec<String>,
@@ -604,6 +616,45 @@ pub enum LogicalNode {
         inner: LogicalId,
         outer_var: String,
         predicate: SubqueryPredicate,
+        /// The block can fail where it is evaluated (A3).
+        fails: bool,
+    },
+    /// `optional { … }`: every input row with each of its matches in the
+    /// inner tree, whose leaf is an `OuterReference` to those same rows, and
+    /// an input row with none once, the columns the inner tree adds null.
+    OptionalJoin {
+        input: LogicalId,
+        inner: LogicalId,
+        outer_var: String,
+        /// The pattern can fail where it is evaluated (A3).
+        fails: bool,
+    },
+    /// `from` an inline read with its own aggregate, `distinct`, `order` or
+    /// `limit`: the read's pattern is the `inner` tree and `read` what it
+    /// returns. With an `input`, the inner tree's leaf is an
+    /// `OuterReference` to the input rows on `outer_var`, the read is
+    /// evaluated per input row and each input row leaves once per row of
+    /// its own read; without one the read runs once and its rows leave.
+    /// `tiebreak` breaks equal `order` keys: the identities of the read's
+    /// references, then its group's value keys, in column order; `reads`
+    /// what the read's expressions read.
+    Correlate {
+        input: Option<LogicalId>,
+        inner: LogicalId,
+        outer_var: Option<String>,
+        read: Box<crate::read_shape::InnerRead>,
+        tiebreak: Vec<ColumnRef>,
+        reads: Vec<ColumnRef>,
+        /// The read can fail where it is evaluated (A3).
+        fails: bool,
+    },
+    /// `from union(a, b)`: every row of `left` and every row of `right`, a
+    /// bag; each arm binds the reference columns `bindings`, and only their
+    /// columns leave.
+    Union {
+        left: LogicalId,
+        right: LogicalId,
+        bindings: Vec<String>,
     },
     /// The leaf of a `not { … }` inner tree: the enclosing pipeline's rows,
     /// correlated on `outer_var`. A node of its own, not the outer node, so
@@ -621,25 +672,67 @@ pub enum LogicalNode {
         query: IRExpr,
         k: Option<u64>,
         reads: Vec<ColumnRef>,
+        /// The score leads the read's final sort (today's ranked read); a
+        /// ranking drawn as a pattern step orders nothing by itself.
+        leads: bool,
+        /// The declared `recall:`; `Some(1.0)` searches every partition, and
+        /// any other bound takes the session's probe policy.
+        recall: Option<f64>,
     },
-    /// A leading `order { bm25($v.prop, q) }`: the full-text ranking, `_score`.
-    TextSearch {
+    /// `from rrf(arm, …)` (the GQ 3 RFC, section 4,
+    /// Fusion): each arm's subtree yields rows binding `target` in its
+    /// rank order; the node yields one row per target any arm selected, the
+    /// target's columns and `Σ weight / (k + rank)` over the arms that
+    /// selected it as `target._rrf`. `k` and `weights` as written (`None`:
+    /// 60, and every arm `1.0`).
+    Fuse {
+        arms: Vec<FuseInput>,
+        target: String,
+        k: Option<IRExpr>,
+        weights: Option<IRExpr>,
+        reads: Vec<ColumnRef>,
+        /// Inside a correlated read's inner tree, the outer name each arm
+        /// starts from: the fusion runs per outer row, partitioned by the
+        /// outer row each arm row belongs to. `None`: one fusion.
+        partition: Option<String>,
+    },
+    /// The rows of the first `targets` distinct `binding` identities of its
+    /// input, which arrives sorted by the ranking's score then that identity:
+    /// a `nearest` window's selection, every row of each selected target
+    /// kept (fan-out carries the score and adds no vote).
+    TargetCut {
         input: LogicalId,
         binding: String,
+        targets: u64,
+    },
+    /// The core's exact `Score`. `Distance` (`distance(rel, $x.f, q)`):
+    /// every input row with the exact distance of `binding`'s vector
+    /// `property` to `query` appended as the binding's `_distance` column; a
+    /// row whose vector is null drops. `Bm25` (`bm25` on a field whose index
+    /// declares an analyzer): every input row whose String `property`
+    /// matches `query`, a `match_terms` predicate, with `bm25_v1` against the
+    /// field corpus of `type_name` appended as the binding's `_score`
+    /// column, by the exact lexical scan. `type_name` is the binding's node
+    /// type; `reads` the scored column and the query's.
+    Score {
+        input: LogicalId,
+        binding: String,
+        type_name: String,
         property: String,
+        kind: ScoreKind,
         query: IRExpr,
         reads: Vec<ColumnRef>,
     },
-    /// A leading `order { rrf(a, b) }`: both arms run the input tree, ranked
-    /// on their targets, and fuse. `k` is the rank constant as written;
-    /// `limit` the query's limit, which sizes a nearest arm.
-    RankFuse {
+    /// `let $v = value`: `value` computed once on every input row as the
+    /// `value` column of the binding `name` the shaper made up, which every
+    /// read of `$v` reads; `reads` the columns the value reads. A value that
+    /// can fail refuses the read there, and no filter written after it moves
+    /// below it (A3).
+    Let {
         input: LogicalId,
-        arms: Box<[SearchArm; 2]>,
-        k: Option<IRExpr>,
-        limit: Option<u64>,
+        name: String,
+        value: IRExpr,
         reads: Vec<ColumnRef>,
-        row_tiebreak: Vec<ColumnRef>,
     },
     /// A `return` with an aggregate: the group keys and aggregate arguments
     /// it reads; `count($v)` reads the identity alone.
@@ -688,15 +781,20 @@ impl LogicalNode {
             Self::Projection { .. } => LogicalKind::Projection,
             Self::Sort { .. } | Self::Ordered { .. } => LogicalKind::Sort,
             Self::Limit { .. } | Self::Page { .. } => LogicalKind::Limit,
+            Self::TargetCut { .. } => LogicalKind::TargetCut,
+            Self::Score { .. } => LogicalKind::Score,
+            Self::Let { .. } => LogicalKind::Let,
             Self::Join { .. } | Self::CrossJoin { .. } => LogicalKind::Join,
             Self::RowDiff { .. } => LogicalKind::RowDiff,
             Self::MergeClassify { .. } => LogicalKind::MergeClassify,
             Self::Expand { .. } => LogicalKind::Expand,
             Self::AntiJoin { .. } => LogicalKind::AntiJoin,
+            Self::OptionalJoin { .. } => LogicalKind::OptionalJoin,
+            Self::Correlate { .. } => LogicalKind::Correlate,
+            Self::Union { .. } => LogicalKind::Union,
             Self::OuterReference { .. } => LogicalKind::OuterReference,
             Self::Nearest { .. } => LogicalKind::Nearest,
-            Self::TextSearch { .. } => LogicalKind::TextSearch,
-            Self::RankFuse { .. } => LogicalKind::RankFuse,
+            Self::Fuse { .. } => LogicalKind::Fuse,
             Self::Aggregate { .. } => LogicalKind::Aggregate,
         }
     }
@@ -712,13 +810,20 @@ impl LogicalNode {
             | Self::RowDiff { input, .. }
             | Self::Expand { input, .. }
             | Self::Nearest { input, .. }
-            | Self::TextSearch { input, .. }
-            | Self::RankFuse { input, .. }
+            | Self::TargetCut { input, .. }
+            | Self::Score { input, .. }
+            | Self::Let { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![*input],
-            Self::Join { left, right, .. } | Self::CrossJoin { left, right } => vec![*left, *right],
-            Self::AntiJoin { input, inner, .. } => vec![*input, *inner],
+            Self::Join { left, right, .. }
+            | Self::CrossJoin { left, right }
+            | Self::Union { left, right, .. } => vec![*left, *right],
+            Self::AntiJoin { input, inner, .. } | Self::OptionalJoin { input, inner, .. } => {
+                vec![*input, *inner]
+            }
+            Self::Correlate { input, inner, .. } => input.iter().copied().chain([*inner]).collect(),
+            Self::Fuse { arms, .. } => arms.iter().map(|arm| arm.input).collect(),
             Self::MergeClassify {
                 base,
                 source,
@@ -743,13 +848,20 @@ impl LogicalNode {
             | Self::RowDiff { input, .. }
             | Self::Expand { input, .. }
             | Self::Nearest { input, .. }
-            | Self::TextSearch { input, .. }
-            | Self::RankFuse { input, .. }
+            | Self::TargetCut { input, .. }
+            | Self::Score { input, .. }
+            | Self::Let { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![input],
-            Self::Join { left, right, .. } | Self::CrossJoin { left, right } => vec![left, right],
-            Self::AntiJoin { input, inner, .. } => vec![input, inner],
+            Self::Join { left, right, .. }
+            | Self::CrossJoin { left, right }
+            | Self::Union { left, right, .. } => vec![left, right],
+            Self::AntiJoin { input, inner, .. } | Self::OptionalJoin { input, inner, .. } => {
+                vec![input, inner]
+            }
+            Self::Correlate { input, inner, .. } => input.iter_mut().chain([inner]).collect(),
+            Self::Fuse { arms, .. } => arms.iter_mut().map(|arm| &mut arm.input).collect(),
             Self::MergeClassify {
                 base,
                 source,
@@ -760,6 +872,83 @@ impl LogicalNode {
             | Self::OuterReference { .. }
             | Self::CsvSource { .. }
             | Self::DeltaSource { .. } => Vec::new(),
+        }
+    }
+}
+
+impl LogicalNode {
+    /// What the node declares to the placement law
+    /// ([`crate::placement`]): whether it can fail, the group key it
+    /// selects rows within, the inputs a conjunct may move into, and the
+    /// binding a scan absorbs a conjunct of. Every kind states its own; the
+    /// law reads only this, never the kind.
+    pub(crate) fn declares(&self) -> crate::placement::Declared<LogicalId> {
+        use crate::placement::Declared;
+        match self {
+            // A scan reads its binding's rows: a conjunct over that binding
+            // alone runs in it. A dependent scan finds one row for each of
+            // its input's, which a conjunct over the input may filter first.
+            Self::TableScan { input, spec } => Declared {
+                absorbs: spec.binding.clone(),
+                ..Declared::passing(input.iter().copied())
+            },
+            Self::Filter { input, fails, .. } => Declared {
+                fails: *fails,
+                ..Declared::passing([*input])
+            },
+            // A row of the input reaches the output with its columns, once
+            // or once per match.
+            Self::Expand { input, .. } | Self::Ordered { input, .. } => Declared::passing([*input]),
+            Self::CrossJoin { left, right } => Declared::passing([*left, *right]),
+            // A semi-join, an outer join and a correlated read each keep
+            // every column of an input row; their inner patterns are scopes
+            // of their own. One that can fail runs on every input row.
+            Self::AntiJoin { input, fails, .. } | Self::OptionalJoin { input, fails, .. } => {
+                Declared {
+                    fails: *fails,
+                    ..Declared::passing([*input])
+                }
+            }
+            Self::Correlate { input, fails, .. } => Declared {
+                fails: *fails,
+                ..Declared::passing(input.iter().copied())
+            },
+            // A `let` fails where its value can; nothing that reads its
+            // column passes it, which `carries` states.
+            Self::Let { input, value, .. } => Declared {
+                fails: value.can_fail(),
+                ..Declared::passing([*input])
+            },
+            // A sort only orders its rows; with a fetch it keeps the first
+            // ones of the whole relation.
+            Self::Sort { input, fetch, .. } => match fetch {
+                None => Declared::passing([*input]),
+                Some(_) => Declared::selecting_all(*input),
+            },
+            // Each selects rows over the whole relation: a `limit`, a page,
+            // a window's cut, a nearest-neighbour search and a score, whose
+            // rows are a ranking's population.
+            Self::Limit { input, .. }
+            | Self::Page { input, .. }
+            | Self::TargetCut { input, .. }
+            | Self::Nearest { input, .. }
+            | Self::Score { input, .. } => Declared::selecting_all(*input),
+            // Each makes rows of its own: groups, a projection, a union's or
+            // a fusion's arms, a scope's outer rows, a load's or a diff's
+            // rows. No conjunct moves into one.
+            Self::Projection { .. }
+            | Self::Aggregate { .. }
+            | Self::Union { .. }
+            | Self::Fuse { .. }
+            | Self::OuterReference { .. }
+            | Self::MetadataCount { .. }
+            | Self::Join { .. }
+            | Self::RowDiff { .. }
+            | Self::MergeClassify { .. }
+            | Self::CsvSource { .. }
+            | Self::DeltaSource { .. }
+            | Self::Validate { .. }
+            | Self::FragmentWrite { .. } => Declared::passing([]),
         }
     }
 }
@@ -800,11 +989,24 @@ pub struct LogicalPlan {
     schemas: Vec<Option<SchemaRef>>,
     root: LogicalId,
     traversal_work_limit: Option<u64>,
+    /// The bindings the query declares none of, which the type checker or
+    /// the shaper made up (`ReadShape::made_up`): the tie rule orders their
+    /// identities after the declared ones.
+    made_up: std::collections::BTreeSet<String>,
 }
 
 impl LogicalPlan {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the query declares no binding `name`.
+    pub(crate) fn made_up(&self, name: &str) -> bool {
+        self.made_up.contains(name)
+    }
+
+    pub(crate) fn set_made_up(&mut self, names: std::collections::BTreeSet<String>) {
+        self.made_up = names;
     }
 
     /// Query-wide policy captured before any rewrite or physical choice.
@@ -941,181 +1143,235 @@ impl LogicalPlan {
     }
 
     fn node_json(&self, id: LogicalId) -> Value {
-        let Some(node) = self.node(id) else {
-            return json!({ "node": "tombstone" });
-        };
-        let mut value = match node {
-            LogicalNode::TableScan { input, spec } => {
-                let mut value = scan_json("TableScan", spec);
-                if input.is_some() {
-                    value["id_restriction"] = json!("input");
+        omnigraph_compiler::stack::deep(|| {
+            let Some(node) = self.node(id) else {
+                return json!({ "node": "tombstone" });
+            };
+            let mut value = match node {
+                LogicalNode::TableScan { input, spec } => {
+                    let mut value = scan_json("TableScan", spec);
+                    if input.is_some() {
+                        value["id_restriction"] = json!("input");
+                    }
+                    value
                 }
-                value
+                LogicalNode::MetadataCount { spec, return_exprs } => {
+                    metadata_count_json(spec, return_exprs)
+                }
+                LogicalNode::Filter { conjuncts, .. } => json!({
+                    "node": "Filter",
+                    "conjuncts": conjuncts.iter().map(gq_conjunct).collect::<Vec<_>>(),
+                    "typed_filters": crate::typed::exprs(conjuncts),
+                }),
+                LogicalNode::Projection {
+                    reads,
+                    return_exprs,
+                    ..
+                } => json!({
+                    "node": "Projection",
+                    "columns": rendered(reads),
+                    "typed_exprs": crate::typed::returns(return_exprs),
+                }),
+                LogicalNode::Sort {
+                    keys,
+                    order_by,
+                    fetch,
+                    tiebreak,
+                    ..
+                } => json!({
+                    "node": "Sort",
+                    "keys": keys,
+                    "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
+                    "fetch": fetch,
+                    "tiebreak": tiebreak_text(tiebreak),
+                }),
+                LogicalNode::Ordered { keys, .. } => json!({
+                    "node": "Sort", "keys": keys, "fetch": null,
+                }),
+                LogicalNode::Limit { rows, .. } => json!({
+                    "node": "Limit", "rows": rows, "bytes": 0, "resume": null,
+                }),
+                LogicalNode::TargetCut {
+                    binding, targets, ..
+                } => json!({
+                    "node": "TargetCut", "binding": binding, "targets": targets,
+                }),
+                LogicalNode::Page {
+                    rows,
+                    bytes,
+                    resume,
+                    ..
+                } => json!({
+                    "node": "Limit",
+                    "rows": rows,
+                    "bytes": bytes,
+                    "resume": resume,
+                }),
+                LogicalNode::Join { kind, on, .. } => json!({
+                    "node": "Join",
+                    "kind": kind,
+                    "on": on,
+                }),
+                LogicalNode::CrossJoin { .. } => json!({
+                    "node": "Join", "kind": "Cross", "on": LOGICAL_ID,
+                }),
+                LogicalNode::RowDiff {
+                    address_short_circuit,
+                    ..
+                } => json!({
+                    "node": "RowDiff",
+                    "address_short_circuit": address_short_circuit,
+                }),
+                LogicalNode::MergeClassify { .. } => json!({ "node": "MergeClassify" }),
+                LogicalNode::Expand {
+                    src,
+                    dst,
+                    edges,
+                    src_type,
+                    dst_type,
+                    min_hops,
+                    max_hops,
+                    edge_binding,
+                    ..
+                } => json!({
+                    "node": "Expand",
+                    "src": src,
+                    "dst": dst,
+                    "edges": EdgeSelectionMirror::from(edges),
+                    "src_type": src_type,
+                    "dst_type": dst_type,
+                    "min_hops": min_hops,
+                    "max_hops": max_hops,
+                    "edge_binding": edge_binding,
+                }),
+                LogicalNode::AntiJoin {
+                    outer_var,
+                    predicate,
+                    ..
+                } => json!({
+                    "node": "AntiJoin",
+                    "outer_var": outer_var,
+                    "predicate": predicate.to_string(),
+                    "typed_left": crate::typed::block(&predicate.left),
+                    "typed_right": crate::typed::expr(&predicate.right),
+                }),
+                LogicalNode::Union { bindings, .. } => json!({
+                    "node": "Union",
+                    "bindings": bindings,
+                }),
+                LogicalNode::OptionalJoin { outer_var, .. } => json!({
+                    "node": "OptionalJoin",
+                    "outer_var": outer_var,
+                }),
+                LogicalNode::Correlate {
+                    outer_var,
+                    read,
+                    tiebreak,
+                    reads,
+                    ..
+                } => {
+                    let mut value = crate::physical::inner_read_json(read, tiebreak);
+                    value["node"] = json!("Correlate");
+                    value["outer_var"] = json!(outer_var);
+                    value["reads"] = json!(rendered(reads));
+                    value
+                }
+                LogicalNode::OuterReference { outer_var } => json!({
+                    "node": "OuterReference",
+                    "outer_var": outer_var,
+                }),
+                LogicalNode::Score {
+                    binding,
+                    type_name,
+                    property,
+                    kind,
+                    query,
+                    reads,
+                    ..
+                } => json!({
+                    "node": "Score",
+                    "binding": binding,
+                    "type_name": type_name,
+                    "property": property,
+                    "kind": crate::physical::score_kind_name(*kind),
+                    "typed_query": crate::typed::expr(query),
+                    "reads": rendered(reads),
+                }),
+                LogicalNode::Let {
+                    name, value, reads, ..
+                } => json!({
+                    "node": "Let",
+                    "name": name,
+                    "typed_value": crate::typed::expr(value),
+                    "reads": rendered(reads),
+                }),
+                LogicalNode::Nearest {
+                    query,
+                    binding,
+                    property,
+                    k,
+                    reads,
+                    recall,
+                    ..
+                } => {
+                    let mut value = json!({
+                        "node": "Nearest",
+                        "binding": binding,
+                        "property": property,
+                        "typed_query": crate::typed::expr(query),
+                        "k": k,
+                        "reads": rendered(reads),
+                    });
+                    if let Some(recall) = recall {
+                        value["recall"] = json!(recall);
+                    }
+                    value
+                }
+                LogicalNode::Fuse {
+                    arms,
+                    target,
+                    k,
+                    weights,
+                    reads,
+                    partition,
+                } => {
+                    let mut value = json!({
+                        "node": "Fuse",
+                        "target": target,
+                        "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
+                        "typed_k": k.as_ref().map(crate::typed::expr),
+                        "typed_weights": weights.as_ref().map(crate::typed::expr),
+                        "reads": rendered(reads),
+                    });
+                    if let Some(outer) = partition {
+                        value["partition"] = json!(format!("per outer row of ${outer}"));
+                    }
+                    value
+                }
+                LogicalNode::Aggregate {
+                    reads,
+                    return_exprs,
+                    ..
+                } => json!({
+                    "node": "Aggregate",
+                    "reads": rendered(reads),
+                    "typed_exprs": crate::typed::returns(return_exprs),
+                }),
+                LogicalNode::CsvSource { spec } => csv_source_json(spec),
+                LogicalNode::DeltaSource { spec } => delta_source_json(spec),
+                LogicalNode::Validate { table, checks, .. } => validate_json(table, checks),
+                LogicalNode::FragmentWrite { spec, .. } => fragment_write_json(spec),
+            };
+            let inputs: Vec<Value> = node
+                .inputs()
+                .into_iter()
+                .map(|input| self.node_json(input))
+                .collect();
+            if !inputs.is_empty() {
+                value["inputs"] = Value::Array(inputs);
             }
-            LogicalNode::MetadataCount { spec, return_exprs } => {
-                metadata_count_json(spec, return_exprs)
-            }
-            LogicalNode::Filter { conjuncts, .. } => json!({
-                "node": "Filter",
-                "conjuncts": conjuncts.iter().map(gq_conjunct).collect::<Vec<_>>(),
-                "typed_filters": crate::typed::exprs(conjuncts),
-            }),
-            LogicalNode::Projection {
-                reads,
-                return_exprs,
-                ..
-            } => json!({
-                "node": "Projection",
-                "columns": rendered(reads),
-                "typed_exprs": crate::typed::returns(return_exprs),
-            }),
-            LogicalNode::Sort {
-                keys,
-                order_by,
-                fetch,
-                tiebreak,
-                ..
-            } => json!({
-                "node": "Sort",
-                "keys": keys,
-                "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
-                "fetch": fetch,
-                "tiebreak": tiebreak_text(tiebreak),
-            }),
-            LogicalNode::Ordered { keys, .. } => json!({
-                "node": "Sort", "keys": keys, "fetch": null,
-            }),
-            LogicalNode::Limit { rows, .. } => json!({
-                "node": "Limit", "rows": rows, "bytes": 0, "resume": null,
-            }),
-            LogicalNode::Page {
-                rows,
-                bytes,
-                resume,
-                ..
-            } => json!({
-                "node": "Limit",
-                "rows": rows,
-                "bytes": bytes,
-                "resume": resume,
-            }),
-            LogicalNode::Join { kind, on, .. } => json!({
-                "node": "Join",
-                "kind": kind,
-                "on": on,
-            }),
-            LogicalNode::CrossJoin { .. } => json!({
-                "node": "Join", "kind": "Cross", "on": LOGICAL_ID,
-            }),
-            LogicalNode::RowDiff {
-                address_short_circuit,
-                ..
-            } => json!({
-                "node": "RowDiff",
-                "address_short_circuit": address_short_circuit,
-            }),
-            LogicalNode::MergeClassify { .. } => json!({ "node": "MergeClassify" }),
-            LogicalNode::Expand {
-                src,
-                dst,
-                edges,
-                src_type,
-                dst_type,
-                min_hops,
-                max_hops,
-                edge_binding,
-                ..
-            } => json!({
-                "node": "Expand",
-                "src": src,
-                "dst": dst,
-                "edges": EdgeSelectionMirror::from(edges),
-                "src_type": src_type,
-                "dst_type": dst_type,
-                "min_hops": min_hops,
-                "max_hops": max_hops,
-                "edge_binding": edge_binding,
-            }),
-            LogicalNode::AntiJoin {
-                outer_var,
-                predicate,
-                ..
-            } => json!({
-                "node": "AntiJoin",
-                "outer_var": outer_var,
-                "predicate": predicate.to_string(),
-                "typed_left": crate::typed::block(&predicate.left),
-                "typed_right": crate::typed::expr(&predicate.right),
-            }),
-            LogicalNode::OuterReference { outer_var } => json!({
-                "node": "OuterReference",
-                "outer_var": outer_var,
-            }),
-            LogicalNode::Nearest {
-                query,
-                binding,
-                property,
-                k,
-                reads,
-                ..
-            } => json!({
-                "node": "Nearest",
-                "binding": binding,
-                "property": property,
-                "typed_query": crate::typed::expr(query),
-                "k": k,
-                "reads": rendered(reads),
-            }),
-            LogicalNode::TextSearch {
-                query,
-                binding,
-                property,
-                reads,
-                ..
-            } => json!({
-                "node": "TextSearch",
-                "binding": binding,
-                "property": property,
-                "typed_query": crate::typed::expr(query),
-                "reads": rendered(reads),
-            }),
-            LogicalNode::RankFuse {
-                arms,
-                k,
-                reads,
-                row_tiebreak,
-                ..
-            } => json!({
-                "node": "RankFuse",
-                "targets": arms.iter().map(|arm| &arm.binding).collect::<Vec<_>>(),
-                "typed_queries": arms.iter().map(|arm| crate::typed::expr(&arm.query)).collect::<Vec<_>>(),
-                "typed_k": k.as_ref().map(crate::typed::expr),
-                "reads": rendered(reads),
-                "row_tiebreak": tiebreak_text(row_tiebreak),
-            }),
-            LogicalNode::Aggregate {
-                reads,
-                return_exprs,
-                ..
-            } => json!({
-                "node": "Aggregate",
-                "reads": rendered(reads),
-                "typed_exprs": crate::typed::returns(return_exprs),
-            }),
-            LogicalNode::CsvSource { spec } => csv_source_json(spec),
-            LogicalNode::DeltaSource { spec } => delta_source_json(spec),
-            LogicalNode::Validate { table, checks, .. } => validate_json(table, checks),
-            LogicalNode::FragmentWrite { spec, .. } => fragment_write_json(spec),
-        };
-        let inputs: Vec<Value> = node
-            .inputs()
-            .into_iter()
-            .map(|input| self.node_json(input))
-            .collect();
-        if !inputs.is_empty() {
-            value["inputs"] = Value::Array(inputs);
-        }
-        value
+            value
+        })
     }
 }
 
@@ -1216,10 +1472,16 @@ pub(crate) fn fragment_write_json(spec: &FragmentWriteSpec) -> Value {
     })
 }
 
-/// One `order` key as GQ text with its direction: `$p.name desc`.
+/// One `order` key as GQ text with its direction and its written null
+/// placement: `$p.name desc`, `$p.age asc nulls last`.
 pub(crate) fn ordering_text(ordering: &IROrdering) -> String {
     let direction = if ordering.descending { "desc" } else { "asc" };
-    format!("{} {direction}", ordering.expr)
+    let placement = match ordering.nulls_first {
+        None => "",
+        Some(true) => " nulls first",
+        Some(false) => " nulls last",
+    };
+    format!("{} {direction}{placement}", ordering.expr)
 }
 
 fn rendered(reads: &[ColumnRef]) -> Vec<String> {

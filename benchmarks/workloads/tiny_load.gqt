@@ -7,7 +7,7 @@ environments:
   - target: omnigraph-engine
     storage: local-filesystem
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Item

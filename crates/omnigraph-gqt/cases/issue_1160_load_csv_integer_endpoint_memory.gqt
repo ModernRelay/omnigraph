@@ -49,7 +49,7 @@ load csv "replacement.csv" into edge:Knows mode overwrite header
 --- expect error: query_memory_bytes
 
 --- query
-query unchanged() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+query unchanged() { match { $a: Person, $a knows $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 0, "b.id": 1}
 --- expect shape
@@ -62,7 +62,7 @@ load csv "replacement.csv" into edge:Knows mode overwrite header
 --- expect ok
 
 --- query
-query replaced() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+query replaced() { match { $a: Person, $a knows $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 0, "b.id": 7}
 --- expect shape
@@ -78,7 +78,7 @@ load csv "empty.csv" into edge:Knows mode overwrite header
 --- expect error: the source holds no records
 
 --- query
-query empty_refusal_preserves_edges() { match { $a: Person $a knows $b } return { count($b) as n } }
+query empty_refusal_preserves_edges() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n": 1}
 --- expect shape

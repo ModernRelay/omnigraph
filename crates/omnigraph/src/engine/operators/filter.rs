@@ -17,20 +17,35 @@ use super::external;
 use super::memory::WorkMemory;
 use super::shape::{Mapped, Streaming};
 use crate::engine::expr::{evaluate_filter, evaluate_filter_where, kept_rows};
+use crate::engine::lexical::{LexicalColumns, answered_first};
 
 /// The refusal name the pool reports when a filtered batch does not fit.
 const OUTPUT: &str = "filter output";
+/// The refusal name the pool reports when an exact lexical scan's matches
+/// do not fit.
+pub(super) const LEXICAL_SCAN: &str = "exact lexical scan";
 
 /// Every one of `filters` evaluated over `batch`, conjoined into one mask
 /// (a null drops the row, as a false does); `None` when there is no filter.
 /// Each filter after the first needs only the rows the earlier ones kept and
 /// is evaluated as `evaluate_filter_where` describes: on those rows alone
-/// when they are few, over the whole batch when they are many.
+/// when they are few, over the whole batch when they are many. The filters
+/// read full-text calls as the membership columns `lexical` adds to the
+/// batch while they are evaluated.
 pub(super) fn conjoined_mask(
     batch: &RecordBatch,
     filters: &[IRExpr],
     params: &ParamMap,
+    lexical: Option<&LexicalColumns>,
 ) -> DfResult<Option<BooleanArray>> {
+    let widened;
+    let batch = match lexical {
+        Some(lexical) if !filters.is_empty() => {
+            widened = lexical.widen(batch).map_err(external)?;
+            &widened
+        }
+        _ => batch,
+    };
     let mut mask: Option<BooleanArray> = None;
     for filter in filters {
         mask = Some(match mask {
@@ -49,6 +64,7 @@ pub(crate) struct FilterExec {
     input: Arc<dyn ExecutionPlan>,
     filters: Vec<IRExpr>,
     params: Arc<ParamMap>,
+    lexical: Option<Arc<LexicalColumns>>,
     shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -58,12 +74,14 @@ impl FilterExec {
         input: Arc<dyn ExecutionPlan>,
         filters: Vec<IRExpr>,
         params: Arc<ParamMap>,
+        lexical: Option<Arc<LexicalColumns>>,
     ) -> Self {
         let shape = Streaming::new(input.schema());
         Self {
             input,
             filters,
             params,
+            lexical,
             shape,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -111,6 +129,7 @@ impl ExecutionPlan for FilterExec {
             children.pop().expect("one child"),
             self.filters.clone(),
             Arc::clone(&self.params),
+            self.lexical.clone(),
         )))
     }
 
@@ -120,12 +139,19 @@ impl ExecutionPlan for FilterExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "FilterExec has one partition");
-        let input = self.input.execute(0, Arc::clone(&ctx))?;
+        let mut input = self.input.execute(0, Arc::clone(&ctx))?;
+        if let Some(lexical) = &self.lexical {
+            let mut scan = WorkMemory::new(Arc::clone(&ctx), LEXICAL_SCAN)?;
+            scan.set_metrics(self.metrics.clone());
+            let lexical = Arc::clone(lexical);
+            input = answered_first(input, async move { lexical.answer(scan).await });
+        }
         let memory = WorkMemory::new(ctx, OUTPUT)?;
         let filters = self.filters.clone();
         let params = Arc::clone(&self.params);
+        let lexical = self.lexical.clone();
         Ok(self.shape.map(&self.metrics, input, move |batch| {
-            let kept = match conjoined_mask(&batch, &filters, &params)? {
+            let kept = match conjoined_mask(&batch, &filters, &params, lexical.as_deref())? {
                 Some(mask) => arrow_select::filter::filter_record_batch(&batch, &mask)?,
                 None => batch,
             };
@@ -145,7 +171,7 @@ mod tests {
 
     use arrow_array::{Array, ArrayRef, Float32Array, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::query::value::{CompOp, Literal};
     use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 
     use super::*;
@@ -200,11 +226,11 @@ mod tests {
         );
         let params = ParamMap::new();
         assert!(
-            conjoined_mask(&batch, std::slice::from_ref(&expensive), &params).is_err(),
+            conjoined_mask(&batch, std::slice::from_ref(&expensive), &params, None).is_err(),
             "the infinite row fails the cast when it is evaluated"
         );
 
-        let mask = conjoined_mask(&batch, &[cheap, expensive], &params)
+        let mask = conjoined_mask(&batch, &[cheap, expensive], &params, None)
             .unwrap()
             .unwrap();
         let kept: Vec<usize> = (0..rows as usize)

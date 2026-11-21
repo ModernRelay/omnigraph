@@ -26,14 +26,14 @@ use omnigraph_cluster::{
     read_serving_snapshot_from_storage, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use ulid::Ulid;
 
 const SCHEMA_V1: &str = "node Person {\n  name: String @key\n}\n";
 const SCHEMA_V2: &str = "node Person {\n  name: String @key\n  title: String?\n}\n";
-const FIND_PERSON_GQ: &str = "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n";
+const FIND_PERSON_GQ: &str = "query find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n";
 const INSERT_PERSON_GQ: &str =
-    "query insert_person($name: String) {\n  insert Person { name: $name }\n}\n";
+    "query insert_person($name: String) {\n  replace Person { name: $name }\n}\n";
 const POLICY_YAML: &str = r#"
 version: 1
 groups:
@@ -208,7 +208,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         .load(
             "main",
             r#"{"type":"Person","data":{"name":"Ada"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -241,7 +241,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         .load(
             "feature",
             r#"{"type":"Person","data":{"name":"OldFeature"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -252,7 +252,7 @@ async fn object_storage_cluster_full_lifecycle(root: &str, expected_scheme: &str
         .load(
             "feature",
             r#"{"type":"Person","data":{"name":"NewFeature"}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -338,7 +338,7 @@ async fn object_storage_offline_deployment(root: &str) {
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"Ada"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();

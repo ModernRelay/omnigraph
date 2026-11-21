@@ -35,7 +35,7 @@ branch create feature
 
 --- mutate
 query x_on_main() {
-    insert Person { name: "x", age: 1 }
+    replace Person { name: "x", age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -44,7 +44,7 @@ query x_on_main() {
 
 --- mutate branch: feature
 query y_on_feature() {
-    insert Person { name: "y", age: 2 }
+    replace Person { name: "y", age: 2 }
 }
 
 --- expect affected: nodes=1 edges=0

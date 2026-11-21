@@ -28,7 +28,7 @@ node Person {
 
 --- mutate
 query propose_erin() as commit {
-    insert Person { name: "erin", age: 5 }
+    replace Person { name: "erin", age: 5 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -42,7 +42,7 @@ branch create from_proposal from commit "${proposal}"
 
 --- mutate
 query park_frank() as unattached branch {
-    insert Person { name: "frank", age: 6 }
+    replace Person { name: "frank", age: 6 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -61,7 +61,7 @@ branch create gone from main
 
 --- mutate branch: gone
 query add_gil() {
-    insert Person { name: "gil", age: 7 }
+    replace Person { name: "gil", age: 7 }
 }
 
 --- expect affected: nodes=1 edges=0

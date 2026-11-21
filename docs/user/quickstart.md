@@ -68,11 +68,8 @@ Write a query (`.gq`) — save as `queries.gq`:
 
 ```gq
 query sources_for_claim($claim: String) {
-  match {
-    $source: Source
-    $claim_node: Claim { slug: $claim }
-    $source supports $claim_node
-  }
+  match { $source: Source, $claim_node: Claim, $source supports $claim_node }
+  where $claim_node.slug = $claim
   return { $source.title as source }
   order { source asc }
 }
@@ -108,7 +105,7 @@ they address the graph with `--target` (the same flag `query` uses above):
 
 ```bash
 omnigraph branch create review/add-benchmark --target ./graph.omni
-omnigraph load --data benchmark.jsonl --mode append \
+omnigraph load --data benchmark.jsonl --mode insert \
   --branch review/add-benchmark --target ./graph.omni
 omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' \

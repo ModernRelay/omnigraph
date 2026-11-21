@@ -59,20 +59,12 @@ pub struct SettingSpec {
 
 pub const DEFINITIONS: &[SettingSpec] = &[
     SettingSpec {
-        name: "engine",
-        kind: SettingKind::Enum(&["v2"]),
-        default: "v2",
-        scope: SettingScope::Request,
-        env: "OMNIGRAPH_ENGINE",
-        doc: "the engine a read query runs on; `v2`, the plan runner, is the one value; this setting does not change change-feed or merge execution",
-    },
-    SettingSpec {
         name: "rrf_plan",
         kind: SettingKind::Enum(&["auto", "force_prefilter", "force_postfilter"]),
         default: "auto",
         scope: SettingScope::Process,
         env: "OMNIGRAPH_RRF_PLAN",
-        doc: "the reciprocal rank fusion plan on a traversal-constrained `nearest`, for diagnosis",
+        doc: "the prefilter gate of a traversal-constrained `nearest`, an `rrf` arm included: decide by size, or force one plan, for diagnosis",
     },
     SettingSpec {
         name: "merge_lineage",
@@ -119,6 +111,28 @@ pub const DEFINITIONS: &[SettingSpec] = &[
         scope: SettingScope::Request,
         env: "OMNIGRAPH_TRAVERSAL_WORK_LIMIT",
         doc: "the finite work budget shared by edge selections in one query; exhaustion terminates the query with an error",
+    },
+    SettingSpec {
+        name: "read_work_limit",
+        kind: SettingKind::Integer {
+            min: 1,
+            max: Some(i64::MAX),
+        },
+        default: "100000000",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_READ_WORK_LIMIT",
+        doc: "how much work one read may do: the results its expansions and joins produce, the pairs a product forms, the neighbors a hop range examines, every traversal together, and the tokens and term comparisons of its exact lexical scans; exhaustion fails the read with an error naming it, never a partial result",
+    },
+    SettingSpec {
+        name: "plan_budget_limit",
+        kind: SettingKind::Integer {
+            min: 1,
+            max: Some(i64::MAX),
+        },
+        default: "65536",
+        scope: SettingScope::Request,
+        env: "OMNIGRAPH_PLAN_BUDGET_LIMIT",
+        doc: "the largest plan budget a declaration may declare with `@budget(plan = n)`, the work units its compile and plan may charge; a declaration declaring more is refused (`T89`) before it is compiled, never clamped",
     },
     SettingSpec {
         name: "write_max_bytes",
@@ -168,13 +182,14 @@ pub const DEFINITIONS: &[SettingSpec] = &[
 /// One variant per [`DEFINITIONS`] row, in the table's order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingId {
-    Engine,
     RrfPlan,
     MergeLineage,
     ChangeLineage,
     AnnNprobes,
     StageWriteConcurrency,
     TraversalWorkLimit,
+    ReadWorkLimit,
+    PlanBudgetLimit,
     WriteMaxBytes,
     LoadSourceMaxBytes,
     QueryMemoryBytes,
@@ -185,13 +200,14 @@ pub enum SettingId {
 impl SettingId {
     /// Every setting, in definition order.
     pub const ALL: [SettingId; DEFINITIONS.len()] = [
-        SettingId::Engine,
         SettingId::RrfPlan,
         SettingId::MergeLineage,
         SettingId::ChangeLineage,
         SettingId::AnnNprobes,
         SettingId::StageWriteConcurrency,
         SettingId::TraversalWorkLimit,
+        SettingId::ReadWorkLimit,
+        SettingId::PlanBudgetLimit,
         SettingId::WriteMaxBytes,
         SettingId::LoadSourceMaxBytes,
         SettingId::QueryMemoryBytes,
@@ -317,17 +333,8 @@ pub enum Traversal {
     Csr,
 }
 
-/// `engine`: the route a read query runs on. `V2`, the plan runner, is the
-/// only value; a later engine version is a new variant.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Engine {
-    #[default]
-    V2,
-}
-
-/// `rrf_plan`: the reciprocal rank fusion plan on a traversal-constrained
-/// `nearest`.
+/// `rrf_plan`: the prefilter gate of a traversal-constrained `nearest`, an
+/// `rrf` arm included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RrfPlan {
     Auto,
@@ -363,7 +370,6 @@ macro_rules! enum_spelling {
     };
 }
 
-enum_spelling!(Engine { V2 => "v2" });
 enum_spelling!(Traversal { Auto => "auto", Indexed => "indexed", Csr => "csr" });
 enum_spelling!(RrfPlan { Auto => "auto", ForcePrefilter => "force_prefilter", ForcePostfilter => "force_postfilter" });
 enum_spelling!(MergeLineage { Off => "off", On => "on", Verify => "verify" });
@@ -416,13 +422,14 @@ pub const STORED_QUERY_CARRIES_NO_SETTINGS: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSettings {
     traversal: Traversal,
-    engine: Engine,
     rrf_plan: RrfPlan,
     merge_lineage: MergeLineage,
     change_lineage: ChangeLineage,
     ann_nprobes: Option<usize>,
     stage_write_concurrency: usize,
     traversal_work_limit: u64,
+    read_work_limit: u64,
+    plan_budget_limit: u64,
     write_max_bytes: u64,
     load_source_max_bytes: u64,
     query_memory_bytes: u64,
@@ -436,13 +443,14 @@ impl Default for SessionSettings {
     fn default() -> Self {
         let mut settings = SessionSettings {
             traversal: Traversal::Auto,
-            engine: Engine::V2,
             rrf_plan: RrfPlan::Auto,
             merge_lineage: MergeLineage::On,
             change_lineage: ChangeLineage::On,
             ann_nprobes: None,
             stage_write_concurrency: 1,
             traversal_work_limit: 1,
+            read_work_limit: 1,
+            plan_budget_limit: 1,
             write_max_bytes: 1,
             load_source_max_bytes: 1,
             query_memory_bytes: 1,
@@ -496,7 +504,6 @@ impl SessionSettings {
     /// its range; `self` is unchanged then.
     pub fn set(&mut self, id: SettingId, value: &SettingValue) -> Result<(), SessionSettingsError> {
         match id {
-            SettingId::Engine => self.engine = parse_enum(id, value, Engine::from_spelling)?,
             SettingId::RrfPlan => self.rrf_plan = parse_enum(id, value, RrfPlan::from_spelling)?,
             SettingId::MergeLineage => {
                 self.merge_lineage = parse_enum(id, value, MergeLineage::from_spelling)?
@@ -510,6 +517,14 @@ impl SessionSettings {
             }
             SettingId::TraversalWorkLimit => {
                 self.traversal_work_limit = u64::try_from(parse_integer(id, value)?)
+                    .expect("invariant: the row's range is 1..=i64::MAX");
+            }
+            SettingId::ReadWorkLimit => {
+                self.read_work_limit = u64::try_from(parse_integer(id, value)?)
+                    .expect("invariant: the row's range is 1..=i64::MAX");
+            }
+            SettingId::PlanBudgetLimit => {
+                self.plan_budget_limit = u64::try_from(parse_integer(id, value)?)
                     .expect("invariant: the row's range is 1..=i64::MAX");
             }
             SettingId::StageWriteConcurrency => {
@@ -542,12 +557,13 @@ impl SessionSettings {
     /// the field the row names, and no other field.
     pub fn copy_field(&mut self, from: &SessionSettings, id: SettingId) {
         match id {
-            SettingId::Engine => self.engine = from.engine,
             SettingId::RrfPlan => self.rrf_plan = from.rrf_plan,
             SettingId::MergeLineage => self.merge_lineage = from.merge_lineage,
             SettingId::ChangeLineage => self.change_lineage = from.change_lineage,
             SettingId::AnnNprobes => self.ann_nprobes = from.ann_nprobes,
             SettingId::TraversalWorkLimit => self.traversal_work_limit = from.traversal_work_limit,
+            SettingId::ReadWorkLimit => self.read_work_limit = from.read_work_limit,
+            SettingId::PlanBudgetLimit => self.plan_budget_limit = from.plan_budget_limit,
             SettingId::StageWriteConcurrency => {
                 self.stage_write_concurrency = from.stage_write_concurrency;
             }
@@ -570,13 +586,14 @@ impl SessionSettings {
     /// The current value in GQ spelling, the `value` column of `show`.
     pub fn get(&self, id: SettingId) -> String {
         match id {
-            SettingId::Engine => self.engine.as_str().to_string(),
             SettingId::RrfPlan => self.rrf_plan.as_str().to_string(),
             SettingId::MergeLineage => self.merge_lineage.as_str().to_string(),
             SettingId::ChangeLineage => self.change_lineage.as_str().to_string(),
             SettingId::AnnNprobes => self.ann_nprobes.unwrap_or(0).to_string(),
             SettingId::StageWriteConcurrency => self.stage_write_concurrency.to_string(),
             SettingId::TraversalWorkLimit => self.traversal_work_limit.to_string(),
+            SettingId::ReadWorkLimit => self.read_work_limit.to_string(),
+            SettingId::PlanBudgetLimit => self.plan_budget_limit.to_string(),
             SettingId::WriteMaxBytes => self.write_max_bytes.to_string(),
             SettingId::LoadSourceMaxBytes => self.load_source_max_bytes.to_string(),
             SettingId::QueryMemoryBytes => self.query_memory_bytes.to_string(),
@@ -609,10 +626,6 @@ impl SessionSettings {
         self.traversal
     }
 
-    pub fn engine(&self) -> Engine {
-        self.engine
-    }
-
     pub fn rrf_plan(&self) -> RrfPlan {
         self.rrf_plan
     }
@@ -632,6 +645,18 @@ impl SessionSettings {
 
     pub fn traversal_work_limit(&self) -> u64 {
         self.traversal_work_limit
+    }
+
+    /// The rows one read's expansions may produce, all together.
+    pub fn read_work_limit(&self) -> u64 {
+        self.read_work_limit
+    }
+
+    /// The largest plan budget a declaration may declare,
+    /// `@budget(plan = n)`; one declaring more is refused before it is
+    /// compiled.
+    pub fn plan_budget_limit(&self) -> u64 {
+        self.plan_budget_limit
     }
 
     pub fn stage_write_concurrency(&self) -> usize {
@@ -763,6 +788,17 @@ pub fn from_env() -> Result<(SessionSettings, Sources), SessionSettingsError> {
 pub fn from_env_with(
     mut lookup: impl FnMut(&'static str) -> Option<String>,
 ) -> Result<(SessionSettings, Sources), SessionSettingsError> {
+    for removed in REMOVED_SETTINGS {
+        if lookup(removed.env).is_some_and(|raw| !raw.trim().is_empty()) {
+            return Err(SessionSettingsError::Environment {
+                variable: removed.env,
+                message: format!(
+                    "unknown setting `{}`; it was removed ({}), so delete the variable",
+                    removed.name, removed.why
+                ),
+            });
+        }
+    }
     let mut settings = SessionSettings::default();
     let mut sources = [Source::Default; DEFINITIONS.len()];
     for id in SettingId::ALL {
@@ -787,7 +823,11 @@ pub fn from_env_with(
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SessionSettingsError {
-    #[error("unknown setting `{name}`; expected one of {}", setting_names())]
+    #[error(
+        "unknown setting `{name}`; {}expected one of {}",
+        removed_note(name),
+        setting_names()
+    )]
     UnknownSetting { name: String },
     #[error("unknown value `{value}` for setting `{}`; expected one of {}", setting.name(), enum_values(*setting))]
     UnknownValue { setting: SettingId, value: String },
@@ -809,6 +849,33 @@ pub enum SessionSettingsError {
         variable: &'static str,
         message: String,
     },
+}
+
+/// A setting a release removed: its name, its environment variable and why
+/// it went. Each is refused as an unknown setting, whose fix deletes it.
+pub const REMOVED_SETTINGS: &[RemovedSetting] = &[RemovedSetting {
+    name: "engine",
+    env: "OMNIGRAPH_ENGINE",
+    why: "every read runs from its plan, and `v2` was its one value",
+}];
+
+/// One row of [`REMOVED_SETTINGS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovedSetting {
+    pub name: &'static str,
+    pub env: &'static str,
+    pub why: &'static str,
+}
+
+/// The removed setting a name denotes, if any.
+pub fn removed_setting(name: &str) -> Option<&'static RemovedSetting> {
+    REMOVED_SETTINGS.iter().find(|removed| removed.name == name)
+}
+
+fn removed_note(name: &str) -> String {
+    removed_setting(name)
+        .map(|removed| format!("it was removed ({}), so delete it; ", removed.why))
+        .unwrap_or_default()
 }
 
 fn setting_names() -> String {
@@ -1094,16 +1161,35 @@ mod tests {
     }
 
     #[test]
+    fn the_removed_engine_setting_is_refused_with_a_fix_that_deletes_it() {
+        let err = SettingId::parse("engine").unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "unknown setting `engine`; it was removed (every read runs from its plan, and `v2` was its one value), so delete it; expected one of rrf_plan,"
+            ),
+            "{err}"
+        );
+        assert!(SettingId::parse_assignment("engine", "v2").is_err());
+        let err =
+            from_env_with(|variable| (variable == "OMNIGRAPH_ENGINE").then(|| "v2".to_string()))
+                .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "OMNIGRAPH_ENGINE: unknown setting `engine`; it was removed (every read runs from its plan, and `v2` was its one value), so delete the variable"
+        );
+        assert!(
+            from_env_with(|variable| (variable == "OMNIGRAPH_ENGINE").then(|| " ".to_string()))
+                .is_ok(),
+            "an empty variable is unset, as for every row"
+        );
+    }
+
+    #[test]
     fn messages_follow_the_definition() {
         let err = SettingId::parse("merge_linage").unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting `merge_linage`; expected one of engine, rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
-        );
-        let err = SessionSettings::default().with("engine", "v1").unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "unknown value `v1` for setting `engine`; expected one of v2"
+            "unknown setting `merge_linage`; expected one of rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, read_work_limit, plan_budget_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir"
         );
         let err = SessionSettings::default()
             .with("merge_lineage", "v3")
@@ -1146,14 +1232,12 @@ mod tests {
     #[test]
     fn values_are_typed_and_the_same_under_every_spelling() {
         let settings = SessionSettings::try_from_values(&[
-            ("engine", "v2"),
             ("rrf_plan", "\"force_prefilter\""),
             ("merge_lineage", "off"),
             ("ann_nprobes", "0"),
             ("stage_write_concurrency", "64"),
         ])
         .unwrap();
-        assert_eq!(settings.engine(), Engine::V2);
         assert_eq!(settings.rrf_plan(), RrfPlan::ForcePrefilter);
         assert_eq!(settings.merge_lineage(), MergeLineage::Off);
         assert_eq!(settings.ann_nprobes(), None);
@@ -1221,20 +1305,8 @@ mod tests {
             sources[SettingId::StageWriteConcurrency as usize],
             Source::Default
         );
-        assert_eq!(settings.engine(), Engine::V2);
-        assert_eq!(sources[SettingId::Engine as usize], Source::Default);
-        let (v2, sources) =
-            from_env_with(|variable| (variable == "OMNIGRAPH_ENGINE").then(|| "v2".to_string()))
-                .unwrap();
-        assert_eq!(v2.engine(), Engine::V2);
-        assert_eq!(sources[SettingId::Engine as usize], Source::Env);
 
         for (variable, value, expected) in [
-            (
-                "OMNIGRAPH_ENGINE",
-                "v1",
-                "OMNIGRAPH_ENGINE: unknown value `v1` for setting `engine`; expected one of v2",
-            ),
             (
                 "OMNIGRAPH_LOAD_CONCURRENCY",
                 "0",

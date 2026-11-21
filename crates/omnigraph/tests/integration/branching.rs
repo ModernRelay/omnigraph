@@ -31,7 +31,8 @@ const SEARCH_DATA: &str = include_str!("../fixtures/search.jsonl");
 const SEARCH_QUERIES: &str = include_str!("../fixtures/search.gq");
 const SEARCH_MUTATIONS: &str = r#"
 query set_doc_title($slug: String, $title: String) {
-    update Doc set { title: $title } where slug = $slug
+    match { $x: Doc } where $x.slug = $slug
+    update $x set { title: $title }
 }
 "#;
 
@@ -47,7 +48,7 @@ const UNIQUE_DATA: &str = r#"{"type":"User","data":{"name":"Alice","email":"alic
 
 const UNIQUE_MUTATIONS: &str = r#"
 query insert_user($name: String, $email: String) {
-    insert User { name: $name, email: $email }
+    replace User { name: $name, email: $email }
 }
 "#;
 
@@ -67,7 +68,7 @@ const EDGE_UNIQUE_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 
 const EDGE_UNIQUE_MUTATIONS: &str = r#"
 query add_knows($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 "#;
 
@@ -89,7 +90,7 @@ const CARDINALITY_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 
 const CARDINALITY_MUTATIONS: &str = r#"
 query add_employment($person: String, $company: String) {
-    insert WorksAt { from: $person, to: $company }
+    insert WorksAt { @src: $person, @dst: $company }
 }
 "#;
 
@@ -116,15 +117,17 @@ node Asset {
 
 const BLOB_MUTATIONS: &str = r#"
 query insert_doc($title: String, $content: Blob, $note: String) {
-    insert Document { title: $title, content: $content, note: $note }
+    replace Document { title: $title, content: $content, note: $note }
 }
 
 query update_doc_note($title: String, $note: String) {
-    update Document set { note: $note } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { note: $note }
 }
 
 query delete_doc($title: String) {
-    delete Document where title = $title
+    match { $x: Document } where $x.title = $title
+    delete $x
 }
 "#;
 
@@ -149,7 +152,11 @@ fn write_sized_external_blob(path: &std::path::Path, bytes: u64) {
 
 async fn init_search_db(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
-    let db = helpers::session(Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap());
+    let db = helpers::session(
+        Omnigraph::init(uri, &helpers::with_full_text(SEARCH_SCHEMA))
+            .await
+            .unwrap(),
+    );
     db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -618,7 +625,7 @@ async fn explicit_target_load_writes_to_named_branch() {
     db.load(
         "feature",
         r#"{"type":"Person","data":{"name":"Eve","age":22}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -870,7 +877,7 @@ async fn branch_merge_with_blob_columns_preserves_blob_data() {
     main.load(
         "main",
         r#"{"type":"Document","data":{"title":"readme","content":"base64:V29ybGQ=","note":"head advance"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1030,11 +1037,13 @@ async fn branch_merge_with_blob_columns_keeps_a_lazy_reader_honest_across_branch
 async fn branch_merge_compares_rows_written_before_a_blob_property_was_added() {
     const WRITES: &str = r#"
 query set_note($title: String, $note: String) {
-    update Document set { note: $note } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { note: $note }
 }
 
 query set_thumb($title: String, $thumb: Blob) {
-    update Document set { thumb: $thumb } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { thumb: $thumb }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1148,7 +1157,7 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
     aba.load(
         "feature",
         r#"{"type":"Document","data":{"title":"aba","content":"base64:T2xk","note":"old"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1203,7 +1212,7 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
     aba.load(
         "feature",
         r#"{"type":"Document","data":{"title":"aba","content":"base64:TmV3","note":"new"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1307,7 +1316,7 @@ node Marker {
     db.load(
         "feature",
         r#"{"type":"Marker","data":{"name":"feature-commit"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1343,7 +1352,7 @@ node Marker {
     db.load(
         "feature",
         r#"{"type":"Marker","data":{"name":"ordinary-advance"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1362,7 +1371,7 @@ node Marker {
     db.load(
         "main",
         r#"{"type":"Document","data":{"title":"doc","content":"base64:TmV3"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2075,7 +2084,7 @@ async fn branch_merge_onto_main_switches_managed_blob_pointers_body() {
             }
         })
         .to_string();
-        db.load("feature", &row, LoadMode::Append).await.unwrap();
+        db.load("feature", &row, LoadMode::Insert).await.unwrap();
     }
 
     let before_tables = pointer_switch_tables(&db).await;
@@ -2579,7 +2588,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"BorrowedCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -2604,7 +2613,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "main",
         None,
         r#"{"type":"Company","data":{"name":"MainCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -2625,7 +2634,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"NewCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -2659,7 +2668,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "replacement",
         None,
         r#"{"type":"Company","data":{"name":"ReplacementCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -2702,7 +2711,7 @@ async fn branch_write_after_adoption_keeps_borrowers_and_stages_fresh_pins() {
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"AfterAdoptCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -3224,7 +3233,7 @@ async fn branch_merge_detects_nested_list_value_change() {
         .load_with_receipt(
             "feature",
             r#"{"type":"Doc","data":{"slug":"x","tags":["a","b"]}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3234,7 +3243,7 @@ async fn branch_merge_detects_nested_list_value_change() {
     main.load_with_receipt(
         "main",
         r#"{"type":"Doc","data":{"slug":"y","tags":["z"]}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3246,7 +3255,7 @@ async fn branch_merge_detects_nested_list_value_change() {
     // returned only if feature's change survived the merge.
     let queries = r#"
 query docs_with_tag($tag: String) {
-    match { $d: Doc  $d.tags contains $tag }
+    match { $d: Doc } where $tag in $d.tags
     return { $d.slug }
 }
 "#;
@@ -3374,8 +3383,8 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
         user_indices.len(),
-        4,
-        "expected rebuilt id BTree plus key-property and title/body indices after rewritten merge"
+        8,
+        "expected rebuilt id BTree, the key property's BTREE, and the full-text, NGRAM and BTREE indexes of title and body after rewritten merge"
     );
 }
 
@@ -3716,7 +3725,7 @@ async fn branch_create_at_a_commit_refuses_what_is_not_branch_history() {
             "main",
             r#"
 query propose($name: String, $age: I32) as commit {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
             "propose",
@@ -3731,7 +3740,7 @@ query propose($name: String, $age: I32) as commit {
             "main",
             r#"
 query park($name: String, $age: I32) as unattached branch {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
             "park",
@@ -4319,11 +4328,12 @@ async fn branch_merge_reports_cardinality_violation_conflict() {
 async fn merge_main_into_branch_validates_adopted_edge_against_branch_node_delete() {
     const MUTATIONS: &str = r#"
 query add_knows($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 
 query delete_person($name: String) {
-    delete Person where name = $name
+    match { $x: Person } where $x.name = $name
+    delete $x
 }
 "#;
 
@@ -5164,28 +5174,24 @@ const EDGE_KEY_MERGE_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
 
 const EDGE_KEY_MERGE_MUTATIONS: &str = r#"
 query add_knows($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 
 query add_knows_since($from: String, $to: String, $since: String) {
-    insert Knows { from: $from, to: $to, since: $since }
+    insert Knows { @src: $from, @dst: $to, since: $since }
 }
 "#;
 
 const EDGE_KEY_MERGE_QUERIES: &str = r#"
 query friends() {
-    match {
-        $p: Person { name: "Alice" }
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
+    where $p.name = "Alice"
     return { $f.name }
 }
 
 query friend_edges() {
-    match {
-        $p: Person { name: "Alice" }
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = "Alice"
     return { $f.name }
 }
 "#;

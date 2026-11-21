@@ -1,16 +1,15 @@
 //! Session and compiled-query read entry points. Every read plans and runs
-//! through `crate::engine::execute_query`; a test session may carry a
-//! `ReadExecutor` that runs its reads instead (feature `test-util`).
+//! through `crate::engine::execute_query`.
 
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::ir::{IROp, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::LoadStmt;
+use omnigraph_compiler::ir::ParamMap;
+use omnigraph_compiler::query::file::LoadStmt;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
-use omnigraph_compiler::{CheckedRead, lower_query};
+use omnigraph_planner::{PatternStep, ReadShape};
 
 use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::engine;
@@ -68,9 +67,9 @@ impl Session {
         params: &ParamMap,
     ) -> Result<(QueryResult, Option<String>)> {
         let settings = self.effective(query_source)?;
-        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let (resolved, catalog) = self.capture_query_view(target).await?;
 
-        let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
+        let compiled = self.compile_named_query(&catalog, query_source, query_name, &settings)?;
         admit_wildcard_target(
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             compiled.ir().has_wildcard_traversal(),
@@ -109,7 +108,7 @@ impl Session {
         let settings = self.effective(query_source)?;
         let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
-        let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
+        let compiled = self.compile_named_query(&catalog, query_source, query_name, &settings)?;
         admit_wildcard_target(true, compiled.ir().has_wildcard_traversal())?;
         if let CompiledRead::Explain(query) = &compiled {
             return engine::explain_rows(query, params, Some(&snapshot), &catalog, &settings).await;
@@ -146,8 +145,8 @@ impl Session {
         params: &ParamMap,
     ) -> Result<serde_json::Value> {
         let settings = self.effective(query_source)?;
-        let (resolved, catalog) = self.capture_read_view(target).await?;
-        let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
+        let (resolved, catalog) = self.capture_query_view(target).await?;
+        let compiled = self.compile_named_query(&catalog, query_source, query_name, &settings)?;
         admit_wildcard_target(
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             compiled.ir().has_wildcard_traversal(),
@@ -228,9 +227,9 @@ impl Session {
         params: &ParamMap,
     ) -> Result<engine::Executed> {
         let settings = self.effective(query_source)?;
-        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let (resolved, catalog) = self.capture_query_view(target).await?;
         let CompiledRead::Query(query) =
-            self.compile_named_query(&catalog, query_source, query_name)?
+            self.compile_named_query(&catalog, query_source, query_name, &settings)?
         else {
             return Err(OmniError::manifest(
                 "the inspection door runs no `explain` statement",
@@ -241,10 +240,17 @@ impl Session {
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             ir.has_wildcard_traversal(),
         )?;
-        let traverses = ir
-            .pipeline
-            .iter()
-            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
+        let traverses = ir.pipeline.iter().any(|op| {
+            matches!(
+                op,
+                PatternStep::Expand { .. }
+                    | PatternStep::AntiJoin { .. }
+                    | PatternStep::Optional { .. }
+                    | PatternStep::Union { .. }
+                    | PatternStep::Correlate { .. }
+                    | PatternStep::Fuse { .. }
+            )
+        });
         let graph_index = if traverses {
             engine::GraphIndexHandle::cached(
                 Arc::clone(&**self),
@@ -298,7 +304,7 @@ impl Session {
             omnigraph_planner::ValidationLimits::DEFAULT,
         )
         .map_err(engine::replay_refused)?;
-        let (resolved, catalog) = self.capture_read_view(target).await?;
+        let (resolved, catalog) = self.capture_query_view(target).await?;
         let plan = &envelope.plan.plan;
         let has_wildcard = plan.assumptions().has_wildcard_traversal || plan.live().any(|(_, node)| {
             matches!(node, omnigraph_planner::PhysicalNode::Expand { edges, .. } if edges.is_wildcard())
@@ -308,9 +314,15 @@ impl Session {
             has_wildcard,
         )?;
         engine::plan_pins_snapshot(plan, Some(&resolved.snapshot))?;
-        engine::replayed_coverage_holds(plan, &resolved.snapshot).await?;
-        let CompiledRead::Query(query) =
-            self.compile_named_query(&catalog, &envelope.query.source, &envelope.query.name)?
+        // The ceiling a recompiled declaration is admitted under; nothing
+        // of it reaches execution, which the plan alone sizes.
+        let settings = self.effective(&envelope.query.source)?;
+        let CompiledRead::Query(query) = self.compile_named_query(
+            &catalog,
+            &envelope.query.source,
+            &envelope.query.name,
+            &settings,
+        )?
         else {
             return Err(OmniError::manifest(
                 "a replay envelope names an `explain` statement, which runs nothing",
@@ -337,9 +349,8 @@ impl Session {
         engine::execute(accepted, &context).await
     }
 
-    /// One compiled query through the engine, or through the installed
-    /// `ReadExecutor`. The lazy graph-index handle means an index-served query
-    /// with no `AntiJoin` never builds the CSR.
+    /// One compiled query through the engine. The lazy graph-index handle
+    /// means an index-served query with no `AntiJoin` never builds the CSR.
     async fn execute_on_route(
         &self,
         settings: &SessionSettings,
@@ -349,23 +360,18 @@ impl Session {
         index_source: IndexSource<'_>,
         catalog: &Arc<Catalog>,
     ) -> Result<QueryResult> {
-        let ir: &QueryIR = &query.ir;
-        #[cfg(feature = "test-util")]
-        if let Some(executor) = self.read_executor() {
-            let erased = ir.erase();
-            let request = omnigraph_catalog::read_executor::ReadRequest {
-                ir: &erased,
-                params,
-                snapshot: snapshot.raw(),
-                catalog,
-                settings,
-            };
-            return executor.execute(request).await;
-        }
-        let needs_graph = ir
-            .pipeline
-            .iter()
-            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
+        let ir: &ReadShape = &query.ir;
+        let needs_graph = ir.pipeline.iter().any(|op| {
+            matches!(
+                op,
+                PatternStep::Expand { .. }
+                    | PatternStep::AntiJoin { .. }
+                    | PatternStep::Optional { .. }
+                    | PatternStep::Union { .. }
+                    | PatternStep::Correlate { .. }
+                    | PatternStep::Fuse { .. }
+            )
+        });
         let graph_index = match (&index_source, needs_graph) {
             (_, false) => engine::GraphIndexHandle::none(),
             (IndexSource::Cached(resolved), true) => engine::GraphIndexHandle::cached(
@@ -398,29 +404,45 @@ impl Omnigraph {
     /// Compile the read statement `query_name` of `query_source` (a declaration,
     /// or `explain` over one), cached in `ReadCaches::compiled_queries`; errors are
     /// never cached. A hit needs the memoized catalog `Arc` of the schema gate.
+    ///
+    /// A declaration whose `@budget(plan = n)` is above the session's
+    /// `plan_budget_limit` is refused (`T89`) before it is compiled; a cached
+    /// one is admitted against the session's ceiling too, since the cache
+    /// spans sessions.
     fn compile_named_query(
         &self,
         catalog: &Arc<Catalog>,
         query_source: &str,
         query_name: &str,
+        settings: &crate::settings::SessionSettings,
     ) -> Result<CompiledRead> {
+        let ceiling = settings.plan_budget_limit();
         let cache = &self.read_caches().compiled_queries;
         let key = crate::runtime_cache::CompiledQueryCache::key_for(query_source, query_name);
-        if let Some(compiled) = cache.get(catalog, &key) {
+        if let Some(compiled) = cache.get(catalog, &key)
+            && compiled
+                .query()
+                .declared_plan
+                .is_none_or(|declared| declared <= ceiling)
+        {
             return Ok(compiled);
         }
         let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
             .map_err(super::query_lookup_error)?;
-        let checked = CheckedRead::check(catalog, statement.decl())?;
-        let ir = Arc::new(lower_query(catalog, checked.query())?);
-        let query = CompiledQuery { ir, checked };
+        omnigraph_compiler::query::check::admit_plan_budget(statement.decl(), ceiling)
+            .map_err(omnigraph_compiler::error::CompilerError::query)?;
+        let query = CompiledQuery::compile(catalog, statement.decl())?;
         let compiled = if statement.is_explain() {
             CompiledRead::Explain(query)
         } else {
             CompiledRead::Query(query)
         };
         crate::instrumentation::record_query_compile();
-        cache.insert(catalog, key, compiled.clone());
+        // A historical catalog is built per read; caching against it would
+        // only evict the live entry for the same source.
+        if catalog.historical().is_none() {
+            cache.insert(catalog, key, compiled.clone());
+        }
         Ok(compiled)
     }
 }

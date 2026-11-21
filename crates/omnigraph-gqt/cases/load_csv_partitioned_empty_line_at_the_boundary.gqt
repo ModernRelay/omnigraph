@@ -159,10 +159,8 @@ load executed: partitions 1 rows 120
 
 --- query
 query after_the_empty_line() {
-    match {
-        $i: Item
-        $i.id = "s60"
-    }
+    match { $i: Item }
+    where $i.id = "s60"
     return { $i.id, $i.n }
 }
 

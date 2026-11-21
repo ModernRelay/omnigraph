@@ -1,0 +1,65 @@
+# issue: none
+# notes: The single hop returns a self-loop's start node; a hop range other
+# notes: than the single hop never returns its start, through a self-loop or a
+# notes: cycle, so `{1,2}` from `p1` reaches `p2` alone although `p1 knows p1`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"p1"}}
+{"type":"Person","data":{"handle":"p2"}}
+{"type":"Person","data":{"handle":"p3"}}
+{"edge":"Knows","from":"p1","to":"p1"}
+{"edge":"Knows","from":"p1","to":"p2"}
+{"edge":"Knows","from":"p2","to":"p1"}
+
+--- query
+query the_single_hop_returns_the_start() {
+    match { $p: Person, $p knows $q }
+    where $p.handle = "p1"
+    return { $q.handle }
+}
+
+--- expect unordered
+{"q.handle":"p1"}
+{"q.handle":"p2"}
+
+--- expect shape
+q.handle: String
+
+--- query
+query a_range_never_returns_the_start() {
+    match { $p: Person, $p knows{1,2} $q }
+    where $p.handle = "p1"
+    return { $q.handle }
+}
+
+--- expect unordered
+{"q.handle":"p2"}
+
+--- expect shape
+q.handle: String
+
+--- query
+query a_range_from_the_second_hop() {
+    match { $p: Person, $p knows{2,3} $q }
+    where $p.handle = "p1"
+    return { $q.handle }
+}
+
+--- expect unordered
+
+--- expect shape
+q.handle: String

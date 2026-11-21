@@ -1,0 +1,111 @@
+# issue: none
+# notes: A `nearest` arm under `rrf` is the standalone `nearest` over its population (the GQ 3 RFC,
+# notes: section 4, law 1: eligibility before selection): its window holds `k` eligible targets.
+# notes: The Docs nearest the query (d1, d2, d3) have no author; only d4, d5 and d6 do. Step 1 fuses a window
+# notes: of 2 over the authored Docs with an exact `distance` arm from [0.5, 0] over the same population (the
+# notes: same query on both is a duplicate arm, `T75`): the window holds
+# notes: d4 and d5, never one of the unauthored Docs, so the fused answer keeps both of the window's
+# notes: targets (d4 = 1/61 + 1/61, d5 = 1/62 + 1/62) beside d6, which only the `distance` arm selects (1/63).
+# notes: Step 2: the authored population fans out (bob and carl wrote d5): each arm ranks d5 once, the
+# notes: fusion yields one row per target, and the authorship drawn again after the `from` carries the
+# notes: target's fused score onto each of its rows.
+# notes: Step 3: two `nearest` arms that swap ranks of d4 and d5 tie both at 1/61 + 1/62; in the second
+# notes: arm d4 and d6 tie at distance 1 and the target identity ranks d4 first; a target only one arm
+# notes: selects (d6, the second arm's window of 3) holds that arm's term alone, 1/63. The written
+# notes: `$d.slug` key orders the fused tie.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(2) @index
+}
+node Person {
+    name: String @key
+}
+edge Wrote: Person -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","embedding":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","embedding":[0.1,0.0]}}
+{"type":"Doc","data":{"slug":"d3","embedding":[0.2,0.0]}}
+{"type":"Doc","data":{"slug":"d4","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d5","embedding":[2.0,0.0]}}
+{"type":"Doc","data":{"slug":"d6","embedding":[3.0,0.0]}}
+{"type":"Person","data":{"name":"ada"}}
+{"type":"Person","data":{"name":"bob"}}
+{"type":"Person","data":{"name":"carl"}}
+{"edge":"Wrote","from":"ada","to":"d4"}
+{"edge":"Wrote","from":"bob","to":"d5"}
+{"edge":"Wrote","from":"carl","to":"d5"}
+{"edge":"Wrote","from":"ada","to":"d6"}
+
+--- query
+query window_over_the_population() {
+    match {
+      let $authored = { match { $p: Person, $d: Doc, $p wrote $d } return { $d } },
+      from rrf(nearest($authored, $d.embedding, [0.0, 0.0], k: 2), distance($authored, $d.embedding, [0.5, 0.0])) as $s,
+    }
+    return { $d.slug, $s }
+    order { $s desc }
+}
+
+--- expect ordered
+{"d.slug":"d4","s":0.032786885246}
+{"d.slug":"d5","s":0.032258064516}
+{"d.slug":"d6","s":0.015873015873}
+
+--- expect shape
+d.slug: String
+s: F64
+
+--- expect plan
+fuse $d: arms [nearest, distance]
+scan Doc as $d: ranked nearest fetch 2
+
+--- query
+query fan_out_carries_the_score() {
+    match {
+      let $authored = { match { $p: Person, $d: Doc, $p wrote $d } return { $d } },
+      from rrf(nearest($authored, $d.embedding, [0.0, 0.0], k: 2), distance($authored, $d.embedding, [0.5, 0.0])) as $s,
+      $p: Person,
+      $p wrote $d,
+    }
+    return { $d.slug, $p.name, $s }
+    order { $s desc, $p.name }
+}
+
+--- expect ordered
+{"d.slug":"d4","p.name":"ada","s":0.032786885246}
+{"d.slug":"d5","p.name":"bob","s":0.032258064516}
+{"d.slug":"d5","p.name":"carl","s":0.032258064516}
+{"d.slug":"d6","p.name":"ada","s":0.015873015873}
+
+--- expect shape
+d.slug: String
+p.name: String
+s: F64
+
+--- query
+query ties_and_one_arm_targets() {
+    match {
+      let $authored = { match { $p: Person, $d: Doc, $p wrote $d } return { $d } },
+      from rrf(nearest($authored, $d.embedding, [0.0, 0.0], k: 2), nearest($authored, $d.embedding, [2.0, 0.0], k: 3)) as $s,
+    }
+    return { $d.slug, $s }
+    order { $s desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d4","s":0.032522474881}
+{"d.slug":"d5","s":0.032522474881}
+{"d.slug":"d6","s":0.015873015873}
+
+--- expect shape
+d.slug: String
+s: F64

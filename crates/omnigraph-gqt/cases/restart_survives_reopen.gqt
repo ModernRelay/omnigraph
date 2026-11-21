@@ -20,7 +20,7 @@ node Person {
 
 --- mutate
 query insert_person($name: String) {
-    insert Person { name: $name, age: 40 }
+    replace Person { name: $name, age: 40 }
 }
 
 --- params

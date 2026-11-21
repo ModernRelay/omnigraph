@@ -1,6 +1,7 @@
 # issue: none
 # notes: On the swept route a key set the budget cannot admit refuses the statement before a malformed source
 # notes: row does (the sets are admitted before the parse); the judged route reports the parse refusal instead.
+# layout: skipped b, c, d: its refusal is the endpoint-set memory admission, estimated from index coverage; with the endpoints indexed the load is admitted and fails on its malformed line
 
 --- runner
 timeout_ms: 10000

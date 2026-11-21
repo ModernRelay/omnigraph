@@ -1,0 +1,54 @@
+# issue: none
+# notes: A name the compiler makes up (an anonymous triple end, a block's
+# notes: column, a closing triple's destination) is spelled with a leading
+# notes: uppercase letter, which no written name has, and its role is a typed
+# notes: record, never read from its spelling. So a written alias shaped like
+# notes: one of the old internal names is an ordinary column: `__temp_b0` is
+# notes: not taken for a block's column, whose filter the read once dropped,
+# notes: and `__anon_1` is not taken for an anonymous end.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":0}}
+{"type":"Person","data":{"handle":"bob","age":5}}
+{"type":"Person","data":{"handle":"cy","age":50}}
+
+--- query
+query a_user_alias_shaped_like_an_internal_name_keeps_its_predicate() {
+    match { from { match { $p: Person } return { $p.handle as h, $p.age as __temp_b0 } } }
+    where $__temp_b0 > 30
+    return { $h }
+}
+
+--- expect unordered
+{"h":"cy"}
+
+--- expect shape
+h: String
+
+--- query
+query a_user_alias_shaped_like_an_anonymous_end_keeps_its_rows() {
+    match { from { match { $p: Person } return { $p.handle as h, $p.age as __anon_1 } } }
+    where $__anon_1 > 30
+    return { $h }
+    order { $h }
+}
+
+--- expect ordered
+{"h":"cy"}
+
+--- expect shape
+h: String

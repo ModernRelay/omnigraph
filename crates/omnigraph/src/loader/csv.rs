@@ -19,7 +19,7 @@ use datafusion::arrow::csv::ReaderBuilder;
 use datafusion::arrow::csv::reader::Format;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
-use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+use omnigraph_compiler::query::file::{LoadStmt, LoadStmtMode, LoadTarget};
 use omnigraph_compiler::types::{PropType, ScalarType};
 
 use super::{
@@ -66,8 +66,9 @@ impl CsvLoadRequest {
             target: stmt.target.clone(),
             mode: match stmt.mode {
                 LoadStmtMode::Overwrite => LoadMode::Overwrite,
-                LoadStmtMode::Append => LoadMode::Append,
-                LoadStmtMode::Merge => LoadMode::Merge,
+                LoadStmtMode::Insert => LoadMode::Insert,
+                LoadStmtMode::Upsert => LoadMode::Upsert,
+                LoadStmtMode::Replace => LoadMode::Replace,
             },
             delimiter: stmt.delimiter,
             header: stmt.header,
@@ -82,8 +83,9 @@ impl CsvLoadRequest {
             target: self.target.clone(),
             mode: match self.mode {
                 LoadMode::Overwrite => LoadStmtMode::Overwrite,
-                LoadMode::Append => LoadStmtMode::Append,
-                LoadMode::Merge => LoadStmtMode::Merge,
+                LoadMode::Insert => LoadStmtMode::Insert,
+                LoadMode::Upsert => LoadStmtMode::Upsert,
+                LoadMode::Replace => LoadStmtMode::Replace,
             },
             delimiter: self.delimiter,
             header: self.header,
@@ -124,6 +126,28 @@ pub(crate) struct PreparedCsvBatch {
     pub(crate) is_edge: bool,
     pub(crate) batches: Vec<RecordBatch>,
     pub(crate) rows: usize,
+    /// A `merge` load's properties the source has no column for: every
+    /// record omits them, so an existing key keeps its stored values and the
+    /// batches are on the relaxed schema until those cells are filled.
+    pub(crate) omitted_columns: Vec<String>,
+}
+
+impl PreparedCsvBatch {
+    /// The batches beside the cells their records omit.
+    pub(crate) fn batches_with_omitted_cells(
+        &self,
+    ) -> Vec<(RecordBatch, crate::exec::keep_omitted::OmittedCells)> {
+        self.batches
+            .iter()
+            .map(|batch| {
+                let mut omitted = crate::exec::keep_omitted::OmittedCells::default();
+                for column in &self.omitted_columns {
+                    omitted.push(column, vec![true; batch.num_rows()]);
+                }
+                (batch.clone(), omitted)
+            })
+            .collect()
+    }
 }
 
 /// The strict batch shape the target's delta carries: the type's own Arrow
@@ -161,7 +185,7 @@ pub(super) async fn capture_csv_source(
     bytes: &CsvBytes,
     request: &CsvLoadRequest,
     source_max_bytes: u64,
-    source_charge: Arc<crate::engine::LoadCharge>,
+    source_charge: Arc<crate::engine::PoolCharge>,
 ) -> Result<CapturedSource> {
     let mut capture = match bytes {
         #[cfg(test)]
@@ -327,12 +351,44 @@ pub(crate) fn prepare_csv_batches(
         )));
     }
 
+    // An `upsert` load keeps what its source omits: a non-key property with no
+    // column is left to the stored row of each existing key. An empty field
+    // is a value, null, which clears it.
+    let omitted_columns = if request.mode == LoadMode::Upsert {
+        let key = match &request.target {
+            LoadTarget::Node(name) => catalog.node_types[name].key.as_ref(),
+            LoadTarget::Edge(name) => catalog.edge_types[name].key.as_ref(),
+        };
+        let leading = if resolved.is_edge { 3 } else { 1 };
+        resolved
+            .arrow_schema
+            .fields()
+            .iter()
+            .skip(leading)
+            .map(|field| field.name())
+            .filter(|name| !key.is_some_and(|key| key.iter().any(|k| k == *name)))
+            .filter(|name| {
+                !resolved.roles.iter().any(
+                    |role| matches!(role, ColumnRole::Property { name: column, .. } if column == *name),
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut relaxed_omitted = crate::exec::keep_omitted::OmittedCells::default();
+    for column in &omitted_columns {
+        relaxed_omitted.push(column, vec![true]);
+    }
+    let arrow_schema =
+        crate::exec::keep_omitted::relaxed_schema(&resolved.arrow_schema, &relaxed_omitted);
     let typing = CsvTyping {
         catalog,
         target: &request.target,
         table_key: &table_key,
         properties: resolved.properties,
-        arrow_schema: &resolved.arrow_schema,
+        arrow_schema: &arrow_schema,
         roles: &resolved.roles,
         is_edge: resolved.is_edge,
     };
@@ -344,6 +400,7 @@ pub(crate) fn prepare_csv_batches(
         is_edge: resolved.is_edge,
         batches,
         rows,
+        omitted_columns,
     })
 }
 
@@ -1360,7 +1417,7 @@ fn parse_records(
 ) -> Result<Vec<RecordBatch>> {
     let parse_error = |error| csv_parse_error(&request.source, table_key, error);
     let row_limit = match request.mode {
-        LoadMode::Append | LoadMode::Merge => Some(KEYED_WRITE_MAX_ROWS),
+        LoadMode::Insert | LoadMode::Upsert | LoadMode::Replace => Some(KEYED_WRITE_MAX_ROWS),
         LoadMode::Overwrite => None,
     };
     let batch_rows = row_limit
@@ -1701,7 +1758,7 @@ mod tests {
 
     #[test]
     fn keyed_modes_read_the_row_cap_as_one_batch_and_refuse_one_more() {
-        for mode in [LoadMode::Append, LoadMode::Merge] {
+        for mode in [LoadMode::Insert, LoadMode::Replace] {
             let at_cap = key_source(KEYED_WRITE_MAX_ROWS);
             let batches = parse_records(
                 at_cap.as_bytes(),
@@ -2105,7 +2162,7 @@ mod tests {
         let request = CsvLoadRequest {
             source: "file:///input.csv".to_string(),
             target: LoadTarget::Edge("Knows".to_string()),
-            mode: LoadMode::Merge,
+            mode: LoadMode::Replace,
             delimiter: b'|',
             header: true,
             columns: Some(vec![
@@ -2116,7 +2173,7 @@ mod tests {
         };
         assert_eq!(
             request.render(),
-            "load csv \"file:///input.csv\" into edge:Knows mode merge delimiter \"|\" header columns (from, to, since)"
+            "load csv \"file:///input.csv\" into edge:Knows mode replace delimiter \"|\" header columns (from, to, since)"
         );
         assert_eq!(
             super::super::CsvLoadRequest::from_statement(&LoadStmt {

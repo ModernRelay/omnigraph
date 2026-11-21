@@ -24,7 +24,7 @@ tables:
     columns:
       id: {kind: ordinal, start: 0, step: 1}
 
---- load generate: v1 seed: 43 mode: append
+--- load generate: v1 seed: 43 mode: insert
 tables:
   - kind: node
     name: Person
@@ -39,11 +39,11 @@ branch create b
 --- expect ok
 
 --- mutate branch: b
-query ins_b() { insert Knows { from: "0", to: "1" } }
+query ins_b() { insert Knows { @src: "0", @dst: "1" } }
 --- expect affected: nodes=0 edges=1
 
 --- mutate
-query del_main() { delete Person where id = 1 }
+query del_main() { match { $x: Person } where $x.id = 1  delete $x }
 --- expect affected: nodes=1 edges=0
 
 --- mutate

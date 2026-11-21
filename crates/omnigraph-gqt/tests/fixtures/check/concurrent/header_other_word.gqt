@@ -15,7 +15,7 @@ node Tag {
 --- seed
 {"type":"Person","data":{"name":"alice"}}
 --- concurrent extra
-w1: query add() { insert Person { name: "bob" } }
+w1: query add() { replace Person { name: "bob" } }
 r1: query all() { match { $p: Person } return { $p.name } }
 order: w1, r1
 --- expect

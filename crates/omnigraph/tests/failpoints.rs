@@ -67,7 +67,8 @@ const BLOB_WRITE_SEED: &str = r#"{"type":"Document","data":{"title":"readme","co
 
 const BLOB_WRITE_MUTATIONS: &str = r#"
 query set_note($title: String, $note: String) {
-    update Document set { note: $note } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { note: $note }
 }
 "#;
 
@@ -121,17 +122,18 @@ node User {
 
 const OCC_UNIQUE_MUTATIONS: &str = r#"
 query insert_user($name: String, $email: String) {
-    insert User { name: $name, email: $email }
+    replace User { name: $name, email: $email }
 }
 "#;
 
 const OCC_DISJOINT_MUTATIONS: &str = r#"
 query set_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    match { $x: Person } where $x.name = $name
+    update $x set { age: $age }
 }
 
 query insert_company($name: String) {
-    insert Company { name: $name }
+    replace Company { name: $name }
 }
 "#;
 
@@ -184,11 +186,7 @@ fn run_rfc023_external_writer_action(
     payload: String,
     action: &'static str,
 ) -> std::result::Result<(), String> {
-    let mode = match mode {
-        LoadMode::Append => "append",
-        LoadMode::Merge => "merge",
-        LoadMode::Overwrite => "overwrite",
-    };
+    let mode = mode.as_str();
     let stdout = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
     let stderr = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
     let mut child = Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
@@ -255,15 +253,9 @@ fn rfc023_external_writer_process() {
     }
     let uri = std::env::var(RFC023_EXTERNAL_URI_ENV).expect("external writer URI");
     let payload = std::env::var(RFC023_EXTERNAL_PAYLOAD_ENV).expect("external writer payload");
-    let mode = match std::env::var(RFC023_EXTERNAL_MODE_ENV)
-        .expect("external writer mode")
-        .as_str()
-    {
-        "append" => LoadMode::Append,
-        "merge" => LoadMode::Merge,
-        "overwrite" => LoadMode::Overwrite,
-        other => panic!("unknown external writer mode '{other}'"),
-    };
+    let mode =
+        LoadMode::parse(&std::env::var(RFC023_EXTERNAL_MODE_ENV).expect("external writer mode"))
+            .unwrap_or_else(|error| panic!("external writer mode: {error}"));
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -286,7 +278,7 @@ fn rfc023_external_writer_process() {
                     } else {
                         r#"{"type":"Company","data":{"name":"winner"}}"#
                     };
-                    db.load_jsonl(data, LoadMode::Append).await.unwrap();
+                    db.load_jsonl(data, LoadMode::Insert).await.unwrap();
                 }
                 "collector_late_live" | "collector_late_retired" => {
                     db.branch_create("collector-late").await.unwrap();
@@ -315,7 +307,9 @@ fn rfc023_external_writer_process() {
                 }
                 "collector_late_base_carrier" => {
                     db.branch_create("carrier").await.unwrap();
-                    db.load("carrier", &payload, LoadMode::Merge).await.unwrap();
+                    db.load("carrier", &payload, LoadMode::Replace)
+                        .await
+                        .unwrap();
                     db.branch_merge("carrier", "source").await.unwrap();
                     db.branch_merge("carrier", "target").await.unwrap();
                     db.branch_delete("carrier").await.unwrap();
@@ -334,7 +328,7 @@ fn rfc023_external_writer_process() {
                     db.load(
                         "collector-existing",
                         r#"{"type":"Person","data":{"name":"collector-follow-up","age":41}}"#,
-                        LoadMode::Append,
+                        LoadMode::Insert,
                     )
                     .await
                     .unwrap();
@@ -915,7 +909,7 @@ async fn branch_write_ignores_unavailable_cleanup_classifier() {
     let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
     {
         let _fp = catalog::CLASSIFY_FRESH_READ.fire_always();
-        db.load_as("feature", None, row, LoadMode::Merge, None)
+        db.load_as("feature", None, row, LoadMode::Replace, None)
             .await
             .expect("fresh writes do not require cleanup classification");
     }
@@ -1214,7 +1208,7 @@ async fn fork_collision_with_live_concurrent_fork_reprepares() {
     let external = tokio::task::spawn_blocking(move || {
         run_rfc023_external_writer_action(
             external_uri,
-            LoadMode::Append,
+            LoadMode::Insert,
             r#"{"type":"Person","data":{"name":"Frank","age":41}}"#.to_string(),
             "load_feature",
         )
@@ -1290,8 +1284,8 @@ async fn rfc023_effect_free_conflict_is_typed_or_fully_reprepared() {
     let _scenario = FailScenario::setup();
 
     for (case, mode, expected_attempts, expected_score) in [
-        ("strict", LoadMode::Append, 1_u64, 1_i32),
-        ("upsert", LoadMode::Merge, 2_u64, 2_i32),
+        ("strict", LoadMode::Insert, 1_u64, 1_i32),
+        ("upsert", LoadMode::Replace, 2_u64, 2_i32),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap().to_string();
@@ -1332,7 +1326,7 @@ async fn rfc023_effect_free_conflict_is_typed_or_fully_reprepared() {
         external.unwrap_or_else(|error| panic!("{case}: {error}"));
 
         let outcome = writer.await.unwrap();
-        if mode == LoadMode::Append {
+        if mode == LoadMode::Insert {
             let err = outcome.expect_err("strict insert must reject the foreign key winner");
             assert!(
                 matches!(
@@ -1352,7 +1346,7 @@ async fn rfc023_effect_free_conflict_is_typed_or_fully_reprepared() {
             outcome.expect("upsert must fully reprepare and publish after the winner");
         }
 
-        if mode == LoadMode::Append {
+        if mode == LoadMode::Insert {
             assert_eq!(probes.stage_merge_insert_calls(), 0);
             assert_eq!(
                 probes.stage_fenced_insert_calls(),
@@ -1411,7 +1405,7 @@ async fn rfc023_disjoint_retryable_strict_conflict_reprepares_without_key_confli
             writer_db.load(
                 "main",
                 r#"{"type":"Person","data":{"name":"strict-a","score":2}}"#,
-                LoadMode::Append,
+                LoadMode::Insert,
             ),
         )
         .await
@@ -1551,7 +1545,7 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
 
 const ISSUE_1331_COMPANY_INSERT: &str = r#"
 query insert_company($name: String) {
-    insert Company { name: $name }
+    replace Company { name: $name }
 }
 "#;
 
@@ -2087,7 +2081,7 @@ async fn upsert_of_a_row_optimize_rewrote_meanwhile_prepares_again_once_issue_13
                     db.load(
                         "main",
                         r#"{"type":"Person","data":{"name":"early-0","age":77}}"#,
-                        LoadMode::Merge,
+                        LoadMode::Replace,
                     )
                     .await
                     .map(|_| ())
@@ -2175,7 +2169,7 @@ async fn each_writers_gated_attempt_prepares_with_the_gate_check_issue_1369() {
                         db.load(
                             "main",
                             r#"{"type":"Person","data":{"name":"early-0","age":77}}"#,
-                            LoadMode::Merge,
+                            LoadMode::Replace,
                         )
                         .await
                         .map(|_| ())
@@ -2407,7 +2401,7 @@ async fn insert_still_reprepares_over_a_row_change_after_optimize_issue_1331() {
 async fn load_overlapping_an_optimize_publication_does_not_start_over_issue_1331() {
     let appended = r#"{"type":"Person","data":{"name":"Loaded","age":50}}"#;
     for (mode, data, expected_rows) in [
-        (LoadMode::Append, appended, 7),
+        (LoadMode::Insert, appended, 7),
         (LoadMode::Overwrite, helpers::TEST_DATA, 4),
     ] {
         let _scenario = FailScenario::setup();
@@ -2644,7 +2638,7 @@ async fn a_write_after_publication_cannot_change_a_blob_put_receipt() {
     let foreign = r#"{"type":"Document","data":{"title":"readme","content":"base64:Zm9yZWlnbg==","preview":"base64:UDA=","note":"n0"}}"#;
     let external_uri = uri.clone();
     tokio::task::spawn_blocking(move || {
-        run_rfc023_external_writer(external_uri, LoadMode::Merge, foreign.to_string())
+        run_rfc023_external_writer(external_uri, LoadMode::Replace, foreign.to_string())
     })
     .await
     .unwrap()
@@ -3168,7 +3162,7 @@ const CARD_RACE_SEED: &str = r#"{"type":"Task","data":{"name":"task-0"}}
 
 const CARD_RACE_MUTATIONS: &str = r#"
 query hold($task: String, $agent: String) {
-    insert HeldBy { from: $task, to: $agent }
+    insert HeldBy { @src: $task, @dst: $agent }
 }
 "#;
 
@@ -3370,7 +3364,7 @@ async fn append_load_revalidates_unique_after_pre_effect_authority_change() {
             .load(
                 "main",
                 r#"{"type":"User","data":{"name":"stale-plan","email":"winner@example.com"}}"#,
-                LoadMode::Append,
+                LoadMode::Insert,
             )
             .await
     });
@@ -3379,7 +3373,7 @@ async fn append_load_revalidates_unique_after_pre_effect_authority_change() {
     db.load(
         "main",
         r#"{"type":"User","data":{"name":"winner","email":"winner@example.com"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("the second load commits while the first attempt is parked pre-effect");
@@ -4289,7 +4283,7 @@ async fn merge_refuses_a_target_recreated_by_another_process_issue_643() {
     tokio::task::spawn_blocking(move || {
         run_rfc023_external_writer_action(
             child_uri,
-            LoadMode::Append,
+            LoadMode::Insert,
             r#"{"type":"Person","data":{"name":"On-t-recreated","age":55}}"#.to_string(),
             "merge_target_recreated",
         )
@@ -4549,14 +4543,14 @@ async fn assert_schema_apply_post_commit_failure_leaves_readable_contract(uri: &
 
     db.load_jsonl(
         r#"{"type":"Company","data":{"name":"SameHandle"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("the same handle writes the published new type after the fault clears");
     fresh
         .load_jsonl(
             r#"{"type":"Company","data":{"name":"FreshHandle"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .expect("a fresh handle writes the published new type after the fault clears");
@@ -4709,7 +4703,7 @@ async fn load_after_schema_apply_pre_publish_failure_keeps_the_accepted_catalog(
     let db = helpers::session(Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap());
     db.load_jsonl(
         "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -4733,13 +4727,13 @@ async fn load_after_schema_apply_pre_publish_failure_keeps_the_accepted_catalog(
     // accepted catalog stays authoritative, so the new type is unknown.
     db.load_jsonl(
         "{\"type\":\"Tag\",\"data\":{\"label\":\"t1\"}}\n",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect_err("an unpublished apply's type must not be loadable");
     db.load_jsonl(
         "{\"type\":\"Person\",\"data\":{\"name\":\"bob\",\"age\":31}}\n",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("the accepted schema keeps accepting rows");
@@ -4786,7 +4780,7 @@ async fn load_waits_for_schema_apply_publication() {
                 "main",
                 None,
                 "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
-                LoadMode::Merge,
+                LoadMode::Replace,
                 None,
             )
             .await
@@ -4842,7 +4836,7 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
     use omnigraph::loader::LoadMode;
     db.load_jsonl(
         r#"{"type": "Company", "data": {"name": "Acme"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("Company write on a non-drifted table should succeed");
@@ -4902,7 +4896,7 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     db.load(
         "main",
         r#"{"type":"Company","data":{"name":"Acme"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("disjoint writer must publish while index artifacts are staged pre-gate");
@@ -4986,7 +4980,7 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
         db.load_jsonl(
             r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -5157,7 +5151,7 @@ async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
 
     db.load_jsonl(
         "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("the next write heals an already-published apply in process");
@@ -5252,7 +5246,7 @@ async fn schema_apply_retry_preserves_the_original_empty_create() {
         } else {
             r#"{"type":"Company","data":{"name":"winner"}}"#
         };
-        reopened.load_jsonl(data, LoadMode::Append).await.unwrap();
+        reopened.load_jsonl(data, LoadMode::Insert).await.unwrap();
         assert_eq!(helpers::count_rows(&reopened, "node:Company").await, 1);
         let export = reopened.export_jsonl("main", &[]).await.unwrap();
         assert!(export.contains("winner"));
@@ -5292,7 +5286,7 @@ async fn schema_apply_added_type_loser_preserves_a_concurrent_process_winner() {
         tokio::task::spawn_blocking(move || {
             run_rfc023_external_writer_action(
                 child_uri,
-                LoadMode::Append,
+                LoadMode::Insert,
                 child_source,
                 "schema_apply_company",
             )
@@ -5360,7 +5354,7 @@ async fn schema_apply_added_type_loser_preserves_a_concurrent_process_winner() {
         } else {
             r#"{"type":"Company","data":{"name":"after"}}"#
         };
-        reopened.load_jsonl(data, LoadMode::Append).await.unwrap();
+        reopened.load_jsonl(data, LoadMode::Insert).await.unwrap();
         assert_eq!(helpers::count_rows(&reopened, "node:Company").await, 2);
     }
 }
@@ -5429,6 +5423,78 @@ edge WorksAt: Human -> Company
         people_before
     );
     assert!(recovered.schema_source().contains("node Human"));
+}
+
+/// A changed analyzer replaces its column's full-text segments with an
+/// untrained one in a detached commit (`commit_full_text_redeclarations`);
+/// interrupted after that commit, the apply publishes nothing: the
+/// registration, the linear HEAD and the accepted analysis stay as they
+/// were, and the same handle's retry publishes the new analysis.
+#[tokio::test]
+#[serial]
+async fn schema_apply_analyzer_redeclaration_partial_effect_leaves_no_residue() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let schema = |analyzer: &str| {
+        format!(
+            "node Doc {{\n    slug: String @key\n    body: String @index(fulltext, analyzer = \"{analyzer}\")\n}}\n"
+        )
+    };
+    let db = helpers::session(Omnigraph::init(&uri, &schema("standard_v1")).await.unwrap());
+    db.load_jsonl(
+        r#"{"type":"Doc","data":{"slug":"d1","body":"Runners were RUNNING"}}"#,
+        LoadMode::Replace,
+    )
+    .await
+    .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+    let snapshot_before = helpers::snapshot_main(&db).await.unwrap();
+    let head_before = lance::Dataset::open(&node_table_uri(&db, "Doc").await)
+        .await
+        .unwrap()
+        .version()
+        .version;
+
+    {
+        let _failpoint = catalog::SCHEMA_APPLY_POST_TABLE_COMMIT.fire_always();
+        let error = db
+            .apply_schema(&schema("english_v1"))
+            .await
+            .expect_err("the redeclaration's detached commit must be interrupted");
+        assert!(
+            error.to_string().contains("schema_apply.post_table_commit"),
+            "unexpected redeclaration error: {error}"
+        );
+    }
+    assert_no_recovery_sidecars(dir.path());
+    assert_no_staging_files(dir.path());
+    let snapshot = helpers::snapshot_main(&db).await.unwrap();
+    assert!(
+        snapshot
+            .dataset("node:Doc")
+            .unwrap()
+            .same_registration(snapshot_before.dataset("node:Doc").unwrap()),
+        "an unpublished redeclaration leaves the registration as it was"
+    );
+    let head = lance::Dataset::open(&node_table_uri(&db, "Doc").await)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        head, head_before,
+        "a detached redeclaration never moves HEAD"
+    );
+    assert!(db.schema_source().contains("standard_v1"));
+
+    db.apply_schema(&schema("english_v1"))
+        .await
+        .expect("the same handle's retry publishes the new analysis");
+    assert!(db.schema_source().contains("english_v1"));
+    drop(db);
+    let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert!(reopened.schema_source().contains("english_v1"));
 }
 
 #[tokio::test]
@@ -5812,7 +5878,7 @@ node Work {
 }
 
 node Embedding {
-    name: String @key
+    name: String @key @index(fulltext)
     vector: Vector(2)? @index
 }
 "#;
@@ -5824,7 +5890,7 @@ node Embedding {
         r#"{"type":"Work","data":{"name":"w0"}}
 {"type":"Embedding","data":{"name":"e0","vector":null}}
 "#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -5837,7 +5903,7 @@ node Embedding {
     );
     db.load_jsonl(
         r#"{"type":"Embedding","data":{"name":"e1","vector":null}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -5857,7 +5923,7 @@ node Embedding {
     for name in ["w1", "w2", "w3", "w4"] {
         db.load_jsonl(
             &format!(r#"{{"type":"Work","data":{{"name":"{name}"}}}}"#),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -5937,13 +6003,12 @@ node Embedding {
         "pending-only vector status must remain visible"
     );
     assert!(
-        embedding.pending_indexes.iter().any(|index| {
-            index.property == "name"
-                && index
-                    .reason
-                    .contains("omnigraph index rebuild --kind full-text")
-        }),
-        "the deferred FTS tail must name its explicit rebuild remedy"
+        embedding
+            .pending_indexes
+            .iter()
+            .all(|index| index.property != "name"
+                && !index.reason.contains("index rebuild --kind full-text")),
+        "a full-text tail no read uses is not pending and never names the one-way rebuild"
     );
 }
 
@@ -6071,7 +6136,7 @@ async fn optimize_keeps_a_tables_fold_when_its_index_build_fails() {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"n\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"n\":2}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -6090,7 +6155,7 @@ async fn optimize_keeps_a_tables_fold_when_its_index_build_fails() {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"n\":3,\"embedding\":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"n\":4,\"embedding\":[0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1]}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -6124,9 +6189,13 @@ async fn optimize_keeps_a_tables_fold_when_its_index_build_fails() {
             ),
         )
         .await
-        .expect("the identity and n BTREE folds must overlap")
+        .expect("the identity, key and n BTREE folds must overlap")
         .unwrap();
-        assert_eq!(probes.entered(), 2, "both lagging BTREEs were rebuilt");
+        assert_eq!(
+            probes.entered(),
+            3,
+            "the three lagging BTREEs (identity, key and n) were rebuilt"
+        );
         report
     };
     assert!(report.graph_commit_id.is_some(), "{report:?}");
@@ -6579,7 +6648,7 @@ async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrit
     let db = helpers::session(Omnigraph::init(&uri, &schema).await.unwrap());
     for n in 0..12 {
         let row = format!(r#"{{"type": "T{n:02}", "data": {{"k": "a"}}}}"#);
-        db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
+        db.load_jsonl(&row, LoadMode::Replace).await.unwrap();
     }
     db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
@@ -6589,7 +6658,7 @@ async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrit
         // run's one productive turn, parked until the planner ran ahead.
         for i in 0..3 {
             let row = format!(r#"{{"type": "T00", "data": {{"k": "p{planning}x{i}"}}}}"#);
-            db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
+            db.load_jsonl(&row, LoadMode::Replace).await.unwrap();
         }
         let rendezvous =
             helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_BEFORE_COMPACT);
@@ -7239,7 +7308,7 @@ async fn setup_branch_merge_multichunk_adopt(dir: &tempfile::TempDir) -> (String
     let db = helpers::session(Omnigraph::init(&uri, RFC023_KEY_SCHEMA).await.unwrap());
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"base","score":0}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -7251,13 +7320,13 @@ async fn setup_branch_merge_multichunk_adopt(dir: &tempfile::TempDir) -> (String
             "{{\"type\":\"Person\",\"data\":{{\"name\":\"merge-row-{row}\",\"score\":1}}}}\n"
         ));
     }
-    db.load("feature", &first_chunk, LoadMode::Append)
+    db.load("feature", &first_chunk, LoadMode::Insert)
         .await
         .unwrap();
     db.load(
         "feature",
         r#"{"type":"Person","data":{"name":"merge-row-8192","score":1}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -7283,7 +7352,8 @@ async fn setup_branch_merge_multichunk_delete(dir: &tempfile::TempDir) -> (Strin
     const CHUNK_ROWS: usize = 8192;
     const DELETE_QUERY: &str = r#"
 query remove_scored() {
-    delete Person where score = 1
+    match { $x: Person } where $x.score = 1
+    delete $x
 }
 "#;
 
@@ -7295,14 +7365,14 @@ query remove_scored() {
             "{{\"type\":\"Person\",\"data\":{{\"name\":\"delete-row-{row}\",\"score\":1}}}}\n"
         ));
     }
-    db.load("main", &first_chunk, LoadMode::Append)
+    db.load("main", &first_chunk, LoadMode::Insert)
         .await
         .unwrap();
     db.load(
         "main",
         "{\"type\":\"Person\",\"data\":{\"name\":\"delete-row-8192\",\"score\":1}}\n\
          {\"type\":\"Person\",\"data\":{\"name\":\"keep\",\"score\":0}}",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -7373,7 +7443,7 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
             r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -8063,7 +8133,7 @@ async fn publisher_retries_retryable_load_publish_state_error() {
     // unaffected.
     let _fp = catalog::PUBLISH_LOAD_STATE.fire_once_at(1);
     let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
-    db.load_as("main", None, row, LoadMode::Merge, None)
+    db.load_as("main", None, row, LoadMode::Replace, None)
         .await
         .expect("publisher must retry the one-shot retryable load_publish_state error and commit");
 }
@@ -8096,7 +8166,7 @@ node Document {
         .load(
             "feature",
             r#"{"type":"Document","data":{"title":"aba","content":"base64:T2xk"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -8133,7 +8203,7 @@ node Document {
             .load(
                 "feature",
                 r#"{"type":"Document","data":{"title":"aba","content":"base64:TmV3"}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await?;
         control.snapshot_of(ReadTarget::branch("feature")).await
@@ -8216,7 +8286,7 @@ node Document {
         .load(
             "feature",
             r#"{"type":"Document","data":{"title":"aba","content":"old"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -8254,7 +8324,7 @@ node Document {
             .load(
                 "feature",
                 r#"{"type":"Document","data":{"title":"aba","content":"new"}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await?;
         control.snapshot_of(ReadTarget::branch("feature")).await
@@ -8331,7 +8401,7 @@ node Document {
         .load(
             "feature",
             r#"{"type":"Document","data":{"title":"aba","content":"old"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -8367,7 +8437,7 @@ node Document {
             .load(
                 "feature",
                 r#"{"type":"Document","data":{"title":"aba","content":"new"}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await?;
         control.snapshot_of(ReadTarget::branch("feature")).await
@@ -8433,7 +8503,7 @@ node Document {
         .load(
             "feature",
             r#"{"type":"Document","data":{"title":"aba","content":"old"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -8466,7 +8536,7 @@ node Document {
             .load(
                 "feature",
                 r#"{"type":"Document","data":{"title":"aba","content":"new"}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
     }
@@ -8541,7 +8611,7 @@ node Document {
                 "\n",
                 r#"{"type":"Document","data":{"title":"victim","content":"doomed"}}"#,
             ),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -8551,7 +8621,8 @@ node Document {
             "feature",
             r#"
 query remove_victim() {
-    delete Document where title = "victim"
+    match { $x: Document } where $x.title = "victim"
+    delete $x
 }
 "#,
             "remove_victim",
@@ -8595,14 +8666,14 @@ query remove_victim() {
             .load(
                 "feature",
                 r#"{"type":"Document","data":{"title":"repl-one","content":"one"}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await?;
         control
             .load(
                 "feature",
                 r#"{"type":"Document","data":{"title":"repl-two","content":"two"}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await?;
         control.snapshot_of(ReadTarget::branch("feature")).await
@@ -9023,7 +9094,7 @@ async fn branch_merge_captured_source_survives_concurrent_cleanup() {
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"p","age":0}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -9033,7 +9104,7 @@ async fn branch_merge_captured_source_survives_concurrent_cleanup() {
         db.load(
             "source",
             &format!(r#"{{"type":"Person","data":{{"name":"p","age":{age}}}}}"#),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -9055,7 +9126,7 @@ async fn branch_merge_captured_source_survives_concurrent_cleanup() {
     let child = tokio::task::spawn_blocking(move || {
         run_rfc023_external_writer_action(
             child_uri,
-            LoadMode::Merge,
+            LoadMode::Replace,
             r#"{"type":"Person","data":{"name":"p","age":3}}"#.to_string(),
             "collector_advance_merge_source",
         )
@@ -9378,7 +9449,11 @@ async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_table() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::session(Omnigraph::init(&uri, SEARCH_SCHEMA).await.unwrap());
+    let db = helpers::session(
+        Omnigraph::init(&uri, &helpers::with_full_text(SEARCH_SCHEMA))
+            .await
+            .unwrap(),
+    );
     db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -9434,7 +9509,7 @@ async fn assert_write_detached_pin_survives_next_write(uri: &str) {
                 r#"{"type":"Person","data":{"name":"Alice","age":30}}
 {"type":"Company","data":{"name":"Acme"}}
 "#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .expect_err("publication landed before its acknowledgement was lost");
@@ -9453,7 +9528,7 @@ async fn assert_write_detached_pin_survives_next_write(uri: &str) {
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Bob","age":25}}
 "#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("the next write extends the detached pin");
@@ -9509,7 +9584,7 @@ async fn assert_optimize_detached_pin_survives_next_write(uri: &str) {
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"AfterOptimize","age":25}}
 "#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("the next write extends the compacted detached pin");
@@ -9824,7 +9899,7 @@ async fn assert_partial_merge_leaves_no_residue(
         "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n\
          {\"type\":\"Person\",\"data\":{\"name\":\"carol\",\"age\":50}}\n\
          {\"type\":\"Person\",\"data\":{\"name\":\"dave\",\"age\":60}}\n",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -9927,7 +10002,7 @@ async fn assert_merge_onto_main_is_a_pointer_switch(seam: &'static omnigraph::se
         "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n\
          {\"type\":\"Person\",\"data\":{\"name\":\"carol\",\"age\":50}}\n\
          {\"type\":\"Person\",\"data\":{\"name\":\"dave\",\"age\":60}}\n",
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -10841,7 +10916,7 @@ impl omnigraph::seams::Decide for AdvanceBeforeLostAck {
         }
         run_rfc023_external_writer(
             self.uri.clone(),
-            LoadMode::Merge,
+            LoadMode::Replace,
             r#"{"type":"Company","data":{"name":"later-writer"}}"#.to_string(),
         )
         .unwrap();
@@ -11267,7 +11342,7 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
                     &format!(
                         "{{\"type\": \"Person\", \"data\": {{\"name\": \"lf{index}\", \"age\": 42}}}}"
                     ),
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                     None,
                 )
                 .await
@@ -11279,7 +11354,7 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
                         "{{\"type\": \"Person\", \"data\": {{\"name\": \"lt{index}\", \"age\": 43}}}}\n\
                          {{\"type\": \"Company\", \"data\": {{\"name\": \"lc{index}\"}}}}"
                     ),
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .map(|_| ())
@@ -11662,7 +11737,7 @@ async fn collector_keeps_pins_published_by_a_late_branch_in_another_process() {
         let child = tokio::task::spawn_blocking(move || {
             run_rfc023_external_writer_action(
                 uri,
-                LoadMode::Append,
+                LoadMode::Insert,
                 r#"{"type":"Person","data":{"name":"collector-late","age":40}}"#.to_string(),
                 action,
             )
@@ -11752,7 +11827,7 @@ async fn collector_refuses_mixed_branch_captures_before_deleting() {
         let child = tokio::task::spawn_blocking(move || {
             run_rfc023_external_writer_action(
                 uri,
-                LoadMode::Append,
+                LoadMode::Insert,
                 r#"{"type":"Person","data":{"name":"collector-main","age":40}}"#.to_string(),
                 action,
             )
@@ -11822,9 +11897,9 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
         .unwrap();
     assert!(row.error.is_none(), "{row:?}");
     assert_eq!(
-        row.manifests_removed, 3,
-        "the retry sweeps what the first pass left of the two links, main's pruned base pin and the \
-         base load's effect beneath its full-text declaration: {row:?}"
+        row.manifests_removed, 2,
+        "the retry sweeps what the first pass left of the two links and main's pruned base pin: \
+         {row:?}"
     );
     let remaining = detached_versions(&person_uri).await;
     for link in &chain[..2] {
@@ -11857,7 +11932,9 @@ async fn table_path_exists(db: &Omnigraph, table_uri: &str, path: &str) -> bool 
 async fn assert_collector_retry_treats_an_index_directory_an_interrupted_pass_removed_as_swept(
     uri: &str,
 ) {
-    let db = helpers::init_and_load_at(uri, helpers::TEST_SCHEMA).await;
+    // Every write declares `Person.name`'s full-text index with an untrained
+    // segment, so each pruned pin names an index directory of its own.
+    let db = helpers::init_and_load_at(uri, &helpers::full_text_test_schema()).await;
     let person_uri = node_table_uri(&db, "Person").await;
     let before = detached_versions(&person_uri).await;
     insert_person(&db, "main", "swept-first").await;
@@ -11984,7 +12061,9 @@ async fn assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_
     uri: &str,
     scoped: bool,
 ) {
-    let db = helpers::init_and_load_at(uri, helpers::TEST_SCHEMA).await;
+    // Every write declares `Person.name`'s full-text index with an untrained
+    // segment, so each pruned pin names an index directory of its own.
+    let db = helpers::init_and_load_at(uri, &helpers::full_text_test_schema()).await;
     // Serving scopes file I/O through Lance's file-object-store provider,
     // whose list/delete path also removes the directory and can return NotFound.
     let db = if scoped {
@@ -12321,7 +12400,7 @@ async fn branch_merge_in_doubt_keeps_input_tags_until_cleanup() {
     db.load(
         "source",
         r#"{"type":"Person","data":{"name":"merge-indeterminate","age":42}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -12389,7 +12468,7 @@ async fn merge_as_commit_probe_failure_retains_inputs_issue_1067() {
     db.load(
         "source",
         r#"{"type":"Person","data":{"name":"probe-failed","age":42}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -12437,13 +12516,13 @@ async fn merge_as_commit_probe_failure_retains_inputs_issue_1067() {
 
 const UNATTACHED_ROOT_QUERY: &str = r#"
 query insert_root($name: String, $age: I32) as unattached branch {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#;
 
 const UNATTACHED_CHILD_QUERY: &str = r#"
 query insert_child($name: String, $age: I32, $base: String) as unattached branch on $base {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#;
 
@@ -12452,7 +12531,7 @@ fn unattached_child_on(base: &str) -> String {
     format!(
         r#"
 query insert_child($name: String, $age: I32) as unattached branch on "{base}" {{
-    insert Person {{ name: $name, age: $age }}
+    replace Person {{ name: $name, age: $age }}
 }}
 "#
     )
@@ -13061,7 +13140,7 @@ async fn abandoned_merge_input_tags_expire_after_target_advances() {
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"p","age":0}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -13071,7 +13150,7 @@ async fn abandoned_merge_input_tags_expire_after_target_advances() {
         db.load(
             "source",
             &format!(r#"{{"type":"Person","data":{{"name":"p","age":{age}}}}}"#),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -13098,7 +13177,7 @@ async fn abandoned_merge_input_tags_expire_after_target_advances() {
     db.load(
         "source",
         r#"{"type":"Person","data":{"name":"p","age":3}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -13111,7 +13190,7 @@ async fn abandoned_merge_input_tags_expire_after_target_advances() {
     db.load(
         "target",
         r#"{"type":"Person","data":{"name":"q","age":4}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -13158,7 +13237,7 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
         db.load(
             "main",
             &format!(r#"{{"type":"Person","data":{{"name":"{name}","age":0}}}}"#),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -13173,7 +13252,7 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
     let child = tokio::task::spawn_blocking(move || {
         run_rfc023_external_writer_action(
             child_uri,
-            LoadMode::Merge,
+            LoadMode::Replace,
             r#"{"type":"Person","data":{"name":"p","age":1}}"#.to_string(),
             "collector_late_base_carrier",
         )
@@ -13189,7 +13268,7 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
             .load(
                 branch,
                 &format!(r#"{{"type":"Person","data":{{"name":"{name}","age":2}}}}"#),
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();
@@ -13433,7 +13512,7 @@ async fn second_process(
 ) -> std::result::Result<(), String> {
     let (uri, payload) = (uri.to_string(), payload.to_string());
     tokio::task::spawn_blocking(move || {
-        run_rfc023_external_writer_action(uri, LoadMode::Append, payload, action)
+        run_rfc023_external_writer_action(uri, LoadMode::Insert, payload, action)
     })
     .await
     .unwrap()

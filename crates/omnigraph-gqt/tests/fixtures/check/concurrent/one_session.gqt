@@ -15,6 +15,6 @@ node Tag {
 --- seed
 {"type":"Person","data":{"name":"alice"}}
 --- concurrent
-w1 x1: query add() { insert Person { name: "bob" } }
+w1 x1: query add() { replace Person { name: "bob" } }
 --- expect
 w1: ok

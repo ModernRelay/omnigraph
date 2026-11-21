@@ -6,9 +6,10 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::Write;
 
+use crate::read_shape::ReadShape;
 use arrow_schema::SchemaRef;
-use omnigraph_compiler::ir::{IRExpr, QueryIR};
-use omnigraph_compiler::query::ast::LoadStmtMode;
+use omnigraph_compiler::ir::IRExpr;
+use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::settings::{SettingId, Traversal};
 use omnigraph_compiler::types::Direction;
 use serde_json::{Value, json};
@@ -27,7 +28,7 @@ use crate::registry::{Coverage, Entry, Route, coverage, lookup};
 use crate::route::RouteOverride;
 use crate::source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentStat, FullTextCoverage, IndexFact, NodeTypeSpec, PlanSource, SideId,
+    FragmentStat, IndexFact, NodeTypeSpec, PlanSource, QueryWork, SideId,
 };
 use crate::validate::subset::{Role, Rule, Tracer};
 use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
@@ -38,6 +39,8 @@ use crate::validate::{self, AcceptInput, AcceptedPlan, ValidationError};
 struct Recorded<'s> {
     source: &'s dyn PlanSource,
     read: RefCell<Assumptions>,
+    /// The plan budget of the read being planned.
+    work: Option<QueryWork>,
 }
 
 impl<'s> Recorded<'s> {
@@ -49,6 +52,15 @@ impl<'s> Recorded<'s> {
         Self {
             source,
             read: RefCell::new(read),
+            work: None,
+        }
+    }
+
+    /// The source for planning `query`, which charges its plan budget.
+    fn for_query(source: &'s dyn PlanSource, query: &ReadShape) -> Self {
+        Self {
+            work: Some(QueryWork::of(query)),
+            ..Self::new(source, query.has_wildcard_traversal())
         }
     }
 
@@ -58,6 +70,8 @@ impl<'s> Recorded<'s> {
         let mut assumptions = self.read.borrow().clone();
         assumptions.gate_policy = self.source.gate_policy();
         assumptions.memory_limit = bounds.query_memory_pool_bytes;
+        assumptions.read_work_limit = self.source.read_work_limit();
+        assumptions.plan_work = self.work.as_ref().map(|w| w.meter.record());
         assumptions
     }
 
@@ -79,6 +93,10 @@ impl<'s> Recorded<'s> {
 }
 
 impl PlanSource for Recorded<'_> {
+    fn query_work(&self) -> Option<&QueryWork> {
+        self.work.as_ref()
+    }
+
     fn index_facts(&self, dataset_key: &str) -> Vec<IndexFact> {
         self.source.index_facts(dataset_key)
     }
@@ -150,6 +168,12 @@ impl PlanSource for Recorded<'_> {
         Ok(spec)
     }
 
+    // An edge object's declaration reads no table: its rows are the
+    // expansion's or the edge scan's, which record their own reads.
+    fn edge_object_fields(&self, type_name: &str) -> Result<arrow_schema::Fields, PlanError> {
+        self.source.edge_object_fields(type_name)
+    }
+
     fn catalogue_fingerprint(&self, type_key: &str) -> Option<String> {
         self.source.catalogue_fingerprint(type_key)
     }
@@ -212,67 +236,39 @@ impl PlanSource for Recorded<'_> {
     fn gate_policy(&self) -> GatePolicy {
         self.source.gate_policy()
     }
-
-    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
-        let coverage = self.source.full_text_coverage(type_key, property);
-        self.read
-            .borrow_mut()
-            .full_text
-            .insert(Assumptions::full_text_key(type_key, property), coverage);
-        coverage
-    }
 }
 
 /// Every parameter name `expr` names.
 fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
-    match expr {
+    omnigraph_compiler::stack::deep(|| match expr {
         IRExpr::Param(name, _) => {
             out.insert(name.clone());
         }
         IRExpr::Nearest { query, .. } => params_of_expr(query, out),
-        IRExpr::Search { field, query, .. }
-        | IRExpr::MatchText { field, query, .. }
-        | IRExpr::Bm25 { field, query, .. } => {
-            params_of_expr(field, out);
-            params_of_expr(query, out);
-        }
-        IRExpr::Fuzzy {
-            field,
-            query,
-            max_edits,
-            ..
-        } => {
-            params_of_expr(field, out);
-            params_of_expr(query, out);
-            if let Some(max_edits) = max_edits {
-                params_of_expr(max_edits, out);
+        IRExpr::Aggregate { arg, fraction, .. } => {
+            params_of_expr(arg, out);
+            if let Some(p) = fraction {
+                params_of_expr(p, out);
             }
         }
-        IRExpr::Rrf {
-            primary,
-            secondary,
-            k,
-            ..
-        } => {
-            params_of_expr(primary, out);
-            params_of_expr(secondary, out);
-            if let Some(k) = k {
-                params_of_expr(k, out);
-            }
-        }
-        IRExpr::Aggregate { arg, .. } => params_of_expr(arg, out),
         IRExpr::Binary { left, right, .. } => {
             params_of_expr(left, out);
             params_of_expr(right, out);
         }
         IRExpr::Not(inner, _)
         | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Neg { expr: inner, .. }
         | IRExpr::Cast { expr: inner, .. } => params_of_expr(inner, out),
+        IRExpr::Call { args, .. } => {
+            for arg in args {
+                params_of_expr(arg, out);
+            }
+        }
         IRExpr::PropAccess { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Literal(_, _)
         | IRExpr::AliasRef(_, _) => {}
-    }
+    })
 }
 
 /// Why the gate built no routed plan. A change-feed or merge operation then
@@ -313,10 +309,6 @@ pub enum Unrouted {
     /// branch merge): the plan's `Validate` is built and decided here and run
     /// by the executor's judge; the write itself never enters a plan.
     WriteOnExecutor { kind: &'static str },
-    /// A full-text call reads a declared index with no segment at the
-    /// pinned snapshot (`PlanError::FullTextIndexRequired`): a conflict the
-    /// engine returns with its typed detail.
-    FullTextIndexRequired { index: String },
 }
 
 impl Unrouted {
@@ -326,7 +318,6 @@ impl Unrouted {
         match error {
             PlanError::Unsupported(diagnostic) => Self::UnsupportedQuery { diagnostic },
             PlanError::Source { detail } => Self::SourceError { message: detail },
-            PlanError::FullTextIndexRequired { index } => Self::FullTextIndexRequired { index },
             other => Self::PlannerError {
                 message: other.to_string(),
             },
@@ -346,7 +337,6 @@ impl Unrouted {
             Self::SourceError { .. } => "source_error",
             Self::ModeOnExecutor { .. } => "mode_on_executor",
             Self::WriteOnExecutor { .. } => "write_on_executor",
-            Self::FullTextIndexRequired { .. } => "full_text_index_required",
         }
     }
 
@@ -372,9 +362,6 @@ impl Unrouted {
             }
             Self::ModeOnExecutor { mode } => json!({ "kind": self.kind(), "mode": mode }),
             Self::WriteOnExecutor { kind } => json!({ "kind": self.kind(), "write": kind }),
-            Self::FullTextIndexRequired { index } => {
-                json!({ "kind": self.kind(), "index": index })
-            }
         }
     }
 }
@@ -475,13 +462,13 @@ pub struct PreparedQuery {
 
 /// Build an executable read plan without rendering explain diagnostics.
 pub async fn plan_query(
-    query: &QueryIR,
+    query: &ReadShape,
     source: &(dyn PlanSource + Sync),
     bounds: &Bounds,
 ) -> Result<PhysicalPlan, Unrouted> {
     let mut optimized = {
         let operation = Operation::Query(Box::new(query.clone()));
-        let recorded = Recorded::new(source, query.has_wildcard_traversal());
+        let recorded = Recorded::for_query(source, query);
         let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
         let mut optimized =
             crate::optimizer::optimize(&mut logical, &recorded, bounds).map_err(Unrouted::of)?;
@@ -542,13 +529,13 @@ impl Traced {
 }
 
 pub(crate) fn plan_traced(
-    query: &QueryIR,
+    query: &ReadShape,
     source: &dyn PlanSource,
     bounds: &Bounds,
     explain: bool,
 ) -> Result<Traced, Unrouted> {
     let operation = Operation::Query(Box::new(query.clone()));
-    let recorded = Recorded::new(source, query.has_wildcard_traversal());
+    let recorded = Recorded::for_query(source, query);
     let mut logical = resolve(&operation, &recorded).map_err(Unrouted::of)?;
     let initial = explain.then(|| logical.to_json());
     let mut tracer = Tracer::for_plan(&logical);
@@ -759,14 +746,16 @@ fn route_decision(
                         logical: plan,
                         explain: explain.engine(),
                     },
-                    LoadStmtMode::Append | LoadStmtMode::Merge => executor_planned(
-                        Unrouted::ModeOnExecutor {
-                            mode: ir.mode.as_str(),
-                        },
-                        explain,
-                        plan,
-                        optimized.physical,
-                    ),
+                    LoadStmtMode::Insert | LoadStmtMode::Upsert | LoadStmtMode::Replace => {
+                        executor_planned(
+                            Unrouted::ModeOnExecutor {
+                                mode: ir.mode.as_str(),
+                            },
+                            explain,
+                            plan,
+                            optimized.physical,
+                        )
+                    }
                 }
             }
             Err(error) => executor(
@@ -1000,10 +989,11 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::read_shape::PatternStep;
     use crate::{MemorySource, NodeTypeSpec, TableRef};
     use arrow_schema::{DataType, Field, Schema};
     use omnigraph_compiler::SYSTEM_COLUMNS_V3;
-    use omnigraph_compiler::ir::{IRExpr, IROp, IRProjection};
+    use omnigraph_compiler::ir::{IRExpr, IRProjection};
     use std::sync::Arc;
 
     use crate::fixture_bounds::BOUNDS;
@@ -1025,30 +1015,35 @@ mod tests {
                 row_count: None,
             },
         );
-        let query = QueryIR {
+        let query = ReadShape {
             name: "documents".into(),
             params: vec![],
-            pipeline: vec![IROp::NodeScan {
+            pipeline: vec![PatternStep::NodeScan {
                 variable: "d".into(),
                 type_name: "Doc".into(),
-                filters: vec![],
             }],
             return_exprs: vec![IRProjection {
                 expr: IRExpr::Variable(
                     "d".into(),
                     omnigraph_compiler::ExprType::Node {
                         type_name: "Doc".into(),
+                        nullable: false,
                     },
                 ),
                 alias: None,
                 column: "d".into(),
                 ty: omnigraph_compiler::ExprType::Node {
                     type_name: "Doc".into(),
+                    nullable: false,
                 },
             }],
             distinct: false,
             order_by: vec![],
             limit: None,
+            limit_param: None,
+            written_columns: Vec::new(),
+            made_up: Default::default(),
+            work: Default::default(),
         };
         let source = source.with_explain_dump_dir(dir.path().to_path_buf());
         EXPLAIN_RENDERS.with(|count| count.set(0));

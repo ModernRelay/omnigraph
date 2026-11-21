@@ -1,0 +1,162 @@
+# issue: none
+# notes: A full-text call read as a value (the GQ 3 RFC, section 4, "The lexical query": `match_terms`
+# notes: is a row predicate and a Boolean like any other) runs in `return`, in `order`, as a group
+# notes: key, under an aggregate and in a block's aggregate: the Boolean the call's matches decide
+# notes: for each row, true or false and never null, computed once after the pattern.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)? @index
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Person","data":{"handle":"a","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"b","name":"Bob","age":20}}
+{"type":"Person","data":{"handle":"p1","name":"Cy","age":50}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Doc","data":{"id":"d1","title":"graph basics","body":"graph databases store graphs","year":2020,"tags":["x"],"embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"id":"d2","title":"vector search","body":"vector search over graph embeddings","year":2021,"tags":["y"],"embedding":[0.9,0.1,0.0]}}
+{"type":"Doc","data":{"id":"d3","title":"cooking","body":"pasta and graph theory of sauces","year":2022,"tags":[],"embedding":[0.0,1.0,0.0]}}
+{"type":"Doc","data":{"id":"d4","title":"rivers","body":"water flows downhill","year":2023,"tags":[],"embedding":[0.0,0.0,1.0]}}
+{"type":"Doc","data":{"id":"d5","title":"graphs again","body":"graph graph graph","year":2024,"tags":[],"embedding":[0.5,0.5,0.0]}}
+{"edge":"Authored","from":"a","to":"d1"}
+{"edge":"Authored","from":"a","to":"d3"}
+{"edge":"Authored","from":"a","to":"d4"}
+{"edge":"Authored","from":"b","to":"d2"}
+{"edge":"Authored","from":"b","to":"d5"}
+{"edge":"Authored","from":"b","to":"d3"}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"p1"}
+{"edge":"WorksAt","from":"a","to":"acme"}
+{"edge":"Cites","from":"d1","to":"d2"}
+
+--- query
+query q($s: String) { match { $d: Doc } return { $d.id, match_terms($d.body, terms($s, mode: any)) as hit } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"d.id":"d1","hit":true}
+{"d.id":"d2","hit":true}
+{"d.id":"d3","hit":true}
+{"d.id":"d4","hit":false}
+{"d.id":"d5","hit":true}
+
+--- expect shape
+d.id: String
+hit: Bool
+
+--- query
+query q($s: String) { match { $d: Doc } return { $d.id } order { match_terms($d.body, terms($s, mode: any)) desc, $d.id } }
+
+--- params
+{"s": "vector graph"}
+
+--- expect ordered
+{"d.id":"d1"}
+{"d.id":"d2"}
+{"d.id":"d3"}
+{"d.id":"d5"}
+{"d.id":"d4"}
+
+--- expect shape
+d.id: String
+
+--- query
+query q($s: String) { match { $d: Doc } return { match_terms($d.body, terms($s)) as hit, count($d) as n } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"hit":false,"n":1}
+{"hit":true,"n":4}
+
+--- expect shape
+hit: Bool
+n: I64
+
+--- query
+query q($s: String) { match { $p: Person, $p authored $d } return { $p.handle, sum(if(match_terms($d.body, terms($s, mode: any)), 1, 0)) as hits } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"hits":2,"p.handle":"a"}
+{"hits":3,"p.handle":"b"}
+
+--- expect shape
+p.handle: String
+hits: F64
+
+--- query
+query q($s: String) { match { $p: Person } where sum(if(match_terms($d.body, terms($s, mode: any)), 1, 0)) { $d: Doc, $p authored $d } > 1 return { $p.name } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"p.name":"Ada"}
+{"p.name":"Bob"}
+
+--- expect shape
+p.name: String
+
+--- query
+query q($s: String) { match { $p: Person, let $n = sum(if(match_terms($d.body, terms($s, mode: any)), 1, 0)) { $d: Doc, $p authored $d } } return { $p.name, $n } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"n":2,"p.name":"Ada"}
+{"n":3,"p.name":"Bob"}
+{"p.name":"Cy"}
+
+--- expect shape
+p.name: String
+n: F64?
+
+--- query
+query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s)) return { $d.id, not match_terms($d.body, terms($s)) as miss } }
+
+--- params
+{"s": "graph"}
+
+--- expect unordered
+{"d.id":"d1","miss":false}
+{"d.id":"d2","miss":false}
+{"d.id":"d3","miss":false}
+{"d.id":"d5","miss":false}
+
+--- expect shape
+d.id: String
+miss: Bool

@@ -89,12 +89,16 @@ impl PatternEdge {
 /// the block qualifies: the inner tree is a chain of `Expand`, dependent
 /// `TableScan` and `Filter` nodes over the `OuterReference`, every `Expand`
 /// introduces a new binding from a bound one (a pattern tree rooted at
-/// `outer_var`), every introduced node binding has its scan, nothing reads
+/// `outer_var`), every introduced node binding has its scan unless nothing
+/// reads more of it than its identity, nothing reads
 /// an outer binding (`outer_var` included: its identity is the key, never a
 /// column read), and one binding's scan is bounded by its own filter (a key
 /// or unique equality or a list membership) below its table's row count. The
 /// root is the binding with the fewest estimated rows, the first in the
-/// correlated tree on a tie. `None` when the block does not qualify.
+/// correlated tree on a tie. `None` when the block does not qualify. The
+/// caller offers no block that can fail: run from a bound key, a block
+/// evaluates its terms on rows no outer row reaches, where a term that can
+/// fail would refuse a read the correlated form answers (A3).
 pub(crate) fn key_set_tree(
     plan: &LogicalPlan,
     inner: LogicalId,
@@ -196,18 +200,20 @@ pub(crate) fn key_set_tree(
     if let Some(argument) = predicate.left.arg() {
         reads_of_expr(argument, &mut reads);
     }
-    if edges.is_empty()
-        || reads.iter().any(|read| !introduced.contains(&read.binding))
-        || vertices[1..]
-            .iter()
-            .any(|vertex| !scans.contains_key(vertex))
-    {
+    // A vertex with no scan is an `Expand`'s end that nothing reads more of
+    // than its identity (the optimizer dropped its scan): it is no root, and
+    // the re-rooted tree reaches it by the edge alone, as the correlated one
+    // did.
+    if edges.is_empty() || reads.iter().any(|read| !introduced.contains(&read.binding)) {
         return Ok(None);
     }
 
     let mut root: Option<(u64, &str)> = None;
     for vertex in &vertices[1..] {
-        let Some(LogicalNode::TableScan { spec, .. }) = plan.node(scans[vertex]) else {
+        let Some(&scan) = scans.get(vertex) else {
+            continue;
+        };
+        let Some(LogicalNode::TableScan { spec, .. }) = plan.node(scan) else {
             return Ok(None);
         };
         let Some(bound) = bounded_rows(spec, source) else {
@@ -255,7 +261,7 @@ pub(crate) fn key_set_tree(
                 .cloned()
                 .ok_or_else(|| PlanError::Internal("key-set node has no schema".to_string()))?;
             top = tree.add(edge.leaving(&from, top), schema.clone());
-            if to != outer_var {
+            if to != outer_var && scans.contains_key(&to) {
                 top = tree.add(
                     LogicalNode::TableScan {
                         input: Some(top),
@@ -283,6 +289,7 @@ pub(crate) fn key_set_tree(
             LogicalNode::Filter {
                 input: top,
                 conjuncts: residual,
+                fails: false,
             },
             schema,
         );
@@ -305,12 +312,12 @@ fn bounded_rows(spec: &ScanSpec, source: &dyn PlanSource) -> Option<u64> {
 }
 
 fn predicate_reads(predicate: &Predicate, out: &mut Vec<ColumnRef>) {
-    match predicate {
+    omnigraph_compiler::stack::deep(|| match predicate {
         Predicate::Gq { reads, .. } => out.extend(reads.iter().cloned()),
         Predicate::And { left, right } => {
             predicate_reads(left, out);
             predicate_reads(right, out);
         }
         Predicate::IdAfter { .. } | Predicate::VersionWindow { .. } => {}
-    }
+    })
 }

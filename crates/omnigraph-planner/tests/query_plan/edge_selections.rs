@@ -2,12 +2,10 @@
 //! that result-only GQT assertions cannot observe.
 
 use super::*;
-use omnigraph_compiler::query::ast::AggFunc;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_planner::ColumnRef;
 use omnigraph_planner::logical::tiebreak_text;
 use omnigraph_planner::mirror::EdgeSelectionMirror;
-use omnigraph_planner::optimizer::validate_rank_fuse_row_tiebreaks;
 use omnigraph_planner::physical::Assumptions;
 
 /// A separate worker bounds synchronous planning; an async query timeout
@@ -38,8 +36,8 @@ fn issue_659_large_finite_bounds_stop_estimation_at_a_fixed_point() {
                         max_hops_cap: 6,
                     },
                 );
-            let mut named = expand("a", "b", vec![]);
-            let IROp::Expand { max_hops, .. } = &mut named else {
+            let mut named = expand("a", "b");
+            let PatternStep::Expand { max_hops, .. } = &mut named else {
                 unreachable!()
             };
             *max_hops = Some(hops);
@@ -79,254 +77,6 @@ fn issue_659_large_finite_bounds_stop_estimation_at_a_fixed_point() {
 }
 
 #[test]
-fn issue_659_rrf_declares_typed_downstream_order_without_changing_fusion_identity() {
-    for (selection, expected) in [
-        (None, vec!["$b.@id"]),
-        (
-            Some(EdgeSelection::Named(member("knows", Direction::Out))),
-            vec!["$b.@id", "$e.@id"],
-        ),
-        (Some(alternatives()), vec!["$b.@id", "$e.@type", "$e.@id"]),
-        (
-            Some(EdgeSelection::Wildcard(alternatives().members().to_vec())),
-            vec!["$b.@id", "$e.@type", "$e.@id"],
-        ),
-        (
-            Some(EdgeSelection::Wildcard(vec![])),
-            vec!["$b.@id", "$e.@type", "$e.@id"],
-        ),
-    ] {
-        let mut source = source();
-        let downstream = if let Some(selection) = selection {
-            if selection.named().is_none() {
-                source = source.with_traversal_work_limit(100);
-            }
-            let mut expansion = selected("a", "b", selection);
-            let IROp::Expand { edge_binding, .. } = &mut expansion else {
-                unreachable!()
-            };
-            *edge_binding = Some("e".into());
-            expansion
-        } else {
-            scan("b")
-        };
-        let arm = IRExpr::Bm25 {
-            field: Box::new(prop("a", "text")),
-            query: Box::new(IRExpr::Literal(
-                Literal::String("needle".into()),
-                value_type(ScalarType::String, false),
-            )),
-            ty: value_type(ScalarType::F32, false),
-        };
-        let op = ir(
-            vec![scan("a"), downstream],
-            vec![prop("b", "slug")],
-            vec![IRExpr::Rrf {
-                primary: Box::new(arm.clone()),
-                secondary: Box::new(arm),
-                k: None,
-                ty: value_type(ScalarType::F64, false),
-            }],
-        );
-        let logical = resolve(&op, &source).unwrap();
-        let logical_keys = logical
-            .live()
-            .find_map(|(_, node)| match node {
-                LogicalNode::RankFuse { row_tiebreak, .. } => Some(row_tiebreak),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(tiebreak_text(logical_keys), expected);
-        let (plan, _) = physical(&op, &source);
-        validate_rank_fuse_row_tiebreaks(&plan).unwrap();
-        let (arms, keys) = plan
-            .live()
-            .find_map(|(_, node)| match node {
-                PhysicalNode::RankFuse {
-                    arms, row_tiebreak, ..
-                } => Some((arms, row_tiebreak)),
-                _ => None,
-            })
-            .unwrap();
-        assert!(arms.iter().all(|arm| arm.binding == "a"));
-        assert_eq!(tiebreak_text(keys), expected);
-        assert!(leads_with_fused_score(&plan, "a"));
-        let bound = omnigraph_planner::BoundPlan {
-            plan,
-            values: Default::default(),
-        };
-        let encoded = serde_json::to_string(&bound).unwrap();
-        let restored: omnigraph_planner::BoundPlan = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(restored, bound);
-        validate_rank_fuse_row_tiebreaks(&restored.plan).unwrap();
-    }
-}
-
-#[test]
-fn rank_fuse_row_keys_cover_both_arms_without_correlated_locals_issue_659() {
-    let mut query = query(correlated(alternatives()));
-    query.pipeline[1] = scan("b");
-    let IROp::AntiJoin { inner, .. } = &mut query.pipeline[2] else {
-        panic!("the fixture ends with a correlated block");
-    };
-    let IROp::Expand { edge_binding, .. } = &mut inner[0] else {
-        panic!("the correlated block binds a selected edge");
-    };
-    *edge_binding = Some("inner_edge".into());
-    let arm = |binding| IRExpr::Bm25 {
-        field: Box::new(prop(binding, "text")),
-        query: Box::new(IRExpr::Literal(
-            Literal::String("needle".into()),
-            value_type(ScalarType::String, false),
-        )),
-        ty: value_type(ScalarType::F32, false),
-    };
-    query.order_by = vec![IROrdering {
-        expr: IRExpr::Rrf {
-            primary: Box::new(arm("a")),
-            secondary: Box::new(arm("b")),
-            k: None,
-            ty: value_type(ScalarType::F64, false),
-        },
-        descending: false,
-    }];
-    let source = source().with_traversal_work_limit(100);
-    let mut plan =
-        futures::executor::block_on(omnigraph_planner::plan_query(&query, &source, &bounds()))
-            .unwrap();
-    let (fuse_id, secondary_input) = plan
-        .live()
-        .find_map(|(id, node)| match node {
-            PhysicalNode::RankFuse {
-                arms, row_tiebreak, ..
-            } => {
-                assert_eq!(arms[0].binding, "a");
-                assert_eq!(arms[1].binding, "b");
-                assert_eq!(tiebreak_text(row_tiebreak), ["$b.@id"]);
-                Some((id, arms[1].input))
-            }
-            _ => None,
-        })
-        .unwrap();
-    validate_rank_fuse_row_tiebreaks(&plan).unwrap();
-    let mut extra = plan
-        .live()
-        .find_map(|(_, node)| matches!(node, PhysicalNode::Expand { .. }).then(|| node.clone()))
-        .unwrap();
-    let PhysicalNode::Expand {
-        input,
-        dst,
-        edge_binding,
-        ..
-    } = &mut extra
-    else {
-        unreachable!()
-    };
-    *input = secondary_input;
-    *dst = "extra".into();
-    *edge_binding = None;
-    let extra = plan.add(extra);
-    let Some(PhysicalNode::RankFuse { arms, .. }) = plan.node_mut(fuse_id) else {
-        unreachable!()
-    };
-    arms[1].input = extra;
-    let error = validate_rank_fuse_row_tiebreaks(&plan).unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("arm 1") && message.contains("$extra.@id"),
-        "{message}"
-    );
-}
-
-#[test]
-fn every_nested_rank_fuse_validates_its_row_keys_issue_659() {
-    let arm = IRExpr::Bm25 {
-        field: Box::new(prop("a", "text")),
-        query: Box::new(IRExpr::Literal(
-            Literal::String("needle".into()),
-            value_type(ScalarType::String, false),
-        )),
-        ty: value_type(ScalarType::F32, false),
-    };
-    let op = ir(
-        vec![scan("a"), scan("b")],
-        vec![prop("b", "slug")],
-        vec![IRExpr::Rrf {
-            primary: Box::new(arm.clone()),
-            secondary: Box::new(arm),
-            k: None,
-            ty: value_type(ScalarType::F64, false),
-        }],
-    );
-    let (mut plan, _) = physical(&op, &source());
-    let (inner_id, mut outer) = plan
-        .live()
-        .find_map(|(id, node)| {
-            matches!(node, PhysicalNode::RankFuse { .. }).then(|| (id, node.clone()))
-        })
-        .unwrap();
-    let PhysicalNode::RankFuse { arms, .. } = &mut outer else {
-        unreachable!()
-    };
-    arms[0].input = inner_id;
-    let outer_id = plan.add(outer);
-    plan.set_root(outer_id);
-    validate_rank_fuse_row_tiebreaks(&plan).unwrap();
-    for invalid in [inner_id, outer_id] {
-        let mut altered = plan.clone();
-        let Some(PhysicalNode::RankFuse { row_tiebreak, .. }) = altered.node_mut(invalid) else {
-            unreachable!()
-        };
-        row_tiebreak.clear();
-        let error = validate_rank_fuse_row_tiebreaks(&altered).unwrap_err();
-        assert!(
-            error.to_string().contains(&format!("rank fuse {invalid} ")),
-            "{error}"
-        );
-    }
-}
-
-#[test]
-fn rank_fuse_without_downstream_bindings_keeps_an_empty_key_list_issue_659() {
-    let arm = IRExpr::Bm25 {
-        field: Box::new(prop("a", "text")),
-        query: Box::new(IRExpr::Literal(
-            Literal::String("needle".into()),
-            value_type(ScalarType::String, false),
-        )),
-        ty: value_type(ScalarType::F32, false),
-    };
-    let op = ir(
-        vec![scan("a")],
-        vec![prop("a", "slug")],
-        vec![IRExpr::Rrf {
-            primary: Box::new(arm.clone()),
-            secondary: Box::new(arm),
-            k: None,
-            ty: value_type(ScalarType::F64, false),
-        }],
-    );
-    let (mut plan, _) = physical(&op, &source());
-    let fuse_id = plan
-        .live()
-        .find_map(|(id, node)| match node {
-            PhysicalNode::RankFuse { row_tiebreak, .. } => {
-                assert!(row_tiebreak.is_empty());
-                Some(id)
-            }
-            _ => None,
-        })
-        .unwrap();
-    validate_rank_fuse_row_tiebreaks(&plan).unwrap();
-    let Some(PhysicalNode::RankFuse { arms, .. }) = plan.node_mut(fuse_id) else {
-        unreachable!()
-    };
-    arms[1].input = usize::MAX;
-    let error = validate_rank_fuse_row_tiebreaks(&plan).unwrap_err();
-    assert!(error.to_string().contains("arm root"), "{error}");
-}
-
-#[test]
 fn issue_659_selected_edge_sort_declares_type_even_when_id_is_ordered() {
     for selection in [
         alternatives(),
@@ -359,7 +109,7 @@ fn issue_659_selected_edge_sort_declares_type_even_when_id_is_ordered() {
             ),
         ] {
             let mut expansion = selected("a", "b", selection.clone());
-            let IROp::Expand { edge_binding, .. } = &mut expansion else {
+            let PatternStep::Expand { edge_binding, .. } = &mut expansion else {
                 unreachable!()
             };
             *edge_binding = Some("e".into());
@@ -461,103 +211,6 @@ fn literal_order_keys_keep_the_sort_and_remaining_identity_order() {
     }
 }
 
-/// Whether the plan's `Sort` leads with `<binding>._rrf desc`, the fused
-/// score column a `RankFuse` appends (RFC 0047 §Total order).
-fn leads_with_fused_score(plan: &omnigraph_planner::PhysicalPlan, binding: &str) -> bool {
-    plan.live().any(|(_, node)| match node {
-        PhysicalNode::Sort { order_by, .. } => order_by.first().is_some_and(|key| {
-            key.descending
-                && matches!(
-                    &key.expr,
-                    IRExpr::PropAccess { variable, property, .. }
-                        if variable == binding && property == "_rrf"
-                )
-        }),
-        _ => false,
-    })
-}
-
-#[test]
-fn fused_row_identity_declared_under_the_fused_score_sort() {
-    let ranked = || {
-        let arm = IRExpr::Bm25 {
-            field: Box::new(prop("a", "text")),
-            query: Box::new(IRExpr::Literal(
-                Literal::String("needle".into()),
-                value_type(ScalarType::String, false),
-            )),
-            ty: value_type(ScalarType::F32, false),
-        };
-        IRExpr::Rrf {
-            primary: Box::new(arm.clone()),
-            secondary: Box::new(arm),
-            k: None,
-            ty: value_type(ScalarType::F64, false),
-        }
-    };
-    for (returns, order, expected) in [
-        (vec![prop("b", "slug")], vec![ranked()], vec!["$b.@id"]),
-        (
-            vec![prop("b", "slug")],
-            vec![ranked(), prop("b", SYSTEM_COLUMNS_V3.id)],
-            vec!["$b.@id"],
-        ),
-        (
-            vec![prop("b", "slug")],
-            vec![ranked(), prop("b", "slug")],
-            vec!["$b.@id"],
-        ),
-        (
-            vec![IRExpr::Aggregate {
-                func: AggFunc::Count,
-                distinct: false,
-                arg: Box::new(IRExpr::Variable(
-                    "b".into(),
-                    omnigraph_compiler::ExprType::Node {
-                        type_name: "T".into(),
-                    },
-                )),
-                signature: AggSignature {
-                    arg: ExprType::Node {
-                        type_name: "T".into(),
-                    },
-                    result: ExprType::from_prop(&PropType::scalar(ScalarType::I64, true)),
-                },
-            }],
-            vec![ranked()],
-            vec!["$b.@id"],
-        ),
-    ] {
-        let aggregate = returns
-            .iter()
-            .any(|expr| matches!(expr, IRExpr::Aggregate { .. }));
-        let op = ir(vec![scan("a"), scan("b")], returns, order);
-        let logical = resolve(&op, &source()).unwrap();
-        let keys = logical
-            .live()
-            .find_map(|(_, node)| match node {
-                LogicalNode::RankFuse { row_tiebreak, .. } => Some(row_tiebreak),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(tiebreak_text(keys), expected);
-        let (plan, _) = physical(&op, &source());
-        let keys = plan
-            .live()
-            .find_map(|(_, node)| match node {
-                PhysicalNode::RankFuse { row_tiebreak, .. } => Some(row_tiebreak),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(tiebreak_text(keys), expected);
-        assert_eq!(
-            leads_with_fused_score(&plan, "a"),
-            !aggregate,
-            "an aggregate with no key after the fusion stays unordered; every other shape sorts by the fused score first"
-        );
-    }
-}
-
 fn member(name: &str, direction: Direction) -> EdgeMember {
     EdgeMember {
         edge_type: name.to_string(),
@@ -565,16 +218,16 @@ fn member(name: &str, direction: Direction) -> EdgeMember {
     }
 }
 
-fn selected(src: &str, dst: &str, edges: EdgeSelection) -> IROp {
-    let mut op = expand(src, dst, vec![]);
-    let IROp::Expand { edges: value, .. } = &mut op else {
+fn selected(src: &str, dst: &str, edges: EdgeSelection) -> PatternStep {
+    let mut op = expand(src, dst);
+    let PatternStep::Expand { edges: value, .. } = &mut op else {
         unreachable!()
     };
     *value = edges;
     op
 }
 
-fn query(op: Operation) -> QueryIR {
+fn query(op: Operation) -> ReadShape {
     let Operation::Query(query) = op else {
         unreachable!()
     };
@@ -592,8 +245,9 @@ fn correlated(edges: EdgeSelection) -> Operation {
     ir(
         vec![
             scan("a"),
-            expand("a", "b", vec![]),
-            IROp::AntiJoin {
+            expand("a", "b"),
+            PatternStep::AntiJoin {
+                fails: false,
                 outer_var: "b".to_string(),
                 inner: vec![selected("b", "x", edges)],
                 predicate: omnigraph_compiler::ir::SubqueryPredicate {
@@ -733,7 +387,7 @@ fn issue_659_selection_admission_precedes_lowering_of_outer_named_edges() {
 #[test]
 fn named_query_ignores_a_source_selection_allowance() {
     let query = query(ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     ));
@@ -866,55 +520,29 @@ fn issue_659_budgeted_search_declares_no_topology_prefilter() {
         )),
         ty: value_type(ScalarType::F32, false),
     };
-    let bm25 = IRExpr::Bm25 {
-        field: Box::new(prop("a", "text")),
-        query: Box::new(IRExpr::Param(
-            "q".to_string(),
-            value_type(ScalarType::String, false),
-        )),
-        ty: value_type(ScalarType::F32, false),
-    };
-    for order in [
-        nearest.clone(),
-        IRExpr::Rrf {
-            primary: Box::new(nearest),
-            secondary: Box::new(bm25),
-            k: None,
-            ty: value_type(ScalarType::F64, false),
-        },
-    ] {
-        let op = ir(
-            vec![scan("a"), selected("a", "b", alternatives())],
-            vec![prop("a", "slug")],
-            vec![order],
-        );
-        let (plan, _) = physical(&op, &source);
-        let mut declarations = 0;
-        for (_, node) in plan.live() {
-            match node {
-                PhysicalNode::Scan {
-                    ranked: Some(ranked),
-                    ..
-                } => {
-                    if let Some(prefilter) = &ranked.prefilter {
-                        declarations += 1;
-                        assert!(!prefilter.admits());
-                        assert!(prefilter.hops.is_empty());
-                    }
-                }
-                PhysicalNode::RankFuse { prefilter, .. } => {
-                    declarations += 1;
-                    assert!(!prefilter.admits());
-                    assert!(prefilter.hops.is_empty());
-                }
-                _ => {}
-            }
+    let op = ir(
+        vec![scan("a"), selected("a", "b", alternatives())],
+        vec![prop("a", "slug")],
+        vec![nearest],
+    );
+    let (plan, _) = physical(&op, &source);
+    let mut declarations = 0;
+    for (_, node) in plan.live() {
+        if let PhysicalNode::Scan {
+            ranked: Some(ranked),
+            ..
+        } = node
+            && let Some(prefilter) = &ranked.prefilter
+        {
+            declarations += 1;
+            assert!(!prefilter.admits());
+            assert!(prefilter.hops.is_empty());
         }
-        assert!(
-            declarations > 0,
-            "the existing prefilter owner was exercised"
-        );
     }
+    assert!(
+        declarations > 0,
+        "the existing prefilter owner was exercised"
+    );
 }
 
 #[test]

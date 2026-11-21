@@ -27,7 +27,7 @@ branch create b0
 
 --- mutate
 query insert_w2() {
-    insert Person { name: "w2" }
+    replace Person { name: "w2" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -39,28 +39,28 @@ branch create b1
 
 --- mutate
 query insert_x1() {
-    insert Person { name: "x1" }
+    replace Person { name: "x1" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query insert_x2() {
-    insert Person { name: "x2" }
+    replace Person { name: "x2" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query insert_x3() {
-    insert Person { name: "x3" }
+    replace Person { name: "x3" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b0
 query insert_y() {
-    insert Person { name: "y" }
+    replace Person { name: "y" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -72,7 +72,8 @@ branch merge b0
 
 --- mutate branch: b1
 query delete_w2() {
-    delete Person where name = "w2"
+    match { $x: Person } where $x.name = "w2"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0

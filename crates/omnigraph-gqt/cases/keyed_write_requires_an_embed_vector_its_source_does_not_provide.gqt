@@ -1,0 +1,106 @@
+# issue: none
+# notes: An `@embed` vector is a property like any other: no write embeds, so assigning its source does not provide it.
+# notes: `insert` and `replace` that omit a required one are `T12`, the message naming the vector and its source; `upsert` requires only its key at check time, so on a new key it is refused when it runs, and on an existing key it keeps the stored vector.
+# notes: A write that assigns the vector lands, and a nullable `@embed` vector may be omitted.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    body: String
+    embedding: Vector(2) @embed(body)
+}
+node Note {
+    slug: String @key
+    body: String
+    embedding: Vector(2)? @embed(body)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","body":"one","embedding":[1.0,0.0]}}
+
+--- mutate
+query insert_source_only() {
+    insert Doc { slug: "d2", body: "two" }
+}
+
+--- expect error: type error: T12: insert for `Doc` must provide non-nullable property `embedding`; it is the `@embed` vector of `body`, and assigning `body` does not provide it
+
+--- mutate
+query replace_source_only() {
+    replace Doc { slug: "d2", body: "two" }
+}
+
+--- expect error: type error: T12: replace for `Doc` must provide non-nullable property `embedding`; it is the `@embed` vector of `body`
+
+--- mutate
+query replace_existing_source_only() {
+    replace Doc { slug: "d1", body: "uno" }
+}
+
+--- expect error: type error: T12: replace for `Doc` must provide non-nullable property `embedding`
+
+--- mutate
+query upsert_new_key_source_only() {
+    upsert Doc { slug: "d2", body: "two" }
+}
+
+--- expect error: missing required property 'embedding'
+
+--- mutate
+query upsert_existing_key_source_only() {
+    upsert Doc { slug: "d1", body: "uno" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_with_vector() {
+    insert Doc { slug: "d2", body: "two", embedding: [0.0, 1.0] }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_nullable_source_only() {
+    insert Note { slug: "n1", body: "note" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.body, $d.embedding }
+}
+
+--- expect unordered
+{"d.body":"uno","d.embedding":[1.0,0.0],"d.slug":"d1"}
+{"d.body":"two","d.embedding":[0.0,1.0],"d.slug":"d2"}
+--- expect shape
+d.slug: String
+d.body: String
+d.embedding: Vector(2)
+
+--- query
+query notes() {
+    match { $n: Note }
+    return { $n.slug, $n.body, $n.embedding }
+}
+
+--- expect unordered
+{"n.body":"note","n.slug":"n1"}
+--- expect shape
+n.slug: String
+n.body: String
+n.embedding: Vector(2)?

@@ -7,19 +7,19 @@
 
 use std::sync::Arc;
 
+use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::catalog::catalogue::catalogue_declarations;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::SettingStmt;
 use omnigraph_compiler::query::codes::Q003;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
+use omnigraph_compiler::query::file::SettingStmt;
 use omnigraph_compiler::query::parser::{has_settings_prefix, parse_query};
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::{
     SessionSettings, SessionSettingsError, SettingId, SettingValue,
 };
-use omnigraph_compiler::{CheckedRead, build_catalog, lower_query};
 
 use crate::engine;
 use crate::error::{OmniError, Result};
@@ -114,9 +114,10 @@ impl CatalogueScope {
     fn compile(&self, source: &str, name: &str) -> Result<(CompiledQuery, bool)> {
         let statement = omnigraph_compiler::find_read_statement(source, name)
             .map_err(crate::exec::query_lookup_error)?;
-        let checked = CheckedRead::check(&self.catalog, statement.decl())?;
-        let ir = Arc::new(lower_query(&self.catalog, checked.query())?);
-        Ok((CompiledQuery { ir, checked }, statement.is_explain()))
+        Ok((
+            CompiledQuery::compile(&self.catalog, statement.decl())?,
+            statement.is_explain(),
+        ))
     }
 
     /// Run the read statement `name` of `source` (a declaration, or

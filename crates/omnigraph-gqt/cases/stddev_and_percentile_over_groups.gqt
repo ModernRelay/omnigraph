@@ -1,0 +1,141 @@
+# issue: none
+# notes: `stddev(x)` is the sample standard deviation (n − 1) of a group's non-null numeric values,
+# notes: null over fewer than two values; `percentile(x, p)` is exact with linear interpolation
+# notes: (PERCENTILE_CONT) over the values in the fixed value order, null over empty input. Both
+# notes: are nullable `F64` over I32, I64 and F64 arguments: an integer converts to the nearest
+# notes: `F64` (2^53 + 1 is 2^53). With no keys over no rows a read returns one row whose
+# notes: `stddev` and `percentile` are null; with keys it returns none. A non-dyadic p (0.123456789)
+# notes: keeps every digit of its interpolation, which a kernel rounding the fraction to 1e-6 would
+# notes: not.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Sale {
+    id: String @key
+    region: String?
+    small: I32?
+    big: I64?
+    amount: F64?
+}
+
+--- seed
+{"type":"Sale","data":{"id":"e1","region":"east","small":2,"big":10,"amount":1.5}}
+{"type":"Sale","data":{"id":"e2","region":"east","small":4,"big":20,"amount":-0.0}}
+{"type":"Sale","data":{"id":"e3","region":"east","small":4,"big":30,"amount":0.0}}
+{"type":"Sale","data":{"id":"e4","region":"east","small":4,"big":40,"amount":2.5}}
+{"type":"Sale","data":{"id":"e5","region":"east","small":5,"big":50,"amount":4.0}}
+{"type":"Sale","data":{"id":"e6","region":"east","small":5}}
+{"type":"Sale","data":{"id":"e7","region":"east","small":7,"big":70,"amount":10.0}}
+{"type":"Sale","data":{"id":"e8","region":"east","small":9,"big":90,"amount":0.1}}
+{"type":"Sale","data":{"id":"e9","region":"east"}}
+{"type":"Sale","data":{"id":"w1","region":"west","small":3,"big":9007199254740993,"amount":0.5}}
+{"type":"Sale","data":{"id":"n1","region":"north"}}
+
+--- query
+query small_per_region() {
+    match { $s: Sale }
+    return {
+        $s.region as region,
+        stddev($s.small) as sd,
+        percentile($s.small, 0) as low,
+        percentile($s.small, 0.5) as median,
+        percentile($s.small, 1) as high,
+        percentile($s.small, 0.123456789) as odd,
+        count($s) as n
+    }
+}
+
+--- expect unordered
+{"high":3,"low":3,"median":3,"n":1,"odd":3,"region":"west"}
+{"high":9,"low":2,"median":4.5,"n":9,"odd":3.728395046,"region":"east","sd":2.138089935299}
+{"n":1,"region":"north"}
+
+--- expect shape
+region: String?
+sd: F64?
+low: F64?
+median: F64?
+high: F64?
+odd: F64?
+n: I64
+
+--- query
+query every_type_without_keys() {
+    match { $s: Sale }
+    return {
+        stddev($s.small) as small_sd,
+        stddev($s.big) as big_sd,
+        stddev($s.amount) as amount_sd,
+        percentile($s.big, 1) as big_max,
+        percentile($s.big, 0.25) as big_quartile,
+        percentile($s.amount, 0) as amount_low,
+        percentile($s.amount, 0.75) as amount_upper,
+        percentile($s.amount, 0.3) as amount_p30
+    }
+}
+
+--- expect unordered
+{"amount_low":0,"amount_p30":0.14,"amount_sd":3.41247710615,"amount_upper":2.875,"big_max":9007199254740992,"big_quartile":27.5,"big_sd":3184525836262870.5,"small_sd":2.108185106779}
+
+--- expect shape
+small_sd: F64?
+big_sd: F64?
+amount_sd: F64?
+big_max: F64?
+big_quartile: F64?
+amount_low: F64?
+amount_upper: F64?
+amount_p30: F64?
+
+--- query
+query no_rows_no_keys() {
+    match { $s: Sale }
+    where $s.id = "none"
+    return { stddev($s.small) as sd, percentile($s.amount, 0.5) as median, count($s) as n }
+}
+
+--- expect unordered
+{"n":0}
+
+--- expect shape
+sd: F64?
+median: F64?
+n: I64
+
+--- query
+query no_rows_with_keys() {
+    match { $s: Sale }
+    where $s.id = "none"
+    return { $s.region as region, stddev($s.small) as sd, percentile($s.amount, 0.5) as median }
+}
+
+--- expect unordered
+
+--- expect shape
+region: String?
+sd: F64?
+median: F64?
+
+--- query
+query widest_regions_first() {
+    match { $s: Sale }
+    return { $s.region as region, stddev($s.amount) as sd, percentile($s.amount, 0.5) as median }
+    order { sd desc nulls last, region }
+    limit 2
+}
+
+--- expect ordered
+{"median":1.5,"region":"east","sd":3.598809326906}
+{"region":"north"}
+
+--- expect shape
+region: String?
+sd: F64?
+median: F64?

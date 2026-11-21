@@ -1,0 +1,110 @@
+# issue: none
+# notes: One law places a `where`'s conjuncts. Numbered in written order, the
+# notes: conjuncts before the first one that can fail are pure and total and
+# notes: may move below any element that cannot fail; that one and every one
+# notes: after it filter in written order, each on the rows the ones before it
+# notes: keep, above every element. Nothing moves below an element that can
+# notes: fail (a `let`, a `from`, an `optional`, a block read as a value), so
+# notes: such an element runs on every row the elements before it produce.
+# notes: ada (age 0) works at acme (size 0): `10 / $p.age` and `10 / $c.size`
+# notes: fail on her unless a conjunct written before them removes her.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32
+}
+node Company {
+    slug: String @key
+    size: I32
+}
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":0}}
+{"type":"Person","data":{"handle":"bob","age":5}}
+{"type":"Person","data":{"handle":"cy","age":50}}
+{"type":"Company","data":{"slug":"acme","size":0}}
+{"type":"Company","data":{"slug":"bolt","size":7}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"WorksAt","from":"cy","to":"bolt"}
+
+--- query
+query a_block_under_or_runs_on_the_rows_the_conjunct_before_it_keeps() {
+    match { $c: Company, $p worksAt $c }
+    where $p.age != 0 and ($p.handle = "zz" or count { $d: Company, $p worksAt $d where 10 / $p.age > 1 } > 0)
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query a_failing_block_argument_under_or_runs_where_the_left_is_not_true() {
+    match { $p: Person }
+    where $p.age = 0 or sum($c.size + 100 / $p.age) { $c: Company, $p worksAt $c } > 0
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query a_failing_block_written_first_runs_on_every_row() {
+    match { $p: Person }
+    where exists { $c: Company, $p worksAt $c where 10 / $c.size > 1 } and $p.handle = "cy"
+    return { $p.handle }
+}
+
+--- expect error: E2
+
+--- query
+query a_conjunct_written_first_guards_a_failing_block() {
+    match { $p: Person }
+    where $p.handle = "cy" and exists { $c: Company, $p worksAt $c where 10 / $c.size > 0 }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query a_failing_from_runs_before_the_where() {
+    match {
+        $p: Person,
+        from { match { $c: Company, $p worksAt $c } return { sum(10 / $c.size) as s } }
+    }
+    where $p.handle = "cy"
+    return { $p.handle, $s }
+}
+
+--- expect error: E2
+
+--- query
+query a_failing_let_runs_before_the_where() {
+    match { $p: Person, let $r = 100 / $p.age }
+    where $p.handle = "cy"
+    return { $p.handle, $r }
+}
+
+--- expect error: E2

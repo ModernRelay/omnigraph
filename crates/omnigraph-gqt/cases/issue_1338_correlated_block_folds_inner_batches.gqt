@@ -39,13 +39,11 @@ tables:
     columns: {}
 
 --- query
-set engine = v2;
 set query_memory_bytes = 12582912;
 query hubs() {
-    match {
-        $a: Person { name: "p00000" }
-        max($b.payload) { $a knows $b  $a.name = $a.name } > ""
-    }
+    match { $a: Person }
+    where $a.name = "p00000"
+        and max($b.payload) { $b: Person, $a knows $b where $a.name = $a.name } > ""
     return { $a.name }
 }
 
@@ -57,3 +55,5 @@ a.name: String
 
 --- expect plan
 anti join $a: correlated
+
+--- reference skipped: scale: the reference's nested loops over 16,384 neighbors of 1 KiB each outrun the case's budget; the case holds the engine's memory bound

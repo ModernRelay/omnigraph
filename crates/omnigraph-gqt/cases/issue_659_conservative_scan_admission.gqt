@@ -45,7 +45,7 @@ edge Likes: Person -> Person
 --- query
 set traversal_work_limit = 23;
 query one_neighbor_refused() {
-    match { $a: Person { name: "a" } $a (knows | likes) $b }
+    match { $a: Person, $a (knows | likes) $b } where $a.name = "a"
     return { $b.name as neighbor }
 }
 
@@ -54,7 +54,7 @@ query one_neighbor_refused() {
 --- query
 set traversal_work_limit = 24;
 query one_neighbor_admitted() {
-    match { $a: Person { name: "a" } $a (knows | likes) $b }
+    match { $a: Person, $a (knows | likes) $b } where $a.name = "a"
     return { $b.name as neighbor }
 }
 
@@ -67,7 +67,7 @@ neighbor: String
 --- query
 set traversal_work_limit = 26;
 query bound_neighbor_refused() {
-    match { $a: Person { name: "a" } $a $e:(knows | likes) $b }
+    match { $a: Person, $a $e:(knows | likes) $b } where $a.name = "a"
     return { $b.name as neighbor }
 }
 
@@ -76,7 +76,7 @@ query bound_neighbor_refused() {
 --- query
 set traversal_work_limit = 27;
 query bound_neighbor_admitted() {
-    match { $a: Person { name: "a" } $a $e:(knows | likes) $b }
+    match { $a: Person, $a $e:(knows | likes) $b } where $a.name = "a"
     return { $b.name as neighbor }
 }
 
@@ -89,7 +89,7 @@ neighbor: String
 --- query
 set traversal_work_limit = 45;
 query second_hop_refused() {
-    match { $a: Person { name: "a" } $a (knows | likes){1,3} $b }
+    match { $a: Person, $a (knows | likes){1,3} $b } where $a.name = "a"
     return { $b.name as neighbor }
 }
 
@@ -98,7 +98,7 @@ query second_hop_refused() {
 --- query
 set traversal_work_limit = 46;
 query second_hop_admitted() {
-    match { $a: Person { name: "a" } $a (knows | likes){1,3} $b }
+    match { $a: Person, $a (knows | likes){1,3} $b } where $a.name = "a"
     return { $b.name as neighbor }
 }
 
