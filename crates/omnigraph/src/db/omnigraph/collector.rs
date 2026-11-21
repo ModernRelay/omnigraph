@@ -82,11 +82,13 @@ pub struct CollectorCost {
     /// Listings: per table location its `_versions/` once, then its objects
     /// once for the orphan rule.
     pub listings: u64,
-    /// Table manifests opened: each chain link once for its predecessor, then
-    /// each root, frozen linear version, unpublished manifest and sweep
-    /// candidate once for its paths.
+    /// Table manifests opened: each chain link once, for its predecessor and
+    /// its paths together, then each root, frozen linear version, unpublished
+    /// manifest and sweep candidate the chain walk did not open, once for its
+    /// paths.
     pub table_opens: u64,
-    /// Index sections read: one per marked or examined manifest.
+    /// Index sections read: one per marked or examined manifest, and one more
+    /// per root for the bases it borrows.
     pub index_reads: u64,
     /// Transaction files read for a spilled deleted-ids record: one per
     /// marked or examined manifest that names a transaction.
@@ -371,7 +373,7 @@ async fn delete_paths(
     paths: &BTreeSet<String>,
     sizes: &BTreeMap<String, u64>,
 ) -> Result<u64> {
-    let mut bytes = 0;
+    let mut files = Vec::new();
     for path in paths {
         if path.starts_with("base:") {
             continue;
@@ -387,13 +389,52 @@ async fn delete_paths(
             }
             continue;
         }
-        bytes += delete_object(store, &full, sizes.get(path).copied()).await?;
+        let size = match sizes.get(path) {
+            Some(size) => *size,
+            None => match store.size(&full).await {
+                Ok(size) => size,
+                Err(lance::Error::NotFound { .. }) => continue,
+                Err(error) => return Err(OmniError::storage(error)),
+            },
+        };
+        files.push((full, size));
+    }
+    delete_files(store, files).await
+}
+
+/// Delete `files` through one delete stream of the table's store, which S3
+/// sends as `DeleteObjects` requests of up to 1,000 keys and other stores
+/// delete concurrently, in no order: these files belong only to manifests
+/// the sweep removes after them, so any subset a stopped pass leaves is
+/// planned again. Returns the bytes of the files the store reported removed,
+/// at each file's `(path, size)`. An absent file counts nothing only on a
+/// store that reports it absent: S3 `DeleteObjects` and the read-through
+/// store report it removed, so its listed size counts.
+async fn delete_files(
+    store: &lance::io::ObjectStore,
+    files: Vec<(object_store::path::Path, u64)>,
+) -> Result<u64> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let sizes: HashMap<object_store::path::Path, u64> = files.iter().cloned().collect();
+    let locations = futures::stream::iter(files.into_iter().map(|(path, _)| Ok(path))).boxed();
+    let mut removed = store.inner.delete_stream(locations);
+    let mut bytes = 0;
+    while let Some(result) = removed.next().await {
+        match result {
+            Ok(path) => bytes += sizes.get(&path).copied().unwrap_or(0),
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(OmniError::storage(lance::Error::from(error))),
+        }
     }
     Ok(bytes)
 }
 
-/// Delete one object and return its size (`known` when the listing gave it);
-/// an absent object was removed by an earlier pass and counts nothing.
+/// Delete one object and return its size (`known` when the listing gave it).
+/// An object an earlier pass removed counts nothing only on a store that
+/// reports it absent: S3 and the read-through store report the delete of an
+/// absent key as done, so a `known` size counts there.
 async fn delete_object(
     store: &lance::io::ObjectStore,
     path: &object_store::path::Path,
@@ -1377,8 +1418,6 @@ async fn trace_table(
         .iter()
         .filter_map(|entry| entry.version_metadata.last_linear_version())
         .max();
-    let (published, chain_order) = discover_published(db, &location, rows, &present, cost).await?;
-    plan.published_set = published.clone();
     resolve_roots(
         plan,
         &present,
@@ -1410,18 +1449,25 @@ async fn trace_table(
             ));
         }
     }
-    for root in plan.roots.iter().chain(plan.linear_roots.iter()) {
-        let Some(handle) = open_at(db, &location, *root).await? else {
+    let mut traced = Traced::default();
+    let (published, chain_order) =
+        discover_published(db, plan, rows, &present, &mut traced, cost).await?;
+    plan.published_set = published.clone();
+    let untraced_roots = plan
+        .roots
+        .iter()
+        .filter(|root| !traced.versions.contains(root))
+        .chain(plan.linear_roots.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    for root in untraced_roots {
+        let Some(handle) = open_at(db, &location, root).await? else {
             plan.errors
                 .push(format!("root version {root} listed but not openable"));
             continue;
         };
         cost.table_opens += 1;
-        let paths = referenced_paths(&handle, cost).await?;
-        plan.referenced_paths.extend(paths.iter().cloned());
-        plan.marked_paths.extend(paths);
-        plan.borrowed_origins
-            .extend(borrowed_origins(handle.dataset(), cost).await?);
+        trace_root(plan, &handle, cost).await?;
     }
     let outside = judge_outside(
         db,
@@ -1434,7 +1480,7 @@ async fn trace_table(
         cost,
     )
     .await?;
-    plan_sweep(db, plan, &chain_order, &outside, cost).await?;
+    plan_sweep(db, plan, &chain_order, &outside, traced, cost).await?;
     plan.foreign_versions = foreign_versions(rows, &linear_present, plan.last_linear_version);
     plan_orphans(handle.dataset(), plan, cost).await?;
     Ok(())
@@ -1563,16 +1609,44 @@ async fn list_manifests(
     Ok((present, linear_present))
 }
 
+/// Versions this run's trace has opened and read, so each detached manifest
+/// opens once: a chain link's paths are read at the open that finds its
+/// predecessor. `swept_paths` holds the paths of the traced versions that
+/// are not roots, which the sweep judges with the rest.
+#[derive(Default)]
+struct Traced {
+    versions: BTreeSet<u64>,
+    swept_paths: BTreeSet<String>,
+}
+
+/// Mark a root's paths and the native origins it borrows from.
+async fn trace_root(
+    plan: &mut TableCollectionPlan,
+    handle: &SnapshotHandle,
+    cost: &mut CollectorCost,
+) -> Result<()> {
+    let paths = referenced_paths(handle, cost).await?;
+    plan.referenced_paths.extend(paths.iter().cloned());
+    plan.marked_paths.extend(paths);
+    plan.borrowed_origins
+        .extend(borrowed_origins(handle.dataset(), cost).await?);
+    Ok(())
+}
+
 /// The published set (every staged version a registration row ever named that
 /// the listing shows, plus the chain links behind it; a walk ends at a covered
 /// or absent version) and the same set in sweep order, links before tips.
+/// Each version the walk opens is read for its paths at the same open, as a
+/// root when the plan's roots hold it and as a sweep candidate otherwise.
 async fn discover_published(
     db: &Omnigraph,
-    location: &str,
+    plan: &mut TableCollectionPlan,
     rows: &[DatasetEntry],
     present: &BTreeMap<u64, u64>,
+    traced: &mut Traced,
     cost: &mut CollectorCost,
 ) -> Result<(BTreeSet<u64>, Vec<u64>)> {
+    let location = plan.location.clone();
     let mut published = BTreeSet::new();
     let mut order = Vec::new();
     for member in rows
@@ -1582,12 +1656,20 @@ async fn discover_published(
         let mut walk = Vec::new();
         let mut version = member;
         while present.contains_key(&version) && published.insert(version) {
-            let Some(handle) = open_at(db, location, version).await? else {
+            let Some(handle) = open_at(db, &location, version).await? else {
                 published.remove(&version);
                 break;
             };
             walk.push(version);
             cost.table_opens += 1;
+            if plan.roots.contains(&version) {
+                trace_root(plan, &handle, cost).await?;
+            } else {
+                let paths = referenced_paths(&handle, cost).await?;
+                plan.referenced_paths.extend(paths.iter().cloned());
+                traced.swept_paths.extend(paths);
+            }
+            traced.versions.insert(version);
             let link = db.storage().transaction_identity(&handle)?;
             if !link.base_is_detached() {
                 break;
@@ -1914,6 +1996,7 @@ async fn plan_sweep(
     plan: &mut TableCollectionPlan,
     chain_order: &[u64],
     outside: &Outside,
+    traced: Traced,
     cost: &mut CollectorCost,
 ) -> Result<()> {
     let location = plan.location.clone();
@@ -1924,8 +2007,13 @@ async fn plan_sweep(
         .filter(|version| !plan.roots.contains(version))
         .chain(linear_candidates.iter().copied())
         .collect();
-    let mut swept_paths = BTreeSet::new();
+    let mut swept_paths = traced.swept_paths;
     for version in candidates.iter() {
+        // A traced version is a detached chain link, never a linear candidate.
+        if traced.versions.contains(version) {
+            plan.sweep.push(*version);
+            continue;
+        }
         let Some(handle) = open_at(db, &location, *version).await? else {
             continue;
         };
