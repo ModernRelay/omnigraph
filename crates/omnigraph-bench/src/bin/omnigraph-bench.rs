@@ -40,6 +40,13 @@ const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 #[command(
     name = "omnigraph-bench",
     version,
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\nsource commit: ",
+        env!("OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT"),
+        "\nsource tree dirty: ",
+        env!("OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY"),
+    ),
     about = "Run GQT benchmarks from a named scenario or custom YAML",
     disable_help_subcommand = true,
     after_help = "Start here:\n  omnigraph-bench list scenarios\n  omnigraph-bench show tiny-read\n  omnigraph-bench run tiny-read\n  omnigraph-bench run --config benchmarks/custom.example.yaml\n  omnigraph-bench cache status tiny-read\n\nfixtures/ holds starting states; workloads/ holds operations and checks.\nUse help config, help cache, init --help, or help --json for agents."

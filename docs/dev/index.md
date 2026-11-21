@@ -19,6 +19,8 @@ change boundaries, and test ownership. Design history and proposals belong in
 | Topic | Guide |
 |---|---|
 | How to reason about a data system: contract, mechanism, distribution of work | [First principles of data systems](systems.md) |
+| What each kind of operation promises, and where the engine differs today | [The contract](contract.md) |
+| The workload hypothesis, what it asks for, and its evidence | [The work](workload.md) |
 | Components, authority, and read/write/control flows | [Architecture](architecture.md) |
 | Non-negotiable guarantees and deny-list | [Architectural invariants](invariants.md) |
 | Query planning, traversal, search, and mutation orchestration | [Execution](execution.md) |

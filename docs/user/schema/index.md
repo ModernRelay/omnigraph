@@ -148,6 +148,19 @@ property discards its stored values. A constraint that also names another
 property or `@src`/`@dst` cannot be removed in place: rebuild the graph
 without it.
 
+### Edge endpoints
+
+Every edge's `from` and `to` must name an existing node of the declared type.
+A write is refused when it would leave an edge whose endpoint does not exist:
+an edge it writes, or, in a node `overwrite` load, a committed edge of a type
+the batch does not replace whose node the batch leaves out. The refusal names
+the edge type and the missing endpoint, and says when the edge is a committed
+one, such as `edge type 'Knows': __dst 'Bob' not found in Person; the write
+removes that node and keeps this committed edge`. To drop such a node in an
+overwrite, put the edge's type in the same batch without that edge. A [branch
+merge](../branching/merge.md#conflicts) lists such an edge as an `orphan_edge`
+conflict with its id.
+
 ### Edge cardinality
 
 `@card(min..max)` counts, for each node of the edge's source type, the edges of
@@ -330,20 +343,5 @@ schema apply and the server schema-apply endpoint refuse cluster-managed graphs.
 
 ## Diagnostic codes
 
-Migration rejections may include a stable `OG-...` code. Match automation on the
-code rather than the message text.
-
-| Code | Meaning |
-|---|---|
-| `OG-DS-102` | Drop a node type that contains entities. |
-| `OG-DS-103` | Drop an edge type that contains entities. |
-| `OG-DS-104` | Drop a populated property. |
-| `OG-MF-103` | Add a required property to a populated type. |
-| `OG-MF-104` | Make a property required while a stored row holds a null (reported by `schema apply`). |
-| `OG-MF-106` | Change a property's type, including enum narrowing or renaming. |
-| `OG-MF-107` | Add an edge type with a non-zero `@card` minimum from an existing node type. |
-| `OG-MF-108` | Add `@unique` to a node type while two stored rows share a key (reported by `schema apply`). |
-
-`omnigraph schema plan` includes these codes in human and JSON output, except
-`OG-MF-104` and `OG-MF-108`, which only `schema apply` can know from the stored
-rows.
+Migration rejections may include a stable `OG-...` code, listed in
+[Schema migration codes](migration-codes.md).
