@@ -1,0 +1,1 @@
+- `omnigraph-bench --version` prints the source commit and tree state the binary was built from, on two lines after the version; `-V` stays one line.

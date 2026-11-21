@@ -33,6 +33,7 @@ use omnigraph_compiler::{
 use omnigraph_planner::{BoundPlan, PhysicalNode};
 use serde_json::Value;
 
+mod bench;
 pub mod concurrent;
 pub mod diagnostic;
 mod generate;
@@ -41,7 +42,10 @@ mod process;
 pub mod runner_config;
 mod served;
 mod yaml;
-pub use concurrent::{ConcurrentStep, SessionExpect, SessionKind, SessionOp};
+pub use bench::{BenchSection, MAX_DURATION_SECONDS, MAX_WARMUP_SECONDS, Sweep};
+pub use concurrent::{
+    ConcurrentStep, Dealt, MergeOp, Pass, SessionExpect, SessionKind, SessionOp, Worker,
+};
 pub use diagnostic::{CaseError, CaseErrorCode, CaseErrors};
 use diagnostic::{nearest, suggestion};
 pub use generate::{BRANCH_MARKER, Branches, Generated, GeneratedParams, Seed};
@@ -53,7 +57,10 @@ pub enum ParamsInput {
     Literal(String),
     Generated(GeneratedParams),
 }
-pub use host::{ExecutionHost, PlainHost};
+pub use host::{
+    ExecutionHost, PlainHost, SCRIPTED_HOST_WORKERS, admit_ungated_case, admit_workers,
+    admit_workers_within, run_block_once,
+};
 use omnigraph::storage::StorageAdapter;
 pub use process::{
     PROCESS_STATS_RECORD, ProcessTarget, admit_process_workload, execute_measured_process,
@@ -111,6 +118,10 @@ pub struct Case {
     /// case, set by [`Case::materialize_csv_fixtures`]: one embedded-only
     /// `file://` base over the materialized sections.
     pub external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+    /// The `--- bench` section: the run of the case's measured block.
+    pub bench: Option<BenchSection>,
+    /// The value this parse bound the section's swept name to.
+    swept: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -153,14 +164,45 @@ impl Case {
         self.items.iter().any(|i| matches!(i, Item::Loop { .. }))
     }
 
+    /// The block a measuring host loops for the `--- bench` section's
+    /// duration; every other host runs it as any free-running block.
+    pub fn measured_block(&self) -> Option<&ConcurrentStep> {
+        self.items.iter().find_map(|item| match item {
+            Item::Step(Step::Concurrent(block)) if block.measured => Some(block),
+            _ => None,
+        })
+    }
+
+    /// The name the `--- bench` section sweeps and the value it reads as in
+    /// this parse: the one [`parse_case_at`] was given, else the first.
+    pub fn swept(&self) -> Option<(&str, u64)> {
+        let sweep = self.bench.as_ref()?.sweep.as_ref()?;
+        Some((sweep.name.as_str(), self.swept?))
+    }
+
     /// Whether the case needs the DST runner: a seam directive or a
-    /// concurrent block, neither of which the direct engine can host.
+    /// concurrent block with an `order:` line, neither of which the direct
+    /// engine can host. A free-running block runs on every host.
     pub fn needs_dst(&self) -> bool {
         !self.seams.is_empty()
-            || self
-                .items
-                .iter()
-                .any(|i| matches!(i, Item::Step(Step::Concurrent(_))))
+            || self.items.iter().any(
+                |i| matches!(i, Item::Step(Step::Concurrent(block)) if !block.is_free_running()),
+            )
+    }
+
+    /// How many passes the plain host runs the case in: one per session
+    /// order of its largest free-running block, one with no block.
+    pub fn plain_passes(&self) -> usize {
+        self.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Step(Step::Concurrent(block)) if block.is_free_running() => {
+                    Some(concurrent::passes(block.sessions.len()))
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1)
     }
 }
 
@@ -1363,6 +1405,23 @@ fn yaml_body(body: &[(usize, &str)]) -> String {
     text
 }
 
+/// A recipe body written as a session statement's continuation lines, which
+/// are indented so they open no session, with that common indentation gone.
+fn dedent(text: &str) -> String {
+    let indent = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        out.push_str(line.get(indent..).unwrap_or(""));
+        out.push('\n');
+    }
+    out
+}
+
 fn refuse_comment_lines(body: &[(usize, &str)], section: &str) -> Result<(), CaseError> {
     for (idx, line) in body {
         if line.trim_start().starts_with('#') {
@@ -2190,8 +2249,9 @@ fn complete_decl_step(
 }
 
 /// The section kinds a header may name, for a near miss.
-const SECTION_KINDS: [&str; 17] = [
+const SECTION_KINDS: [&str; 18] = [
     "runner",
+    "bench",
     "schema",
     "seed",
     "branches",
@@ -2572,6 +2632,28 @@ pub fn grammar_text() -> String {
 }
 
 pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
+    parse_case_at(stem, text, None)
+}
+
+/// [`parse_case`] with the name the case's `--- bench` section sweeps bound
+/// to `swept`, one of the sweep's values; `None` binds the first, which is
+/// what a host with a scripted clock runs.
+pub fn parse_case_at(stem: &str, text: &str, swept: Option<u64>) -> Result<Case, CaseErrors> {
+    let bound = if text.contains('\r') {
+        None
+    } else {
+        bench::bind(text, swept).map_err(CaseErrors::one)?
+    };
+    let Some((bound, value)) = bound else {
+        return parse_text(stem, text);
+    };
+    let mut case = parse_text(stem, &bound)?;
+    case.input_text = text.into();
+    case.swept = Some(value);
+    Ok(case)
+}
+
+fn parse_text(stem: &str, text: &str) -> Result<Case, CaseErrors> {
     if text.contains('\r') {
         return Err(CaseErrors::one(
             CaseError::new(
@@ -2640,6 +2722,19 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             (None, &sections[..])
         }
     };
+    let (bench_header, sections) = match sections.first() {
+        Some(first) if first.name == "bench" => (Some(first), &sections[1..]),
+        _ => (None, sections),
+    };
+    let bench = match bench_header.map(|section| bench::parse(&yaml_body(&section.body))) {
+        Some(Ok(bench)) => Some(bench),
+        Some(Err(error)) => {
+            let line = bench_header.map_or(1, |section| section.header_line + 1);
+            errors.push(error.located(line, &lines));
+            None
+        }
+        None => None,
+    };
     let fixture_sections = sections;
     let (fixture, sections) = match parse_fixture(sections) {
         Ok(parts) => parts,
@@ -2680,6 +2775,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
     }
     let mut bound_names: HashSet<String> = HashSet::new();
+    let mut block_refused = false;
+    let mut bench_misplaced = false;
 
     for section in sections {
         let (kind, rest) = match section.name.split_once([' ', '\t']) {
@@ -2765,6 +2862,13 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         "there is no `--- fault` section; a code seam is a `--- seam` with the same `at`, `occurrence` and `scope` and `action: fail` (was `return_error`) or `action: skip`, and a store fault is a `--- seam` naming a store place with `subject:` or a decision seam with a store action",
                     )
                     .fix("write `--- seam` with `at:`, `occurrence:`, `scope:` and `action:` lines"));
+                }
+                "bench" => {
+                    return Err(CaseError::new(
+                        CaseErrorCode::SectionOrder,
+                        "`--- bench` is out of position; it directly follows `--- runner`, once",
+                    )
+                    .fix("move the `--- bench` section directly under the `--- runner` section"));
                 }
                 "runner" | "schema" | "seed" | "branches" => {
                     return Err(CaseError::new(
@@ -3134,12 +3238,20 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                 }
                 "concurrent" => {
                     let line = section.header_line + 1;
-                    if !rest.is_empty() {
-                        return Err(CaseError::new(
-                            CaseErrorCode::StepKind,
-                            "`--- concurrent` takes no arguments",
-                        ));
-                    }
+                    let (scripted, measured) = match rest.trim() {
+                        "" => (false, false),
+                        "scripted" => (true, false),
+                        "measured" => (false, true),
+                        other => {
+                            return Err(CaseError::new(
+                                CaseErrorCode::StepKind,
+                                format!(
+                                    "`--- concurrent` is the free-running block, `--- concurrent measured` the free-running block a bench times and `--- concurrent scripted` the block with an `order:` line, got `--- concurrent {other}`"
+                                ),
+                            )
+                            .fix("write `--- concurrent`, `--- concurrent measured` or `--- concurrent scripted`"));
+                        }
+                    };
                     if loops.open.is_some() {
                         return Err(CaseError::new(
                             CaseErrorCode::LoopStructure,
@@ -3152,82 +3264,24 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     if cursor.pending.is_some() {
                         return Err(missing_previous_expect());
                     }
-                    let (lines, order) = concurrent::parse_block(&section.body).map_err(|e| {
+                    let parsed = if measured {
+                        concurrent::parse_measured_block(&section.body)
+                    } else {
+                        concurrent::parse_block(&section.body, scripted)
+                    };
+                    let (lines, order) = parsed.map_err(|e| {
                         CaseError::from(e)
                             .code(CaseErrorCode::BodyShape)
                             .line_or(line)
                     })?;
-                    let mut sessions = Vec::with_capacity(lines.len());
-                    for session in lines {
-                        let file = parse_query(&session.text).map_err(|e| {
-                            CaseError::new(
-                                CaseErrorCode::QueryParse,
-                                format!("session `{}` does not parse: {e}", session.label),
-                            )
-                            .fix("rewrite the session's statement so it parses; the message names where the grammar stopped")
-                            .at_line(session.line)
-                        })?;
-                        if !file.settings.is_empty() {
-                            return Err(CaseError::new(
-                                CaseErrorCode::StepKind,
-                                format!(
-                                    "session `{}` carries `set` or `reset` lines; a block session is one statement",
-                                    session.label
-                                ),
-                            )
-                            .at_line(session.line));
-                        }
-                        let FileBody::Queries(decls) = file.body else {
-                            return Err(CaseError::new(
-                                CaseErrorCode::StepKind,
-                                format!(
-                                    "session `{}` must be a query or mutation declaration; show, branch and explain statements are not admitted in a block",
-                                    session.label
-                                ),
-                            )
-                            .at_line(session.line));
-                        };
-                        let [decl] = decls.as_slice() else {
-                            return Err(CaseError::new(
-                                CaseErrorCode::StepKind,
-                                format!(
-                                    "session `{}` holds exactly one declaration, got {}",
-                                    session.label,
-                                    decls.len()
-                                ),
-                            )
-                            .at_line(session.line));
-                        };
-                        if !decl.params.is_empty() {
-                            return Err(CaseError::new(
-                                CaseErrorCode::StepKind,
-                                format!(
-                                    "session `{}` declares parameters; a block session takes none",
-                                    session.label
-                                ),
-                            )
-                            .at_line(session.line));
-                        }
-                        inspect_decl(decl, &mut needs_indices)?;
-                        let kind = if decl.mutations.is_empty() {
-                            SessionKind::Query
-                        } else {
-                            SessionKind::Mutation
-                        };
-                        sessions.push(SessionOp {
-                            label: session.label,
-                            branch: session.branch,
-                            source: session.text,
-                            name: decl.name.clone(),
-                            kind,
-                            expect: SessionExpect::Ok,
-                        });
-                    }
+                    substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+                    let sessions = concurrent::build_sessions(lines, &mut needs_indices)?;
                     ordinal += 1;
                     cursor.pending = Some(Pending::Concurrent(ConcurrentStep {
                         ordinal,
                         sessions,
                         order,
+                        measured,
                     }));
                 }
                 "params" => {
@@ -3317,16 +3371,28 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                             .fix("write `--- expect` with no mode word, then one `<label>: ok` or `<label>: error: <needle>` line per session"));
                         }
                         refuse_comment_lines(&section.body, "expect")?;
-                        let labels: Vec<&str> =
-                            step.sessions.iter().map(|s| s.label.as_str()).collect();
-                        let expects = concurrent::parse_expect_body(&section.body, &labels)
+                        let mut groups: Vec<&str> = Vec::new();
+                        for op in &step.sessions {
+                            if !groups.contains(&op.group.as_str()) {
+                                groups.push(op.group.as_str());
+                            }
+                        }
+                        let expects = concurrent::parse_expect_body(&section.body, &groups)
                             .map_err(|e| {
                                 CaseError::from(e)
                                     .code(CaseErrorCode::BodyShape)
                                     .line_or(line)
                             })?;
-                        for (op, expect) in step.sessions.iter_mut().zip(expects) {
-                            op.expect = expect;
+                        let expects: Vec<(String, SessionExpect)> = groups
+                            .iter()
+                            .map(|g| (*g).to_string())
+                            .zip(expects)
+                            .collect();
+                        for op in step.sessions.iter_mut() {
+                            if let Some((_, expect)) = expects.iter().find(|(g, _)| *g == op.group)
+                            {
+                                op.expect = expect.clone();
+                            }
                         }
                         push_step(&mut items, &mut loops, Step::Concurrent(step));
                         return Ok(());
@@ -3646,6 +3712,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             Ok(())
         })();
         if let Err(error) = outcome {
+            block_refused |= kind == "concurrent";
+            bench_misplaced |= kind == "bench";
             errors.push(error.located(section.header_line + 1, &lines));
             substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
             cursor.abandon();
@@ -3693,6 +3761,43 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             .located(loops.header_line, &lines),
         );
     }
+    let measured: Vec<usize> = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Step(Step::Concurrent(block)) if block.measured => Some(block.ordinal),
+            _ => None,
+        })
+        .collect();
+    let block_line = |ordinal: &usize| source_lines.get(ordinal).copied().unwrap_or(last_line);
+    if let Some(second) = measured.get(1) {
+        errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "a case holds one `--- concurrent measured` block: one `--- bench` section describes one run",
+            )
+            .fix("keep `measured` on the block the bench times and write the other as `--- concurrent`")
+            .located(block_line(second), &lines),
+        );
+    }
+    match (bench_header, measured.first()) {
+        (Some(section), None) if !block_refused => errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "`--- bench` describes the run of a `--- concurrent measured` block and the case holds none",
+            )
+            .fix("mark the block the bench times `--- concurrent measured`, or drop the `--- bench` section")
+            .located(section.header_line + 1, &lines),
+        ),
+        (None, Some(block)) if !bench_misplaced => errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "`--- concurrent measured` needs a `--- bench` section, which says how long a measuring host runs it",
+            )
+            .fix("write `--- bench` with `duration_seconds:` directly under `--- runner`")
+            .located(block_line(block), &lines),
+        ),
+        _ => {}
+    }
     for (idx, line) in lines.iter().enumerate() {
         if line.contains("${") && !substitutable_lines.contains(&idx) {
             errors.push(
@@ -3726,6 +3831,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         needs_indices,
         csv_sections,
         external_blob_policy: None,
+        bench,
+        swept: None,
     };
     Ok(case)
 }
@@ -5119,17 +5226,82 @@ async fn run_mutate_step(
         .map(|commit| commit.graph_commit_id.clone()))
 }
 
-/// One session of a block: the statement on its branch through the case
-/// session under the case's traversal pin, compared with the session's expect.
+/// What one run of a session's statement reported: its authority conflicts,
+/// the times its write was prepared again after `ReadSetChanged`, inside the
+/// engine (the pre-effect reprepares behind an acknowledged write) or by the
+/// host once the engine's budget was spent. A measurement, never an oracle:
+/// under DST the count differs between replays of one seed (the Lance CPU
+/// pool's one-tick window), so no evidence row compares it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionReport {
+    pub conflicts: u32,
+}
+
+/// One run of a session's statement on `session`; `seq` is the ordinal of
+/// this run on the worker, 0 under a scripted clock. The statement runs under
+/// a probe that counts the engine's reprepares; a statement the engine still
+/// answers with `ReadSetChanged` is run again by the host, up to
+/// [`concurrent::MAX_HOST_RETRIES`] times, each counted too; the session's
+/// expect holds against the final outcome. One rule on every host, so
+/// `authority_conflicts` means the same in the DST evidence row and in a
+/// measuring host's record.
 pub async fn run_session(
     host: &impl ExecutionHost,
     session: &Session,
     op: &SessionOp,
-) -> Result<(), String> {
-    let params = build_params(None, &[], None, &Bindings::new())?;
+    seq: u64,
+) -> Result<SessionReport, String> {
+    let reprepares = Arc::new(AtomicU64::new(0));
+    let mut host_retries = 0u32;
+    loop {
+        let probes = QueryIoProbes {
+            mutation_reprepares: Arc::clone(&reprepares),
+            ..capture_query_io_probes().unwrap_or_default()
+        };
+        let outcome = with_query_io_probes(probes, attempt_session(host, session, op, seq)).await?;
+        if let Err(error) = &outcome
+            && error.is_read_set_changed()
+            && host_retries < concurrent::MAX_HOST_RETRIES
+        {
+            host_retries += 1;
+            host.observe(|| {
+                format!(
+                    "session `{}` runs again after authority conflict {}: {error}",
+                    op.label, host_retries
+                )
+            });
+            continue;
+        }
+        let report = SessionReport {
+            conflicts: u32::try_from(reprepares.load(Ordering::Relaxed))
+                .unwrap_or(u32::MAX)
+                .saturating_add(host_retries),
+        };
+        let what = op.kind.name();
+        return match &op.expect {
+            SessionExpect::Ok => outcome
+                .map(|()| report)
+                .map_err(|e| format!("{what} failed: {e}")),
+            SessionExpect::Error { needle } => {
+                check_error_expect(host, needle, outcome, &format!("the {what} succeeded"))
+                    .map(|()| report)
+            }
+        };
+    }
+}
+
+/// One attempt of a session's statement: `Err` is the harness's own refusal
+/// (a traversal pin violated, a recipe exhausted), `Ok` the engine's answer.
+async fn attempt_session(
+    host: &impl ExecutionHost,
+    session: &Session,
+    op: &SessionOp,
+    seq: u64,
+) -> Result<Result<(), omnigraph::error::OmniError>, String> {
     let mode = pinned_mode(session);
-    match op.kind {
+    match &op.kind {
         SessionKind::Mutation => {
+            let params = build_params(None, &[], None, &Bindings::new())?;
             let (outcome, counts) = under_traversal(
                 mode,
                 session.mutate(&op.branch, &op.source, &op.name, &params),
@@ -5155,16 +5327,10 @@ pub async fn run_session(
             if let Some(violation) = check_pin(mode, &counts, false) {
                 return Err(violation);
             }
-            match &op.expect {
-                SessionExpect::Ok => outcome
-                    .map(|_| ())
-                    .map_err(|e| format!("mutation failed: {e}")),
-                SessionExpect::Error { needle } => {
-                    check_error_expect(host, needle, outcome, "the mutation succeeded")
-                }
-            }
+            Ok(outcome.map(|_| ()))
         }
         SessionKind::Query => {
+            let params = build_params(None, &[], None, &Bindings::new())?;
             let query = session.query(
                 ReadTarget::branch(&op.branch),
                 &op.source,
@@ -5176,16 +5342,263 @@ pub async fn run_session(
             if let Some(violation) = check_pin(mode, &counts, false) {
                 return Err(violation);
             }
-            match &op.expect {
-                SessionExpect::Ok => outcome
-                    .map(|_| ())
-                    .map_err(|e| format!("query failed: {e}")),
-                SessionExpect::Error { needle } => {
-                    check_error_expect(host, needle, outcome, "the query succeeded")
-                }
+            Ok(outcome.map(|_| ()))
+        }
+        SessionKind::Load(recipe) => {
+            let index = op.dealt_index(seq);
+            let text = recipe.generated.dealt_row(index)?;
+            let outcome = session
+                .load(&op.branch, &text, recipe.mode)
+                .await
+                .inspect_err(|error| host.observe_fault(error));
+            host.observe(|| match &outcome {
+                Ok(_) => format!(
+                    "session `{}` loaded dealt row {index} on {}",
+                    op.label, op.branch
+                ),
+                Err(error) => format!("session `{}` actual load error: {error}", op.label),
+            });
+            Ok(outcome.map(|_| ()))
+        }
+        SessionKind::Merge(merge) => {
+            let target = merge.into.as_deref().unwrap_or(MAIN_BRANCH);
+            let outcome = session
+                .branch_merge_as_with_options(&merge.source, target, None, merge.as_commit)
+                .await
+                .inspect_err(|error| host.observe_fault(error));
+            if let Ok(result) = &outcome
+                && let Some(commit) = &result.commit
+            {
+                host.record("commit", || commit_evidence(commit.published));
             }
+            host.observe(|| {
+                format!(
+                    "session `{}` actual merge: {:?}",
+                    op.label,
+                    outcome.as_ref().map(|result| result.outcome)
+                )
+            });
+            Ok(outcome.map(|_| ()))
         }
     }
+}
+
+/// After a block, every row a `load generate:` session dealt is read back by
+/// its key on the case session, `runs` runs per worker, and compared column
+/// by column with the row the recipe generated; a missing row or a changed
+/// column fails the block. The check needs no line in the file: a dealt row
+/// is a row the host knows, so the host asks for it. A session whose expect
+/// is an `error:` loaded nothing the file claims, so it is not read back.
+pub async fn readback_dealt_rows(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &ConcurrentStep,
+    runs: u64,
+) -> Result<(), String> {
+    let params = build_params(None, &[], None, &Bindings::new())?;
+    for op in &step.sessions {
+        let SessionKind::Load(recipe) = &op.kind else {
+            continue;
+        };
+        if matches!(op.expect, SessionExpect::Error { .. }) {
+            continue;
+        }
+        for seq in 0..runs {
+            readback_row(host, session, op, recipe, seq, &params).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The row session `op` dealt on its run `seq`, read by its key and compared
+/// column by column with the row the recipe generated.
+async fn readback_row(
+    host: &impl ExecutionHost,
+    session: &Session,
+    op: &SessionOp,
+    recipe: &Dealt,
+    seq: u64,
+    params: &omnigraph_compiler::ParamMap,
+) -> Result<(), String> {
+    let index = op.dealt_index(seq);
+    let (table, column, value) = recipe.generated.dealt_key(index)?;
+    let literal = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+    let dealt: Value = serde_json::from_str(&recipe.generated.dealt_row(index)?)
+        .map_err(|e| format!("dealt row {index} is not JSON: {e}"))?;
+    let Some(Value::Object(data)) = dealt.get("data") else {
+        return Err(format!("dealt row {index} carries no `data` object"));
+    };
+    let projection: Vec<String> = data.keys().map(|name| format!("$r.{name}")).collect();
+    let expected = Value::Object(
+        data.iter()
+            .map(|(name, value)| (format!("r.{name}"), value.clone()))
+            .collect(),
+    );
+    let source = format!(
+        "query readback() {{ match {{ $r: {table} {{ {column}: {literal} }} }} return {{ {} }} }}",
+        projection.join(", ")
+    );
+    let result = session
+        .query(ReadTarget::branch(&op.branch), &source, "readback", params)
+        .await
+        .map_err(|e| {
+            format!(
+                "readback of the row session `{}` dealt on {}: {e}",
+                op.label, op.branch
+            )
+        })?;
+    let rows = result
+        .to_rust_json()
+        .map_err(|e| format!("readback rows failed to render as JSON: {e}"))?;
+    let Value::Array(actual) = rows else {
+        return Err("readback returned a non-array row set".into());
+    };
+    if actual.len() != 1 {
+        return Err(format!(
+            "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback found {} rows",
+            op.label,
+            op.branch,
+            actual.len()
+        ));
+    }
+    compare_rows(&[expected], &actual, false).map_err(|(message, _)| {
+        format!(
+            "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback differs: {message}",
+            op.label, op.branch
+        )
+    })?;
+    host.observe(|| {
+        format!(
+            "readback: row {index} of session `{}` ({column} = {literal}) is on {} as dealt",
+            op.label, op.branch
+        )
+    });
+    Ok(())
+}
+
+/// How many dealt rows of one session the readback after a measured block
+/// compares column by column; every acknowledged key is looked for.
+pub const READBACK_COMPARED_PER_SESSION: u64 = 8;
+
+/// What the readback after a measured block read: the acknowledged dealt
+/// rows it found by key, and how many of those it compared in full.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Readback {
+    pub rows: u64,
+    pub compared: u64,
+}
+
+/// The readback after a block whose sessions ran many times: `acked[i]` is
+/// how many runs session `i` of the block was acknowledged for. Every dealt
+/// key of those runs must be in one scan of its recipe's key column, and
+/// [`READBACK_COMPARED_PER_SESSION`] rows spread over each session's runs are
+/// compared column by column, as [`readback_dealt_rows`] compares them all.
+pub async fn readback_acked_rows(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &ConcurrentStep,
+    acked: &[u64],
+) -> Result<Readback, String> {
+    let params = build_params(None, &[], None, &Bindings::new())?;
+    let mut scans: HashMap<(String, String, String), HashSet<String>> = HashMap::new();
+    let mut readback = Readback::default();
+    for (op, &runs) in step.sessions.iter().zip(acked) {
+        let SessionKind::Load(recipe) = &op.kind else {
+            continue;
+        };
+        if runs == 0 || matches!(op.expect, SessionExpect::Error { .. }) {
+            continue;
+        }
+        let (table, column, _) = recipe.generated.dealt_key(op.dealt_index(0))?;
+        let scan = (op.branch.clone(), table.clone(), column.clone());
+        if !scans.contains_key(&scan) {
+            let source = format!(
+                "query readback_keys() {{ match {{ $r: {table} }} return {{ $r.{column} }} }}"
+            );
+            let result = session
+                .query(
+                    ReadTarget::branch(&op.branch),
+                    &source,
+                    "readback_keys",
+                    &params,
+                )
+                .await
+                .map_err(|e| format!("readback of the keys of {table} on {}: {e}", op.branch))?;
+            let Value::Array(rows) = result
+                .to_rust_json()
+                .map_err(|e| format!("readback keys failed to render as JSON: {e}"))?
+            else {
+                return Err("readback returned a non-array row set".into());
+            };
+            let name = format!("r.{column}");
+            let keys = rows
+                .iter()
+                .filter_map(|row| row.get(&name))
+                .map(|key| serde_json::to_string(key).map_err(|e| e.to_string()))
+                .collect::<Result<HashSet<String>, String>>()?;
+            scans.insert(scan.clone(), keys);
+        }
+        let keys = &scans[&scan];
+        for seq in 0..runs {
+            let index = op.dealt_index(seq);
+            let (_, _, value) = recipe.generated.dealt_key(index)?;
+            let literal = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+            if !keys.contains(&literal) {
+                return Err(format!(
+                    "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback found no such row",
+                    op.label, op.branch
+                ));
+            }
+        }
+        readback.rows += runs;
+        let stride = runs.div_ceil(READBACK_COMPARED_PER_SESSION).max(1);
+        let mut seq = 0;
+        while seq < runs {
+            readback_row(host, session, op, recipe, seq, &params).await?;
+            readback.compared += 1;
+            seq += stride;
+        }
+    }
+    Ok(readback)
+}
+
+/// A free-running block under a scripted clock with no gate: every session
+/// runs its statement once, in the session order `order` (a permutation of
+/// the block's sessions), on the case session. One pass is the same
+/// statements as sequential steps; the plain host runs the case once per
+/// order ([`concurrent::passes`]), so the block's expects and every step
+/// after it must hold whoever goes first. The interleaving search inside a
+/// statement stays the DST runner's.
+pub async fn run_free_running_block(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &ConcurrentStep,
+    order: &[usize],
+) -> Result<(), StepFail> {
+    let label = format!("step {} (concurrent)", step.ordinal);
+    let fail = |message: String| StepFail::new(label.clone(), message);
+    host.observe(|| {
+        let names: Vec<&str> = order
+            .iter()
+            .map(|&i| step.sessions[i].label.as_str())
+            .collect();
+        format!("free-running block: session order {names:?}")
+    });
+    let mut conflicts = 0u32;
+    for &index in order {
+        let op = &step.sessions[index];
+        let report = run_session(host, session, op, 0)
+            .await
+            .map_err(|message| fail(format!("session `{}`: {message}", op.label)))?;
+        conflicts += report.conflicts;
+    }
+    host.record(
+        "concurrent_block",
+        || serde_json::json!({"free_running": true, "order": order, "authority_conflicts": conflicts}),
+    );
+    readback_dealt_rows(host, session, step, 1)
+        .await
+        .map_err(fail)
 }
 
 /// The case session: the definition's defaults over the fresh handle, the

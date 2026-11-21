@@ -31,11 +31,23 @@ fn legacy_catalog() -> &'static Path {
                 &repository_root().join("benchmarks/benchmarks.yaml"),
             )
             .unwrap();
+            let mut swept = std::collections::BTreeSet::new();
             for scenario in &catalog.definition.scenarios {
-                let (mut definition, _) = scenario.expand(
+                let (case, _) = scenario.expand(
                     &catalog.definition.defaults,
                     &omnigraph_bench::catalog::local_environment(),
                 );
+                let mut definition = match case.step.clone() {
+                    Some(step) => case.measuring(step),
+                    None => {
+                        let mut points = catalog.points(&scenario.id).unwrap().plans;
+                        if points.len() > 1 {
+                            swept.insert(scenario.id.as_str());
+                            continue;
+                        }
+                        points.swap_remove(0).definition
+                    }
+                };
                 for path in omnigraph_bench::catalog::fixture_paths(&definition.fixture)
                     .into_iter()
                     .chain([definition.workload.queries.as_path()])
@@ -64,6 +76,9 @@ fn legacy_catalog() -> &'static Path {
                 .unwrap();
             }
             for (name, ids) in &catalog.definition.suites {
+                if ids.iter().any(|id| swept.contains(id.as_str())) {
+                    continue;
+                }
                 let suite = omnigraph_bench::SuiteV1 {
                     version: 1,
                     name: name.clone(),
@@ -1076,12 +1091,19 @@ fn clone_route_at_two_refs_puts_records_the_report_reads_back() {
     );
     let groups = series["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 2, "{series}");
+    let harness = commit_of("HEAD");
     let mut order = Vec::new();
     for group in groups {
+        assert_eq!(
+            group["harness_commits"],
+            serde_json::json!([harness]),
+            "one instrument measured both refs: {group}"
+        );
         let rows = group["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 2, "{series}");
         for row in rows {
             assert_eq!(row["sut"], "product-binary", "{row}");
+            assert_eq!(row["harness_commit"], harness.as_str(), "{row}");
             assert_eq!(row["status"], "complete", "{row}");
             assert_eq!(row["observed_repetitions"], 1, "{row}");
             order.push((
