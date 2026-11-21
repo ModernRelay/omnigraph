@@ -247,6 +247,17 @@ impl ClusterStore {
         if kind == StorageKind::Local {
             return Ok(Self::for_config_dir(Path::new(&normalized)));
         }
+        if kind == StorageKind::Gcs {
+            // Graphs may live at gs:// roots; the cluster ledger's serving
+            // lease and bootstrap handoff are not yet qualified there.
+            return Err(Diagnostic::error(
+                "storage_root_invalid",
+                "storage",
+                format!(
+                    "cluster storage does not support gs:// roots ('{diagnostic_root}'); use a local, s3:// or az:// cluster root"
+                ),
+            ));
+        }
         let storage = storage_handle_for_uri(&normalized).map_err(|err| {
             Diagnostic::error(
                 "storage_root_invalid",
@@ -439,12 +450,12 @@ impl ClusterStore {
     /// local path for `file://` roots (byte-compatible, directly usable by
     /// the engine); the remote URI the engine opens natively otherwise.
     pub(crate) fn graph_root(&self, graph_id: &str) -> String {
-        match self.kind() {
-            StorageKind::Local => format!("{}/graphs/{graph_id}.omni", self.display_root),
-            StorageKind::S3 | StorageKind::Azure => {
-                format!("{}/graphs/{graph_id}.omni", self.root)
-            }
-        }
+        let root = if self.kind().is_object_store() {
+            &self.root
+        } else {
+            &self.display_root
+        };
+        format!("{root}/graphs/{graph_id}.omni")
     }
 
     /// Refuse symlink/alias substitution before accepting or resuming deletion.
@@ -531,15 +542,13 @@ impl ClusterStore {
     /// probe means "not a cluster"; filesystem, transport, and authorization
     /// failures stay loud so callers cannot bypass cluster ownership checks.
     pub(crate) async fn has_state(&self) -> omnigraph_storage::Result<bool> {
-        match self.kind() {
-            StorageKind::Local => Path::new(&self.display_root)
-                .join(CLUSTER_STATE_FILE)
-                .try_exists()
-                .map_err(StorageError::from),
-            StorageKind::S3 | StorageKind::Azure => {
-                self.adapter.exists(&self.uri(CLUSTER_STATE_FILE)).await
-            }
+        if self.kind().is_object_store() {
+            return self.adapter.exists(&self.uri(CLUSTER_STATE_FILE)).await;
         }
+        Path::new(&self.display_root)
+            .join(CLUSTER_STATE_FILE)
+            .try_exists()
+            .map_err(StorageError::from)
     }
 
     /// One bounded GET supplies both the exact bytes and their backend CAS
@@ -658,16 +667,16 @@ impl ClusterStore {
         &self,
         graph_uri: &str,
     ) -> omnigraph_storage::Result<bool> {
-        match storage_kind_for_uri(graph_uri)? {
-            StorageKind::Local => Path::new(graph_uri.trim_start_matches("file://"))
-                .try_exists()
-                .map_err(StorageError::from),
+        if storage_kind_for_uri(graph_uri)?.is_object_store() {
             // `exists` falls back from an exact-object HEAD to a recursive,
             // bounded-to-the-first-result prefix listing. A partially deleted
             // graph whose root contains only nested Lance objects therefore
             // remains present, while list/authorization failures stay loud.
-            StorageKind::S3 | StorageKind::Azure => self.adapter.exists(graph_uri).await,
+            return self.adapter.exists(graph_uri).await;
         }
+        Path::new(graph_uri.trim_start_matches("file://"))
+            .try_exists()
+            .map_err(StorageError::from)
     }
 
     // ---- recovery sidecars ----

@@ -363,7 +363,7 @@ pub fn object_store_path_from_uri(uri: &str) -> Result<String> {
             })?;
             Ok(url.path().trim_start_matches('/').to_string())
         }
-        StorageKind::Azure => {
+        StorageKind::Azure | StorageKind::Gcs => {
             let url = url::Url::parse(uri).map_err(|e| {
                 OmniError::manifest_internal(format!(
                     "invalid remote object-store uri '{}': {}",

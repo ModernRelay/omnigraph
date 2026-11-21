@@ -52,9 +52,9 @@ environments:
 
 With schema and seed, the complete scenario executes against a fresh graph
 for each environment. These two target/storage combinations are implemented.
-With `--store`, direct engine execution opens an existing `file://`, `s3://`
-or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
-`azure-blob-storage` backend. It skips initialization, seed loading and
+With `--store`, direct engine execution opens an existing `file://`, `s3://`,
+`az://` or `gs://` root matching the declared `local-filesystem`,
+`s3-compatible`, `azure-blob-storage` or `google-cloud-storage` backend. It skips initialization, seed loading and
 automatic index building; ordinary steps may change the supplied store, and
 seams and concurrent blocks are refused there. An `omnigraph-engine-dst`
 environment takes `--store` with a `file://` root instead: the in-memory

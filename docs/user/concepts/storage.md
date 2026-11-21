@@ -12,6 +12,7 @@ datasets directly.
 | `/absolute/path/graph.omni` or `file:///absolute/path/graph.omni` | Local filesystem |
 | `s3://bucket/prefix/graph.omni` | Amazon S3 or an S3-compatible service |
 | `az://container/prefix/graph.omni` | Azure Blob Storage qualification preview |
+| `gs://bucket/prefix/graph.omni` | Google Cloud Storage preview, embedded API only |
 
 An `http://` or `https://` URL addresses an OmniGraph server; it is not a graph
 storage URI. These are engine/server storage capabilities, not CLI target variants.
@@ -70,8 +71,8 @@ A graph's commit protocol relies on the store honouring conditional writes
 S3 binding. The project's S3 test suites run against RustFS; qualify any other
 S3-compatible service before production. Google Cloud Storage's S3
 interoperability endpoint is untested, and a store that ignores the conditions
-can let two writers publish the same graph version. Native `gs://` URIs are not
-supported.
+can let two writers publish the same graph version; use a native `gs://` root
+for Google Cloud Storage instead.
 
 ## Azure configuration
 
@@ -87,6 +88,49 @@ belong in the URI.
 Azure Container Apps supplies its managed-identity endpoint variables at
 runtime. Restart the process after changing storage-account, endpoint, or
 identity selection.
+
+## Google Cloud Storage configuration
+
+Google Cloud Storage support is a preview. A `gs://` root works for a graph
+opened by URI through the embedded Rust API (`Omnigraph::open`,
+`Omnigraph::init`). Cluster storage roots, CLI targets and servers do not
+accept `gs://` yet. No CI job runs against Google Cloud Storage: the bucket
+tests run only when an operator points them at a bucket, and Lance's multipart
+uploads of large files have not been exercised there.
+
+Roots use the strict form `gs://<bucket>/<prefix>`. Credentials never belong
+in the URI. OmniGraph reads its Google configuration once per process from
+`GOOGLE_*` environment variables and gives the same options to the client for
+control objects and to Lance's client for datasets:
+
+- `GOOGLE_SERVICE_ACCOUNT` (a key file path) or `GOOGLE_SERVICE_ACCOUNT_KEY`
+  (the key itself) selects a service account.
+- Otherwise `GOOGLE_APPLICATION_CREDENTIALS`, or the
+  `gcloud auth application-default login` file, supplies Google's
+  application-default credentials, and then the metadata server of the
+  Compute Engine, GKE or Cloud Run instance.
+- `GOOGLE_STORAGE_TOKEN` or `GOOGLE_BEARER_TOKEN` supplies a fixed access token.
+- `GOOGLE_BASE_URL` and the `GOOGLE_`-prefixed client options (for example
+  `GOOGLE_HTTP1_ONLY`) apply to both clients.
+
+Opening a `gs://` root refuses an environment that names a Google option
+without the `GOOGLE_` prefix, such as `SERVICE_ACCOUNT`, `BEARER_TOKEN`,
+`BASE_URL` or `TIMEOUT`: Lance would read such a name and the control-object
+client would not. It also refuses two spellings of one option with different
+values. Restart the process after changing any captured variable. A workload
+identity federation (`external_account`) credentials file is not supported;
+use the metadata server or a service-account key.
+
+The identity needs read, create, overwrite, delete and list on objects in the
+bucket, for example `roles/storage.objectUser`. Every conditional write is
+checked against the object generation (`x-goog-if-generation-match`), so
+graph publication keeps the same single-winner guarantee as on S3. Google
+limits writes to one object name to about one per second.
+
+Running one writer process per graph remains the operator's responsibility.
+An embedded program can fence other writers out of a branch with
+`claim_branch_writer`, as on any backend; see
+[writer epoch](../operations/troubleshooting.md#writer-epoch).
 
 For deployment, server boot, and cloud-specific safety requirements, see
 [Deployment](../deployment.md).

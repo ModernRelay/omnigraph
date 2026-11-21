@@ -44,6 +44,8 @@ pub enum Storage {
     S3Compatible,
     #[serde(rename = "azure-blob-storage")]
     AzureBlob,
+    #[serde(rename = "google-cloud-storage")]
+    GoogleCloudStorage,
 }
 
 impl Environment {
@@ -73,11 +75,13 @@ impl Environment {
                 "unsupported_environment: --store cannot execute seams or scripted concurrent blocks on the direct engine; select or declare omnigraph-engine-dst (--target omnigraph-engine-dst)".into(),
             );
         }
-        if !["file://", "s3://", "az://"]
+        if !["file://", "s3://", "az://", "gs://"]
             .iter()
             .any(|prefix| uri.starts_with(prefix))
         {
-            return Err("invalid_case: --store requires a file://, s3:// or az:// URI".into());
+            return Err(
+                "invalid_case: --store requires a file://, s3://, az:// or gs:// URI".into(),
+            );
         }
         let normalized = omnigraph::storage::normalize_root_uri(uri)
             .map_err(|e| format!("invalid_case: --store: {e}"))?;
@@ -87,6 +91,7 @@ impl Environment {
             omnigraph::storage::StorageKind::Local => Storage::LocalFilesystem,
             omnigraph::storage::StorageKind::S3 => Storage::S3Compatible,
             omnigraph::storage::StorageKind::Azure => Storage::AzureBlob,
+            omnigraph::storage::StorageKind::Gcs => Storage::GoogleCloudStorage,
         };
         if storage != actual {
             return Err(format!(
@@ -108,6 +113,7 @@ impl Environment {
             Storage::InMemoryObjectStore => "in-memory-object-store",
             Storage::S3Compatible => "s3-compatible",
             Storage::AzureBlob => "azure-blob-storage",
+            Storage::GoogleCloudStorage => "google-cloud-storage",
         };
         target.is_none_or(|value| value == actual_target)
             && storage.is_none_or(|value| value == actual_storage)
@@ -406,6 +412,7 @@ mod tests {
             (Storage::LocalFilesystem, "file:///tmp/graph"),
             (Storage::S3Compatible, "s3://bucket/graph"),
             (Storage::AzureBlob, "az://container/graph"),
+            (Storage::GoogleCloudStorage, "gs://bucket/graph"),
         ] {
             let env = Environment {
                 execution: Execution::Engine { storage },
@@ -417,6 +424,7 @@ mod tests {
                 Storage::LocalFilesystem,
                 Storage::S3Compatible,
                 Storage::AzureBlob,
+                Storage::GoogleCloudStorage,
                 Storage::InMemoryObjectStore,
             ] {
                 if storage != other {

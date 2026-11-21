@@ -881,6 +881,7 @@ cannot establish it.
 | `in-memory-object-store` | An injected object store whose contents live in process memory. |
 | `s3-compatible` | An explicitly configured S3-compatible service. |
 | `azure-blob-storage` | An explicitly configured Azure Blob service or emulator. |
+| `google-cloud-storage` | An explicitly configured Google Cloud Storage bucket, through `--store` only. |
 
 These names are GQT configuration values. `StorageAdapter` is the existing
 Rust interface, and `ObjectStorageAdapter` provides these storage

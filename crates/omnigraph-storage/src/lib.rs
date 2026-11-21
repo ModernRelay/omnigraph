@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
@@ -20,6 +21,9 @@ use thiserror::Error;
 
 mod binding;
 pub use binding::{CapturedStorageBinding, StorageDestination, storage_handle_for_binding};
+
+mod gcs;
+pub use gcs::gcs_lance_storage_options;
 
 mod scoped;
 pub use scoped::{OWNED_STORE_NAME, StorageIoScope};
@@ -378,6 +382,7 @@ impl From<std::io::Error> for StorageError {
 const FILE_SCHEME_PREFIX: &str = "file://";
 const S3_SCHEME_PREFIX: &str = "s3://";
 const AZURE_SCHEME_PREFIX: &str = "az://";
+const GCS_SCHEME_PREFIX: &str = "gs://";
 /// The DST harness's opaque in-memory scheme (Lance's shared-memory
 /// provider). Named beside its siblings; every user (the classification
 /// arm, the URI normalizer, the Memory-codec strip) is `dst`-gated, so
@@ -1246,13 +1251,26 @@ pub enum StorageKind {
     Local,
     S3,
     Azure,
+    Gcs,
+}
+
+impl StorageKind {
+    /// Whether roots of this kind are object-store keys (`s3://`, `az://`,
+    /// `gs://`) rather than local paths. The one exhaustive answer, so a new
+    /// kind decides it here and every local-versus-remote branch follows.
+    pub fn is_object_store(self) -> bool {
+        match self {
+            Self::Local => false,
+            Self::S3 | Self::Azure | Self::Gcs => true,
+        }
+    }
 }
 
 /// Concrete storage selection for control-plane authority checks.
 ///
 /// Unlike [`StorageAdapter`], this handle cannot be implemented by a caller:
 /// it is minted only after this crate selects and initializes a real local,
-/// S3, or Azure backend. Authority factories accept this concrete handle so an
+/// S3, Azure, or Google Cloud Storage backend. Authority factories accept this concrete handle so an
 /// in-memory/custom adapter cannot manufacture persisted cluster evidence.
 #[derive(Debug, Clone)]
 pub struct StorageHandle {
@@ -1307,6 +1325,9 @@ enum UriCodec {
     S3 { bucket: String },
     /// `az://{container}/{key}` URIs, mapped onto a container-scoped store.
     Azure { container: String },
+    /// `gs://{bucket}/{key}` URIs, mapped onto a bucket-scoped store whose
+    /// CAS token is the object generation rather than its ETag.
+    Gcs { bucket: String },
     /// Opaque keys for the in-memory test/embedded backend; leading
     /// slashes are stripped.
     Memory,
@@ -1316,6 +1337,13 @@ enum UriCodec {
 struct S3Location {
     bucket: String,
     key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GcsLocation {
+    bucket: String,
+    key: String,
+    canonical_uri: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1367,6 +1395,34 @@ impl ObjectStorageAdapter {
         self
     }
 
+    /// A conditional-update object-store backend over `store`. With a scope,
+    /// its mutations are accounted to it and its reads go through
+    /// `retrying` ([`Self::with_scope_and_retrying`]).
+    fn remote<S: ObjectStore>(
+        store: S,
+        retrying: Option<S>,
+        codec: UriCodec,
+        scope: Option<StorageIoScope>,
+    ) -> Self {
+        let adapter = Self {
+            store: Arc::new(store),
+            scope: None,
+            codec,
+            supports_conditional_update: true,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
+            read_through: None,
+        };
+        match (scope, retrying) {
+            (Some(scope), Some(retrying)) => {
+                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
+            }
+            _ => adapter,
+        }
+    }
+
     /// S3 backend scoped to the bucket named in `root_uri`. Credentials and
     /// endpoint come from the standard `AWS_*` environment variables (the
     /// same ones Lance reads for its dataset stores).
@@ -1382,26 +1438,14 @@ impl ObjectStorageAdapter {
     fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
         let (store, retrying) = s3_clients(&location.bucket, root_uri, scope.is_some())?;
-
-        let adapter = Self {
-            store: Arc::new(store),
-            scope: None,
-            codec: UriCodec::S3 {
+        Ok(Self::remote(
+            store,
+            retrying,
+            UriCodec::S3 {
                 bucket: location.bucket,
             },
-            supports_conditional_update: true,
-            #[cfg(test)]
-            omit_read_etag: false,
-            #[cfg(test)]
-            omit_write_etag: false,
-            read_through: None,
-        };
-        Ok(match (scope, retrying) {
-            (Some(scope), Some(retrying)) => {
-                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
-            }
-            _ => adapter,
-        })
+            scope,
+        ))
     }
 
     /// Azure backend selected from the process-wide canonical root snapshot.
@@ -1494,25 +1538,49 @@ impl ObjectStorageAdapter {
                 ),
             )
         })?;
-        let adapter = Self {
-            store: Arc::new(store),
-            scope: None,
-            codec: UriCodec::Azure {
+        Ok(Self::remote(
+            store,
+            retrying,
+            UriCodec::Azure {
                 container: root.container().to_string(),
             },
-            supports_conditional_update: true,
-            #[cfg(test)]
-            omit_read_etag: false,
-            #[cfg(test)]
-            omit_write_etag: false,
-            read_through: None,
-        };
-        Ok(match (scope, retrying) {
-            (Some(scope), Some(retrying)) => {
-                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
-            }
-            _ => adapter,
-        })
+            scope,
+        ))
+    }
+
+    /// Google Cloud Storage backend scoped to the bucket named in `root_uri`,
+    /// built from the process's captured `GOOGLE_*` configuration, the same
+    /// options Lance's `gs://` datasets receive (`gcs_lance_storage_options`).
+    /// Without explicit credentials, Google's application-default chain
+    /// applies: a credentials file, then the instance metadata server.
+    pub fn gcs_from_root_uri(root_uri: &str) -> Result<Self> {
+        Self::gcs_from_root_uri_with_scope(root_uri, None)
+    }
+
+    /// Single-attempt Google Cloud Storage mutations accounted to the
+    /// supplied owner.
+    pub fn gcs_from_root_uri_scoped(root_uri: &str, scope: StorageIoScope) -> Result<Self> {
+        Self::gcs_from_root_uri_with_scope(root_uri, Some(scope))
+    }
+
+    fn gcs_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
+        // URI validity is independent of environment and is checked first.
+        let location = parse_gcs_uri(root_uri)?;
+        let environment = gcs::gcs_environment()?;
+        let (store, retrying) = remote_clients(
+            gcs::gcs_bucket_builder(&location.bucket, &environment),
+            scope.is_some(),
+            GoogleCloudStorageBuilder::with_retry,
+            |builder| build_gcs_store(builder, root_uri),
+        )?;
+        Ok(Self::remote(
+            store,
+            retrying,
+            UriCodec::Gcs {
+                bucket: location.bucket,
+            },
+            scope,
+        ))
     }
 
     /// In-memory backend for tests and embedded experiments. Implements the
@@ -1597,7 +1665,7 @@ impl ObjectStorageAdapter {
                 })
             }
             StorageKind::S3 => Self::s3_read_through(base_uri, root_uri, scope).await,
-            StorageKind::Azure => Err(StorageError::backend(
+            StorageKind::Azure | StorageKind::Gcs => Err(StorageError::backend(
                 StorageFailureKind::Configuration,
                 format!("read-through storage needs a local or s3 clone root, got '{root_uri}'"),
             )),
@@ -1805,6 +1873,30 @@ impl ObjectStorageAdapter {
                     )
                 })
             }
+            UriCodec::Gcs { bucket } => {
+                let location = parse_gcs_uri(uri)?;
+                if &location.bucket != bucket {
+                    return Err(StorageError::backend(
+                        StorageFailureKind::Configuration,
+                        format!(
+                            "gcs storage bucket mismatch for '{}': expected '{}', found '{}'",
+                            uri, bucket, location.bucket
+                        ),
+                    ));
+                }
+                if location.key.is_empty() {
+                    return Err(StorageError::backend(
+                        StorageFailureKind::Configuration,
+                        format!("gcs storage path is empty for '{}'", uri),
+                    ));
+                }
+                ObjectPath::parse(&location.key).map_err(|err| {
+                    StorageError::backend(
+                        StorageFailureKind::Configuration,
+                        format!("invalid gcs object path for '{}': {}", uri, err),
+                    )
+                })
+            }
             UriCodec::Memory => {
                 // DST: accept the harness's scheme-carrying roots
                 // (shared-memory://name/key) — that scheme is namespacing
@@ -1925,7 +2017,10 @@ impl ObjectStorageAdapter {
     /// an earlier copy of the same request; a scope's client sends once.
     fn request_client(&self) -> RequestClient {
         if self.scope.is_none()
-            && matches!(self.codec, UriCodec::S3 { .. } | UriCodec::Azure { .. })
+            && matches!(
+                self.codec,
+                UriCodec::S3 { .. } | UriCodec::Azure { .. } | UriCodec::Gcs { .. }
+            )
         {
             RequestClient::Repeating
         } else {
@@ -2002,8 +2097,44 @@ impl ObjectStorageAdapter {
         }
     }
 
+    /// The token a conditional-update backend compares server-side: the
+    /// object generation on Google Cloud Storage, whose `object_store` client
+    /// sends `x-goog-if-generation-match` from `UpdateVersion::version` and
+    /// never from the ETag, and the ETag everywhere else.
+    fn remote_token(&self, e_tag: Option<String>, version: Option<String>) -> Option<String> {
+        match self.codec {
+            UriCodec::Gcs { .. } => version,
+            _ => e_tag,
+        }
+    }
+
+    /// The `If-Match` precondition naming `token`, in the field this backend
+    /// compares (see [`Self::remote_token`]).
+    fn update_version(&self, token: &str) -> object_store::UpdateVersion {
+        match self.codec {
+            UriCodec::Gcs { .. } => object_store::UpdateVersion {
+                e_tag: None,
+                version: Some(token.to_string()),
+            },
+            _ => object_store::UpdateVersion {
+                e_tag: Some(token.to_string()),
+                version: None,
+            },
+        }
+    }
+
+    /// [`required_remote_token`] naming this backend's token.
+    fn required_token(&self, action: &str, uri: &str, token: Option<String>) -> Result<String> {
+        let name = match self.codec {
+            UriCodec::Gcs { .. } => "object generation",
+            _ => "ETag",
+        };
+        required_remote_token(action, uri, token, name)
+    }
+
     /// The one GET every versioned read and read-back takes: the object and
-    /// its ETag, or the store's error (`NotFound` when no object exists).
+    /// its CAS token (see [`Self::remote_token`]), or the store's error
+    /// (`NotFound` when no object exists).
     /// What it observes settles an earlier conditional request to the key
     /// whose precondition no longer holds (scoped.rs), so every owner read
     /// settles alike. An answer without an ETag shows nothing about the
@@ -2025,7 +2156,7 @@ impl ObjectStorageAdapter {
                 return Err(err);
             }
         };
-        let etag = result.meta.e_tag.clone();
+        let etag = self.remote_token(result.meta.e_tag.clone(), result.meta.version.clone());
         #[cfg(test)]
         let etag = if self.omit_read_etag { None } else { etag };
         if let Some(token) = &etag {
@@ -2381,8 +2512,9 @@ impl StorageAdapter for ObjectStorageAdapter {
                 .map_err(|err| storage_backend_error("rename_delete", from_uri, err))?;
             return Ok(());
         }
-        // LocalFileSystem overrides rename with atomic fs::rename. S3 uses
-        // copy + delete and may leave both names after a crash.
+        // LocalFileSystem overrides rename with atomic fs::rename. S3 and
+        // GCS use a synchronous server-side copy + delete and may leave both
+        // names after a crash.
         self.store
             .rename(&from, &to)
             .await
@@ -2560,10 +2692,11 @@ impl StorageAdapter for ObjectStorageAdapter {
             .map_err(|err| storage_backend_error("read", uri, err))?;
         // The token SOURCE must agree with the write_text_if_match strategy
         // below: conditional-update backends compare ETags server-side, so
-        // the token is the ETag; the local emulation compares content, so
-        // the token is the content hash. Mixing them makes every CAS lose.
+        // the token is the ETag (the generation on GCS); the local emulation
+        // compares content, so the token is the content hash. Mixing them
+        // makes every CAS lose.
         let version = if self.supports_conditional_update {
-            required_remote_etag("read", uri, etag)?
+            self.required_token("read", uri, etag)?
         } else {
             local_version_token(&bytes)
         };
@@ -2595,7 +2728,7 @@ impl StorageAdapter for ObjectStorageAdapter {
             return Err(limit_error(expected_bytes));
         }
         let remote_token = if self.supports_conditional_update {
-            Some(required_remote_etag("bounded_read", uri, etag)?)
+            Some(self.required_token("bounded_read", uri, etag)?)
         } else {
             None
         };
@@ -2635,10 +2768,7 @@ impl StorageAdapter for ObjectStorageAdapter {
         let location = self.object_path(uri)?;
         let payload = PutPayload::from(contents.as_bytes().to_vec());
         if self.supports_conditional_update {
-            let version = object_store::UpdateVersion {
-                e_tag: Some(expected_version.to_string()),
-                version: None,
-            };
+            let version = self.update_version(expected_version);
             let lost = match self
                 .send_conditional_put(
                     "write_if_match",
@@ -2649,10 +2779,10 @@ impl StorageAdapter for ObjectStorageAdapter {
                 .await
             {
                 Resolution::Applied { value: result, .. } => {
-                    let etag = result.e_tag;
+                    let etag = self.remote_token(result.e_tag, result.version);
                     #[cfg(test)]
                     let etag = if self.omit_write_etag { None } else { etag };
-                    return Ok(Some(required_remote_etag("write_if_match", uri, etag)?));
+                    return Ok(Some(self.required_token("write_if_match", uri, etag)?));
                 }
                 Resolution::Conflict(_) => return Ok(None),
                 Resolution::Refused(error) => {
@@ -2667,7 +2797,8 @@ impl StorageAdapter for ObjectStorageAdapter {
             let Some((bytes, etag)) = read else {
                 return Ok(None);
             };
-            let current = required_remote_etag("read back", uri, etag)
+            let current = self
+                .required_token("read back", uri, etag)
                 .map_err(|error| error.unread_outcome("write_if_match", uri))?;
             if current == expected_version {
                 return Err(unresolved_conditional_error("write_if_match", uri, lost));
@@ -2787,6 +2918,8 @@ pub fn storage_kind_for_uri(uri: &str) -> Result<StorageKind> {
         Ok(StorageKind::S3)
     } else if uri.starts_with(AZURE_SCHEME_PREFIX) {
         Ok(StorageKind::Azure)
+    } else if uri.starts_with(GCS_SCHEME_PREFIX) {
+        Ok(StorageKind::Gcs)
     } else if uri.starts_with(FILE_SCHEME_PREFIX)
         || !has_uri_scheme(uri)
         || is_windows_drive_path(uri)
@@ -2821,6 +2954,10 @@ pub fn storage_handle_for_uri(uri: &str) -> Result<StorageHandle> {
             adapter: Arc::new(ObjectStorageAdapter::azure_from_root_uri(uri)?),
             kind: StorageKind::Azure,
         }),
+        StorageKind::Gcs => Ok(StorageHandle {
+            adapter: Arc::new(ObjectStorageAdapter::gcs_from_root_uri(uri)?),
+            kind: StorageKind::Gcs,
+        }),
     }
 }
 
@@ -2834,6 +2971,7 @@ pub fn storage_handle_for_uri_scoped(uri: &str, scope: StorageIoScope) -> Result
             &CanonicalAzureRoot::from_env(uri)?,
             scope,
         )?,
+        StorageKind::Gcs => ObjectStorageAdapter::gcs_from_root_uri_scoped(uri, scope)?,
     };
     Ok(StorageHandle {
         adapter: Arc::new(adapter),
@@ -2898,6 +3036,7 @@ pub fn normalize_root_uri(uri: &str) -> Result<String> {
         }
         StorageKind::S3 => Ok(trim_trailing_slashes(uri)),
         StorageKind::Azure => Ok(parse_azure_uri(uri)?.canonical_uri),
+        StorageKind::Gcs => Ok(parse_gcs_uri(uri)?.canonical_uri),
     }
 }
 
@@ -2953,7 +3092,7 @@ pub fn write_queue_root_identity(normalized_root: &str) -> Result<String> {
 pub fn join_uri(root_uri: &str, relative_path: &str) -> String {
     let relative_path = relative_path.trim_start_matches('/');
     match storage_kind_for_uri(root_uri) {
-        Ok(StorageKind::S3 | StorageKind::Azure) => {
+        Ok(kind) if kind.is_object_store() => {
             let root = trim_trailing_slashes(root_uri);
             if root.is_empty() {
                 relative_path.to_string()
@@ -2961,7 +3100,7 @@ pub fn join_uri(root_uri: &str, relative_path: &str) -> String {
                 format!("{}/{}", root, relative_path)
             }
         }
-        Ok(StorageKind::Local) => {
+        Ok(_) => {
             let root = if root_uri.starts_with(FILE_SCHEME_PREFIX) {
                 local_path_from_file_uri(root_uri)
                     .map(|path| normalize_local_path(&path))
@@ -3119,18 +3258,30 @@ fn s3_clients(
     object_store::aws::AmazonS3,
     Option<object_store::aws::AmazonS3>,
 )> {
-    let mut builder = s3_bucket_builder(bucket);
-    let retrying = match scoped {
-        true => Some(build_s3_store(
-            builder.clone().with_retry(scoped_read_retry_config()),
-            root_uri,
-        )?),
-        false => None,
-    };
-    if scoped {
-        builder = builder.with_retry(single_attempt_retry_config());
+    remote_clients(
+        s3_bucket_builder(bucket),
+        scoped,
+        AmazonS3Builder::with_retry,
+        |builder| build_s3_store(builder, root_uri),
+    )
+}
+
+/// The clients of one remote root built from `builder`: the store its reads
+/// and writes go to and, when `scoped`, a second client with bounded retries
+/// for its reads, the first then single-attempt
+/// (`ObjectStorageAdapter::with_scope_and_retrying`).
+fn remote_clients<B: Clone, S>(
+    builder: B,
+    scoped: bool,
+    with_retry: impl Fn(B, object_store::RetryConfig) -> B,
+    build: impl Fn(B) -> Result<S>,
+) -> Result<(S, Option<S>)> {
+    if !scoped {
+        return Ok((build(builder)?, None));
     }
-    Ok((build_s3_store(builder, root_uri)?, retrying))
+    let retrying = build(with_retry(builder.clone(), scoped_read_retry_config()))?;
+    let single = build(with_retry(builder, single_attempt_retry_config()))?;
+    Ok((single, Some(retrying)))
 }
 
 /// Whether two canonical key prefixes of one bucket (object-store paths: no
@@ -3167,6 +3318,121 @@ fn parse_s3_uri(uri: &str) -> Result<S3Location> {
         bucket: bucket.to_string(),
         key: url.path().trim_start_matches('/').to_string(),
     })
+}
+
+fn build_gcs_store(
+    builder: GoogleCloudStorageBuilder,
+    root_uri: &str,
+) -> Result<object_store::gcp::GoogleCloudStorage> {
+    builder.build().map_err(|err| {
+        let kind = classify_object_store_error(&err);
+        StorageError::backend(
+            kind,
+            format!(
+                "failed to initialize gcs storage for '{}': {err}",
+                redacted_storage_uri(root_uri)
+            ),
+        )
+    })
+}
+
+fn gcs_configuration_error(message: impl Into<String>) -> StorageError {
+    StorageError::backend(StorageFailureKind::Configuration, message)
+}
+
+/// Parse `gs://<bucket>[/<object-prefix>]` strictly. Credentials, ports,
+/// queries and fragments never belong in a storage root, and a spelling that
+/// another spelling would alias (empty interior segments, dot segments,
+/// percent escapes, backslashes, control characters) is refused rather than
+/// normalized, so one root has one canonical URI.
+fn parse_gcs_uri(uri: &str) -> Result<GcsLocation> {
+    let diagnostic_uri = redacted_storage_uri(uri);
+    let remainder = uri.strip_prefix(GCS_SCHEME_PREFIX).ok_or_else(|| {
+        gcs_configuration_error(format!(
+            "unsupported gcs uri '{diagnostic_uri}': expected gs://<bucket>[/<prefix>]"
+        ))
+    })?;
+    let (bucket, key) = remainder.split_once('/').unwrap_or((remainder, ""));
+    if bucket.is_empty() {
+        return Err(gcs_configuration_error(format!(
+            "missing gcs bucket in '{diagnostic_uri}'"
+        )));
+    }
+    validate_gcs_bucket_name(bucket, &diagnostic_uri)?;
+    if key.contains(['?', '#', '%', '\\']) || key.chars().any(char::is_control) {
+        return Err(gcs_configuration_error(format!(
+            "invalid gcs object path in '{diagnostic_uri}': queries, fragments, percent \
+             escapes, backslashes and control characters are not accepted"
+        )));
+    }
+    let key = key.trim_end_matches('/');
+    if !key.is_empty()
+        && key
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(gcs_configuration_error(format!(
+            "invalid gcs object path in '{diagnostic_uri}': empty or dot segments are not accepted"
+        )));
+    }
+    let canonical_uri = if key.is_empty() {
+        format!("{GCS_SCHEME_PREFIX}{bucket}")
+    } else {
+        format!("{GCS_SCHEME_PREFIX}{bucket}/{key}")
+    };
+    Ok(GcsLocation {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        canonical_uri,
+    })
+}
+
+/// Google's bucket naming rules
+/// (<https://cloud.google.com/storage/docs/buckets#naming>): 3 to 63
+/// characters of lowercase letters, digits, `-` and `_`, or up to 222 with
+/// dot-separated components of at most 63; first and last characters a letter
+/// or digit. Anything else (userinfo, ports, uppercase) is refused here, so
+/// it cannot reach a request.
+fn validate_gcs_bucket_name(bucket: &str, diagnostic_uri: &str) -> Result<()> {
+    let invalid = || {
+        gcs_configuration_error(format!(
+            "invalid gcs bucket name in '{diagnostic_uri}': expected 3-63 lowercase letters, \
+             digits, '-', '_' or '.', starting and ending with a letter or digit"
+        ))
+    };
+    let dotted = bucket.contains('.');
+    let max_len = if dotted { 222 } else { 63 };
+    if bucket.len() < 3 || bucket.len() > max_len {
+        return Err(invalid());
+    }
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    if !bucket
+        .chars()
+        .all(|c| alnum(c) || matches!(c, '-' | '_' | '.'))
+        || !bucket.starts_with(alnum)
+        || !bucket.ends_with(alnum)
+    {
+        return Err(invalid());
+    }
+    if dotted
+        && bucket
+            .split('.')
+            .any(|component| component.is_empty() || component.len() > 63)
+    {
+        return Err(invalid());
+    }
+    // Names Google reserves: the `goog` prefix, `google` anywhere, and the
+    // dotted-decimal form of an IP address.
+    if bucket.starts_with("goog")
+        || bucket.contains("google")
+        || bucket.parse::<std::net::Ipv4Addr>().is_ok()
+    {
+        return Err(gcs_configuration_error(format!(
+            "invalid gcs bucket name in '{diagnostic_uri}': Google reserves names that \
+             begin with 'goog', contain 'google' or form an IP address"
+        )));
+    }
+    Ok(())
 }
 
 fn storage_backend_error(action: &str, uri: &str, err: object_store::Error) -> StorageError {
@@ -3616,11 +3882,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn required_remote_etag(action: &str, uri: &str, etag: Option<String>) -> Result<String> {
-    etag.filter(|etag| !etag.is_empty()).ok_or_else(|| {
+    required_remote_token(action, uri, etag, "ETag")
+}
+
+/// A conditional-update backend's CAS token, or a typed failure: a content
+/// hash is never substituted for a token the backend did not return.
+fn required_remote_token(
+    action: &str,
+    uri: &str,
+    token: Option<String>,
+    name: &str,
+) -> Result<String> {
+    token.filter(|token| !token.is_empty()).ok_or_else(|| {
         StorageError::backend(
             StorageFailureKind::Permanent,
             format!(
-                "storage {action} failed for '{uri}': remote backend omitted the required ETag"
+                "storage {action} failed for '{uri}': remote backend omitted the required {name}"
             ),
         )
     })
@@ -4403,7 +4680,8 @@ mod tests {
     }
 
     /// Shared backend assertions; S3 runs in
-    /// `tests/integration/s3_storage.rs::s3_adapter_conditional_writes_contract`.
+    /// `tests/integration/s3_storage.rs::s3_adapter_conditional_writes_contract`,
+    /// GCS in `contract_suite_gcs_when_configured`.
     async fn contract_suite(adapter: &dyn StorageAdapter, root: &str) {
         // Write/read round-trip; replace is in-place and atomic.
         let a = format!("{root}/contract/a.json");
@@ -5944,6 +6222,419 @@ mod tests {
             "custom://opaque/root/_schema.pg",
             "an unsupported scheme may remain opaque during joining but must never become a local path"
         );
+    }
+
+    /// Google Cloud Storage's conditional surface over `InMemory`: the CAS
+    /// token is the object generation, reported in `ObjectMeta::version` and
+    /// `PutResult::version`, and an if-match names it in
+    /// `UpdateVersion::version` only, as `object_store`'s GCS client sends
+    /// `x-goog-if-generation-match`. The ETag it reports is unrelated to the
+    /// generation, so an adapter that conditions on the ETag cannot pass.
+    #[derive(Debug, Default)]
+    struct GcsGenerationStore {
+        inner: InMemory,
+    }
+
+    impl std::fmt::Display for GcsGenerationStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("gcs-generation-store")
+        }
+    }
+
+    impl GcsGenerationStore {
+        fn as_gcs_meta(mut meta: ObjectMeta) -> ObjectMeta {
+            meta.version = meta.e_tag.take();
+            meta.e_tag = meta
+                .version
+                .as_ref()
+                .map(|generation| format!("\"md5-{generation}\""));
+            meta
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for GcsGenerationStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            mut options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            if let PutMode::Update(version) = &options.mode {
+                if version.e_tag.is_some() {
+                    return Err(object_store::Error::NotSupported {
+                        source: "GCS conditions a replace on the generation, not the ETag".into(),
+                    });
+                }
+                let generation = version
+                    .version
+                    .clone()
+                    .ok_or(object_store::Error::Generic {
+                        store: "gcs-generation-store",
+                        source: "missing generation".into(),
+                    })?;
+                options.mode = PutMode::Update(object_store::UpdateVersion {
+                    e_tag: Some(generation),
+                    version: None,
+                });
+            }
+            let result = self.inner.put_opts(location, payload, options).await?;
+            Ok(PutResult {
+                e_tag: result
+                    .e_tag
+                    .as_ref()
+                    .map(|generation| format!("\"md5-{generation}\"")),
+                version: result.e_tag,
+                ..result
+            })
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let mut result = self.inner.get_opts(location, options).await?;
+            result.meta = Self::as_gcs_meta(result.meta);
+            Ok(result)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            Box::pin(self.inner.list(prefix).map_ok(Self::as_gcs_meta))
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            let mut result = self.inner.list_with_delimiter(prefix).await?;
+            result.objects = result.objects.into_iter().map(Self::as_gcs_meta).collect();
+            Ok(result)
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn gcs_generation_adapter() -> ObjectStorageAdapter {
+        ObjectStorageAdapter {
+            store: Arc::new(GcsGenerationStore::default()),
+            scope: None,
+            codec: UriCodec::Gcs {
+                bucket: "bucket".to_string(),
+            },
+            supports_conditional_update: true,
+            omit_read_etag: false,
+            omit_write_etag: false,
+            read_through: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn gcs_conditions_on_the_object_generation_not_the_etag_issue_1461() {
+        let adapter = gcs_generation_adapter();
+        contract_suite(&adapter, "gs://bucket/root").await;
+
+        let state = "gs://bucket/root/state.json";
+        adapter.write_text(state, "s1").await.unwrap();
+        let (_, v1) = adapter.read_text_versioned(state).await.unwrap();
+        assert!(
+            !v1.contains("md5-"),
+            "the token is the generation, not the ETag: {v1}"
+        );
+        let v2 = adapter
+            .write_text_if_match(state, "s2", &v1)
+            .await
+            .unwrap()
+            .expect("the current generation must win");
+        assert!(
+            !v2.contains("md5-"),
+            "a write returns the new generation: {v2}"
+        );
+        assert_eq!(adapter.read_text_versioned(state).await.unwrap().1, v2);
+        assert!(
+            adapter
+                .write_text_if_match(state, "s3", &v1)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale generation must lose"
+        );
+        assert_eq!(adapter.read_text(state).await.unwrap(), "s2");
+
+        // A scoped owner's requests and reads account by the same token.
+        let scope = StorageIoScope::new();
+        let scoped = gcs_generation_adapter().with_scope(scope.clone());
+        contract_suite(&scoped, "gs://bucket/scoped").await;
+        assert_eq!(scope.unsettled_keys(), 0);
+    }
+
+    #[tokio::test]
+    async fn gcs_missing_generation_fails_closed() {
+        let mut adapter = gcs_generation_adapter();
+        let state = "gs://bucket/root/state.json";
+        adapter.write_text(state, "s1").await.unwrap();
+        adapter.omit_read_etag = true;
+        let error = adapter.read_text_versioned(state).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("omitted the required object generation"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parse_gcs_uri_is_strict_and_canonical() {
+        let location = parse_gcs_uri("gs://knowledge-bucket/projects/p1/graph.omni/").unwrap();
+        assert_eq!(location.bucket, "knowledge-bucket");
+        assert_eq!(location.key, "projects/p1/graph.omni");
+        assert_eq!(
+            location.canonical_uri,
+            "gs://knowledge-bucket/projects/p1/graph.omni"
+        );
+        assert_eq!(
+            parse_gcs_uri("gs://bucket").unwrap().canonical_uri,
+            "gs://bucket"
+        );
+        assert_eq!(
+            parse_gcs_uri("gs://bucket/").unwrap().canonical_uri,
+            "gs://bucket"
+        );
+        assert_eq!(
+            parse_gcs_uri("gs://my.dotted_bucket-1/a").unwrap().bucket,
+            "my.dotted_bucket-1"
+        );
+        for refused in [
+            "gs:///prefix",
+            "gs://ab/prefix",
+            "gs://Bucket/prefix",
+            "gs://user@bucket/prefix",
+            "gs://bucket:443/prefix",
+            "gs://-bucket/prefix",
+            "gs://bucket./prefix",
+            "gs://bucket..name/prefix",
+            "gs://goog-bucket/prefix",
+            "gs://my-google-bucket/prefix",
+            "gs://192.168.5.4/prefix",
+            "gs://bucket/prefix?token=secret",
+            "gs://bucket/prefix#fragment",
+            "gs://bucket/a//b",
+            "gs://bucket/a/./b",
+            "gs://bucket/a/../b",
+            "gs://bucket/a%2Fb",
+            "gs://bucket/a\\b",
+            "gs://bucket/a\nb",
+            "s3://bucket/prefix",
+        ] {
+            let error = parse_gcs_uri(refused).expect_err(refused);
+            assert_eq!(
+                error.failure_kind(),
+                StorageFailureKind::Configuration,
+                "{refused}: {error}"
+            );
+            assert!(!error.to_string().contains("secret"), "{error}");
+        }
+    }
+
+    #[test]
+    fn gcs_roots_classify_normalize_and_join_as_object_store_roots() {
+        assert_eq!(
+            storage_kind_for_uri("gs://bucket/graph").unwrap(),
+            StorageKind::Gcs
+        );
+        assert_eq!(
+            normalize_root_uri("gs://bucket/graph/").unwrap(),
+            "gs://bucket/graph"
+        );
+        assert!(normalize_root_uri("gs://bucket/a//b").is_err());
+        assert_eq!(
+            join_uri("gs://bucket/graph", "/__manifest"),
+            "gs://bucket/graph/__manifest"
+        );
+        assert_eq!(
+            write_queue_root_identity("gs://bucket/graph").unwrap(),
+            "gs://bucket/graph"
+        );
+        let adapter = gcs_generation_adapter();
+        assert!(adapter.object_path("gs://bucket/graph/a.json").is_ok());
+        assert!(adapter.object_path("gs://other/graph/a.json").is_err());
+        assert!(adapter.object_path("gs://bucket").is_err());
+        assert!(adapter.object_path("s3://bucket/graph/a.json").is_err());
+        assert_eq!(adapter.request_client(), RequestClient::Repeating);
+    }
+
+    #[tokio::test]
+    async fn gcs_roots_refuse_read_through_and_captured_bindings() {
+        let error =
+            ObjectStorageAdapter::durable_read_through("gs://bucket/base", "gs://bucket/root")
+                .await
+                .unwrap_err();
+        assert_eq!(error.failure_kind(), StorageFailureKind::Configuration);
+        let error =
+            CapturedStorageBinding::capture("gs://bucket/graph", &StorageDestination::Local)
+                .unwrap_err();
+        assert!(error.to_string().contains("gs://"), "{error}");
+    }
+
+    /// The bucket name for the Google Cloud Storage contract, or `None` to
+    /// skip. Credentials come from the application-default chain.
+    fn gcs_test_root(suite: &str) -> Option<String> {
+        let bucket = env::var("OMNIGRAPH_GCS_TEST_BUCKET").ok()?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Some(format!(
+            "gs://{bucket}/omnigraph-storage-{suite}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    /// The conditional half of the contract against a bucket: it touches
+    /// single objects only (PUT, GET, DELETE), so it is the part a store must
+    /// prove before anything above it can rely on CAS.
+    #[tokio::test]
+    async fn conditional_contract_gcs_when_configured() {
+        let Some(root) = gcs_test_root("conditional") else {
+            eprintln!("skipping GCS conditional contract: OMNIGRAPH_GCS_TEST_BUCKET is not set");
+            return;
+        };
+        let adapter = Arc::new(ObjectStorageAdapter::gcs_from_root_uri(&root).unwrap());
+        let scoped = Arc::new(
+            ObjectStorageAdapter::gcs_from_root_uri_scoped(&root, StorageIoScope::new()).unwrap(),
+        );
+        for (name, adapter) in [("unscoped", &adapter), ("scoped", &scoped)] {
+            // Create-if-absent: one of eight concurrent claimants wins and its
+            // payload is the one stored.
+            let claim = format!("{root}/{name}/claim.json");
+            let claimants = (0..8).map(|index| {
+                let adapter = Arc::clone(adapter);
+                let claim = claim.clone();
+                tokio::spawn(async move {
+                    let payload = format!("claimant-{index}");
+                    let won = adapter.write_text_if_absent(&claim, &payload).await;
+                    won.map(|won| (won, payload))
+                })
+            });
+            // A failure reports once: each task returns its error and the
+            // test unwraps after joining.
+            let outcomes = futures::future::join_all(claimants)
+                .await
+                .into_iter()
+                .map(|joined| joined.unwrap())
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            let winners: Vec<_> = outcomes.into_iter().filter(|(won, _)| *won).collect();
+            assert_eq!(winners.len(), 1, "{name}: exactly one claimant wins");
+            assert_eq!(adapter.read_text(&claim).await.unwrap(), winners[0].1);
+
+            // Replace-if-match: the current generation wins once; a stale one
+            // and a racing copy of the same one lose without overwriting.
+            let state = format!("{root}/{name}/state.json");
+            adapter.write_text(&state, "s1").await.unwrap();
+            let (text, v1) = adapter.read_text_versioned(&state).await.unwrap();
+            assert_eq!(text, "s1");
+            assert_eq!(
+                adapter
+                    .read_text_versioned_if_exists_bounded(&state, 2)
+                    .await
+                    .unwrap(),
+                Some(("s1".to_string(), v1.clone()))
+            );
+            let racers = (0..4).map(|index| {
+                let adapter = Arc::clone(adapter);
+                let state = state.clone();
+                let v1 = v1.clone();
+                tokio::spawn(async move {
+                    let payload = format!("racer-{index}");
+                    let won = adapter.write_text_if_match(&state, &payload, &v1).await;
+                    won.map(|won| (won, payload))
+                })
+            });
+            let outcomes = futures::future::join_all(racers)
+                .await
+                .into_iter()
+                .map(|joined| joined.unwrap())
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            let winners: Vec<_> = outcomes
+                .into_iter()
+                .filter_map(|(won, payload)| won.map(|token| (token, payload)))
+                .collect();
+            assert_eq!(winners.len(), 1, "{name}: exactly one if-match wins");
+            let (v2, payload) = &winners[0];
+            assert_ne!(v2, &v1);
+            assert_eq!(
+                adapter.read_text_versioned(&state).await.unwrap(),
+                (payload.clone(), v2.clone())
+            );
+            assert!(
+                adapter
+                    .write_text_if_match(&state, "stale", &v1)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{name}: a stale generation loses"
+            );
+            let v3 = adapter
+                .write_text_if_match(&state, "s3", v2)
+                .await
+                .unwrap()
+                .expect("the current generation wins");
+            assert_eq!(adapter.read_text(&state).await.unwrap(), "s3");
+            assert_ne!(&v3, v2);
+            let missing = format!("{root}/{name}/missing.json");
+            assert!(
+                adapter
+                    .write_text_if_match(&missing, "x", &v3)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{name}: an if-match cannot create"
+            );
+            assert_eq!(adapter.read_text_if_exists(&missing).await.unwrap(), None);
+            for key in [&claim, &state] {
+                adapter.delete(key).await.unwrap();
+            }
+        }
+    }
+
+    /// The whole shared contract against a bucket, listing and prefix
+    /// deletion included.
+    #[tokio::test]
+    async fn contract_suite_gcs_when_configured() {
+        let Some(root) = gcs_test_root("contract") else {
+            eprintln!("skipping GCS storage contract: OMNIGRAPH_GCS_TEST_BUCKET is not set");
+            return;
+        };
+        let adapter = ObjectStorageAdapter::gcs_from_root_uri(&root).unwrap();
+        contract_suite(&adapter, &root).await;
+        adapter.delete_prefix(&root).await.unwrap();
     }
 
     #[test]

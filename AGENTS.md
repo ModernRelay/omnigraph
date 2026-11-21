@@ -55,7 +55,7 @@ compiler: parse, typecheck, IR, lowering
 engine: snapshots, execution, graph publication, recovery
         |
         v
-Lance datasets on file, S3-compatible, or Azure Blob storage
+Lance datasets on file, S3-compatible, Azure Blob, or Google Cloud Storage
 ```
 
 Workspace members live under `crates/`, plus `skills/` and

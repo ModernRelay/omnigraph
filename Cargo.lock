@@ -4438,7 +4438,11 @@ dependencies = [
  "pin-project",
  "prost",
  "rand 0.9.4",
+ "reqsign-core",
+ "reqsign-file-read-tokio",
+ "reqsign-google",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -5849,6 +5853,7 @@ dependencies = [
  "opendal-layer-timeout",
  "opendal-service-azblob",
  "opendal-service-azdls",
+ "opendal-service-gcs",
  "opendal-service-s3",
 ]
 
@@ -5985,6 +5990,28 @@ checksum = "bdf9c9d0bfd1fa3638eec485c7f3448252cbb5a81774a2aa7abadc3e4f1ea43e"
 dependencies = [
  "http 1.4.2",
  "opendal-core",
+]
+
+[[package]]
+name = "opendal-service-gcs"
+version = "0.59.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9e5197fce0cd5929db9129a7e71e503841aa20bea4f1dcc54ab097a5f3652e9"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http 1.4.2",
+ "log",
+ "opendal-core",
+ "percent-encoding",
+ "quick-xml 0.42.0",
+ "reqsign-core",
+ "reqsign-file-read-tokio",
+ "reqsign-google",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -7187,6 +7214,25 @@ checksum = "b3235df90a6bca681aa47dd86f2393d122a6d77042aa8a7c81e218cd45c5bfc0"
 dependencies = [
  "anyhow",
  "reqsign-core",
+ "tokio",
+]
+
+[[package]]
+name = "reqsign-google"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "272a5813571885c1455ffe106f0c768577e6ce69313446d4476e8d41dcf6ac5a"
+dependencies = [
+ "bytes",
+ "form_urlencoded",
+ "http 1.4.2",
+ "log",
+ "percent-encoding",
+ "reqsign-aws-v4",
+ "reqsign-core",
+ "rsa",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
