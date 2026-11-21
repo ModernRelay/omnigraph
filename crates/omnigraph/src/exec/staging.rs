@@ -639,8 +639,9 @@ impl MutationStaging {
                 }
             }
         }
-        let concurrency = concurrency.min(stage_inputs.len()).max(1);
-        let mut staged_entries: Vec<StagedTableEntry> =
+        let requested_concurrency = concurrency;
+        let write_concurrency = requested_concurrency.min(stage_inputs.len()).max(1);
+        let mut write_stream =
             futures::stream::iter(stage_inputs.into_iter().enumerate().map(
                 |(stage_idx, (table_key, table, path, expected))| async move {
                     // DST window (loader walk, inside D2): between per-table
@@ -661,14 +662,14 @@ impl MutationStaging {
                     .await
                 },
             ))
-            .buffered(concurrency)
-            .collect::<Vec<Result<Option<StagedTableEntry>>>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+            .buffered(write_concurrency);
+
+        let mut staged_entries = Vec::new();
+        while let Some(res) = write_stream.next().await {
+            if let Some(entry) = res? {
+                staged_entries.push(entry);
+            }
+        }
 
         // Second pass: stage deletes through the same staged path. D₂
         // guarantees a delete-touched table carries no pending write batches,
@@ -682,6 +683,7 @@ impl MutationStaging {
         // no inline HEAD advance, closing the zero-row drift class).
         let mut __dst_dp: Vec<_> = delete_predicates.into_iter().collect();
         __dst_dp.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut delete_inputs = Vec::with_capacity(__dst_dp.len());
         for (table_key, predicates) in __dst_dp {
             let path = paths.get(&table_key).cloned().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
@@ -700,19 +702,36 @@ impl MutationStaging {
             };
             let removed_ids = deleted_ids.get(&table_key).cloned().unwrap_or_default();
             let row_addrs = deleted_row_addrs.remove(&table_key);
-            if let Some(entry) = stage_delete_table(
-                db,
-                table_key,
-                combined,
-                path,
-                expected,
-                removed_ids,
-                row_addrs,
-            )
-            .await?
-            {
-                staged_entries.push(entry);
+            delete_inputs.push((table_key, combined, path, expected, removed_ids, row_addrs));
+        }
+
+        if !delete_inputs.is_empty() {
+            let delete_concurrency = requested_concurrency.min(delete_inputs.len()).max(1);
+            let mut delete_stream =
+                futures::stream::iter(delete_inputs.into_iter().map(
+                    |(table_key, combined, path, expected, removed_ids, row_addrs)| async move {
+                        stage_delete_table(
+                            db,
+                            table_key,
+                            combined,
+                            path,
+                            expected,
+                            removed_ids,
+                            row_addrs,
+                        )
+                        .await
+                    },
+                ))
+                .buffered(delete_concurrency);
+
+            let mut staged_deletes = Vec::new();
+            while let Some(res) = delete_stream.next().await {
+                if let Some(entry) = res? {
+                    staged_deletes.push(entry);
+                }
             }
+
+            staged_entries.extend(staged_deletes);
         }
 
         let expected_versions = expected_table_versions(&expected_versions, &paths)?;
@@ -1040,6 +1059,12 @@ async fn stage_delete_table(
     let ds = db
         .open_pinned_for_write(&path.full_path, &path.entry)
         .await?;
+
+    // Bracket the actual storage future, not preparation or publication. The
+    // task-local probe is unset in production; tests use its rendezvous to
+    // prove that the configured cross-table width is exercised.
+    let _stage_write_probe = crate::instrumentation::enter_stage_write_probe().await;
+
     // The delete ops captured the matched rows' addresses at the pin; stage
     // their deletion vectors directly. Addresses from another version than
     // the one reopened here would name other rows, so that case (and a

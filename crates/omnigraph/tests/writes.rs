@@ -5027,6 +5027,72 @@ async fn multi_table_staging_matches_serial_staging() {
     );
 }
 
+#[tokio::test]
+async fn multi_table_delete_staging_matches_serial_staging() {
+    type Observation = (
+        usize,
+        usize,
+        usize,
+        usize,
+    );
+
+    async fn run_once(concurrency: usize, release_after: usize) -> (Observation, u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let probes = StageWriteProbes::rendezvous(release_after);
+        let observed = probes.clone();
+        const DELETE_QUERIES: &str = r#"
+            query delete_two_edge_tables() {
+                delete Knows where from = "Alice"
+                delete WorksAt where from = "Bob"
+            }
+        "#;
+        let staged =
+            helpers::with_setting(&db, "stage_write_concurrency", &concurrency.to_string());
+        let mutation_params = params(&[]);
+        let mutation = Box::pin(staged.mutate(
+            "main",
+            DELETE_QUERIES,
+            "delete_two_edge_tables",
+            &mutation_params,
+        ));
+        let mutation = with_stage_write_probes(probes, mutation);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), mutation)
+            .await
+            .expect("configured delete staging width never reached the rendezvous")
+            .unwrap();
+
+        let result = (
+            result.affected_nodes,
+            result.affected_edges,
+            count_rows(&db, "edge:Knows").await,
+            count_rows(&db, "edge:WorksAt").await,
+        );
+        (result, observed.entered(), observed.peak_in_flight())
+    }
+
+    let (serial, serial_entered, serial_peak) = run_once(1, 1).await;
+    assert_eq!(
+        serial_entered, 2,
+        "the delete mutation must stage exactly two tables"
+    );
+    assert_eq!(serial_peak, 1, "width 1 must keep delete staging serial");
+
+    let (concurrent, concurrent_entered, concurrent_peak) = run_once(4, 2).await;
+    assert_eq!(
+        concurrent_entered, 2,
+        "the delete mutation must stage exactly two tables"
+    );
+    assert_eq!(
+        concurrent_peak, 2,
+        "width 4 must overlap both independent delete staging futures"
+    );
+    assert_eq!(
+        serial, concurrent,
+        "delete staging concurrency must not change any observable effect"
+    );
+}
+
 // ─── Edge @key write-path pins ───────────────────────────────────────────────
 
 const EDGE_KEY_WRITE_SCHEMA: &str = r#"
