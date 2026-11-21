@@ -393,7 +393,7 @@ impl std::fmt::Display for StorageRootConflict {
         match self {
             Self::Overlap { base } => write!(
                 formatter,
-                "external Blob base '{base}' overlaps an OmniGraph storage root; bases must name storage outside every graph and cluster root"
+                "external Blob base '{base}' overlaps an Omnigraph storage root; bases must name storage outside every graph and cluster root"
             ),
             Self::UncomparableRoot { base } => write!(
                 formatter,
@@ -2052,7 +2052,7 @@ mod tests {
             OmniError::ExternalBlobPolicy { uri, reason } => {
                 assert_eq!(uri, "<redacted>");
                 assert!(
-                    reason.contains("overlaps an OmniGraph storage root"),
+                    reason.contains("overlaps an Omnigraph storage root"),
                     "unexpected reason: {reason}"
                 );
             }
