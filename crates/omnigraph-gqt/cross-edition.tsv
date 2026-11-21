@@ -82,10 +82,7 @@ issue_659_compiler_scopes.gqt	12	requests	cost.accepted-refusal	Edition 2 refuse
 issue_659_compiler_scopes.gqt	13	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
 issue_659_compiler_scopes.gqt	27	requests	open:pushed-filter-late-materializes	The respelled text tests `$p.name = "p"` at the top level, where it is pushed into the Person scan, and Lance fetches the scan's `__id` after the filter column, a second GET of the one-fragment data file; edition 2's text tested it inside the nested block, in memory.
 issue_659_edge_selection_contract.gqt	4	requests	cost.accepted-refusal	Edition 2 refused this read before reading; edition 3 accepts and runs it.
-issue_659_rrf_typed_edge_identity.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-issue_659_rrf_typed_edge_identity.gqt	3	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_747_full_text_calls_need_a_full_text_index.gqt	6	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
-issue_763_exists_predicate.gqt	6	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_787_rrf_order_keys_after_fused_score.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
 issue_787_rrf_order_keys_after_fused_score.gqt	3	requests	open:index-probe-where-edition-2-scanned	The read probes a scalar index the edition-2 plan did not read, whose two requests exceed what edition 2's scan read on this one-fragment table.
 issue_788_search_led_aggregate_order_keys.gqt	2	requests	cost.exact-lexical-scan	The exact lexical scan reads the text column's data file once more where edition 2 read the full-text index.
