@@ -9,6 +9,8 @@ use omnigraph::storage::{CapturedStorageBinding, storage_for_binding};
 use omnigraph_cluster::{ClusterAdmission, ClusterAdmissionPurpose};
 use tokio::sync::Mutex;
 
+use crate::command_outcome::EngineWrite;
+
 type Owners = Arc<Mutex<BTreeMap<String, ClusterAdmission>>>;
 
 tokio::task_local! {
@@ -33,8 +35,7 @@ pub(crate) async fn embedded_storage(
         None => {
             let storage = storage_for_binding(binding)?;
             let root = binding.uri();
-            let marker = format!("{}/__clone/created", root.trim_end_matches('/'));
-            if storage.exists(&marker).await? {
+            if storage.exists(&clone_marker(root)).await? {
                 return Err(crate::targets::refusal(
                     "target_invalid",
                     format!(
@@ -44,8 +45,22 @@ pub(crate) async fn embedded_storage(
             }
             Ok(storage)
         }
-        Some(base) => Ok(omnigraph::storage::storage_read_through(base, binding.uri()).await?),
+        Some(base) => {
+            // The build writes the marker when the clone root has none,
+            // before the engine opens the graph, so the open's own refusal
+            // no longer says that the command took no effect.
+            let marker = clone_marker(binding.uri());
+            if !storage_for_binding(binding)?.exists(&marker).await? {
+                crate::command_outcome::storage_wrote();
+            }
+            Ok(omnigraph::storage::storage_read_through(base, binding.uri()).await?)
+        }
     }
+}
+
+/// The object whose presence makes `root` a graph shallow clone's root.
+fn clone_marker(root: &str) -> String {
+    format!("{}/__clone/created", root.trim_end_matches('/'))
 }
 
 /// Read commands never acquire writer admission or run the writable capability
@@ -87,7 +102,13 @@ pub(crate) async fn open_writable(
         None => None,
     };
     crate::command_outcome::writable_open();
-    let db = omnigraph::db::Omnigraph::open_with_storage(binding.uri(), storage.await?).await?;
+    let storage = storage.await?;
+    // The open's own error says what the open did: a typed refusal, such as
+    // a root that holds no graph, precedes every write the open makes, while
+    // an untyped storage failure stays one whose effects are unknown.
+    let db = omnigraph::db::Omnigraph::open_with_storage(binding.uri(), storage)
+        .await
+        .engine_write()?;
     Ok(match policy {
         Some(policy) => db.with_policy(policy),
         None => db,

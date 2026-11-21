@@ -40,6 +40,13 @@ const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 #[command(
     name = "omnigraph-bench",
     version,
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\nsource commit: ",
+        env!("OMNIGRAPH_BENCH_SOURCE_GIT_COMMIT"),
+        "\nsource tree dirty: ",
+        env!("OMNIGRAPH_BENCH_SOURCE_WORKTREE_DIRTY"),
+    ),
     about = "Run GQT benchmarks from a named scenario or custom YAML",
     disable_help_subcommand = true,
     after_help = "Start here:\n  omnigraph-bench list scenarios\n  omnigraph-bench show tiny-read\n  omnigraph-bench run tiny-read\n  omnigraph-bench run --config benchmarks/custom.example.yaml\n  omnigraph-bench cache status tiny-read\n\nfixtures/ holds starting states; workloads/ holds operations and checks.\nUse help config, help cache, init --help, or help --json for agents."
@@ -2627,6 +2634,10 @@ struct ReportRow {
     sut: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     commit: Option<String>,
+    /// The harness build that drove and timed the row: its instrument, apart
+    /// from `commit`, the product it measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    harness_commit: Option<String>,
     version: String,
     status: String,
     requested_repetitions: u32,
@@ -2716,6 +2727,9 @@ struct ReportGroup {
     point_id: String,
     point_name: String,
     machine: String,
+    /// The distinct harness commits of the rows, in order of first appearance;
+    /// more than one means the group was measured by two instruments.
+    harness_commits: Vec<String>,
     rows: Vec<ReportRow>,
 }
 
@@ -2815,6 +2829,11 @@ async fn run_report(
                     && group.point_id == row.point_id
                     && group.machine == row.machine =>
             {
+                if let Some(harness) = &row.harness_commit
+                    && !group.harness_commits.contains(harness)
+                {
+                    group.harness_commits.push(harness.clone());
+                }
                 group.rows.push(row)
             }
             _ => groups.push(ReportGroup {
@@ -2822,6 +2841,7 @@ async fn run_report(
                 point_id: row.point_id.clone(),
                 point_name: row.point_name.clone(),
                 machine: row.machine.clone(),
+                harness_commits: row.harness_commit.iter().cloned().collect(),
                 rows: vec![row],
             }),
         }
@@ -2836,16 +2856,27 @@ async fn run_report(
         return print_json_success(&output);
     }
     for group in &output.groups {
+        let harness = match group.harness_commits.as_slice() {
+            [] => "-".to_string(),
+            [one] => one[..one.len().min(12)].to_string(),
+            several => format!("mixed({})", several.len()),
+        };
         println!(
-            "## {} point={} machine={}",
-            group.case_id, group.point_name, group.machine
+            "## {} point={} machine={} harness={}",
+            group.case_id, group.point_name, group.machine, harness
         );
-        println!("invoked_at_unix_ms\tcommit\tsut\tversion\tn\tmin_us\tp50_us\tmax_us\tstatus");
+        println!(
+            "invoked_at_unix_ms\tcommit\tharness\tsut\tversion\tn\tmin_us\tp50_us\tmax_us\tstatus"
+        );
         for row in &group.rows {
             println!(
-                "{}\t{}\t{}\t{}\t{}/{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}/{}\t{}\t{}\t{}\t{}",
                 row.invoked_at_unix_ms,
                 row.commit
+                    .as_deref()
+                    .map(|c| &c[..c.len().min(12)])
+                    .unwrap_or("-"),
+                row.harness_commit
                     .as_deref()
                     .map(|c| &c[..c.len().min(12)])
                     .unwrap_or("-"),
@@ -2889,9 +2920,10 @@ async fn run_report(
 
 fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String) -> ReportRow {
     use omnigraph_bench::gqt_record::GqtSutIdentityV1;
-    let (sut, commit, version, declared_machine) = match &record.sut {
+    let (sut, commit, harness_commit, version, declared_machine) = match &record.sut {
         GqtSutIdentityV1::Embedded(sut) => (
             "embedded",
+            Some(sut.source_commit.clone()),
             Some(sut.source_commit.clone()),
             sut.package_version.clone(),
             None,
@@ -2899,6 +2931,7 @@ fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String)
         GqtSutIdentityV1::Served(sut) => (
             "declared-deployment",
             Some(sut.receipt.server.source_commit.clone()),
+            Some(sut.client_build.source_commit.clone()),
             sut.receipt.server.package_version.clone(),
             sut.receipt
                 .machine
@@ -2914,6 +2947,7 @@ fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String)
             sut.source_commit
                 .clone()
                 .or_else(|| sut.requested_commit.clone()),
+            Some(sut.harness.source_commit.clone()),
             sut.package_version.clone(),
             None,
         ),
@@ -2933,6 +2967,7 @@ fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String)
         invoked_at_unix_ms: record.invocation.invoked_at_unix_ms,
         sut,
         commit,
+        harness_commit,
         version,
         status: serde_json::to_value(record.acquisition.status)
             .ok()

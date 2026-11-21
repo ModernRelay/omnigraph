@@ -1,0 +1,158 @@
+name: Bench Binaries
+
+# The benchmark lab's two binaries, built where the commit lands. One job on
+# GitHub's arm64 runner inside the Amazon Linux 2023 container the lab's
+# campaign machine runs (glibc 2.34; a binary linked on Ubuntu 24.04 needs
+# 2.39 and does not start there): `cargo build --release --locked` of
+# `omnigraph-cli` and of `omnigraph-bench`, one package per call so neither
+# binary's features depend on the other's manifest, RUSTFLAGS empty as the
+# lab and the release archives build. The artifact `bench-binaries-<sha>` is
+# what the lab shelves under `binaries/<sha>/`: the two binaries, their
+# `sha256sum` lines, the public catalog `benchmarks/` and `build.json`. The
+# sha is the commit built: a pull request's head, never GitHub's merge commit.
+# Nothing here talks to AWS; the lab pulls the artifact.
+
+on:
+  push:
+    branches:
+      - main
+      - 'bench/**'
+    tags:
+      - 'v*'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build omnigraph and omnigraph-bench (arm64, AL2023)
+    # A pull request builds only under the lab's `benchmark` label, the label
+    # the lab's watcher measures; every other trigger builds.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'benchmark')
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "5"
+      # A set RUSTFLAGS, empty included, replaces the workspace `[build]
+      # rustflags` (.cargo/config.toml): the lab's binaries build without the cfg.
+      RUSTFLAGS: ""
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      # Before the checkout: with git in the container the checkout keeps
+      # `.git`, which the harness's build script reads for its source commit.
+      - name: Install build tools
+        run: dnf install -y -q clang gcc gcc-c++ make openssl-devel pkgconf-pkg-config protobuf-compiler protobuf-devel git tar gzip python3 which
+
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+
+      # rustup with no default toolchain, then the toolchain `rust-toolchain.toml`
+      # pins, each download tried three times: one connect timeout to
+      # static.rust-lang.org is a retried step here, not a lost build.
+      - name: Install the pinned toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SOURCE_SHA must be a full commit id"; exit 1; }
+          for try in 1 2 3; do
+            if curl --fail --silent --show-error --proto '=https' --tlsv1.2 https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path; then break; fi
+            [ "$try" -lt 3 ] || exit 1
+            sleep 20
+          done
+          export PATH="$HOME/.cargo/bin:$PATH"
+          for try in 1 2 3; do
+            if rustup toolchain install --profile minimal; then break; fi
+            [ "$try" -lt 3 ] || exit 1
+            sleep 20
+          done
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          shared-key: bench-binaries-aarch64-al2023
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build omnigraph
+        run: cargo build --release --locked -p omnigraph-cli
+
+      - name: Build omnigraph-bench
+        run: cargo build --release --locked -p omnigraph-bench
+
+      # The CLI has no `--version` flag (`disable_version_flag`); `version` is
+      # its subcommand. The harness takes the flag.
+      - name: Check the binaries start
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/release/omnigraph version
+          target/release/omnigraph-bench --version
+
+      # The artifact is named by SOURCE_SHA, and the harness records nothing
+      # unless it was compiled from a whole commit and a clean tree. Its long
+      # version names both, so the binary must agree with the artifact's name.
+      - name: Check the harness was built from this commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(target/release/omnigraph-bench --version)"
+          echo "$version"
+          grep -qx "source commit: $SOURCE_SHA" <<<"$version" \
+            || { echo "::error::omnigraph-bench was not built from $SOURCE_SHA"; exit 1; }
+          grep -qx "source tree dirty: false" <<<"$version" \
+            || { echo "::error::omnigraph-bench was not built from a clean tree"; exit 1; }
+
+      - name: Assemble the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 0755 target/release/omnigraph target/release/omnigraph-bench dist/
+          (cd dist && sha256sum omnigraph > omnigraph.sha256 && sha256sum omnigraph-bench > omnigraph-bench.sha256)
+          tar -czf dist/benchmarks.tar.gz benchmarks
+          python3 - dist/build.json <<'PY'
+          import json, os, subprocess, sys, time
+          def line(argv):
+              return subprocess.run(argv, capture_output=True, text=True, check=True).stdout.splitlines()[0].strip()
+          os_release = dict(l.split("=", 1) for l in open("/etc/os-release") if "=" in l)
+          json.dump({
+              "version": 1,
+              "commit": os.environ["SOURCE_SHA"],
+              "event": os.environ["GITHUB_EVENT_NAME"],
+              "ref": os.environ["GITHUB_REF"],
+              "rustc": line(["rustc", "--version"]),
+              "cargo": line(["cargo", "--version"]),
+              "target": "aarch64-unknown-linux-gnu",
+              "rustflags": os.environ.get("RUSTFLAGS", ""),
+              "os_release": os_release.get("PRETTY_NAME", "").strip().strip('"'),
+              "glibc": line(["ldd", "--version"]),
+              "runner": {"os": os.environ.get("RUNNER_OS", ""), "arch": os.environ.get("RUNNER_ARCH", "")},
+              "workflow_run": {"id": os.environ["GITHUB_RUN_ID"], "attempt": os.environ["GITHUB_RUN_ATTEMPT"]},
+              "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          }, open(sys.argv[1], "w"), indent=1, sort_keys=True)
+          PY
+          ls -l dist
+
+      - name: Upload bench-binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-binaries-${{ env.SOURCE_SHA }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

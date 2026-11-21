@@ -148,8 +148,9 @@ to the validator; if its workflow lacks the trigger, every entry stalls until
 the timeout.
 
 The reporting contexts that are not required (`V5 ↔ V10 Format Fence`, the
-`RustFS S3 Integration` shards, `Azurite Azure Integration`, `Container
-Entrypoint`, `Azure Deployment Validation`, `Azure Contract Guards`) and the
+`RustFS S3 Integration` shards, `Azurite Azure Integration`, `Benchmark
+Harness (arm64 Linux)`, `Container Entrypoint`, `Azure Deployment
+Validation`, `Azure Contract Guards`) and the
 vocabulary guard are gated off the merge-group branch: the queue merges on
 the required contexts alone, so a run there would finish after the merge and
 only repeat the post-merge run. `DST pinned suite` (`dst.yml`) runs on queue

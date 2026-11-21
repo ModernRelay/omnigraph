@@ -749,11 +749,15 @@ invalid anywhere in the list fails the command, named by its path.
 
 `report <scenario|suite> --store <uri>` reads the store's `records/` and
 prints the selection's series: one row per record (invocation time, commit,
-system under test, version, observed and requested repetitions, min, p50,
-max, status), grouped by scenario, `point_id` and machine label; a group is
-one machine's rows and the report never forms a factor across groups. A
-record whose bytes do not hash to its name, or that is not run-record JSON,
-fails the report.
+harness commit, system under test, version, observed and requested
+repetitions, min, p50, max, status), grouped by scenario, `point_id` and
+machine label; a group is one machine's rows and the report never forms a
+factor across groups. The harness commit is the build that drove and timed
+the row, apart from the commit it measured; a group names the distinct
+harness commits of its rows (`harness_commits`, `harness=mixed(n)` in the
+text form), so a series measured by two instruments reads as two. A record
+whose bytes do not hash to its name, or that is not run-record JSON, fails
+the report.
 
 Machine-readable diagnostic-mode failures keep the suite/case/point identity
 and all completed runs or repetitions. A worker killed at its hard deadline

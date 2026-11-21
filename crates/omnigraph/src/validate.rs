@@ -32,7 +32,7 @@ use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::EdgeType;
 
 use crate::db::{Omnigraph, Snapshot};
-use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
+use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result, graph_type_subject};
 use crate::table_store::{ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, TableStore};
 use kernels::{CardPlan, HoldersByKey, card_affected, card_violations, match_unique_holders};
 use key_set::{IntKeySet, IntKeySetLayout, canonical_i64, key_bytes};
@@ -58,10 +58,20 @@ impl Violation {
         }
     }
 
-    /// Map to the write-path surface error. The message already matches the
-    /// write path's text (`validators.rs` asserts via `.contains`).
+    /// Map to the write-path surface error. An orphan edge's message names
+    /// only the missing endpoint, so the refusal leads with the edge type, as
+    /// a merge conflict does; every other kind's message already names what
+    /// it refuses. The edge id stays out: a generated id names nothing the
+    /// user wrote, and its time part differs between two runs of one write.
     pub(crate) fn into_omni_error(self) -> OmniError {
-        OmniError::manifest(self.message)
+        match self.kind {
+            MergeConflictKind::OrphanEdge => OmniError::manifest(format!(
+                "{}: {}",
+                graph_type_subject(&self.table_key),
+                self.message
+            )),
+            _ => OmniError::manifest(self.message),
+        }
     }
 }
 
