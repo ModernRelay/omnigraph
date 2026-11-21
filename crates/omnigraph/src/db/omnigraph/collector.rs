@@ -371,7 +371,7 @@ async fn delete_paths(
     paths: &BTreeSet<String>,
     sizes: &BTreeMap<String, u64>,
 ) -> Result<u64> {
-    let mut bytes = 0;
+    let mut files = Vec::new();
     for path in paths {
         if path.starts_with("base:") {
             continue;
@@ -387,7 +387,42 @@ async fn delete_paths(
             }
             continue;
         }
-        bytes += delete_object(store, &full, sizes.get(path).copied()).await?;
+        let size = match sizes.get(path) {
+            Some(size) => *size,
+            None => match store.size(&full).await {
+                Ok(size) => size,
+                Err(lance::Error::NotFound { .. }) => continue,
+                Err(error) => return Err(OmniError::storage(error)),
+            },
+        };
+        files.push((full, size));
+    }
+    delete_files(store, files).await
+}
+
+/// Delete `files` through one delete stream of the table's store, which S3
+/// sends as `DeleteObjects` requests of up to 1,000 keys and other stores
+/// delete concurrently, in no order: these files belong only to manifests
+/// the sweep removes after them, so any subset a stopped pass leaves is
+/// planned again. Returns the bytes of the files the store removed, at each
+/// file's `(path, size)`; an absent file counts nothing.
+async fn delete_files(
+    store: &lance::io::ObjectStore,
+    files: Vec<(object_store::path::Path, u64)>,
+) -> Result<u64> {
+    if files.is_empty() {
+        return Ok(0);
+    }
+    let sizes: HashMap<object_store::path::Path, u64> = files.iter().cloned().collect();
+    let locations = futures::stream::iter(files.into_iter().map(|(path, _)| Ok(path))).boxed();
+    let mut removed = store.inner.delete_stream(locations);
+    let mut bytes = 0;
+    while let Some(result) = removed.next().await {
+        match result {
+            Ok(path) => bytes += sizes.get(&path).copied().unwrap_or(0),
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(OmniError::storage(lance::Error::from(error))),
+        }
     }
     Ok(bytes)
 }

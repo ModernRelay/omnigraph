@@ -34,6 +34,9 @@ use crate::helpers::collector::{
     detached_versions, insert_person, insert_scored, keep_one, main_plan, merge_three_chunk_chain,
     pins_in_history, retained_on, staged_since,
 };
+use crate::helpers::cost::{
+    assert_sweep_delete_requests_flat_in_files, measure_cleanup_after_inserts,
+};
 use crate::helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
     mixed_params, mutate_main, snapshot_main,
@@ -6135,4 +6138,21 @@ async fn collector_reclaims_blob_sidecars_after_the_last_retained_pin() {
         .await,
         current_payload,
     );
+}
+
+/// Issue 1252: the sweep sends a table's freed files as one delete stream,
+/// which S3 answers as one `DeleteObjects` request per 1,000 objects, and
+/// sends no HEAD for a file whose size its listing gave. The published
+/// manifests stay single deletes, oldest first. So the delete requests beyond
+/// one per manifest stay flat as the files removed grow. The S3 twin is
+/// `write_cost_s3::cleanup_sweep_delete_requests_on_s3_issue_1252`.
+#[tokio::test]
+async fn cleanup_sweep_deletes_files_in_one_stream_per_group_issue_1252() {
+    let mut curve = Vec::new();
+    for commits in [4usize, 16] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        curve.push(measure_cleanup_after_inserts(&db, commits).await);
+    }
+    assert_sweep_delete_requests_flat_in_files(&curve);
 }
