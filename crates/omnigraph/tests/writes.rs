@@ -3614,7 +3614,7 @@ query cascade_then_explicit($name: String, $other: String) {
 }
 
 /// A node delete's cascade reads the edge table through
-/// `validate::RemovalEdgeReads`: never one filter over every removed id,
+/// the bounded edge-key lookup: never one filter over every removed id,
 /// whose memory grew with removed ids times edge fragments (#1442). The
 /// removal holds more ids than one filter, so with no index every fragment
 /// is read whole once and matched in memory; after `ensure_indices`, the

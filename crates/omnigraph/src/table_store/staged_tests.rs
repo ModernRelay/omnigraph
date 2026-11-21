@@ -1374,12 +1374,26 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
             .unwrap(),
         "the pre-existing BTREE must not claim the newly inserted fragment"
     );
+    // One wide absent key makes pushing this list to the uncovered fragment
+    // exceed the literal allowance. The strict conflict can come from either
+    // partition; the upsert count sees both and counts a repeated key once.
+    let mut wanted = vec!["w".repeat(1536 * 1024), String::new()];
+    for key in ["alice", "bob"] {
+        wanted[1] = key.to_owned();
+        assert_eq!(
+            TableStore::first_existing_id(&committed, &wanted, SYSTEM_COLUMNS_LEGACY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(key)
+        );
+    }
+    wanted.extend(["alice".to_string(), "bob".to_string()]);
     assert_eq!(
-        TableStore::first_existing_id(&committed, &["bob".to_string()], SYSTEM_COLUMNS_LEGACY)
+        TableStore::existing_id_count(&committed, &wanted, SYSTEM_COLUMNS_LEGACY)
             .await
             .unwrap(),
-        Some("bob".to_string()),
-        "indexed lookup must retain its uncovered-fragment correctness fallback"
+        2
     );
 }
 

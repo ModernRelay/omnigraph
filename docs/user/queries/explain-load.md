@@ -50,11 +50,18 @@ version. A probe first pays its key list, one entry per input row, so an
 unindexed endpoint check scans, and a partially or fully indexed table keeps
 `probe` only while the key list is small against it. Unknown counts and equal
 costs keep `probe`; statistics record `index_coverage` and both costs.
-`retained_edges` and `source_cardinality` always use `probe`, and so does
-`cardinality` except on an overwrite under a non-zero minimum: there it uses
-`scan`, one projected scan of the replaced table's source column for a source
-the new edges leave without one. An `edge_ri` check
-also carries `probe`, where it reads the committed ids: `swept` when both
+The plan reports `probe` for `retained_edges`, `source_cardinality` and
+ordinary `cardinality` checks. The engine learns the actual edge IDs and
+source or destination IDs during execution. Small filters can go to every
+fragment. When copying the filter into each unindexed fragment would exceed
+the lookup's byte allowance, the engine probes indexed fragments in bounded
+chunks and matches the remaining fragments in one projected scan. A key too
+large for a single filter takes the scan path across the whole table. An edge
+overwrite with a non-zero minimum reports `scan` for `cardinality`. It reads
+the replaced table's source column to find a source left without an edge.
+
+An `edge_ri` check also carries `probe`, which identifies when it reads
+the committed IDs. It uses `swept` when both
 endpoint checks of the edge use `scan` and both node types carry one
 `I32`, `I64` or `U32` `@key`, so the committed sets load while the source
 parses and each parse partition probes its own rows; `judged` otherwise,
@@ -67,15 +74,9 @@ table holds no rows removes nothing, so its plan carries neither the
 `retained_edges` checks nor the scan; a node target no edge type references,
 an edge overwrite, an append and a merge carry `none` as well. Under `none`
 no removed id is found, so the removed-id allowance of `write_max_bytes`
-charges nothing. Retained-edge access describes the lookup in the incident
-edge table. Its plan always says `probe`, because the removed ids are known
-only when the overwrite runs. At run time the engine pushes them, 8,192 per
-endpoint per filter, to the edge fragments that a BTREE on each probed
-endpoint covers, and reads each other fragment once, whole, matching its rows
-in memory. When such a BTREE covers every fragment, or when one filter with
-every removed id, copied to each uncovered fragment, holds at most 8,192 ids
-per endpoint, every fragment gets the filter. Append and merge keep the
-consulted table, so their `edge_ri` and non-key `@unique` checks use `probe` only when every
+charges nothing.
+
+Append and merge keep the consulted table, so their `edge_ri` and non-key `@unique` checks use `probe` only when every
 looked-up column carries a BTREE covering every fragment of that table (the
 `@key` column's own index, or an `@index` on an orderable scalar; an `@index`
 on a String is a full-text index and does not count) and `scan` otherwise, a

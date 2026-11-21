@@ -715,8 +715,8 @@ exact-`id`, filter-bearing MergeInsert adapter:
 - upsert updates or inserts without changing modes on retry. With an id
   BTREE it first runs the strict insert's exact-id probe, while the fragments
   the BTREE leaves uncovered times the source ids stay within one keyed batch
-  (8,192), since Lance plans the probe's `IN` list once per uncovered
-  fragment. Rows all new stage through the absence-proven insert writer; rows
+  (8,192). This limits the work spent classifying an upsert before it
+  decides which writer to use. Rows all new stage through the absence-proven insert writer; rows
   all present stage as a known-present update only while the BTREE covers
   more fragments than it leaves and those uncovered fragments' recorded
   data-file sizes are known and total at most 1 MiB
@@ -772,14 +772,17 @@ a deleted table is scanned once; addresses from another version than the
 reopened pin take Lance's scanning delete. A node removal reads each edge
 table that references the type for the edges touching its removed ids (the
 delete cascade, and the retained-edge check of an Overwrite, `load csv` or a
-merge) through `validate::RemovalEdgeReads`. Lance gives every fragment that
-no index answers a pushed filter on its own copy of the filter, built before
-the scan reads. So the plan pushes the ids to every fragment, 8,192 per
-filter, only when a BTREE on each probed endpoint covers the table, or when
-one filter holds every id and the uncovered fragments times those ids stay at
-most 8,192; otherwise it probes the covered fragments and reads the uncovered
-ones once, whole, matching their rows against the removed ids in memory
-(#1442). A node delete whose predicate has
+merge). The same key lookup finds old edge IDs, counts committed edges by
+source for cardinality checks and checks incoming IDs against a pinned table
+before a strict insert or an eligible upsert. Lance can clone a filter for every fragment
+its index cannot answer. Omnigraph considers the literal bytes, expression
+storage and the number of such fragments when deciding whether to push a
+filter. Each probe allows up to 4 MiB for ID literals and their estimated
+fragment copies. Larger lookups use bounded probes on fragments covered by a BTREE on
+every participating column and match the other fragments once against the
+requested keys. If a single key or endpoint pair exceeds the filter allowance,
+the lookup scans the projected columns across the whole table. A retained-edge
+check that needs only one orphan stops at its first match. A node delete whose predicate has
 a `<key> = v` conjunct on the type's single String `@key` also filters on the
 derived id when the pinned table has an id BTREE, as the read planner's key
 narrowing does. Mutation validation reads the write's pinned base through the

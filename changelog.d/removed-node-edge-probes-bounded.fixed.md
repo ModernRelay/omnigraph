@@ -1,1 +1,1 @@
-- Removing nodes an edge type references (overwrite load, `load csv`, delete or merge) no longer needs memory that grows with removed ids times edge fragments.
+- Node removal bounds filter copies across edge fragments even for long IDs. An overwrite that can reject on the first orphan retains only that edge.
