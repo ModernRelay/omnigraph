@@ -1154,6 +1154,29 @@ not read (invariants deny-list), or change Lance:
 Writes respelled for the one-snapshot rule (a group selecting on another
 type) read that type's table too, which edition 2's sequential text did not.
 
+### A `limit` without `order`
+
+A `limit` with no `order` cuts the tie rule's order (`read:1`), so it plans
+the `Sort` with no written key and the limit as its `fetch`: a streaming
+top-k over every qualifying row, keyed by identity, holding `fetch` rows, with
+the other return columns hydrated for those rows alone. It reads every row
+below it, where edition 2 stopped its scan at the first rows; its cost is a
+sorted `limit`'s, and it grows with the qualifying rows, not with `fetch`.
+Measured 2026-11-21 with release CLIs and `--stats` on the migration matrix's
+100,000-document corpus (median of five runs, local filesystem, 2 CPUs),
+`limit 10` returning two columns:
+
+| Read | Edition 2 | GQ 3 |
+|---|---|---|
+| scan, no `order` | 24.3 ms | 72.5 ms |
+| scan, `order { $d.year desc }` | 75.5 ms | 81.9 ms |
+| `where $d.year > 2005`, no `order` | 26.6 ms | 88.1 ms |
+| `where $d.year > 2005`, `order { $d.year desc }` | 77.4 ms | 89.9 ms |
+
+Peak RSS was 269 to 276 MB for edition 2 and 282 to 283 MB for GQ 3 in every
+row: the top-k holds ten rows. A read that wants the first rows cheaply and
+can name them orders by an indexed key or narrows them in `where`.
+
 ## V2 plan lowering: one node, one operator
 
 The planner owns the walk from a `PhysicalPlan` to operators.

@@ -236,8 +236,8 @@ traversal's destination before its edge), then a `from`'s value columns, all
 ascending; group rows use their keys, bare nodes (by id) first. Ids are read
 only when they can change the order. A `limit` with no `order` cuts this order
 alone: `limit 2` returns the two smallest ids, not a scan's first rows, and
-reads every match. On ungrouped, non-DISTINCT rows an order key need not be
-projected, as in `order { $p.age > 30 }`. A reference key sorts by identity:
+reads every match, at the cost of a sorted `limit`. On ungrouped,
+non-DISTINCT rows an order key need not be projected, as in `order { $p.age > 30 }`. A reference key sorts by identity:
 `$p` by `$p.@id`, a multi-type edge by `@type`, then `@id`. Over grouped rows,
 an aggregated or DISTINCT return, an order key must be a return item or its
 alias (`T42`): `count($d)` after `return { count($d) as deals }`.
