@@ -569,6 +569,13 @@ impl Requirements {
                 (Some(PhysicalNode::Fuse { target, .. }), BoundVariable::Node { .. }) => {
                     target == name
                 }
+                // A traversal binds its destination by identity, of the type
+                // every edge it follows ends on, when nothing reads more of it
+                // (the optimizer then drops the destination's scan).
+                (
+                    Some(PhysicalNode::Expand { dst, dst_type, .. }),
+                    BoundVariable::Node { type_name },
+                ) => dst == name && dst_type == type_name,
                 (
                     Some(PhysicalNode::Expand {
                         edge_binding: Some(edge),

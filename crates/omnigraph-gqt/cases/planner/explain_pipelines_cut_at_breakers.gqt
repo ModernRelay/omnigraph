@@ -72,7 +72,7 @@ query knows_nobody() {
 --- expect shape
 p.name: String
 --- expect plan
-pipeline 0: OuterReference -> Expand -> Scan(input_ids) => AntiJoin(inner)
+pipeline 0: OuterReference -> Expand => AntiJoin(inner)
 pipeline 1: Scan => AntiJoin
 pipeline 2: AntiJoin -> Projection => consumer after 0, 1
 

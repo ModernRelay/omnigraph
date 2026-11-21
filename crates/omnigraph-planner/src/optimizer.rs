@@ -2296,7 +2296,11 @@ fn projection_pushdown(
             demands.entry(binding).or_default().identity = true;
         }
     }
+    let elided = elide_endpoint_scans(plan, &demands);
     for (id, binding, node_type) in scans {
+        if elided.contains(&id) {
+            continue;
+        }
         let demand = demands.get(&binding);
         let whole_object = demand.map_or_else(
             || {
@@ -2339,6 +2343,53 @@ fn projection_pushdown(
         }
     }
     Ok(true)
+}
+
+/// Drop a dependent scan that only names a traversal's end: its binding is
+/// the `Expand`'s destination, nothing reads a property or the whole entity
+/// of it, and no filter, fragment scope or access path narrows it. The
+/// expansion already carries the destination's identity, and every edge's
+/// end exists at the snapshot it was read from (`write:6`, `merge:3`), and
+/// is of the destination's type (the type checker resolves each edge member
+/// against it), so the scan would find exactly one row for each input row
+/// and add no column anything reads. A fixed rule over the plan's own
+/// demand: it reads no statistic.
+fn elide_endpoint_scans(
+    plan: &mut LogicalPlan,
+    demands: &HashMap<String, Demand>,
+) -> HashSet<LogicalId> {
+    let candidates: Vec<(LogicalId, LogicalId)> = plan
+        .live()
+        .filter_map(|(id, node)| {
+            let LogicalNode::TableScan {
+                input: Some(input),
+                spec,
+            } = node
+            else {
+                return None;
+            };
+            let binding = spec.binding.as_ref()?;
+            let Some(LogicalNode::Expand { dst, .. }) = plan.node(*input) else {
+                return None;
+            };
+            let unread = demands
+                .get(binding)
+                .is_none_or(|demand| !demand.entity && demand.properties.is_empty());
+            (dst == binding
+                && unread
+                && spec.filter.is_none()
+                && spec.runtime_filter.is_none()
+                && spec.fragments.is_none()
+                && spec.access.is_none())
+            .then_some((id, *input))
+        })
+        .collect();
+    let mut elided = HashSet::new();
+    for (scan, expand) in candidates {
+        plan.splice_out(scan, expand);
+        elided.insert(scan);
+    }
+    elided
 }
 
 /// What one binding's scan must read, gathered from every node of the tree.

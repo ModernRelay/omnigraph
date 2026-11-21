@@ -874,6 +874,8 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
 
 /// Disjoint adjacency sets prove this ranked source empty even though each
 /// destination is dense enough for a hash build. GQT cannot observe skipped I/O.
+/// `total` counts `$d.slug`, not `$d`: a destination read for nothing but its
+/// identity has no scan, so no hash build either.
 #[tokio::test]
 #[serial]
 async fn proven_empty_ranked_source_skips_hash_builds_and_keeps_aggregate_row() {
@@ -897,7 +899,7 @@ query rows($q: Vector(4)) {
 }
 query total($q: Vector(4)) {
     match { let $pop = { match { $s: Source, $d: Doc, $s links $d, $t: Doc, $s tags $t } return { $s, $d, $t } }, from nearest($pop, $s.embedding, $q, k: 10) as $distance }
-    return { count($d) as n }
+    return { count($d.slug) as n }
     limit 10
 }
 "#;

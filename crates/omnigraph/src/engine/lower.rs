@@ -281,7 +281,8 @@ impl<'a> Lowering<'a> {
 
     /// The edge the bulk CSR degree answers for a row-count block: one
     /// single-hop, filter-free, unbound expand from the outer binding (by id
-    /// lookup or hash join); an undirected edge only for an existence test.
+    /// lookup, hash join, or no scan of its end); an undirected edge only for
+    /// an existence test.
     fn bulk_row_count(
         &self,
         inner: NodeId,
@@ -305,6 +306,8 @@ impl<'a> Lowering<'a> {
             {
                 *probe
             }
+            // A destination nothing reads beyond its identity has no scan.
+            PhysicalNode::Expand { .. } => inner,
             _ => return Ok(None),
         };
         Ok(match self.node(inner)? {

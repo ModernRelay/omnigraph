@@ -527,7 +527,15 @@ multi-hop fan-out is:
   downstream `Limit` that stops reading cancels the producer (the `Expand` row
   of [the operator table](#v2-plan-lowering-one-node-one-operator));
 - narrow rows: `projection_pushdown` reads only the columns the tree uses
-  before destination rows are repeated per edge, and `late_materialization`
+  before destination rows are repeated per edge, and drops a traversal end's
+  dependent scan when nothing reads more of that binding than its identity
+  (`count($t)`, a block's `$x: Person` bound only to reach the edge): the
+  `Expand` carries the end's `__id`, every edge's end exists at the snapshot
+  (`write:6`, `merge:3`) and is of the end's type, so the scan would add one
+  row per row and no column anything reads; plan validation accepts the
+  `Expand` as that binding's read (`no scan <Type> as $var` in a `.gqt` plan),
+  and a block's key-set tree and the bulk CSR check run without the scan
+  too. `late_materialization`
   moves return-only columns to a `HydrateColumns` node above a root `Limit` in
   a plan without an `Aggregate` ([filters and pushdown](#filters-and-pushdown));
 - set semantics: an unbound traversal returns each endpoint pair once, and
@@ -1114,6 +1122,37 @@ under the same `explain_version`, its `datafusion` row saying the operators
 are lowered only at execution ([explain-load.md](../user/queries/explain-load.md)).
 Destination hydration uses the planned projection; edge-property attach
 retains its complete property projection.
+
+### Store requests edition 3 adds over edition 2
+
+The cross-edition job measures every step both editions run under the
+simulation (`scripts/cross-edition.py --measure`). After the dropped end scans
+above, three mechanisms still make some steps issue more store requests than
+edition 2's text did, all on the simulation's one-fragment tables, where a
+fixed per-read cost is not repaid; none adds stored state, and fixing any of
+them would choose an access path by table size, a statistic the planner does
+not read (invariants deny-list), or change Lance:
+
+- An index probe where edition 2 scanned. A key equality, `in` list or
+  String `@index` predicate probes its BTREE (or NGRAM) whatever the table's
+  size, a fixed rule; edition 2 could not use a String key's index there. The
+  probe reads the index's root and one page (two requests), which exceeds the
+  one data file edition 2's scan read. At more than a few fragments the probe
+  reads fewer objects than the scan, and its cost grows with the index depth,
+  not the table.
+- A page reread by concurrent index searches. Several searches of one filter
+  (the arms of an `or`, an `in` list's values, an NGRAM's trigrams) run at
+  once and each misses the same uncached page, since Lance 13's
+  `search_missing_pages` reads outside its cache's loader; each search reads
+  it once. The rereads are bounded by the number of searches, not by rows.
+- A filter pushed where edition 2 filtered in memory. A respelled read that
+  tests a key equality at the top level pushes it into the scan, and Lance's
+  heuristic late materialization reads the filter column, then fetches the
+  other projected columns (`__id`) of the matching rows: on a one-fragment
+  file that is a second request for it.
+
+Writes respelled for the one-snapshot rule (a group selecting on another
+type) read that type's table too, which edition 2's sequential text did not.
 
 ## V2 plan lowering: one node, one operator
 

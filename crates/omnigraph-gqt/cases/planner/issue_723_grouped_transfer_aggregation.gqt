@@ -1,6 +1,7 @@
 # issue: 723
 # red_on: none; small-result correctness guard, memory reproduction in execution_memory.rs
-# notes: Bound transfer edges retain parallel rows and nullable amounts through grouping.
+# notes: Bound transfer edges retain parallel rows and nullable amounts through grouping. The
+# notes: destination, read for nothing but its identity, has no scan.
 # notes: Fixed-pool and scale acceptance: omnigraph/tests/integration/execution_memory.rs and repro_issue_723.rs.
 
 --- runner
@@ -47,7 +48,7 @@ transfers: I64
 sent: F64?
 --- expect plan
 scan Account as $src: columns [__id, accountId]
-scan Account as $dst: columns [__id, accountId]
+no scan Account as $dst
 pass projection_pushdown
 not pass aggregate_pushdown
 

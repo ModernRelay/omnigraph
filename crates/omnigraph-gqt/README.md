@@ -722,7 +722,9 @@ A `scan <Type>[ as $var]:` line selects the scans of that type (or the one
 bound to that binding) and claims one fact of each: `columns [..]` the exact
 columns it projects; `not columns [..]` columns it must not read; `filter
 reads [..]` a pushed filter reading exactly those columns (`binding.property`);
-`no filter` no pushed filter at all. `filter reads [..]` on its own states that
+`no filter` no pushed filter at all. `no scan <Type> as $var` states that no
+scan of that type binds `$var`: a traversal's end that nothing reads more of
+than its identity, which the expansion carries. `filter reads [..]` on its own states that
 an in-memory `Filter` node stays in the plan reading exactly those columns.
 `sort tiebreak [$a.@id, $e.@type, $e.@id]` states the exact ordered metadata
 keys a physical `Sort` appends after user order keys. `$a` abbreviates `$a.@id`;

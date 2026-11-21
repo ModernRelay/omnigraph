@@ -1177,7 +1177,8 @@ fn anti_join_of(plan: &PhysicalPlan) -> (omnigraph_planner::AntiJoinStrategy, Ve
 /// chain produces fewer rows: one `$k`, ten `$m`, a hundred `$a` keys against
 /// the correlated 1,000 outer rows expanded twice. The key-set tree is a
 /// table scan of `$k` under the pushed equality, then both hops reversed,
-/// ending on `$a` with no scan of it and no `OuterReference`.
+/// ending on `$a` with no scan of it and no `OuterReference`. Nothing reads
+/// `$m` beyond its identity, so neither tree scans it.
 #[test]
 fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
     use omnigraph_planner::AntiJoinStrategy;
@@ -1192,7 +1193,7 @@ fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
     assert!(
         optimized.statistics.iter().any(|statistic| {
             statistic.statistic == "anti_join_rows($a)"
-                && statistic.value == "correlated 4001 estimated, key_set 121 estimated"
+                && statistic.value == "correlated 3001 estimated, key_set 111 estimated"
         }),
         "{:?}",
         optimized.statistics
@@ -1228,7 +1229,6 @@ fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
         shape,
         [
             "expand $m Some(In) $a",
-            "dependent scan $m",
             "expand $k Some(In) $m",
             "table scan $k filtered true",
         ]
@@ -1241,8 +1241,8 @@ fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
     );
 }
 
-/// The same block over one outer row stays correlated: its 122 rows beat the
-/// 1,201 the key set reaches when each destination has a hundred sources.
+/// The same block over one outer row stays correlated: its 112 rows beat the
+/// 1,101 the key set reaches when each destination has a hundred sources.
 #[test]
 fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
     use omnigraph_planner::AntiJoinStrategy;
@@ -1261,7 +1261,7 @@ fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
     assert!(
         optimized.statistics.iter().any(|statistic| {
             statistic.statistic == "anti_join_rows($a)"
-                && statistic.value == "correlated 122 estimated, key_set 1201 estimated"
+                && statistic.value == "correlated 112 estimated, key_set 1101 estimated"
         }),
         "{:?}",
         optimized.statistics

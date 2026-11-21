@@ -40,7 +40,7 @@ use serde_json::Value;
 use crate::load_plan::PipelineClaim;
 use crate::report::Report;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>[ <btree|bitmap|label_list|ngram>]`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `fuse $var: arms [nearest, bm25, distance, ordered, rrf][ per outer row]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>[ <btree|bitmap|label_list|ngram>]`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `fuse $var: arms [nearest, bm25, distance, ordered, rrf][ per outer row]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `no scan <Type> as $var`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
@@ -94,6 +94,12 @@ pub(crate) enum PlanLine {
     },
     BlockAggregate {
         claim: AggregateClaim,
+    },
+    /// No scan of `type_name` binds `binding`: a traversal's end that
+    /// nothing reads more of than its identity.
+    NoScan {
+        type_name: String,
+        binding: String,
     },
     /// The scans of `type_name` (all of them, or the one bound to `binding`)
     /// satisfy `claim`.
@@ -274,6 +280,20 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
                 ));
             };
             lines.push(PlanLine::Pipeline { claim });
+            continue;
+        }
+        if let Some(scan) = line.strip_prefix("no scan ") {
+            let Some((type_name, binding)) = scan
+                .split_once(" as $")
+                .map(|(type_name, binding)| (type_name.trim(), binding.trim()))
+                .filter(|(type_name, binding)| identifier(type_name) && identifier(binding))
+            else {
+                return Err(refused("is `no scan <Type> as $var`"));
+            };
+            lines.push(PlanLine::NoScan {
+                type_name: type_name.to_string(),
+                binding: binding.to_string(),
+            });
             continue;
         }
         if let Some(gq) = line.strip_prefix("no cast ") {
@@ -895,6 +915,11 @@ pub(crate) fn validate_plan_columns(lines: &[PlanLine], catalog: &Catalog) -> Re
                     return Err(format!("expect plan: unknown node type `{ty}`"));
                 }
             }
+        }
+        if let PlanLine::NoScan { type_name, .. } = line
+            && catalog.query_node_type(type_name).is_none()
+        {
+            return Err(format!("expect plan: unknown node type `{type_name}`"));
         }
         let PlanLine::Scan {
             type_name,
@@ -2085,6 +2110,18 @@ pub(crate) fn plan_mismatch(
                     ));
                 }
             }
+            PlanLine::NoScan { type_name, binding } => {
+                let type_key = format!("node:{type_name}");
+                if nodes
+                    .scans
+                    .iter()
+                    .any(|scan| scan.type_key == type_key && scan.binding.as_ref() == Some(binding))
+                {
+                    return Some(format!(
+                        "expect plan: no scan of `{type_name}` binds `${binding}`, but the plan scans it"
+                    ));
+                }
+            }
             PlanLine::Scan {
                 type_name,
                 binding,
@@ -2966,10 +3003,22 @@ mod tests {
             ),
             ("hash join $e", "no hash join over `$e`"),
             ("scan Other: access id_lookup", "no scan of `Other`"),
+            (
+                "no scan Doc as $d",
+                "no scan of `Doc` binds `$d`, but the plan scans it",
+            ),
         ] {
             let lines = parse_plan_body(&[(0, claim)]).unwrap();
             let mismatch = check(&lines, &explain).unwrap();
             assert!(mismatch.contains(message), "{mismatch}");
+        }
+        // A traversal's end that nothing reads more of than its identity has
+        // no scan of its own.
+        let ended =
+            parse_plan_body(&[(0, "no scan Source as $d"), (1, "no scan Doc as $e")]).unwrap();
+        assert_eq!(check(&ended, &explain), None);
+        for refused in ["no scan Doc", "no scan as $d", "no scan Doc as d"] {
+            assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
         }
         let looked_up = json!({
             "physical_plan": {"node": "Projection", "inputs": [
