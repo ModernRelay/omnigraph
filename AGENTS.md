@@ -226,6 +226,9 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 
 - Preserve unrelated work in a dirty tree. Never discard user changes.
 - Make the smallest coherent change that closes the behavior and test surface.
+- Never weaken, skip or delete a check to make a change pass. A test, guard,
+  golden or pin changes only when what it guards changes, and the pull request
+  says so.
 - For a bug, reproduce the predicted failure at the tier the regression rule
   below names, then fix the root cause and prove the regression turns green.
 - Query-behavior tests default to `.gqt` logic tests under
@@ -283,4 +286,6 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   published release documents and the bytes they are verified against.
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
-- Keep this file a map. New deep content goes in its audience-owned guide.
+- Keep this file a map. New deep content goes in its audience-owned guide. A
+  rule belongs here only when a violation is hard to detect or hard to
+  reverse; where a check can catch it, add the check instead.
