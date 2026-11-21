@@ -64,7 +64,6 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::SOURCE_SHA must be a full commit id"; exit 1; }
-          [ "$(git rev-parse HEAD)" = "$SOURCE_SHA" ] || { echo "::error::the checkout is not $SOURCE_SHA"; exit 1; }
           for try in 1 2 3; do
             if curl --fail --silent --show-error --proto '=https' --tlsv1.2 https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path; then break; fi
@@ -103,6 +102,20 @@ jobs:
           set -euo pipefail
           target/release/omnigraph version
           target/release/omnigraph-bench --version
+
+      # The artifact is named by SOURCE_SHA, and the harness records nothing
+      # unless it was compiled from a whole commit and a clean tree. Its long
+      # version names both, so the binary must agree with the artifact's name.
+      - name: Check the harness was built from this commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(target/release/omnigraph-bench --version)"
+          echo "$version"
+          grep -qx "source commit: $SOURCE_SHA" <<<"$version" \
+            || { echo "::error::omnigraph-bench was not built from $SOURCE_SHA"; exit 1; }
+          grep -qx "source tree dirty: false" <<<"$version" \
+            || { echo "::error::omnigraph-bench was not built from a clean tree"; exit 1; }
 
       - name: Assemble the artifact
         shell: bash
