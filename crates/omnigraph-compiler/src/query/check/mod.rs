@@ -5005,6 +5005,7 @@ impl Ctx<'_> {
                 (term, ty, shaped)
             }
         };
+        check_fraction_arguments(&c.name, &params, &bindings, &term)?;
         let bindings: Vec<(String, IRExpr)> = params
             .iter()
             .map(|(p, _)| p.clone())
@@ -8188,6 +8189,109 @@ fn require_bool(e: &SExpr, what: &str) -> R<()> {
 /// fits, and `F64` beside a float; a float literal stays `F64`. A negated
 /// integer literal is one too: `-3` beside an `I32` is the negation of an
 /// `I32` literal, where both the literal and its negation fit.
+/// A called read's parameter that a `percentile` in its body reads as its
+/// fraction takes what the fraction takes where it is written: a number
+/// literal in [0, 1] or a numeric parameter of the caller, whose value the
+/// engine checks before the read reads a row (`E5`). A caller's column, a
+/// computed value or `null` would give each caller row its own fraction,
+/// which a `percentile` does not have.
+fn check_fraction_arguments(
+    name: &str,
+    params: &[(String, PropType)],
+    bindings: &[SExpr],
+    body: &Term,
+) -> R<()> {
+    let mut fractions = HashSet::new();
+    fraction_params(body, &mut fractions);
+    for ((pname, _), v) in params.iter().zip(bindings) {
+        if !fractions.contains(pname) {
+            continue;
+        }
+        let literal = |kind: &SKind| match kind {
+            SKind::Lit(Literal::Integer(n)) => Some(*n as f64),
+            SKind::Lit(Literal::Float(f)) => Some(*f),
+            _ => None,
+        };
+        let value = match &v.kind {
+            SKind::Param(_) => continue,
+            SKind::Neg(inner) => literal(&inner.kind).map(|v| -v),
+            kind => literal(kind),
+        };
+        return match value {
+            Some(f) if (0.0..=1.0).contains(&f) && !matches!(v.kind, SKind::Neg(_)) => continue,
+            Some(f) => Err(err(
+                T8,
+                format!(
+                    "`{name}`'s parameter `${pname}` is `percentile`'s fraction p, which is in [0, 1], got {f}"
+                ),
+            )),
+            None => Err(err(
+                T8,
+                format!(
+                    "`{name}`'s parameter `${pname}` is `percentile`'s fraction p, a number literal in [0, 1] or a numeric parameter, got {}",
+                    v.ty.display()
+                ),
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// The parameters of a read's term that a `percentile` reads as its
+/// fraction. A call inside it passes a use on: when the callee's fraction
+/// parameter is bound to one of this read's parameters, that parameter is a
+/// fraction too. A callee's own parameters stay inside its body.
+fn fraction_params(term: &Term, out: &mut HashSet<String>) {
+    let from_expr = |e: &IRExpr, out: &mut HashSet<String>| {
+        e.visit_nodes(|n| {
+            if let IRExpr::Aggregate {
+                fraction: Some(p), ..
+            } = n
+                && let IRExpr::Param(name, _) = &**p
+            {
+                out.insert(name.clone());
+            }
+        })
+    };
+    match term {
+        Term::Call { bindings, body, .. } => {
+            let mut inner = HashSet::new();
+            fraction_params(body, &mut inner);
+            for (p, e) in bindings {
+                if inner.contains(p)
+                    && let IRExpr::Param(name, _) = e
+                {
+                    out.insert(name.clone());
+                }
+            }
+            return;
+        }
+        Term::Group { keys, aggs, .. } => {
+            for (_, e) in keys {
+                from_expr(e, out);
+            }
+            for (_, a) in aggs {
+                if let Some(IRExpr::Param(name, _)) = &a.fraction {
+                    out.insert(name.clone());
+                }
+                if let Some(arg) = &a.arg {
+                    from_expr(arg, out);
+                }
+            }
+        }
+        Term::Filter { pred, .. } => from_expr(pred, out),
+        Term::Project { items, .. } => {
+            for (_, e) in items {
+                from_expr(e, out);
+            }
+        }
+        _ => {}
+    }
+    for child in term.children() {
+        fraction_params(child, out);
+    }
+}
+
 fn adapt(e: SExpr, other: &Ty) -> SExpr {
     if let (SKind::Neg(inner), Ty::Value(t)) = (&e.kind, other)
         && let SKind::Lit(Literal::Integer(n)) = inner.kind

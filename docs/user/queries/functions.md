@@ -81,7 +81,10 @@ converted to the nearest `F64` first:
   (SQL's `PERCENTILE_CONT`). It is null over no values. `p` is a numeric
   literal from 0 to 1 or a declared numeric parameter. A literal outside
   that range, a column, or a missing `p` is `T8`. A parameter bound outside
-  the range, or to null, is `E5` before the read reads a row.
+  the range, or to null, is `E5` before the read reads a row. A declared
+  read called with `from` passes `p` the same way: the call binds the
+  parameter `p` names to a literal from 0 to 1 or to the caller's numeric
+  parameter, and a caller's column there is `T8` at the call.
 
 Both hold the group's values in the query's memory, `query_memory_bytes`
 ([session settings](settings.md)). Neither takes `distinct` (`T57`). Both

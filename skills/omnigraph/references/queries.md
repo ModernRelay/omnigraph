@@ -448,7 +448,8 @@ Supported: `count`, `sum`, `avg`, `min`, `max`, `collect`, `stddev`, `percentile
 `percentile($x.n, 0.5)` the exact percentile with linear interpolation (null
 over none), both a nullable `F64` over numeric values held in
 `query_memory_bytes`; `p` is a literal from 0 to 1 (`T8` outside) or a
-numeric parameter (`E5` when bound outside or to null), and neither takes
+numeric parameter (`E5` when bound outside or to null), also through a
+`from` call (a caller's column bound to `p` is `T8`), and neither takes
 `distinct` (`T57`). Both work as block values too:
 `percentile($s.amount, 0.5) { $s: Sale, $h sells $s } as median`.
 `count(distinct $f)` counts distinct nodes (distinct edges over an edge

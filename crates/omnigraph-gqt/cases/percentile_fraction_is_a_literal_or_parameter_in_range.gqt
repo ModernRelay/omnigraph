@@ -3,6 +3,9 @@
 # notes: outside [0, 1], a column and a missing p are type errors (T8); a parameter bound outside
 # notes: [0, 1] or to null refuses the read before it reads a row (E5), with keys over no rows too.
 # notes: `distinct` applies to neither `stddev` nor `percentile` (T57).
+# notes: A called read's parameter that its `percentile` reads as p takes the same: a call binds it to a
+# notes: number literal in [0, 1] or a caller's numeric parameter, and binding it to a caller's column,
+# notes: directly or through another call, or to a literal outside [0, 1], is a type error at the call (T8).
 
 --- runner
 timeout_ms: 10000
@@ -171,3 +174,78 @@ query count_takes_no_fraction() {
 }
 
 --- expect error: T8: `count` takes one argument
+
+--- query
+query pct($f: F64) {
+    match { $s: Sale }
+    return { percentile($s.small, $f) as value }
+}
+query at_half() {
+    match { from pct(0.5) }
+    return { $value }
+}
+
+--- expect unordered
+{"value":15}
+
+--- expect shape
+value: F64?
+
+--- query
+query pct($f: F64) {
+    match { $s: Sale }
+    return { percentile($s.small, $f) as value }
+}
+query at_caller_fraction($q: F64) {
+    match { from pct($q) }
+    return { $value }
+}
+
+--- params
+{"q": 1}
+
+--- expect unordered
+{"value":40}
+
+--- expect shape
+value: F64?
+
+--- query
+query pct($f: F64?) {
+    match { $s: Sale }
+    return { percentile($s.small, $f) as value }
+}
+query per_sale_share() {
+    match { $t: Sale, from pct($t.share) }
+    return { $t.id, $value }
+}
+
+--- expect error: T8: `pct`'s parameter `$f` is `percentile`'s fraction p, a number literal in [0, 1] or a numeric parameter, got F64?
+
+--- query
+query pct($f: F64?) {
+    match { $s: Sale }
+    return { percentile($s.small, $f) as value }
+}
+query relay($g: F64?) {
+    match { from pct($g) }
+    return { $value }
+}
+query per_sale_share_relayed() {
+    match { $t: Sale, from relay($t.share) }
+    return { $t.id, $value }
+}
+
+--- expect error: T8: `relay`'s parameter `$g` is `percentile`'s fraction p, a number literal in [0, 1] or a numeric parameter, got F64?
+
+--- query
+query pct($f: F64) {
+    match { $s: Sale }
+    return { percentile($s.small, $f) as value }
+}
+query above_one() {
+    match { from pct(1.5) }
+    return { $value }
+}
+
+--- expect error: T8: `pct`'s parameter `$f` is `percentile`'s fraction p, which is in [0, 1], got 1.5
