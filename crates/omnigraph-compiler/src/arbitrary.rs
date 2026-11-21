@@ -138,6 +138,8 @@ pub enum PropTy {
     Vector(&'static str),
     /// A `String @index(fulltext)` field.
     FullText,
+    /// `Blob`, which no read reads: [`GenBlobWrite`] declares it.
+    Blob,
 }
 
 pub const ENUM_MEMBERS: [&str; 3] = ["red", "green", "blue"];
@@ -336,6 +338,7 @@ fn prop_decl(p: &Prop, enum_ty: &str) -> String {
         PropTy::FullText => {
             return format!("String{q} @index(fulltext, analyzer = \"english_v1\")");
         }
+        PropTy::Blob => format!("Blob{q}"),
     };
     if p.indexed {
         format!("{base} @index")
@@ -495,6 +498,7 @@ fn prop_json(c: &mut Choices, p: &Prop) -> Option<String> {
             let words: Vec<&str> = (0..n).map(|_| *c.pick(&WORDS)).collect();
             json_string(&words.join(" "))
         }
+        PropTy::Blob => json_string(c.pick(&["base64:", "base64:AQID", "base64:BAUGBw=="])),
     })
 }
 
@@ -722,6 +726,115 @@ impl GenRead {
     }
 }
 
+/// A write whose assignment copies a Blob read from its group's row: the
+/// generated schema with a `b: Blob?` on every node and edge type, and a
+/// write whose group's `match` a generated read's elements draw, then one
+/// `update`, `insert`, `upsert` or `replace` assigning `b` a Blob value over
+/// the bound nodes and edges (a cell, `null`, a Blob parameter, `if` and
+/// `coalesce` of them).
+#[derive(Debug, Clone)]
+pub struct GenBlobWrite {
+    pub schema: String,
+    pub source: String,
+}
+
+impl GenBlobWrite {
+    pub fn generate(c: &mut Choices, schema: &GenSchema) -> Self {
+        let mut with_blobs = schema.clone();
+        for props in with_blobs
+            .nodes
+            .iter_mut()
+            .map(|n| &mut n.props)
+            .chain(with_blobs.edges.iter_mut().map(|e| &mut e.props))
+        {
+            props.push(Prop {
+                name: "b".into(),
+                ty: PropTy::Blob,
+                nullable: true,
+                indexed: false,
+            });
+        }
+        let options = ReadOptions {
+            search: false,
+            order_limit: false,
+            ..ReadOptions::default()
+        };
+        let mut g = ReadGen {
+            schema: &with_blobs,
+            c,
+            options,
+            fresh: 0,
+            params: Vec::new(),
+            nullable_nodes: Vec::new(),
+            pure: false,
+            pure_blocks: false,
+        };
+        let mut scope = Vec::new();
+        let mut elements = Vec::new();
+        g.first_element(&mut scope, &mut elements);
+        for _ in 0..g.c.below(3) {
+            g.element(&mut scope, &mut elements, 1);
+        }
+        let mut text = format!("  match {{ {} }}", elements.join(", "));
+        if g.c.flag(30) {
+            let w = g.expr(Class::Bool, &scope, 1);
+            let _ = write!(text, "\n  where {w}");
+        }
+        let value = g.blob_value(&scope, 2);
+        let targets: Vec<(String, usize)> = ReadGen::node_vars(&scope)
+            .into_iter()
+            .filter(|(n, _)| !g.nullable_nodes.contains(n))
+            .collect();
+        let statement = match g.c.below(5) {
+            0 | 4 if !targets.is_empty() => {
+                let (x, _) = g.c.pick(&targets).clone();
+                format!("update {x} set {{ b: {value} }}")
+            }
+            mode => {
+                let t = g.c.below(with_blobs.nodes.len());
+                // A non-null key that no block computes (`T44`): a String in
+                // scope or a literal.
+                let strs = g.leaves(Class::Str, &scope);
+                let key = if !strs.is_empty() && g.c.flag(70) {
+                    format!("coalesce({}, \"k\")", g.c.pick(&strs))
+                } else {
+                    g.literal(Class::Str)
+                };
+                let mut assignments = vec![format!("k: {key}")];
+                for p in &with_blobs.nodes[t].props {
+                    if p.nullable {
+                        continue;
+                    }
+                    let v = match &p.ty {
+                        PropTy::Scalar(sc) => match sc.class() {
+                            Class::Int => "1".to_string(),
+                            Class::Float => "1.5".to_string(),
+                            class => g.literal(class),
+                        },
+                        PropTy::Enum => "\"red\"".to_string(),
+                        PropTy::ListStr => "[]".to_string(),
+                        PropTy::Vector(_) | PropTy::FullText | PropTy::Blob => continue,
+                    };
+                    assignments.push(format!("{}: {v}", p.name));
+                }
+                assignments.push(format!("b: {value}"));
+                let verb = ["insert", "insert", "upsert", "replace", "upsert"][mode];
+                format!(
+                    "{verb} {} {{ {} }}",
+                    with_blobs.nodes[t].name,
+                    assignments.join(", ")
+                )
+            }
+        };
+        let _ = write!(text, "\n  {statement}");
+        let decls: Vec<String> = g.params.iter().map(|(_, d, _)| d.clone()).collect();
+        GenBlobWrite {
+            schema: with_blobs.text(),
+            source: format!("query w({}) {{\n{text}\n}}\n", decls.join(", ")),
+        }
+    }
+}
+
 impl ReadGen<'_, '_, '_> {
     fn var(&mut self, prefix: &str) -> String {
         self.fresh += 1;
@@ -781,6 +894,39 @@ impl ReadGen<'_, '_, '_> {
             }
         }
         (text, ordered)
+    }
+
+    /// A Blob value over the nodes and edges in scope: a cell `$x.b`, `null`,
+    /// a Blob parameter, or `if` and `coalesce` of such values.
+    fn blob_value(&mut self, scope: &[Var], depth: u32) -> String {
+        let cells: Vec<String> = scope
+            .iter()
+            .filter(|v| matches!(v.kind, VarKind::Node(_) | VarKind::Edge(_)))
+            .map(|v| format!("{}.b", v.name))
+            .collect();
+        match self.c.below(10) {
+            0 | 1 if depth > 0 => {
+                // A condition no block computes (`T44`).
+                let condition = self.pure_conjunct(scope);
+                let then = self.blob_value(scope, depth - 1);
+                let otherwise = self.blob_value(scope, depth - 1);
+                format!("if({condition}, {then}, {otherwise})")
+            }
+            2 | 3 if depth > 0 => {
+                let n = 2 + self.c.below(2);
+                let args: Vec<String> = (0..n).map(|_| self.blob_value(scope, depth - 1)).collect();
+                format!("coalesce({})", args.join(", "))
+            }
+            4 => "null".to_string(),
+            5 => {
+                let name = self.var("blob");
+                self.params
+                    .push((name.clone(), format!("{name}: Blob?"), None));
+                name
+            }
+            _ if !cells.is_empty() => self.c.pick(&cells).clone(),
+            _ => "null".to_string(),
+        }
     }
 
     /// The integer leaves in scope that a division may meet as zero: node
@@ -3280,6 +3426,109 @@ mod tests {
         " nulls last",
         "\u{a0}",
     ];
+
+    /// Generated writes that copy a Blob read from the row type-check and
+    /// lower: no refusal (`T86` among them) and a write shape the planner
+    /// builds, over every statement and every Blob value form.
+    fn generated_blob_writes_lower(cases: u32) {
+        let mut runner = TestRunner::new_with_rng(
+            Config {
+                cases,
+                failure_persistence: None,
+                ..Config::default()
+            },
+            proptest::test_runner::TestRng::deterministic_rng(
+                proptest::test_runner::RngAlgorithm::ChaCha,
+            ),
+        );
+        let refusals: std::cell::RefCell<std::collections::BTreeMap<String, (usize, String)>> =
+            Default::default();
+        let drawn: std::cell::RefCell<std::collections::BTreeMap<&str, usize>> = Default::default();
+        let total = std::cell::Cell::new(0usize);
+        runner
+            .run(&(choices(64), choices(256)), |(s, w)| {
+                let schema = GenSchema::generate(&mut Choices::new(&s), SchemaOptions::default());
+                let write = GenBlobWrite::generate(&mut Choices::new(&w), &schema);
+                let catalog = build_catalog(&parse_schema(&write.schema).unwrap()).unwrap();
+                total.set(total.get() + 1);
+                for form in BLOB_FORMS {
+                    if write.source.contains(form) {
+                        *drawn.borrow_mut().entry(form).or_default() += 1;
+                    }
+                }
+                let outcome = check_source(&catalog, &write.source).and_then(|mut decls| {
+                    let core = decls.pop().unwrap().1?.core;
+                    match &core {
+                        crate::ir::core::CoreDecl::Write(core) => {
+                            crate::shape::write::WriteShape::of(core, &catalog).map_err(|e| {
+                                crate::query::diagnostic::QueryDiagnostic::typecheck(
+                                    crate::query::codes::P006,
+                                    e.to_string(),
+                                )
+                            })?;
+                            Ok(())
+                        }
+                        crate::ir::core::CoreDecl::Read(_) => Ok(()),
+                    }
+                });
+                if let Err(d) = outcome {
+                    let mut refusals = refusals.borrow_mut();
+                    let entry = refusals
+                        .entry(d.code.as_str().to_string())
+                        .or_insert((0, String::new()));
+                    entry.0 += 1;
+                    if entry.1.is_empty() {
+                        entry.1 = format!("{}\n{}\n{}", d.message, write.schema, write.source);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let refusals = refusals.into_inner();
+        for (code, (n, example)) in &refusals {
+            eprintln!("{code}: {n}/{}\n{example}\n", total.get());
+        }
+        assert!(refusals.is_empty(), "{} codes refused", refusals.len());
+        let drawn = drawn.into_inner();
+        eprintln!(
+            "Blob writes drawing each form of {}: {drawn:?}",
+            total.get()
+        );
+        let missing: Vec<&&str> = BLOB_FORMS
+            .iter()
+            .filter(|s| !drawn.contains_key(*s))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "no generated Blob write draws {missing:?}"
+        );
+    }
+
+    /// The statements, value forms and sources the Blob write generator must
+    /// reach.
+    const BLOB_FORMS: [&str; 10] = [
+        "update ",
+        "insert ",
+        "upsert ",
+        "replace ",
+        "if(",
+        "coalesce(",
+        "Blob?)",
+        "optional {",
+        "$k",
+        "$edge",
+    ];
+
+    #[test]
+    fn generated_blob_writes_lower_at_the_gate() {
+        generated_blob_writes_lower(2_000);
+    }
+
+    #[test]
+    #[ignore = "nightly: 100,000 generated Blob writes; the gate runs 2,000"]
+    fn generated_blob_writes_lower_at_nightly_breadth() {
+        generated_blob_writes_lower(100_000);
+    }
 
     #[test]
     fn generated_reads_type_check_at_the_gate() {

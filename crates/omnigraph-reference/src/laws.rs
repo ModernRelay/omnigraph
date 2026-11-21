@@ -673,7 +673,7 @@ fn arm_column(c: &mut Choices, schema: &GenSchema, node: usize, var: &str) -> (S
     let props: Vec<_> = schema.nodes[node]
         .props
         .iter()
-        .filter(|p| !matches!(p.ty, PropTy::Vector(_)))
+        .filter(|p| !matches!(p.ty, PropTy::Vector(_) | PropTy::Blob))
         .collect();
     match c.below(4) {
         0 => (
@@ -702,7 +702,7 @@ fn arm_column(c: &mut Choices, schema: &GenSchema, node: usize, var: &str) -> (S
                 ),
                 PropTy::ListStr => (ScalarType::String, true, None),
                 PropTy::FullText => (ScalarType::String, false, None),
-                PropTy::Vector(_) => unreachable!("filtered"),
+                PropTy::Vector(_) | PropTy::Blob => unreachable!("filtered"),
             };
             (
                 format!("{var}.{}", p.name),

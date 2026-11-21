@@ -104,6 +104,7 @@ jobs:
             query::syntax::tests::round_trip::print_then_parse_is_the_identity_on_generated_declarations_at_nightly_breadth \
             query::syntax::tests::round_trip::a_displayed_expression_types_to_the_expression_at_nightly_breadth \
             arbitrary::tests::generated_reads_type_check_at_nightly_breadth \
+            arbitrary::tests::generated_blob_writes_lower_at_nightly_breadth \
             engine::lexical_scan::tests::the_banded_distance_equals_the_table_on_generated_terms_at_nightly_breadth \
             laws::generated_reads_hold_the_operator_laws_at_nightly_breadth \
             laws::generated_unions_type_as_the_rfc_joins_their_arms_at_nightly_breadth \
