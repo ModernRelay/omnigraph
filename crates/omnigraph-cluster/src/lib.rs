@@ -393,7 +393,7 @@ async fn plan_config_dir_impl(
             Ok(migrations) => {
                 for change in &mut changes {
                     if let ResourceKind::Schema(graph_id) = resource_kind(&change.resource) {
-                        change.migration = migrations.get(&graph_id).cloned();
+                        change.set_schema_migration(migrations.get(&graph_id).cloned());
                     }
                 }
             }

@@ -774,6 +774,96 @@ fn cluster_e2e_apply_schema_query_and_noop_each_have_exact_receipts() {
     let repeated = apply_cluster_fixture(temp.path());
     assert!(repeated["result"]["graphs"].as_object().unwrap().is_empty());
     assert_ne!(repeated["result"]["id"], evolved["result"]["id"]);
+
+    // A schema change needs an actor the installed policy grants
+    // `schema_apply`, as apply does.
+    let plan_as = |root: &std::path::Path, json: bool| {
+        let mut command = cli();
+        command
+            .args(["--as", "act-cluster-test", "cluster", "plan", "--target"])
+            .arg(root)
+            .arg("--config")
+            .arg(root);
+        if json {
+            command.arg("--json");
+        }
+        output_success(&mut command)
+    };
+    // A comment-only edit converges with no graph publication: the graph
+    // keeps its accepted source and head, the ledger records the configured
+    // text's digest beside the unchanged contract, and the next plan sees no
+    // difference.
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let shown = |graph: &std::path::Path| {
+        stdout_string(&output_success(
+            cli().args(["schema", "show", "--target"]).arg(graph),
+        ))
+    };
+    let commits = |graph: &std::path::Path| {
+        stdout_string(&output_success(
+            cli()
+                .args(["commit", "list", "--json", "--target"])
+                .arg(graph),
+        ))
+    };
+    let (accepted, history) = (shown(&graph), commits(&graph));
+    let state = |root: &std::path::Path| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(root.join("__cluster/state.json")).unwrap()).unwrap()
+    };
+    let contract = state(temp.path())["applied_revision"]["schema_contracts"]["knowledge"].clone();
+    let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        format!("// reviewed by the data team\n{schema}"),
+    )
+    .unwrap();
+    let plan = parse_stdout_json(&plan_as(temp.path(), true));
+    let change = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["resource"] == "schema.knowledge")
+        .unwrap();
+    assert_eq!(change["text_only"], true, "{plan}");
+    let configured = change["after_digest"].clone();
+    let text_only = apply_cluster_fixture(temp.path());
+    assert_eq!(
+        text_only["result"]["graphs"]["knowledge"]["result"]["NoOp"]["contract"], contract,
+        "{text_only}"
+    );
+    assert_eq!((shown(&graph), commits(&graph)), (accepted, history));
+    assert!(!shown(&graph).contains("reviewed"));
+    let achieved = state(temp.path());
+    assert_eq!(
+        achieved["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        configured
+    );
+    assert_eq!(
+        achieved["applied_revision"]["schema_contracts"]["knowledge"],
+        contract
+    );
+    let plan = cluster_json(temp.path(), "plan");
+    assert!(plan["changes"].as_array().unwrap().is_empty(), "{plan}");
+
+    // A real change after it publishes the configured text, comment included.
+    fs::write(
+        temp.path().join("people.pg"),
+        format!(
+            "// reviewed by the data team\n{}",
+            schema.replace("bio: String?", "bio: String? nickname: String?")
+        ),
+    )
+    .unwrap();
+    let real = apply_cluster_fixture(temp.path());
+    assert!(
+        real["result"]["graphs"]["knowledge"]["result"]["Committed"]["commit"].is_object(),
+        "{real}"
+    );
+    let stored = shown(&graph);
+    assert!(
+        stored.contains("reviewed by the data team") && stored.contains("nickname"),
+        "{stored}"
+    );
 }
 
 /// A stored query in edition-2 text is refused at deployment; `lint --fix

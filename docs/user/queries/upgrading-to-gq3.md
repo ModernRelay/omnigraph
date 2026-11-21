@@ -245,6 +245,8 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
   one-way.
 - A schema apply whose plan has no step publishes nothing: the stored text
   and the graph head stay as they were, so an explicit `distance = "l2"` over
-  an omitted one, or an edited comment, is never stored. A cluster refuses
-  such a text-only change of a graph's schema file (`schema_preflight_failed`);
-  keep the file equal to `omnigraph schema show`.
+  an omitted one, or an edited comment, is never stored. A cluster applies
+  such a text-only change of a graph's schema file with no graph commit:
+  `cluster plan` reports it as `text_only`, and the graph keeps the source
+  `omnigraph schema show` shows
+  ([deployment boundaries](../clusters/index.md#deployment-boundaries)).

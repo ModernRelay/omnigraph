@@ -2322,7 +2322,28 @@ mod tests {
                 (prepared, None)
             };
             // Deliberately bypass request admission to model foreign handle
-            // drift. Even a source-only change invalidates the exact binding.
+            // drift. A text-only apply (a comment) keeps the accepted
+            // identity and publishes nothing, so it is no drift; a
+            // description change is an identity change and invalidates the
+            // exact binding.
+            let bound = alpha.engine.schema_contract_digest();
+            let applied = alpha
+                .engine
+                .apply_schema(&format!(
+                    "// foreign {stage} comment\n{}",
+                    alpha.engine.schema_source()
+                ))
+                .await
+                .unwrap();
+            assert!(!applied.applied && applied.commit.is_none());
+            assert_eq!(alpha.engine.schema_contract_digest(), bound);
+            if stage == "prepare" {
+                drop(
+                    registry
+                        .prepare_same_view(&operations, &alpha.key, transition_deadline())
+                        .unwrap(),
+                );
+            }
             alpha
                 .engine
                 .apply_schema(&format!(

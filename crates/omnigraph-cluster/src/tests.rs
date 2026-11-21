@@ -3309,37 +3309,75 @@ async fn plan_embeds_migration_preview_for_schema_update() {
         Some(omnigraph_compiler::schema::one_way::ONE_WAY_NOTE)
     );
 
-    // Text that keeps the stored schema plans no step: the engine's apply
-    // would publish nothing, so the ledger would record text the graph does
-    // not hold. Plan and apply refuse it and write nothing.
+    // Text that keeps the accepted identity plans no step: the plan names it
+    // text only, apply publishes no graph commit and the graph keeps its
+    // accepted source, and the ledger records the configured text's digest
+    // beside the unchanged contract, so the next plan sees no change.
     fs::write(
         dir.path().join("people.pg"),
         format!("// reworded comment\n{SCHEMA}"),
     )
     .unwrap();
-    let state = fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
+    let version = identity_manifest_version(dir.path()).await;
+    let ledger = |dir: &Path| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(dir.join(CLUSTER_STATE_FILE)).unwrap()).unwrap()
+    };
+    let contract = ledger(dir.path())["applied_revision"]["schema_contracts"]["knowledge"].clone();
     let out = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
-    assert!(!out.ok, "{out:?}");
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let change = out
+        .changes
+        .iter()
+        .find(|change| change.resource == "schema.knowledge")
+        .unwrap();
+    assert!(change.text_only, "{change:?}");
     assert!(
-        out.diagnostics
-            .iter()
-            .any(|d| d.code == "schema_preflight_failed" && d.message.contains("plans no step")),
-        "{:?}",
-        out.diagnostics
+        change
+            .migration
+            .as_ref()
+            .is_some_and(|plan| plan.supported && plan.steps.is_empty())
     );
-    let refused = apply_deployment(
+    let configured = change.after_digest.clone().unwrap();
+    let applied = apply_deployment(
         dir.path(),
         None,
         &DeploymentCaller::storage_owner(Some("principal:owner".into())),
         |_, _, _| {},
     )
     .await
-    .unwrap_err();
-    assert_eq!(refused.code, "schema_preflight_failed", "{refused:?}");
-    assert_eq!(
-        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
-        state
+    .unwrap();
+    let DeploymentLookup::Complete { result } = applied else {
+        panic!("{applied:?}");
+    };
+    assert!(result.converged, "{result:?}");
+    assert!(
+        matches!(
+            &result.graphs["knowledge"],
+            GraphDeploymentResult::Schema {
+                result: omnigraph::db::SchemaApplySettlement::NoOp { .. }
+            }
+        ),
+        "{:?}",
+        result.graphs
     );
+    assert_eq!(identity_manifest_version(dir.path()).await, version);
+    let achieved = ledger(dir.path());
+    assert_eq!(
+        achieved["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        configured.as_str()
+    );
+    assert_eq!(
+        achieved["applied_revision"]["schema_contracts"]["knowledge"],
+        contract
+    );
+    assert_ne!(contract["source_hash"], configured.as_str());
+    let db = Omnigraph::open_read_only(dir.path().join("graphs/knowledge.omni").to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(db.schema_source().as_str(), SCHEMA);
+    drop(db);
+    let out = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
+    assert!(out.ok && out.changes.is_empty(), "{out:?}");
     fs::write(dir.path().join("people.pg"), additive).unwrap();
 
     let caller = DeploymentCaller::storage_owner(Some("principal:owner".into()));

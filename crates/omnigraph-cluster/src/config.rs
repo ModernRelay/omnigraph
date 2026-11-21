@@ -700,11 +700,30 @@ pub(crate) async fn observe_declared_graphs(
 
         match observe_live_graph(backend, &graph_uri).await {
             Ok(observation) => {
-                let schema_matches = observation.schema_digest == graph.schema_digest;
+                // The ledger realizes a text-only change by the unchanged
+                // contract: the configured text's digest sits beside the
+                // accepted identity, and the graph keeps its accepted source.
+                let realized = state
+                    .applied_revision
+                    .resources
+                    .get(&schema_address)
+                    .is_some_and(|schema| schema.digest == graph.schema_digest)
+                    && state
+                        .applied_revision
+                        .schema_contracts
+                        .as_ref()
+                        .and_then(|contracts| contracts.get(&graph.id))
+                        == Some(&observation.contract);
+                let schema_matches = observation.schema_digest == graph.schema_digest || realized;
+                let schema_digest = if realized {
+                    graph.schema_digest.clone()
+                } else {
+                    observation.schema_digest.clone()
+                };
                 state.applied_revision.resources.insert(
                     schema_address.clone(),
                     StateResource {
-                        digest: observation.schema_digest.clone(),
+                        digest: schema_digest.clone(),
                         applies_to: None,
                         embedding_provider: None,
                         embedding_profile: None,
@@ -718,7 +737,7 @@ pub(crate) async fn observe_declared_graphs(
                 let external_blob_policy = state_graph_external_blob_policy(state, &graph.id);
                 let graph_digest_value = graph_digest_with_external_blob_policy(
                     &graph.id,
-                    Some(&observation.schema_digest),
+                    Some(&schema_digest),
                     Some(&query_digests),
                     embedding_provider.as_deref(),
                     embedding_provider_digest.as_ref(),
@@ -807,6 +826,7 @@ pub(crate) async fn observe_declared_graphs(
 pub(crate) struct LiveGraphObservation {
     graph_manifest_version: u64,
     schema_digest: String,
+    contract: omnigraph::db::SchemaContractDigest,
 }
 
 pub(crate) async fn observe_live_graph(
@@ -827,6 +847,7 @@ pub(crate) async fn observe_live_graph(
     Ok(LiveGraphObservation {
         graph_manifest_version: snapshot.graph_manifest_version(),
         schema_digest: sha256_hex(schema_source.as_bytes()),
+        contract: db.schema_contract_digest(),
     })
 }
 

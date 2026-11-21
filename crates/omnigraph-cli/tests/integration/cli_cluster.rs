@@ -2838,6 +2838,72 @@ fn cluster_plan_json_reads_inferred_local_state() {
                 && change["operation"] == "update"),
         "{json}"
     );
+
+    // A schema change needs an actor the installed policy grants
+    // `schema_apply`, as apply does.
+    let plan_as = |root: &std::path::Path, json: bool| {
+        let mut command = cli();
+        command
+            .args(["--as", "act-cluster-test", "cluster", "plan", "--target"])
+            .arg(root)
+            .arg("--config")
+            .arg(root);
+        if json {
+            command.arg("--json");
+        }
+        output_success(&mut command)
+    };
+    // A comment-only edit keeps the accepted identity: the plan reports the
+    // schema update as text only, with no step, and says the graph keeps its
+    // accepted source.
+    let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        format!("// reviewed\n{schema}"),
+    )
+    .unwrap();
+    let json = parse_stdout_json(&plan_as(temp.path(), true));
+    assert_eq!(json["ok"], true, "{json}");
+    let change = json["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["resource"] == "schema.knowledge")
+        .unwrap();
+    assert_eq!(change["operation"], "update");
+    assert_eq!(change["text_only"], true, "{change}");
+    assert_eq!(change["migration"]["supported"], true);
+    assert_eq!(change["migration"]["steps"], serde_json::json!([]));
+    let human = stdout_string(&plan_as(temp.path(), false));
+    assert!(
+        human.contains("Update schema.knowledge [text only]"),
+        "{human}"
+    );
+    assert!(
+        human.contains(
+            "graph keeps its accepted schema source, which `omnigraph schema show` shows"
+        ),
+        "{human}"
+    );
+
+    // A real change after it is no longer text only.
+    fs::write(
+        temp.path().join("people.pg"),
+        format!(
+            "// reviewed\n{}",
+            schema.replace("age: I32?", "age: I32?\n  bio: String?")
+        ),
+    )
+    .unwrap();
+    let json = parse_stdout_json(&plan_as(temp.path(), true));
+    let change = json["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["resource"] == "schema.knowledge")
+        .unwrap();
+    assert!(change.get("text_only").is_none(), "{change}");
+    assert_ne!(change["migration"]["steps"], serde_json::json!([]));
 }
 
 #[test]

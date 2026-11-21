@@ -1456,9 +1456,6 @@ pub async fn plan_captured_deployment(
                     "observed schema migration is unsupported",
                 ));
             }
-            if migration.steps.is_empty() {
-                diagnostics.push(schema_text_without_step(graph));
-            }
             if db
                 .branch_list()
                 .await
@@ -1471,7 +1468,7 @@ pub async fn plan_captured_deployment(
                     format!("graph {graph} schema apply requires only main"),
                 ));
             }
-            change.migration = Some(migration);
+            change.set_schema_migration(Some(migration));
         }
     }
     annotate_plan_changes(&store, &mut changes, diagnostics.first())?;
@@ -2326,9 +2323,10 @@ async fn prepare_graphs(
                 )
                 .await
                 .map_err(|error| refusal("schema_preflight_failed", error.to_string()))?;
-            if intent.is_noop() {
-                return Err(schema_text_without_step(&graph));
-            }
+            // A text-only change keeps the accepted identity: its intent is a
+            // no-op that publishes nothing, and the graph keeps its accepted
+            // source. The ledger then records the configured text's digest
+            // beside the unchanged contract.
             if intent.base_contract() != achieved {
                 return Err(refusal(
                     "applied_schema_drift",
@@ -2344,18 +2342,6 @@ async fn prepare_graphs(
         graphs.insert(graph, entry);
     }
     Ok((graphs, migrations))
-}
-
-/// A configured schema whose text differs from the stored one while its plan
-/// has no step: the engine's apply publishes nothing for it, so the stored
-/// source would never match the configuration the ledger records.
-fn schema_text_without_step(graph: &str) -> Diagnostic {
-    refusal(
-        "schema_preflight_failed",
-        format!(
-            "graph {graph}: the configured schema text differs from the stored schema but plans no step, so a schema apply publishes nothing for it; keep the configured text equal to the stored schema (`omnigraph schema show`) or make a change the plan reports"
-        ),
-    )
 }
 
 fn authorize_graph_deletion(
@@ -2725,7 +2711,11 @@ fn validate_pending_input(
             || entry.intent.as_ref().is_some_and(|intent| {
                 intent.actor() != pending.authorization.authority.actor.as_deref()
                     || intent.base_contract() != &pending.authorization.base.schema_contracts[graph]
-                    || intent.desired_contract().source_hash != bundle.resources[&address].digest
+                    // A no-op intent keeps the accepted source; any other
+                    // publishes exactly the configured text.
+                    || (!intent.is_noop()
+                        && intent.desired_contract().source_hash
+                            != bundle.resources[&address].digest)
             })
         {
             return Err(refusal(

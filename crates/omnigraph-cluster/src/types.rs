@@ -222,9 +222,27 @@ pub struct PlanChange {
     /// unavailable (error `schema_preview_unavailable`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub migration: Option<SchemaMigrationPlan>,
+    /// For schema updates: the configured text differs from the applied text
+    /// while its accepted identity is the same (a comment, layout, an explicit
+    /// default), so the migration has no step. Apply publishes no graph commit
+    /// and the graph keeps its accepted source; the ledger records the new
+    /// text's digest beside the unchanged contract.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub text_only: bool,
     /// Removing a declared graph deletes its managed root and retained history.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delete_root: Option<String>,
+}
+
+impl PlanChange {
+    /// Attach a schema update's migration plan. A supported plan with no
+    /// step keeps the accepted identity: the change is text only.
+    pub(crate) fn set_schema_migration(&mut self, migration: Option<SchemaMigrationPlan>) {
+        self.text_only = migration
+            .as_ref()
+            .is_some_and(|plan| plan.supported && plan.steps.is_empty());
+        self.migration = migration;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

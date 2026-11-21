@@ -554,11 +554,18 @@ pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Wri
             } else {
                 ""
             };
+            let text_only = if change.text_only { " [text only]" } else { "" };
             writeln!(
                 stdout,
-                "  {:?} {}{bindings}",
+                "  {:?} {}{bindings}{text_only}",
                 change.operation, change.resource
             )?;
+            if change.text_only {
+                writeln!(
+                    stdout,
+                    "      no step: the accepted identity is unchanged, so apply publishes no graph commit; the graph keeps its accepted schema source, which `omnigraph schema show` shows"
+                )?;
+            }
             if let Some(migration) = &change.migration {
                 if !migration.supported {
                     writeln!(stdout, "      migration UNSUPPORTED:")?;

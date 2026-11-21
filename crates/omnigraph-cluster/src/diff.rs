@@ -20,6 +20,7 @@ pub(crate) fn diff_resources(
                 binding_change: false,
                 metadata_change: None,
                 migration: None,
+                text_only: false,
                 delete_root: None,
             }),
             Some(before) if before != after => changes.push(PlanChange {
@@ -32,6 +33,7 @@ pub(crate) fn diff_resources(
                 binding_change: false,
                 metadata_change: None,
                 migration: None,
+                text_only: false,
                 delete_root: None,
             }),
             Some(_) => {}
@@ -49,6 +51,7 @@ pub(crate) fn diff_resources(
                 binding_change: false,
                 metadata_change: None,
                 migration: None,
+                text_only: false,
                 delete_root: None,
             });
         }
@@ -98,6 +101,7 @@ pub(crate) fn diff_state_resources(
                 binding_change: metadata_change == PlanMetadataChange::PolicyBindings,
                 metadata_change: Some(metadata_change),
                 migration: None,
+                text_only: false,
                 delete_root: None,
             });
         }

@@ -429,10 +429,13 @@ fn valid_contracts(
         .keys()
         .filter_map(|address| address.strip_prefix("graph."))
         .collect();
+    // A schema resource's digest is the configured text, and the contract's
+    // `source_hash` the source the graph holds. They differ after a text-only
+    // change, which realizes the configured text by the unchanged contract.
     graphs.len() == contracts.len()
         && contracts.iter().all(|(graph, contract)| {
             graphs.contains(graph.as_str())
-                && resources.get(&schema_address(graph)) == Some(&contract.source_hash)
+                && resources.contains_key(&schema_address(graph))
                 && valid_contract(contract)
         })
 }
