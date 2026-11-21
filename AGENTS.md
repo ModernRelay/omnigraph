@@ -114,6 +114,27 @@ more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
 
+Applied to the shape of a design, that lens is **conceptual integrity**
+(Brooks): few ideas, applied everywhere. Always weigh it.
+
+- **Correct by construction.** Make the illegal state unrepresentable; fix the
+  class, not the reported instance.
+- **Generality.** The prompting case is an instance of the mechanism, with no
+  branch, flag or constant of its own (zero-one-infinity).
+- **Orthogonality and composability.** Primitives vary independently and close
+  under composition; extend or compose one before adding one.
+- **Intrinsic naming.** Name a thing by what it is or selects, never by the
+  caller, scenario or change that prompted it.
+- **Cases as data.** Real variation is a parameter or a table row, not new
+  code.
+
+The counterweight is **speculative generality** (Fowler) and the wrong
+abstraction (Metz): YAGNI, the rule of three. For a design choice, state the
+specific form and the general form, argue for and against each, and name what
+the choice trades away. Decide by the same lens, on evidence: the general form
+wins only when the tree has the cases it serves today and it leaves fewer
+concepts than the specific one (parsimony).
+
 Validate every assumption. Do not assume how a function, module or symbol
 behaves: read it. For Lance internals, read the upstream implementation.
 
