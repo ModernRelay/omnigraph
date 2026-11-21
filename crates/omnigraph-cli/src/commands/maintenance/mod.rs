@@ -117,6 +117,7 @@ pub(crate) async fn run_optimize(
     let db = crate::admission::open_writable(
         &binding,
         async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
+        None,
         stderr,
     )
     .await?;
@@ -139,6 +140,7 @@ pub(crate) async fn run_index(
             let db = crate::admission::open_writable(
                 &binding,
                 async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
+                None,
                 stderr,
             )
             .await?;
@@ -197,6 +199,7 @@ pub(crate) async fn rebuild_full_text_indexes(
     let db = crate::admission::open_writable(
         binding,
         async { Ok(omnigraph::storage::storage_for_binding(binding)?) },
+        None,
         stderr,
     )
     .await?;
@@ -251,6 +254,7 @@ pub(crate) async fn run_cleanup(
     let db = crate::admission::open_writable(
         &binding,
         async { Ok(omnigraph::storage::storage_for_binding(&binding)?) },
+        None,
         stderr,
     )
     .await?;

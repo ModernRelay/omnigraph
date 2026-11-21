@@ -53,7 +53,7 @@ pub(crate) async fn refuse_legacy_sidecars(
     Err(OmniError::recovery_required(
         first.clone(),
         format!(
-            "{operation} found {} recovery sidecar(s) under '{RECOVERY_DIR_NAME}/' ({}), written by an OmniGraph \
+            "{operation} found {} recovery sidecar(s) under '{RECOVERY_DIR_NAME}/' ({}), written by an Omnigraph \
              build that predates detached table commits; this build cannot interpret them. Open the graph \
              read-write with the build that wrote them so it finishes its recovery, then retry",
             ids.len(),

@@ -4362,7 +4362,7 @@ fn path_to_utf8(path: &Path) -> Result<&str, ProjectionError> {
         ProjectionError::new(
             "projection_path_not_utf8",
             Some(path),
-            "OmniGraph local URIs require a UTF-8 path",
+            "Omnigraph local URIs require a UTF-8 path",
         )
     })
 }

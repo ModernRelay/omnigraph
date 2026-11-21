@@ -719,7 +719,7 @@ fn overlap_diagnostic_paths(outcome: &LoadOutcome) -> Vec<String> {
             assert!(
                 diagnostic
                     .message
-                    .contains("overlaps an OmniGraph storage root"),
+                    .contains("overlaps an Omnigraph storage root"),
                 "{diagnostic:?}"
             );
         })

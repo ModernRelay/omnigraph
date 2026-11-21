@@ -3287,6 +3287,52 @@ fn optimize_resolves_a_cluster_graph_by_id() {
     );
 }
 
+/// A direct `load csv` whose source lies inside a cluster graph's storage
+/// root is refused before the command takes the cluster's admission: it
+/// reports no effects, retains no admission lock, and the graph does not move,
+/// so the corrected load is not blocked.
+#[test]
+fn load_statement_over_a_cluster_graph_root_is_refused_before_admission() {
+    let temp = applied_knowledge_cluster();
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let csv_path = graph.join("people.csv");
+    fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+    let version_before = manifest_dataset_version(&graph);
+
+    let output = cli()
+        .arg("mutate")
+        .arg("--target")
+        .arg(temp.path())
+        .args(["--graph", "knowledge", "--as", "act-operator", "-e"])
+        .arg(format!(
+            "load csv \"file://{}\" into node:Person mode append header",
+            csv_path.display()
+        ))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = parse_stdout_json(&output);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("overlaps an Omnigraph storage root"),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["disposition"],
+        serde_json::json!({"effects": "none", "action": "fix"}),
+        "{refused}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("cluster admission retained"),
+        "{output:?}"
+    );
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+    assert_eq!(manifest_dataset_version(&graph), version_before);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
     let temp = applied_knowledge_cluster();
