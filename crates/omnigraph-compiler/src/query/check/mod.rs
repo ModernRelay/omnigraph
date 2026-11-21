@@ -5015,7 +5015,7 @@ impl Ctx<'_> {
                 (term, ty, shaped)
             }
         };
-        check_fraction_arguments(&c.name, &params, &bindings, &term)?;
+        check_fraction_arguments(c, &params, &bindings, &term)?;
         let bindings: Vec<(String, IRExpr)> = params
             .iter()
             .map(|(p, _)| p.clone())
@@ -8206,11 +8206,19 @@ fn require_bool(e: &SExpr, what: &str) -> R<()> {
 /// computed value or `null` would give each caller row its own fraction,
 /// which a `percentile` does not have.
 fn check_fraction_arguments(
-    name: &str,
+    c: &Call,
     params: &[(String, PropType)],
     bindings: &[SExpr],
     body: &Term,
 ) -> R<()> {
+    let name = &c.name;
+    // At the call, which binds the value, not in the called read's body.
+    let refused = |message: String| {
+        let mut d = QueryDiagnostic::typecheck(T8, message);
+        d.position = Some(c.at.position);
+        d.end = Some(c.at.end_position);
+        Err(E::D(d))
+    };
     let mut fractions = HashSet::new();
     fraction_params(body, &mut fractions);
     for ((pname, _), v) in params.iter().zip(bindings) {
@@ -8229,18 +8237,12 @@ fn check_fraction_arguments(
         };
         return match value {
             Some(f) if (0.0..=1.0).contains(&f) && !matches!(v.kind, SKind::Neg(_)) => continue,
-            Some(f) => Err(err(
-                T8,
-                format!(
-                    "`{name}`'s parameter `${pname}` is `percentile`'s fraction p, which is in [0, 1], got {f}"
-                ),
+            Some(f) => refused(format!(
+                "`{name}`'s parameter `${pname}` is `percentile`'s fraction p, which is in [0, 1], got {f}"
             )),
-            None => Err(err(
-                T8,
-                format!(
-                    "`{name}`'s parameter `${pname}` is `percentile`'s fraction p, a number literal in [0, 1] or a numeric parameter, got {}",
-                    v.ty.display()
-                ),
+            None => refused(format!(
+                "`{name}`'s parameter `${pname}` is `percentile`'s fraction p, a number literal in [0, 1] or a numeric parameter, got {}",
+                v.ty.display()
             )),
         };
     }
