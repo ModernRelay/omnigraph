@@ -67,13 +67,17 @@ async fn text(store: &dyn ObjectStore, key: &str) -> Option<String> {
     }
 }
 
+/// The keys `store` lists under `prefix`, sorted: a listing's order is the
+/// store's, and a local filesystem lists in directory order.
 async fn keys(store: &dyn ObjectStore, prefix: Option<&str>) -> Vec<String> {
-    store
+    let mut keys: Vec<String> = store
         .list(prefix.map(Path::from).as_ref())
         .map_ok(|meta| meta.location.to_string())
         .try_collect()
         .await
-        .unwrap()
+        .unwrap();
+    keys.sort();
+    keys
 }
 
 /// Every object of `store` with its text, sorted by key: the base's bytes.
@@ -176,10 +180,8 @@ pub async fn a_durable_store_keeps_its_whiteouts_out_of_sight(fixture: &dyn Fixt
         .unwrap();
     store.delete(&graph("c.txt")).await.unwrap();
     store.delete(&graph("a.txt")).await.unwrap();
-    let mut layer_keys = keys(layer.as_ref(), Some("graph/__clone")).await;
-    layer_keys.sort();
     assert_eq!(
-        layer_keys,
+        keys(layer.as_ref(), Some("graph/__clone")).await,
         vec!["graph/__clone/created", "graph/__clone/deleted/a.txt"],
         "the created object and one whiteout per deleted base object, nothing for a clone-root key"
     );
