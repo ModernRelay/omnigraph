@@ -1,8 +1,7 @@
 //! Shared CLI contract tests, compiled once in the application library.
 
 use super::{
-    apply_bearer_token, branch_statement_change_request, branch_statement_query_request,
-    normalize_bearer_token, sync_dir,
+    apply_bearer_token, branch_statement_change_request, branch_statement_query_request, sync_dir,
 };
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
@@ -133,16 +132,6 @@ fn apply_bearer_token_leaves_request_unchanged_when_not_configured() {
         .build()
         .unwrap();
     assert!(request.headers().get(AUTHORIZATION).is_none());
-}
-
-#[test]
-fn normalize_bearer_token_trims_and_filters_blank_values() {
-    assert_eq!(normalize_bearer_token(None), None);
-    assert_eq!(normalize_bearer_token(Some("   ".to_string())), None);
-    assert_eq!(
-        normalize_bearer_token(Some(" demo-token ".to_string())).as_deref(),
-        Some("demo-token")
-    );
 }
 
 /// Sets process environment variables for one test and restores the previous

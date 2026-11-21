@@ -62,6 +62,30 @@ pub struct CleanupPolicyOptions {
     pub older_than: Option<Duration>,
 }
 
+impl CleanupPolicyOptions {
+    /// The instant `older_than` puts before `now`. A duration that reaches
+    /// before the earliest instant the calendar represents is a bad request:
+    /// reading it as "no cutoff" would drop the age rule the caller asked for.
+    pub(crate) fn cutoff(
+        &self,
+        now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let Some(older_than) = self.older_than else {
+            return Ok(None);
+        };
+        chrono::TimeDelta::from_std(older_than)
+            .ok()
+            .and_then(|age| now().checked_sub_signed(age))
+            .map(Some)
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "older_than of {}s reaches before the earliest representable time",
+                    older_than.as_secs()
+                ))
+            })
+    }
+}
+
 /// What one optimize run did to one table. A run reports exactly one outcome
 /// for every table it considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -779,7 +803,7 @@ impl OptimizeRequest {
 /// Per-dataset outcome of `cleanup_all_datasets`. `error` is `Some` when this
 /// dataset's version GC failed; cleanup is fault-isolated per dataset, so a
 /// single dataset's failure is recorded here rather than aborting the whole sweep.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DatasetCleanupStats {
     /// Qualified graph type key, or `__manifest` for the system dataset.
     pub type_key: String,
@@ -795,6 +819,16 @@ pub struct DatasetCleanupStats {
     pub unpublished_bytes: u64,
     /// Linear versions above the newest pin any registration names.
     pub foreign_versions: Vec<u64>,
+    /// On the `__manifest` row at or above the branch-row stamp (RFC "Branch
+    /// existence in the catalog" §The collector): trees under
+    /// `__manifest/tree/` that no live row names, removed.
+    pub manifest_trees_removed: u64,
+    /// Retired branch entries removed from main's config map.
+    pub branch_entries_removed: u64,
+    /// Retired entries a concurrent publication kept for a later run.
+    pub branch_entries_deferred: u64,
+    /// Ref files the upgrade left under `_refs/branches/`, unlinked.
+    pub ref_files_unlinked: u64,
 }
 
 struct OptimizeTableTask {
@@ -2104,12 +2138,19 @@ async fn clear_stale_auto_cleanup_config(
     if keys.is_empty() {
         return Ok(false);
     }
-    // Merge-update with `None` values to delete the keys — the non-deprecated
-    // replacement for `delete_config_keys` (awaiting the builder merges rather
-    // than replacing the whole config map).
-    let entries: Vec<(&str, Option<&str>)> = keys.iter().map(|k| (k.as_str(), None)).collect();
-    ds.update_config(entries).await?;
+    remove_config_keys(ds, &keys).await?;
     Ok(true)
+}
+
+/// Delete `keys` from the config map in one merge-update commit with `None`
+/// values, the shape Lance rebases past the publisher's overwrites and
+/// refuses on a concurrent write of the same key.
+async fn remove_config_keys(
+    ds: &mut lance::Dataset,
+    keys: &[String],
+) -> std::result::Result<(), lance::Error> {
+    let entries: Vec<(&str, Option<&str>)> = keys.iter().map(|k| (k.as_str(), None)).collect();
+    ds.update_config(entries).await.map(|_| ())
 }
 
 decide_seam! {
@@ -2261,9 +2302,7 @@ async fn cleanup_detached_only(
     graph_branches: &[Option<String>],
     table_tasks: &[(String, String)],
 ) -> Result<Vec<DatasetCleanupStats>> {
-    let before_timestamp = options
-        .older_than
-        .map(|duration| crate::dst_clock::now_utc() - duration);
+    let before_timestamp = options.cutoff(crate::dst_clock::now_utc)?;
     let native_plan = prepare_native_fork_reconciliation(db, before_timestamp).await?;
     let plan = super::collector::plan_collection(db, options, graph_branches).await?;
     let mut table_tasks = table_tasks.to_vec();
@@ -2278,7 +2317,7 @@ async fn cleanup_detached_only(
     }
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
     let plan = &plan;
-    let results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
+    let mut results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
         .map(|(table_key, full_path)| async move {
             let summary = plan.row_summary(&full_path);
             let mut swept = super::collector::SweepStats::default();
@@ -2324,6 +2363,7 @@ async fn cleanup_detached_only(
                 unpublished_manifests: summary.unpublished_manifests,
                 unpublished_bytes: summary.unpublished_bytes,
                 foreign_versions: summary.foreign_versions,
+                ..DatasetCleanupStats::default()
             }
         })
         .buffer_unordered(concurrency)
@@ -2387,6 +2427,21 @@ async fn cleanup_detached_only(
             "cleanup could not reconcile some orphaned forks; will retry next cleanup"
         );
     }
+    if reconciled.manifest_trees_removed
+        + reconciled.branch_entries_removed
+        + reconciled.branch_entries_deferred
+        + reconciled.ref_files_unlinked
+        > 0
+    {
+        results.push(DatasetCleanupStats {
+            type_key: "__manifest".to_string(),
+            manifest_trees_removed: reconciled.manifest_trees_removed,
+            branch_entries_removed: reconciled.branch_entries_removed,
+            branch_entries_deferred: reconciled.branch_entries_deferred,
+            ref_files_unlinked: reconciled.ref_files_unlinked,
+            ..DatasetCleanupStats::default()
+        });
+    }
     Ok(results)
 }
 
@@ -2398,6 +2453,12 @@ async fn cleanup_detached_only(
 pub struct BranchReconcileStats {
     pub reclaimed: Vec<(String, String)>,
     pub failures: Vec<(String, String)>,
+    /// The `__manifest` arm's four counts at or above the branch-row stamp
+    /// (RFC "Branch existence in the catalog" §The collector).
+    pub manifest_trees_removed: u64,
+    pub branch_entries_removed: u64,
+    pub branch_entries_deferred: u64,
+    pub ref_files_unlinked: u64,
 }
 
 /// Collect unreferenced table forks under cleanup's complete writer gates.
@@ -2483,25 +2544,332 @@ fn is_native_layout_directory(part: &str) -> bool {
     )
 }
 
-fn native_tree_prefix(relative: &str) -> Result<String> {
+/// What follows `tree/` in `name`; `None` unless `name` lies below `tree`.
+fn path_below_tree<'a>(name: &'a str, tree: &str) -> Option<&'a str> {
+    name.strip_prefix(tree)
+        .and_then(|suffix| suffix.strip_prefix('/'))
+}
+
+/// Every tree name the path of a listed object admits, shortest first: each
+/// valid branch name that precedes a layout directory with a path below it.
+fn native_tree_candidates(relative: &str) -> Vec<String> {
     let segments = relative.split('/').collect::<Vec<_>>();
-    segments
-        .iter()
-        .enumerate()
-        .find_map(|(index, part)| {
-            if index == 0 || index + 1 == segments.len() || !is_native_layout_directory(part) {
-                return None;
-            }
-            let branch = segments[..index].join("/");
-            lance::dataset::refs::check_valid_branch(&branch)
-                .is_ok()
-                .then_some(branch)
-        })
+    (1..segments.len().saturating_sub(1))
+        .filter(|index| is_native_layout_directory(segments[*index]))
+        .map(|index| segments[..index].join("/"))
+        .filter(|branch| lance::dataset::refs::check_valid_branch(branch).is_ok())
+        .collect()
+}
+
+fn native_tree_prefix(relative: &str) -> Result<String> {
+    native_tree_candidates(relative)
+        .into_iter()
+        .next()
         .ok_or_else(|| {
             OmniError::manifest_conflict(format!(
                 "cleanup cannot identify a native fork tree for '{relative}'"
             ))
         })
+}
+
+/// The `__manifest` arm's inventory, by main's stamp: the refs below the
+/// branch-row stamp, the rows at or above it.
+enum ManifestInventory {
+    Refs(NativeForkInventory),
+    Rows(ManifestTreeInventory),
+}
+
+/// The rows arm's inventory (RFC "Branch existence in the catalog" §The
+/// collector): the trees under `__manifest/tree/`, listed before main's latest
+/// rows so a create in flight is already a row; the rows, tags and ref files.
+struct ManifestTreeInventory {
+    trees: std::collections::BTreeSet<String>,
+    live: Vec<crate::db::manifest::BranchRow>,
+    retired: std::collections::BTreeSet<String>,
+    tagged: std::collections::HashSet<String>,
+    ref_files: Vec<String>,
+}
+
+/// The rows arm's inventory of `__manifest` at `full_path`; `None` below the
+/// branch-row stamp, where the refs are the inventory.
+async fn manifest_tree_inventory(
+    db: &Omnigraph,
+    full_path: &str,
+) -> Result<Option<ManifestTreeInventory>> {
+    let mut dataset = db
+        .storage()
+        .open_dataset_head(full_path, None)
+        .await?
+        .into_dataset();
+    if !crate::db::manifest::has_branch_rows(&dataset) {
+        return Ok(None);
+    }
+    let root = dataset
+        .branch_location()
+        .find_main()
+        .map_err(OmniError::storage)?
+        .path;
+    let tree = root.clone().join("tree");
+    let prefix = format!("{tree}/");
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    let archive_suffix = format!("/{}", crate::branch_control::RETIRED_BRANCH_ARCHIVE);
+    let mut trees = std::collections::BTreeSet::new();
+    let mut listed = std::collections::BTreeSet::new();
+    let mut files = store.read_dir_all(&tree, None);
+    while let Some(file) = files.next().await {
+        let file = file.map_err(OmniError::storage)?;
+        let relative = file
+            .location
+            .as_ref()
+            .strip_prefix(&prefix)
+            .ok_or_else(|| {
+                OmniError::manifest_conflict(format!(
+                    "cleanup listed native tree object outside '{tree}'"
+                ))
+            })?;
+        match relative.strip_suffix(&archive_suffix) {
+            Some(branch) => trees.insert(branch.to_string()),
+            None => {
+                native_tree_prefix(relative)?;
+                listed.insert(native_tree_candidates(relative))
+            }
+        };
+    }
+    dataset
+        .checkout_latest()
+        .await
+        .map_err(OmniError::storage)?;
+    let rows = crate::db::manifest::BranchRows::decode(dataset.manifest())?;
+    for candidates in listed {
+        let row_named = candidates
+            .iter()
+            .rev()
+            .find(|native| rows.branch(native).is_some() || rows.is_retired(native));
+        trees.extend(row_named.or(candidates.first()).cloned());
+    }
+    let tagged = dataset
+        .tags()
+        .list()
+        .await
+        .map_err(OmniError::storage)?
+        .into_values()
+        .filter_map(|tag| tag.branch)
+        .collect();
+    let ref_files = crate::branch_control::branch_ref_names(&dataset).await?;
+    Ok(Some(ManifestTreeInventory {
+        trees,
+        live: rows.live().cloned().collect(),
+        retired: rows.retired().map(str::to_string).collect(),
+        tagged,
+        ref_files,
+    }))
+}
+
+/// The inventoried tree a Lance base path lies in, the longest tree name the
+/// path under `tree/` starts with; main's own root and a path under no
+/// inventoried tree name none.
+fn tree_of_base_path<'a>(
+    tree_prefix: &str,
+    trees: &'a std::collections::BTreeSet<String>,
+    path: &object_store::path::Path,
+) -> Option<&'a String> {
+    let relative = path.as_ref().strip_prefix(tree_prefix)?;
+    trees
+        .iter()
+        .filter(|tree| {
+            relative
+                .strip_prefix(tree.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+        .max_by_key(|tree| tree.len())
+}
+
+/// The `__manifest` arm at or above the branch-row stamp (the RFC's §The
+/// collector): keep the live rows' trees, a not-ready row's fork point, the
+/// tagged and `retained` trees and what kept heads' `base_paths` reach.
+async fn collect_manifest_trees(
+    db: &Omnigraph,
+    full_path: &str,
+    inventory: ManifestTreeInventory,
+    mut retained: std::collections::HashSet<String>,
+    stats: &mut BranchReconcileStats,
+) -> Result<()> {
+    let mut dataset = db
+        .storage()
+        .open_dataset_head(full_path, None)
+        .await?
+        .into_dataset();
+    let root = dataset
+        .branch_location()
+        .find_main()
+        .map_err(OmniError::storage)?
+        .path;
+    let tree_root = root.clone().join("tree");
+    let tree_prefix = format!("{tree_root}/");
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
+    retained.extend(inventory.tagged.iter().cloned());
+    for row in &inventory.live {
+        retained.insert(row.native.clone());
+        if !inventory.trees.contains(&row.native) && !row.parent_is_main() {
+            retained.insert(row.parent.clone());
+        }
+    }
+    let mut pending: Vec<String> = retained
+        .iter()
+        .filter(|native| inventory.trees.contains(*native))
+        .cloned()
+        .collect();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(native) = pending.pop() {
+        if !visited.insert(native.clone()) {
+            continue;
+        }
+        let head = match dataset.checkout_branch(&native).await {
+            Ok(head) => head,
+            Err(lance::Error::NotFound { .. }) => continue,
+            Err(error) => return Err(OmniError::storage(error)),
+        };
+        for base in head.manifest().base_paths.values() {
+            let path = base
+                .extract_path(dataset.session().store_registry())
+                .map_err(OmniError::storage)?;
+            let Some(other) = tree_of_base_path(&tree_prefix, &inventory.trees, &path) else {
+                continue;
+            };
+            if retained.insert(other.clone()) {
+                pending.push(other.clone());
+            }
+        }
+    }
+    let mut removed = std::collections::BTreeSet::new();
+    let named: std::collections::BTreeSet<&str> = inventory
+        .trees
+        .iter()
+        .chain(inventory.live.iter().map(|row| &row.native))
+        .chain(&inventory.retired)
+        .map(String::as_str)
+        .collect();
+    for native in inventory
+        .trees
+        .iter()
+        .filter(|native| !retained.contains(*native))
+    {
+        let descendant_lives = named
+            .iter()
+            .any(|other| path_below_tree(other, native).is_some());
+        let layout_holds_a_named_tree = named.iter().any(|other| {
+            path_below_tree(other, native)
+                .and_then(|rest| rest.split('/').next())
+                .is_some_and(is_native_layout_directory)
+        });
+        if layout_holds_a_named_tree {
+            continue;
+        }
+        match remove_manifest_tree(&store, &tree_root, native, descendant_lives).await {
+            Ok(()) => {
+                removed.insert(native.clone());
+                stats
+                    .reclaimed
+                    .push(("__manifest".to_string(), native.clone()));
+                stats.manifest_trees_removed += 1;
+            }
+            Err(error) => stats
+                .failures
+                .push(("__manifest".to_string(), format!("{native}: {error}"))),
+        }
+    }
+    let keys: Vec<String> = inventory
+        .retired
+        .iter()
+        .filter(|native| {
+            !inventory.tagged.contains(*native)
+                && (removed.contains(*native) || !inventory.trees.contains(*native))
+        })
+        .map(|native| crate::db::manifest::branch_rows::branch_entry_key(native))
+        .collect();
+    if !keys.is_empty() {
+        match remove_config_keys(&mut dataset, &keys).await {
+            Ok(()) => {
+                stats.branch_entries_removed += keys.len() as u64;
+                if let Err(error) = db.refresh_coordinator_only().await {
+                    tracing::warn!(
+                        target: "omnigraph::cleanup",
+                        error = %error,
+                        "coordinator refresh after the retired entries' removal failed"
+                    );
+                }
+            }
+            Err(error) => {
+                stats.branch_entries_deferred += keys.len() as u64;
+                tracing::warn!(
+                    target: "omnigraph::cleanup",
+                    error = %error,
+                    entries = keys.len(),
+                    "cleanup deferred the removal of retired branch entries to the next run"
+                );
+            }
+        }
+    }
+    for name in &inventory.ref_files {
+        match crate::branch_control::unlink_branch_ref(&dataset, name).await {
+            Ok(()) => stats.ref_files_unlinked += 1,
+            Err(error) => stats
+                .failures
+                .push(("__manifest".to_string(), format!("ref '{name}': {error}"))),
+        }
+    }
+    Ok(())
+}
+
+/// Remove one tree by its layout directories and retirement archive, never
+/// the directory above it (every slash-named sibling's home) and never a
+/// descendant's; the tree's own directory goes once nothing below it lives.
+async fn remove_manifest_tree(
+    store: &lance::io::ObjectStore,
+    tree_root: &object_store::path::Path,
+    native: &str,
+    descendant_lives: bool,
+) -> Result<()> {
+    let mut base = tree_root.clone();
+    for segment in native.split('/') {
+        base = base.join(segment);
+    }
+    for directory in [
+        "_versions",
+        "_transactions",
+        "data",
+        "_deletions",
+        "_indices",
+    ] {
+        match store.remove_dir_all(base.clone().join(directory)).await {
+            Ok(()) | Err(lance::Error::NotFound { .. }) => {}
+            Err(error) => return Err(OmniError::storage(error)),
+        }
+    }
+    match store
+        .delete(
+            &base
+                .clone()
+                .join(crate::branch_control::RETIRED_BRANCH_ARCHIVE),
+        )
+        .await
+    {
+        Ok(()) | Err(lance::Error::NotFound { .. }) => {}
+        Err(error) => return Err(OmniError::storage(error)),
+    }
+    if !descendant_lives {
+        match store.remove_dir_all(base).await {
+            Ok(()) | Err(lance::Error::NotFound { .. }) => {}
+            Err(error) => return Err(OmniError::storage(error)),
+        }
+    }
+    Ok(())
 }
 
 async fn native_fork_inventory(
@@ -2662,7 +3030,7 @@ decide_seam! {
 }
 
 struct NativeForkReconciliationPlan {
-    manifest: Option<NativeForkInventory>,
+    manifest: Option<ManifestInventory>,
     tables: Vec<(String, String, String, NativeForkInventory)>,
     stats: BranchReconcileStats,
 }
@@ -2693,9 +3061,14 @@ async fn prepare_native_fork_reconciliation(
     };
     let manifest_inventory = async {
         let full_path = crate::db::manifest::manifest_uri(db.root_uri());
+        if let Some(inventory) = manifest_tree_inventory(db, &full_path).await? {
+            return Ok(ManifestInventory::Rows(inventory));
+        }
         let handle = db.storage().open_dataset_head(&full_path, None).await?;
         crate::branch_control::archive_retired_manifest_branches(handle.dataset()).await?;
-        native_fork_inventory(handle.dataset(), before_timestamp).await
+        native_fork_inventory(handle.dataset(), before_timestamp)
+            .await
+            .map(ManifestInventory::Refs)
     }
     .await;
     match manifest_inventory {
@@ -2854,19 +3227,37 @@ async fn reconcile_frozen_native_forks(
         let retained = native_table_retention_roots(&inventory, plan, &full_path, &object_base);
         collect_native_forks(db, &full_path, &table_key, inventory, retained, &mut stats).await;
     }
-    if let Some(inventory) = frozen.manifest {
-        let full_path = crate::db::manifest::manifest_uri(db.root_uri());
-        let mut retained = plan.protected_manifest_branches.clone();
-        retained.extend(inventory.tagged.iter().cloned());
-        collect_native_forks(
-            db,
-            &full_path,
-            "__manifest",
-            inventory,
-            retained,
-            &mut stats,
-        )
-        .await;
+    let full_path = crate::db::manifest::manifest_uri(db.root_uri());
+    match frozen.manifest {
+        Some(ManifestInventory::Refs(inventory)) => {
+            let mut retained = plan.protected_manifest_branches.clone();
+            retained.extend(inventory.tagged.iter().cloned());
+            collect_native_forks(
+                db,
+                &full_path,
+                "__manifest",
+                inventory,
+                retained,
+                &mut stats,
+            )
+            .await;
+        }
+        Some(ManifestInventory::Rows(inventory)) => {
+            if let Err(error) = collect_manifest_trees(
+                db,
+                &full_path,
+                inventory,
+                plan.protected_manifest_branches.clone(),
+                &mut stats,
+            )
+            .await
+            {
+                stats
+                    .failures
+                    .push(("__manifest".to_string(), error.to_string()));
+            }
+        }
+        None => {}
     }
     Ok(stats)
 }

@@ -19,11 +19,8 @@ omnigraph query sources_for_claim --query queries.gq \
 # Publish its result to main, then remove the source branch.
 omnigraph branch merge review/add-benchmark --into main --delete-branch \
   --target ./graph.omni
-```
 
-List and delete branches with:
-
-```bash
+# List the branches; delete one by name.
 omnigraph branch list --target ./graph.omni
 omnigraph branch delete review/abandoned --target ./graph.omni
 ```
@@ -41,10 +38,18 @@ written a commit, whatever its history, and the branches are not read as one
 cut. The served listing needs the `read` that `GET /branches` needs, and has
 details only for branches the caller may `read`.
 
-Creating a branch defaults to `main` when `--from` is omitted. To start a
-branch at a past commit instead of a branch head, use `--from-commit`; see
-[start a branch at a commit](#start-a-branch-at-a-commit). A load can create a
-missing target branch by combining `--branch <name>` with `--from <base>`.
+A create records the branch in the catalog, then writes its tree. Interrupted
+between the two, it leaves a **not ready** branch, shown by `--detailed` as
+`<name> not_ready from=… created_at=…` and refused on read and write with
+`branch_not_ready` (HTTP 409) until `branch delete` removes it. A delete
+interrupted after ending the tree leaves a **retirement pending** branch, shown
+as `<name> deleted (retirement pending)` (`retirement_pending: true`) and
+refused with `branch_deleted` until the next `branch delete` finishes it. A
+create of a held name, ready or not, refuses with `branch_exists`.
+
+Creating a branch defaults to `main` when `--from` is omitted; `--from-commit`
+starts it at a past commit (see [start a branch at a commit](#start-a-branch-at-a-commit));
+a load creates a missing target branch with `--branch <name>` and `--from <base>`.
 
 Each branch operation is also a GQ statement, so a client that already sends
 `.gq` source needs no second transport. The three control writes go to
@@ -62,55 +67,50 @@ branch merge-base "review/add-benchmark" into main
 branch merge "review/add-benchmark" into main dry run
 ```
 
-`from` defaults to `main` and `into` defaults to `main`. A name outside the
-identifier alphabet (a lowercase letter or `_`, then letters, digits, or `_`),
-such as one containing `/`, `-`, or `.`, is quoted, as above; `main`, `b0`,
-and `_x` are bare. A control write answers a
-`ChangeOutput` whose `outcome.kind` is `created`, `deleted`, or `merged`
-(`outcome.merge` holds the merge result), with zero affected counts; a merge
-that publishes a commit reports it in `commit`. `branch list` answers one row
-per branch in column `name`, sorted by name. Each statement runs under the same
-policy check as its HTTP route (`POST /branches`, `DELETE /branches/{branch_name}`,
-`POST /branches/merge`, `GET /branches`), and `branch list` is a read, so it is
-refused on `POST /mutate` as a control write is refused on `POST /query`. The
-branch reads `branch diff`, `branch merge-base` and `branch merge … dry run`
-answer rows as `branch list` does and take their routes' checks; see
-[reviewing a branch](changes.md#review-a-branch) and
+`from` and `into` default to `main`. A name outside the identifier alphabet (a
+lowercase letter or `_`, then letters, digits, or `_`), such as one containing
+`/`, `-`, or `.`, is quoted, as above; `main`, `b0`, and `_x` are bare. A
+control write answers a `ChangeOutput` whose `outcome.kind` is `created`,
+`deleted`, or `merged` (`outcome.merge` holds the merge result), with zero
+affected counts; a merge that publishes a commit reports it in `commit`.
+`branch list` answers one row per branch in column `name`, sorted by name. Each
+statement runs under the same policy check as its HTTP route (`POST /branches`,
+`DELETE /branches/{branch_name}`, `POST /branches/merge`, `GET /branches`);
+`branch list` is a read, refused on `POST /mutate` as a control write is on
+`POST /query`. The branch reads `branch diff`, `branch merge-base` and
+`branch merge … dry run` answer rows as `branch list` does and take their
+routes' checks; see [reviewing a branch](changes.md#review-a-branch) and
 [previewing a merge](merge.md#preview-a-merge). A bare `dry run` after the
 names is the clause, so a branch named `dry` is quoted.
 
-Branches are cheap until written: unchanged data remains shared with the source.
+Branches are cheap until written: unchanged data stays shared with the source.
 A branch remains after a normal merge, so prefer `--delete-branch` or delete it
-when review is complete. Live branches retain the history they depend on and can
-prevent `omnigraph cleanup` from reclaiming old data.
+after review. Live branches keep the history they depend on from `cleanup`.
 
 ## Branch names
 
 Branch names may contain `/`, but live names must not be path prefixes of one
-another. For example, `review` and `review/alice` cannot coexist. `main` is
-reserved. A parent branch can be deleted while descendants remain. A path segment
-may not end in `.` followed by 26 upper-case letters and digits: that shape is
-reserved for OmniGraph's internal per-life branch identity. Ordinary dotted
-names such as `release.1.2` are fine.
+another (`review` and `review/alice` cannot coexist); `main` is reserved. A
+parent branch can be deleted while descendants remain. A path segment may not
+end in `.` followed by 26 upper-case letters and digits, the shape reserved for
+Omnigraph's internal per-life branch identity; `release.1.2` is fine.
 
-A branch name is used exactly as written. A name that is empty, has leading or
-trailing whitespace, or contains a control character is refused wherever a
-branch is named: the branch a read or write targets, `from`, merge sources and
-targets, branch create and delete, Blob writes, change feeds and branch
-statements. The server answers `400 Bad Request` before authorization, the
-embedded engine returns a bad-request error before any effect, and the CLI
-reports either error. Names are never trimmed, so `main ` does not name
-`main`.
+A branch name is used exactly as written, never trimmed: `main ` does not name
+`main`. A name that is empty, has leading or trailing whitespace, or contains a
+control character is refused wherever a branch is named (read and write
+targets, `from`, merge sources and targets, create and delete, Blob writes,
+change feeds and branch statements): the server answers `400 Bad Request`
+before authorization, the embedded engine a bad-request error before any
+effect, and the CLI reports either.
 
 Deleting a branch and creating another with the same name yields a fresh
-branch lifetime. Readers that captured the deleted branch fail with a typed
-error rather than seeing the replacement. Deletion retires the logical name
-and leaves native manifest history and table storage for explicit `omnigraph cleanup`; it starts no background table-reclaim work. Cleanup preserves data still needed by
-other branches and their underlying histories.
-
-Branch-control operations are safe across handles in one writer process. Do not
-run branch create/delete control concurrently from separate writer processes
-against the same graph.
+lifetime; readers that captured the deleted branch fail with `branch_deleted`.
+Deletion retires the name in the catalog and leaves its history and table
+storage for explicit `omnigraph cleanup`, which reclaims every tree the catalog
+no longer names and keeps data other branches still need; no background reclaim
+runs. Create and delete publish on `main`: beside a process that claimed its
+writer epoch they are refused `writer_fenced`; a delete of a branch another
+process holds proceeds, and that process's next write is refused `branch_deleted`.
 
 ## Atomicity model
 

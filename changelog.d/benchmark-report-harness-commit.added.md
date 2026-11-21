@@ -1,0 +1,1 @@
+- `omnigraph-bench report` names the harness commit that drove each row, beside the commit it measured, and lists a group's distinct harness commits (`harness=mixed(n)` in the text form).

@@ -131,7 +131,7 @@ impl DatasetLease {
                 limits,
             )
             .and_then(|t| t.restore_active()),
-            ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone => {
+            ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone | ResetMode::Rebuild => {
                 return Err(error(
                     "the dataset lease restores a restore level only; the clone level reads the template through an empty active root",
                 ));

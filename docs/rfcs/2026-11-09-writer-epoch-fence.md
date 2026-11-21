@@ -13,7 +13,7 @@ supersedes: []
 superseded_by: []
 blocked_on:
   - "the stamp order with 2026-10-16-graph-access-serving-and-cross-process-writes and PR 963"
-  - "the tombstone's relation to the epoch, decided with 2026-10-16-graph-access-serving-and-cross-process-writes"
+  - "the tombstone's relation to the epoch, decided with 2026-10-16-graph-access-serving-and-cross-process-writes, settled by 2026-11-19-branch-row-in-the-catalog: the tombstone asserts no epoch, since it ends the chain, and leaves the chain's `writer_epoch` row as it was"
   - "the GQ spelling of branch claim, on the branch-statement grammar of 0055-gq-branch-statements"
 ---
 
@@ -111,7 +111,7 @@ A wrong assumption costs a write nothing new: on a held branch a claim is the on
 
 ### Publications outside `publish_prepared`
 
-Every publication through the publisher asserts its process's holder, the ones with no ordinary write transaction included: `repair`'s pin-adopting publish, schema apply's and settlement's `ExactGraphVersion` publications, the system-column upgrade, and the publication of an unpublished commit, a proposal written with `as commit`, which asserts the publisher's holder and not the proposal's captured authority. Two writers of the branch sit outside the publisher and assert nothing: `optimize`'s configuration commit, a Lance `update_config` commit (Invariants, not fenced), and `omnigraph upgrade`'s stamp-only route, which writes no row and runs with every writer stopped.
+Every publication through the publisher asserts its process's holder, the ones with no ordinary write transaction included: `repair`'s pin-adopting publish, schema apply's and settlement's `ExactGraphVersion` publications, the system-column upgrade, and the publication of an unpublished commit, a proposal written with `as commit`, which asserts the publisher's holder and not the proposal's captured authority. Three writers of a branch sit outside the publisher and assert nothing: `optimize`'s configuration commit, a Lance `update_config` commit (Invariants, not fenced), `omnigraph upgrade`'s stamp-only route, which writes the branch rows and no publication, and runs with every writer stopped, and the collector's removal of a retired row's entry on main, an `UpdateConfig` of `config_updates` alone.
 
 ### Sibling sentences this RFC amends
 
@@ -135,7 +135,7 @@ Against [the architectural invariants](../dev/invariants.md):
 
 Deny list: "process-local locks presented as distributed writer fencing" is what this RFC stops relying on; the gates stay contention optimizations. "Silent retries" and "acknowledgement before durable graph visibility" are untouched: a claim is acknowledged when its version exists, a refusal is never retried.
 
-Support boundary, "Branch creation/deletion and cleanup retain their existing single-writer-process control boundary": unchanged. The epoch fences publications through the publisher only. Not fenced today: Lance ref metadata puts (`replace_metadata`), ref unlinks and deletes, the collector's deletes of refs and trees, `optimize`'s configuration commit. The ref and collector writes become fenced once their first durable step is a publication, which the graph-access RFC's control facts make of them; `optimize`'s configuration commit waits for a change of its own; the sentence stays until then.
+Support boundary, "Branch creation/deletion and cleanup retain their existing single-writer-process control boundary": unchanged. The epoch fences publications through the publisher only. Not fenced today: Lance ref metadata puts (`replace_metadata`), ref unlinks and deletes, the collector's deletes of refs and trees, `optimize`'s configuration commit. Branch create and delete become fenced once their deciding step is a publication, which the branch row and the retired row of 2026-11-19-branch-row-in-the-catalog make of them; the collector's writes stay outside the publisher; `optimize`'s configuration commit waits for a change of its own; the sentence stays until then.
 
 No invariant is weakened.
 
@@ -191,7 +191,7 @@ Acceptance: every test green; on an unheld branch a write's request delta exactl
 1. **The row, the holder, the check, the claim API, the control-fact publication kind**, under the control-fact stamp with its upgrade route and the two `commit.rs` lines unless already landed. Nothing changes before a graph is upgraded; after it, epoch 0 everywhere, no claim until phase 2's command.
 2. **The collector by epoch, `branch claim` in CLI and HTTP (the GQ statement once RFC 0055's grammar has landed), `--claim` on the direct commands that publish, the `branch_claim` action, the `branch list` field, the owner's probe skip, and the server claiming each agent branch it creates.** From here a branch a server creates is held by that server; after a restart the orchestrator claims, through the server, each agent branch it is to write.
 3. **`main` claimed after admission** by the cluster lease holder, whose `main` reads then run probe-free. Precondition: `main`'s maintenance through the served route and schema apply through a served route no RFC adds today ([Graph access and cross-process writes](2026-10-16-graph-access-serving-and-cross-process-writes.md) keeps `schema apply` direct), or both by the stop, run with `--claim`, claim-again procedure (User behavior).
-4. **Consumers.** The graph-access RFC's registration, tombstone and drop record publish through the control-fact kind under the same assertion; the merger's takeover of abandoned branches follows in its own change.
+4. **Consumers.** The registration (the branch row) and the drop record publish under the publish assertion; the tombstone asserts no epoch (2026-11-19-branch-row-in-the-catalog); the merger's takeover of abandoned branches follows in its own change.
 
 `implementation` moves to `in-progress` at phase 1 and to `complete` at phase 3.
 
@@ -216,3 +216,4 @@ Implementation note, 2026-11-13: phase 1 and, from phase 2, the `branch_claim` a
   - **The holder's branch.** The entry carries the native branch of its claim and counts only on that chain: the epoch restarts on a branch recreated under its name, so the number alone let a process that held the deleted branch at `E` publish on the new one at `E`. Rejected: carrying the epoch across a delete, which waits on the tombstone decision (`blocked_on`).
   - **The probe skip with several handles.** A handle skips only while its installed head is not behind the version the holder records for the process's last publication, and reloads when behind: the installed head is a handle's own, so a second handle of the owner would otherwise read its old snapshot with nothing to end it. Rejected: one installed head shared by a process's handles, a change larger than the fence; the skip for a single handle only.
   - **A claim for a direct command.** `--claim` runs the claim in the command's own process: a `branch claim` by direct CLI ends with its process before the command starts, so the stop, claim, run procedure had no surface to run on. Rejected: served routes only, which no RFC adds today for `schema apply`, `index build`, `index rebuild` or `repair`.
+- 2026-11-20: amended by RFC 2026-11-19 "Branch existence in the catalog": the second `blocked_on` entry, §Publications outside `publish_prepared`, the support-boundary paragraph of §Invariants and rollout phase 4 now say the tombstone asserts no epoch, the branch rows make create and delete fenced, and the upgrade route and the collector's entry removal sit outside the publisher.

@@ -704,6 +704,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
+        "branch_delete_through_rows",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
         "commit_updates_with_actor_with_expected",
         WriteProtocol::Exact("shared publisher gateway"),
     ),
@@ -747,6 +753,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "delete_branch_with_expected",
+        WriteProtocol::NativeRefControl,
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "delete_branch_through",
         WriteProtocol::NativeRefControl,
     ),
     (
@@ -1011,6 +1023,8 @@ gateway_surfaces! {
     ],
     "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::ReadOrPure => [
         "cached_rows",
+        "adopt_image",
+        "rekey_image",
         "held_writer_version",
         "withdraw_held_version",
         "release_writer_epoch",
@@ -1026,6 +1040,13 @@ gateway_surfaces! {
     ],
     "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("writer epoch claim gateway: the loaded rows with the `writer_epoch` row one epoch above the one the claim first read, as the next `__manifest` version under the branch incarnation the caller captured; the branch head is unchanged and no graph commit is recorded")) => [
         "claim_writer_epoch",
+    ],
+    "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("branch row gateway: the loaded rows unchanged with the intent's entries in the config map, a branch row or a retired row on main under the process's writer epoch or a tree's tombstone under none, as the next `__manifest` version with the loaded fragments named again; the branch head is unchanged and no graph commit is recorded")) => [
+        "publish_rows",
+    ],
+    "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::ReadOrPure => [
+        "refuse_if_fenced",
+        "main_publisher",
     ],
     "omnigraph-catalog/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::ReadOrPure => [
         "new_with_session",
@@ -1058,7 +1079,7 @@ durable_calls! {
     // deletion is last, so interrupted settlement can safely finish later.
     ("db/omnigraph/prepared_create.rs", ".delete_prefix(", 2, WriteProtocol::Exact("quiesced token-owned empty birth tables and unpublished manifest files; never graph root or foreign refs")),
     ("db/omnigraph/prepared_create.rs", ".delete(", 1, WriteProtocol::Exact("exact prepared init claim, removed only after all verified birth artifacts")),
-    ("db/upgrade.rs", "commit_builder(", 4, WriteProtocol::Exact("offline storage upgrade: fence, conversion and activation commits with zero retries under main-owned intent, and the per-ref stamp commit of the stamp-only route")),
+    ("db/upgrade.rs", "commit_builder(", 4, WriteProtocol::Exact("offline storage upgrade: fence, conversion and activation commits with zero retries under main-owned intent, and the per-ref stamp commit of the stamp-only route; the activation commit and main's stamp commit carry the branch rows of every ref when they raise main to the branch-row stamp")),
     ("db/upgrade.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("db/upgrade.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("omnigraph-core/fts_compat.rs", ".put(", 1, WriteProtocol::Composed("staged index artifact")),
@@ -1175,20 +1196,22 @@ durable_calls! {
     ("db/omnigraph/optimize.rs", "commit_updates_on_branch_with_expected(", 1, OPTIMIZE_V9),
     ("db/omnigraph/optimize.rs", ".update_config(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph.rs", ".branch_create(", 2, WriteProtocol::NativeRefControl),
-    ("db/omnigraph.rs", ".branch_delete_captured(", 1, WriteProtocol::NativeRefControl),
+    ("db/omnigraph.rs", ".branch_delete_captured(", 2, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".create_branch(", 1, WriteProtocol::NativeRefControl),
     ("db/graph_coordinator.rs", ".delete_branch_with_expected(", 1, WriteProtocol::NativeRefControl),
     ("omnigraph-core/branch_control.rs", ".create_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
     ("omnigraph-core/lance_clone.rs", ".create_branch(", 1, WriteProtocol::Composed("scoped native clone index-origin forwarding")),
+    ("omnigraph-core/lance_clone.rs", "commit_builder(", 1, WriteProtocol::Composed("the shallow-clone commit that is a branch's tree at the fork point its row on main names, with no ref written (RFC \"Branch existence in the catalog\" §Create)")),
     ("omnigraph-core/lance_clone.rs", ".commit(", 1, WriteProtocol::Composed("Lance commit-handler publication forwarding")),
     ("omnigraph-core/lance_clone.rs", ".delete(", 1, WriteProtocol::Composed("Lance commit-handler deletion forwarding")),
     ("omnigraph-core/branch_control.rs", ".replace_metadata(", 1, WriteProtocol::NativeRefControl),
     ("omnigraph-core/branch_control.rs", ".put_opts(", 1, WriteProtocol::Composed("create-only exact retirement archive before native ref unlink")),
-    ("omnigraph-core/branch_control.rs", ".delete(", 1, WriteProtocol::Composed("unlink only the freshly validated retired ref after its exact archive is durable")),
+    ("omnigraph-core/branch_control.rs", ".delete(", 1, WriteProtocol::Composed("unlink a ref file and nothing else: the freshly validated retired ref after its exact archive is durable below the branch-row stamp, every ref once the upgrade's rows are the branch set")),
     ("omnigraph-core/branch_control.rs", ".tags(", 1, WriteProtocol::ReadOnlyAccess),
     ("omnigraph-catalog/retention.rs", ".tags(", 3, WriteProtocol::Composed("nonce-owned merge input tag creation and immutable collector tag inventories")),
     ("omnigraph-catalog/retention.rs", ".delete(", 1, WriteProtocol::Composed("release acknowledged nonce-owned merge tags or tags with proven dead target authority")),
-    ("db/omnigraph/optimize.rs", ".tags(", 1, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/optimize.rs", ".tags(", 2, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/optimize.rs", ".delete(", 1, WriteProtocol::PhysicalOnly),
     ("db/omnigraph/collector.rs", ".tags(", 2, WriteProtocol::ReadOnlyAccess),
     ("omnigraph-core/branch_control.rs", ".force_delete_branch(", 1, WriteProtocol::Composed("graph/data native refs")),
     ("db/omnigraph/optimize.rs", ".force_delete_branch(", 1, WriteProtocol::PhysicalOnly),
@@ -1214,13 +1237,13 @@ durable_calls! {
     // candidate scan + parent before-image probe and the full-merge fallback.
     // Read-only — it stages and publishes nothing.
     ("changes/candidate_scan.rs", ".dataset()", 5, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/collector.rs", ".dataset()", 17, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/collector.rs", ".dataset()", 19, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".delete(", 1, WriteProtocol::Composed("detached-only sweep through the table's own Lance store: freed files, then the published manifests no retained `__manifest` version pins (links before tips) and the dead stagings; an interrupted pass is re-swept by the next")),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
     ("db/omnigraph/optimize.rs", ".dataset()", 11, WriteProtocol::Composed("Optimize planning, including each plan's measure against its table ceilings, + read-only coverage and native-fork inventory + the configuration clear's read-back after a failed removal + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
-    ("db/omnigraph/optimize.rs", ".into_dataset()", 1, WriteProtocol::PhysicalOnly),
+    ("db/omnigraph/optimize.rs", ".into_dataset()", 3, WriteProtocol::PhysicalOnly),
     // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
     // derived, regenerable topology written ONLY from `optimize`'s tail (never
     // the query path, which only loads), outside graph visibility — a stale or
@@ -2693,6 +2716,12 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         "removal of a refused overwrite's own uncommitted fragment files, each under a fresh Lance data-file name the same call's writer minted and no manifest references; a late delete can only remove that file, and a file that stays is cleanup's",
     ),
     (
+        "db/omnigraph/optimize.rs",
+        ".delete(",
+        1,
+        "removal of the retirement archive of a `__manifest` tree the collector reclaims at or above the branch-row stamp: the file was written once by a legacy delete under a ULID-suffixed native name no later lifetime reuses, and nothing reads it at that stamp; a late delete removes a file of a tree already gone, and a file that stays is the next cleanup's",
+    ),
+    (
         "db/omnigraph/collector.rs",
         ".delete(",
         1,
@@ -3652,6 +3681,11 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "db/commit_graph.rs: omnigraph_catalog::commit_graph::CommitGraph",
     "db/commit_graph.rs: omnigraph_catalog::commit_graph::GraphCommit",
     "db/commit_graph.rs: omnigraph_catalog::commit_graph::GraphCommitKind",
+    "db/manifest.rs: omnigraph_catalog::BRANCH_CREATE_POST_ROW",
+    "db/manifest.rs: omnigraph_catalog::BRANCH_CREATE_POST_TREE",
+    "db/manifest.rs: omnigraph_catalog::BRANCH_DELETE_POST_RETIRED_ROW",
+    "db/manifest.rs: omnigraph_catalog::BRANCH_DELETE_POST_TOMBSTONE",
+    "db/manifest.rs: omnigraph_catalog::BRANCH_DELETE_PRE_TOMBSTONE",
     "db/manifest.rs: omnigraph_catalog::DatasetEntry",
     "db/manifest.rs: omnigraph_catalog::DatasetUpdate",
     "db/manifest.rs: omnigraph_catalog::INTERNAL_MANIFEST_SCHEMA_VERSION",
