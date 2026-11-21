@@ -35,8 +35,7 @@ pub(crate) async fn embedded_storage(
         None => {
             let storage = storage_for_binding(binding)?;
             let root = binding.uri();
-            let marker = format!("{}/__clone/created", root.trim_end_matches('/'));
-            if storage.exists(&marker).await? {
+            if storage.exists(&clone_marker(root)).await? {
                 return Err(crate::targets::refusal(
                     "target_invalid",
                     format!(
@@ -46,8 +45,22 @@ pub(crate) async fn embedded_storage(
             }
             Ok(storage)
         }
-        Some(base) => Ok(omnigraph::storage::storage_read_through(base, binding.uri()).await?),
+        Some(base) => {
+            // The build writes the marker when the clone root has none,
+            // before the engine opens the graph, so the open's own refusal
+            // no longer says that the command took no effect.
+            let marker = clone_marker(binding.uri());
+            if !storage_for_binding(binding)?.exists(&marker).await? {
+                crate::command_outcome::storage_wrote();
+            }
+            Ok(omnigraph::storage::storage_read_through(base, binding.uri()).await?)
+        }
     }
+}
+
+/// The object whose presence makes `root` a graph shallow clone's root.
+fn clone_marker(root: &str) -> String {
+    format!("{}/__clone/created", root.trim_end_matches('/'))
 }
 
 /// Read commands never acquire writer admission or run the writable capability

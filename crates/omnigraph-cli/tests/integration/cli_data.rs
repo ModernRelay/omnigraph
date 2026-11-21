@@ -6279,6 +6279,51 @@ fn cli_refuses_a_missing_graph_as_not_found_before_any_write() {
     }
 }
 
+/// Under `--base`, building read-through storage writes a new clone root's
+/// `__clone/created` marker before the engine opens the graph. When the base
+/// holds no graph, the open's not-found refusal covers the open alone: the
+/// marker stays, so the command does not report effects none. Once the root
+/// holds the marker, the same refusal writes nothing and reports effects none.
+#[test]
+fn cli_does_not_report_no_effects_after_writing_a_clone_marker() {
+    let temp = tempdir().unwrap();
+    let base = temp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let clone = temp.path().join("clone.omni");
+    let marker = clone.join("__clone").join("created");
+    let branch_create = || {
+        cli()
+            .args(["branch", "create", "feature", "--json", "--target"])
+            .arg(&clone)
+            .arg("--base")
+            .arg(&base)
+            .output()
+            .unwrap()
+    };
+
+    let output = branch_create();
+    let refused = parse_stdout_json(&output);
+    assert_eq!(refused["code"], "not_found", "{refused}");
+    assert_eq!(
+        refused["disposition"],
+        json!({"effects": "unknown", "action": "reconcile"}),
+        "{refused}"
+    );
+    assert_eq!(output.status.code(), Some(2), "{refused}");
+    assert!(marker.exists(), "{}", marker.display());
+
+    let output = branch_create();
+    let refused = parse_stdout_json(&output);
+    assert_eq!(refused["code"], "not_found", "{refused}");
+    assert_eq!(
+        refused["disposition"],
+        json!({"effects": "none", "action": "fix"}),
+        "{refused}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{refused}");
+    assert_eq!(fs::read_dir(&clone).unwrap().count(), 1);
+}
+
 #[test]
 fn cli_fails_for_missing_schema_or_data_file() {
     let temp = tempdir().unwrap();

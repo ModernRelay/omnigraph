@@ -37,6 +37,7 @@ pub(crate) struct Evidence {
     kind: CommandKind,
     dispatched: usize,
     writable_open: bool,
+    storage_wrote: bool,
     last_request_effectful: bool,
     http_status: Option<u16>,
     retry_after: Option<String>,
@@ -228,6 +229,14 @@ pub(crate) fn writable_open() {
     update(|state| state.writable_open = true);
 }
 
+/// Building the command's storage wrote before the engine ran, as read-through
+/// storage under `--base` writes a new clone root's `__clone/created` marker.
+/// An engine error then covers only the engine's part, so it no longer says
+/// that the command took no effect.
+pub(crate) fn storage_wrote() {
+    update(|state| state.storage_wrote = true);
+}
+
 /// An embedded engine write's own error. The engine refuses with a typed,
 /// settled error before it publishes and marks a publication in doubt, so
 /// this error carries what the write did, unlike any error after it.
@@ -363,7 +372,11 @@ impl Failure {
                 },
             }
         };
-        let served = served.or_else(|| output.disposition.filter(|_| engine_write && embedded));
+        let served = served.or_else(|| {
+            output
+                .disposition
+                .filter(|_| engine_write && embedded && !evidence.storage_wrote)
+        });
         let not_started = !contradicted
             && (read
                 || admission.is_some()
