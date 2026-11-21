@@ -1,8 +1,9 @@
 # issue: none
 # notes: A node overwrite's plan carries one retained-edges stage per endpoint of every edge
 # notes: table that references the type; dropping a node a committed edge still points at
-# notes: refuses as an orphan edge before any fragment write, and keeping every referenced
-# notes: node lands the replacement while probing retained edges for removed, unreferenced p3.
+# notes: refuses as an orphan edge before any fragment write, naming the committed edge's type,
+# notes: and keeping every referenced node lands the replacement while probing retained
+# notes: edges for removed, unreferenced p3.
 
 --- runner
 timeout_ms: 10000
@@ -36,7 +37,7 @@ p3,c@x
 --- mutate
 load csv "drop_p2.csv" into node:Person mode overwrite header
 
---- expect error: 'p2' not found in Person
+--- expect error: edge type 'Knows': __dst 'p2' not found in Person; the write removes that node and keeps this committed edge
 
 --- query
 query unchanged() {
