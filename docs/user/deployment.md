@@ -183,7 +183,8 @@ and removed-ID collections across each operation's tables; see
 return HTTP 413 with structured `resource_limit` details before the operation's
 data fragments or publication, and leave the server available for smaller work.
 They do not undo an implicitly created load branch or earlier command effects,
-and do not establish a process memory ceiling or automatic retry safety.
+and do not establish a process memory ceiling or automatic retry safety. For
+retained caches, see [Lance cache limits](operations/troubleshooting.md#lance-cache-limits).
 
 ## Container
 
