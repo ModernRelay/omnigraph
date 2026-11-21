@@ -3509,6 +3509,140 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
     );
 }
 
+/// Issue 925: repeated updates to the same row in one mutation must retain
+/// only the latest pending version per id, so 16 sequential updates stay at
+/// 1 pending entity (instead of doubling past `KEYED_WRITE_MAX_ROWS`),
+/// repeated Blob-row updates keep retained payload bytes bounded, and
+/// unordered `load` duplicate-key / `@unique` refusals stay unchanged.
+#[tokio::test]
+async fn issue_925_multi_update_keeps_one_pending_version_and_preserves_load_semantics() {
+    use omnigraph::loader::LoadMode;
+
+    const SCHEMA: &str = r#"
+node Item {
+    label: String
+    step: I64
+}
+node Doc {
+    slug: String @key
+    tag: String @unique
+    note: String?
+    body: Blob?
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+
+    db.load_jsonl(
+        concat!(
+            r#"{"type":"Item","data":{"label":"solo","step":0}}"#,
+            "\n",
+            r#"{"type":"Doc","data":{"slug":"d1","tag":"t1","note":"v0","body":"base64:AQIDBA=="}}"#,
+            "\n",
+        ),
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // 1. 16 sequential updates on one unkeyed row: pre-fix this reads 2^(k-2)
+    //    copies and fails at statement 15 with `keyed entities for node:Item`
+    //    (16,384 > 8,192). Post-fix it retains 1 pending row and reports 16.
+    let mut updates = String::from("query sixteen_updates() {\n");
+    for step in 1..=16 {
+        updates.push_str(&format!(
+            "    update Item set {{ step: {step} }} where label = \"solo\"\n"
+        ));
+    }
+    updates.push_str("}\n");
+    let res = db
+        .mutate(
+            "main",
+            &updates,
+            "sixteen_updates",
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("16 sequential updates on one row must stay within keyed entity cap");
+    assert_eq!(res.affected_nodes, 16);
+    assert_eq!(count_rows(&db, "node:Item").await, 1);
+
+    // 2. Four sequential non-blob updates on a keyed Blob row with a tight
+    //    `write_max_bytes` (enough for 2 copies during a scan, less than 4
+    //    accumulated copies): retained payload bytes must reflect the latest
+    //    version so 4 updates succeed and preserve the Blob bytes.
+    let blob_payload = vec![0x5Au8; 1024];
+    use base64::Engine as _;
+    let b64 = format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(&blob_payload)
+    );
+    let blob_query = r#"set write_max_bytes = 3072;
+query four_blob_updates($b: String) {
+    insert Doc { slug: "d2", tag: "t2", note: "n0", body: $b }
+    update Doc set { note: "n1" } where slug = "d2"
+    update Doc set { note: "n2" } where slug = "d2"
+    update Doc set { note: "n3" } where slug = "d2"
+    update Doc set { note: "n4" } where slug = "d2"
+}"#;
+    let blob_res = db
+        .mutate(
+            "main",
+            blob_query,
+            "four_blob_updates",
+            &params(&[("$b", &b64)]),
+        )
+        .await
+        .expect("4 updates on a pending Blob row must not multiply retained payload bytes");
+    assert_eq!(blob_res.affected_nodes, 5);
+    let stored_blob = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Doc", "d2", "body"),
+    )
+    .await;
+    assert_eq!(&stored_blob[..], &blob_payload[..]);
+
+    // 3. Unordered `load` duplicate-key and `@unique` refusals remain intact.
+    let dup_append = db
+        .load_jsonl(
+            concat!(
+                r#"{"type":"Doc","data":{"slug":"dup","tag":"u1"}}"#,
+                "\n",
+                r#"{"type":"Doc","data":{"slug":"dup","tag":"u2"}}"#,
+                "\n",
+            ),
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        dup_append.to_string().contains("duplicate")
+            || dup_append.to_string().contains("conflict")
+            || dup_append.to_string().contains("@unique"),
+        "append load with duplicate key must still fail loudly: {dup_append}"
+    );
+
+    let dup_merge_unique = db
+        .load_jsonl(
+            concat!(
+                r#"{"type":"Doc","data":{"slug":"m1","tag":"shared"}}"#,
+                "\n",
+                r#"{"type":"Doc","data":{"slug":"m2","tag":"shared"}}"#,
+                "\n",
+            ),
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        dup_merge_unique.to_string().contains("@unique"),
+        "merge load with duplicate @unique across distinct keys must still fail: {dup_merge_unique}"
+    );
+}
+
 /// Two `delete` ops on the same node table in one query. Pre-fix,
 /// op-2's `open_table_for_mutation` went through
 /// `open_for_mutation_on_branch` which trips `ensure_expected_version`

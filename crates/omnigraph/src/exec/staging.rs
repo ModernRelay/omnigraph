@@ -30,7 +30,7 @@ use crate::storage_layer::{
     DeletedIdBudget, KEYED_WRITE_MAX_ROWS, KeyedWriteSemantics, PendingUsage, SnapshotHandle,
     StagedHandle, WriteBudget, retain_keyed_batch, retained_keyed_bytes,
 };
-use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
+use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
 use datafusion::prelude::Expr;
 use futures::stream::StreamExt;
@@ -92,6 +92,15 @@ impl PendingTable {
             bytes
                 .checked_add(batch_bytes)
                 .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
+        })
+    }
+
+    fn total_payload_bytes(&self) -> Result<u64> {
+        self.batches.iter().try_fold(0_u64, |bytes, batch| {
+            let batch_payload = crate::table_store::write_batch_bytes(batch)?.payload;
+            bytes.checked_add(batch_payload).ok_or_else(|| {
+                OmniError::manifest_internal("pending Blob payload byte count overflow")
+            })
         })
     }
 }
@@ -362,6 +371,180 @@ impl MutationStaging {
         entry.batches.push(batch);
         self.pending_bytes = pending_bytes;
         self.pending_payload_bytes = pending_payload_bytes;
+        Ok(())
+    }
+
+    /// Append a batch to the per-table accumulator with statement-ordered
+    /// keyed replacement: an `Upsert` batch replaces prior pending rows for
+    /// the same `id` on this table.
+    ///
+    /// This gives mutations a consistent keyed image for read-your-writes,
+    /// bounding pending rows to distinct entities per type (issue #925).
+    /// Unordered bulk loads use [`Self::append_batch`] directly, so duplicate
+    /// intake keys across load batches continue to fail validation.
+    pub(crate) fn upsert_statement_batch(
+        &mut self,
+        table_key: &str,
+        schema: SchemaRef,
+        mode: PendingMode,
+        batch: RecordBatch,
+        system_columns: SystemColumns,
+    ) -> Result<()> {
+        if batch.num_rows() == 0 && mode != PendingMode::Overwrite {
+            return Ok(());
+        }
+
+        let Some(existing) = self.pending.get(table_key) else {
+            return self.append_batch(table_key, schema, mode, batch);
+        };
+
+        if mode != PendingMode::Upsert {
+            return self.append_batch(table_key, schema, mode, batch);
+        }
+
+        if existing.mode == PendingMode::Overwrite || mode == PendingMode::Overwrite {
+            if existing.mode != mode {
+                return Err(OmniError::manifest_internal(format!(
+                    "table '{}' cannot mix overwrite staging with append/merge staging",
+                    table_key
+                )));
+            }
+        }
+        if existing.mode == PendingMode::ColumnPatch || mode == PendingMode::ColumnPatch {
+            return Err(OmniError::manifest_internal(format!(
+                "table '{table_key}' cannot stage a column patch beside another write"
+            )));
+        }
+        if !schemas_compatible(&existing.schema, &batch.schema()) {
+            return Err(OmniError::manifest(format!(
+                "table '{}' accumulated mutation batches with mismatched schemas: \
+                 prior batches have {} columns, this batch has {}. \
+                 This typically happens on a blob-bearing table when one \
+                 op uses the full schema (e.g. an `insert`) and another \
+                 omits unassigned blob columns (e.g. an `update` that \
+                 doesn't set every blob property). Split the mutation \
+                 into two queries: one for the inserts, one for the \
+                 updates.",
+                table_key,
+                existing.schema.fields().len(),
+                batch.schema().fields().len(),
+            )));
+        }
+
+        let mut incoming_ids = HashSet::new();
+        if let Some(id_col) = batch.column_by_name(system_columns.id) {
+            if let Some(str_arr) = id_col.as_any().downcast_ref::<StringArray>() {
+                for i in 0..str_arr.len() {
+                    if str_arr.is_valid(i) {
+                        incoming_ids.insert(str_arr.value(i));
+                    }
+                }
+            }
+        }
+
+        if incoming_ids.is_empty() {
+            return self.append_batch(table_key, schema, mode, batch);
+        }
+
+        let mut replacement_batches = Vec::with_capacity(existing.batches.len());
+        for existing_batch in &existing.batches {
+            let Some(id_col) = existing_batch.column_by_name(system_columns.id) else {
+                replacement_batches.push(existing_batch.clone());
+                continue;
+            };
+            let Some(str_arr) = id_col.as_any().downcast_ref::<StringArray>() else {
+                replacement_batches.push(existing_batch.clone());
+                continue;
+            };
+
+            let mut keep_mask = Vec::with_capacity(existing_batch.num_rows());
+            let mut any_evicted = false;
+            for i in 0..existing_batch.num_rows() {
+                if str_arr.is_valid(i) && incoming_ids.contains(str_arr.value(i)) {
+                    keep_mask.push(false);
+                    any_evicted = true;
+                } else {
+                    keep_mask.push(true);
+                }
+            }
+
+            if any_evicted {
+                let mask = BooleanArray::from(keep_mask);
+                let filtered = arrow_select::filter::filter_record_batch(existing_batch, &mask)
+                    .map_err(OmniError::arrow_internal)?;
+                if filtered.num_rows() > 0 {
+                    replacement_batches.push(filtered);
+                }
+            } else {
+                replacement_batches.push(existing_batch.clone());
+            }
+        }
+
+        let incoming_usage = crate::table_store::write_batch_bytes(&batch)?;
+        let incoming_bytes = incoming_usage.rows;
+        let incoming_payload = incoming_usage.payload;
+
+        let post_eviction_rows: usize = replacement_batches.iter().map(|b| b.num_rows()).sum();
+        let post_eviction_bytes: u64 = replacement_batches.iter().try_fold(0_u64, |b, batch| {
+            let bytes = crate::table_store::write_batch_bytes(batch)?.rows;
+            b.checked_add(bytes)
+                .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
+        })?;
+        let post_eviction_payload: u64 =
+            replacement_batches.iter().try_fold(0_u64, |p, batch| {
+                let bytes = crate::table_store::write_batch_bytes(batch)?.payload;
+                p.checked_add(bytes).ok_or_else(|| {
+                    OmniError::manifest_internal("pending Blob payload byte count overflow")
+                })
+            })?;
+
+        let new_table_rows = post_eviction_rows
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| OmniError::manifest_internal("pending keyed row count overflow"))?;
+        if new_table_rows > KEYED_WRITE_MAX_ROWS {
+            return Err(OmniError::resource_limit(
+                format!("keyed entities for {table_key}"),
+                KEYED_WRITE_MAX_ROWS as u64,
+                new_table_rows as u64,
+            ));
+        }
+
+        let new_table_bytes = post_eviction_bytes
+            .checked_add(incoming_bytes)
+            .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?;
+        self.write_budget.check(
+            format!("keyed entity bytes for {table_key}"),
+            new_table_bytes,
+        )?;
+
+        let old_table_bytes = existing.total_bytes()?;
+        let other_tables_bytes = self.pending_bytes.saturating_sub(old_table_bytes);
+        let new_global_bytes = other_tables_bytes
+            .checked_add(new_table_bytes)
+            .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?;
+        self.write_budget
+            .check("retained keyed batch bytes per operation", new_global_bytes)?;
+
+        let old_table_payload = existing.total_payload_bytes()?;
+        let other_tables_payload = self.pending_payload_bytes.saturating_sub(old_table_payload);
+        let new_global_payload = other_tables_payload
+            .checked_add(post_eviction_payload)
+            .and_then(|p| p.checked_add(incoming_payload))
+            .ok_or_else(|| {
+                OmniError::manifest_internal("pending Blob payload byte count overflow")
+            })?;
+        self.write_budget
+            .check("decoded blob input bytes per operation", new_global_payload)?;
+
+        let entry = self.pending.get_mut(table_key).unwrap();
+        replacement_batches.push(batch);
+        entry.batches = replacement_batches;
+        if entry.mode == PendingMode::StrictInsert {
+            entry.mode = PendingMode::Upsert;
+        }
+
+        self.pending_bytes = new_global_bytes;
+        self.pending_payload_bytes = new_global_payload;
         Ok(())
     }
 
