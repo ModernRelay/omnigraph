@@ -50,6 +50,8 @@ pub mod session;
 pub mod storage;
 pub(crate) mod storage_layer;
 pub(crate) mod table_store;
+#[cfg(test)]
+pub(crate) mod test_alloc;
 pub(crate) mod validate;
 
 pub use blob::{
