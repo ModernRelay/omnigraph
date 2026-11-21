@@ -5220,15 +5220,19 @@ impl Ctx<'_> {
                         if mode == InsertMode::Upsert && !key.contains(p.as_str()) {
                             continue;
                         }
-                        if let Some(e) = node.embed_sources.get(p)
-                            && assigned.contains(e.source.as_str())
-                        {
-                            continue;
-                        }
+                        // An `@embed` vector is a property like any other:
+                        // no write embeds, so its source does not provide it.
+                        let embed = node.embed_sources.get(p).map_or(String::new(), |e| {
+                            format!(
+                                "; it is the `@embed` vector of `{}`, and assigning `{}` does \
+                                 not provide it, since no write embeds",
+                                e.source, e.source
+                            )
+                        });
                         missing = Some(err(
                             T12,
                             format!(
-                                "{word} for `{type_name}` must provide non-nullable property `{p}`"
+                                "{word} for `{type_name}` must provide non-nullable property `{p}`{embed}"
                             ),
                         ));
                         break;

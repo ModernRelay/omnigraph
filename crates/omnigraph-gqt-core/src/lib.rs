@@ -27,7 +27,6 @@ use omnigraph_compiler::query::syntax::{
     Arg, DeclBody, Element, Expr, LetValue, Pattern, ReadBody, RelExpr,
 };
 use omnigraph_compiler::query::value::Literal;
-use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::settings::{SessionSettings, SettingId, SettingRow, Traversal};
 use omnigraph_compiler::{
@@ -1802,16 +1801,12 @@ fn inspect_decl(decl: &QueryDecl, needs_indices: &mut bool) -> Result<(), String
     }
 }
 
-fn props_use_embed(props: &[PropDecl]) -> bool {
-    props.iter().any(|p| anns_use_embed(&p.annotations))
-}
-
-fn anns_use_embed(annotations: &[Annotation]) -> bool {
-    annotations.iter().any(|a| a.name == "embed")
-}
-
-fn refuse_embed_schema(schema: &str, start_line: usize) -> Result<(), CaseError> {
-    let file = parse_schema(schema).map_err(|e| {
+/// Refuse a schema section that does not parse, at its first line. A schema
+/// using `@embed` is in scope: no load or write embeds, so it resolves no
+/// embedding provider; only a `nearest` over a string does, and that is
+/// refused where the query is read.
+fn parse_case_schema(schema: &str, start_line: usize) -> Result<(), CaseError> {
+    parse_schema(schema).map_err(|e| {
         CaseError::new(
             CaseErrorCode::QueryParse,
             format!("schema section starting at line {start_line} does not parse: {e}"),
@@ -1819,19 +1814,6 @@ fn refuse_embed_schema(schema: &str, start_line: usize) -> Result<(), CaseError>
         .fix("rewrite the schema body so it parses; the message names where the grammar stopped")
         .at_line(start_line)
     })?;
-    let uses_embed = file.declarations.iter().any(|decl| match decl {
-        SchemaDecl::Interface(i) => props_use_embed(&i.properties),
-        SchemaDecl::Node(n) => anns_use_embed(&n.annotations) || props_use_embed(&n.properties),
-        SchemaDecl::Edge(e) => anns_use_embed(&e.annotations) || props_use_embed(&e.properties),
-    });
-    if uses_embed {
-        return Err(CaseError::new(
-            CaseErrorCode::BodyShape,
-            "schemas using `@embed` resolve an embedding provider from process environment \
-             and stay Rust tests",
-        )
-        .at_line(start_line));
-    }
     Ok(())
 }
 
@@ -2430,7 +2412,7 @@ fn parse_fixture<'a>(
                 .collect::<Vec<_>>()
                 .join("\n");
             let mut errors = Vec::new();
-            if let Err(error) = refuse_embed_schema(&schema, sections[0].header_line + 1) {
+            if let Err(error) = parse_case_schema(&schema, sections[0].header_line + 1) {
                 errors.push(error);
             }
             let seed = (|| {
@@ -3856,7 +3838,7 @@ fn parse_text(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         )
                         .fix("write the whole desired `.pg` schema under `--- apply schema`"));
                     }
-                    refuse_embed_schema(&source, section.header_line + 2)?;
+                    parse_case_schema(&source, section.header_line + 2)?;
                     ordinal += 1;
                     push_step(
                         &mut items,

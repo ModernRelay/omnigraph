@@ -1678,14 +1678,17 @@ fn refuses_ordered_expect_without_an_order_clause() {
     assert!(refusal("x", &text).contains("order` clause"));
 }
 
+/// A schema using `@embed` resolves no embedding provider, since no load or
+/// write embeds, so a case may declare one; a `nearest` over a string still
+/// resolves one and stays refused.
 #[test]
-fn refuses_embed_schema() {
+fn accepts_embed_schema() {
     let schema = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Doc {\n    slug: String @key\n    text: String\n    vec: Vector(4) @embed(\"text\")\n}\n";
     let seed = "--- seed\n";
     let text = format!("{HDR}{schema}{seed}{QUERY}{EXPECT}")
         .replace("$p: Person", "$p: Doc")
         .replace("$p.name", "$p.slug");
-    assert!(refusal("x", &text).contains("@embed"));
+    parse_case("x", &text).unwrap();
 }
 
 #[test]
@@ -4107,9 +4110,9 @@ async fn every_read_step_is_compared_with_the_reference() {
     assert!(error.contains("does not reach"), "{error}");
 }
 
-/// `--- apply schema` is a step whose body is the whole desired schema; any
-/// other argument, an empty body or an `@embed` schema refuses the case, and
-/// the served path refuses the step by name.
+/// `--- apply schema` is a step whose body is the whole desired schema, an
+/// `@embed` one included; any other argument or an empty body refuses the
+/// case, and the served path refuses the step by name.
 #[test]
 fn apply_schema_is_a_step_with_a_schema_body() {
     let apply = "--- apply schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n";
@@ -4131,11 +4134,15 @@ fn apply_schema_is_a_step_with_a_schema_body() {
             "--- apply schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n",
             "--- apply schema\n\n",
         ),
-        ("age: I32?", "e: Vector(2) @embed(\"name\")"),
     ] {
         assert!(
             parse_case("apply_schema", &text.replace(from, to)).is_err(),
             "{from} -> {to}"
         );
     }
+    parse_case(
+        "apply_schema",
+        &text.replace("age: I32?", "e: Vector(2) @embed(\"name\")"),
+    )
+    .unwrap();
 }

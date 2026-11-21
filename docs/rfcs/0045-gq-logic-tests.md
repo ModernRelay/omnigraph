@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - azimafroozeh
 created: 2026-08-29
-updated: 2026-10-13
+updated: 2026-11-20
 discussion: https://github.com/ModernRelay/omnigraph/pull/584
 supersedes: []
 superseded_by: []
@@ -1685,11 +1685,11 @@ the iteration named. Every surface named here is public today.
 Every case owns its store, so cases run concurrently (Runner mechanics
 below); within a case, steps are strictly sequential, and a `--- concurrent`
 block is one step whose sessions overlap inside it. Cases needing
-process-global state stay Rust tests: the harness refuses a schema using
-`@embed` and a `nearest` over a string argument, both of which resolve an
-embedding provider from process environment variables
-(`EmbeddingClient::from_env`); a `nearest` over an explicit vector
-parameter stays in scope. Fault cases expressible by Faults at an explicit
+process-global state stay Rust tests: the harness refuses a `nearest` over
+a string argument, which resolves an embedding provider from process
+environment variables (`EmbeddingClient::from_env`); a `nearest` over an
+explicit vector parameter stays in scope, and so does a schema using
+`@embed`, since no load or write embeds. Fault cases expressible by Faults at an explicit
 step may use GQT; other failpoint cases stay Rust tests. Interleaved writers
 and transaction races with a named interleaving are `--- concurrent` blocks;
 randomized interleavings stay in the existing DST suites. Fault-enabled GQT
@@ -2814,3 +2814,10 @@ historical command and configuration descriptions are not migration aliases.
   `?` for a column holding one. Superseded: "it takes no `?` (the object is
   never null)" in the shape section and "`Person?` is refused (the object is
   never null)" in the 2026 shape-section entry.
+- 2026-11-20, `@embed` schemas: no load or write embeds, and a keyed write
+  that omits a required `@embed` vector is `T12`, so a schema using `@embed`
+  resolves no embedding provider and a case may declare one, in `--- schema`
+  and in `--- apply schema`; a `nearest` over a string still resolves one and
+  stays refused. Superseded in §Execution semantics: "the harness refuses a
+  schema using `@embed` and a `nearest` over a string argument, both of which
+  resolve an embedding provider from process environment variables".

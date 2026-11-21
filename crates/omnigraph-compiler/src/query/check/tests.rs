@@ -1775,6 +1775,53 @@ fn keyed_writes_carry_their_mode_and_refuse_identity_changes() {
     assert!(m.contains("`@dst`") && m.contains("endpoint"), "{m}");
 }
 
+/// An `@embed` vector is a property like any other: no write embeds, so
+/// assigning its source does not provide it, and a keyed write that omits a
+/// required one is `T12`, the message naming the vector and its source.
+/// `upsert` still requires only its key here; a nullable vector may be
+/// omitted.
+#[test]
+fn a_required_embed_vector_is_not_provided_by_its_source() {
+    let catalog = build_catalog(
+        &parse_schema(
+            "node Doc { slug: String @key  body: String  embedding: Vector(2) @embed(body) }\n\
+             node Note { slug: String @key  body: String  embedding: Vector(2)? @embed(body) }",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let first = |src: &str| {
+        type_source(&catalog, src)
+            .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+            .remove(0)
+            .1
+    };
+    for word in ["insert", "replace"] {
+        let src = format!("query w($s: String) {{ {word} Doc {{ slug: $s, body: \"b\" }} }}");
+        let e = first(&src).expect_err("a required vector its source does not provide");
+        assert_eq!(e.code.as_str(), "T12", "{e}\n{src}");
+        let text = e.to_string();
+        assert!(
+            text.contains("`embedding`") && text.contains("assigning `body` does not provide it"),
+            "{text}"
+        );
+    }
+    for word in ["insert", "replace", "upsert"] {
+        first(&format!(
+            "query w($s: String) {{ {word} Doc {{ slug: $s, body: \"b\", embedding: [1.0, 0.0] }} }}"
+        ))
+        .unwrap_or_else(|e| panic!("{word} assigning the vector: {e}"));
+        first(&format!(
+            "query w($s: String) {{ {word} Note {{ slug: $s, body: \"b\" }} }}"
+        ))
+        .unwrap_or_else(|e| panic!("{word} omitting a nullable vector: {e}"));
+    }
+    // `upsert` requires only its key at check time; a new key that omits
+    // the vector is refused when it runs.
+    first("query w($s: String) { upsert Doc { slug: $s, body: \"b\" } }")
+        .unwrap_or_else(|e| panic!("upsert requires only its key: {e}"));
+}
+
 #[test]
 fn the_constructive_or_destructive_split_and_ordered_statements() {
     let m = refused(

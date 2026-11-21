@@ -111,11 +111,10 @@ query retitle($slug: String, $t: String) { match { $x: Signal } where $x.slug = 
 query remove($slug: String)              { match { $x: Signal } where $x.slug = $slug  delete $x }
 ```
 
-- **Every non-nullable property must be supplied.** Lint normally reports T12
-  when one is missing. A non-null Vector target carrying `@embed`
-  is a known exception: source-only insert can lint successfully even though
-  execution still requires the vector. Supply it explicitly; writes never
-  embed automatically.
+- **Every non-nullable property must be supplied.** `insert` or `replace`
+  missing one is `T12`, a non-null `@embed` vector included: no write embeds,
+  so assigning its source does not provide it. Supply the vector, or prepare
+  it with the offline `omnigraph embed` pipeline.
 - **Five write statements, one per intent.** `insert T { … }` creates and fails with `key_conflict` on an existing key; `upsert T { … }` creates or sets only the named properties (the others, Blob and vector included, keep their values); `replace T { … }` creates or writes the whole row (an omitted nullable property becomes null); `update $x set { … }` sets named properties of selected nodes or edges; `delete $x` removes them. `null` clears in every statement. A job that retries after an uncertain outcome uses `upsert` or `replace`, which are idempotent; a retried `insert` whose first attempt landed fails. `upsert`/`replace` on a type with no `@key` is `T92` (use `insert`).
 - A single mutation is insert/upsert/replace/update-only **or** delete-only — never both (`T76`, which `lint` reports); split them.
 - A write group's `match … where` is a read's: traversals, edge bindings (`delete $k`; `$k: Knows` alone binds every edge of the type, in a read too), blocks, `let` and `from`; assignments may read the row (`city: $c.city`, `@dst: $c`). A `Blob` read from a row is `T86`; every group selects on the graph the write started from, so a selection reading a type an earlier group of the write changes is `T91` (use a second write, or several statements after one `match`); one statement giving an entity two values is `E4`.

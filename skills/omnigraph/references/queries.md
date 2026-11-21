@@ -605,13 +605,16 @@ it sets, and is refused at run time if it would create without one:
 type error: T12: insert for `Signal` must provide non-nullable property `brief`
 ```
 
-For an `@embed` target the message ends ``… property `embedding` or @embed source `text` ``.
+An `@embed` vector is a property like any other: no write embeds, so
+assigning its source does not provide it. A non-null one omitted is `T12`, and
+the message says so:
 
-Lint permits omission of a non-null Vector target annotated with
-`@embed(source)` when its source is supplied, but mutation execution does not
-auto-embed and still rejects the missing vector. Supply that target explicitly;
-use the offline embedding pipeline for generated values. A nullable target may
-remain null even when its source is present.
+```
+type error: T12: insert for `Doc` must provide non-nullable property `embedding`; it is the `@embed` vector of `body`, and assigning `body` does not provide it, since no write embeds
+```
+
+Supply the vector; use the offline embedding pipeline for generated values. A
+nullable vector may be omitted and stays null.
 
 ### Insert edge
 

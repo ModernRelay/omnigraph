@@ -81,9 +81,9 @@ Commits, and History](../branching/index.md)).
 ## Keys and identity
 
 - `null` clears a property in every statement; only `replace` clears what it omits.
-- Creating without a required property is an error (`T12` for `insert` and
-  `replace`, at run time for an `upsert` of a new key); an `upsert` of an
-  existing key needs none.
+- Creating without a required property, an `@embed` vector included (no write
+  embeds), is an error (`T12` for `insert` and `replace`, at run time for an
+  `upsert` of a new key); an `upsert` of an existing key needs none.
 - `insert` fails with `key_conflict` on a committed key or one the write
   staged earlier, naming `upsert` and `replace`. A job that retries after an
   uncertain outcome uses those two, which are idempotent.
