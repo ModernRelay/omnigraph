@@ -6,10 +6,16 @@ async fn replaced_file_remains_visible_when_directory_sync_fails() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
     std::fs::write(&path, "old").unwrap();
-    let error = replace_file_with_dir_sync(&path, "new", |parent| {
-        assert_eq!(parent, directory.path());
-        Err(std::io::Error::other("injected directory sync failure"))
-    })
+    let error = replace_file_with_dir_sync(
+        &path,
+        "new",
+        "operator config",
+        crate::operator::OPERATOR_FILE_MAX_BYTES,
+        |parent| {
+            assert_eq!(parent, directory.path());
+            Err(std::io::Error::other("injected directory sync failure"))
+        },
+    )
     .unwrap_err();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     assert!(error.to_string().contains("file was replaced"), "{error}");

@@ -766,18 +766,34 @@ impl std::error::Error for ReplacementSyncFailed {
 /// Replace the file by writing a sibling and renaming it over, keeping its
 /// permissions.
 pub(crate) fn replace_file(path: &Path, text: &str) -> Result<()> {
-    replace_file_with_dir_sync(path, text, crate::sync_dir)
+    replace_file_with_limit(
+        path,
+        text,
+        "operator config",
+        crate::operator::OPERATOR_FILE_MAX_BYTES,
+    )
+}
+
+pub(crate) fn replace_file_with_limit(
+    path: &Path,
+    text: &str,
+    description: &str,
+    max_bytes: usize,
+) -> Result<()> {
+    replace_file_with_dir_sync(path, text, description, max_bytes, crate::sync_dir)
 }
 
 fn replace_file_with_dir_sync(
     path: &Path,
     text: &str,
+    description: &str,
+    max_bytes: usize,
     sync_dir: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<()> {
-    if text.len() > crate::operator::OPERATOR_FILE_MAX_BYTES {
+    if text.len() > max_bytes {
         return Err(refusal(
             "target_config_invalid",
-            "operator config exceeds 1 MiB",
+            format!("{description} exceeds {} MiB", max_bytes / (1024 * 1024)),
         ));
     }
     let parent = path

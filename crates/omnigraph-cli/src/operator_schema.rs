@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod editor;
 mod validation;
 mod yaml;
 
@@ -273,6 +274,10 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 pub(crate) fn parse(text: &str, base_dir: &Path) -> Result<OperatorConfig, ConfigError> {
+    resolve(parse_source(text)?, base_dir)
+}
+
+fn parse_source(text: &str) -> Result<yaml_serde::Value, ConfigError> {
     if text.len() > MAX_CONFIG_BYTES {
         return Err(ConfigError(
             "operator configuration exceeds the 1 MiB limit".into(),
@@ -286,6 +291,10 @@ pub(crate) fn parse(text: &str, base_dir: &Path) -> Result<OperatorConfig, Confi
             "legacy target_config_version is unsupported; write a version: 1 operator document using docs/user/cli/targets.md#upgrade-from-the-old-format; there is no automatic importer".into(),
         ));
     }
+    Ok(value)
+}
+
+fn resolve(value: yaml_serde::Value, base_dir: &Path) -> Result<OperatorConfig, ConfigError> {
     let mut config: OperatorConfig = yaml_serde::from_value(value)
         .map_err(|error| ConfigError(format!("invalid operator configuration: {error}")))?;
     validation::validate(&mut config, base_dir)?;

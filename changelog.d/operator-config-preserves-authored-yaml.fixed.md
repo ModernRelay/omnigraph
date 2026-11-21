@@ -1,0 +1,1 @@
+- Editing or renaming a target or profile now preserves comments, formatting and relative paths in the rest of the operator configuration.
