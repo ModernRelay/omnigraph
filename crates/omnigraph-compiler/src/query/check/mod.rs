@@ -409,6 +409,7 @@ fn typed_decl_measured(
         at: None,
         element_span: None,
         refusals: Vec::new(),
+        typed_refusals: 0,
         work: PlanWork::new(DEFAULT_PLAN_BUDGET as u64),
         overrun: std::cell::RefCell::new(None),
         typed_calls: HashMap::new(),
@@ -1273,6 +1274,11 @@ struct Ctx<'a> {
     /// The refusals the recovery points of the declaration recorded
     /// ([`Ctx::recover`]).
     refusals: Vec<QueryDiagnostic>,
+    /// How many of [`Self::refusals`] leave their scope typed as their fix
+    /// would: a name a triple introduces but no binding binds (`T84`) is
+    /// typed by the triple, so the inline read holding it keeps its type and
+    /// the scope it returns into is checked in the same pass.
+    typed_refusals: usize,
     /// The plan budget of the declaration being checked and the work
     /// charged to it ([`crate::budget`]): every term node and expression
     /// node built and every expression typed, so a compile stops as soon as
@@ -2345,6 +2351,7 @@ impl Ctx<'_> {
     fn read_body(&mut self, body: &ReadBody, mut sc: Scope) -> R<Rel> {
         let top = sc.recover;
         let mark = self.refusals.len();
+        let typed_mark = self.typed_refusals;
         if let Some(refusal) = ranking_in_order_or_return(self.catalog, body, &sc) {
             if !top {
                 return Err(E::D(refusal));
@@ -2639,7 +2646,8 @@ impl Ctx<'_> {
         // An inline read holding a refusal is of the error type; the top
         // read body keeps the term of what it typed, which the lowering
         // admission reads ([`check_decl`]).
-        if sc.inner && (self.refusals.len() > mark || sc.refused) {
+        if sc.inner && (self.refusals.len() - mark > self.typed_refusals - typed_mark || sc.refused)
+        {
             return Err(E::Recorded);
         }
         term = Term::Project {
@@ -3149,10 +3157,12 @@ impl Ctx<'_> {
         // A refused binding still declares its name, so `T84` names only
         // what no binding element introduces; a refused `from` drew columns
         // no one knows, any of which may be the name.
+        // The triple typed every name it introduced, so the scope keeps its
+        // types past this refusal, as the fix (a binding of each) would.
         if (sc.block || sc.inner) && !sc.opaque {
             let checked = unbound_triple_names(pattern, sc, &introduced);
             if self.guard(sc.recover, checked)?.is_none() {
-                sc.refused = true;
+                self.typed_refusals += 1;
             }
         }
         if let Some(predicate) = &pattern.predicate {

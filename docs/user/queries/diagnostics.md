@@ -34,7 +34,10 @@ type checker checks every element, conjunct, item, key, statement,
 assignment and operand, in blocks, `optional`s and inline reads too, and
 gives a refused construct an error type that passes every check: what reads
 a name a refused construct would bind is not reported, and a block or inline
-read holding a refusal is of that type.
+read holding a refusal is of that type. A triple end bound nowhere (`T84`)
+is the exception: the triple typed it, so its block or inline read keeps the
+type its fix would give, and a refusal of the scope it returns into is
+reported in the same pass.
 
 ```text
 query q() { match { $c: Company } where $c.names = "x" and $c.slug = 3 return { $c } }

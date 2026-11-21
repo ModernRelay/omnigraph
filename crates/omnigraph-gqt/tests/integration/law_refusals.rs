@@ -719,16 +719,20 @@ fn every_refusal_reaches_a_fixed_point_within_three_passes() {
     );
 }
 
-/// A fix may reveal a refusal the pass did not report: in one declaration
-/// the checker stops at its first refusal, so here fixing `T84` (`$q`
-/// bound nowhere in the inline read) reveals `T68` (the inline read returns
-/// `$p` into a scope that holds it), and the pass leaves as many refusals
-/// as it found.
+/// A fix does not reveal a refusal the pass did not report: `T84` (`$q`
+/// bound nowhere in the inline read) leaves the inline read typed as its fix
+/// would, so the same pass also reports `T68` (the inline read returns `$p`
+/// into a scope that holds it), and one pass of fixes converges.
 #[test]
-#[ignore = "hunt: a type-level fix reveals a refusal of the same declaration the pass did not report, so the refusals do not shrink"]
 fn a_fix_does_not_reveal_a_refusal_of_its_own_declaration() {
     let source = "query q() {\n  match { $p: Person, from { match { $p knows $q } return { $p } order { $q.age } } }\n  return { $p.name }\n}";
-    converge(&catalog(rows::CHECKED), source).unwrap();
+    let cat = catalog(rows::CHECKED);
+    let codes: Vec<&str> = check_source_all(&cat, source)
+        .iter()
+        .map(|refusal| refusal.code.as_str())
+        .collect();
+    assert_eq!(codes, ["T84", "T68"], "one pass reports both");
+    converge(&cat, source).unwrap();
 }
 
 /// No source reaches a slice or an `unwrap` in the parser: every prefix of

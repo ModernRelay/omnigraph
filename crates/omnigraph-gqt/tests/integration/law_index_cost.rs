@@ -253,12 +253,17 @@ impl Read {
 
     /// The step's requests to the read's table.
     fn requests(&self) -> Result<u64, String> {
+        Ok(self.cost()?.0)
+    }
+
+    /// The step's requests to the read's table and the bytes they read.
+    fn cost(&self) -> Result<(u64, u64), String> {
         let dataset = dataset(self.shape.schema(), self.shape.table());
         let steps = measure(&self.case())?;
         Ok(steps
             .first()
             .and_then(|step| step.get(&dataset).copied())
-            .unwrap_or(0))
+            .unwrap_or((0, 0)))
     }
 }
 
@@ -281,9 +286,12 @@ fn dataset(schema: &str, table: &str) -> String {
     )
 }
 
+/// One measured step's requests per dataset directory and the bytes they read.
+type StepCost = BTreeMap<String, (u64, u64)>;
+
 /// Run `case` under `--measure`; for each measured step, its requests per
-/// dataset directory.
-fn measure(case: &str) -> Result<Vec<BTreeMap<String, u64>>, String> {
+/// dataset directory and the bytes they read.
+fn measure(case: &str) -> Result<Vec<StepCost>, String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let path = dir.path().join("law_index_cost.gqt");
     std::fs::write(&path, case).map_err(|e| e.to_string())?;
@@ -318,7 +326,9 @@ fn measure(case: &str) -> Result<Vec<BTreeMap<String, u64>>, String> {
         let mut by_dataset = BTreeMap::new();
         for request in group["value"]["log"].as_array().into_iter().flatten() {
             let dataset = request["dataset"].as_str().unwrap_or_default().to_string();
-            *by_dataset.entry(dataset).or_insert(0) += 1;
+            let entry = by_dataset.entry(dataset).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += request["bytes"].as_u64().unwrap_or(0);
         }
         steps.push(by_dataset);
     }
@@ -490,27 +500,45 @@ fn an_id_lookup_without_an_index_does_not_multiply_its_reads_with_the_frontier_i
 }
 
 /// (i) over clustered data: every row but the matching one holds one value,
-/// so a scan skips each fragment whose value range rules the equality out
-/// and reads the table in five requests at both sizes, while the BTREE
-/// probe takes seven and twelve. The index path is chosen by rule, not by
-/// what each path reads; choosing by request cost is a later planner stage.
+/// so a scan skips each fragment whose value range rules the equality out.
+/// Measured 2026-11-21 (seed 0, one matching row): at 4,096 rows the BTREE
+/// probe takes 7 requests and 22,163 bytes against the scan's 5 and 12,306;
+/// at 32,768 rows the probe takes 12 and 39,601, the scan still 5 and
+/// 12,306. The index path is chosen by rule, not by what each path reads.
+/// Preferring the pruned scan is a choice by the data's value ranges, which
+/// the planner does not read: stage S5 prices both paths from statistics an
+/// explain records (each fragment's value range, the index's depth), never
+/// a rule that reads them silently.
 #[cfg(tokio_unstable)]
 #[test]
 #[ignore = "hunt: a BTREE equality on clustered I64 data costs more requests than the scan whose fragment value ranges prune it"]
 fn a_btree_equality_on_clustered_data_costs_more_than_the_pruned_scan() {
-    let at = |indexed: bool| {
+    let at = |rows: u64, indexed: bool| {
         Read {
             shape: Shape::Btree,
-            rows: N,
+            rows,
             first: 0,
             matching: 1,
             indexed,
             pool: None,
             clustered: true,
         }
-        .requests()
+        .cost()
         .unwrap_or_else(|failure| panic!("{failure}"))
     };
-    let (index, scan) = (at(true), at(false));
-    assert!(index < scan, "index {index}, scan {scan}");
+    let mut costs = Vec::new();
+    for rows in [N, 8 * N] {
+        let (index, scan) = (at(rows, true), at(rows, false));
+        eprintln!(
+            "{rows} rows: index {} requests, {} bytes; scan {} requests, {} bytes",
+            index.0, index.1, scan.0, scan.1
+        );
+        costs.push((rows, index, scan));
+    }
+    for (rows, index, scan) in costs {
+        assert!(
+            index.0 < scan.0,
+            "{rows} rows: index {index:?}, scan {scan:?}"
+        );
+    }
 }
