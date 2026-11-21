@@ -410,6 +410,7 @@ pub struct SnapshotOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BranchCreateRequest {
     /// Parent branch to fork from; the new branch starts at its head.
     /// Mutually exclusive with `from_commit`. Defaults to `main`.
@@ -496,6 +497,7 @@ pub struct BranchDeleteOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BranchMergeRequest {
     /// Source branch whose commits will be merged.
     pub source: String,
@@ -1357,6 +1359,7 @@ pub struct ChangeFeedQuery {
 
 /// Body for the change baseline handshake.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeBaselineRequest {
     /// Branch to capture. Defaults to `main`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1796,6 +1799,7 @@ pub struct ChangeRequest {
 /// named in the path. The query source and name come from the registry,
 /// never the body; only the runtime inputs are supplied here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InvokeStoredQueryRequest {
     /// JSON object whose keys match the stored query's declared parameters.
     #[serde(default)]
@@ -1991,6 +1995,7 @@ impl From<omnigraph_compiler::SystemColumns> for SystemColumnsOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestRequest {
     /// Target branch. Defaults to `main`. Without `from`, the branch must
     /// already exist — a missing branch is a 404, never an implicit fork.
@@ -4346,6 +4351,49 @@ mod tests {
         }))
         .unwrap_err();
         assert!(error.to_string().contains("unknown field `table_keys`"));
+    }
+
+    #[test]
+    fn request_dtos_deny_unknown_fields_issue_528() {
+        // BranchCreateRequest
+        let err = serde_json::from_value::<BranchCreateRequest>(json!({
+            "name": "b1",
+            "unknown": 1,
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `unknown`"));
+
+        // BranchMergeRequest
+        let err = serde_json::from_value::<BranchMergeRequest>(json!({
+            "source": "feat",
+            "dryRun": true,
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `dryRun`"));
+
+        // ChangeBaselineRequest
+        let err = serde_json::from_value::<ChangeBaselineRequest>(json!({
+            "branch": "main",
+            "unknown": "val",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `unknown`"));
+
+        // InvokeStoredQueryRequest
+        let err = serde_json::from_value::<InvokeStoredQueryRequest>(json!({
+            "branch": "main",
+            "unknown": "val",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `unknown`"));
+
+        // IngestRequest
+        let err = serde_json::from_value::<IngestRequest>(json!({
+            "data": "{}",
+            "unknown": "val",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `unknown`"));
     }
 
     #[test]
