@@ -6202,9 +6202,11 @@ async fn vector_ivf_partition_sizing_issue_485_issue_486() {
         "vector index on 100 rows must have isqrt(100) = 10 partitions, found {num_partitions} (stats: {stats_json})"
     );
 
-    // Load 525 more rows -> total 625 rows -> target isqrt(625) = 25
+    // Load 300 more rows -> total 400 rows -> target isqrt(400) = 20.
+    // 10 partitions on 400 rows is healthy (10 * 2 = 20 >= 20, not degenerate).
+    // An optimize fold over the appended rows must preserve the 10 partitions.
     let mut data2 = String::new();
-    for i in 100..625 {
+    for i in 100..400 {
         data2.push_str(&format!(
             r#"{{"type":"Doc","data":{{"slug":"s{}","v":[{}.0, 1.0, 2.0, 3.0]}}}}"#,
             i, i
@@ -6213,8 +6215,6 @@ async fn vector_ivf_partition_sizing_issue_485_issue_486() {
     }
     db.load_jsonl(&data2, LoadMode::Merge).await.unwrap();
 
-    // Issue #486: an existing vector index with 10 partitions on 625 rows
-    // has 10 * 2 < 25 (it fell below half target), so optimize must detect it and fold/resize it.
     let outcome2 = db
         .optimize_as(None, OptimizeRequest::default())
         .await
@@ -6224,7 +6224,7 @@ async fn vector_ivf_partition_sizing_issue_485_issue_486() {
             .datasets
             .iter()
             .any(|d| d.type_key == "node:Doc" && d.committed()),
-        "optimize must detect undersized partition count and fold/resize index"
+        "optimize fold over appended rows must commit"
     );
 
     let ds2 = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
@@ -6232,8 +6232,42 @@ async fn vector_ivf_partition_sizing_issue_485_issue_486() {
     let stats2: serde_json::Value = serde_json::from_str(&stats_json2).unwrap();
     let num_partitions2 = first_num_partitions(&stats2).unwrap_or(0);
     assert_eq!(
-        num_partitions2, 25,
-        "folded vector index on 625 rows must be resized to isqrt(625) = 25 partitions, found {num_partitions2}"
+        num_partitions2, 10,
+        "folded vector index on 400 rows must preserve healthy 10 partitions (10 * 2 >= 20), found {num_partitions2}"
+    );
+
+    // Load 225 more rows -> total 625 rows -> target isqrt(625) = 25.
+    // Issue #486: an existing vector index with 10 partitions on 625 rows
+    // has 10 * 2 < 25 (it fell below half target), so optimize must detect it and fold/resize it.
+    let mut data3 = String::new();
+    for i in 400..625 {
+        data3.push_str(&format!(
+            r#"{{"type":"Doc","data":{{"slug":"s{}","v":[{}.0, 1.0, 2.0, 3.0]}}}}"#,
+            i, i
+        ));
+        data3.push('\n');
+    }
+    db.load_jsonl(&data3, LoadMode::Merge).await.unwrap();
+
+    let outcome3 = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        outcome3
+            .datasets
+            .iter()
+            .any(|d| d.type_key == "node:Doc" && d.committed()),
+        "optimize must detect undersized partition count and fold/resize index"
+    );
+
+    let ds3 = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let stats_json3 = ds3.index_statistics(&vec_idx.name).await.unwrap();
+    let stats3: serde_json::Value = serde_json::from_str(&stats_json3).unwrap();
+    let num_partitions3 = first_num_partitions(&stats3).unwrap_or(0);
+    assert_eq!(
+        num_partitions3, 25,
+        "folded vector index on 625 rows must be resized to isqrt(625) = 25 partitions, found {num_partitions3}"
     );
 }
 
