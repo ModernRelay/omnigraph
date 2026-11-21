@@ -81,11 +81,12 @@ graphs:
 
 A graph ID is 1–64 ASCII letters, digits or hyphens, starts with a letter,
 and is not `policies`, `healthz`, `openapi` or `graphs`. The server refuses at
-startup every ID outside the character, length and reserved-name rules, and the
-cluster's recorded state requires the leading letter, so `cluster validate`,
-`plan` and `apply` refuse any other ID with `invalid_resource_id` before
-anything is written. An underscore is refused in a graph ID; policy bundle,
-query and embedding provider names may contain one. If a cluster already
+startup every ID outside the character, length and reserved-name rules.
+Deployment addresses and the cluster's recorded state require a letter or `_`
+first, and the server refuses `_`, so a graph ID must start with a letter.
+`cluster validate`, `plan` and `apply` refuse any other ID with
+`invalid_resource_id` before anything is written. Policy bundle, query and
+embedding provider names may contain `_`. If a cluster already
 declares a graph whose ID breaks this rule, no other change applies until you
 rename or remove that graph in `cluster.yaml`. Renaming or removing it deletes
 the old graph root and its history.
