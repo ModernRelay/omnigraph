@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::concurrent::{ConcurrentStep, Pass, permutation};
 use crate::runner_config::SeamDirective;
+use crate::served::ServerTarget;
 use crate::{Case, Item, QueryStep, Step, StepFail};
 
 /// The most workers one label of a block declares on a host with a scripted
@@ -151,6 +152,22 @@ pub trait ExecutionHost: Sync {
         Self: Sized,
     {
         run_block_once(self, session, step)
+    }
+
+    /// The measured block of a workload against a server. Only a host that
+    /// measures runs one, each session over a client of its own.
+    fn served_block<'a>(
+        &'a self,
+        _target: &'a ServerTarget,
+        _case: &'a Case,
+        step: &'a ConcurrentStep,
+    ) -> BoxFuture<'a, Result<(), StepFail>> {
+        futures::future::ready(Err(StepFail::new(
+            format!("step {} (concurrent)", step.ordinal),
+            "unsupported_environment: a measured block against a server requires a measuring host"
+                .into(),
+        )))
+        .boxed()
     }
 }
 

@@ -1537,10 +1537,12 @@ fn validate_production_reset(case: &crate::legacy::case::CaseV1) -> RunnerResult
             "unsupported_runner_axis",
             "plain-copy requires verified Linux XFS instance-store NVMe with the process-fresh, preparation-only, page-cache-uncontrolled cache declaration",
         )),
-        ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone => Err(RunnerError::new(
-            "unsupported_runner_axis",
-            "runner-v1 implements the restore levels only",
-        )),
+        ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone | ResetMode::Rebuild => {
+            Err(RunnerError::new(
+                "unsupported_runner_axis",
+                "runner-v1 implements the restore levels only",
+            ))
+        }
     }
 }
 
@@ -1704,7 +1706,10 @@ async fn execute_owned_run(
                         RunnerError::new("fixture_handoff_failed", error.to_string())
                     })?,
                 ),
-                ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone => {
+                ResetMode::None
+                | ResetMode::S3Versioning
+                | ResetMode::Clone
+                | ResetMode::Rebuild => {
                     return Err(RunnerError::new(
                         "unsupported_runner_axis",
                         "the local runner accepts a restore level's handoff only",

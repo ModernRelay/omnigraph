@@ -74,8 +74,9 @@ pub use runner_config::{
 /// changes, pinned by the grammar golden under `tests/grammar/`.
 pub const GQT_FORMAT_VERSION: u32 = 1;
 pub use served::{
-    ServerTarget, admit_served, admit_served_workload, execute_measured_served,
-    execute_steps_served,
+    SeededTable, ServedSession, ServerTarget, admit_served, admit_served_workload,
+    execute_measured_served, execute_steps_served, provision_served, server_ready,
+    server_source_commit,
 };
 
 mod load_plan;
@@ -5383,19 +5384,57 @@ async fn attempt_session(
     }
 }
 
+/// One read of a branch, answered as JSON rows: the door a block's readback
+/// asks through. A session answers it in process and a served session over
+/// HTTP, so the readback is the same check on every route a block runs on.
+pub trait ReadDoor: Sync {
+    /// The rows query `name` of `source` returns on `branch`; `Err` is the
+    /// read's own failure as text.
+    fn rows<'a>(
+        &'a self,
+        branch: &'a str,
+        source: &'a str,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>>;
+}
+
+impl ReadDoor for Session {
+    fn rows<'a>(
+        &'a self,
+        branch: &'a str,
+        source: &'a str,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>> {
+        async move {
+            let params = build_params(None, &[], None, &Bindings::new())?;
+            let result = self
+                .query(ReadTarget::branch(branch), source, name, &params)
+                .await
+                .map_err(|e| e.to_string())?;
+            match result
+                .to_rust_json()
+                .map_err(|e| format!("engine rows failed to render as JSON: {e}"))?
+            {
+                Value::Array(rows) => Ok(rows),
+                _ => Err("engine returned a non-array row set".into()),
+            }
+        }
+        .boxed()
+    }
+}
+
 /// After a block, every row a `load generate:` session dealt is read back by
-/// its key on the case session, `runs` runs per worker, and compared column
+/// its key through `door`, `runs` runs per worker, and compared column
 /// by column with the row the recipe generated; a missing row or a changed
 /// column fails the block. The check needs no line in the file: a dealt row
 /// is a row the host knows, so the host asks for it. A session whose expect
 /// is an `error:` loaded nothing the file claims, so it is not read back.
 pub async fn readback_dealt_rows(
     host: &impl ExecutionHost,
-    session: &Session,
+    door: &impl ReadDoor,
     step: &ConcurrentStep,
     runs: u64,
 ) -> Result<(), String> {
-    let params = build_params(None, &[], None, &Bindings::new())?;
     for op in &step.sessions {
         let SessionKind::Load(recipe) = &op.kind else {
             continue;
@@ -5404,7 +5443,7 @@ pub async fn readback_dealt_rows(
             continue;
         }
         for seq in 0..runs {
-            readback_row(host, session, op, recipe, seq, &params).await?;
+            readback_row(host, door, op, recipe, seq).await?;
         }
     }
     Ok(())
@@ -5414,11 +5453,10 @@ pub async fn readback_dealt_rows(
 /// column by column with the row the recipe generated.
 async fn readback_row(
     host: &impl ExecutionHost,
-    session: &Session,
+    door: &impl ReadDoor,
     op: &SessionOp,
     recipe: &Dealt,
     seq: u64,
-    params: &omnigraph_compiler::ParamMap,
 ) -> Result<(), String> {
     let index = op.dealt_index(seq);
     let (table, column, value) = recipe.generated.dealt_key(index)?;
@@ -5438,8 +5476,8 @@ async fn readback_row(
         "query readback() {{ match {{ $r: {table} {{ {column}: {literal} }} }} return {{ {} }} }}",
         projection.join(", ")
     );
-    let result = session
-        .query(ReadTarget::branch(&op.branch), &source, "readback", params)
+    let actual = door
+        .rows(&op.branch, &source, "readback")
         .await
         .map_err(|e| {
             format!(
@@ -5447,12 +5485,6 @@ async fn readback_row(
                 op.label, op.branch
             )
         })?;
-    let rows = result
-        .to_rust_json()
-        .map_err(|e| format!("readback rows failed to render as JSON: {e}"))?;
-    let Value::Array(actual) = rows else {
-        return Err("readback returned a non-array row set".into());
-    };
     if actual.len() != 1 {
         return Err(format!(
             "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback found {} rows",
@@ -5495,11 +5527,10 @@ pub struct Readback {
 /// compared column by column, as [`readback_dealt_rows`] compares them all.
 pub async fn readback_acked_rows(
     host: &impl ExecutionHost,
-    session: &Session,
+    door: &impl ReadDoor,
     step: &ConcurrentStep,
     acked: &[u64],
 ) -> Result<Readback, String> {
-    let params = build_params(None, &[], None, &Bindings::new())?;
     let mut scans: HashMap<(String, String, String), HashSet<String>> = HashMap::new();
     let mut readback = Readback::default();
     for (op, &runs) in step.sessions.iter().zip(acked) {
@@ -5515,21 +5546,10 @@ pub async fn readback_acked_rows(
             let source = format!(
                 "query readback_keys() {{ match {{ $r: {table} }} return {{ $r.{column} }} }}"
             );
-            let result = session
-                .query(
-                    ReadTarget::branch(&op.branch),
-                    &source,
-                    "readback_keys",
-                    &params,
-                )
+            let rows = door
+                .rows(&op.branch, &source, "readback_keys")
                 .await
                 .map_err(|e| format!("readback of the keys of {table} on {}: {e}", op.branch))?;
-            let Value::Array(rows) = result
-                .to_rust_json()
-                .map_err(|e| format!("readback keys failed to render as JSON: {e}"))?
-            else {
-                return Err("readback returned a non-array row set".into());
-            };
             let name = format!("r.{column}");
             let keys = rows
                 .iter()
@@ -5554,7 +5574,7 @@ pub async fn readback_acked_rows(
         let stride = runs.div_ceil(READBACK_COMPARED_PER_SESSION).max(1);
         let mut seq = 0;
         while seq < runs {
-            readback_row(host, session, op, recipe, seq, &params).await?;
+            readback_row(host, door, op, recipe, seq).await?;
             readback.compared += 1;
             seq += stride;
         }

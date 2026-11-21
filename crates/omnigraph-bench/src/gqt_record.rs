@@ -1,7 +1,7 @@
 //! Scenario-specific GQT authority records; legacy serializers stay unchanged.
 use crate::case::{Backend, ResetMode};
-use crate::concurrent_host::Driver;
 use crate::dataset_cache::{DatasetManifestV1, validate_manifest_evidence};
+use crate::driver::Driver;
 use crate::gqt_case::{
     BlockRun, GqtPointIdentityV1, MAX_EXPANDED_STEPS, Target, validate_point_spec,
 };
@@ -86,6 +86,11 @@ pub struct ProductSutIdentityV1 {
     /// of itself is `source_commit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_commit: Option<String>,
+    /// The digest of the build's `omnigraph-server`, on a `reset: rebuild`
+    /// record: the run started that binary per repetition and the workload
+    /// ran against it. Absent where the product binary itself ran the steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_executable_sha256: Option<String>,
     pub harness: SutIdentityV1,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +102,9 @@ impl ProductSutIdentityV1 {
     pub(crate) fn validate(&self) -> RecordResult<()> {
         crate::record::validate_harness(&self.harness)?;
         validate_sha256(&self.executable_sha256, "sut.executable_sha256")?;
+        if let Some(server) = &self.server_executable_sha256 {
+            validate_sha256(server, "sut.server_executable_sha256")?;
+        }
         validate_text(&self.package_version, "sut.package_version")?;
         validate_text(&self.http_contract, "sut.http_contract")?;
         if let Some(commit) = &self.source_commit {
@@ -215,6 +223,9 @@ pub(crate) enum GqtEvidence<'a> {
     Embedded(EmbeddedEvidence<'a>),
     Served(&'a ServedSutIdentityV1),
     Clone(CloneEvidence<'a>),
+    /// A server the run started per repetition: the clone record's evidence,
+    /// its SUT naming the server binary too.
+    OwnedServer(CloneEvidence<'a>),
 }
 pub(crate) struct EmbeddedEvidence<'a> {
     pub(crate) sut: &'a SutIdentityV1,
@@ -268,18 +279,27 @@ impl GqtRunRecordV1 {
             }
             (
                 GqtSutIdentityV1::Product(sut),
-                Target::Engine,
+                target,
                 Some(machine),
                 Some(backend),
                 None,
                 Some(_),
                 Some(base),
-            ) => Ok(GqtEvidence::Clone(CloneEvidence {
-                sut,
-                machine,
-                backend,
-                base,
-            })),
+            ) => {
+                let evidence = CloneEvidence {
+                    sut,
+                    machine,
+                    backend,
+                    base,
+                };
+                match (target, &sut.server_executable_sha256) {
+                    (Target::Engine, None) => Ok(GqtEvidence::Clone(evidence)),
+                    (Target::Server, Some(_)) => Ok(GqtEvidence::OwnedServer(evidence)),
+                    _ => Err(error(
+                        "a product record names a server binary exactly when its target is the server",
+                    )),
+                }
+            }
             _ => Err(error("target and evidence tuple disagree")),
         }
     }
@@ -393,6 +413,10 @@ fn assemble(
                 executable_sha256: product.executable_sha256.clone(),
                 source_commit: product.source_commit.clone(),
                 requested_commit: product.requested_commit.clone(),
+                server_executable_sha256: product
+                    .server
+                    .as_ref()
+                    .map(|server| server.executable_sha256.clone()),
                 harness: {
                     let harness = crate::record::sut_identity_from_build(&execution.build)?;
                     crate::record::validate_harness(&harness)?;
@@ -555,15 +579,18 @@ pub fn validate_concurrent(r: &ConcurrentRunRecordV1) -> RecordResult<()> {
 
 fn validate_concurrent_with_proof(r: &ConcurrentRunRecordV1) -> RecordResult<PreparationProofV2> {
     let spec = &r.record.run.run_spec;
+    let runs_a_block = match spec.environment.target {
+        Target::Engine => spec.protocol.reset != ResetMode::Clone,
+        Target::Server => spec.protocol.reset == ResetMode::Rebuild,
+    };
     if r.format_version != 1
         || r.driver != Driver::ClosedLoop
         || r.claim_grade
         || r.sweep != spec.sweep
-        || spec.environment.target != Target::Engine
-        || spec.protocol.reset == ResetMode::Clone
+        || !runs_a_block
     {
         return Err(error(
-            "a concurrent record is a closed-loop run of an embedded point at its swept value, and never claim-grade",
+            "a concurrent record is a closed-loop run at its swept value, of an embedded point on a restored store or a server point under reset: rebuild, and never claim-grade",
         ));
     }
     let run = BlockRun {
@@ -693,7 +720,7 @@ fn validate_with_proof(
                         "a sample ran on another runtime build than the record states",
                     ));
                 }
-                crate::concurrent_host::validate(
+                crate::driver::validate(
                     observed,
                     step,
                     block.run,
@@ -772,6 +799,11 @@ fn validate_target_evidence(r: &GqtRunRecordV1) -> RecordResult<PreparationProof
         GqtEvidence::Served(sut) => {
             let receipt = &sut.receipt;
             sut.validate()?;
+            if spec.protocol.reset == ResetMode::Rebuild {
+                return Err(error(
+                    "a deployment receipt names a server an operator provisioned, and reset: rebuild a server the run starts",
+                ));
+            }
             if receipt.backend != spec.environment.backend
                 || receipt.dataset.recipe_sha256 != spec.dataset_recipe_sha256
                 || receipt.dataset.logical_content_sha256 != spec.dataset_logical_digest
@@ -803,6 +835,34 @@ fn validate_target_evidence(r: &GqtRunRecordV1) -> RecordResult<PreparationProof
             Ok(PreparationProofV2::Clone {
                 base_manifest_sha256: base.manifest_sha256.clone(),
             })
+        }
+        GqtEvidence::OwnedServer(CloneEvidence {
+            sut,
+            machine,
+            backend,
+            base,
+        }) => {
+            sut.validate()?;
+            validate_machine_identity(machine).map_err(error)?;
+            validate_backend(&spec.environment.backend, backend)?;
+            validate_base_evidence(base)?;
+            let Some(server_sha256) = sut.server_executable_sha256.clone() else {
+                return Err(error("an owned-server record names no server binary"));
+            };
+            if base.recipe_sha256 != spec.dataset_recipe_sha256
+                || base.summary.logical_content_sha256 != spec.dataset_logical_digest
+                || base.summary.algorithm != spec.dataset_identity_algorithm
+                || spec.protocol.reset != ResetMode::Rebuild
+                || r.measurements
+                    .raw_samples
+                    .iter()
+                    .any(|sample| sample.peak_rss_bytes.is_none())
+            {
+                return Err(error(
+                    "base binding mismatch, or a sample without its server's peak memory",
+                ));
+            }
+            Ok(PreparationProofV2::OwnedServer { server_sha256 })
         }
     }
 }
