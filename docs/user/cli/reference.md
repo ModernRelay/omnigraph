@@ -59,7 +59,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `init` | Create an empty graph from a `.pg` schema | direct |
 | `catalogue` | Query this binary's engine registries with `-e` or `--query`; optional `--json` | local, no operator config or graph storage |
 | `query` | Run a read query, or a branch read (`branch list`, `diff`, `merge-base`, `merge … dry run`), `show`, or `explain` statement | direct or served |
-| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
+| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create` (refused with `branch_exists` when a branch holds the name), `branch delete` (also removes a [not-ready branch](../branching/index.md#branch-workflow) and finishes a pending retirement), `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
 | `load` | Load graph JSONL in `insert`, `upsert`, `replace` or `overwrite` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `list --detailed` adds each branch's head, start and times, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
@@ -207,13 +207,14 @@ omnigraph schema upgrade-system-columns --target ./graph.omni --check --json
 ```
 
 `omnigraph upgrade --target ADDRESS`
-converts a standalone v8, v9 (release 0.11.x) or v13 graph to v17, offline and
-in place, keeping branches and commit history, and stamps a v14, v15 or v16 graph
-to v17 with one metadata-only commit per live branch; stop every process using
-the graph and retain a verified whole-root backup first. `--check` writes
-nothing; `--to-format` accepts 17 only. `check_passed`, `already_current` (a
-v17 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
-other format below 14, `newer_than_binary` above 17, `unsupported_target`)
+converts a standalone v8, v9 (release 0.11.x) or v13 graph to v18, offline and
+in place, keeping branches and commit history, and stamps a v14 to v17 graph
+to v18 with one metadata-only commit per live branch, `main`'s recording every
+branch in the catalog, then removes the branch ref files; stop every process
+using the graph and retain a verified whole-root backup first. `--check` writes
+nothing; `--to-format` accepts 18 only. `check_passed`, `already_current` (a
+v18 graph with no ref file left) and `completed` exit 0; `check_failed` (`unsupported_source` for any
+other format below 14, `newer_than_binary` above 18, `unsupported_target`)
 and `recovery_required` (a pending attempt, finished as `recovery.action` says,
 or leftover recovery files) exit 1. The report names the formats, the route,
 the `work` counts, findings and the recovery action. Server and cluster

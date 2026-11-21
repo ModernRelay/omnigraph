@@ -166,6 +166,10 @@ pub(crate) enum EpochAssertion {
     Publish,
     /// A claim whose first load read `read`: the rows still stand there.
     Claim { read: u64 },
+    /// The tombstone that ends a tree's chain: nothing is checked and nothing
+    /// is cleared, so a delete proceeds past another process's claim and the
+    /// chain keeps its last epoch.
+    None,
 }
 
 /// What a publication that passed the check does next.
@@ -193,6 +197,7 @@ pub(crate) fn check_writer_epoch(
     assertion: EpochAssertion,
 ) -> std::result::Result<EpochVerdict, Fenced> {
     match assertion {
+        EpochAssertion::None => Ok(EpochVerdict::Proceed),
         EpochAssertion::Publish if held.unwrap_or(0) == current => Ok(EpochVerdict::Proceed),
         EpochAssertion::Publish => Err(Fenced {
             held,
@@ -209,26 +214,35 @@ pub(crate) fn check_writer_epoch(
     }
 }
 
-/// How a claim whose put returned no answer settles, by the `writer_epoch`
-/// row of the version it attempted.
+/// How a control-fact publication whose put returned no answer settles, by
+/// the version it attempted: a claim by its `writer_epoch` row, a branch row
+/// by its config entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnansweredClaim {
-    /// The version holds the row with this claim's attempt id.
+pub(crate) enum UnansweredPublication {
+    /// The version holds this publication's fact.
     Landed,
-    /// Another publication holds the version: no request of this claim lands.
+    /// Another publication holds the version: no request of this one lands.
     Lost,
     /// The store acknowledged the version and it holds something else.
     InDoubt,
+}
+
+/// `landed` is whether the attempted version holds the publication's fact.
+pub(crate) fn settle_unanswered(landed: bool, after_ack: bool) -> UnansweredPublication {
+    match (landed, after_ack) {
+        (true, _) => UnansweredPublication::Landed,
+        (false, true) => UnansweredPublication::InDoubt,
+        (false, false) => UnansweredPublication::Lost,
+    }
 }
 
 pub(crate) fn settle_unanswered_claim(
     attempted: Option<&WriterEpochRow>,
     attempt_id: &str,
     after_ack: bool,
-) -> UnansweredClaim {
-    match attempted {
-        Some(row) if row.attempt_id == attempt_id => UnansweredClaim::Landed,
-        _ if after_ack => UnansweredClaim::InDoubt,
-        _ => UnansweredClaim::Lost,
-    }
+) -> UnansweredPublication {
+    settle_unanswered(
+        attempted.is_some_and(|row| row.attempt_id == attempt_id),
+        after_ack,
+    )
 }

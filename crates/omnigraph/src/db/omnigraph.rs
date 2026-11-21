@@ -2638,10 +2638,12 @@ impl Omnigraph {
     pub async fn refresh(&self) -> Result<()> {
         let _serial = self.write_queue.acquire_schema_exclusive().await?;
         let (installed, mut next) = self.installed_coordinator_copy();
-        next.refresh().await?;
+        let outcome = next.refresh().await?;
         self.install_coordinator(next, &installed);
         self.reload_schema_view_from_coordinator().await?;
-        self.invalidate_read_caches().await;
+        if outcome.reloaded_rows() {
+            self.invalidate_read_caches().await;
+        }
         Ok(())
     }
 
@@ -2675,9 +2677,11 @@ impl Omnigraph {
     /// Refresh coordinator state while the caller owns the applicable schema permit.
     pub(crate) async fn refresh_coordinator_only(&self) -> Result<()> {
         let (installed, mut next) = self.installed_coordinator_copy();
-        next.refresh().await?;
+        let outcome = next.refresh().await?;
         self.install_coordinator(next, &installed);
-        self.invalidate_read_caches().await;
+        if outcome.reloaded_rows() {
+            self.invalidate_read_caches().await;
+        }
         Ok(())
     }
 
@@ -2961,9 +2965,9 @@ impl Omnigraph {
                 let copy = GraphCoordinator::clone(&coord);
                 (coord, copy)
             };
-            next.refresh().await?;
+            let outcome = next.refresh().await?;
             let resolved = warm_resolved_target(&next, target).await?;
-            if self.install_coordinator(next, &installed) {
+            if self.install_coordinator(next, &installed) && outcome.reloaded_rows() {
                 self.invalidate_read_caches().await;
             }
             return Ok(resolved);
@@ -3185,10 +3189,10 @@ impl Omnigraph {
                         }
                     } else {
                         let mut next = GraphCoordinator::clone(&coord);
-                        next.refresh().await?;
+                        let outcome = next.refresh().await?;
                         let refreshed_incarnation = next.manifest_incarnation();
                         let cut = Arc::new(next.build_change_feed_cut().await?);
-                        if self.install_coordinator(next, &coord) {
+                        if self.install_coordinator(next, &coord) && outcome.reloaded_rows() {
                             self.invalidate_read_caches().await;
                         }
                         *self.feed_cut_cache.write().await =
@@ -4296,7 +4300,8 @@ impl Omnigraph {
             .acquire_branches(&[source.clone(), Some(target.clone())])
             .await?;
         let branches = [source.clone(), Some(target.clone())];
-        let warm_snapshot = self.coordinator.load_full().snapshot();
+        let installed = self.coordinator.load_full();
+        let warm_snapshot = installed.snapshot();
         let (control_catalog, identity) = self
             .accepted_catalog_for_snapshot(&warm_snapshot)
             .await
@@ -4323,6 +4328,9 @@ impl Omnigraph {
             .map_err(OmniError::before_effect)?;
         // A create changes no read-cache key; see `delete_captured_branch_storage`.
         source_coord.branch_create(&target).await?;
+        if installed.current_branch().is_none() && source_coord.current_branch().is_none() {
+            self.install_coordinator(source_coord, &installed);
+        }
         Ok(())
     }
 
@@ -4466,9 +4474,7 @@ impl Omnigraph {
             )
             .await
             .map_err(OmniError::before_effect)?;
-        // A locally owned source coordinator cannot be swapped by a concurrent
-        // `branch_create_from`; the ref write is durable whichever handle
-        // issued it.
+        let installed = self.coordinator.load_full();
         let created = match (start, start_record) {
             (CreateStart::Head(from), _) => BranchCreated {
                 from_commit_id: source_coord.branch_create(&target_branch).await?,
@@ -4490,7 +4496,9 @@ impl Omnigraph {
                 unreachable!("a commit start captures the commit's record with its source")
             }
         };
-        // A create changes no read-cache key; see `delete_captured_branch_storage`.
+        if installed.current_branch().is_none() && source_coord.current_branch().is_none() {
+            self.install_coordinator(source_coord, &installed);
+        }
         Ok(created)
     }
 
@@ -4697,7 +4705,8 @@ impl Omnigraph {
         };
         drop(cache);
         let branches = [Some(branch.clone())];
-        let warm_snapshot = self.coordinator.load_full().snapshot();
+        let installed = self.coordinator.load_full();
+        let warm_snapshot = installed.snapshot();
         let (control_catalog, identity) = self
             .accepted_catalog_for_snapshot(&warm_snapshot)
             .await
@@ -4721,12 +4730,51 @@ impl Omnigraph {
             }
             _ => None,
         };
+        if installed.has_branch_rows() {
+            let mut control = self
+                .main_control_for_delete(&installed, &branch)
+                .await
+                .map_err(OmniError::before_effect)?;
+            let identifier = control
+                .live_row_identifier(&branch)
+                .map_err(OmniError::before_effect)?
+                .ok_or_else(|| {
+                    OmniError::BranchNotFound {
+                        branch: branch.clone(),
+                    }
+                    .before_effect()
+                })?;
+            let (_control_catalog, _table_guards) = self
+                .join_control_catalog_to_capture(
+                    control_catalog,
+                    &identity,
+                    &branches,
+                    table_guards,
+                    &control,
+                    "branch_delete",
+                )
+                .await
+                .map_err(OmniError::before_effect)?;
+            control
+                .branch_delete_through_rows(&branch, &identifier, cached_target.as_ref())
+                .await?;
+            if installed.current_branch().is_none() {
+                self.install_coordinator(control, &installed);
+            }
+            return Ok(());
+        }
         let mut target_control = match cached_target {
             Some(coordinator) => coordinator,
-            None => self
+            None => match self
                 .open_coordinator_for_branch(Some(branch.as_str()))
                 .await
-                .map_err(OmniError::before_effect)?,
+            {
+                Ok(coordinator) => coordinator,
+                Err(OmniError::BranchNotReady { .. } | OmniError::BranchDeleted { .. }) => {
+                    return self.delete_unopenable_branch(&branch).await;
+                }
+                Err(error) => return Err(OmniError::before_effect(error)),
+            },
         };
         let (_control_catalog, _table_guards) = self
             .join_control_catalog_to_capture(
@@ -4741,6 +4789,46 @@ impl Omnigraph {
             .map_err(OmniError::before_effect)?;
         self.delete_captured_branch_storage(&branch, &mut target_control)
             .await
+    }
+
+    /// RFC "Branch existence in the catalog" §Delete step 1: main at its
+    /// latest version, where `branch`'s row is resolved; the handle's own main
+    /// when it holds main (refreshed only if its head moved), one open otherwise.
+    async fn main_control_for_delete(
+        &self,
+        installed: &Arc<GraphCoordinator>,
+        branch: &str,
+    ) -> Result<GraphCoordinator> {
+        match installed.current_branch() {
+            Some(active) if active == branch => Err(OmniError::manifest_conflict(format!(
+                "cannot delete currently active branch '{branch}'"
+            ))),
+            Some(_) => self.open_coordinator_for_branch(None).await,
+            None => {
+                let mut control = GraphCoordinator::clone(installed);
+                if !control.head_is_current().await? {
+                    control.refresh().await?;
+                }
+                Ok(control)
+            }
+        }
+    }
+
+    /// RFC "Branch existence in the catalog" §Delete of a branch whose chain
+    /// refuses a reader's open, not ready or tombstoned by an earlier attempt:
+    /// main's coordinator completes the retirement under the row's identifier.
+    async fn delete_unopenable_branch(&self, branch: &str) -> Result<()> {
+        let mut control = self
+            .open_coordinator_for_branch(None)
+            .await
+            .map_err(OmniError::before_effect)?;
+        let identifier = control.live_row_identifier(branch)?.ok_or_else(|| {
+            OmniError::BranchNotFound {
+                branch: branch.to_string(),
+            }
+            .before_effect()
+        })?;
+        control.branch_delete_captured(branch, &identifier).await
     }
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
@@ -5865,7 +5953,7 @@ pub type ReadCheck<'a> = dyn FnMut(&str) -> bool + Send + 'a;
 /// The live graph branches, as [`Omnigraph::branch_list_detailed`] lists them.
 #[derive(Debug, Clone)]
 pub struct BranchListing {
-    /// Every live branch, `main` first and the rest by name.
+    /// Every branch with a live row, `main` first and the rest by name.
     pub branches: Vec<String>,
     /// One entry per branch the caller may read, in the order of `branches`.
     pub details: Vec<BranchDetail>,
@@ -5880,35 +5968,45 @@ pub struct BranchListing {
 pub struct BranchDetail {
     pub name: String,
     /// The commit a read of the branch sees: its newest commit, or the commit
-    /// it started at while it has written none.
-    pub head: GraphCommit,
+    /// it started at while it has written none. `None` while the branch has
+    /// no tree to read: not ready, a create that wrote its row and no tree
+    /// (RFC "Branch existence in the catalog" §Readers), or its retirement
+    /// pending.
+    pub head: Option<GraphCommit>,
     /// The branch this one started from, as that branch was named then; it
     /// may since have been deleted or recreated. `None` on `main`.
     pub from: Option<String>,
     /// The commit the branch started at. Fixed for the branch's lifetime:
     /// unlike the merge base, a later merge does not move it. `None` on
-    /// `main`.
+    /// `main` and with `head`.
     pub from_commit_id: Option<String>,
     /// When the branch was created, in Unix microseconds recorded to the
     /// second; `None` on `main`.
     pub created_at: Option<i64>,
     /// When the head last moved, in Unix microseconds: the time of the
-    /// branch's newest commit, or `created_at` while it has written none.
-    pub updated_at: i64,
+    /// branch's newest commit, or `created_at` while it has written none;
+    /// `None` with `head`.
+    pub updated_at: Option<i64>,
+    /// The branch's tree carries a tombstone: a delete crashed before its
+    /// retired row, or finished after the rows were read. Reads refuse
+    /// `branch_deleted`; the next `branch delete` finishes the retirement.
+    pub retirement_pending: bool,
 }
 
 impl BranchDetail {
     fn from_catalog(detail: crate::db::manifest::GraphBranchDetail) -> Self {
-        let head = crate::db::commit_graph::graph_commit_from_manifest_row(detail.head);
+        let head = detail
+            .head
+            .map(crate::db::commit_graph::graph_commit_from_manifest_row);
         let created_at = detail.created_at_seconds.map(|seconds| {
             i64::try_from(seconds)
                 .unwrap_or(i64::MAX)
                 .saturating_mul(1_000_000)
         });
-        let updated_at = match created_at {
-            Some(created_at) if !detail.head_is_own => created_at,
+        let updated_at = head.as_ref().map(|head| match created_at {
+            Some(created_at) if detail.head_is_own == Some(false) => created_at,
             _ => head.created_at,
-        };
+        });
         Self {
             name: detail.name,
             head,
@@ -5916,6 +6014,7 @@ impl BranchDetail {
             from_commit_id: detail.from_commit_id,
             created_at,
             updated_at,
+            retirement_pending: detail.retirement_pending,
         }
     }
 }
@@ -6805,7 +6904,9 @@ edge WorksAt: Person -> Company
         owner.branch_create("dev").await.unwrap();
         let mut reader = Omnigraph::open(uri).await.unwrap();
         reader.sync_branch("dev").await.unwrap();
-        seed_person_row(&mut reader, "Alice", Some(30)).await;
+        for name in ["Alice", "Bob", "Carol"] {
+            seed_person_row(&mut reader, name, Some(30)).await;
+        }
         let old = reader.snapshot().await;
         owner.branch_delete("dev").await.unwrap();
         let desired = TEST_SCHEMA
@@ -6822,7 +6923,9 @@ edge WorksAt: Person -> Company
         let replacement = fresh.snapshot().await;
         assert_eq!(
             old.graph_manifest_version(),
-            replacement.graph_manifest_version()
+            replacement.graph_manifest_version(),
+            "three writes on dev bring its retired version to the recreated start: the retired \
+             row, the apply and the new row each advance main by one"
         );
         assert_ne!(old.native_branch(), replacement.native_branch());
         assert_ne!(old.schema_contract(), replacement.schema_contract());
@@ -6842,7 +6945,9 @@ edge WorksAt: Person -> Company
         owner.branch_create("dev").await.unwrap();
         let mut old_reader = Omnigraph::open(uri).await.unwrap();
         old_reader.sync_branch("dev").await.unwrap();
-        seed_person_row(&mut old_reader, "Alice", Some(30)).await;
+        for name in ["Alice", "Bob", "Carol"] {
+            seed_person_row(&mut old_reader, name, Some(30)).await;
+        }
         let old = old_reader.snapshot().await;
         let old_identity = snapshot_contract_identity(&old).unwrap();
         owner.branch_delete("dev").await.unwrap();

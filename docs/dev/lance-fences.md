@@ -780,16 +780,16 @@ semantics);
 ### Branches/tags
 
 Each graph-branch lifetime is `{logical}.{ULID}`; bare names identify legacy
-lifetimes. Unretired native `__manifest/_refs/branches/` entries define logical
-branches. Deletion writes identity-bound retirement metadata, archives the exact
+lifetimes. Below storage format 18, unretired native
+`__manifest/_refs/branches/` entries define logical branches. Deletion writes identity-bound retirement metadata, archives the exact
 `BranchContents` inside its native tree, then unlinks the active ref. Needed
 native ancestry and historical merge-base providers remain readable through the
 archive. User `__manifest` tags block logical deletion; valid engine merge-input
 tags instead protect their exact snapshots until the target publication witness
 expires.
 
-Stock `Branches::get` and `list` include every physical ref. Omnigraph's logical
-manifest helpers validate and filter `omnigraph.retired_manifest_branch`, a
+Stock `Branches::get` and `list` include every physical ref. Below format 18,
+Omnigraph's logical manifest helpers validate and filter `omnigraph.retired_manifest_branch`, a
 version-1 JSON value binding the exact native name and identifier. An absent
 marker means live; malformed, unsupported, or mismatched metadata fails closed.
 The metadata update publishes retirement and preserves unrelated metadata.
@@ -802,6 +802,20 @@ historical resolution read archives. Cleanup retains required native ancestors
 and exact merge-base providers, then reclaims unneeded trees with their
 archives. Delayed staging is judged from the complete post-list identity cut and
 final capture validation, so its retirement history need not remain forever.
+
+At or above format 18 the branch set is `main`'s catalog: one config entry of
+`main`'s `__manifest` per branch, keyed `omnigraph.branch.<native name>` and
+decoded by `BranchRows`; a retired branch keeps its key with the value `-`.
+Logical enumeration (`live_named_branches`) reads `main`'s live entries with no
+ref listing. Deletion publishes an `omnigraph.tombstone` entry on the branch's
+own `__manifest`, whose readers `refuse_tombstoned` then refuses with
+`branch_deleted`, then rewrites the branch's entry on `main` as retired;
+nothing is archived and no ref is unlinked. Cleanup removes the tree of a
+retired branch that no live entry names, no tag names and no kept tree's
+`base_paths` reach, then removes the retired entry from `main`'s config,
+deferring it to a later run when that publication fails, and unlinks any ref
+file the upgrade left under `_refs/branches/`. Lance tags still pin a branch's
+tree: cleanup keeps a tagged tree and its retired entry.
 
 **Owners:** `integration/branching.rs`, `branch_control.rs` tests,
 `integration/merge_cleanup.rs`
@@ -825,9 +839,12 @@ lists `_refs/branches/` once and reads only that branch's own incarnations, so
 another branch's retirement rewrite, or its malformed retirement record, no
 longer fails a branch open or a held-ref re-resolve; fresh creation narrows content reads to its source and the target's equal,
 ancestor and descendant names.
-Operations that require a complete inventory, including logical enumeration and
-cleanup, still read every active ref; maintenance and historical resolution also
-read retirement archives. Delete the retry arm and un-ignore the guard at the
+Below format 18, operations that require a complete inventory, including
+logical enumeration and cleanup, still read every active ref; maintenance and
+historical resolution also read retirement archives. At or above format 18 no
+branch resolution or enumeration reads a ref: a branch opens by its entry's
+native name on `main`, and cleanup's only ref operation unlinks the ref files
+the upgrade left. Delete the retry arm and un-ignore the guard at the
 bump whose `from_path` reads a ref in one `get`.
 
 **Owners:** `branch_control.rs` stale-head tests (they go red at that bump),

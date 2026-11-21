@@ -6,6 +6,8 @@ timeout_ms: 60000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
 
 --- bench
 warmup_seconds: 5

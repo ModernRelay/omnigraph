@@ -219,6 +219,16 @@ pub enum BranchStartRefusal {
     UnattachedSnapshot,
 }
 
+fn format_branch_exists(branch: &str, live: &str) -> String {
+    if branch == live {
+        return format!("branch '{branch}' already exists");
+    }
+    format!(
+        "cannot create branch '{branch}' while live branch '{live}' shares its physical Lance \
+         path; live graph branch names may not be ancestors or descendants"
+    )
+}
+
 fn format_branch_start_refusal(graph_commit_id: &str, reason: &BranchStartRefusal) -> String {
     let why = match reason {
         BranchStartRefusal::NotRetained {
@@ -360,6 +370,22 @@ pub enum OmniError {
     /// an arbitrary storage `NotFound` as branch absence.
     #[error("branch '{branch}' not found")]
     BranchNotFound { branch: String },
+    /// `branch create` named a logical name a live branch holds, or one an
+    /// ancestor or descendant of a live branch's name, which would share its
+    /// physical Lance path. Refused before any effect.
+    #[error("{}", format_branch_exists(branch, live))]
+    BranchExists { branch: String, live: String },
+    /// The branch was deleted under the operation: its chain carries a
+    /// tombstone, or main's rows hold no live row with the identifier the
+    /// operation captured.
+    #[error("branch '{branch}' was deleted")]
+    BranchDeleted { branch: String },
+    /// The branch has a live row and no tree: its create was interrupted
+    /// between the row and the tree. `branch delete` removes the row.
+    #[error(
+        "branch '{branch}' is not ready: its create left no tree; delete it and create it again"
+    )]
+    BranchNotReady { branch: String },
     /// A graph diff endpoint names neither a live branch nor a resolvable
     /// graph commit. Carries only the caller's own spelling.
     #[error("'{target}' names no branch and no commit")]

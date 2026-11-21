@@ -834,7 +834,7 @@ async fn named_write_capture_reuses_the_exact_local_publication() {
         let dir = tempfile::tempdir().unwrap();
         let db = init_and_load(&dir).await;
         db.branch_create("feature").await.unwrap();
-        for (age, expected_scans) in [(31, 2), (32, 0)] {
+        for (age, expected_scans) in [(31, 1), (32, 0)] {
             let (result, io) = measure(helpers::mutate_branch(
                 &db,
                 "feature",

@@ -1,0 +1,112 @@
+# issue: none
+# notes: A create that fails after its entry in main's catalog and before its tree leaves a branch
+# notes: that is listed, refuses reads and writes as not ready, and blocks a create of its name.
+# notes: Its delete removes it, after a reopen too, and the name can then be created again.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- seam
+at: branch_create.post_row
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch create b
+
+--- expect error: injected failpoint triggered: branch_create.post_row
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "b"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query branch: b
+query read_not_ready_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: branch 'b' is not ready
+
+--- mutate branch: b
+query write_not_ready_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect error: branch 'b' is not ready
+
+--- mutate
+branch create b
+
+--- expect error: branch 'b' already exists
+
+--- restart
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "b"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- mutate
+branch delete b
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query write_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: b
+query names_on_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String

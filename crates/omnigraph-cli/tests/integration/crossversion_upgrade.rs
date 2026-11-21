@@ -26,7 +26,7 @@
 //! `c0a4519f`) and `OMNIGRAPH_V011_BIN` (the released 0.11.0 CLI, which writes
 //! storage format 9 and converts a 0.10.x graph to format 8 or 9) drive the
 //! in-place route: the offline `omnigraph upgrade` of a genuine stamp-13,
-//! stamp-9 or stamp-8 root to format 17 with its branches and commit history
+//! stamp-9 or stamp-8 root to the current format with its branches and commit history
 //! kept. Those two, and `OMNIGRAPH_V6_BIN` where a journey starts from a 0.10.x
 //! graph, fall back to a binary under `target/storage-upgrade-binaries/`; with
 //! `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` an unresolved predecessor of a
@@ -103,7 +103,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     assert!(
         String::from_utf8(candidate_version.stdout)
             .unwrap()
-            .contains("internal-schema 17 (serves v14 to v17)")
+            .contains("internal-schema 18 (serves v14 to v18)")
     );
 
     let temp = tempdir().unwrap();
@@ -1420,6 +1420,11 @@ fn human_report_lines(
             count("census_reads"),
             count("census_cells")
         ),
+        format!(
+            "rows: {} written, refs: {} unlinked",
+            count("rows_written"),
+            count("refs_unlinked")
+        ),
     ]
 }
 
@@ -1975,9 +1980,9 @@ fn storage_upgrade_refuses_cluster_path_aliases() {
     }
 }
 
-const V13_HANDLER: &str = "history-lance-files-v13-to-v17";
-const V9_HANDLER: &str = "history-lance-files-v9-to-v17";
-const V8_HANDLER: &str = "history-lance-files-v8-to-v17";
+const V13_HANDLER: &str = "history-lance-files-v13-to-v18";
+const V9_HANDLER: &str = "history-lance-files-v9-to-v18";
+const V8_HANDLER: &str = "history-lance-files-v8-to-v18";
 
 /// The schema contract a root below stamp 13 keeps as three root objects.
 const ROOT_SCHEMA_OBJECTS: [&str; 3] = ["_schema.pg", "_schema.ir.json", "__schema_state.json"];
@@ -2918,6 +2923,7 @@ fn storage_upgrade_preserves_history(
     let temp = tempdir().unwrap();
     let graph = temp.path().join("standalone.omni");
     let uri = graph.to_str().unwrap();
+    let current = omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
     let [schema, data, queries, predecessor_queries] = journey_fixture(temp.path());
     let query_path = queries.to_str().unwrap();
     let predecessor_query_path = predecessor_queries.to_str().unwrap();
@@ -3238,7 +3244,7 @@ fn storage_upgrade_preserves_history(
     ));
     assert_eq!(check["outcome"], "check_passed", "{check}");
     assert_eq!(check["observed_format"], source_format);
-    assert_eq!(check["target_format"], 17);
+    assert_eq!(check["target_format"], current);
     assert_eq!(check["target_defaulted"], true);
     assert_eq!(check["route"], serde_json::json!([handler]));
     assert_eq!(check["completed_handlers"], serde_json::json!([]));
@@ -3256,7 +3262,7 @@ fn storage_upgrade_preserves_history(
             "upgrade {}: check_passed (check)",
             check["location"].as_str().unwrap()
         ),
-        &format!("format: {source_format} -> 17 (default target)"),
+        &format!("format: {source_format} -> {current} (default target)"),
         &format!("route: {handler}"),
     );
     assert_eq!(
@@ -3305,9 +3311,15 @@ fn storage_upgrade_preserves_history(
     ));
     assert_eq!(upgraded["outcome"], "completed", "{upgraded}");
     assert_eq!(upgraded["observed_format"], source_format);
-    assert_eq!(upgraded["target_format"], 17);
+    assert_eq!(upgraded["target_format"], current);
     assert_eq!(upgraded["completed_handlers"], serde_json::json!([handler]));
-    assert_eq!(upgraded["last_durable_completed_boundary"], "activated");
+    let boundary = upgraded["last_durable_completed_boundary"]
+        .as_str()
+        .unwrap();
+    assert!(
+        boundary.starts_with("unlinked:ref '") && boundary.ends_with('\''),
+        "the route ends on the last ref file it unlinked after activation: {boundary}"
+    );
     assert_eq!(upgraded["findings"], serde_json::json!([]));
     assert!(upgraded["recovery"].is_null(), "{upgraded}");
     assert_eq!(
@@ -3319,6 +3331,14 @@ fn storage_upgrade_preserves_history(
         after.contains_key(Path::new("__history/legacy/locator/directory.oglx")),
         "{:?}",
         after.keys().collect::<Vec<_>>()
+    );
+    let refs_left: Vec<_> = after
+        .keys()
+        .filter(|path| path.starts_with("__manifest/_refs/branches"))
+        .collect();
+    assert!(
+        refs_left.is_empty(),
+        "the upgrade unlinks every ref file: {refs_left:?}"
     );
     if let Some(predecessor_schema) = predecessor_schema {
         for object in ROOT_SCHEMA_OBJECTS.map(Path::new) {
@@ -3345,7 +3365,7 @@ fn storage_upgrade_preserves_history(
         }
         let again = support::parse_stdout_json(&output_success(&mut command));
         assert_eq!(again["outcome"], "already_current", "{again}");
-        assert_eq!(again["observed_format"], 17);
+        assert_eq!(again["observed_format"], current);
         assert_eq!(graph_files(&graph), after, "a rerun must write nothing");
     }
     assert!(
@@ -3363,7 +3383,7 @@ fn storage_upgrade_preserves_history(
         let served = support::parse_stdout_json(&output_success(
             cli().args(["snapshot", "--target", uri, "--branch", branch, "--json"]),
         ));
-        assert_eq!(served["internal_schema_version"], 17, "{branch}");
+        assert_eq!(served["internal_schema_version"], current, "{branch}");
         let listing = support::parse_stdout_json(&output_success(cli().args([
             "commit", "list", "--target", uri, "--branch", branch, "--json",
         ])));

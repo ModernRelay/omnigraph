@@ -1860,6 +1860,15 @@ impl ApiError {
             OmniError::BranchNotFound { branch } => {
                 Self::not_found(format!("branch '{branch}' not found"))
             }
+            error @ OmniError::BranchExists { .. } => {
+                Self::new(ErrorCode::BranchExists, error.to_string())
+            }
+            error @ OmniError::BranchDeleted { .. } => {
+                Self::new(ErrorCode::BranchDeleted, error.to_string())
+            }
+            error @ OmniError::BranchNotReady { .. } => {
+                Self::new(ErrorCode::BranchNotReady, error.to_string())
+            }
             error @ OmniError::ReadTargetNotFound { .. } => Self::not_found(error.to_string()),
             error @ OmniError::AmbiguousReadTarget { .. } => Self::bad_request(error.to_string()),
             error @ OmniError::BranchStartRefused { .. } => {

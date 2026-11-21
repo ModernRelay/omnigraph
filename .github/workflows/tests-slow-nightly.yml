@@ -110,7 +110,9 @@ jobs:
             laws::generated_unions_type_as_the_rfc_joins_their_arms_at_nightly_breadth \
             laws::generated_recursions_agree_on_their_least_fixpoint_at_nightly_breadth \
             query::check::tests::compile_cost::compile_cost_grows_linearly_in_every_construct_family_at_nightly_breadth \
-            plan_replay::every_single_plan_edit_is_refused_or_replays_the_run_at_nightly_breadth
+            plan_replay::every_single_plan_edit_is_refused_or_replays_the_run_at_nightly_breadth \
+            gqt_tests::concurrent::owned_server::process::a_rebuild_repetition_runs_against_the_builds_own_server \
+            gqt_tests::concurrent::owned_server::process::every_statement_kind_runs_against_the_builds_own_server
           do
             filter="${filter:+$filter + }test(=$test_name)"
             owners+=(--passed "$test_name")

@@ -115,6 +115,15 @@ route.
   command or HTTP route claims a branch in this release; report it to the
   operator and do not retry. A process another one replaced can answer reads
   from before the claim until a write of its own is refused.
+- `branch_exists` (HTTP `409`): `branch create` named a branch that exists, a
+  not-ready one included. Pick another name, or `branch delete` the holder.
+- `branch_deleted` (HTTP `409`): the branch was deleted under the operation,
+  or its retirement is pending after an interrupted delete. Nothing was
+  written; `branch list --detailed` shows `deleted (retirement pending)`, and
+  the next `branch delete` of the name finishes it.
+- `branch_not_ready` (HTTP `409`): the branch's create wrote no tree. Reads and
+  writes refuse until `branch delete` removes it; a new `branch create` then
+  starts the name again.
 - `recovery_required` (HTTP `503` with `recovery_required.operation_id`):
   when it identifies an already published schema apply or system-column upgrade,
   the table pins and accepted schema contract are durable together; only the

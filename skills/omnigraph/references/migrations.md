@@ -48,9 +48,10 @@ refuse a branch at 14, and `as unattached branch` refuses one at 14 or 15. To
 stamp a standalone graph first, stop every process using it, back up the
 whole root and run `omnigraph upgrade --target ./graph.omni --check --json`,
 then without `--check`: the stamp-only route (`stamp-v14-to-v16` in 0.14,
-`stamp-v14-to-v17` in the current binary, which stamps 17) writes one
-metadata-only commit per live branch, main first, and a run that stops is
-finished by running it again. `upgrade` refuses cluster graphs; publish ordinarily on the
+`stamp-v14-to-v18` in the current binary, which stamps 18) writes one
+metadata-only commit per live branch, main first, with `main`'s commit
+recording every branch in the catalog, then removes the branch ref files; a
+run that stops is finished by running it again. `upgrade` refuses cluster graphs; publish ordinarily on the
 branch instead. A binary refuses a graph stamped above the formats it
 serves, so upgrade every binary first.
 See the [0.13 to 0.14 checklist](../../../docs/user/operations/upgrade-0.14.md).

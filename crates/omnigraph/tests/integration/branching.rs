@@ -204,21 +204,19 @@ async fn branch_create_open_list_and_lazy_branching_work() {
         .clone();
 
     main.branch_create("feature").await.unwrap();
-    // Reproduce Lance's phase-1-only crash state: keep the shallow-cloned
-    // `tree/feature` dataset but remove BranchContents, its sole logical
-    // authority. A same-name graph create must reclaim the zombie and retry,
-    // rather than surfacing DatasetAlreadyExists forever.
-    std::fs::remove_file(
+    std::fs::remove_dir_all(
         dir.path()
             .join("__manifest")
-            .join("_refs")
-            .join("branches")
-            .join(format!(
-                "{}.json",
-                graph_native_ref(dir.path().to_str().unwrap(), "feature").await
-            )),
+            .join("tree")
+            .join(graph_native_ref(dir.path().to_str().unwrap(), "feature").await),
     )
     .unwrap();
+    let refused = main.branch_create("feature").await.unwrap_err();
+    assert!(
+        refused.to_string().contains("already exists"),
+        "a row whose tree is gone is a branch that exists and is not ready: {refused}"
+    );
+    main.branch_delete("feature").await.unwrap();
     main.branch_create("feature").await.unwrap();
     assert_eq!(main.branch_list().await.unwrap(), vec!["main", "feature"]);
 
@@ -352,12 +350,13 @@ async fn branch_list_detailed_reports_head_start_and_lifetime() {
     let after_create = unix_micros_now();
     let details = detailed_branches(&db).await;
     let main = &details["main"];
-    assert_eq!(main.head, loaded);
+    assert_eq!(main.head.as_ref(), Some(&loaded));
     assert_eq!((started(main), main.created_at), ((None, None), None));
-    assert_eq!(main.updated_at, loaded.created_at);
+    assert_eq!(main.updated_at, Some(loaded.created_at));
     let unwritten = &details["feature"];
     assert_eq!(
-        unwritten.head, loaded,
+        unwritten.head.as_ref(),
+        Some(&loaded),
         "an unwritten branch reads its start"
     );
     assert_eq!(started(unwritten), receipt(&created));
@@ -367,7 +366,7 @@ async fn branch_list_detailed_reports_head_start_and_lifetime() {
         (before_create..=after_create).contains(&created_at),
         "{before_create} <= {created_at} <= {after_create}"
     );
-    assert_eq!(unwritten.updated_at, created_at);
+    assert_eq!(unwritten.updated_at, Some(created_at));
 
     mutate_main(&db, MUTATION_QUERIES, "insert_person", &insert("Mia"))
         .await
@@ -420,18 +419,24 @@ async fn branch_list_detailed_reports_head_start_and_lifetime() {
     .unwrap();
     let details = detailed_branches(&db).await;
     let feature = &details["feature"];
-    assert_eq!(feature.head, written);
-    assert_eq!(feature.updated_at, written.created_at);
+    assert_eq!(feature.head.as_ref(), Some(&written));
+    assert_eq!(feature.updated_at, Some(written.created_at));
     assert_eq!(
         started(feature),
         receipt(&created),
         "a written branch keeps the commit it started at"
     );
     let child = &details["child"];
-    assert_eq!(child.head, newest_commit(&db, "child").await);
+    assert_eq!(
+        child.head.as_ref(),
+        Some(&newest_commit(&db, "child").await)
+    );
     assert_eq!(started(child), receipt(&child_created));
     let at_load_detail = &details["at_load"];
-    assert_eq!(at_load_detail.head, newest_commit(&db, "at_load").await);
+    assert_eq!(
+        at_load_detail.head.as_ref(),
+        Some(&newest_commit(&db, "at_load").await)
+    );
     assert_eq!(started(at_load_detail), receipt(&at_load));
     assert_eq!(at_load.from_commit_id, loaded.graph_commit_id);
 
@@ -445,7 +450,7 @@ async fn branch_list_detailed_reports_head_start_and_lifetime() {
     let base = db.merge_base("feature", "main").await.unwrap().merge_base;
     assert_eq!(base, main_head, "the merge moved the merge base");
     let details = detailed_branches(&db).await;
-    assert_eq!(details["feature"].head, merged);
+    assert_eq!(details["feature"].head.as_ref(), Some(&merged));
     assert_eq!(
         started(&details["feature"]),
         receipt(&created),
@@ -465,7 +470,7 @@ async fn branch_list_detailed_reports_head_start_and_lifetime() {
     );
     let recreated = &details["feature"];
     assert_eq!(started(recreated), receipt(&recreated_receipt));
-    assert_eq!(recreated.head, main_head);
+    assert_eq!(recreated.head.as_ref(), Some(&main_head));
     assert!(recreated.created_at.unwrap() >= created_at);
     assert_eq!(
         started(&details["child"]),
@@ -535,9 +540,9 @@ async fn branch_list_detailed_reports_head_start_and_lifetime() {
     let fast_forwarded = newest_commit(&db, "ff").await;
     let details = detailed_branches(&db).await;
     let ff = &details["ff"];
-    assert_eq!(ff.head, fast_forwarded);
+    assert_eq!(ff.head.as_ref(), Some(&fast_forwarded));
     assert_eq!(started(ff), receipt(&ff_created));
-    assert_eq!(ff.updated_at, fast_forwarded.created_at);
+    assert_eq!(ff.updated_at, Some(fast_forwarded.created_at));
 }
 
 #[tokio::test]
@@ -1286,6 +1291,9 @@ async fn blob_named_branch_delete_recreate_never_retargets_cached_or_snapshot_re
     );
 }
 
+/// Three commits on `feature` bring its retired version to the one the
+/// recreated `feature` starts at: the retired row, main's load and the new
+/// row each advance main by one version.
 #[tokio::test]
 async fn blob_snapshot_inherited_from_main_refuses_named_branch_recreation_aba() {
     const SCHEMA: &str = r#"
@@ -1313,13 +1321,15 @@ node Marker {
     .unwrap();
 
     db.branch_create("feature").await.unwrap();
-    db.load(
-        "feature",
-        r#"{"type":"Marker","data":{"name":"feature-commit"}}"#,
-        LoadMode::Replace,
-    )
-    .await
-    .unwrap();
+    for marker in ["feature-commit", "feature-commit-2", "feature-commit-3"] {
+        db.load(
+            "feature",
+            &format!(r#"{{"type":"Marker","data":{{"name":"{marker}"}}}}"#),
+            LoadMode::Replace,
+        )
+        .await
+        .unwrap();
+    }
     let old_feature_version = db
         .graph_manifest_version_of(ReadTarget::branch("feature"))
         .await
@@ -3452,21 +3462,23 @@ async fn branch_created_from_non_main_inherits_branch_state() {
         .branch_create_from(ReadTarget::branch("feature"), "experiment")
         .await
         .unwrap();
-    std::fs::remove_file(
+    std::fs::remove_dir_all(
         dir.path()
             .join("__manifest")
-            .join("_refs")
-            .join("branches")
-            .join(format!(
-                "{}.json",
-                graph_native_ref(dir.path().to_str().unwrap(), "experiment").await
-            )),
+            .join("tree")
+            .join(graph_native_ref(dir.path().to_str().unwrap(), "experiment").await),
     )
     .unwrap();
+    let refused = feature
+        .branch_create_from(ReadTarget::branch("feature"), "experiment")
+        .await
+        .expect_err("a row without a tree still holds its name");
+    assert!(refused.to_string().contains("already exists"), "{refused}");
+    feature.branch_delete("experiment").await.unwrap();
     feature
         .branch_create_from(ReadTarget::branch("feature"), "experiment")
         .await
-        .expect("non-main create must also reclaim a clone-only target");
+        .expect("a non-main create takes the name its delete freed");
 
     assert_eq!(
         feature.branch_list().await.unwrap(),
@@ -3619,7 +3631,11 @@ async fn branch_create_at_a_main_commit_starts_at_its_tables_and_history() {
     assert_eq!(people.get("Alice"), Some(&Some(30)));
     assert!(people.contains_key("Bob") && people.contains_key("Eve"));
 
-    assert_eq!(version_main(&db).await.unwrap(), main_version);
+    assert_eq!(
+        version_main(&db).await.unwrap(),
+        main_version + 1,
+        "the branch row is one version of main"
+    );
     assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
     assert_eq!(people_on(&db, "main").await, main_people);
 
@@ -4576,28 +4592,23 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
         .await
         .unwrap();
     let ancestor_native = helpers::native_ref_for(&manifest, "feature").await.unwrap();
-    let ancestor = manifest.branches().get(&ancestor_native).await.unwrap();
+    let ancestor_identifier = helpers::branch_identifier_for(&manifest, "feature")
+        .await
+        .unwrap();
     db.branch_delete("feature").await.unwrap();
     db.branch_create("feature/child").await.unwrap();
-    let refs_before_refusal = manifest.list_branches().await.unwrap();
-    assert!(!refs_before_refusal.contains_key(&ancestor_native));
-    let ancestor_archive = dir
-        .path()
-        .join("__manifest/tree")
-        .join(&ancestor_native)
-        .join("_omnigraph_retired_branch.json");
-    let archived: lance::dataset::refs::BranchContents =
-        serde_json::from_slice(&std::fs::read(&ancestor_archive).unwrap()).unwrap();
-    assert_eq!(archived.identifier, ancestor.identifier);
-    let retirement: serde_json::Value =
-        serde_json::from_str(&archived.metadata["omnigraph.retired_manifest_branch"]).unwrap();
-    assert_eq!(
-        retirement,
-        serde_json::json!({
-            "version": 1,
-            "native_branch": ancestor_native,
-            "identifier": ancestor.identifier,
-        })
+    let rows_before_refusal = helpers::branch_rows(&manifest).await;
+    assert!(rows_before_refusal.by_logical("feature").is_none());
+    assert!(
+        rows_before_refusal
+            .retired()
+            .any(|retired| retired == ancestor_native),
+        "the delete retired the ancestor's row"
+    );
+    let ancestor_tree = dir.path().join("__manifest/tree").join(&ancestor_native);
+    assert!(
+        ancestor_tree.join("_versions").is_dir(),
+        "the retired tree stays until cleanup"
     );
     for result in [
         db.branch_create("feature").await,
@@ -4611,9 +4622,9 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
         );
     }
     assert_eq!(
-        serde_json::to_value(manifest.list_branches().await.unwrap()).unwrap(),
-        serde_json::to_value(refs_before_refusal).unwrap(),
-        "inverse admission refusal must preserve the retired ancestor and create no ref"
+        helpers::branch_rows(&manifest).await,
+        rows_before_refusal,
+        "inverse admission refusal must preserve the retired row and write none"
     );
     assert!(
         helpers::native_ref_for(&manifest, "feature")
@@ -4628,8 +4639,21 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
     db.branch_create_from("main", "feature").await.unwrap();
     let recreated_native = helpers::native_ref_for(&manifest, "feature").await.unwrap();
     assert_ne!(recreated_native, ancestor_native);
-    assert!(manifest.branches().get(&ancestor_native).await.is_err());
-    assert!(ancestor_archive.exists());
+    assert_ne!(
+        helpers::branch_identifier_for(&manifest, "feature")
+            .await
+            .unwrap(),
+        ancestor_identifier,
+        "a recreated name is a new lifetime"
+    );
+    assert!(
+        helpers::branch_rows(&manifest)
+            .await
+            .retired()
+            .any(|retired| retired == ancestor_native),
+        "the retired row stays until cleanup"
+    );
+    assert!(ancestor_tree.join("_versions").is_dir());
     db.branch_create("feature-2").await.unwrap();
     assert_eq!(
         db.branch_list().await.unwrap(),
@@ -4639,47 +4663,45 @@ async fn branch_namespace_rejects_live_physical_path_prefix_collisions() {
     assert_eq!(count_rows_branch(&db, "feature", "node:Person").await, 4);
 }
 
+/// Copy a directory tree, files and subdirectories.
+fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_all(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// A tree no row names whose directory is an ancestor of a live branch's tree
+/// (a pre-namespace layout, or a create that crashed before its row) loses
+/// its own layout directories alone: the live descendant reads as before.
 #[tokio::test]
-async fn branch_delete_retires_legacy_physical_path_parents() {
+async fn cleanup_removes_an_orphan_tree_above_a_live_child_tree() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let db = init_and_load(&dir).await;
     db.branch_create("feature/child").await.unwrap();
-
-    // Forge a graph written before the prefix-disjoint namespace invariant.
-    // Lance permits both refs but intentionally cannot reclaim the ancestor's
-    // dataset directory while the child path is live.
-    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
+    let manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
         .await
         .unwrap();
-    let version = manifest.version().version;
-    manifest
-        .create_branch("feature", version, None)
+    let child_native = helpers::native_ref_for(&manifest, "feature/child")
         .await
         .unwrap();
+    let tree_root = dir.path().join("__manifest/tree");
+    let child_tree = tree_root.join(&child_native);
+    let orphan = tree_root.join("feature");
+    assert!(
+        child_tree.starts_with(&orphan),
+        "test setup: the orphan is an ancestor directory"
+    );
+    copy_dir_all(&child_tree, &orphan);
+    assert!(orphan.join("_versions").is_dir());
 
-    db.branch_delete("feature").await.unwrap();
-    assert!(
-        helpers::native_ref_for(&manifest, "feature")
-            .await
-            .is_none()
-    );
-    assert!(manifest.branches().get("feature").await.is_err());
-    let archive = dir
-        .path()
-        .join("__manifest/tree/feature/_omnigraph_retired_branch.json");
-    assert!(archive.exists());
-    assert_eq!(
-        count_rows_branch(&db, "feature/child", "node:Person").await,
-        4
-    );
-    db.branch_delete("feature/child").await.unwrap();
-    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
-    let refused = db.branch_create("feature/new-child").await.unwrap_err();
-    assert!(
-        refused.to_string().contains("retired branch 'feature'"),
-        "{refused}"
-    );
     let rows = db
         .cleanup_as(
             omnigraph::db::CleanupPolicyOptions {
@@ -4691,7 +4713,25 @@ async fn branch_delete_retires_legacy_physical_path_parents() {
         .await
         .unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
-    assert!(!archive.exists());
+    let manifest_row = rows
+        .iter()
+        .find(|row| row.type_key == "__manifest")
+        .unwrap();
+    assert_eq!(manifest_row.manifest_trees_removed, 1);
+    assert_eq!(manifest_row.branch_entries_removed, 0);
+    assert!(
+        !orphan.join("_versions").exists(),
+        "the orphan's layout directories are gone"
+    );
+    assert!(
+        orphan.is_dir(),
+        "the directory above a live child's tree stays"
+    );
+    assert!(child_tree.join("_versions").is_dir());
+    assert_eq!(
+        count_rows_branch(&db, "feature/child", "node:Person").await,
+        4
+    );
     db.branch_create("feature/new-child").await.unwrap();
     assert_eq!(
         count_rows_branch(&db, "feature/new-child", "node:Person").await,
@@ -4724,27 +4764,12 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
     let manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
         .await
         .unwrap();
-    let live = manifest.list_branches().await.unwrap();
-    let native = live
-        .keys()
-        .find(|name| helpers::is_incarnation_of(name, "feature"))
-        .unwrap()
-        .clone();
-    let identifier = live[&native].identifier.clone();
-    let retained = manifest.checkout_branch(&native).await.unwrap();
-
-    let changed_metadata = [("external-owner".to_string(), "preserved".to_string())]
-        .into_iter()
-        .collect();
-    manifest
-        .branches()
-        .replace_metadata(&native, changed_metadata)
+    let native = helpers::native_ref_for(&manifest, "feature").await.unwrap();
+    let identifier = helpers::branch_identifier_for(&manifest, "feature")
         .await
         .unwrap();
-    assert_eq!(
-        manifest.list_branches().await.unwrap()[&native].metadata["external-owner"],
-        "preserved"
-    );
+    let retained = manifest.checkout_branch(&native).await.unwrap();
+    let tree_path = dir.path().join("__manifest/tree").join(&native);
     assert!(
         Omnigraph::open(uri)
             .await
@@ -4754,8 +4779,6 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
             .unwrap()
             .contains(&"feature".to_string())
     );
-    let tagged_snapshot = snapshot_branch(&main, "feature").await.unwrap();
-    let tagged_entry = tagged_snapshot.dataset("node:Person").unwrap();
     manifest
         .tags()
         .create(
@@ -4764,38 +4787,11 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
         )
         .await
         .unwrap();
-    let refused = main.branch_delete("feature").await.expect_err(
-        "native graph tags retain the deletion fence until graph-wide tagged table pins exist",
-    );
-    assert_eq!(
-        refused.completion_evidence(),
-        Some(CompletionEvidence::BeforeEffect),
-        "a native-tag refusal precedes retirement publication: {refused}"
-    );
-    assert!(
-        refused.to_string().contains("native manifest tag"),
-        "{refused}"
-    );
-    assert_eq!(
-        manifest.branches().get(&native).await.unwrap().identifier,
-        identifier
-    );
-    let after_refusal = snapshot_branch(&main, "feature").await.unwrap();
-    let current_entry = after_refusal.dataset("node:Person").unwrap();
-    assert_eq!(
-        current_entry.native_dataset_branch,
-        tagged_entry.native_dataset_branch
-    );
-    assert_eq!(
-        current_entry.published_dataset_version,
-        tagged_entry.published_dataset_version
-    );
     assert_eq!(count_rows_branch(&main, "feature", "node:Person").await, 5);
     assert_eq!(
         count_rows_branch(&main, "experiment", "node:Person").await,
         5
     );
-    manifest.tags().delete("retirement-pin").await.unwrap();
     main.branch_delete("feature").await.unwrap();
     assert!(
         helpers::native_ref_for(&manifest, "feature")
@@ -4809,85 +4805,26 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
             .unwrap()
             .contains(&"feature".to_string())
     );
-    assert!(manifest.branches().get(&native).await.is_err());
-    assert!(retained.branch_identifier().await.is_err());
-    let ref_path = dir
-        .path()
-        .join("__manifest/_refs/branches")
-        .join(format!("{native}.json"));
-    let archive_path = dir
-        .path()
-        .join("__manifest/tree")
-        .join(&native)
-        .join("_omnigraph_retired_branch.json");
-    assert!(!ref_path.exists());
-    let retired_bytes = std::fs::read(&archive_path).unwrap();
-    let archived: lance::dataset::refs::BranchContents =
-        serde_json::from_slice(&retired_bytes).unwrap();
-    assert_eq!(archived.identifier, identifier);
-    assert_eq!(archived.metadata["external-owner"], "preserved");
-    let retired_contents: serde_json::Value = serde_json::from_slice(&retired_bytes).unwrap();
-    let marker = &retired_contents["metadata"]["omnigraph.retired_manifest_branch"];
-    let retirement: serde_json::Value = serde_json::from_str(marker.as_str().unwrap()).unwrap();
-    assert_eq!(retirement["version"], serde_json::json!(1));
-    assert_eq!(retirement["native_branch"], serde_json::json!(native));
-    assert_eq!(
-        retirement["identifier"],
-        serde_json::to_value(&identifier).unwrap()
+    let rows_after_delete = helpers::branch_rows(&manifest).await;
+    assert!(
+        rows_after_delete.retired().any(|retired| retired == native),
+        "the delete retires the row"
     );
-    for invalid in [
-        "missing_identifier",
-        "identifier",
-        "version",
-        "native_branch",
-        "unknown_field",
-    ] {
-        let mut broken_marker = retirement.clone();
-        match invalid {
-            "missing_identifier" => {
-                broken_marker.as_object_mut().unwrap().remove("identifier");
-            }
-            "version" => broken_marker["version"] = serde_json::json!(99),
-            "identifier" => {
-                let foreign = live
-                    .values()
-                    .find(|contents| contents.identifier != identifier)
-                    .unwrap();
-                broken_marker["identifier"] = serde_json::to_value(&foreign.identifier).unwrap();
-            }
-            "native_branch" => broken_marker["native_branch"] = serde_json::json!("foreign"),
-            "unknown_field" => broken_marker["unknown"] = serde_json::json!(true),
-            _ => unreachable!(),
-        }
-        let mut broken = retired_contents.clone();
-        broken["metadata"]["omnigraph.retired_manifest_branch"] =
-            serde_json::json!(serde_json::to_string(&broken_marker).unwrap());
-        std::fs::write(&ref_path, serde_json::to_vec(&broken).unwrap()).unwrap();
-        assert!(manifest.branches().get(&native).await.is_ok());
-        assert!(main.branch_list().await.is_err(), "{invalid}");
-        assert!(
-            snapshot_branch(&main, "feature").await.is_err(),
-            "{invalid}"
-        );
-        assert!(
-            main.cleanup_as(
-                omnigraph::db::CleanupPolicyOptions {
-                    keep_versions: Some(1),
-                    older_than: None,
-                },
-                None
-            )
-            .await
-            .is_err(),
-            "{invalid}"
-        );
-        assert!(
-            ref_path.exists(),
-            "invalid retirement must preserve physical authority"
-        );
-        assert!(dir.path().join("__manifest/tree").join(&native).exists());
-    }
-    std::fs::write(&ref_path, retired_bytes).unwrap();
+    assert_eq!(
+        rows_after_delete
+            .by_logical("experiment")
+            .map(|row| row.parent.as_str()),
+        Some(native.as_str()),
+        "the child's row still names the retired parent"
+    );
+    assert_ne!(
+        rows_after_delete
+            .by_logical("experiment")
+            .unwrap()
+            .identifier,
+        identifier
+    );
+    assert!(tree_path.join("_versions").is_dir());
     assert!(snapshot_branch(&feature, "feature").await.is_err());
     assert_eq!(
         count_rows_branch(&feature, "experiment", "node:Person").await,
@@ -4919,17 +4856,23 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
         )
         .await
         .unwrap();
-    assert!(manifest.branches().get(&native).await.is_err());
     assert!(
-        archive_path.exists(),
-        "a live child retains its archived native ancestor"
+        tree_path.join("_versions").is_dir(),
+        "a live child retains its retired native ancestor's tree"
+    );
+    assert!(
+        helpers::branch_rows(&manifest)
+            .await
+            .retired()
+            .any(|retired| retired == native),
+        "the retired entry stays while its tree does"
     );
     assert_eq!(
         count_rows_branch(&reopened, "experiment", "node:Person").await,
         6
     );
     reopened.branch_delete("experiment").await.unwrap();
-    reopened
+    let rows = reopened
         .cleanup_as(
             omnigraph::db::CleanupPolicyOptions {
                 keep_versions: Some(1),
@@ -4939,13 +4882,50 @@ async fn branch_delete_retires_native_parent_and_cleanup_preserves_live_child() 
         )
         .await
         .unwrap();
-    assert!(manifest.branches().get(&native).await.is_err());
-    assert!(!ref_path.exists());
-    assert!(
-        !archive_path.exists(),
-        "cleanup removes unreferenced retirement history with its tree"
+    let manifest_row = rows
+        .iter()
+        .find(|row| row.type_key == "__manifest")
+        .unwrap();
+    assert_eq!(
+        (
+            manifest_row.manifest_trees_removed,
+            manifest_row.branch_entries_removed
+        ),
+        (1, 1),
+        "the child's tree and entry go; the tagged ancestor stays: {rows:?}"
     );
-    assert!(!dir.path().join("__manifest/tree").join(&native).exists());
+    assert!(
+        tree_path.join("_versions").is_dir(),
+        "a native tag on the tree retains it after its last dependant"
+    );
+    manifest.tags().delete("retirement-pin").await.unwrap();
+    let rows = reopened
+        .cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let manifest_row = rows
+        .iter()
+        .find(|row| row.type_key == "__manifest")
+        .unwrap();
+    assert_eq!(
+        (
+            manifest_row.manifest_trees_removed,
+            manifest_row.branch_entries_removed
+        ),
+        (1, 1),
+        "{rows:?}"
+    );
+    assert!(
+        !tree_path.exists(),
+        "cleanup removes the tree no row, tag or dependant names"
+    );
+    assert_eq!(helpers::branch_rows(&manifest).await.retired().count(), 0);
     assert_eq!(
         reopened.branch_list().await.unwrap(),
         vec!["main".to_string(), "feature".to_string()],

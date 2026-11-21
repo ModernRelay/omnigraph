@@ -231,7 +231,9 @@ pub async fn ensure_manifest_branch_create_namespace(
     Ok(())
 }
 
-async fn branch_ref_names(dataset: &Dataset) -> Result<Vec<String>> {
+/// Every native ref name under `_refs/branches/`, live or retired; no ref is
+/// read.
+pub async fn branch_ref_names(dataset: &Dataset) -> Result<Vec<String>> {
     let root = dataset
         .branch_location()
         .find_main()
@@ -509,6 +511,17 @@ async fn archive_retired_ref(
         Err(lance::Error::RefNotFound { .. }) => return Ok(()),
         Err(error) => return Err(OmniError::storage(error)),
     }
+    unlink_branch_ref(dataset, branch).await
+}
+
+/// Delete the ref file of `branch` under `_refs/branches/` and nothing else:
+/// the tree stays. An absent ref is done; a failed delete is one only while
+/// the ref is still there.
+pub async fn unlink_branch_ref(dataset: &Dataset, branch: &str) -> Result<()> {
+    let store = dataset
+        .object_store(None)
+        .await
+        .map_err(OmniError::storage)?;
     let root = dataset
         .branch_location()
         .find_main()

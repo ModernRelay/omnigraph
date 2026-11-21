@@ -4234,7 +4234,10 @@ async fn main_history(db: &Session) -> MainHistory {
             commit.graph_commit_id.clone(),
         ));
         let snapshot = db.snapshot_of(target.clone()).await.unwrap();
-        assert_eq!(
+        assert!(
+            snapshot.graph_manifest_version() >= commit.graph_manifest_version,
+            "the head commit is served from main's current version, which the branch rows \
+             advance past the commit's: {} < {}",
             snapshot.graph_manifest_version(),
             commit.graph_manifest_version
         );

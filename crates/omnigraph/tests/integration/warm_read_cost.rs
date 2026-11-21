@@ -37,22 +37,16 @@ fn assert_only_the_probe_head(manifest_reads: u64, context: &str) {
     );
 }
 
-/// A warm named-branch read's recorded `__manifest` requests: the branch's
-/// `BranchContents` lifetime witness and the probe's HEAD of the held version
-/// in the branch tree, never a manifest body.
-fn assert_branch_witness_and_probe_head(reads: &[String]) {
-    assert_eq!(reads.len(), 2, "{reads:#?}");
+/// A warm named-branch read's one recorded `__manifest` request: the probe's
+/// HEAD of the held version in the branch tree, never a manifest body and no
+/// witness beside it, since the branch's lifetime is in the tree's name.
+fn assert_only_the_branch_probe_head(reads: &[String]) {
     assert!(
-        reads
-            .iter()
-            .any(|read| read.contains("_refs/branches/feature") && read.ends_with(".json")),
-        "the branch-lifetime witness is read: {reads:#?}"
-    );
-    assert!(
-        reads.iter().any(|read| read.contains("/tree/feature")
-            && read.contains("/_versions/")
-            && read.ends_with(".manifest")),
-        "the other request is the probe's HEAD of the held branch version: {reads:#?}"
+        reads.len() == 1
+            && reads[0].contains("/tree/feature")
+            && reads[0].contains("/_versions/")
+            && reads[0].ends_with(".manifest"),
+        "the one `__manifest` request is the probe's HEAD of the held branch version: {reads:#?}"
     );
 }
 
@@ -418,15 +412,17 @@ async fn named_read_borrows_write_capture_and_rejects_recreated_branch() {
         let db = init_and_load(&dir).await;
         let writer = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
         db.branch_create("feature").await.unwrap();
-        mutate_branch(
-            &db,
-            "feature",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "OldFeature")], &[("$age", 22)]),
-        )
-        .await
-        .unwrap();
+        for name in ["OldFeature", "OldFeature2", "OldFeature3"] {
+            mutate_branch(
+                &db,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", 22)]),
+            )
+            .await
+            .unwrap();
+        }
         let old_head = db.resolve_snapshot("feature").await.unwrap();
         let old_version = db
             .graph_manifest_version_of(ReadTarget::branch("feature"))
@@ -462,6 +458,9 @@ async fn named_read_borrows_write_capture_and_rejects_recreated_branch() {
                 .await
                 .unwrap(),
             old_version,
+            "the ABA this test pins needs both lifetimes at one `__manifest` version: the new one \
+             is born at main's version after the retired row, a main write and its own row, so \
+             the old one wrote three times"
         );
         for _ in 0..2 {
             let (rows, io) = measure(db.query_with_head(
@@ -489,6 +488,7 @@ async fn branch_delete_reuses_only_a_current_write_capture() {
         let dir = tempfile::tempdir().unwrap();
         let db = init_and_load(&dir).await;
         let writer = session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+        let mut arms = Vec::new();
         for foreign in ["none", "write", "recreate"] {
             db.branch_create("feature").await.unwrap();
             mutate_branch(
@@ -512,6 +512,17 @@ async fn branch_delete_reuses_only_a_current_write_capture() {
                 .unwrap();
             }
             if foreign == "recreate" {
+                for name in ["Local2", "Local3"] {
+                    mutate_branch(
+                        &db,
+                        "feature",
+                        MUTATION_QUERIES,
+                        "insert_person",
+                        &mixed_params(&[("$name", name)], &[("$age", 22)]),
+                    )
+                    .await
+                    .unwrap();
+                }
                 let old_version = writer
                     .graph_manifest_version_of(ReadTarget::branch("feature"))
                     .await
@@ -532,17 +543,28 @@ async fn branch_delete_reuses_only_a_current_write_capture() {
                         .await
                         .unwrap(),
                     old_version,
+                    "the ABA this arm pins needs both lifetimes at one `__manifest` version: the \
+                     new one is born at main's version after the retired row, a main write and \
+                     its own row, so the old one wrote three times"
                 );
             }
             let main_rows = count_rows(&writer, "node:Person").await;
             let (deleted, io) = measure(db.branch_delete("feature")).await;
             deleted.unwrap();
-            assert_eq!(io.manifest_scan_count, u64::from(foreign != "none"));
-            assert_eq!(io.version_probes, 1);
             assert!(io.manifest_reads > 0);
+            arms.push((foreign, io.manifest_scan_count, io.version_probes));
             assert!(db.resolve_snapshot("feature").await.is_err());
             assert_eq!(count_rows(&db, "node:Person").await, main_rows);
         }
+        assert_eq!(
+            arms,
+            [("none", 0, 2), ("write", 1, 2), ("recreate", 2, 2)],
+            "(arm, `__manifest` scans, version probes): the cached capture's lifetime and \
+             main's head are probed once each; a current capture is never scanned, a stale one \
+             once as it reloads; a retired lifetime's capture is dropped and main has moved, so \
+             main is reloaded once for the handle's view, its publisher adopting that read as \
+             its image, and the branch is opened once"
+        );
     })
     .await;
 }
@@ -634,13 +656,9 @@ async fn thousand_warm_queries_read_no_schema_contract() {
 
 // ── Morphological-matrix coverage: branch-warm + stale-refresh cells ──────────
 
-/// A WARM read on a non-main branch (handle synced to that branch) reads only
-/// that branch's authoritative `BranchContents` lifetime witness. It does not
-/// read or scan a `__manifest` version body. Exercises Fix 2's
-/// branch-owned-table open (`{table_path}/tree/{branch}` + with_version) on Fix
-/// 1's warm path — the cell that regressed when the open used `with_branch`
-/// against the base. The one ref read is required because version/e-tag/time
-/// can all repeat across a same-source delete/recreate.
+/// A WARM read on a non-main branch (handle synced to that branch) probes only
+/// the held version in that branch's tree, whose name carries the lifetime: no
+/// `__manifest` body, no scan, no witness (Fix 2's branch-owned-table open).
 #[tokio::test]
 async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
     cost_harness(async {
@@ -657,8 +675,8 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
         assert_eq!(io.version_probes, 1);
         assert_eq!(io.internal_open_count, 0);
         assert_eq!(io.manifest_scan_count, 0);
-        assert_eq!(io.manifest_reads, 2);
-        assert_branch_witness_and_probe_head(&last_manifest_reads());
+        assert_eq!(io.manifest_reads, 1, "{:#?}", last_manifest_reads());
+        assert_only_the_branch_probe_head(&last_manifest_reads());
         // Write to the branch so its tables are branch-owned (under tree/feature).
         db.mutate(
             "feature",
@@ -682,12 +700,11 @@ async fn warm_branch_read_uses_one_ref_witness_without_manifest_scan() {
 
         assert_eq!(
             io.manifest_reads,
-            2,
-            "warm branch read must spend one read on the native branch-lifetime witness and one \
-             on the probe's HEAD; reads: {:#?}",
+            1,
+            "warm branch read spends one read, the probe's HEAD in the branch tree; reads: {:#?}",
             last_manifest_reads()
         );
-        assert_branch_witness_and_probe_head(&last_manifest_reads());
+        assert_only_the_branch_probe_head(&last_manifest_reads());
         assert_eq!(
             io.version_probes, 1,
             "warm branch read probes only the requested branch once"
@@ -764,7 +781,6 @@ async fn native_branch_controls_use_one_post_gate_manifest_capture() {
         Box::pin(assert_branch_control_source_incarnation(&db, &mut writer)).await;
         #[cfg(feature = "failpoints")]
         Box::pin(assert_cached_borrower_survives_branch_delete(
-            dir.path(),
             &db,
             &mut writer,
         ))
@@ -790,12 +806,14 @@ async fn assert_bound_branch_control_cost(db: &Session, writer: &mut Session) {
     deleted.unwrap();
     assert_eq!(
         (delete_io.internal_open_count, delete_io.manifest_scan_count),
-        (2, 1),
-        "branch delete needs one coherent target capture and one native-ref opener"
+        (1, 1),
+        "branch delete needs one coherent target capture; main is the installed \
+         coordinator the create adopted, so no second opener"
     );
     assert_eq!(
-        delete_io.version_probes, 0,
-        "deletion does not probe surviving branch snapshots"
+        delete_io.version_probes, 1,
+        "deletion probes main's head once, where the branch row lives, and no surviving \
+         branch snapshot"
     );
 
     db.branch_create("cold_delete").await.unwrap();
@@ -814,10 +832,15 @@ async fn assert_bound_branch_control_cost(db: &Session, writer: &mut Session) {
             stale_delete_io.internal_open_count,
             stale_delete_io.manifest_scan_count
         ),
-        (2, 1),
-        "a stale surviving-main view must not add work to target deletion"
+        (2, 2),
+        "main moved under this handle, so the delete reloads it once, for the handle's view, \
+         and its publisher adopts that read as its acknowledged image (RFC \"Branch existence \
+         in the catalog\" §Readers), then the branch publisher opens and reads the tree"
     );
-    assert_eq!(stale_delete_io.version_probes, 0);
+    assert_eq!(
+        stale_delete_io.version_probes, 1,
+        "the one probe finds main's head moved, so the row is read from main's latest version"
+    );
     let (created, stale_create_io) = measure(db.branch_create("main_fresh")).await;
     created.unwrap();
     assert_eq!(
@@ -825,8 +848,10 @@ async fn assert_bound_branch_control_cost(db: &Session, writer: &mut Session) {
             stale_create_io.internal_open_count,
             stale_create_io.manifest_scan_count
         ),
-        (1, 1),
-        "a stale bound source must take one coherent fresh capture"
+        (0, 0),
+        "the delete before it installed main at its latest version (RFC \"Branch existence in \
+         the catalog\" §Readers), so the source is current and nothing is captured; the query \
+         below proves the fork carries the external row"
     );
     let main_fresh = db
         .query(
@@ -849,8 +874,10 @@ async fn assert_non_bound_branch_control_cost(db: &Session, writer: &mut Session
             create_from_io.internal_open_count,
             create_from_io.manifest_scan_count,
         ),
-        (1, 1),
-        "branch create-from must use one coherent post-gate source capture"
+        (2, 2),
+        "branch create-from opens its branch source once, and the main publisher built over \
+         the main that open resolved through loads main's hot fragment once, for the row's \
+         epoch and contract checks (RFC \"Branch existence in the catalog\" §Readers)"
     );
 
     let (created_from, warm_from_io) =
@@ -918,7 +945,22 @@ async fn assert_branch_control_source_incarnation(db: &Session, writer: &mut Ses
     // Reusing that slot must therefore compare native lifetime, including
     // when the replacement starts again at the same manifest version.
     db.branch_create_from("feature", "aba_seed").await.unwrap();
-    let old_source_version = db.graph_manifest_version_of("feature").await.unwrap();
+    let main_version = writer.graph_manifest_version_of("main").await.unwrap();
+    let replacement_version = main_version + 6;
+    let mut pad = 0;
+    while writer.graph_manifest_version_of("feature").await.unwrap() < replacement_version {
+        pad += 1;
+        mutate_branch(
+            writer,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("aba_pad_{pad}"))], &[("$age", 20)]),
+        )
+        .await
+        .unwrap();
+    }
+    let old_source_version = writer.graph_manifest_version_of("feature").await.unwrap();
     for child in ["review", "review_warm", "review_fresh", "aba_seed"] {
         writer.branch_delete(child).await.unwrap();
     }
@@ -936,7 +978,9 @@ async fn assert_branch_control_source_incarnation(db: &Session, writer: &mut Ses
     assert_eq!(
         writer.graph_manifest_version_of("feature").await.unwrap(),
         old_source_version,
-        "ABA fixture must reuse a manifest version in a different native lifetime"
+        "the ABA this fixture pins needs both lifetimes at one `__manifest` version: the \
+         replacement forks main at the version its own row commit loaded, after four child \
+         retirements and the source's, then writes once, so the source wrote up to that version"
     );
     db.branch_create_from("feature", "review_recreated")
         .await
@@ -968,11 +1012,7 @@ async fn assert_branch_control_source_incarnation(db: &Session, writer: &mut Ses
 }
 
 #[cfg(feature = "failpoints")]
-async fn assert_cached_borrower_survives_branch_delete(
-    graph_dir: &std::path::Path,
-    db: &Session,
-    writer: &mut Session,
-) {
+async fn assert_cached_borrower_survives_branch_delete(db: &Session, writer: &mut Session) {
     for branch in ["main_fresh", "review_recreated"] {
         writer.branch_delete(branch).await.unwrap();
     }
@@ -984,10 +1024,13 @@ async fn assert_cached_borrower_survives_branch_delete(
 
     let manifest_uri = format!("{}/__manifest", db.uri());
     let manifest = lance::Dataset::open(&manifest_uri).await.unwrap();
-    let refs_before = manifest.list_branches().await.unwrap();
+    let rows_before = helpers::branch_rows(&manifest).await;
     let borrower_native = helpers::graph_native_ref(db.uri(), "binding_check").await;
-    assert_eq!(
-        refs_before[&borrower_native].parent_branch, None,
+    assert!(
+        rows_before
+            .branch(&borrower_native)
+            .unwrap()
+            .parent_is_main(),
         "borrower must not be a native descendant of the delete target"
     );
     let source = db.snapshot_of("feature").await.unwrap();
@@ -1043,41 +1086,39 @@ async fn assert_cached_borrower_survives_branch_delete(
             io.manifest_scan_count,
             io.version_probes
         ),
-        (1, 0, 1),
-        "cached table-borrower deletion must validate and reuse its current capture"
+        (2, 1, 1),
+        "the cached capture of the target is probed once and reused; the handle is bound to \
+         the borrower, so main is opened and read once for the row, and its publisher adopts \
+         that read as its acknowledged image, so the epoch check rereads nothing (RFC \"Branch \
+         existence in the catalog\" §Readers); the capture's publisher, which never published, \
+         opens the tree once and serves its rows from the image the capture's open adopted"
     );
 
+    assert!(!rows_before.is_retired(&source_native));
+    let rows_after = helpers::branch_rows(&manifest).await;
+    assert!(rows_after.branch(&source_native).is_none());
     assert!(
-        !refs_before[&source_native]
-            .metadata
-            .contains_key("omnigraph.retired_manifest_branch")
+        rows_after.is_retired(&source_native),
+        "logical deletion retires the exact captured native lifetime"
     );
-    let mut refs_after = manifest.list_branches().await.unwrap();
-    assert!(!refs_after.contains_key(&source_native));
-    let archive_path = graph_dir
-        .join("__manifest/tree")
-        .join(&source_native)
-        .join("_omnigraph_retired_branch.json");
-    let mut archived: lance::dataset::refs::BranchContents =
-        serde_json::from_slice(&std::fs::read(archive_path).unwrap()).unwrap();
-    let retirement = archived
-        .metadata
-        .remove("omnigraph.retired_manifest_branch")
-        .expect("logical deletion publishes retirement metadata");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&retirement).unwrap(),
-        serde_json::json!({
-            "version": 1,
-            "native_branch": source_native,
-            "identifier": refs_before[&source_native].identifier,
-        }),
-        "retirement must bind the exact captured native lifetime"
+    let tree = manifest.checkout_branch(&source_native).await.unwrap();
+    assert!(
+        omnigraph_catalog::BranchRows::decode(tree.manifest())
+            .unwrap()
+            .tombstone()
+            .is_some(),
+        "the retired tree's head carries the delete's tombstone"
     );
-    refs_after.insert(source_native, archived);
+    let surviving = |rows: &omnigraph_catalog::BranchRows| {
+        rows.live()
+            .filter(|row| row.native != source_native)
+            .map(|row| (row.native.clone(), row.identifier.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
     assert_eq!(
-        serde_json::to_value(refs_after).unwrap(),
-        serde_json::to_value(refs_before).unwrap(),
-        "deletion must archive the exact target and preserve every surviving ref"
+        surviving(&rows_after),
+        surviving(&rows_before),
+        "deletion must retire the exact target and preserve every surviving row"
     );
     assert!(
         helpers::native_ref_for(&manifest, "feature")
@@ -1092,10 +1133,11 @@ async fn assert_cached_borrower_survives_branch_delete(
     );
     for (branch, (version, head, pins, rows)) in before.clone() {
         let snapshot = db.snapshot_of(branch).await.unwrap();
+        let retired_row = u64::from(branch == "main");
         assert_eq!(
             snapshot.graph_manifest_version(),
-            version,
-            "{branch} version moved"
+            version + retired_row,
+            "{branch} version: the retired row is one commit on main and none on a sibling"
         );
         assert_eq!(
             db.resolve_snapshot(branch).await.unwrap(),
@@ -1193,15 +1235,17 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
     let reader = session(Omnigraph::open(uri).await.unwrap());
 
     writer.branch_create("feature").await.unwrap();
-    mutate_branch(
-        &writer,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-    )
-    .await
-    .unwrap();
+    for name in ["Eve", "Frank", "Grace"] {
+        mutate_branch(
+            &writer,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+    }
 
     reader.sync_branch("feature").await.unwrap();
     let old_feature = reader
@@ -1248,7 +1292,8 @@ async fn warm_read_on_recreated_branch_observes_new_incarnation() {
         .unwrap();
     assert_eq!(
         new_version, old_version,
-        "test setup must exercise branch incarnation reuse at one Lance version"
+        "test setup must exercise branch incarnation reuse at one Lance version: three writes \
+         on feature, then the retired row, main's write and the new row each advance main by one"
     );
 
     assert_eq!(

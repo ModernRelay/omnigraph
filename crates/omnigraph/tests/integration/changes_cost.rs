@@ -1247,23 +1247,27 @@ async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
                  no adjacency proof covers"
             );
             eprintln!(
-                "DIFF change_lineage={value}: internal_open_count={} total_reads={}",
-                io.internal_open_count,
-                io.total_reads()
+                "DIFF change_lineage={value}: internal_open_count={} data_reads={} \
+                 manifest_reads={}",
+                io.internal_open_count, io.data_reads, io.manifest_reads
             );
             lineage_io.push((value, io));
         }
         let (off, on) = (&lineage_io[0].1, &lineage_io[1].1);
         assert!(
             off.internal_open_count < on.internal_open_count
-                && off.total_reads() < on.total_reads(),
+                && off.manifest_reads < on.manifest_reads
+                && off.data_reads > on.data_reads,
             "`off` opens no coordinator for the ancestry answer, which `on` opens right after \
-             it into the cold merge-authority cache: off {} opens / {} reads, on {} opens / {} \
-             reads",
+             it into the cold merge-authority cache, two version-file requests through main's \
+             rows; `off` reads more data for it, the exact merge's images beside row identity's: \
+             off {} opens / {} manifest reads / {} data reads, on {} / {} / {}",
             off.internal_open_count,
-            off.total_reads(),
+            off.manifest_reads,
+            off.data_reads,
             on.internal_open_count,
-            on.total_reads()
+            on.manifest_reads,
+            on.data_reads
         );
 
         // Main fast-forwards to side-a: the same window, now ending at main,

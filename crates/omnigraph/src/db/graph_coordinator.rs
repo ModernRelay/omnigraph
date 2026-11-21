@@ -18,7 +18,7 @@ use super::manifest::{
     BranchRecords, CapturedManifestProbe, CommitBuffer, ExpectedTableVersions,
     GenesisManifestAttempt, GraphHeadExpectation, HistoryRecord, HistoryReleaseBytes,
     LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
-    PublishPrecondition, SchemaContractRow, UnattachedCommit, UnattachedIntent,
+    PublishPrecondition, RefreshOutcome, SchemaContractRow, UnattachedCommit, UnattachedIntent,
     UnattachedWriteBase, UnpublishedCommit, UnpublishedMergeInputs,
 };
 use super::omnigraph::normalize_branch_name;
@@ -370,6 +370,15 @@ impl GraphCoordinator {
         self.manifest.branch_identifier().await
     }
 
+    /// The identifier of `branch`'s live row on the main this coordinator
+    /// holds, at or above the branch-row stamp; `None` when no row is live.
+    pub(crate) fn live_row_identifier(
+        &self,
+        branch: &str,
+    ) -> Result<Option<lance::dataset::refs::BranchIdentifier>> {
+        self.manifest.live_row_identifier(branch)
+    }
+
     /// The exact head of the active branch: the head commit when this branch
     /// incarnation wrote it, `None` on a fork that has not published. From the
     /// same `__manifest` version as [`Self::snapshot`].
@@ -404,8 +413,14 @@ impl GraphCoordinator {
 
     /// Install the latest version of the branch's `__manifest`: the table
     /// state and the head, from one read of that version.
-    pub async fn refresh(&mut self) -> Result<()> {
+    pub async fn refresh(&mut self) -> Result<RefreshOutcome> {
         self.manifest.refresh().await
+    }
+
+    /// Whether the main this coordinator holds keeps the branch set in its
+    /// rows (at or above the branch-row stamp).
+    pub(crate) fn has_branch_rows(&self) -> bool {
+        omnigraph_catalog::has_branch_rows(self.manifest.main_manifest())
     }
 
     pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
@@ -592,6 +607,24 @@ impl GraphCoordinator {
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
         self.manifest
             .delete_branch_with_expected(&branch, expected_identifier)
+            .await
+    }
+
+    /// [`Self::branch_delete_captured`] on main's coordinator at or above the
+    /// branch-row stamp, `held` a coordinator this process holds on the
+    /// branch, whose publisher's acknowledged image the tombstone loads from
+    /// (RFC "Branch existence in the catalog" §Delete).
+    pub(crate) async fn branch_delete_through_rows(
+        &mut self,
+        name: &str,
+        expected_identifier: &lance::dataset::refs::BranchIdentifier,
+        held: Option<&GraphCoordinator>,
+    ) -> Result<()> {
+        let branch = normalize_branch_name(name)?
+            .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
+        let chain = held.map(|held| held.manifest.publisher());
+        self.manifest
+            .delete_branch_through(&branch, expected_identifier, chain)
             .await
     }
 
