@@ -259,7 +259,7 @@ query passages($matter: String, $q: String) {
 The exact `bm25` scores the population's rows: the passages the traversal
 reaches from the selected revision, in score order. Their statistics are the
 field corpus, so the exact lexical scan reads `Passage.text` across the whole
-table however few passages the traversal reaches. A `nearest` ranking ranks the
+table, once, however few passages the traversal reaches. A `nearest` ranking ranks the
 reached entities, never a global top list that the traversal later cuts.
 
 ## What a ranked read reports

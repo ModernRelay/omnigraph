@@ -2309,12 +2309,16 @@ query pairs() {
     }
 }
 
-/// The exact `bm25` reads its field corpus once for the corpus statistics,
-/// keeping no document, then scores each row of its population from the
-/// row's own text, so its memory is the scored window's and one value's
-/// analysis, not the corpus's. Thirty thousand documents, every one
-/// matching each of forty query terms, hold several times the 4 MiB pool;
-/// the ten best are answered within it, and the pool is released.
+/// The exact `bm25` reads its field corpus once: as it counts the corpus
+/// statistics it keeps each matching document's identity, token count and
+/// alternatives, never its text, scores those documents after the pass, and
+/// gives a row of its population its score by identity. So its memory is
+/// the matches', not the corpus's: thirty thousand documents whose text
+/// holds several times the 4 MiB pool, a tenth of them matching the query,
+/// answer the ten best within it. When every document matches each of forty
+/// query terms, the kept alternatives outgrow the pool and the read is
+/// refused with `query_memory_bytes`, as `match_terms` is when its matches
+/// do. Both release the pool.
 #[tokio::test]
 #[serial]
 async fn bm25_scores_a_corpus_several_times_the_pool_within_it() {
@@ -2333,9 +2337,14 @@ node Doc { slug: String @key  text: String @index(fulltext, analyzer = "standard
     let mut corpus_bytes = 0;
     for d in 0..documents {
         // Document d repeats term(d % 40) once more than the others, so the
-        // scores differ and the window is decided.
+        // scores differ and the window is decided; every tenth holds
+        // `needle`, once more in one of every seven of those.
+        let needle = match d % 10 {
+            0 => "needle ".repeat(1 + d % 7),
+            _ => String::new(),
+        };
         let text = format!(
-            "{} {} {} {}",
+            "{needle}{} {} {} {}",
             words.join(" "),
             words[d % words.len()],
             "pad".repeat(1 + d % 7),
@@ -2362,13 +2371,26 @@ node Doc { slug: String @key  text: String @index(fulltext, analyzer = "standard
         probes.clone(),
         with_query_memory_limit(
             4 * MIB,
-            query_main(&db, query, "best", &params(&[("q", &words.join(" "))])),
+            query_main(&db, query, "best", &params(&[("q", "needle")])),
         ),
     )
     .await
     .unwrap();
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 10);
+    assert_released(&probes);
+
+    let probes = QueryMemoryProbes::default();
+    let error = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(
+            4 * MIB,
+            query_main(&db, query, "best", &params(&[("q", &words.join(" "))])),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_memory_refusal(error, 4 * MIB);
     assert_released(&probes);
 }
 

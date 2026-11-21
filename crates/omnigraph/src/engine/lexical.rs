@@ -7,7 +7,9 @@
 //! (the GQ 3 RFC, section 4). A `Filter` or `Let` reads each
 //! call as a Boolean column, the membership of the row's identity in the
 //! call's matches, which a null or token-empty document never joins; a
-//! `Score` appends each matching row's `bm25_v1` score. The operator runs the
+//! `Score` appends each matching row's `bm25_v1` score, which the scan
+//! computed for every matching document and the row takes by its identity,
+//! so the population reads no text. The operator runs the
 //! scan when its consumer first polls it, before it pulls its input, so a
 //! node that never runs (below a `Limit` of 0, say) scans nothing. The scan
 //! reads the field's table at the pinned snapshot under the engine's scan
@@ -145,7 +147,8 @@ impl LexicalSource {
             source: self.clone(),
             type_name: type_name.to_string(),
             call: call.clone(),
-            scorer: OnceLock::new(),
+            scores: OnceLock::new(),
+            held: Mutex::new(None),
         })
     }
 }
@@ -243,14 +246,17 @@ impl LexicalColumns {
     }
 }
 
-/// The exact `bm25` of one `Score` node: its field corpus's `bm25_v1`
-/// statistics, read once when the operator first runs, which score each row
-/// of its population from the row's own value.
+/// The exact `bm25` of one `Score` node: the `bm25_v1` score of every
+/// matching document of its field corpus, read in one pass when the operator
+/// first runs and held, charged to the query's pool, for the operator's
+/// lifetime; a row of the population takes its score by its identity.
 pub(crate) struct LexicalScore {
     source: LexicalSource,
     type_name: String,
     call: IRExpr,
-    scorer: OnceLock<Arc<super::lexical_scan::Bm25Scorer>>,
+    scores: OnceLock<Arc<super::lexical_scan::Bm25Scores>>,
+    /// The charge the scores hold for the operator's lifetime.
+    held: Mutex<Option<WorkMemory>>,
 }
 
 impl std::fmt::Debug for LexicalScore {
@@ -260,9 +266,10 @@ impl std::fmt::Debug for LexicalScore {
 }
 
 impl LexicalScore {
-    /// Read the field corpus once, its work charged to `memory`.
+    /// Read the field corpus once, its work and its scores charged to
+    /// `memory`, which the scores keep.
     pub(crate) async fn answer(&self, memory: WorkMemory) -> Result<()> {
-        if self.scorer.get().is_some() {
+        if self.scores.get().is_some() {
             return Ok(());
         }
         let snapshot = self.source.snapshot()?;
@@ -272,7 +279,7 @@ impl LexicalScore {
             &self.call,
             &self.source.params,
         )?;
-        let scorer = super::lexical_scan::bm25(
+        let scores = super::lexical_scan::bm25(
             snapshot,
             &self.source.catalog,
             &self.type_name,
@@ -281,15 +288,16 @@ impl LexicalScore {
             &memory,
         )
         .await?;
-        let _ = self.scorer.set(Arc::new(scorer));
+        let _ = self.scores.set(Arc::new(scores));
+        *super::operators::memory::locked(&self.held) = Some(memory);
         Ok(())
     }
 
-    /// The corpus's scorer. An error before the corpus was read.
-    pub(crate) fn scorer(&self) -> Result<&super::lexical_scan::Bm25Scorer> {
-        self.scorer
+    /// The corpus's scores. An error before the corpus was read.
+    pub(crate) fn scores(&self) -> Result<&super::lexical_scan::Bm25Scores> {
+        self.scores
             .get()
-            .map(|scorer| scorer.as_ref())
+            .map(|scores| scores.as_ref())
             .ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "the exact `bm25` over `{}` was read before its scan ran",

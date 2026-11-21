@@ -638,10 +638,20 @@ fn resolve_pipeline(
             } => {
                 let input = bound(current, "score")?;
                 let schema = schema_of(plan, input)?;
-                // Each row is scored from its own value of the scored
-                // property: `distance`'s vector, `bm25`'s text.
-                let mut reads = vec![ColumnRef::property(binding, property)];
-                reads_of_expr(query, &mut reads);
+                // `distance` scores each row from its own vector. `bm25`
+                // scores each matching document during its corpus pass and
+                // looks a row up by its identity, so the population reads
+                // no text.
+                let mut reads = match kind {
+                    omnigraph_compiler::ir::core::ScoreKind::Bm25 => {
+                        vec![ColumnRef::property(binding, IDENTITY_MEMBER)]
+                    }
+                    omnigraph_compiler::ir::core::ScoreKind::Distance => {
+                        let mut reads = vec![ColumnRef::property(binding, property)];
+                        reads_of_expr(query, &mut reads);
+                        reads
+                    }
+                };
                 reads.dedup();
                 plan.add(
                     LogicalNode::Score {

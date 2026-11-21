@@ -924,16 +924,18 @@ impl Lower for Walk<'_, '_> {
                 .into());
             };
             let scores = self.lowering.lexical_source().score(type_name, query);
-            let name = format!("{binding}.{property}");
+            // The scan scores every matching document; a row takes its score
+            // by its identity.
+            let name = format!("{binding}.{}", self.lowering.catalog.system_columns.id);
             let schema = input.schema();
             let hidden = format!("{HIDDEN}{name}");
-            let value_column = if schema.column_with_name(&hidden).is_some() {
+            let id_column = if schema.column_with_name(&hidden).is_some() {
                 hidden
             } else if schema.column_with_name(&name).is_some() {
                 name
             } else {
                 return Err(OmniError::manifest_internal(format!(
-                    "the exact `bm25`'s field '{name}' is not in its input"
+                    "the exact `bm25`'s identity '{name}' is not in its input"
                 ))
                 .into());
             };
@@ -941,7 +943,7 @@ impl Lower for Walk<'_, '_> {
                 "{binding}.{}",
                 omnigraph_compiler::query::value::SCORE_COLUMN
             );
-            let exec = ScoreExec::bm25(input, value_column, score, scores)?;
+            let exec = ScoreExec::bm25(input, id_column, score, scores)?;
             return self.built(id, exec);
         }
         let column = format!("{binding}.{property}");

@@ -212,6 +212,7 @@ NearestColdIndexed           l.get        calls=9
 NearestWarmIndexed           l.get        calls=2
 NearestCorrelated            l.get        calls=12
 RrfCorrelated                l.get        calls=10
+Bm25Body                     l.get        calls=3
 VectorIndexRefreshLagging    l.get        calls=24
 VectorIndexRefreshLagging    l.list       calls=1
 VectorIndexRefreshLagging    l.put        calls=11

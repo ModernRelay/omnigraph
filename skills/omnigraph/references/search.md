@@ -277,9 +277,10 @@ use a `where` filter there. No call takes an analyzer (`terms(…)` with one is
 Every full-text call is exact and reads no index: the exact lexical scan
 normalizes each value to NFC, analyzes it with the profile and decides each
 row, so built, partly built and unbuilt indexes give the same rows. It reads
-the field's whole text on every call, so its time is linear in that text
-(about 50 ms per MiB on two CPUs; see the user guide's "The exact scan's
-cost" in `docs/user/search/analyzers.md`).
+the field's whole text once on every call, a `bm25` too (its one pass scores
+every matching document, and its memory follows the matches), so its time is
+linear in that text (about 50 ms per MiB on two CPUs; see the user guide's
+"The exact scan's cost" in `docs/user/search/analyzers.md`).
 `match_terms($d.f, terms($q, mode: all | any, max_edits: 0..=2))` matches a
 query term to a stored term within the budget (one edit per inserted, deleted
 or substituted character; a swap costs two). `bm25` is `bm25_v1`, an `F64`

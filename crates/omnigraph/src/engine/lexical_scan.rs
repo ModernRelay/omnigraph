@@ -551,86 +551,112 @@ impl Corpus {
 
     /// The `bm25_v1` score of a matching document of `len` tokens whose
     /// alternatives per query term are `hits`, with `idf` from [`Self::idf`].
+    #[cfg(test)]
     pub(crate) fn score(&self, idf: &[f64], len: u64, hits: &[Vec<(u8, u64)>]) -> Result<f64> {
+        checked_score(self.total(idf, len, hits))
+    }
+
+    /// [`Self::score`]'s sum, before [`checked_score`] admits it.
+    #[cfg(test)]
+    fn total(&self, idf: &[f64], len: u64, hits: &[Vec<(u8, u64)>]) -> f64 {
+        self.total_of(
+            idf,
+            len,
+            hits.iter().enumerate().flat_map(|(term, hits)| {
+                hits.iter()
+                    .map(move |&(edits, occurrences)| Hit::new(term, edits, occurrences))
+            }),
+        )
+    }
+
+    /// The sum over `hits`, a document's alternatives in query-term order:
+    /// per term the best weight, times the term's IDF, added in term order.
+    fn total_of(&self, idf: &[f64], len: u64, hits: impl IntoIterator<Item = Hit>) -> f64 {
         let avg_len = self.tokens as f64 / self.documents as f64;
         let norm = 1.2 * (0.25 + 0.75 * len as f64 / avg_len);
         let mut total = 0f64;
-        for (idf, hits) in idf.iter().zip(hits) {
-            let mut best: Option<f64> = None;
-            for &(edits, occurrences) in hits {
-                let tf = occurrences as f64;
-                let weight = EDIT_WEIGHTS[usize::from(edits)] * 2.2 * tf / (tf + norm);
-                best = Some(best.map_or(weight, |best| best.max(weight)));
-            }
-            if let Some(best) = best {
-                total += idf * best;
-            }
-        }
-        if !total.is_finite() || total <= 0.0 {
-            return Err(numeric_failure(
-                E3,
-                format!("a `bm25_v1` score is {total}, not a finite positive number"),
-            ));
-        }
-        Ok(total)
-    }
-}
-
-/// What scoring a value by `bm25_v1` needs once its field corpus has been
-/// read: the field's analyzer profile, the query, and the corpus statistics
-/// with each query term's IDF. It holds nothing per document, so a
-/// population of any size is scored in the memory one value's analysis
-/// takes, row by row as the population streams.
-pub(crate) struct Bm25Scorer {
-    profile: AnalyzerProfile,
-    query: LexicalQuery,
-    corpus: Corpus,
-    idf: Vec<f64>,
-}
-
-impl Bm25Scorer {
-    /// Each of `values` scored, in order: its `bm25_v1` score, or `None` for
-    /// a value outside the matches (a null, a value with no analyzed term,
-    /// one that misses the query's mode). Each value's analysis is charged
-    /// to `memory` while it is held and its tokens and comparisons to the
-    /// query's work.
-    pub(crate) fn score(
-        &self,
-        values: &StringArray,
-        memory: &WorkMemory,
-    ) -> Result<Vec<Option<f64>>> {
-        if self.query.matches_nothing() {
-            return Ok(vec![None; values.len()]);
-        }
-        let mut scan = FieldScan::new(Analyzer::of(self.profile)?, &self.query, memory)?;
-        let mut out = Vec::with_capacity(values.len());
-        for row in 0..values.len() {
-            let document = match values.is_valid(row) {
-                true => scan.document(values.value(row))?,
-                false => None,
-            };
-            let score = match document {
-                Some(document) => {
-                    let hits = scan.hits(&document)?;
-                    match hits.matched(self.query.all) {
-                        true => Some(self.corpus.score(&self.idf, document.len, &hits.by_term)?),
-                        false => None,
-                    }
+        let mut best: Option<(u32, f64)> = None;
+        for hit in hits {
+            let tf = hit.occurrences as f64;
+            let weight = EDIT_WEIGHTS[usize::from(hit.edits)] * 2.2 * tf / (tf + norm);
+            best = match best {
+                Some((term, best)) if term == hit.term => Some((term, best.max(weight))),
+                Some((term, best)) => {
+                    total += idf[term as usize] * best;
+                    Some((hit.term, weight))
                 }
-                None => None,
+                None => Some((hit.term, weight)),
             };
-            scan.row_done();
-            out.push(score);
         }
-        scan.report();
-        Ok(out)
+        if let Some((term, best)) = best {
+            total += idf[term as usize] * best;
+        }
+        total
     }
 }
 
-/// The `bm25_v1` corpus statistics of `type_name`'s `property` at `snapshot`
-/// for `query`: one streamed pass over the field that counts the field
-/// corpus, its tokens and each query term's document frequency, keeping no
-/// document.
+/// One stored alternative of a query term in a document: the term's
+/// position in the query, its edits and its occurrences.
+#[derive(Debug, Clone, Copy)]
+struct Hit {
+    term: u32,
+    edits: u8,
+    occurrences: u64,
+}
+
+impl Hit {
+    fn new(term: usize, edits: u8, occurrences: u64) -> Self {
+        // A query holds at most `QUERY_MAX_TERMS` terms.
+        Self {
+            term: term as u32,
+            edits,
+            occurrences,
+        }
+    }
+}
+
+/// A `bm25_v1` sum as a score: `E3` unless it is finite and positive.
+fn checked_score(total: f64) -> Result<f64> {
+    if !total.is_finite() || total <= 0.0 {
+        return Err(numeric_failure(
+            E3,
+            format!("a `bm25_v1` score is {total}, not a finite positive number"),
+        ));
+    }
+    Ok(total)
+}
+
+/// The `bm25_v1` scores of a field's matching documents, by entity
+/// identity: what one pass over the field leaves. A row of the population
+/// is looked up by its identity, so its text is never read again.
+#[derive(Debug, Default)]
+pub(crate) struct Bm25Scores {
+    /// Each matching document's sum, checked when a row reads it, so a sum
+    /// outside the population refuses nothing.
+    totals: HashMap<String, f64>,
+}
+
+impl Bm25Scores {
+    /// The score of the entity `id`: `None` outside the matches (a null
+    /// value, one with no analyzed term, one that misses the query's mode),
+    /// `E3` for a sum that is not finite and positive.
+    pub(crate) fn score(&self, id: &str) -> Result<Option<f64>> {
+        self.totals.get(id).copied().map(checked_score).transpose()
+    }
+}
+
+/// One matching document as the pass keeps it: its identity, its token
+/// count and the range of its alternatives in the pass's one list of them.
+type Matching = (String, u64, std::ops::Range<usize>);
+
+/// The `bm25_v1` scores of `type_name`'s `property` at `snapshot` for
+/// `query`: one streamed pass over the field that counts the field corpus,
+/// its tokens and each query term's document frequency, and keeps each
+/// matching document's identity, token count and alternatives (one entry per
+/// matched term and edit distance, in one list), charged to `memory` like
+/// the identities `match_terms` keeps. After
+/// the pass every kept document is scored against the complete statistics,
+/// and only the scores stay charged, for as long as `memory` lives.
 pub(crate) async fn bm25(
     snapshot: &Snapshot,
     catalog: &Catalog,
@@ -638,26 +664,23 @@ pub(crate) async fn bm25(
     property: &str,
     query: LexicalQuery,
     memory: &WorkMemory,
-) -> Result<Bm25Scorer> {
+) -> Result<Bm25Scores> {
     let profile = declared_profile(catalog, type_name, property).ok_or_else(|| {
         OmniError::manifest_internal(format!(
             "the exact lexical scan reads `{type_name}.{property}`, whose index declares no analyzer"
         ))
     })?;
+    // No document matches a query of no term, so the corpus is not read.
+    if query.matches_nothing() {
+        return Ok(Bm25Scores::default());
+    }
     let mut corpus = Corpus {
         holding: vec![0; query.terms.len()],
         ..Corpus::default()
     };
-    // No document matches a query of no term, so its statistics score
-    // nothing and the corpus is not read.
-    if query.matches_nothing() {
-        return Ok(Bm25Scorer {
-            profile,
-            query,
-            corpus,
-            idf: Vec::new(),
-        });
-    }
+    let base = memory.charged();
+    let mut matching: Vec<Matching> = Vec::new();
+    let mut alternatives: Vec<Hit> = Vec::new();
     let mut scan = FieldScan::new(Analyzer::of(profile)?, &query, memory)?;
     scan_field(
         snapshot,
@@ -665,7 +688,7 @@ pub(crate) async fn bm25(
         type_name,
         property,
         memory,
-        |_, value| {
+        |id, value| {
             let document = match value {
                 Some(value) => scan.document(value)?,
                 None => None,
@@ -684,6 +707,24 @@ pub(crate) async fn bm25(
                     *holding = checked(*holding, 1, "a term's document frequency")?;
                 }
             }
+            if hits.matched(query.all) {
+                let start = alternatives.len();
+                for (term, hits) in hits.by_term.iter().enumerate() {
+                    for &(edits, occurrences) in hits {
+                        alternatives.push(Hit::new(term, edits, occurrences));
+                    }
+                }
+                memory
+                    .string(id.len())
+                    .map_err(|error| memory.error(error))?;
+                memory
+                    .entries::<Matching>(1)
+                    .map_err(|error| memory.error(error))?;
+                memory
+                    .entries::<Hit>(alternatives.len() - start)
+                    .map_err(|error| memory.error(error))?;
+                matching.push((id.to_string(), document.len, start..alternatives.len()));
+            }
             scan.row_done();
             Ok(())
         },
@@ -692,12 +733,23 @@ pub(crate) async fn bm25(
     scan.report();
     drop(scan);
     let idf = corpus.idf();
-    Ok(Bm25Scorer {
-        profile,
-        query,
-        corpus,
-        idf,
-    })
+    let mut totals = HashMap::with_capacity(matching.len());
+    let mut id_bytes = 0usize;
+    for (id, len, range) in matching {
+        id_bytes += id.len();
+        let total = corpus.total_of(&idf, len, alternatives[range].iter().copied());
+        totals.insert(id, total);
+    }
+    drop(alternatives);
+    // The alternatives are gone; the identities and their scores stay.
+    memory.shrink_to(base);
+    memory
+        .string(id_bytes)
+        .map_err(|error| memory.error(error))?;
+    memory
+        .entries::<(String, f64)>(totals.len())
+        .map_err(|error| memory.error(error))?;
+    Ok(Bm25Scores { totals })
 }
 
 #[cfg(test)]

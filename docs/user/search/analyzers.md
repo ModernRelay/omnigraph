@@ -95,10 +95,13 @@ at the query's snapshot, whatever filters or `limit` the query carries, so its
 time is linear in the bytes of that field across the node type. Measured on
 two CPUs, the scan takes about 50 ms per MiB of text: about 9.7 s over a
 171,000-document corpus, which a native full-text index answered in about
-113 ms before this release. Its memory does not grow with the field: `bm25`
-keeps the corpus's statistics and scores each row from its own text, so a
-corpus larger than the query's memory pool scores within it. Keep such calls
-to node types whose text fits the latency you need.
+113 ms before this release. A `bm25` reads the field once, as a
+`match_terms` does: the same pass counts the corpus's statistics and scores
+every matching document, and the population's rows take their scores without
+reading their text again. Its memory follows the matches, not the field's
+text: for each matching document it keeps the identity, the length and the
+query terms it holds, charged to the query's memory pool for that query
+alone. Keep such calls to node types whose text fits the latency you need.
 
 `match_terms($d.f, terms($q, mode: all | any, max_edits: n))` is true where
 every (`all`, the default) or some (`any`) distinct analyzed term of `$q` has

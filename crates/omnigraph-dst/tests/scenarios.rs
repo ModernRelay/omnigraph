@@ -3674,8 +3674,11 @@ query nearest_docs($q: Vector(2)) {
 /// own): a `nearest` correlated on each outer person, its population the
 /// person's documents, scored exactly and cut to the person's two nearest
 /// by the read's own window, all outer rows in one evaluation of the
-/// population; and an `rrf` correlated on each outer person, a `bm25` arm
-/// and a `nearest` arm over the person's documents fused per person.
+/// population; an `rrf` correlated on each outer person, a `bm25` arm
+/// and a `nearest` arm over the person's documents fused per person; and a
+/// `bm25` over every document (`Bm25Body`), which reads the field once: its
+/// corpus pass scores each matching document, and its population scan reads
+/// no text.
 fn ranking_read_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = r#"
 node Person {
@@ -3705,8 +3708,16 @@ query fused_per_author($q: Vector(2), $s: String) {
     }
     return { $p.handle, $d.slug, $f }
 }
+
+query bm25_body($s: String) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from bm25($pop, $d.body, $s) as $score
+    }
+    return { $d.slug, $score }
+}
 "#;
-    const LABELS: [&str; 2] = ["NearestCorrelated", "RrfCorrelated"];
+    const LABELS: [&str; 3] = ["NearestCorrelated", "RrfCorrelated", "Bm25Body"];
 
     struct RankingReadCost;
 
@@ -3805,6 +3816,24 @@ query fused_per_author($q: Vector(2), $s: String) {
             assert!(
                 (4..=16).contains(&rows.as_array().unwrap().len()),
                 "each author's fused documents: {rows}"
+            );
+            omnigraph_dst::cost::set_label(LABELS[2]);
+            let rows = reader
+                .query(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    QUERIES,
+                    "bm25_body",
+                    &params,
+                )
+                .await
+                .unwrap()
+                .to_rust_json()
+                .unwrap();
+            omnigraph_dst::cost::set_label("_ranking_read_verify");
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                8,
+                "the eight documents about graphs: {rows}"
             );
         }
     }
