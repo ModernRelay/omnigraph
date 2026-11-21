@@ -642,6 +642,15 @@ mod tests {
         assert!(!map.contains_key(&"b"));
         assert!(map.contains_key(&"c"));
 
+        // `peek` counts no use; `insert_evicting` names what it evicted;
+        // `remove` leaves no recency entry behind.
+        assert_eq!(map.peek(&"a"), Some(&1));
+        assert_eq!(map.insert_evicting("d", 4), vec![("a", 1)]);
+        assert_eq!(map.remove(&"c"), Some(3));
+        assert_eq!(map.remove(&"c"), None);
+        assert_eq!(map.keys_by_recency(), vec!["d"]);
+        assert_eq!(map.insert_evicting("e", 5), vec![]);
+
         map.invalidate_all();
         assert_eq!(map.len(), 0);
     }

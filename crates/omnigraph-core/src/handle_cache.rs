@@ -44,14 +44,34 @@ where
     }
 
     pub fn insert(&mut self, key: K, value: V) {
+        self.insert_evicting(key, value);
+    }
+
+    /// [`Self::insert`], returning the entries evicted to stay within the
+    /// cap, least recently used first.
+    pub fn insert_evicting(&mut self, key: K, value: V) -> Vec<(K, V)> {
         self.entries.insert(key.clone(), value);
         self.touch(key);
+        let mut evicted = Vec::new();
         while self.entries.len() > self.cap {
-            let Some(oldest) = self.lru.pop_front() else {
+            let Some(oldest) = self.pop_oldest() else {
                 break;
             };
-            self.entries.remove(&oldest);
+            evicted.push(oldest);
         }
+        evicted
+    }
+
+    /// The entry of `key`, without counting a use.
+    pub fn peek(&self, key: &K) -> Option<&V> {
+        self.entries.get(key)
+    }
+
+    /// Remove the entry of `key`.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let removed = self.entries.remove(key)?;
+        self.lru.retain(|existing| existing != key);
+        Some(removed)
     }
 
     pub fn invalidate_all(&mut self) {

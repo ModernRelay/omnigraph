@@ -899,6 +899,95 @@ async fn named_write_capture_reuses_the_exact_local_publication() {
     .await;
 }
 
+/// The writer state of every named branch a handle writes stays warm: a write
+/// that follows writes on other named branches issues the requests of a write
+/// that returns to the branch the handle wrote last, however many branches it
+/// writes in turn. Each point is a fresh graph whose named branches are
+/// written round-robin; the first round opens every branch's writer state and
+/// the later rounds are measured.
+#[tokio::test]
+async fn named_branch_write_requests_are_flat_in_the_branches_written() {
+    fn requests(io: &IoCounts) -> u64 {
+        io.data_reads + io.data_writes + io.manifest_reads + io.manifest_writes
+    }
+    cost_harness(async {
+        let mut curve: Vec<(u64, IoCounts)> = Vec::new();
+        for branches in [1u64, 2, 4] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = init_and_load(&dir).await;
+            let names = (0..branches)
+                .map(|branch| format!("writer-{branch}"))
+                .collect::<Vec<_>>();
+            for name in &names {
+                db.branch_create(name).await.unwrap();
+            }
+            let mut costliest: Option<IoCounts> = None;
+            for round in 0..3 {
+                for name in &names {
+                    let (result, io) = measure(helpers::mutate_branch(
+                        &db,
+                        name,
+                        MUTATION_QUERIES,
+                        "set_age",
+                        &mixed_params(&[("$name", "Alice")], &[("$age", 40 + round)]),
+                    ))
+                    .await;
+                    result.unwrap();
+                    if round > 0 && costliest.is_none_or(|worst| requests(&io) > requests(&worst)) {
+                        costliest = Some(io);
+                    }
+                }
+            }
+            let costliest = costliest.expect("a measured round");
+            eprintln!(
+                "{branches} named branches written in turn: {} requests per write, {costliest:?}",
+                requests(&costliest)
+            );
+            for name in &names {
+                let result = db
+                    .query(
+                        omnigraph::db::ReadTarget::branch(name.as_str()),
+                        helpers::TEST_QUERIES,
+                        "get_person",
+                        &helpers::params(&[("$name", "Alice")]),
+                    )
+                    .await
+                    .unwrap();
+                let batch = result.concat_batches().unwrap();
+                assert_eq!(
+                    batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<arrow_array::Int32Array>()
+                        .unwrap()
+                        .value(0),
+                    42,
+                    "{name}: the last round's write"
+                );
+            }
+            curve.push((branches, costliest));
+        }
+        let (_, one) = curve[0];
+        for (branches, io) in &curve[1..] {
+            for (select, what) in [
+                (requests as fn(&IoCounts) -> u64, "requests"),
+                (|io: &IoCounts| io.manifest_reads, "`__manifest` reads"),
+                (|io: &IoCounts| io.manifest_scan_count, "`__manifest` scans"),
+                (|io: &IoCounts| io.internal_open_count, "`__manifest` opens"),
+            ] {
+                assert!(
+                    select(io) <= select(&one),
+                    "{what} per named-branch write grew with the branches written in turn: \
+                     one branch {} -> {branches} branches {} ({one:?} -> {io:?})",
+                    select(&one),
+                    select(io),
+                );
+            }
+        }
+    })
+    .await;
+}
+
 /// A deterministic cross-run I/O assertion; GQT --measure reports counts,
 /// but baseline differences do not fail a case. A validation opens each
 /// committed table once under either pool, so the reuse shows in the reads.

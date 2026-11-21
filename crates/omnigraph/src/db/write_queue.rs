@@ -62,7 +62,7 @@
 //! lost coordinator CAS round is a wait of the CAS kind: every round crosses
 //! `acquire`, the winning swap `hold`, and a refused install `refused`, the
 //! one `acquire` that ends with no hold. Not gates, and so outside this
-//! module: `Omnigraph::feed_cut_cache` and `Omnigraph::merge_authority_cache`,
+//! module: `Omnigraph::feed_cut_cache` and `Omnigraph::branch_authorities`,
 //! caches held across no round trip, and the operator-local locks under
 //! `engine/`, intra-query state. The `forbidden_apis` guard refuses a new
 //! blocking primitive elsewhere in `db/` and `exec/` without a sentinel
