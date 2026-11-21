@@ -13,7 +13,7 @@ node Doc {
     slug: String @key
     n: I64 @index
     name: String @index
-    embedding: Vector(4)
+    embedding: Vector(4) @index
 }
 
 edge Knows: Doc -> Doc {
@@ -76,6 +76,7 @@ edge Knows: Doc -> Doc {
 {"edge":"Knows","id":"e040_0","from":"d040","to":"d041","data":{}}
 
 --- query
+set ann_nprobes = 0;
 query nearest_eligible_docs($q: Vector(4)) {
     match {
         $d: Doc

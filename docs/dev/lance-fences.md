@@ -109,11 +109,12 @@ and is rebuilt with the engine's target partitions
 reports its `nearest` search exhaustive: an attempt that searched every
 partition of such an IVF_FLAT index, or that carries neither counter (Lance's
 flat kNN), ranked exactly; one counter alone does not. Previously with 1 partition,
-every search was exhaustive. With dynamic IVF partition sizing (~sqrt(n) partitions
-via `rows.isqrt().clamp(1, 4096).min(rows)`), a default search probes a subset
-under `ann_nprobes`; it is exhaustive only on tables where partition count is 1
-(tables with <= 3 rows) or when `ann_nprobes` covers all partitions, and approximate
-otherwise.
+every search covered the single partition and was reported exhaustive. With dynamic IVF
+partition sizing (~sqrt(n) partitions via `rows.isqrt().clamp(1, 4096).min(rows)`),
+a default search probes a subset capped by `ann_nprobes` and is approximate;
+it reports exhaustive only when every partition was actually searched (such as
+mono-partition tables with <= 3 rows or when all partitions are visited), or when
+falling back to an unindexed flat scan.
 
 **Owners:** `lance_surface_guards.rs`, `search.rs`
 (`nearest_ranks_by_l2_over_a_cosine_index_issue_1297`,

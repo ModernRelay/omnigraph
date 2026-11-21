@@ -3696,8 +3696,10 @@ impl TableStore {
                 let target = Self::target_vector_partitions(non_null_rows);
                 let mut final_partitions = if non_null_rows == 0 {
                     1
-                } else {
+                } else if Self::is_degenerate_vector_index(partitions, non_null_rows) {
                     partitions.min(non_null_rows).max(target)
+                } else {
+                    partitions.min(non_null_rows)
                 };
                 loop {
                     let params = lance::index::vector::VectorIndexParams::ivf_flat(
