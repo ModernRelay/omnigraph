@@ -37,7 +37,7 @@ puts each changed path in one class:
 
 | Class | Paths | Jobs that run |
 |---|---|---|
-| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `PR Title`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`, `CI Gate`). `Check AGENTS.md Links` reads documentation through `scripts/check-docs.py`, `Fix Regression Gate` requires `AGENTS.md` to name the corpus path `crates/omnigraph-gqt/cases/`, and `PR Title` reads the `changelog.d/` notes a pull request adds. `Test omnigraph-server --features aws` and the `GQ Logic Tests` cells start and report without building |
+| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `PR Title`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`, `CI Gate`). `Check AGENTS.md Links` reads documentation through `scripts/check-docs.py` and `docs/dev/contract.md` through `scripts/check-contract-marks.py`, `Fix Regression Gate` requires `AGENTS.md` to name the corpus path `crates/omnigraph-gqt/cases/`, and `PR Title` reads the `changelog.d/` notes a pull request adds. `Test omnigraph-server --features aws` and the `GQ Logic Tests` cells start and report without building |
 | GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
@@ -58,7 +58,9 @@ case arming a seam turns the guard red where the PR can see it. The fixture
 parity test in `crates/omnigraph-bench/src/branch_merge.rs` also reads
 `generated_branch_merge_dataset.gqt` from the corpus. `GQT (ordinary)` runs
 it with the other benchmark unit tests on `run_gqt`, including cases-only
-changes, while `Test Workspace` covers it on engine input. No crate reads a deployment
+changes, while `Test Workspace` covers it on engine input.
+`scripts/check-contract-marks.py` (`Check AGENTS.md Links`, always on) reads
+the `# notes: contract:` header lines of every case. No crate reads a deployment
 file. `scripts/check-change-classes.py` keeps the
 literal-spelling half of this true: it replays the classifier over fixture
 diffs and fails when a string literal in a Rust or TOML file under `crates/`
@@ -321,7 +323,18 @@ merge-group run skips it, the pull request run having covered the diff),
 annotating each offending file and
 line; markers already on the base branch never fail an unrelated pull
 request. There is no exemption; a document that must quote a conflict block
-indents the markers one space. After the documentation checks, the same
+indents the markers one space. The same context runs
+`scripts/check-contract-marks.py`, with its self-test first: it reads the
+addresses [the contract](contract.md#citing) defines from the page itself,
+and the `// contract:` comments of test code and the `# notes: contract:`
+header lines of `.gqt` cases under `crates/`. It fails when a comment names
+an address the page does not define, when a statement carries `✓` and no
+test names it, when a test names a statement that carries no `✓`, and when a
+`✓` stands anywhere on the page but straight after an address or at the end
+of a cell of the table of rules per kind. `--update` rewrites the marks from
+the comments; CI never passes it. The context is always on, so a
+documentation-only edit of a mark and a test-only edit of a comment are both
+checked. After the documentation checks, the same
 context runs `typos` (`crate-ci/typos`, pinned by commit) over every tracked
 text file, hidden paths such as `.github/` included; the tool itself skips
 `Cargo.toml` manifests, lock files and binaries. It matches each word against
@@ -633,6 +646,7 @@ For repository metadata and workflow changes, first
 ```bash
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
+python3 scripts/check-contract-marks.py --self-test && python3 scripts/check-contract-marks.py   # after a contract.md edit or a `contract:` comment in a test; `--update` rewrites the marks
 python3 scripts/test_release_notes.py
 python3 scripts/test_edge_release.py
 python3 scripts/check-release-note.py --self-test

@@ -765,8 +765,15 @@ Contract: keeps E2, write.changes; closes G2; decides D1
 
 A cost claim also names the activity it is for in [the work](workload.md).
 
-A test names the statement it holds in a comment, `// contract: merge:2`. A
-statement gets its `✓` from such a test, never by hand.
+A test names the statement it holds in a comment on a line of its own,
+`// contract: merge:2`, and several as `// contract: merge:2, E2`. A `.gqt`
+case names it in a header line, `# notes: contract: merge:2`. A statement
+gets its `✓` from such a test, never by hand:
+`python3 scripts/check-contract-marks.py --update` writes the mark straight
+after the statement's address, or at the end of its cell in the table of
+rules per kind. Without the flag the script is the check that CI runs. It
+refuses a mark that no test earns, a named statement without its mark, and
+an address that this page does not define.
 
 ## Sources
 
