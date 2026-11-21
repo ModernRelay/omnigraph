@@ -5706,8 +5706,8 @@ async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
         report.cost
     );
     assert!(
-        report.cost.index_reads <= report.cost.table_opens,
-        "every index read is one of those opens: {:?}",
+        report.cost.index_reads <= report.cost.table_opens + pins,
+        "every index read is one of those opens, plus one per root for the bases it borrows: {:?}",
         report.cost
     );
     assert!(
