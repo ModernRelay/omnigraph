@@ -156,7 +156,7 @@ async fn overwrite_probed(
         )));
     }
     let config_only = matches!(placement, Placement::ConfigOnly { .. });
-    if config_only {
+    if config_only && dataset.manifest().branch.is_none() {
         require_branch_rows(written)?;
     }
     let mut metadata = dataset.schema().metadata.clone();

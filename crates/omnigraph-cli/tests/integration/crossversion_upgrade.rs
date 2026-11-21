@@ -26,7 +26,7 @@
 //! `c0a4519f`) and `OMNIGRAPH_V011_BIN` (the released 0.11.0 CLI, which writes
 //! storage format 9 and converts a 0.10.x graph to format 8 or 9) drive the
 //! in-place route: the offline `omnigraph upgrade` of a genuine stamp-13,
-//! stamp-9 or stamp-8 root to format 17 with its branches and commit history
+//! stamp-9 or stamp-8 root to the current format with its branches and commit history
 //! kept. Those two, and `OMNIGRAPH_V6_BIN` where a journey starts from a 0.10.x
 //! graph, fall back to a binary under `target/storage-upgrade-binaries/`; with
 //! `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` an unresolved predecessor of a
@@ -2669,6 +2669,7 @@ fn storage_upgrade_preserves_history(
     let temp = tempdir().unwrap();
     let graph = temp.path().join("standalone.omni");
     let uri = graph.to_str().unwrap();
+    let current = omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
     let [schema, data, queries] = journey_fixture(temp.path());
     let query_path = queries.to_str().unwrap();
     let first = born_with.as_ref().map_or(old, |born| born.binary);
@@ -2963,7 +2964,7 @@ fn storage_upgrade_preserves_history(
     ));
     assert_eq!(check["outcome"], "check_passed", "{check}");
     assert_eq!(check["observed_format"], source_format);
-    assert_eq!(check["target_format"], 17);
+    assert_eq!(check["target_format"], current);
     assert_eq!(check["target_defaulted"], true);
     assert_eq!(check["route"], serde_json::json!([handler]));
     assert_eq!(check["completed_handlers"], serde_json::json!([]));
@@ -2981,7 +2982,7 @@ fn storage_upgrade_preserves_history(
             "upgrade {}: check_passed (check)",
             check["location"].as_str().unwrap()
         ),
-        &format!("format: {source_format} -> 17 (default target)"),
+        &format!("format: {source_format} -> {current} (default target)"),
         &format!("route: {handler}"),
     );
     assert_eq!(
@@ -3030,7 +3031,7 @@ fn storage_upgrade_preserves_history(
     ));
     assert_eq!(upgraded["outcome"], "completed", "{upgraded}");
     assert_eq!(upgraded["observed_format"], source_format);
-    assert_eq!(upgraded["target_format"], 17);
+    assert_eq!(upgraded["target_format"], current);
     assert_eq!(upgraded["completed_handlers"], serde_json::json!([handler]));
     assert_eq!(upgraded["last_durable_completed_boundary"], "activated");
     assert_eq!(upgraded["findings"], serde_json::json!([]));
@@ -3070,7 +3071,7 @@ fn storage_upgrade_preserves_history(
         }
         let again = support::parse_stdout_json(&output_success(&mut command));
         assert_eq!(again["outcome"], "already_current", "{again}");
-        assert_eq!(again["observed_format"], 17);
+        assert_eq!(again["observed_format"], current);
         assert_eq!(graph_files(&graph), after, "a rerun must write nothing");
     }
     assert!(
@@ -3088,7 +3089,7 @@ fn storage_upgrade_preserves_history(
         let served = support::parse_stdout_json(&output_success(
             cli().args(["snapshot", "--target", uri, "--branch", branch, "--json"]),
         ));
-        assert_eq!(served["internal_schema_version"], 17, "{branch}");
+        assert_eq!(served["internal_schema_version"], current, "{branch}");
         let listing = support::parse_stdout_json(&output_success(cli().args([
             "commit", "list", "--target", uri, "--branch", branch, "--json",
         ])));

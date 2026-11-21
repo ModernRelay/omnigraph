@@ -282,8 +282,11 @@ pub fn supports_branch_rows(stamp: u32) -> bool {
     stamp >= BRANCH_ROWS_STAMP
 }
 
-/// Refuse to write a branch row, a retired row or a tombstone on a chain
-/// stamped below [`BRANCH_ROWS_STAMP`], naming the explicit upgrade.
+/// Refuse to write a branch row or a retired row on a main stamped below
+/// [`BRANCH_ROWS_STAMP`], naming the explicit upgrade. A tombstone is gated
+/// by main's stamp through the delete that publishes it, never by the stamp
+/// of the chain it ends, which a branch forked from a pre-upgrade version of
+/// main carries.
 pub fn require_branch_rows(stamp: u32) -> Result<()> {
     if supports_branch_rows(stamp) {
         return Ok(());

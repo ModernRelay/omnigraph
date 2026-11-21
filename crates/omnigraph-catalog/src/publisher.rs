@@ -2679,13 +2679,16 @@ fn row_outcome_in_doubt(
 }
 
 impl GraphNamespacePublisher {
-    /// Load the bound branch and run one row attempt's checks: the stamp, the
-    /// writer epoch under the intent's assertion with no bump, and the
-    /// intent's own build of its entries over the loaded rows.
+    /// Load the bound branch and run one row attempt's checks: the stamp for
+    /// a row on main (a tombstone's chain carries its fork point's), the
+    /// writer epoch under the intent's assertion, the intent's own entries.
     async fn prepare_row(&self, intent: &RowIntent) -> Result<PreparedRow> {
         self.holder_key()?;
         let LoadedPublishState { dataset, rows, .. } = self.load_publish_state().await?;
-        require_branch_rows(guard_stamp(&dataset)?)?;
+        let stamp = guard_stamp(&dataset)?;
+        if intent.chain.is_none() {
+            require_branch_rows(stamp)?;
+        }
         let native = dataset.manifest().branch.clone();
         intent.refuse_replaced_lifetime(native.as_deref())?;
         let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());

@@ -17828,6 +17828,85 @@ fn v18_only_a_tree_with_no_version_is_classified_not_ready() {
     assert!(failed.storage_failure().is_some(), "{failed:?}");
 }
 
+/// A branch forked from a version of main written before the upgrade carries
+/// that version's stamp; its delete publishes the tombstone on that chain and
+/// retires the row, since main's stamp is the protocol.
+#[tokio::test]
+async fn v18_a_branch_forked_from_a_pre_upgrade_version_of_main_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let init = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let fork_commit = init.head().graph_commit_id.clone();
+    let mut main = open_manifest_dataset(uri, None).await.unwrap();
+    super::migrations::set_stamp_for_test(&mut main, 17)
+        .await
+        .unwrap();
+    let fork_version = main.version().version;
+    super::migrations::set_stamp_for_test(&mut main, 18)
+        .await
+        .unwrap();
+
+    let mut mc = ManifestCoordinator::open(uri).await.unwrap();
+    mc.create_branch_at("feature", fork_version, &fork_commit, None)
+        .await
+        .unwrap();
+    let tree = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    assert_eq!(super::migrations::read_stamp(&tree), Some(17));
+    let native = BranchRows::decode(mc.main_manifest().manifest())
+        .unwrap()
+        .by_logical("feature")
+        .unwrap()
+        .native
+        .clone();
+
+    mc.delete_branch("feature").await.unwrap();
+    let rows =
+        BranchRows::decode(open_manifest_dataset(uri, None).await.unwrap().manifest()).unwrap();
+    assert!(rows.is_retired(&native));
+    assert_eq!(rows.by_logical("feature"), None);
+}
+
+/// The delete of a not-ready branch retires a row whose tree holds no
+/// version; the collector's read of the retired histories passes it over.
+#[tokio::test]
+async fn v18_a_retired_row_with_no_tree_is_passed_over_by_the_retired_histories() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let version = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let row = probe_branch_row(PROBE_NATIVE, version);
+    let publisher = publisher_in(uri, None, &Arc::default());
+    publisher
+        .publish_rows(&fixed_row_intent(&row))
+        .await
+        .unwrap();
+    let retired = publisher
+        .publish_rows(&super::publisher::RowIntent::retired_row(
+            &row.native,
+            "01BX5ZZKBKACTAV9WEVGEMMVRZ".to_string(),
+        ))
+        .await
+        .unwrap();
+    assert!(retired.branch_rows.is_retired(&row.native));
+
+    let graphs = ManifestCoordinator::retired_commit_graphs(uri, &HistoryCache::default())
+        .await
+        .unwrap();
+    assert!(
+        graphs.is_empty(),
+        "{:?}",
+        graphs.iter().map(|(native, _)| native).collect::<Vec<_>>()
+    );
+}
+
 /// A live row whose create wrote no tree opens as not ready, and its delete
 /// retires the row with no tree behind it.
 #[tokio::test]

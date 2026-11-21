@@ -2881,7 +2881,9 @@ impl ManifestCoordinator {
     /// commit is found while `__history` does not hold it yet. One open of
     /// `__manifest`, one listing of its branches, and one scan per branch
     /// until the commit is found: the branch of this coordinator, then main,
-    /// then the other live branches, the one created last first.
+    /// then the other live branches, the one created last first. A live row
+    /// whose tree is not written, the not-ready branch, holds no commit and
+    /// is passed over.
     pub async fn record_in_live_branches(
         &self,
         graph_commit_id: &str,
@@ -2920,6 +2922,7 @@ impl ManifestCoordinator {
                 Some(native) => match main.checkout_branch(native).await {
                     Ok(branch) => branch,
                     Err(lance::Error::RefNotFound { .. }) => continue,
+                    Err(error) if layout::tree_never_written(&error) => continue,
                     Err(error) => return Err(OmniError::storage(error)),
                 },
             };

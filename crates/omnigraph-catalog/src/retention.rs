@@ -442,6 +442,10 @@ impl ManifestCoordinator {
         .await
     }
 
+    /// The commit graph of every retired lifetime whose tree holds a head,
+    /// the name retired last first. A retired name whose tree holds no
+    /// version, as the delete of a not-ready branch leaves, holds no history
+    /// and is passed over.
     pub async fn retired_commit_graphs_with_session(
         root_uri: &str,
         history: &HistoryCache,
@@ -453,10 +457,14 @@ impl ManifestCoordinator {
         names.sort();
         let mut graphs = Vec::new();
         for native in names.into_iter().rev() {
-            let dataset = main
+            let dataset = match main
                 .checkout_version(Ref::Version(Some(native.clone()), None))
                 .await
-                .map_err(OmniError::storage)?;
+            {
+                Ok(dataset) => dataset,
+                Err(error) if crate::layout::tree_has_no_head(&error) => continue,
+                Err(error) => return Err(OmniError::storage(error)),
+            };
             let session = dataset.session();
             let (head, buffer, registry) =
                 match crate::legacy::retired_head(root_uri, &session, history.objects(), &dataset)
