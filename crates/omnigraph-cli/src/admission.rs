@@ -92,9 +92,14 @@ pub(crate) async fn open_read_only_with_binding(
 /// standalone graph has no policy. `storage` builds the adapter the caller
 /// opens the graph with; it runs only once the graph is admitted, since
 /// building a read-through adapter under `--base` writes the clone marker.
+/// `external_blob_policy`, when given, is installed on the opened handle as
+/// part of the open: the handle refuses a base over its own storage root, and
+/// that refusal, like the open's own, is the engine's typed error, which says
+/// the write did not start.
 pub(crate) async fn open_writable(
     binding: &CapturedStorageBinding,
     storage: impl Future<Output = Result<Arc<dyn omnigraph::storage::StorageAdapter>>>,
+    external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
     stderr: &mut dyn Write,
 ) -> Result<omnigraph::db::Omnigraph> {
     let policy = match ensure_graph_with_binding(binding, stderr).await? {
@@ -108,6 +113,10 @@ pub(crate) async fn open_writable(
     // an untyped storage failure stays one whose effects are unknown.
     let db = omnigraph::db::Omnigraph::open_with_storage(binding.uri(), storage)
         .await
+        .and_then(|db| match external_blob_policy {
+            Some(policy) => db.with_external_blob_policy(policy),
+            None => Ok(db),
+        })
         .engine_write()?;
     Ok(match policy {
         Some(policy) => db.with_policy(policy),

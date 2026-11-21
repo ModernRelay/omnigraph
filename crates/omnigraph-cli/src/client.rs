@@ -520,11 +520,8 @@ impl GraphClient {
     ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
         let storage = crate::admission::embedded_storage(binding, base);
-        let db = crate::admission::open_writable(binding, storage, stderr).await?;
-        let db = match external_blob_policy {
-            Some(policy) => db.with_external_blob_policy(policy)?,
-            None => db,
-        };
+        let db =
+            crate::admission::open_writable(binding, storage, external_blob_policy, stderr).await?;
         let mut session = Arc::new(db).session(defaults, sources);
         for (id, value) in settings {
             session.set(*id, value, Source::Request)?;
