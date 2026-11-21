@@ -6,6 +6,7 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance_table::format::Fragment;
 
+use crate::branch_rows::BranchRows;
 use crate::error::{OmniError, Result};
 use crate::history::{self, Appended, HistoryRecord};
 use crate::record::expand_from_storage;
@@ -84,6 +85,11 @@ pub struct ManifestState {
     /// its `writer_epoch` row's when that branch incarnation wrote the row, 0
     /// with no row or with one its fork source wrote.
     pub writer_epoch: u64,
+    /// The branch rows of this SAME manifest version's config map: the live
+    /// branch set when the version is main's, a tree's tombstone otherwise
+    /// (RFC "Branch existence in the catalog"); decoded once per version and
+    /// shared by every state and snapshot of it.
+    pub branch_rows: Arc<BranchRows>,
 }
 
 /// The `writer_epoch` row, a control fact: the JSON payload of its `metadata`
@@ -818,6 +824,9 @@ pub(crate) struct ManifestRows {
     pub(crate) schema_contract: Option<SchemaContractRow>,
     pub(crate) registry: LineageRegistry,
     pub(crate) writer_epoch: Option<WriterEpochRow>,
+    /// The rows the version file's config map carries; nothing of them is in
+    /// the data file, so [`Self::to_batch`] writes none.
+    pub(crate) branch_rows: Arc<BranchRows>,
 }
 
 /// The columns of a [`manifest_schema`] batch under construction, one entry
@@ -1016,6 +1025,7 @@ impl ManifestRows {
             &self.tables,
             &self.head,
             self.writer_epoch.as_ref(),
+            &self.branch_rows,
             version,
             native_branch,
         )?;
@@ -1024,13 +1034,15 @@ impl ManifestRows {
     }
 }
 
-/// The visible state of the `table` rows, the head commit's record and the
-/// `writer_epoch` row of one `__manifest` version, as [`ManifestRows::state`]
-/// reads it. A commit's own record holds no control fact and passes `None`.
+/// The visible state of the `table` rows, the head commit's record, the
+/// `writer_epoch` row and the branch rows of one `__manifest` version, as
+/// [`ManifestRows::state`] reads it. A commit's own record holds no control
+/// fact and passes `None` and an empty row set.
 pub(crate) fn manifest_state(
     tables: &[TableRow],
     head: &GraphLineageRow,
     writer_epoch: Option<&WriterEpochRow>,
+    branch_rows: &Arc<BranchRows>,
     version: u64,
     native_branch: Option<&str>,
 ) -> Result<ManifestState> {
@@ -1060,6 +1072,7 @@ pub(crate) fn manifest_state(
             .into_iter()
             .collect(),
         writer_epoch: WriterEpochRow::resolved(writer_epoch, native_branch),
+        branch_rows: Arc::clone(branch_rows),
     })
 }
 
@@ -1113,6 +1126,18 @@ pub(crate) async fn read_manifest_rows_projected(dataset: &Dataset) -> Result<Ma
 pub(crate) async fn read_manifest_rows_with_contract(
     dataset: &Dataset,
 ) -> Result<(ManifestRows, Result<SchemaContractRow>)> {
+    let (rows, contract, _) = read_manifest_rows_with_contract_and_batch(dataset).await?;
+    Ok((rows, contract))
+}
+
+/// [`read_manifest_rows_with_contract`] keeping the stored batch when the
+/// scan read every column cleanly: the hot fragment's rows as
+/// [`rows_of_batch`] reads them back, for the coordinator's publisher to hold
+/// as its acknowledged image, so its first publish rereads nothing.
+pub(crate) async fn read_manifest_rows_with_contract_and_batch(
+    dataset: &Dataset,
+) -> Result<(ManifestRows, Result<SchemaContractRow>, Option<RecordBatch>)> {
+    guard_row_layout(dataset)?;
     let content_shape = require_schema_content(dataset);
     let scan_dataset = if content_shape.is_ok()
         && !dataset
@@ -1124,7 +1149,9 @@ pub(crate) async fn read_manifest_rows_with_contract(
     } else {
         dataset.clone()
     };
-    let (rows, error) = scan_manifest_rows(&scan_dataset, content_shape.is_ok()).await?;
+    let with_content = content_shape.is_ok();
+    let (rows, error, batches) = scan_rows_and_batches(&scan_dataset, with_content).await?;
+    let clean = error.is_none();
     let contract = content_shape.and(error.map_or(Ok(()), Err)).and_then(|()| {
         finish_schema_contract_row(
             rows.schema_contract.clone(),
@@ -1132,7 +1159,14 @@ pub(crate) async fn read_manifest_rows_with_contract(
             dataset.version().version,
         )
     });
-    Ok((rows, contract))
+    let batch = match (with_content && clean, batches.first()) {
+        (true, Some(first)) => Some(
+            datafusion::arrow::compute::concat_batches(&first.schema(), &batches)
+                .map_err(OmniError::arrow_internal)?,
+        ),
+        _ => None,
+    };
+    Ok((rows, contract, batch))
 }
 
 async fn scan_manifest_rows(
@@ -1183,27 +1217,66 @@ fn hot_scanner(dataset: &Dataset) -> Result<lance::dataset::scanner::Scanner> {
     Ok(scanner)
 }
 
+/// [`read_manifest_rows`] with the stored batch the rows were decoded from,
+/// the hot fragment's rows as [`rows_of_batch`] reads them back, for a
+/// publisher to hold as its acknowledged image.
+pub(crate) async fn read_manifest_rows_and_batch(
+    dataset: &Dataset,
+) -> Result<(ManifestRows, RecordBatch)> {
+    guard_row_layout(dataset)?;
+    let (rows, content_error, batches) = scan_rows_and_batches(dataset, true).await?;
+    if let Some(error) = content_error {
+        return Err(error);
+    }
+    let schema = batches
+        .first()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "`__manifest` version {} holds no row",
+                dataset.version().version
+            ))
+        })?
+        .schema();
+    let batch = datafusion::arrow::compute::concat_batches(&schema, &batches)
+        .map_err(OmniError::arrow_internal)?;
+    Ok((rows, batch))
+}
+
 /// [`scan_manifest_rows`] without the stamp and pending-key guard, which the
-/// caller has answered for. Reads the hot fragment only.
+/// caller has answered for. Reads the hot fragment only; the branch rows come
+/// from the version file the open already read.
 async fn scan_rows_unguarded(
     dataset: &Dataset,
     with_content: bool,
 ) -> Result<(ManifestRows, Option<OmniError>)> {
+    let (rows, error, _) = scan_rows_and_batches(dataset, with_content).await?;
+    Ok((rows, error))
+}
+
+/// [`scan_rows_unguarded`] keeping the batches it decoded.
+async fn scan_rows_and_batches(
+    dataset: &Dataset,
+    with_content: bool,
+) -> Result<(ManifestRows, Option<OmniError>, Vec<RecordBatch>)> {
     crate::instrumentation::record_manifest_scan();
     let mut scanner = hot_scanner(dataset)?;
     scanner
         .project(&crate::record::packed_projection(dataset, with_content))
         .map_err(OmniError::storage)?;
-    let mut batches = scanner
+    let mut stream = scanner
         .try_into_stream()
         .await
         .map_err(OmniError::storage)?;
     let mut rows = RowsDecoder::default();
-    while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
         rows.push(&batch, Some(dataset.version().version), with_content)?;
+        batches.push(batch);
     }
     let error = rows.content_error.take();
-    Ok((rows.finish()?, error))
+    let mut rows = rows.finish()?;
+    rows.branch_rows = Arc::new(BranchRows::decode(dataset.manifest())?);
+    Ok((rows, error, batches))
 }
 
 /// The registry rows of `fragments`, cold fragments of `dataset`, which hold
@@ -1234,6 +1307,8 @@ pub(crate) async fn read_cold_registry(
 }
 
 /// Strict decoding of the acknowledged batch retained by the publisher cache.
+/// The batch holds the data file's rows alone; the caller decodes the branch
+/// rows from the version file it retained beside the batch.
 pub(crate) fn rows_of_batch(stored: &RecordBatch) -> Result<ManifestRows> {
     let mut rows = RowsDecoder::default();
     rows.push(stored, None, true)?;
@@ -1554,6 +1629,7 @@ impl RowsDecoder {
             buffer: CommitBuffer { commits, replaced },
             registry,
             writer_epoch: self.writer_epoch,
+            branch_rows: Arc::default(),
         })
     }
 

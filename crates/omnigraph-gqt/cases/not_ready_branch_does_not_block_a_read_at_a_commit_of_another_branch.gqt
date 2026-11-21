@@ -1,0 +1,60 @@
+# issue: none
+# notes: A read at a commit of branch b from main, before `__history` holds it, scans the live
+# notes: branches for it. A create of c that failed after its catalog entry left c listed with no
+# notes: tree; the scan passes c over and answers from b.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query write_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $on_b
+
+--- seam
+at: branch_create.post_row
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch create c
+
+--- expect error: injected failpoint triggered: branch_create.post_row
+
+--- restart
+
+--- query snapshot: $on_b
+query people_at_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
