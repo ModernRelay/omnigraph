@@ -3010,7 +3010,7 @@ async fn assert_exact_named_head_race(establish_head: bool) {
             .collect(),
         "the head inherited from main must not count as the exact head of `feature`"
     );
-    let branch_identifier = branch_manifest.branch_identifier().await.unwrap();
+    let branch_identifier = live_identifier(uri, Some("feature")).await;
 
     let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
         Some("feature"),
@@ -3251,7 +3251,7 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
     mc.create_branch("feature", None).await.unwrap();
 
     let old_branch = open_manifest_dataset(uri, Some("feature")).await.unwrap();
-    let old_identifier = old_branch.branch_identifier().await.unwrap();
+    let old_identifier = live_identifier(uri, Some("feature")).await;
     assert!(
         read_manifest_state(&old_branch)
             .await
@@ -3265,36 +3265,42 @@ async fn exact_publish_rejects_named_branch_delete_recreate_aba() {
     // version and exact graph-head absence can repeat; only Lance's native
     // branch identifier distinguishes the incarnation.
     mc.delete_branch("feature").await.unwrap();
+    let main = open_manifest_dataset(uri, None).await.unwrap();
     assert!(
         matches!(
-            probe_dataset_latest_incarnation(&old_branch, Some("feature")).await,
+            probe_dataset_latest_incarnation(&old_branch, Some("feature"), Some(&main)).await,
             Err(OmniError::BranchNotFound { .. })
         ),
         "a cached native handle must reject retired live authority"
     );
-    let archived = crate::branch_control::archived_manifest_branch(
-        &old_branch,
-        old_branch.manifest().branch.as_deref().unwrap(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(archived.identifier, old_identifier);
-    assert!(matches!(
-        old_branch.branch_identifier().await,
-        Err(lance::Error::RefNotFound { .. })
-    ));
+    let old_native = old_branch.manifest().branch.clone().unwrap();
+    let mut old_tree = old_branch.clone();
+    old_tree.checkout_latest().await.unwrap();
+    assert!(
+        BranchRows::decode(old_tree.manifest())
+            .unwrap()
+            .tombstone()
+            .is_some(),
+        "the retired lifetime's tree ends in its tombstone"
+    );
+    let main = open_manifest_dataset(uri, None).await.unwrap();
+    assert!(
+        BranchRows::decode(main.manifest())
+            .unwrap()
+            .is_retired(&old_native)
+    );
     mc.create_branch("feature", None).await.unwrap();
+    let main = open_manifest_dataset(uri, None).await.unwrap();
     assert_ne!(
-        probe_dataset_latest_incarnation(&old_branch, Some("feature"))
+        probe_dataset_latest_incarnation(&old_branch, Some("feature"), Some(&main))
             .await
             .unwrap()
             .branch_identifier,
         old_identifier,
         "the freshness probe must resolve the replacement incarnation"
     );
-    let recreated = open_manifest_dataset(uri, Some("feature")).await.unwrap();
-    let recreated_identifier = recreated.branch_identifier().await.unwrap();
+    open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let recreated_identifier = live_identifier(uri, Some("feature")).await;
     assert_ne!(old_identifier, recreated_identifier);
 
     let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
@@ -3802,6 +3808,7 @@ fn record_states_batch() -> RecordBatch {
         schema_contract: None,
         registry: Default::default(),
         writer_epoch: None,
+        branch_rows: Default::default(),
         tables: vec![probe_table(
             7,
             TableState::Dropped {
@@ -4058,7 +4065,7 @@ async fn stamps_11_and_12_are_refused_by_open_read_and_publish() {
             let message = error.to_string();
             assert!(
                 message.contains(&format!("internal schema v{stamp}"))
-                    && message.contains("reads only v14 to v17")
+                    && message.contains("reads only v14 to v18")
                     && !message.contains("omnigraph upgrade"),
                 "{what} of a stamp {stamp} manifest: {message}"
             );
@@ -4353,7 +4360,7 @@ async fn fresh_fork_publishes_on_top_of_the_head_it_inherits() {
     let on_fork = lineage_intent(Some("feature"), None);
     let precondition = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
         Some("feature"),
-        fork_manifest.branch_identifier().await.unwrap(),
+        live_identifier(uri, Some("feature")).await,
         None,
     ));
     let outcome = GraphNamespacePublisher::new(uri, Some("feature"))
@@ -4523,7 +4530,7 @@ async fn unattached_root_on_a_fresh_branch_records_the_inherited_head() {
     let update = append_person_and_make_update(uri, &person, "Alice").await;
     let authority = GraphHeadExpectation::new(
         Some("feature"),
-        fork_manifest.branch_identifier().await.unwrap(),
+        live_identifier(uri, Some("feature")).await,
         None,
     );
 
@@ -8128,6 +8135,7 @@ fn replaced_table_rows_store_the_delta_against_the_current_row() {
         schema_contract: None,
         registry: Default::default(),
         writer_epoch: None,
+        branch_rows: Default::default(),
         tables: vec![
             probe_table(7, pin(9, current_metadata)),
             probe_table(
@@ -8247,6 +8255,7 @@ fn replaced_row_measure_and_stored(
         schema_contract: None,
         registry: Default::default(),
         writer_epoch: None,
+        branch_rows: Default::default(),
         tables: current,
         head: probe_commit("c9", Some("c8")),
         buffer: CommitBuffer {
@@ -8522,6 +8531,7 @@ fn settled_commit_rows_imply_their_parent_and_inherit_their_contract() {
         schema_contract: None,
         registry: Default::default(),
         writer_epoch: None,
+        branch_rows: Default::default(),
         tables: Vec::new(),
         head: commit("c4", Some("c3"), Some(2)),
         buffer: CommitBuffer {
@@ -8589,6 +8599,7 @@ fn manifest_rows_refuse_a_buffer_that_is_not_a_run_behind_the_head() {
             schema_contract: None,
             registry: Default::default(),
             writer_epoch: None,
+            branch_rows: Default::default(),
             tables: Vec::new(),
             head,
             buffer,
@@ -9758,14 +9769,18 @@ async fn freshness_probe_asks_for_the_next_version_by_name() {
         sent.drain_lists();
 
         // Unchanged: version 1 is found and version 2 is absent.
-        let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
+        let latest = probe_dataset_latest_incarnation(&held, None, None)
+            .await
+            .unwrap();
         assert_eq!(latest.version, 1, "v2_paths={v2_paths}");
         assert_eq!(sent.drain(), (0, 1, 2), "v2_paths={v2_paths}");
         assert_eq!(sent.drain_lists(), 0, "v2_paths={v2_paths}");
 
         // Another writer commits once: versions 1 and 2 are found, 3 is absent.
         append().await;
-        let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
+        let latest = probe_dataset_latest_incarnation(&held, None, None)
+            .await
+            .unwrap();
         assert_eq!(latest.version, 2, "v2_paths={v2_paths}");
         assert_eq!(sent.drain(), (0, 1, 3), "v2_paths={v2_paths}");
         assert_eq!(sent.drain_lists(), 0, "v2_paths={v2_paths}");
@@ -9773,7 +9788,9 @@ async fn freshness_probe_asks_for_the_next_version_by_name() {
         // A gap of more than two versions: the listing answers.
         append().await;
         append().await;
-        let latest = probe_dataset_latest_incarnation(&held, None).await.unwrap();
+        let latest = probe_dataset_latest_incarnation(&held, None, None)
+            .await
+            .unwrap();
         assert_eq!(latest.version, 4, "v2_paths={v2_paths}");
         assert_eq!(sent.drain(), (0, 0, 3), "v2_paths={v2_paths}");
         assert_eq!(sent.drain_lists(), 1, "v2_paths={v2_paths}");
@@ -9788,7 +9805,7 @@ async fn freshness_probe_asks_for_the_next_version_by_name() {
             .unwrap();
         sent.drain();
         sent.drain_lists();
-        let error = probe_dataset_latest_incarnation(&held, None)
+        let error = probe_dataset_latest_incarnation(&held, None, None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -9839,15 +9856,9 @@ async fn reads_at_a_known_manifest_version_resolve_only_that_version_issue_1380(
     let opens = probes.internal_open_count.clone();
     crate::instrumentation::with_query_io_probes(probes, async {
         let session = crate::lance_access::control_session();
-        // (branch, version, (GET, absent GET, HEAD), listings). A local root
-        // finds a latest version without a listing, so the saving shows as
-        // the latest manifest's GET; on S3, GCS and Azure a `_versions/`
-        // listing goes with it. Main resolves only the version. A named
-        // branch lists its refs, opens main to reach them and reads its own
-        // ref, then resolves only the version: no latest of its own.
         for (branch, version, requests, lists) in [
             (None, main_read, (1, 0, 1), 0),
-            (Some("feature"), feature_read, (3, 0, 1), 1),
+            (Some("feature"), feature_read, (2, 0, 1), 0),
         ] {
             manifest.drain();
             manifest.drain_lists();
@@ -9865,7 +9876,10 @@ async fn reads_at_a_known_manifest_version_resolve_only_that_version_issue_1380(
             assert_eq!(
                 (manifest.drain(), manifest.drain_lists()),
                 (requests, lists),
-                "{branch:?} at {version}"
+                "{branch:?} at {version}: (GET, absent GET, HEAD) and listings; a local root \
+                 finds the latest version without a listing, so the saving shows as the latest \
+                 manifest's GET; main resolves only the version; a named branch reads main's \
+                 latest for its row, then resolves only the version, no latest of its own"
             );
         }
 
@@ -11240,6 +11254,7 @@ async fn missing_or_inconsistent_archived_schema_content_fails_closed() {
         schema_contract: None,
         registry: Default::default(),
         writer_epoch: None,
+        branch_rows: Default::default(),
         tables: Vec::new(),
         head: unnamed.commit,
         buffer: CommitBuffer::default(),
@@ -13891,6 +13906,67 @@ async fn legacy_versions_of_an_upgraded_root_are_served_from_their_records() {
     }
 }
 
+/// The activation commit of a converted root as the upgrade writes it: the
+/// pending key dropped and, at or above the branch-row stamp, a `branch` row
+/// per live ref and a retired row per retired ref.
+async fn activate_legacy_root(
+    active: Dataset,
+    kept: Vec<(String, String)>,
+    target: u32,
+) -> Dataset {
+    use lance::dataset::transaction::{Operation, Transaction, UpdateMap};
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if super::migrations::supports_branch_rows(target) {
+        let mut live: Vec<_> = crate::branch_control::list_live_manifest_branch_contents(&active)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        live.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.extend(live.into_iter().map(|(native, contents)| {
+            super::branch_rows::BranchRow {
+                native,
+                identifier: contents.identifier,
+                parent: contents
+                    .parent_branch
+                    .unwrap_or_else(|| crate::MAIN_BRANCH_HEAD_KEY.to_string()),
+                parent_version: contents.parent_version,
+                created_at: contents.create_at,
+                attempt_id: crate::branch_names::mint_incarnation(),
+            }
+            .entry()
+        }));
+        let mut retired: Vec<String> = super::retention::retired_manifest_branches(&active)
+            .await
+            .unwrap()
+            .into_keys()
+            .collect();
+        retired.sort();
+        rows.extend(
+            retired
+                .iter()
+                .map(|native| super::branch_rows::retired_entry(native)),
+        );
+    }
+    let operation = Operation::UpdateConfig {
+        config_updates: (!rows.is_empty()).then(|| UpdateMap {
+            update_entries: rows.into_iter().map(Into::into).collect(),
+            replace: false,
+        }),
+        table_metadata_updates: None,
+        field_metadata_updates: HashMap::new(),
+        schema_metadata_updates: Some(UpdateMap {
+            update_entries: kept.into_iter().map(Into::into).collect(),
+            replace: true,
+        }),
+    };
+    let transaction = Transaction::new(active.version().version, operation, None);
+    crate::lance_commit::commit_builder(Arc::new(active))
+        .execute(transaction)
+        .await
+        .unwrap()
+}
+
 async fn assert_legacy_versions_of_an_upgraded_root(target: u32) {
     use super::commit_graph::{HistoryCache, graph_commit_from_manifest_row};
     use super::migrations::UPGRADE_PENDING_KEY;
@@ -13962,12 +14038,11 @@ async fn assert_legacy_versions_of_an_upgraded_root(target: u32) {
     keys.sort();
     assert_eq!(keys, ["node:Firm", "node:Person"]);
 
-    let mut active = conversion.clone();
     let kept: Vec<(String, String)> = metadata
         .into_iter()
         .filter(|(key, _)| key != UPGRADE_PENDING_KEY)
         .collect();
-    active.update_schema_metadata(kept).replace().await.unwrap();
+    let active = activate_legacy_root(conversion.clone(), kept, target).await;
     assert_eq!(active.version().version, 7);
     let (activated, _) = super::state::read_converted_state(&active).await.unwrap();
     let ordinary = read_manifest_state(&active).await.unwrap();
@@ -14242,7 +14317,7 @@ async fn stamps_13_is_refused_by_open_read_and_publish_naming_the_upgrade() {
         .to_string();
     for clause in [
         "internal schema v13",
-        "reads only v14 to v17",
+        "reads only v14 to v18",
         "For a standalone root, stop all readers, writers and maintenance",
         "run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`",
         "A cluster-managed graph has no in-place route yet: with a main development build from \
@@ -15820,7 +15895,10 @@ async fn v17_a_branch_reads_its_own_epoch_and_0_from_a_row_its_source_wrote() {
     let uri = dir.path().to_str().unwrap();
     let row = probe_writer_epoch(4, None);
     main_holding_writer_epoch(uri, &row).await;
-    let mut main = ManifestCoordinator::open(uri).await.unwrap();
+    let mut main = ManifestCoordinator::open(uri)
+        .await
+        .unwrap()
+        .with_batch_publisher(Arc::new(publisher_holding(uri, &row)));
     main.create_branch("feature", None).await.unwrap();
 
     let on_main = open_manifest_dataset(uri, None).await.unwrap();
@@ -16142,6 +16220,24 @@ fn v17_the_writer_epoch_check_outcomes() {
         (Some(3), 3, Claim { read: 2 }, Ok(AlreadyHeld)),
         (None, 3, Claim { read: 2 }, fenced(None, Some(2), 3)),
         (Some(2), 3, Claim { read: 2 }, fenced(Some(2), Some(2), 3)),
+        (
+            None,
+            3,
+            super::writer_epoch::EpochAssertion::None,
+            Ok(Proceed),
+        ),
+        (
+            Some(2),
+            3,
+            super::writer_epoch::EpochAssertion::None,
+            Ok(Proceed),
+        ),
+        (
+            Some(3),
+            0,
+            super::writer_epoch::EpochAssertion::None,
+            Ok(Proceed),
+        ),
     ] {
         assert_eq!(
             check_writer_epoch(held, current, assertion),
@@ -16254,7 +16350,7 @@ async fn v17_the_holder_version_follows_each_landed_publication() {
 /// version it attempted.
 #[test]
 fn v17_an_unanswered_claim_settles_by_the_attempt_id_of_the_version_it_attempted() {
-    use super::writer_epoch::UnansweredClaim::{InDoubt, Landed, Lost};
+    use super::writer_epoch::UnansweredPublication::{InDoubt, Landed, Lost};
     use super::writer_epoch::settle_unanswered_claim;
     let own = probe_writer_epoch(2, None);
     let other = super::state::WriterEpochRow {
@@ -16293,15 +16389,24 @@ async fn live_identifier(
     uri: &str,
     branch: Option<&str>,
 ) -> lance::dataset::refs::BranchIdentifier {
-    match branch {
-        None => lance::dataset::refs::BranchIdentifier::main(),
-        Some(_) => open_manifest_dataset(uri, branch)
-            .await
+    let Some(logical) = branch else {
+        return lance::dataset::refs::BranchIdentifier::main();
+    };
+    let main = open_manifest_dataset(uri, None).await.unwrap();
+    if crate::layout::has_branch_rows(&main) {
+        return BranchRows::decode(main.manifest())
             .unwrap()
-            .branch_identifier()
-            .await
-            .unwrap(),
+            .by_logical(logical)
+            .unwrap_or_else(|| panic!("no live row for branch '{logical}'"))
+            .identifier
+            .clone();
     }
+    open_manifest_dataset(uri, branch)
+        .await
+        .unwrap()
+        .branch_identifier()
+        .await
+        .unwrap()
 }
 
 /// The `(held, read, current)` of a `WriterFenced` refusal.
@@ -16748,12 +16853,16 @@ async fn v17_a_fork_of_a_claimed_branch_starts_unclaimed_and_claims_under_its_ow
     ManifestCoordinator::init(uri, &build_test_catalog())
         .await
         .unwrap();
-    let owner = publisher_in(uri, None, &Arc::default());
+    let owner_process = Arc::default();
+    let owner = publisher_in(uri, None, &owner_process);
     let on_main = owner
         .claim_writer_epoch(&live_identifier(uri, None).await)
         .await
         .unwrap();
-    let mut main = ManifestCoordinator::open(uri).await.unwrap();
+    let mut main = ManifestCoordinator::open(uri)
+        .await
+        .unwrap()
+        .with_batch_publisher(Arc::new(publisher_in(uri, None, &owner_process)));
     main.create_branch("feature", None).await.unwrap();
 
     let other = publisher_in(uri, Some("feature"), &Arc::default());
@@ -17093,7 +17202,10 @@ async fn v17_a_fork_of_a_fork_reads_epoch_0_and_claims_1() {
     let uri = dir.path().to_str().unwrap();
     let row = probe_writer_epoch(3, None);
     main_holding_writer_epoch(uri, &row).await;
-    let mut main = ManifestCoordinator::open(uri).await.unwrap();
+    let mut main = ManifestCoordinator::open(uri)
+        .await
+        .unwrap()
+        .with_batch_publisher(Arc::new(publisher_holding(uri, &row)));
     main.create_branch("first", None).await.unwrap();
     let on_first = publisher_in(uri, Some("first"), &Arc::default());
     for _ in 0..2 {
@@ -17108,7 +17220,8 @@ async fn v17_a_fork_of_a_fork_reads_epoch_0_and_claims_1() {
     }
     let mut first = ManifestCoordinator::open_at_branch(uri, "first")
         .await
-        .unwrap();
+        .unwrap()
+        .with_batch_publisher(Arc::new(publisher_holding(uri, &row)));
     first.create_branch("second", None).await.unwrap();
 
     for branch in ["first", "second"] {
@@ -17168,5 +17281,803 @@ async fn v17_a_main_entry_above_a_recreated_roots_epoch_is_refused_once_and_clea
             landed.known_state.writer_epoch
         ),
         (version + 1, 0)
+    );
+}
+
+/// The branch row of `native` forked from main at `parent_version`, as a
+/// create mints it before its first attempt.
+fn probe_branch_row(native: &str, parent_version: u64) -> super::BranchRow {
+    use lance::dataset::refs::BranchIdentifier;
+    super::BranchRow {
+        native: native.to_string(),
+        identifier: BranchIdentifier::new(&BranchIdentifier::main(), parent_version),
+        parent: "main".to_string(),
+        parent_version,
+        created_at: 1_763_600_000,
+        attempt_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+    }
+}
+
+/// The intent that publishes `row` as it is on every attempt.
+fn fixed_row_intent(row: &super::BranchRow) -> super::publisher::RowIntent {
+    let row = row.clone();
+    super::publisher::RowIntent::branch_row(row.attempt_id.clone(), move |_| Ok(row.clone()))
+}
+
+/// The data files a `__manifest` version names, in fragment order.
+fn data_files(dataset: &lance::Dataset) -> Vec<String> {
+    dataset
+        .fragments()
+        .iter()
+        .flat_map(|fragment| fragment.files.iter().map(|file| file.path.clone()))
+        .collect()
+}
+
+const PROBE_NATIVE: &str = "feature.01JD0000000000000000000000";
+
+/// A branch row publishes one version whose only change is its entry: the
+/// rows, data files and stamp are the loaded version's, no graph commit is
+/// recorded, and the same intent published again writes no version.
+#[tokio::test]
+async fn v18_a_branch_row_publishes_one_version_holding_only_its_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let before = open_manifest_dataset(uri, None).await.unwrap();
+    let read = read_manifest_rows(&before).await.unwrap();
+    let row = probe_branch_row(PROBE_NATIVE, before.version().version);
+    let publisher = publisher_in(uri, None, &Arc::default());
+
+    let published = publisher
+        .publish_rows(&fixed_row_intent(&row))
+        .await
+        .unwrap();
+    assert_eq!(
+        published.dataset.version().version,
+        before.version().version + 1
+    );
+    assert_eq!(
+        super::migrations::read_stamp(&published.dataset),
+        Some(INTERNAL_MANIFEST_SCHEMA_VERSION)
+    );
+    assert_eq!(published.parent_commit_id, None);
+    assert_eq!(published.branch_rows.branch(&row.native), Some(&row));
+    assert_eq!(published.known_state.branch_rows, published.branch_rows);
+    assert_eq!(
+        published.known_state.version,
+        published.dataset.version().version
+    );
+    assert_eq!(data_files(&published.dataset), data_files(&before));
+
+    let rows = read_manifest_rows(&published.dataset).await.unwrap();
+    assert_eq!(rows.branch_rows.branch(&row.native), Some(&row));
+    assert_eq!(
+        (
+            &rows.tables,
+            &rows.head,
+            &rows.buffer,
+            &rows.schema_contract,
+            &rows.registry,
+            &rows.writer_epoch
+        ),
+        (
+            &read.tables,
+            &read.head,
+            &read.buffer,
+            &read.schema_contract,
+            &read.registry,
+            &read.writer_epoch
+        )
+    );
+
+    let again = publisher
+        .publish_rows(&fixed_row_intent(&row))
+        .await
+        .unwrap();
+    assert_eq!(
+        again.dataset.version().version,
+        published.dataset.version().version
+    );
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(
+        latest.version().version,
+        published.dataset.version().version
+    );
+}
+
+/// A row below the branch-row stamp is refused naming the upgrade, and the
+/// version does not move.
+#[tokio::test]
+async fn v18_a_row_below_the_branch_row_stamp_is_refused_naming_the_upgrade() {
+    for stamp in [16, 17] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        ManifestCoordinator::init(uri, &build_test_catalog())
+            .await
+            .unwrap();
+        let mut dataset = open_manifest_dataset(uri, None).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut dataset, stamp)
+            .await
+            .unwrap();
+        let version = dataset.version().version;
+        let row = probe_branch_row(PROBE_NATIVE, version);
+        let error = publisher_in(uri, None, &Arc::default())
+            .publish_rows(&fixed_row_intent(&row))
+            .await
+            .expect_err("a row landed below the branch-row stamp")
+            .to_string();
+        for clause in [
+            format!("__manifest is stamped at internal schema v{stamp}; branch rows need v18"),
+            "run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`"
+                .to_string(),
+        ] {
+            assert!(error.contains(&clause), "stamp {stamp}: {error}");
+        }
+        let unmoved = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(unmoved.version().version, version, "stamp {stamp}");
+    }
+}
+
+/// A retired row replaces the row under its key and leaves the live set,
+/// and a second retire of the native name, by another publisher, writes no
+/// version.
+#[tokio::test]
+async fn v18_a_retired_row_replaces_the_row_and_a_second_retire_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let version = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let row = probe_branch_row(PROBE_NATIVE, version);
+    let publisher = publisher_in(uri, None, &Arc::default());
+    let published = publisher
+        .publish_rows(&fixed_row_intent(&row))
+        .await
+        .unwrap();
+    assert_eq!(published.branch_rows.live_count(), 1);
+
+    let retire = |attempt_id: &str| {
+        super::publisher::RowIntent::retired_row(&row.native, attempt_id.to_string())
+    };
+    let retired = publisher
+        .publish_rows(&retire("01BX5ZZKBKACTAV9WEVGEMMVRZ"))
+        .await
+        .unwrap();
+    assert_eq!(
+        retired.dataset.version().version,
+        published.dataset.version().version + 1
+    );
+    assert!(retired.branch_rows.is_retired(&row.native));
+    assert_eq!(retired.branch_rows.branch(&row.native), None);
+    assert_eq!(retired.branch_rows.live_count(), 0);
+
+    let again = publisher_in(uri, None, &Arc::default())
+        .publish_rows(&retire("01BX5ZZKBKACTAV9WEVGEMMVRA"))
+        .await
+        .unwrap();
+    assert_eq!(
+        again.dataset.version().version,
+        retired.dataset.version().version
+    );
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, retired.dataset.version().version);
+    let rows = read_manifest_rows(&latest).await.unwrap();
+    assert!(rows.branch_rows.is_retired(&row.native));
+    assert!(rows.branch_rows.live().next().is_none());
+}
+
+/// A row and a retired row assert main's epoch (a non-holder is fenced, the
+/// holder's row raises its held version); the tombstone asserts none: it lands
+/// on a held chain, keeps its `writer_epoch` row, and a second one writes nothing.
+#[tokio::test]
+async fn v18_a_row_asserts_mains_epoch_and_a_tombstone_asserts_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let owner_process = Arc::default();
+    let owner = publisher_in(uri, None, &owner_process);
+    let other_process = Arc::default();
+    let other = publisher_in(uri, None, &other_process);
+    assert_eq!(owner.claim_writer_epoch(&main).await.unwrap().epoch, 1);
+    let version = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let row = probe_branch_row(PROBE_NATIVE, version);
+
+    let refused = other
+        .publish_rows(&fixed_row_intent(&row))
+        .await
+        .expect_err("a row landed under another process's epoch");
+    assert_eq!(writer_fenced(&refused), (None, None, 1));
+    assert!(!is_retryable_publish_conflict(&refused));
+    let unmoved = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(unmoved.version().version, version);
+
+    let published = owner.publish_rows(&fixed_row_intent(&row)).await.unwrap();
+    assert_eq!(
+        (
+            published.dataset.version().version,
+            published.known_state.writer_epoch
+        ),
+        (version + 1, 1)
+    );
+    assert_eq!(owner.held_writer_version(None), Some(version + 1));
+    let refused = other
+        .publish_rows(&super::publisher::RowIntent::retired_row(
+            &row.native,
+            "01BX5ZZKBKACTAV9WEVGEMMVRZ".to_string(),
+        ))
+        .await
+        .expect_err("a retired row landed under another process's epoch");
+    assert_eq!(writer_fenced(&refused), (None, None, 1));
+
+    let mut coordinator = ManifestCoordinator::open(uri)
+        .await
+        .unwrap()
+        .with_batch_publisher(Arc::new(publisher_in(uri, None, &owner_process)));
+    coordinator.create_branch("claimed", None).await.unwrap();
+    let feature = live_identifier(uri, Some("claimed")).await;
+    let holder = publisher_in(uri, Some("claimed"), &other_process);
+    let claimed = holder.claim_writer_epoch(&feature).await.unwrap();
+    assert_eq!(claimed.epoch, 1);
+    let chain_version = claimed.published.dataset.version().version;
+    let deleter = publisher_in(uri, Some("claimed"), &Arc::default());
+    let refused = publish_a_commit(&deleter, Some("feature"))
+        .await
+        .expect_err("a publish landed on a chain another process holds");
+    assert_eq!(writer_fenced(&refused), (None, None, 1));
+
+    let tombstone = super::TombstoneRow {
+        attempt_id: "01BX5ZZKBKACTAV9WEVGEMMVRZ".to_string(),
+        deleted_at: 1_763_600_100,
+    };
+    let chain = claimed
+        .published
+        .dataset
+        .manifest()
+        .branch
+        .clone()
+        .expect("the claimed chain's native name");
+    let ended = deleter
+        .publish_rows(&super::publisher::RowIntent::tombstone(&chain, &tombstone))
+        .await
+        .unwrap();
+    assert_eq!(ended.dataset.version().version, chain_version + 1);
+    assert_eq!(ended.branch_rows.tombstone(), Some(&tombstone));
+    assert_eq!(ended.writer_epoch, claimed.published.writer_epoch);
+    assert_eq!(ended.known_state.writer_epoch, 1);
+    let rows = read_manifest_rows(&ended.dataset).await.unwrap();
+    assert_eq!(rows.writer_epoch, claimed.published.writer_epoch);
+    assert_eq!(rows.branch_rows.tombstone(), Some(&tombstone));
+    assert_eq!(
+        data_files(&ended.dataset),
+        data_files(&claimed.published.dataset)
+    );
+
+    let other_tombstone = super::TombstoneRow {
+        attempt_id: "01BX5ZZKBKACTAV9WEVGEMMVRA".to_string(),
+        deleted_at: 1_763_600_200,
+    };
+    let again = publisher_in(uri, Some("claimed"), &Arc::default())
+        .publish_rows(&super::publisher::RowIntent::tombstone(
+            &chain,
+            &other_tombstone,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        again.dataset.version().version,
+        ended.dataset.version().version
+    );
+    assert_eq!(again.branch_rows.tombstone(), Some(&tombstone));
+}
+
+/// A row whose put lost its version to a late publication reloads and lands
+/// one version above it; its entries are built from the reloaded version on
+/// every attempt, so the row forks from the version it lands beside.
+#[tokio::test]
+async fn v18_a_row_that_lost_its_version_is_built_again_from_the_reloaded_main() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let publisher = publisher_in(uri, None, &Arc::default());
+    let writer = publisher_in(uri, None, &Arc::default());
+    let version = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let loaded_at = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&loaded_at);
+    let intent = super::publisher::RowIntent::branch_row(
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+        move |attempt| {
+            assert!(attempt.branch_rows.is_empty());
+            seen.lock().unwrap().push(attempt.version);
+            Ok(probe_branch_row(PROBE_NATIVE, attempt.version))
+        },
+    );
+
+    let published = publisher
+        .publish_rows_interleaved(&intent, async {
+            let late = publish_a_commit(&writer, None).await.unwrap();
+            assert_eq!(late.dataset.version().version, version + 1);
+        })
+        .await
+        .unwrap();
+    assert_eq!(published.dataset.version().version, version + 2);
+    let row = published
+        .branch_rows
+        .branch(PROBE_NATIVE)
+        .expect("the row landed");
+    assert_eq!(row.parent_version, version + 1);
+    assert_eq!(*loaded_at.lock().unwrap(), vec![version, version + 1]);
+    let rows = read_manifest_rows(&published.dataset).await.unwrap();
+    assert_eq!(
+        (&rows.head, &rows.buffer),
+        (&published.head, &published.buffer)
+    );
+    assert_eq!(rows.branch_rows.branch(PROBE_NATIVE), Some(row));
+}
+
+/// A row whose manifest create is applied and answered by a lost
+/// acknowledgement is re-issued unchanged, as a publish's is: the re-issue
+/// finds the version held, and the publication answers with it.
+#[tokio::test]
+async fn v18_a_row_whose_acknowledgement_is_lost_settles_by_its_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let version = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let row = probe_branch_row(PROBE_NATIVE, version);
+    let fault = ManifestRequestFault::new(ManifestFault::LostAcknowledgement);
+    let probes = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(fault.clone())),
+        ..Default::default()
+    };
+    let published = crate::instrumentation::with_query_io_probes(
+        probes,
+        publisher_in(uri, None, &Arc::default()).publish_rows(&fixed_row_intent(&row)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(published.dataset.version().version, version + 1);
+    assert_eq!(published.branch_rows.branch(&row.native), Some(&row));
+    assert_eq!(
+        fault
+            .manifest_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the original request and one re-issue"
+    );
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, version + 1);
+    let rows = read_manifest_rows(&latest).await.unwrap();
+    assert_eq!(rows.branch_rows.branch(&row.native), Some(&row));
+}
+
+/// A row whose create gets no answer and whose version an ordinary publish
+/// holds is lost: the error comes back `Unpublished`, nothing of the row is in
+/// that version, and the next publication of the row lands one version up.
+#[tokio::test]
+async fn v18_a_row_that_lost_its_unanswered_version_comes_back_unpublished() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let writer = publisher_in(uri, None, &Arc::default());
+    let version = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let row = probe_branch_row(PROBE_NATIVE, version);
+    let fault = ManifestRequestFault::new(ManifestFault::EveryManifestPut);
+    let unanswered = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(fault.clone())),
+        ..Default::default()
+    };
+    let answered = crate::instrumentation::with_query_io_probes(Default::default(), async {
+        let late = publish_a_commit(&writer, None).await.unwrap();
+        assert_eq!(late.dataset.version().version, version + 1);
+    });
+    let publisher = publisher_in(uri, None, &Arc::default());
+    let failed = crate::instrumentation::with_query_io_probes(
+        unanswered,
+        publisher.publish_rows_interleaved(&fixed_row_intent(&row), answered),
+    )
+    .await
+    .map_err(OmniError::unpublished)
+    .expect_err("a row landed on a version a publish holds");
+    assert!(failed.storage_failure().is_some(), "{failed:?}");
+    assert!(!failed.is_manifest_publish_in_doubt(), "{failed:?}");
+    assert_eq!(
+        failed.completion_evidence(),
+        Some(crate::error::CompletionEvidence::Unpublished),
+        "{failed:?}"
+    );
+    assert_eq!(
+        fault
+            .manifest_puts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1 + crate::manifest_request::CONDITIONAL_REQUEST_REISSUES as usize
+    );
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, version + 1);
+    assert!(
+        read_manifest_rows(&latest)
+            .await
+            .unwrap()
+            .branch_rows
+            .is_empty()
+    );
+
+    let published = publisher
+        .publish_rows(&fixed_row_intent(&row))
+        .await
+        .unwrap();
+    assert_eq!(published.dataset.version().version, version + 2);
+    assert_eq!(published.branch_rows.branch(&row.native), Some(&row));
+}
+
+/// The native name of the live row of `logical` in main's latest version.
+async fn live_native(uri: &str, logical: &str) -> String {
+    let main = open_manifest_dataset(uri, None).await.unwrap();
+    BranchRows::decode(main.manifest())
+        .unwrap()
+        .by_logical(logical)
+        .unwrap_or_else(|| panic!("no live row for branch '{logical}'"))
+        .native
+        .clone()
+}
+
+/// A delete retires the lifetime the main it holds resolved. When the name
+/// was deleted and created again since, its tombstone is refused: the new
+/// lifetime's chain carries none, does not move, and still publishes.
+#[tokio::test]
+async fn v18_a_delete_holding_a_replaced_lifetime_leaves_the_new_one_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    main.create_branch("feature", None).await.unwrap();
+    let first = live_native(uri, "feature").await;
+    let mut behind = ManifestCoordinator::open(uri).await.unwrap();
+
+    main.delete_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
+    let second = live_native(uri, "feature").await;
+    assert_ne!(first, second);
+    let recreated = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+
+    let refused = behind
+        .delete_branch("feature")
+        .await
+        .expect_err("a delete of the first lifetime ended the second");
+    assert!(
+        refused
+            .to_string()
+            .contains("branch 'feature' changed before retirement"),
+        "{refused:?}"
+    );
+    assert!(!is_retryable_publish_conflict(&refused), "{refused:?}");
+
+    let latest_main = open_manifest_dataset(uri, None).await.unwrap();
+    let rows = BranchRows::decode(latest_main.manifest()).unwrap();
+    assert_eq!(
+        rows.by_logical("feature").map(|row| row.native.as_str()),
+        Some(second.as_str())
+    );
+    assert!(rows.is_retired(&first));
+    let latest = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    assert_eq!(latest.version().version, recreated.version().version);
+    assert_eq!(
+        BranchRows::decode(latest.manifest()).unwrap().tombstone(),
+        None
+    );
+    publish_a_commit(
+        &GraphNamespacePublisher::new(uri, Some("feature")),
+        Some("feature"),
+    )
+    .await
+    .unwrap();
+}
+
+/// A tree with no version under its `_versions/` is the not-ready verdict; a
+/// version Lance listed whose manifest object is missing is a storage failure.
+#[test]
+fn v18_only_a_tree_with_no_version_is_classified_not_ready() {
+    let never_written = lance::Error::not_found("__manifest/tree/feature/_versions");
+    assert!(crate::layout::tree_never_written(&never_written));
+    assert!(crate::layout::tree_has_no_head(&never_written));
+    let not_ready = crate::layout::branch_tree_error(never_written, "feature");
+    assert!(
+        matches!(&not_ready, OmniError::BranchNotReady { branch } if branch == "feature"),
+        "{not_ready:?}"
+    );
+
+    let missing_manifest = lance::Error::dataset_not_found(
+        "__manifest/tree/feature/_versions/1.manifest",
+        Box::new(std::io::Error::other("object not found")),
+    );
+    assert!(!crate::layout::tree_never_written(&missing_manifest));
+    assert!(crate::layout::tree_has_no_head(&missing_manifest));
+    let failed = crate::layout::branch_tree_error(missing_manifest, "feature");
+    assert!(failed.storage_failure().is_some(), "{failed:?}");
+}
+
+/// A live row whose create wrote no tree opens as not ready, and its delete
+/// retires the row with no tree behind it.
+#[tokio::test]
+async fn v18_a_row_with_no_tree_opens_as_not_ready_and_is_retired_by_a_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let version = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let row = probe_branch_row(PROBE_NATIVE, version);
+    publisher_in(uri, None, &Arc::default())
+        .publish_rows(&fixed_row_intent(&row))
+        .await
+        .unwrap();
+
+    let refused = open_manifest_dataset(uri, Some("feature"))
+        .await
+        .expect_err("a row with no tree opened");
+    assert!(
+        matches!(&refused, OmniError::BranchNotReady { branch } if branch == "feature"),
+        "{refused:?}"
+    );
+
+    let mut main = ManifestCoordinator::open(uri).await.unwrap();
+    main.delete_branch("feature").await.unwrap();
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    let rows = BranchRows::decode(latest.manifest()).unwrap();
+    assert!(rows.is_retired(&row.native));
+    assert_eq!(rows.by_logical("feature"), None);
+}
+
+/// The create of `feature` from main at `fork`, as it stands before its
+/// first attempt.
+fn probe_create(fork: ForkPoint) -> CreateRow {
+    CreateRow {
+        name: "feature".to_string(),
+        native: PROBE_NATIVE.to_string(),
+        attempt_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+        created_at: 1_763_600_000,
+        fork,
+        source_native: None,
+        source_identifier: lance::dataset::refs::BranchIdentifier::main(),
+    }
+}
+
+/// Main's branch rows decoded from `entries`.
+fn branch_rows_of(entries: &[(String, String)]) -> BranchRows {
+    BranchRows::from_entries(
+        None,
+        entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
+    .unwrap()
+}
+
+/// A create attempt that loads the row an earlier put of the same create
+/// landed answers that row unchanged, so nothing is put again; a row another
+/// create landed under the name refuses it.
+#[test]
+fn v18_a_create_attempt_answers_the_row_its_own_put_landed() {
+    let create = probe_create(ForkPoint::MainAtAttempt);
+    let empty = BranchRows::default();
+    let first = create
+        .row_for(&RowAttempt {
+            branch_rows: &empty,
+            schema_contract: None,
+            version: 7,
+        })
+        .unwrap();
+    assert_eq!(
+        (
+            first.native.as_str(),
+            first.parent_version,
+            first.parent_is_main()
+        ),
+        (PROBE_NATIVE, 7, true)
+    );
+
+    let landed = branch_rows_of(&[first.entry()]);
+    let again = create
+        .row_for(&RowAttempt {
+            branch_rows: &landed,
+            schema_contract: None,
+            version: 9,
+        })
+        .unwrap();
+    assert_eq!(again, first, "the landed row, not one built at version 9");
+
+    let other = BranchRow {
+        attempt_id: "01BX5ZZKBKACTAV9WEVGEMMVRA".to_string(),
+        ..first.clone()
+    };
+    let taken = branch_rows_of(&[other.entry()]);
+    let refused = create
+        .row_for(&RowAttempt {
+            branch_rows: &taken,
+            schema_contract: None,
+            version: 9,
+        })
+        .expect_err("another create's row answered as this create's");
+    assert!(
+        matches!(&refused, OmniError::BranchExists { branch, live }
+            if branch == "feature" && live == "feature"),
+        "{refused:?}"
+    );
+}
+
+/// A create attempt that loads its native name retired is refused as deleted:
+/// the branch was deleted between two attempts, and a row built again would
+/// bring the deleted lifetime back.
+#[test]
+fn v18_a_create_attempt_over_its_retired_row_is_refused_as_deleted() {
+    let create = probe_create(ForkPoint::MainAtAttempt);
+    let retired = branch_rows_of(&[crate::branch_rows::retired_entry(PROBE_NATIVE)]);
+    let refused = create
+        .row_for(&RowAttempt {
+            branch_rows: &retired,
+            schema_contract: None,
+            version: 9,
+        })
+        .expect_err("a retired lifetime was created again");
+    assert!(
+        matches!(&refused, OmniError::BranchDeleted { branch } if branch == "feature"),
+        "{refused:?}"
+    );
+}
+
+/// A create from a fixed version forks there while the main an attempt loaded
+/// pins that version's schema contract, and is refused `schema_changed`,
+/// naming the commit it starts from, under any other contract.
+#[test]
+fn v18_a_fixed_fork_attempt_under_another_schema_contract_is_refused() {
+    let contract = |hash: &str| crate::state::SchemaContractHead {
+        schema_ir_hash: hash.to_string(),
+        schema_identity_version: 1,
+        schema_identity_domain: "probe".to_string(),
+    };
+    let (forked, moved) = (contract("forked"), contract("moved"));
+    let create = probe_create(ForkPoint::Fixed {
+        version: 5,
+        contract: Some(forked.clone()),
+        commit: "commit-at-5".to_string(),
+    });
+    let rows = BranchRows::default();
+    let row = create
+        .row_for(&RowAttempt {
+            branch_rows: &rows,
+            schema_contract: Some(&forked),
+            version: 9,
+        })
+        .unwrap();
+    assert_eq!(row.parent_version, 5);
+
+    for loaded in [Some(&moved), None] {
+        let refused = create
+            .row_for(&RowAttempt {
+                branch_rows: &rows,
+                schema_contract: loaded,
+                version: 9,
+            })
+            .expect_err("a branch started across a schema change");
+        assert!(
+            matches!(
+                &refused,
+                OmniError::BranchStartRefused {
+                    graph_commit_id,
+                    reason: crate::error::BranchStartRefusal::SchemaChanged,
+                } if graph_commit_id == "commit-at-5"
+            ),
+            "{refused:?}"
+        );
+    }
+}
+
+/// A branch whose row is retired after the listing read main and before the
+/// read of its tree keeps its name and has no details: it was deleted after
+/// the listing. While its row is live, a branch with no tree lists not ready.
+#[tokio::test]
+async fn v18_a_branch_retired_after_the_listing_keeps_its_name_and_has_no_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let version = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let row = probe_branch_row(PROBE_NATIVE, version);
+    publisher_in(uri, None, &Arc::default())
+        .publish_rows(&fixed_row_intent(&row))
+        .await
+        .unwrap();
+    let session = Arc::new(lance::session::Session::default());
+
+    let listing = crate::branch_detail::list_graph_branches_detailed(uri, &session, &mut |_| true)
+        .await
+        .unwrap();
+    assert_eq!(listing.branches, ["main", "feature"]);
+    let not_ready = listing
+        .details
+        .iter()
+        .find(|detail| detail.name == "feature")
+        .expect("a live row with no tree has a detail");
+    assert!(
+        not_ready.head.is_none() && !not_ready.retirement_pending,
+        "{not_ready:?}"
+    );
+
+    let mut retire = Some(super::publisher::RowIntent::retired_row(
+        &row.native,
+        "01BX5ZZKBKACTAV9WEVGEMMVRA".to_string(),
+    ));
+    let listing = crate::branch_detail::list_graph_branches_detailed(uri, &session, &mut |name| {
+        if name == "feature"
+            && let Some(retired) = retire.take()
+        {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async {
+                            publisher_in(uri, None, &Arc::default())
+                                .publish_rows(&retired)
+                                .await
+                                .unwrap();
+                        })
+                });
+            });
+        }
+        true
+    })
+    .await
+    .unwrap();
+    assert_eq!(listing.branches, ["main", "feature"]);
+    assert!(
+        listing
+            .details
+            .iter()
+            .all(|detail| detail.name != "feature"),
+        "{:?}",
+        listing.details
     );
 }

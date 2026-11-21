@@ -173,6 +173,7 @@ pub(crate) async fn init_manifest_graph(
         buffer: Default::default(),
         registry: Default::default(),
         writer_epoch: None,
+        branch_rows: Default::default(),
     };
     // The internal-schema stamp rides the Create write's schema metadata, so
     // the stamp is atomic with manifest birth: no crash window can leave
@@ -301,6 +302,8 @@ pub(crate) struct OpenedManifest {
     pub(crate) branch_identifier: lance::dataset::refs::BranchIdentifier,
     /// The native ref the branch resolved to, `None` on main.
     pub(crate) native_branch: Option<String>,
+    /// The main the branch resolved through, `None` on main.
+    pub(crate) main: Option<Dataset>,
 }
 
 /// Reads back the state the `__manifest` Create commit landed. The
@@ -315,6 +318,7 @@ pub(crate) async fn load_initial_manifest_state(dataset: Dataset) -> Result<Open
         rows,
         branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
         native_branch: None,
+        main: None,
     })
 }
 
@@ -323,12 +327,19 @@ pub(crate) async fn open_manifest_graph(
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
 ) -> Result<OpenedManifest> {
-    let (dataset, branch_identifier, native_branch) = open_manifest_branch_with_identifier(
+    let opened = open_manifest_branch_with_identifier(
         root_uri.trim_end_matches('/'),
         branch,
         control_session,
     )
     .await?;
+    crate::layout::refuse_tombstoned(&opened, branch)?;
+    let crate::layout::OpenedBranch {
+        dataset,
+        branch_identifier,
+        native_branch,
+        main,
+    } = opened;
     let (known_state, rows) = read_manifest_state_and_rows(&dataset).await?;
     Ok(OpenedManifest {
         dataset,
@@ -336,6 +347,7 @@ pub(crate) async fn open_manifest_graph(
         rows,
         branch_identifier,
         native_branch,
+        main,
     })
 }
 

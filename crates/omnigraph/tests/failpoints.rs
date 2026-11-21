@@ -368,6 +368,22 @@ fn rfc023_external_writer_process() {
                         assert_eq!(db.claim_branch_writer(&payload).await.unwrap(), 1);
                     }
                 }
+                "branch_create" => {
+                    db.branch_create(&payload).await.unwrap();
+                }
+                "branch_delete_tombstone_only" => {
+                    let _scenario = FailScenario::setup();
+                    let _fp = catalog::BRANCH_DELETE_POST_TOMBSTONE.fire_always();
+                    db.branch_delete(&payload)
+                        .await
+                        .expect_err("the fault after the tombstone is the delete's error");
+                }
+                "branch_create_from" => {
+                    let (source, name) = payload.split_once('=').expect("<source>=<name>");
+                    db.branch_create_from(ReadTarget::branch(source), name)
+                        .await
+                        .unwrap();
+                }
                 other => panic!("unknown external writer action '{other}'"),
             }
         });
@@ -413,52 +429,69 @@ async fn unregistered_node_table_uri(db: &Omnigraph) -> String {
     format!("{root}/nodes/{}", orphans[0])
 }
 
-// Lance can durably complete a native ref mutation while the caller observes
-// an error (for example, a lost object-store acknowledgement). BranchContents
-// is the logical authority in both directions: matching create metadata means
-// success, and an absent ref means delete succeeded even if tree cleanup or the
-// acknowledgement failed. Neither control emits graph lineage or a main-table
-// version.
+/// RFC "Branch existence in the catalog": a create failing after its row leaves
+/// a listed, not-ready branch; a delete failing after its tombstone leaves it
+/// listed and refusing reads as deleted; after its retired row it has deleted.
 #[tokio::test]
 #[serial]
-async fn native_branch_controls_reclassify_lost_acknowledgements() {
+async fn branch_row_faults_leave_the_rows_as_the_truth() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = helpers::init_and_load(&dir).await;
-    let before_version = version_main(&db).await.unwrap();
     let before_commits = db.list_commits(Some("main")).await.unwrap().len();
 
     {
-        let _fp = catalog::BRANCH_CREATE_POST_NATIVE.fire_always();
+        let _fp = catalog::BRANCH_CREATE_POST_ROW.fire_always();
         db.branch_create("feature")
             .await
-            .expect("matching BranchContents must classify a lost create acknowledgement");
+            .expect_err("a fault after the row is the create's error");
     }
-    assert!(
-        db.branch_list()
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main", "feature"]);
+    let again = db.branch_create("feature").await.unwrap_err();
+    assert!(again.to_string().contains("already exists"), "{again}");
+    let read = helpers::snapshot_branch(&db, "feature").await.unwrap_err();
+    assert!(read.to_string().contains("is not ready"), "{read}");
+    db.branch_delete("feature").await.unwrap();
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+
+    {
+        let _fp = catalog::BRANCH_CREATE_POST_TREE.fire_always();
+        db.branch_create("feature")
             .await
-            .unwrap()
-            .iter()
-            .any(|branch| branch == "feature")
+            .expect_err("a fault after the tree is the create's error");
+    }
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Person").await,
+        4,
+        "the row and the tree both landed"
     );
 
     {
-        let _fp = catalog::BRANCH_DELETE_POST_NATIVE.fire_always();
+        let _fp = catalog::BRANCH_DELETE_POST_TOMBSTONE.fire_always();
         db.branch_delete("feature")
             .await
-            .expect("absent BranchContents must classify a lost delete acknowledgement");
+            .expect_err("a fault after the tombstone is the delete's error");
     }
-    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
-    assert_eq!(version_main(&db).await.unwrap(), before_version);
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main", "feature"]);
+    let read = helpers::snapshot_branch(&db, "feature").await.unwrap_err();
+    assert!(read.to_string().contains("was deleted"), "{read}");
+    db.branch_delete("feature").await.unwrap();
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+
+    db.branch_create("feature").await.unwrap();
+    {
+        let _fp = catalog::BRANCH_DELETE_POST_RETIRED_ROW.fire_always();
+        db.branch_delete("feature")
+            .await
+            .expect_err("a fault after the retired row is the delete's error");
+    }
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
     assert_eq!(
         db.list_commits(Some("main")).await.unwrap().len(),
         before_commits,
-        "native branch controls must not manufacture graph lineage"
+        "branch controls record no graph lineage"
     );
 
-    // A start at a past commit clones the version that published it through
-    // the same native create: a failure between the inventory and the create
-    // leaves nothing, and a lost acknowledgement classifies as success.
     let loaded = db.list_commits(Some("main")).await.unwrap()[0]
         .graph_commit_id
         .clone();
@@ -470,31 +503,22 @@ async fn native_branch_controls_reclassify_lost_acknowledgements() {
     )
     .await
     .unwrap();
-    let before_version = version_main(&db).await.unwrap();
-    let before_commits = db.list_commits(Some("main")).await.unwrap();
     let at_load = ReadTarget::snapshot(SnapshotId::new(loaded.clone()));
     {
-        let _fp = catalog::BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE.fire_always();
+        let _fp = catalog::BRANCH_CREATE_POST_ROW.fire_always();
         db.branch_create_from(at_load.clone(), "at-load")
             .await
-            .expect_err("a failure before the native create creates nothing");
+            .expect_err("a fault after the row is the start's error");
     }
-    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
-    {
-        let _fp = catalog::BRANCH_CREATE_POST_NATIVE.fire_always();
-        let created = db
-            .branch_create_from(at_load, "at-load")
-            .await
-            .expect("matching BranchContents must classify a lost create acknowledgement");
-        assert_eq!(created.from_commit_id, loaded);
-    }
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main", "at-load"]);
+    db.branch_delete("at-load").await.unwrap();
+    let created = db.branch_create_from(at_load, "at-load").await.unwrap();
+    assert_eq!(created.from_commit_id, loaded);
     assert_eq!(
-        helpers::count_rows_branch(&db, "at-load", "node:Person").await,
+        count_rows_branch(&db, "at-load", "node:Person").await,
         4,
         "the branch holds the commit's rows, not main's head"
     );
-    assert_eq!(version_main(&db).await.unwrap(), before_version);
-    assert_eq!(db.list_commits(Some("main")).await.unwrap(), before_commits);
 }
 
 /// Cleanup deletes a swept table version's files before its manifest, so a
@@ -4342,12 +4366,10 @@ async fn sibling_branch_creates_exclude_at_the_schema_gate() {
     db.branch_create("b").await.unwrap();
     let db = std::sync::Arc::new(db);
 
-    let after_inventory = helpers::failpoint::Rendezvous::park_first(
-        &catalog::BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE,
-    );
+    let after_row = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_CREATE_POST_ROW);
     let first_db = std::sync::Arc::clone(&db);
     let first = tokio::spawn(async move { first_db.branch_create("feature").await });
-    after_inventory.wait_until_reached().await;
+    after_row.wait_until_reached().await;
 
     let queued = helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_GATE_EXCLUSIVE_QUEUED);
     let second_db = std::sync::Arc::clone(&db);
@@ -4360,11 +4382,11 @@ async fn sibling_branch_creates_exclude_at_the_schema_gate() {
     assert!(
         !second.is_finished(),
         "a sibling create must wait at the schema gate while the first create sits \
-         between its inventory and its native create"
+         between its row and its tree"
     );
     queued.release();
 
-    after_inventory.release();
+    after_row.release();
     first
         .await
         .unwrap()
@@ -8286,6 +8308,39 @@ node Document {
     );
 }
 
+/// The schema of the two delete/recreate ABA polls: `Marker` takes the two
+/// commits before the polled `Document` load that bring the old `feature` to
+/// the version the recreated one starts at, with `Document`'s version kept.
+const ABA_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: String
+}
+
+node Marker {
+    name: String @key
+}
+"#;
+
+/// The two `Marker` loads on `feature`, as many as the retired row and the
+/// new row advance main by; returns the second one's commit id, the feed's
+/// start, so the polled commit is the one `Document` load that follows.
+async fn load_aba_markers(db: &Session) -> String {
+    let mut last = None;
+    for marker in ["m1", "m2"] {
+        let receipt = db
+            .load_with_receipt(
+                "feature",
+                &format!(r#"{{"type":"Marker","data":{{"name":"{marker}"}}}}"#),
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+        last = Some(receipt.commit.graph_commit_id);
+    }
+    last.expect("two markers were loaded")
+}
+
 /// The feed re-proves each commit's manifest head (`commit_snapshot`), but then
 /// opens the per-table datasets SEPARATELY by (branch path, numeric version). A
 /// branch delete/recreate AFTER the head proof but before the table open would
@@ -8306,27 +8361,21 @@ async fn change_feed_poll_refuses_delete_recreate_aba_before_table_open() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let schema = r#"
-node Document {
-    title: String @key
-    content: String
-}
-"#;
-    let setup = helpers::session(Omnigraph::init(&uri, schema).await.unwrap());
+    let setup = helpers::session(Omnigraph::init(&uri, ABA_SCHEMA).await.unwrap());
     // Isolate a SINGLE commit (the feature-authored one) so its manifest head is
     // proven BEFORE the failpoint and only the per-table open can catch the ABA;
     // start after the base commit so a later commit's `commit_snapshot` (the
     // first-window guard) is not the one that catches it.
-    let base = setup
-        .load_with_receipt(
+    setup
+        .load(
             "main",
             r#"{"type":"Document","data":{"title":"aba","content":"base"}}"#,
             LoadMode::Overwrite,
         )
         .await
         .unwrap();
-    let base_commit_id = base.commit.graph_commit_id.clone();
     setup.branch_create("feature").await.unwrap();
+    let base_commit_id = load_aba_markers(&setup).await;
     setup
         .load(
             "feature",
@@ -8412,23 +8461,17 @@ async fn change_feed_poll_refuses_table_open_aba_without_etag_witness() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-    let schema = r#"
-node Document {
-    title: String @key
-    content: String
-}
-"#;
-    let setup = helpers::session(Omnigraph::init(&uri, schema).await.unwrap());
-    let base = setup
-        .load_with_receipt(
+    let setup = helpers::session(Omnigraph::init(&uri, ABA_SCHEMA).await.unwrap());
+    setup
+        .load(
             "main",
             r#"{"type":"Document","data":{"title":"aba","content":"base"}}"#,
             LoadMode::Overwrite,
         )
         .await
         .unwrap();
-    let base_commit_id = base.commit.graph_commit_id.clone();
     setup.branch_create("feature").await.unwrap();
+    let base_commit_id = load_aba_markers(&setup).await;
     setup
         .load(
             "feature",
@@ -11110,10 +11153,19 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
     // definition; blob/change-feed read seams cannot arm write state.
     let cells: &[(&str, Driver)] = &[
         ("branch_control.pre_gates", Driver::BranchCreate),
+        (
+            "branch_create.post_inventory_pre_native",
+            Driver::BranchCreate,
+        ),
         ("branch_create.post_native", Driver::BranchCreate),
+        ("branch_create.post_row", Driver::BranchCreate),
+        ("branch_create.post_tree", Driver::BranchCreate),
         ("branch_delete.post_table_gates", Driver::BranchDelete),
         ("branch_delete.post_native", Driver::BranchDelete),
         ("branch_delete.post_archive", Driver::BranchDelete),
+        ("branch_delete.pre_tombstone", Driver::BranchDelete),
+        ("branch_delete.post_tombstone", Driver::BranchDelete),
+        ("branch_delete.post_retired_row", Driver::BranchDelete),
         ("load.post_branch_create_pre_stage", Driver::LoadFork),
         ("load.between_table_stages", Driver::LoadTwoTables),
         ("fork.before_classify", Driver::BranchMutate),
@@ -11232,14 +11284,14 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
                 db.branch_create(&name).await.expect("delete-row setup");
                 let commits_before = db.list_commits(Some("main")).await.unwrap();
                 let result = db.branch_delete(&name).await;
-                if *seam == "branch_delete.post_archive" {
-                    let error = result.as_ref().expect_err("post-archive fault is reached");
-                    assert_eq!(
-                        error.completion_evidence(),
-                        Some(CompletionEvidence::Uncertain),
-                        "retirement published before completion failed: {error}"
+                if *seam == "branch_delete.post_retired_row" {
+                    result
+                        .as_ref()
+                        .expect_err("the fault after the retired row is reached");
+                    assert!(
+                        !db.branch_list().await.unwrap().contains(&name),
+                        "the retired row landed before the fault"
                     );
-                    assert!(!db.branch_list().await.unwrap().contains(&name));
                     assert_eq!(db.list_commits(Some("main")).await.unwrap(), commits_before);
                 }
                 result.map_err(|error| error.to_string())
@@ -13825,10 +13877,10 @@ async fn branch_claim_refuses_a_non_holders_merge_into_the_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
     second_process(&uri, "branch_claim", "main=1")
         .await
         .unwrap();
-    db.branch_create("feature").await.unwrap();
     insert_person(&db, "feature", "never-merged").await;
     let held = collect_column_strings(&read_table(&db, "node:Person").await, "name");
 
@@ -14099,4 +14151,509 @@ async fn branch_claim_owner_serves_a_bound_branch_deleted_under_it_until_its_nex
             );
         }
     }
+}
+
+/// The native name main's rows hold for `logical` now, read fresh.
+async fn native_name_now(uri: &str, logical: &str) -> Option<String> {
+    let manifest = Dataset::open(&format!("{uri}/__manifest")).await.unwrap();
+    helpers::native_ref_for(&manifest, logical).await
+}
+
+/// The live rows main holds now, main itself not counted.
+async fn live_rows_now(uri: &str) -> usize {
+    let manifest = Dataset::open(&format!("{uri}/__manifest")).await.unwrap();
+    helpers::branch_rows(&manifest).await.live_count()
+}
+
+/// Whether the tree of `native` still has its versions directory.
+fn tree_exists(dir: &tempfile::TempDir, native: &str) -> bool {
+    dir.path()
+        .join("__manifest/tree")
+        .join(native)
+        .join("_versions")
+        .is_dir()
+}
+
+/// The history blocks written so far under `__history/blocks`.
+fn history_blocks(dir: &tempfile::TempDir) -> usize {
+    std::fs::read_dir(dir.path().join("__history/blocks"))
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+/// One `cleanup` run: the `__manifest` row's trees and entries removed, a
+/// row the run reports only when it removed one of either.
+async fn manifest_cleanup(db: &Session) -> (u64, u64) {
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    rows.iter()
+        .find(|row| row.type_key == "__manifest")
+        .map_or((0, 0), |row| {
+            (row.manifest_trees_removed, row.branch_entries_removed)
+        })
+}
+
+/// Two creates of one name in two processes race on main's version: the one
+/// whose row lands second reloads and refuses `branch_exists`, one live row
+/// remains, and no tree is left for the collector.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_row_two_creates_of_one_name_leave_one_live_branch() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_CONTROL_PRE_GATES);
+    let creator = Arc::clone(&db);
+    let create = tokio::spawn(async move { creator.branch_create("feature").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_create", "feature")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = create
+        .await
+        .unwrap()
+        .expect_err("the other process's row landed first");
+    assert!(refused.to_string().contains("already exists"), "{refused}");
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main", "feature"]);
+    assert_eq!(live_rows_now(&uri).await, 1, "one live row under the name");
+    assert_eq!(count_rows_branch(&db, "feature", "node:Person").await, 4);
+    assert_eq!(
+        manifest_cleanup(&db).await,
+        (0, 0),
+        "the refused create wrote no tree"
+    );
+}
+
+/// A write parked before its `__manifest` put while another process
+/// tombstones the branch is refused `branch_deleted` when its put loses; its
+/// staging is unreferenced and the collector reclaims it with the tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_row_write_parked_before_its_put_is_refused_by_a_second_process_delete() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+    db.sync_branch("feature").await.unwrap();
+    let person_uri = node_table_uri(&db, "Person").await;
+    let before = detached_versions(&person_uri).await;
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_PRE_MERGE);
+    let writer = Arc::clone(&db);
+    let write = tokio::spawn(async move { try_insert(&writer, "feature", "late").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_delete_tombstone_only", "feature")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = write
+        .await
+        .unwrap()
+        .expect_err("the tombstone landed below the parked put");
+    assert!(refused.to_string().contains("was deleted"), "{refused}");
+    assert_eq!(
+        db.branch_list().await.unwrap(),
+        vec!["main", "feature"],
+        "the tombstoned branch lists until its retired row"
+    );
+    let stranded = &detached_versions(&person_uri).await - &before;
+    assert_eq!(stranded.len(), 1, "the refused write left its staging");
+    second_process(&uri, "branch_delete", "feature")
+        .await
+        .expect("the next delete finishes the tombstoned branch");
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+    let sibling = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        manifest_cleanup(&sibling).await,
+        (1, 1),
+        "the deleted branch's tree and its retired entry"
+    );
+    assert!(
+        detached_versions(&person_uri).await.is_disjoint(&stranded),
+        "the staging of a tombstoned chain is dead"
+    );
+}
+
+/// A delete parked after its tombstone and before its retired row is finished
+/// by another process's delete of the name: the parked one succeeds at the
+/// retired row it finds, and the branch's history holds one block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_row_delete_parked_after_its_tombstone_is_finished_by_a_second_process_delete() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+    insert_person(&db, "feature", "first-life").await;
+    let blocks_before = history_blocks(&dir);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_DELETE_POST_TOMBSTONE);
+    let deleter = Arc::clone(&db);
+    let delete = tokio::spawn(async move { deleter.branch_delete("feature").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_delete", "feature")
+        .await
+        .unwrap();
+    parked.release();
+
+    delete
+        .await
+        .unwrap()
+        .expect("the retired row the other process published is this delete's");
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+    assert_eq!(
+        history_blocks(&dir),
+        blocks_before + 1,
+        "two settlements of one tombstoned head write one block"
+    );
+    assert_eq!(manifest_cleanup(&db).await, (1, 1));
+}
+
+/// A delete parked between resolving its row and its tombstone, while another
+/// process deletes the branch and creates it again, is refused before effect:
+/// the new lifetime keeps its row, carries no tombstone and still takes a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_row_delete_parked_before_its_tombstone_leaves_a_recreated_branch_untouched() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+    let first = native_name_now(&uri, "feature")
+        .await
+        .expect("the first lifetime's row");
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_DELETE_PRE_TOMBSTONE);
+    let deleter = Arc::clone(&db);
+    let delete = tokio::spawn(async move { deleter.branch_delete("feature").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_recreate", "feature")
+        .await
+        .unwrap();
+    let second = native_name_now(&uri, "feature")
+        .await
+        .expect("the second lifetime's row");
+    assert_ne!(first, second);
+    parked.release();
+
+    let refused = delete
+        .await
+        .unwrap()
+        .expect_err("a delete of the first lifetime ended the second");
+    assert!(
+        refused.to_string().contains("changed before retirement"),
+        "{refused}"
+    );
+    assert_eq!(
+        native_name_now(&uri, "feature").await.as_deref(),
+        Some(second.as_str()),
+        "the second lifetime's row is live"
+    );
+    let sibling = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    insert_person(&sibling, "feature", "second-life").await;
+    assert_eq!(
+        count_rows_branch(&sibling, "feature", "node:Person").await,
+        5
+    );
+    assert_eq!(
+        manifest_cleanup(&sibling).await,
+        (1, 1),
+        "the first lifetime's tree and its retired entry"
+    );
+    assert!(tree_exists(&dir, &second) && !tree_exists(&dir, &first));
+}
+
+/// A create parked between its row and its tree while another process
+/// deletes the not-ready branch is refused as deleted at its probe of main;
+/// the tree it wrote after the retirement is the collector's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_row_create_parked_before_its_tree_is_refused_by_a_delete_of_the_not_ready_branch() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_CREATE_POST_ROW);
+    let creator = Arc::clone(&db);
+    let create = tokio::spawn(async move { creator.branch_create("feature").await });
+    parked.wait_until_reached().await;
+    let native = native_name_now(&uri, "feature")
+        .await
+        .expect("the row landed before the park");
+    second_process(&uri, "branch_delete", "feature")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = create
+        .await
+        .unwrap()
+        .expect_err("the row was retired under the create");
+    assert!(refused.to_string().contains("deleted"), "{refused}");
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+    assert!(tree_exists(&dir, &native), "the create wrote its tree");
+    assert_eq!(
+        manifest_cleanup(&db).await,
+        (1, 1),
+        "the tree no live row names and the retired entry"
+    );
+    assert!(!tree_exists(&dir, &native));
+}
+
+/// A create from a branch whose row publish is parked before its put, while
+/// another process deletes that source, is refused as deleted when its reload
+/// finds no live row for the source; `cleanup` reclaims the source's tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_row_create_from_a_source_deleted_under_it_is_refused_at_its_reload() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    db.branch_create("source").await.unwrap();
+    insert_person(&db, "source", "on-source").await;
+    let source_native = native_name_now(&uri, "source").await.unwrap();
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_PRE_MERGE);
+    let creator = Arc::clone(&db);
+    let create = tokio::spawn(async move {
+        creator
+            .branch_create_from(ReadTarget::branch("source"), "child")
+            .await
+    });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_delete", "source")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = create
+        .await
+        .unwrap()
+        .expect_err("the source was retired below the parked put");
+    assert!(refused.to_string().contains("deleted"), "{refused}");
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+    assert_eq!(live_rows_now(&uri).await, 0);
+    assert_eq!(
+        manifest_cleanup(&db).await,
+        (1, 1),
+        "the source's tree and its retired entry"
+    );
+    assert!(!tree_exists(&dir, &source_native));
+}
+
+/// A not-ready child whose row names a deleted source keeps the source's tree
+/// and its retired entry in `cleanup` until the child is deleted too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_row_not_ready_child_keeps_its_deleted_sources_tree() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    db.branch_create("source").await.unwrap();
+    insert_person(&db, "source", "on-source").await;
+    let source_native = native_name_now(&uri, "source").await.unwrap();
+    {
+        let _fp = catalog::BRANCH_CREATE_POST_ROW.fire_always();
+        db.branch_create_from(ReadTarget::branch("source"), "child")
+            .await
+            .expect_err("the fault after the row leaves the child not ready");
+    }
+    second_process(&uri, "branch_delete", "source")
+        .await
+        .unwrap();
+
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main", "child"]);
+    assert_eq!(
+        manifest_cleanup(&db).await,
+        (0, 0),
+        "a not-ready row's fork point stays, with the source's retired entry"
+    );
+    assert!(tree_exists(&dir, &source_native));
+    db.branch_delete("child").await.unwrap();
+    assert_eq!(
+        manifest_cleanup(&db).await,
+        (1, 2),
+        "the source's tree, and the entries of the source and of the child that never had a tree"
+    );
+    assert!(!tree_exists(&dir, &source_native));
+    assert_eq!(live_rows_now(&uri).await, 0);
+}
+
+/// A not-ready row's fork point is a root: the pin main held when the row
+/// landed survives `--keep 1` after main moves on, since a create still
+/// writing its tree reads it; with the row retired the pin is swept.
+#[tokio::test]
+#[serial]
+async fn branch_row_not_ready_branch_keeps_its_fork_point_a_root() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let before = detached_versions(&person_uri).await;
+    insert_person(&db, "main", "Eve").await;
+    let pinned_at_fork = staged_since(&person_uri, &before).await;
+    {
+        let _fp = catalog::BRANCH_CREATE_POST_ROW.fire_always();
+        db.branch_create("feature")
+            .await
+            .expect_err("the fault after the row leaves the branch not ready");
+    }
+    insert_person(&db, "main", "Frank").await;
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert!(
+        plan.roots.contains(&pinned_at_fork),
+        "the not-ready row's fork point keeps the pin a root: {:?}",
+        plan.roots
+    );
+    assert!(!plan.sweep.contains(&pinned_at_fork));
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    assert!(
+        detached_versions(&person_uri)
+            .await
+            .contains(&pinned_at_fork),
+        "cleanup keeps the fork point's table version"
+    );
+
+    db.branch_delete("feature").await.unwrap();
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(
+        plan.sweep.contains(&pinned_at_fork),
+        "with the row retired the pin is swept: {:?}",
+        plan.sweep
+    );
+}
+
+/// A not-ready row has no tree to stamp: `upgrade` and `upgrade --check`
+/// answer `already_current` on a current graph that holds one.
+#[tokio::test]
+#[serial]
+async fn branch_row_not_ready_branch_leaves_upgrade_already_current() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    {
+        let _fp = catalog::BRANCH_CREATE_POST_ROW.fire_always();
+        db.branch_create("feature")
+            .await
+            .expect_err("the fault after the row leaves the branch not ready");
+    }
+    drop(db);
+    for check in [true, false] {
+        let report = omnigraph::db::upgrade_storage(
+            &uri,
+            omnigraph::db::UpgradeOptions {
+                check,
+                to_format: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.outcome,
+            omnigraph::db::UpgradeOutcome::AlreadyCurrent,
+            "check={check}: {report:?}"
+        );
+    }
+}
+
+/// A claim of `main` landing between a delete's epoch read and its retired
+/// row fences the retired row: the branch stays tombstoned with a live row
+/// until the holder's delete finishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_row_retired_row_is_fenced_by_a_claim_of_main_under_the_delete() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_DELETE_POST_TOMBSTONE);
+    let deleter = Arc::clone(&db);
+    let delete = tokio::spawn(async move { deleter.branch_delete("feature").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_claim", "main=1")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = delete
+        .await
+        .unwrap()
+        .expect_err("the retired row asserts main's epoch");
+    let (_, _, current) = writer_fenced(refused);
+    assert_eq!(current, 1, "the claim that landed under the delete");
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main", "feature"]);
+    let read = helpers::snapshot_branch(&db, "feature").await.unwrap_err();
+    assert!(read.to_string().contains("was deleted"), "{read}");
+    assert_eq!(
+        manifest_cleanup(&db).await,
+        (0, 0),
+        "a tombstoned branch with a live row stops nothing and loses nothing"
+    );
+
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 2);
+    db.branch_delete("feature").await.unwrap();
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+    assert_eq!(manifest_cleanup(&db).await, (1, 1));
+}
+
+/// A grandchild's live row keeps its deleted parent's and grandparent's trees
+/// through `cleanup`, since its data files live in them; once the grandchild
+/// is deleted the three trees and the three retired entries go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_row_cleanup_keeps_a_live_grandchilds_deleted_ancestors() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    db.branch_create("g").await.unwrap();
+    insert_person(&db, "g", "on-g").await;
+    db.branch_create_from(ReadTarget::branch("g"), "p")
+        .await
+        .unwrap();
+    insert_person(&db, "p", "on-p").await;
+    db.branch_create_from(ReadTarget::branch("p"), "c")
+        .await
+        .unwrap();
+    let natives = [
+        native_name_now(&uri, "g").await.unwrap(),
+        native_name_now(&uri, "p").await.unwrap(),
+        native_name_now(&uri, "c").await.unwrap(),
+    ];
+
+    db.branch_delete("p").await.unwrap();
+    db.branch_delete("g").await.unwrap();
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main", "c"]);
+    assert_eq!(count_rows_branch(&db, "c", "node:Person").await, 6);
+    assert_eq!(
+        manifest_cleanup(&db).await,
+        (0, 0),
+        "the trees a live row's data files live in stay"
+    );
+    assert!(natives.iter().all(|native| tree_exists(&dir, native)));
+    insert_person(&db, "c", "on-c").await;
+    assert_eq!(count_rows_branch(&db, "c", "node:Person").await, 7);
+
+    db.branch_delete("c").await.unwrap();
+    assert_eq!(manifest_cleanup(&db).await, (3, 3));
+    assert!(natives.iter().all(|native| !tree_exists(&dir, native)));
 }

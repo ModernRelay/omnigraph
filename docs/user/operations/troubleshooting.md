@@ -33,7 +33,7 @@ for `not_retained`.
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
 | 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
 | 408 | The request body did not arrive before its deadline (`request_timeout`) | Send the request again; nothing was admitted |
-| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, a branch whose writer epoch refuses the writing process (`writer_fenced`), or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable |
+| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, a branch whose writer epoch refuses the writing process (`writer_fenced`), a `branch create` of a name a branch holds (`branch_exists`), a branch that was deleted (`branch_deleted`) or whose create wrote no tree (`branch_not_ready`), or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable. A not-ready branch is removed by `branch delete`; a deleted branch's retirement is finished by the next `branch delete` |
 | 410 | Required change-feed history was reclaimed, or the commit a branch start names (`branch_start_refusal`, `not_retained`) | Capture and durably install a new baseline, then resume from its terminal cursor; start the branch at a retained commit |
 | 412 | Blob entity-tag or graph-commit precondition failed (`precondition_failed`), or `Omnigraph-If-Actor` named another actor than the credential (`actor_mismatch`) | For `precondition_failed`, refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit. For `actor_mismatch` nothing ran: use the named actor's credential or correct the header; retrying unchanged fails again |
 | 413 | Request or operation exceeded a bounded resource limit (`payload_too_large`) | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
@@ -95,7 +95,8 @@ full-text index to build, `retry` for `too_many_requests`,
 `branch_start_refusal`, `payload_too_large`, `unsupported_media_type` and
 `range_not_satisfiable`, and
 `refresh` for the rest: `forbidden`, `precondition_failed`, `conflict`,
-`writer_fenced`, `external_blob_source`, `change_feed_gap` and `internal`. A write the server
+`writer_fenced`, `branch_exists`, `branch_deleted`, `branch_not_ready`,
+`external_blob_source`, `change_feed_gap` and `internal`. A write the server
 could not settle answers `500`.
 
 The CLI reports the server's disposition when that request was the command's

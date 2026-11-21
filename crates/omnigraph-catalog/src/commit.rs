@@ -48,8 +48,8 @@ use lance_table::format::Fragment;
 use crate::error::{OmniError, Result};
 use crate::manifest_request::ManifestRequestProbe;
 use crate::migrations::{
-    BLOCK_REGISTRY_STAMP, CONTROL_FACTS_STAMP, guard_stamp, stamp_after_publish, stamp_entry,
-    supports_control_facts,
+    BLOCK_REGISTRY_STAMP, CONTROL_FACTS_STAMP, guard_stamp, require_branch_rows,
+    stamp_after_publish, stamp_entry, supports_control_facts,
 };
 use crate::publisher::map_lance_publish_error;
 use crate::record::{compact_to_storage, manifest_storage_schema};
@@ -70,6 +70,10 @@ pub(crate) enum Placement {
     /// only retry is the one around the random version id; the properties ride
     /// the transaction (an unpublished graph commit's record).
     Detached { properties: HashMap<String, String> },
+    /// `dataset`'s version + 1 holding `entries` in its config map over the
+    /// loaded version's fragments by reference, cold ones then the hot one:
+    /// nothing is staged and the version number is the CAS.
+    ConfigOnly { entries: HashMap<String, String> },
 }
 
 /// How many random detached ids Lance may try before it gives up; zero
@@ -100,6 +104,18 @@ pub(crate) async fn overwrite_detached(
     properties: HashMap<String, String>,
 ) -> Result<(Dataset, RecordBatch)> {
     overwrite_placed(dataset, rows, None, Placement::Detached { properties }).await
+}
+
+/// Write `entries` into the config map of `dataset`'s version + 1 over `rows`,
+/// the row set that version keeps unchanged: a branch row, a retired row or a
+/// tombstone. Returns the hot batch, the one `dataset` holds, beside the new
+/// version.
+pub(crate) async fn overwrite_config(
+    dataset: Dataset,
+    rows: &ManifestRows,
+    entries: HashMap<String, String>,
+) -> Result<(Dataset, RecordBatch)> {
+    overwrite_placed(dataset, rows, None, Placement::ConfigOnly { entries }).await
 }
 
 async fn overwrite_placed(
@@ -139,55 +155,71 @@ async fn overwrite_probed(
              facts need v{CONTROL_FACTS_STAMP}"
         )));
     }
+    let config_only = matches!(placement, Placement::ConfigOnly { .. });
+    if config_only {
+        require_branch_rows(written)?;
+    }
     let mut metadata = dataset.schema().metadata.clone();
     let (stamp_key, stamp_value) = stamp_entry(written);
     metadata.insert(stamp_key, stamp_value);
-    let schema = manifest_storage_schema(metadata);
+    let schema = manifest_storage_schema(metadata.clone());
     let batch = compact_to_storage(&rows.to_batch()?, &schema)?;
     let dataset = Arc::new(dataset);
-    let mut fragments = match loaded >= BLOCK_REGISTRY_STAMP {
-        true => state::cold_fragments(&dataset),
-        false => Vec::new(),
+    let (fragments, schema) = if config_only {
+        let mut schema = dataset.schema().clone();
+        schema.metadata = metadata;
+        (dataset.fragments().to_vec(), schema)
+    } else {
+        let mut fragments = match loaded >= BLOCK_REGISTRY_STAMP {
+            true => state::cold_fragments(&dataset),
+            false => Vec::new(),
+        };
+        if let Some(cold) = cold {
+            let repacked = fragments_to_repack(&fragments, cold.len());
+            let mut cold = cold.clone();
+            cold.merge(&state::read_cold_registry(&dataset, &repacked).await?);
+            fragments.retain(|kept| !repacked.iter().any(|joined| joined.id == kept.id));
+            let (written, _) = stage(
+                &dataset,
+                compact_to_storage(&cold.to_batch()?, &schema)?,
+                None,
+            )
+            .await?;
+            fragments.extend(written);
+        }
+        let hot_rows = batch.num_rows();
+        if u32::try_from(hot_rows).is_err() {
+            return Err(OmniError::manifest_internal(
+                "manifest hot rows exceed the Lance fragment limit",
+            ));
+        }
+        let (hot, schema) = stage(&dataset, batch.clone(), Some(hot_rows.max(1))).await?;
+        if hot.len() != 1 {
+            return Err(OmniError::manifest_internal(
+                "manifest hot rows must occupy exactly one fragment",
+            ));
+        }
+        fragments.extend(hot);
+        (fragments, schema)
     };
-    if let Some(cold) = cold {
-        let repacked = fragments_to_repack(&fragments, cold.len());
-        let mut cold = cold.clone();
-        cold.merge(&state::read_cold_registry(&dataset, &repacked).await?);
-        fragments.retain(|kept| !repacked.iter().any(|joined| joined.id == kept.id));
-        let (written, _) = stage(
-            &dataset,
-            compact_to_storage(&cold.to_batch()?, &schema)?,
-            None,
-        )
-        .await?;
-        fragments.extend(written);
-    }
-    let hot_rows = batch.num_rows();
-    if u32::try_from(hot_rows).is_err() {
-        return Err(OmniError::manifest_internal(
-            "manifest hot rows exceed the Lance fragment limit",
-        ));
-    }
-    let (hot, schema) = stage(&dataset, batch.clone(), Some(hot_rows.max(1))).await?;
-    if hot.len() != 1 {
-        return Err(OmniError::manifest_internal(
-            "manifest hot rows must occupy exactly one fragment",
-        ));
-    }
-    fragments.extend(hot);
+    let (config_upsert_values, properties) = match placement {
+        Placement::Linear => (None, None),
+        Placement::Detached { properties } => (None, Some(properties)),
+        Placement::ConfigOnly { entries } => (Some(entries), None),
+    };
     let operation = Operation::Overwrite {
         fragments,
         schema,
-        config_upsert_values: None,
+        config_upsert_values,
         initial_bases: None,
     };
     let mut transaction = TransactionBuilder::new(dataset.version().version, operation).build();
     let handler = crate::lance_clone::probed_commit_handler(&dataset, probe)
         .await
         .map_err(OmniError::storage)?;
-    let builder = match placement {
-        Placement::Linear => crate::lance_commit::commit_builder(dataset).with_max_retries(0),
-        Placement::Detached { properties } => {
+    let builder = match properties {
+        None => crate::lance_commit::commit_builder(dataset).with_max_retries(0),
+        Some(properties) => {
             transaction.transaction_properties = Some(Arc::new(properties));
             crate::lance_commit::commit_builder(dataset)
                 .with_detached(true)

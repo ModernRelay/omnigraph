@@ -1,0 +1,79 @@
+# issue: none
+# notes: A delete that fails after main's catalog has retired the entry only loses its
+# notes: acknowledgement: the branch is gone from the list and from reads, and its name can be
+# notes: created again.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query write_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- seam
+at: branch_delete.post_retired_row
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch delete b
+
+--- expect error: injected failpoint triggered: branch_delete.post_retired_row
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query branch: b
+query read_deleted_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: branch 'b' not found
+
+--- restart
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- query branch: b
+query names_on_recreated_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

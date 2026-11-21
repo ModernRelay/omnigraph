@@ -103,7 +103,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     assert!(
         String::from_utf8(candidate_version.stdout)
             .unwrap()
-            .contains("internal-schema 17 (serves v14 to v17)")
+            .contains("internal-schema 18 (serves v14 to v18)")
     );
 
     let temp = tempdir().unwrap();
@@ -1420,6 +1420,11 @@ fn human_report_lines(
             count("census_reads"),
             count("census_cells")
         ),
+        format!(
+            "rows: {} written, refs: {} unlinked",
+            count("rows_written"),
+            count("refs_unlinked")
+        ),
     ]
 }
 
@@ -1940,9 +1945,9 @@ fn storage_upgrade_refuses_cluster_path_aliases() {
     }
 }
 
-const V13_HANDLER: &str = "history-lance-files-v13-to-v17";
-const V9_HANDLER: &str = "history-lance-files-v9-to-v17";
-const V8_HANDLER: &str = "history-lance-files-v8-to-v17";
+const V13_HANDLER: &str = "history-lance-files-v13-to-v18";
+const V9_HANDLER: &str = "history-lance-files-v9-to-v18";
+const V8_HANDLER: &str = "history-lance-files-v8-to-v18";
 
 /// The schema contract a root below stamp 13 keeps as three root objects.
 const ROOT_SCHEMA_OBJECTS: [&str; 3] = ["_schema.pg", "_schema.ir.json", "__schema_state.json"];

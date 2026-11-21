@@ -27,6 +27,53 @@ pub(crate) fn branch_ref_error(error: lance::Error, branch: &str) -> OmniError {
     }
 }
 
+/// Whether a failed checkout of a tree's latest version found no version
+/// under its `_versions/`: Lance answers that listing with `NotFound`, and a
+/// version it listed whose manifest object is missing with `DatasetNotFound`.
+pub(crate) fn tree_never_written(error: &lance::Error) -> bool {
+    matches!(error, lance::Error::NotFound { .. })
+}
+
+/// Whether a failed checkout leaves a delete no head to end with a tombstone:
+/// a tree never written, or a listed version whose manifest object is gone.
+pub(crate) fn tree_has_no_head(error: &lance::Error) -> bool {
+    tree_never_written(error) || matches!(error, lance::Error::DatasetNotFound { .. })
+}
+
+/// A failed read of the tree a live row names (RFC "Branch existence in the
+/// catalog" §Readers): no version under its `_versions/` is the not-ready
+/// verdict, a row whose create wrote no tree; the rest is the read's own.
+pub(crate) fn branch_tree_error(error: lance::Error, branch: &str) -> OmniError {
+    match tree_never_written(&error) {
+        true => OmniError::BranchNotReady {
+            branch: branch.to_string(),
+        },
+        false => OmniError::storage(error),
+    }
+}
+
+/// Whether `main`'s stamp keeps the branch set in its rows, so a tree is
+/// opened through them and never through a ref.
+pub fn has_branch_rows(main: &Dataset) -> bool {
+    crate::migrations::guard_stamp(main).is_ok_and(crate::migrations::supports_branch_rows)
+}
+
+/// The error of a branch checkout from `main` at `resolution`: the tree's
+/// for its latest version at or above the branch-row stamp, the ref's below
+/// it; a known version that is missing is the storage miss it is.
+pub(crate) fn branch_open_error(
+    main: &Dataset,
+    resolution: VersionResolution,
+    error: lance::Error,
+    branch: &str,
+) -> OmniError {
+    match (has_branch_rows(main), resolution) {
+        (true, VersionResolution::Latest) => branch_tree_error(error, branch),
+        (true, VersionResolution::At(_)) => OmniError::storage(error),
+        (false, _) => branch_ref_error(error, branch),
+    }
+}
+
 pub fn manifest_uri(root: &str) -> String {
     format!("{}/{}", root.trim_end_matches('/'), MANIFEST_DIR)
 }
@@ -48,6 +95,14 @@ pub(crate) async fn resolve_native_manifest_branch(
     dataset: &Dataset,
     logical: &str,
 ) -> Result<String> {
+    if has_branch_rows(dataset) {
+        return crate::BranchRows::decode(dataset.manifest())?
+            .by_logical(logical)
+            .map(|row| row.native.clone())
+            .ok_or_else(|| OmniError::BranchNotFound {
+                branch: logical.to_string(),
+            });
+    }
     crate::branch_control::resolve_live_native_branch(dataset, logical)
         .await?
         .ok_or_else(|| OmniError::BranchNotFound {
@@ -67,6 +122,26 @@ pub async fn open_manifest_dataset_with_session(
     control_session: &Arc<lance::session::Session>,
 ) -> Result<Dataset> {
     open_manifest_branch(root_uri, branch, VersionResolution::Latest, control_session).await
+}
+
+/// [`open_manifest_dataset_with_session`] keeping the main the branch was
+/// resolved through, whose rows answer the branch's identifier at or above
+/// the branch-row stamp; `None` when main itself was opened.
+pub(crate) async fn open_manifest_dataset_through_main(
+    root_uri: &str,
+    branch: Option<&str>,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<(Dataset, Option<Dataset>)> {
+    let Some(branch) = branch.filter(|branch| *branch != "main") else {
+        let main = open_main_manifest(root_uri, VersionResolution::Latest, control_session).await?;
+        return Ok((main, None));
+    };
+    let main = open_main_manifest(root_uri, VersionResolution::Latest, control_session).await?;
+    let native = resolve_native_manifest_branch(&main, branch).await?;
+    let dataset = checkout_manifest_branch(&main, &native, VersionResolution::Latest)
+        .await
+        .map_err(|error| branch_open_error(&main, VersionResolution::Latest, error, branch))?;
+    Ok((dataset, Some(main)))
 }
 
 /// Open one manifest branch at a `version` the caller already knows,
@@ -134,7 +209,7 @@ async fn open_manifest_branch(
     let native = resolve_native_manifest_branch(&main, branch).await?;
     checkout_manifest_branch(&main, &native, resolution)
         .await
-        .map_err(|error| branch_ref_error(error, branch))
+        .map_err(|error| branch_open_error(&main, resolution, error, branch))
 }
 
 /// The one body of the native-name opens: [`open_manifest_branch`] without
@@ -151,7 +226,14 @@ async fn open_manifest_native(
     let main = open_main_manifest(root_uri, VersionResolution::Latest, control_session).await?;
     checkout_manifest_branch(&main, native, resolution)
         .await
-        .map_err(|error| branch_ref_error(error, crate::branch_names::logical_branch_name(native)))
+        .map_err(|error| {
+            branch_open_error(
+                &main,
+                resolution,
+                error,
+                crate::branch_names::logical_branch_name(native),
+            )
+        })
 }
 
 /// Main's `__manifest` at `resolution`. A version the caller already holds
@@ -193,21 +275,64 @@ async fn checkout_manifest_branch(
     }
 }
 
+/// One manifest branch opened at its latest version with the lifetime that
+/// selected it: the identifier, the native name the logical branch resolved
+/// to (`None` for main), and the main the branch resolved through (`None` for
+/// main), whose rows answer the branch's existence without a request at or
+/// above [`crate::migrations::BRANCH_ROWS_STAMP`].
+pub(crate) struct OpenedBranch {
+    pub(crate) dataset: Dataset,
+    pub(crate) branch_identifier: BranchIdentifier,
+    pub(crate) native_branch: Option<String>,
+    pub(crate) main: Option<Dataset>,
+}
+
+impl OpenedBranch {
+    /// Main itself, opened at `dataset`.
+    pub(crate) fn main(dataset: Dataset) -> Self {
+        Self {
+            dataset,
+            branch_identifier: BranchIdentifier::main(),
+            native_branch: None,
+            main: None,
+        }
+    }
+}
+
+/// RFC "Branch existence in the catalog" §Readers: a chain whose head carries
+/// a tombstone refuses a reader's open and refresh with `branch_deleted`; the
+/// delete's own open and the collector's inventory read the row and go on.
+pub(crate) fn refuse_tombstoned(opened: &OpenedBranch, branch: Option<&str>) -> Result<()> {
+    let Some(branch) = branch.filter(|branch| *branch != "main") else {
+        return Ok(());
+    };
+    if crate::BranchRows::decode(opened.dataset.manifest())?
+        .tombstone()
+        .is_some()
+    {
+        return Err(OmniError::BranchDeleted {
+            branch: branch.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Open one manifest branch together with the exact Lance branch lifetime
-/// that selected it and the native ref name the logical branch resolved to
-/// (`None` for main).
+/// that selected it and the native name the logical branch resolved to.
 ///
-/// `checkout_branch` and `BranchContents` are separate reads. Surrounding the
-/// checkout with identifier reads prevents a concurrent delete/recreate from
-/// pairing an old checked-out dataset with the replacement branch's identity.
-/// A later recreation is harmless: the returned identifier remains the
-/// witness for this pinned dataset and the coordinator's freshness probe will
-/// observe the new identity.
+/// At or above the branch-row stamp the lifetime is the row of the main
+/// opened here, and the tree is checked out by that row's native name. Below
+/// it, `checkout_branch` and `BranchContents` are separate reads: surrounding
+/// the checkout with identifier reads prevents a concurrent delete/recreate
+/// from pairing an old checked-out dataset with the replacement branch's
+/// identity. A later recreation is harmless: the returned identifier remains
+/// the witness for this pinned dataset and the coordinator's freshness probe
+/// will observe the new identity.
 pub(crate) async fn open_manifest_branch_with_identifier(
     root_uri: &str,
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
-) -> Result<(Dataset, BranchIdentifier, Option<String>)> {
+) -> Result<OpenedBranch> {
     let uri = manifest_uri(root_uri.trim_end_matches('/'));
     let dataset = crate::instrumentation::open_dataset(
         &uri,
@@ -217,8 +342,26 @@ pub(crate) async fn open_manifest_branch_with_identifier(
     )
     .await?;
     let Some(branch) = branch.filter(|branch| *branch != "main") else {
-        return Ok((dataset, BranchIdentifier::main(), None));
+        return Ok(OpenedBranch::main(dataset));
     };
+    if crate::migrations::supports_branch_rows(crate::migrations::guard_stamp(&dataset)?) {
+        let row = crate::BranchRows::decode(dataset.manifest())?
+            .by_logical(branch)
+            .cloned()
+            .ok_or_else(|| OmniError::BranchNotFound {
+                branch: branch.to_string(),
+            })?;
+        let branch_dataset = dataset
+            .checkout_branch(&row.native)
+            .await
+            .map_err(|error| branch_tree_error(error, branch))?;
+        return Ok(OpenedBranch {
+            dataset: branch_dataset,
+            branch_identifier: row.identifier,
+            native_branch: Some(row.native),
+            main: Some(dataset),
+        });
+    }
     let native = resolve_native_manifest_branch(&dataset, branch).await?;
 
     for _ in 0..BRANCH_IDENTIFIER_CAPTURE_ATTEMPTS {
@@ -233,7 +376,12 @@ pub(crate) async fn open_manifest_branch_with_identifier(
             .await
             .map_err(|error| branch_ref_error(error, branch))?;
         if before == after {
-            return Ok((branch_dataset, before, Some(native)));
+            return Ok(OpenedBranch {
+                dataset: branch_dataset,
+                branch_identifier: before,
+                native_branch: Some(native),
+                main: Some(dataset),
+            });
         }
         tokio::task::yield_now().await;
     }

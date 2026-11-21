@@ -759,7 +759,9 @@ the check runs where the precondition already runs, on every attempt.
 
 **Each control fact carries its attempt id.** A control-fact operation mints one
 ***attempt id***, a ULID, before its first publish attempt, and every fact it
-writes records it. The attempt id is a control fact's identity, as the graph
+writes records it, except the retired row, a `-` under the branch's key, which
+records none: two deletes converge on it, so any `-` in the attempted version
+is the owner's landed attempt. The attempt id is a control fact's identity, as the graph
 commit id is a row publication's:
 
 - **Read-back.** After a lost acknowledgement, the publisher settles the
@@ -775,16 +777,16 @@ commit id is a row publication's:
   compares heads, which cannot tell two control facts apart, since neither
   moves the head.
 - **The owner's retry.** A fact with the operation's own attempt id is its own
-  landed attempt, never a refusal: the operation goes on to its follow-ups,
-  the ref, the deregistration, the archive and unlink, or the tag release.
+  landed attempt, never a refusal: the operation goes on to its next step,
+  the tree, the retired row, or the tag release.
 - **Unknown outcomes.** Every control fact is a linear publication on its
   chain, so one whose request stays ambiguous is fenced by its version key, as
   a linear row publication is in [§5 of storage outcomes per operation](https://github.com/ModernRelay/omnigraph/pull/1093): the chain's next publication either
   loads it or takes its version first. A read of the registration, tombstone
   or drop record is final once the attempted version is readable, by the
   read-back rule above, without waiting for a later version: a create's
-  follow-up writes the ref, not another manifest version, so the chain may stay
-  at the registration. The attempt id stays on the fact, in the log and in
+  next step writes the tree, not another version of main, so main's chain may
+  stay at the row. The attempt id stays on the fact, in the log and in
   `disposition.check`.
 
 The refusals in the table apply to facts with another attempt id, with two
@@ -797,28 +799,26 @@ its candidate's drop record.
    reloads and refuses with `branch_deleted`, or wins it, and the delete
    reloads into the new head and tombstones that. History settlement reads the
    chain up to the tombstone, so it is complete. Delete then publishes the
-   deregistration on main, and the retirement marker, the `BranchContents`
-   archive and the unlink follow as today. A crash between them leaves a
-   tombstoned branch that refuses writes, which the next delete, cleanup or
-   `repair` finishes.
+   retired row on main; nothing follows. A crash between them leaves a
+   tombstoned branch that refuses writes, which the next delete finishes.
 2. **A branch exists when main registers it.** Create mints the native name
    `{logical}.{ULID}` and first publishes its registration on main: the logical
    name, that native name and the fork point it branches from. Only then does it
-   create the native ref and tree. The registration is the branch's visibility
+   write the tree. The registration is the branch's visibility
    point: list, resolve, schema apply, system-column upgrade and cleanup read
    the logical branches from main's registrations, in the attempt that
-   publishes, and a ref no registration names is no branch. Two creates of one
+   publishes, and a tree no row names is no branch. Two creates of one
    name race on main's version, and the loser refuses with `branch_exists`
-   before it has written anything. A crash after the registration and before
-   the ref leaves a registered branch with no ref, which refuses reads and
-   writes as not ready. A create of that name refuses with `branch_exists`;
-   its delete removes it, and `repair` completes it from the recorded fork
-   point, which cleanup retains while the registration names it. Listings read
+   before it has written anything. A crash after the row and before the tree
+   leaves a branch with no tree, which refuses reads and writes as not ready. A
+   create of that name refuses with `branch_exists`; its delete removes it;
+   cleanup retains its fork point while the row names it. Listings read
    registrations too: `branch list`, with the details
    [#1012](https://github.com/ModernRelay/omnigraph/pull/1012) adds, lists such
-   a branch as not ready. Its registration fills `name`, `from` and
-   `from_commit_id`; `head`, `created_at` and `updated_at` stay absent until its
-   ref exists, so #1012 makes them optional.
+   a branch as not ready. Its row fills `name`, `from` and `created_at`;
+   `head`, `from_commit_id` and `updated_at` stay absent until its tree exists,
+   `from_commit_id` then read from the tree at the row's `parent_version`, and
+   this RFC (2026-11-19-branch-row-in-the-catalog) makes them optional.
 
    Until [schema apply with live branches](https://github.com/ModernRelay/omnigraph/pull/963)
    lands, a registration also refuses, on any attempt, when main's schema
@@ -834,20 +834,18 @@ its candidate's drop record.
    registration no longer reads main's contract, and a registration is never
    the reason an apply or an upgrade refuses. PR 963 then decides what they
    pin in place of main's exact version and branch set.
-3. **Cleanup reclaims only what no registration names.** A create registers
-   before its ref and tree exist, so a ref or tree that no registration names
-   is no create in progress. The collector lists refs and trees before it reads
-   main's registrations, so any listed ref or tree whose create is in flight is
-   already registered in what it reads. Such a ref or tree, whether a tombstone
-   retired it, a late marker rewrite recreated its ref, or a create crashed
-   before it, is a candidate with no age threshold. The registration set decides
-   which refs and trees are candidates; it does not replace the collector's
-   keep set. `protected_manifest_branches` still keeps any tree a live branch
+3. **Cleanup reclaims only what no registration names.** A create publishes
+   its row before its tree exists, so a tree that no row names is no create in
+   progress. The collector lists trees, then reads main's latest version, so
+   any listed tree whose create is in flight is already in the rows it reads.
+   Such a tree, whether a tombstone retired it or a create crashed before it,
+   is a candidate with no age threshold. The row set decides which trees are
+   candidates; it does not replace the collector's keep set. `protected_manifest_branches` still keeps any tree a live branch
    reads and any retired tree that supplies a live tag, a retention root or
    imported merge-base lineage (`retained_merge_bases`), and a not-ready
-   registration's fork point stays while the registration names it. The
-   collector deletes the remaining candidates through a ref delete and a delete
-   of that tree alone, never Lance's forced branch delete. The deciding
+   row's fork point stays while the row names it. The collector deletes the
+   remaining candidates through a delete of that tree alone, never Lance's
+   forced branch delete. The deciding
    authority is the registration set, never an age, as invariant 5 requires. Lance 13's stock
    `cleanup_old_versions` now also reaches unreferenced data newer than the
    retained manifests
@@ -871,19 +869,21 @@ defines:
 - a fresh key, such as a data, deletion, index or transaction file or a
   detached manifest, which nothing names until a publication does;
 - a conditional key, a `__manifest` version written only if absent;
-- a mutable key written only as a follow-up of a publication, whose late or
-  repeated landing changes nothing logical: retirement's marker rewrite, the
-  archive, the unlink and a drop's tag release.
+- a mutable key written only as a follow-up of a publication or of the
+  upgrade's stamp commit, whose late or repeated landing changes nothing
+  logical: a drop's tag release, and the upgrade's unlink of the ref files, the
+  follow-up of the route's stamp commit.
 
-The marker rewrite is unconditional in Lance 13: a late one can even recreate a
-ref the delete already unlinked. That ref is deregistered, so it names no
-logical branch, and cleanup's registration rule reclaims it with its tree. A guard against unconditional
-writes of mutable keys admits these only as follow-ups of a publication.
+A guard against unconditional writes of mutable keys admits these only as
+follow-ups of a publication or the upgrade's stamp commit.
 
 **Format.** Control facts are new `__manifest` rows under the next storage
-stamp. Only `omnigraph upgrade`'s stamp-only route raises a graph to it, and
-that route's one publication on main registers every live branch from the
-census it already takes, with writers stopped as it already requires; an
+stamp; the branch row and the tombstone ride the version file's config map,
+and the loader decodes them into rows. Only `omnigraph upgrade`'s stamp-only
+route raises a graph to it, and that route raises every live branch, as
+today's does, and its one commit on main writes a row per live ref from the
+live-ref inventory it reads; its follow-ups unlink the refs, with writers
+stopped as it already requires; an
 ordinary publication never raises the stamp, so no registration can hide a
 live branch. Once main carries the stamp, older binaries refuse the graph and
 each other branch takes the stamp with its next publication. Until a graph is
@@ -902,14 +902,13 @@ main's registrations, refuse instead, which is the point until PR 963. Row write
 `integration/branch_control_cost.rs` measures the added requests per backend.
 
 **Recovery.** Every new durable step is a publication or a follow-up of one. A
-crash after a tombstone and before the unlink leaves a branch that refuses
-writes, which delete, cleanup and `repair` complete. A crash after a
-registration and before its ref leaves a branch that refuses as not ready until
-its delete removes it or `repair` completes it. A crash loses the attempt id
+crash after a tombstone and before the retired row leaves a branch that
+refuses writes, which the next delete completes. A crash after a row and
+before its tree leaves a branch that refuses as not ready until its delete
+removes it. A crash loses the attempt id
 with its process. Delete and drop need no id, because a later one completes
 the follow-ups. A create does not converge: a new create of the name refuses
-with `branch_exists`, and `repair` completes the branch or its delete removes
-it. A crash after a drop
+with `branch_exists`, and its delete removes it. A crash after a drop
 record and before the tag release leaves tags that expire with their captured
 authority, as a proposal's tags already do.
 
@@ -989,9 +988,8 @@ A client that refuses unknown fields in error bodies must accept
   into the manifest CAS.
 - **Crash convergence (5).** Every new engine durable step is either a
   zero-retry publication on a `__manifest` chain or a derived, idempotent
-  follow-up: retirement's marker, archive and unlink; a registered create's
-  ref; a drop's tag release. A crash leaves state the next attempt, cleanup or
-  `repair` completes. Cleanup decides from registration authority, not age.
+  follow-up: a registered create's tree, a drop's tag release. A crash leaves
+  state the next attempt completes. Cleanup decides from registration authority, not age.
 - **Bounded and observable (11).** Server limits and operation lifecycle keep
   their owners. One code registry and disposition object describe failures;
   clients do not silently replay an uncertain operation.
@@ -1137,8 +1135,8 @@ Extend the existing owners in [the testing map](../dev/testing.md):
   gates hid; today all actors share `for_root`.
 - **Engine, `integration/branch_control_cost.rs`:** the added publications per
   create, delete and drop, per backend.
-- **Storage upgrade:** the stamp-only route registers every live branch in its
-  one publication, no ordinary publication raises the stamp, older binaries
+- **Storage upgrade:** the stamp-only route writes a row per live ref in its
+  one commit and unlinks the refs, no ordinary publication raises the stamp, older binaries
   refuse the new stamp, and the cross-version fences cover it.
 
 Run CLI integration tests with `RUST_MIN_STACK=16777216` and the existing
@@ -1613,3 +1611,8 @@ proposal.
   exception table for served cluster roots and stays there for direct
   targets. The other commands in that row are unchanged. The table stands
   unchanged until acceptance.
+- 2026-11-20: amended by RFC 2026-11-19 "Branch existence in the catalog":
+  §Engine (control facts, attempt ids, items 1 to 3, late requests, format,
+  recovery), §Invariants (crash convergence) and §Evidence (storage upgrade)
+  now name the branch row, the retired row and the tree in place of the
+  registration, the ref and its follow-ups.
