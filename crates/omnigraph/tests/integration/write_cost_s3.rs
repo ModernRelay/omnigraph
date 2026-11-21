@@ -30,9 +30,9 @@
 
 use crate::helpers;
 
-use crate::helpers::cost::{IoCounts, assert_flat, measure_insert, s3_graph};
-use crate::helpers::{commit_many, s3_test_graph_uri};
-use omnigraph::db::Omnigraph;
+use crate::helpers::cost::{IoCounts, assert_flat, measure, measure_insert, s3_graph};
+use crate::helpers::{TEST_QUERIES, commit_many, params, s3_test_graph_uri};
+use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
@@ -161,4 +161,45 @@ node Document {
         1,
         "one bounded prepared batch must not GET the same S3 object per row"
     );
+}
+
+/// Issue 1250: a read pinned to a commit opens each table at the manifest its
+/// registration recorded. On an object store each manifest read is then one
+/// request; before, every open first sent a HEAD for the manifest's size.
+/// Skips without `OMNIGRAPH_S3_TEST_BUCKET`.
+#[tokio::test]
+async fn pinned_read_sends_no_manifest_head_on_s3_issue_1250() {
+    let Some(db) = s3_graph("pinned-read-manifests").await else {
+        eprintln!(
+            "SKIP pinned_read_sends_no_manifest_head_on_s3_issue_1250: OMNIGRAPH_S3_TEST_BUCKET unset"
+        );
+        return;
+    };
+    commit_many(&db, 2).await;
+    let (_, head) = db
+        .query_with_head(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    let pinned = || ReadTarget::snapshot(SnapshotId::new(head.clone().unwrap()));
+    for attempt in ["first", "repeat"] {
+        let (rows, io) = measure(db.query(
+            pinned(),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
+        ))
+        .await;
+        rows.unwrap();
+        eprintln!(
+            "{attempt}: opens={} opener={} heads={} data_total={}",
+            io.data_open_count, io.data_opener_reads, io.data_opener_heads, io.data_reads
+        );
+        assert!(io.data_open_count > 0, "{attempt}: {io:?}");
+        assert_eq!(io.data_opener_heads, 0, "{attempt}: {io:?}");
+    }
 }

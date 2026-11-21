@@ -3047,6 +3047,8 @@ fn warm_read_labels(commits: u64) -> Vec<String> {
         "ReadWarmHop",
         "ReadStaleLookup",
         "ReadStaleHop",
+        "ReadPinnedHop",
+        "ReadPinnedHopRepeat",
     ]
     .iter()
     .map(|label| format!("{label}History{commits}"))
@@ -3072,8 +3074,12 @@ impl WarmReadCost {
     }
 
     async fn hop(db: &Session) -> serde_json::Value {
+        Self::hop_at(db, omnigraph::db::ReadTarget::branch("main")).await
+    }
+
+    async fn hop_at(db: &Session, target: omnigraph::db::ReadTarget) -> serde_json::Value {
         db.query(
-            omnigraph::db::ReadTarget::branch("main"),
+            target,
             WARM_READ_QUERIES,
             "friends_of",
             &params(&[("$name", "Alice")]),
@@ -3153,12 +3159,39 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for W
         let stale_lookup = Self::lookup(&reader).await;
         omnigraph_dst::cost::set_label(&labels[6]);
         let stale_hop = Self::hop(&reader).await;
+        // A read pinned to a commit (here the head, as a client that pins its
+        // later reads sends it) opens its tables at their recorded manifests
+        // with no read cache, so a repeat costs what the first read did.
+        omnigraph_dst::cost::set_label("_read_head");
+        let head = reader
+            .query_with_head(
+                omnigraph::db::ReadTarget::branch("main"),
+                WARM_READ_QUERIES,
+                "get_person",
+                &params(&[("$name", "Alice")]),
+            )
+            .await
+            .unwrap()
+            .1
+            .unwrap();
+        let pinned =
+            || omnigraph::db::ReadTarget::snapshot(omnigraph::db::SnapshotId::new(head.clone()));
+        omnigraph_dst::cost::set_label(&labels[7]);
+        let pinned_hop = Self::hop_at(&reader, pinned()).await;
+        omnigraph_dst::cost::set_label(&labels[8]);
+        let pinned_repeat = Self::hop_at(&reader, pinned()).await;
         omnigraph_dst::cost::set_label("_read_verify");
         let alice = serde_json::json!([{"p.name": "Alice", "p.age": 30}]);
         for rows in [&cold_lookup, &warm_lookup, &stale_lookup] {
             assert_eq!(rows, &alice);
         }
-        for rows in [&cold_hop, &warm_hop, &stale_hop] {
+        for rows in [
+            &cold_hop,
+            &warm_hop,
+            &stale_hop,
+            &pinned_hop,
+            &pinned_repeat,
+        ] {
             let mut names = rows
                 .as_array()
                 .unwrap()
@@ -3219,8 +3252,12 @@ struct GraphIndexRetentionCost;
 
 impl GraphIndexRetentionCost {
     async fn hop(db: &Session) -> serde_json::Value {
+        Self::hop_at(db, omnigraph::db::ReadTarget::branch("main")).await
+    }
+
+    async fn hop_at(db: &Session, target: omnigraph::db::ReadTarget) -> serde_json::Value {
         db.query(
-            omnigraph::db::ReadTarget::branch("main"),
+            target,
             WARM_READ_QUERIES,
             "friends_of",
             &params(&[("$name", "Alice")]),

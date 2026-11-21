@@ -812,10 +812,7 @@ impl Snapshot {
                         &entry.dataset_path,
                         entry.native_dataset_branch.as_deref(),
                         entry.published_dataset_version,
-                        entry.version_metadata.e_tag(),
-                        entry.version_metadata.staged_version(),
-                        entry.version_metadata.transaction_uuid(),
-                        entry.version_metadata.last_linear_version(),
+                        &entry.version_metadata,
                         &location,
                         Some(&caches.session),
                         caches.table_wrapper.clone(),
@@ -823,9 +820,12 @@ impl Snapshot {
                     .await
             }
             None => {
-                let session =
-                    crate::lance_access::statement_session(self.session.store_registry(), 0, 0);
-                open_dataset_entry(entry, &self.root_uri, Some(&session)).await
+                open_dataset_entry_at_recorded_manifest(
+                    entry,
+                    &self.root_uri,
+                    self.session.store_registry(),
+                )
+                .await
             }
         }
     }
@@ -1381,10 +1381,34 @@ pub async fn open_dataset_entry(
     crate::instrumentation::open_pinned_dataset(
         &location,
         entry.published_dataset_version,
-        entry.version_metadata.staged_version(),
-        entry.version_metadata.transaction_uuid(),
-        entry.version_metadata.last_linear_version(),
+        &entry.version_metadata,
         session,
+        crate::instrumentation::table_wrapper(),
+    )
+    .await
+}
+
+/// [`open_dataset_entry`] at the manifest object the registration recorded,
+/// for an open that keeps no read cache: a session of its own that caches
+/// nothing (`instrumentation::open_pinned_dataset_at_recorded_manifest`).
+/// The dataset reports the recorded identity, not the store's, so it is never
+/// a witness (`TableVersionMetadata::witnesses`): an open that checks a pin's
+/// identity uses [`open_dataset_entry`].
+pub(crate) async fn open_dataset_entry_at_recorded_manifest(
+    entry: &DatasetEntry,
+    root_uri: &str,
+    registry: Arc<lance::io::ObjectStoreRegistry>,
+) -> Result<Dataset> {
+    let location = table_uri_for_path(
+        root_uri,
+        &entry.dataset_path,
+        entry.native_dataset_branch.as_deref(),
+    )?;
+    crate::instrumentation::open_pinned_dataset_at_recorded_manifest(
+        &location,
+        entry.published_dataset_version,
+        &entry.version_metadata,
+        registry,
         crate::instrumentation::table_wrapper(),
     )
     .await
