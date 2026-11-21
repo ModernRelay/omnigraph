@@ -61,6 +61,17 @@ USER_FORBIDDEN = {
     r"\bPhase \d+[A-Z]?\b": "implementation phases do not belong in user docs",
 }
 
+# Auth-gated GHCR image references in user/deploy/skill docs (issue 831):
+# Docker Hub (`docker.io/modernrelay/omnigraph-server`) is the public pull
+# channel; only `oci://ghcr.io/...` attestation verification uses GHCR.
+GHCR_SERVER_IMAGE = re.compile(
+    r"(?<!oci://)\bghcr\.io/modernrelay/omnigraph-server\b", re.IGNORECASE
+)
+GHCR_INLINE_PULL = re.compile(
+    r"(?:docker\s+(?:pull|run)|--server-image)\s+[^`\n]*\bghcr\.io/modernrelay/omnigraph-server\b",
+    re.IGNORECASE,
+)
+
 
 def tracked_markdown() -> list[Path]:
     result = subprocess.run(
@@ -529,6 +540,48 @@ def check_skill_version(errors: list[str]) -> None:
         )
 
 
+def check_public_container_images(files: list[Path], errors: list[str]) -> None:
+    """Reject auth-gated GHCR pull/deploy commands in public documentation.
+
+    Docker Hub (`docker.io/modernrelay/omnigraph-server`) is the anonymous pull
+    channel. Provenance attestations live on GHCR, so `oci://ghcr.io/...`
+    verification commands and prose describing the GHCR mirror remain allowed.
+    """
+    for path in files:
+        if not (
+            path.is_relative_to(ROOT / "docs" / "user")
+            or path.is_relative_to(ROOT / "deploy")
+            or path.is_relative_to(SKILL_DIR)
+            or path == ROOT / "README.md"
+        ):
+            continue
+        relative = path.relative_to(ROOT)
+        fence: str | None = None
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            match = re.match(r"^\s*(```+|~~~+)", line)
+            if match:
+                marker = match.group(1)[0]
+                if fence is None:
+                    fence = marker
+                elif marker == fence:
+                    fence = None
+                continue
+            if fence is not None:
+                if GHCR_SERVER_IMAGE.search(line):
+                    errors.append(
+                        f"{relative}:{number}: container command uses auth-gated "
+                        "ghcr.io/modernrelay/omnigraph-server; use "
+                        "docker.io/modernrelay/omnigraph-server (only oci:// attestation "
+                        "verification uses GHCR)"
+                    )
+            elif GHCR_INLINE_PULL.search(line):
+                errors.append(
+                    f"{relative}:{number}: container command uses auth-gated "
+                    "ghcr.io/modernrelay/omnigraph-server; use "
+                    "docker.io/modernrelay/omnigraph-server"
+                )
+
+
 def main() -> int:
     from release_notes import check_working_notes
 
@@ -546,6 +599,7 @@ def main() -> int:
     check_rfcs(errors)
     check_conflict_markers(files, errors)
     check_user_boundary(files, errors)
+    check_public_container_images(files, errors)
     check_skill_version(errors)
     check_working_notes(ROOT, errors)
 

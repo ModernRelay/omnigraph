@@ -196,7 +196,7 @@ docker run --rm -p 8080:8080 \
   -e AWS_ACCESS_KEY_ID \
   -e AWS_SECRET_ACCESS_KEY \
   -e OMNIGRAPH_SERVER_BEARER_TOKENS_JSON \
-  ghcr.io/modernrelay/omnigraph-server:<tag>
+  docker.io/modernrelay/omnigraph-server:<tag>
 ```
 
 For a local cluster, mount the complete cluster directory and point
@@ -207,7 +207,7 @@ docker run --rm -p 8080:8080 \
   -v /srv/company-brain:/var/lib/omnigraph/cluster \
   -e OMNIGRAPH_CLUSTER=/var/lib/omnigraph/cluster \
   -e OMNIGRAPH_SERVER_BEARER_TOKEN \
-  ghcr.io/modernrelay/omnigraph-server:<tag>
+  docker.io/modernrelay/omnigraph-server:<tag>
 ```
 
 Terminate TLS at a load balancer or trusted reverse proxy. Keep bearer tokens
