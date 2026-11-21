@@ -307,15 +307,15 @@ Files no listed manifest references follow Lance's seven-day unverified-file
 rule, including temporary manifests. Each orphan Blob sidecar must satisfy
 that age rule itself, even when its parent data file is older.
 
-Each table's result row (under `--json`) carries `bytes_removed`,
-`manifests_removed` (table versions deleted: published ones no retained
-graph commit names, and dead staging), `unpublished_manifests` and
-`unpublished_bytes` (the staging the run found, dead ones included),
-`foreign_versions` (Lance versions above the table's last linear version,
-which the run never deletes) and `error`, set only when the table's trace
-did not finish, in which case its counts are zero. `old_versions_removed`
-stays for one release beside `manifests_removed` and carries the same
-number; nothing defers a table, so the row has no `deferred` field.
+Completed `--json` runs report planning requests under `planning_cost`,
+including table manifests opened as `table_opens`. Each table's result row
+carries `bytes_removed`, `manifests_removed` (table versions deleted: published
+ones no retained graph commit names, and dead staging), `unpublished_manifests`
+and `unpublished_bytes` (the staging the run found, dead ones included),
+`foreign_versions` (Lance versions above the table's last linear version, which
+the run never deletes) and `error` (an unfinished trace, with zero counts).
+`old_versions_removed` aliases `manifests_removed` for one release. No table is
+deferred, so rows have no `deferred` field.
 
 Exit 0 means every table was visited and that nothing a retained graph
 commit pins, and no file such a commit references, was removed. It does not mean every table was collected: read the result rows

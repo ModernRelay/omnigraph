@@ -402,6 +402,8 @@ and deleted branches' refs once nothing needs them. Branch
 deletion and `optimize` leave this reclamation to `cleanup`. On a cluster
 graph the applied policy judges the `--as` actor: `reclaim` for `cleanup`,
 `maintain` for `optimize` and `index`.
+With `--confirm --json`, `planning_cost.table_opens` counts the table manifests
+opened to plan the sweep.
 
 ## Stored Queries
 

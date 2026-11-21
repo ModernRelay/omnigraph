@@ -1,0 +1,1 @@
+- `cleanup --confirm --json` reports collector planning costs, including the number of table manifests opened.
