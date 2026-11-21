@@ -200,6 +200,11 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
   `update` assigning a key or an endpoint is `T93`, and `upsert` or `replace`
   on a type with no `@key` is `T92`. The load modes are `insert`, `upsert`,
   `replace` and `overwrite` ([Mutations and loads](../mutations/index.md#statements)).
+- An assignment may copy a Blob read from its group's row (`content:
+  $f.content`, or under `if` and `coalesce`) in every write statement
+  ([Blobs](../blobs.md#copying-a-blob-from-a-row)). Everywhere else a Blob
+  property is no value: a `let` binding one, `is null` on one, and one under a
+  function outside an assignment are `T24`.
 - A bound plan saved by an earlier release is refused with "unsupported bound
   plan version …; regenerate the saved plan": regenerate it from the query
   ([Explain](explain.md)).

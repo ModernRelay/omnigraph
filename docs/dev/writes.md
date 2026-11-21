@@ -329,9 +329,14 @@ on the write's snapshot, never on the effects earlier groups staged (the GQ 3
 RFC, section 2), so a group whose selection reads a table an earlier group of
 the write changes is refused at type check (`T91`,
 `shape::write::earlier_group_change`); a staged scan and a selection read
-therefore select the same rows. An assignment that reads a Blob from a row is
-refused too (`T86`). Statements of one group see the keyed effects of the
-statements before them: the pending rows hold one current version per id.
+therefore select the same rows. An assignment that reads a Blob from a row
+is lowered to the cells it copies (`shape::write::BlobValue`): the selection
+read returns each source node's or edge's identity (and its type where an
+edge binding matches several), the `if` conditions that choose among them,
+and `exec/blob_copy.rs` reads the chosen cells at the same snapshot, one
+selection batch at a time ([Blob internals](blob.md#copying-a-blob-from-a-row)).
+Statements of one group see the keyed effects of the statements before them:
+the pending rows hold one current version per id.
 
 `MutationStaging` accumulates read-your-writes batches and delete predicates
 in memory. It performs all type, value, uniqueness, endpoint, cardinality, and

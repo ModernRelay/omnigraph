@@ -554,13 +554,14 @@ properties through the binding (`$x.slug`, `$x.@src`). A statement takes no
 `where`: `update T set { … } where …` and `delete T where …` are refused
 (`Q008`), and a write's elements written without `match { }` are refused
 (`Q013`); each diagnostic prints the group form. The selection takes a read's
-traversals, edge bindings, blocks, `let` and `from`, and runs as a read of the
+traversals, edge bindings, blocks, `let`, `from` and `optional`, and runs as a read of the
 graph the write started from:
 `match { $c: Company, $p $k:worksAt $c } where $c.slug = $slug  delete $k`.
 Assignments may read the row (`city: $c.city`; an endpoint as `@dst: $c`), and
-an `insert`, `upsert` or `replace` runs once per row. A `Blob` read from a row is refused
-(`T86`); rows of one statement giving one entity's property two values are
-refused (`E4`).
+an `insert`, `upsert` or `replace` runs once per row. A `Blob` read from a row copies
+that cell (`data: $f.data`, also under `if` and `coalesce`; see
+`references/blobs.md`); rows of one statement giving one entity's property two
+values are refused (`E4`).
 
 ### Insert, upsert and replace
 

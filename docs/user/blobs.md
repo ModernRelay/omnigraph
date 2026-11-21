@@ -163,12 +163,41 @@ write takes its actor from the bearer token, and `--as` there only asserts it. A
 embedded or served, as a graph-commit precondition does. Each write is sent
 once: after an unknown outcome, read the cell before writing again.
 
+### Copying a Blob from a row
+
+A mutation assignment may read a Blob from its group's row, in `update`,
+`insert`, `upsert` and `replace`. Each row writes the cell its row names:
+
+```gq
+query copy_cover($from: String, $to: String) {
+  match { $f: Document, $t: Document } where $f.slug = $from and $t.slug = $to
+  update $t set { content: $f.content }
+}
+```
+
+The value may also be a branch of `if` or an argument of `coalesce`
+(`content: coalesce($f.content, $t.content)`), beside a Blob parameter or
+`null`; a node an `optional` matched nothing for gives null. A copied value is
+the source cell as the write's snapshot holds it, written as the write path
+writes a parameter of the same value: managed bytes are copied, a null cell
+writes null (refused on a non-nullable property), and an external reference to
+a whole object is written as its URI, so it needs the graph's external Blob
+policy to admit its source, and the incremental write copies the object's bytes
+into graph-managed storage. A stored reference to a byte range of an object is
+refused rather than widened to the whole object. The copied bytes count toward
+`write_max_bytes` before any is read, and rows of one statement that give one
+entity two different Blobs are refused (`E4`) without showing either.
+
+A String read from a row and assigned to a Blob property is the Blob's input
+spelling, as a String parameter is: `base64:` bytes or an external URI.
+
 ## Query behavior
 
 Blob properties are not ordinary `.gq` read values. They cannot be projected,
-filtered, ordered, or aggregated. Write them through load or mutation
-assignment, then read an individual Blob value through the dedicated CLI or
-HTTP surface.
+filtered, ordered, aggregated, bound by `let` or tested with `is null`
+(`T24`); the one place a `.gq` text reads a Blob is an assignment that copies
+it. Write them through load or mutation assignment, then read an individual
+Blob value through the dedicated CLI or HTTP surface.
 
 To replace or clear one value, use the CLI, HTTP or embedded writes in
 [Replacing one Blob value](#replacing-one-blob-value); each is an atomic graph

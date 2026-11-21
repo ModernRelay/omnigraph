@@ -295,8 +295,10 @@ a later release lowers it.
 
 | Refused |
 |---|
-| A `Blob` read from a row in an assignment (a write group whose selection reads a type an earlier group changes is `T91`: every group selects on the write's snapshot) |
 | A read that calls itself (`Fix`) |
+
+A write group whose selection reads a type an earlier group of the write
+changes is `T91`, not `T86`: every group selects on the write's snapshot.
 
 ```text
 query reachable($from: String) { match { from union({ match { $p: Person } where $p.handle = $from return { $p as q } }, { match { from reachable($from), $r: Person, $q knows $r } return { $r as q } }) } return distinct { $q } }

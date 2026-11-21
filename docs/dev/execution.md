@@ -333,15 +333,18 @@ with no clauses runs once. Every other group lowers its selection to a read
 shaped by `read_shape` and run by the engine (`engine::execute_selection`)
 against the write's captured snapshot and catalog, with the `now()` the write
 bound: it returns per row the `@id` of each `update` or `delete` variable and
-each assignment value that reads the row. The statement then stages the
-typed membership `id in [ids]` with those values per entity, and an `insert`
-runs once per row; two values for one entity and property through one
+each assignment value that reads the row; a `Blob` read from the row is
+returned as the identity of the node or edge whose cell it copies (with the
+edge type where the binding matches several, and each `if` condition), and
+`exec/blob_copy.rs` reads the chosen cells at the same snapshot
+([Blob internals](blob.md#copying-a-blob-from-a-row)). The statement then
+stages the typed membership `id in [ids]` with those values per entity, and an
+`insert` runs once per row; two values for one entity and property through one
 statement's rows are `E4`. Every group selects on the write's snapshot, so
 the type checker refuses a group whose selection reads a table an earlier
-group writes (`T91`); a selection the read shaper refuses and a `Blob` read
-from a row are not lowered, and since the write shaper is the compiler's too,
-the type checker refuses each with `T86`. Such a write publishes once,
-through the same staging.
+group writes (`T91`); a selection the read shaper refuses is not lowered, and
+since the write shaper is the compiler's too, the type checker would refuse it
+with `T86`. Such a write publishes once, through the same staging.
 
 The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current

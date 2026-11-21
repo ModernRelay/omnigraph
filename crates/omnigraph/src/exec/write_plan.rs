@@ -11,7 +11,7 @@ use omnigraph_compiler::ir::IRParam;
 use omnigraph_compiler::ir::core::CoreWrite;
 use omnigraph_compiler::shape::write::WriteShape;
 pub(crate) use omnigraph_compiler::shape::write::{
-    Assignment, InsertRows, SelectedRows, Selection, WriteOp,
+    Assignment, InsertRows, RowSource, SelectedRows, Selection, WriteOp,
 };
 
 use crate::error::Result;

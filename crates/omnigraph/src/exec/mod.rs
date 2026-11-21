@@ -33,6 +33,7 @@ use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::storage_layer::SnapshotHandle;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
+mod blob_copy;
 mod blob_write;
 pub(crate) mod keep_omitted;
 pub(crate) mod merge;

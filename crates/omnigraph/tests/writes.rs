@@ -2543,6 +2543,285 @@ async fn blob_put_carries_siblings_by_value_and_never_reads_its_target() {
     );
 }
 
+/// An assignment that reads a Blob from its group's row copies the cell the
+/// row selects, read at the write's snapshot: a managed cell's bytes, an
+/// external reference's object (materialized as managed bytes by the keyed
+/// write, under the graph's external Blob policy), and a null cell as null,
+/// in `update`, `insert`, `upsert` and `replace`. A write over several rows
+/// reads each source column's chosen cells in one batched read, and only the
+/// cells a row chooses; their bytes are charged to `write_max_bytes` before
+/// any is read; two rows giving one entity two different Blobs are `E4`; a
+/// ranged external reference is refused without naming its URI. Each write
+/// publishes once.
+#[tokio::test]
+async fn blob_read_from_a_row_copies_the_cell_its_row_selects() {
+    use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+    const SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+edge Feeds: Document -> Document {
+    content: Blob?
+}
+"#;
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("sources");
+    std::fs::create_dir(&source_dir).unwrap();
+    let object = source_dir.join("object.bin");
+    std::fs::write(&object, b"external object").unwrap();
+    let object_uri = url::Url::from_file_path(&object).unwrap().to_string();
+    let allow = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(&source_dir).unwrap(),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let graph_path = root.path().join("graph");
+    let db = helpers::session(
+        Omnigraph::init(graph_path.to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(allow)
+            .unwrap(),
+    );
+    let node = |title: &str, content: Option<&str>| {
+        serde_json::json!({"type": "Document", "data": {"title": title, "content": content}})
+            .to_string()
+    };
+    let edge = |from: &str, to: &str| {
+        serde_json::json!({"edge": "Feeds", "from": from, "to": to, "data": {}}).to_string()
+    };
+    let rows = [
+        node("managed", Some("base64:bWFuYWdlZA==")),
+        node("external", Some(&object_uri)),
+        node("empty", None),
+        node("s1", Some("base64:b25l")),
+        node("s2", Some("base64:dHdv")),
+        node("s3", Some("base64:dGhyZWU=")),
+        node("t1", Some("base64:b2xk")),
+        node("t2", Some("base64:b2xk")),
+        node("t3", Some("base64:b2xk")),
+        node("target", Some("base64:b2xk")),
+        edge("s1", "t1"),
+        edge("s2", "t2"),
+        edge("s3", "t3"),
+    ]
+    .join("\n");
+    db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+    let cell = |title: &str| node_blob_cell("Document", title, "content");
+    let version = || async { snapshot_main(&db).await.unwrap().graph_manifest_version() };
+    let copy = |source: &str, statement: &str| {
+        format!(
+            "query copy() {{ match {{ $s: Document }} where $s.title = \"{source}\" {statement} }}"
+        )
+    };
+
+    // Several rows: one batched read of the source column, one payload per
+    // chosen cell, one publication.
+    let before = version().await;
+    let probes = MergeWriteProbes::default();
+    let result = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            "query fan() { match { $s: Document, $s feeds $t } update $t set { content: $s.content } }",
+            "fan",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 3);
+    assert_eq!(probes.blob_managed_batch_read_calls(), 1);
+    assert_eq!(probes.blob_payload_read_calls(), 3);
+    assert_eq!(version().await, before + 1);
+    for (target, bytes) in [("t1", &b"one"[..]), ("t2", b"two"), ("t3", b"three")] {
+        assert_eq!(
+            read_managed_blob_bytes(&db, "main", cell(target)).await,
+            bytes
+        );
+    }
+
+    // A managed cell, in each statement.
+    for (statement, title) in [
+        (
+            "match { $t: Document } where $t.title = \"target\" update $t set { content: $s.content }",
+            "target",
+        ),
+        (
+            "insert Document { title: \"inserted\", content: $s.content }",
+            "inserted",
+        ),
+        (
+            "upsert Document { title: \"upserted\", content: $s.content }",
+            "upserted",
+        ),
+        (
+            "replace Document { title: \"replaced\", content: $s.content }",
+            "replaced",
+        ),
+    ] {
+        let source = if statement.starts_with("match") {
+            "query copy() { match { $s: Document, $t: Document } where $s.title = \"managed\" and $t.title = \"target\" update $t set { content: $s.content } }".to_string()
+        } else {
+            copy("managed", statement)
+        };
+        mutate_main(&db, &source, "copy", &params(&[]))
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+        assert_eq!(
+            read_managed_blob_bytes(&db, "main", cell(title)).await,
+            b"managed",
+            "{statement}"
+        );
+    }
+
+    // An external reference: the keyed write materializes its object.
+    mutate_main(
+        &db,
+        &copy(
+            "external",
+            "replace Document { title: \"from-external\", content: $s.content }",
+        ),
+        "copy",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_managed_blob_bytes(&db, "main", cell("from-external")).await,
+        b"external object"
+    );
+
+    // A null cell writes null; `coalesce` passes over it, reading only the
+    // cell it chooses.
+    let probes = MergeWriteProbes::default();
+    with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            "query copy() { match { $e: Document, $m: Document, $t: Document } where $e.title = \"empty\" and $m.title = \"managed\" and $t.title = \"t1\" update $t set { content: coalesce($e.content, $m.content) } }",
+            "copy",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(probes.blob_payload_read_calls(), 1);
+    assert_eq!(
+        read_managed_blob_bytes(&db, "main", cell("t1")).await,
+        b"managed"
+    );
+    mutate_main(
+        &db,
+        "query copy() { match { $s: Document, $t: Document } where $s.title = \"empty\" and $t.title = \"t1\" update $t set { content: $s.content } }",
+        "copy",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    let cleared = db
+        .read_blob_at(ReadTarget::branch("main"), cell("t1"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&cleared, OmniError::Manifest(error) if error.kind == omnigraph::error::ManifestErrorKind::NotFound),
+        "{cleared:?}"
+    );
+
+    // The chosen bytes are charged before any is read.
+    let before = version().await;
+    let probes = MergeWriteProbes::default();
+    let refused = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            "set write_max_bytes = 10;\nquery fan() { match { $s: Document, $s feeds $t } update $t set { content: $s.content } }",
+            "fan",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            OmniError::ResourceLimitExceeded {
+                limit: 10,
+                actual: 11,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(probes.blob_payload_read_calls(), 0);
+    assert_eq!(version().await, before);
+
+    // Two different Blobs for one entity are `E4`, and nothing publishes.
+    let two = mutate_main(
+        &db,
+        "query two() { match { $s: Document, $t: Document } where $t.title = \"target\" and ($s.title = \"s1\" or $s.title = \"s2\") update $t set { content: $s.content } }",
+        "two",
+        &params(&[]),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        two.contains("E4") && two.contains("two different Blob values for `content`"),
+        "{two}"
+    );
+    assert_eq!(version().await, before);
+
+    // A ranged external reference is refused without naming its URI.
+    let ranged_dir = tempfile::tempdir().unwrap();
+    let ranged_uri = ranged_dir.path().to_str().unwrap();
+    let ranged_db = Omnigraph::init(
+        ranged_uri,
+        "node Document {\n    title: String @key\n    content: Blob?\n}\n",
+    )
+    .await
+    .unwrap();
+    helpers::seed_ranged_external_blob_row(&ranged_db, ranged_uri).await;
+    let ranged_db = helpers::session(ranged_db);
+    let before = snapshot_main(&ranged_db)
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    let refused = mutate_main(
+        &ranged_db,
+        &copy(
+            "ranged",
+            "replace Document { title: \"copy\", content: $s.content }",
+        ),
+        "copy",
+        &params(&[]),
+    )
+    .await
+    .unwrap_err();
+    let message = refused.to_string();
+    assert!(
+        matches!(&refused, OmniError::Manifest(error) if error.kind == omnigraph::error::ManifestErrorKind::BadRequest),
+        "{refused:?}"
+    );
+    assert!(
+        message.contains("ranged external Blob descriptor (offset 4, length 8)"),
+        "{message}"
+    );
+    assert!(!message.contains("s3://"), "{message}");
+    assert_eq!(
+        snapshot_main(&ranged_db)
+            .await
+            .unwrap()
+            .graph_manifest_version(),
+        before
+    );
+}
+
 /// Under a denying policy a put or clear that must carry a stored external
 /// reference fails with `StoredExternalBlobDenied` naming that sibling, on a
 /// node and on an edge, without effect. A row holding two such cells is

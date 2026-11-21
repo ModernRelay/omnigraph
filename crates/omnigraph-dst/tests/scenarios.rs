@@ -2767,6 +2767,12 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
 /// omits the Blob and the vector (`LoadUpsertKeepBlob1M`), which reads them
 /// from the committed row and rewrites them, and a `replace` load of it
 /// (`LoadReplaceBlob1M`), which reads no stored row.
+///
+/// A Blob read from a row in an assignment: an `update` copying one row's
+/// 1 MiB Blob into another (`UpdateCopyBlob1M`) reads the source cell's
+/// descriptor by its id, then its bytes, and rewrites the target row; a
+/// `replace` copying all four rows' Blobs into four new keys
+/// (`ReplaceCopy4Blob1M`) reads the four source cells in one batched read.
 fn update_patch_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    content: Blob?\n    emb: Vector(8)?\n}\n";
     const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
@@ -2802,6 +2808,14 @@ query upsert_keep_scalars() {
 }
 query replace_existing() {
     replace Doc { slug: "d1", age: 7 }
+}
+query copy_one() {
+    match { $s: Doc, $t: Doc } where $s.slug = "d2" and $t.slug = "d1"
+    update $t set { content: $s.content }
+}
+query copy_all() {
+    match { $s: Doc }
+    replace Doc { slug: concat($s.slug, "-copy"), age: $s.age, content: $s.content }
 }
 "#;
 
@@ -2911,7 +2925,8 @@ query replace_existing() {
             }
             let result = db.mutate("main", UPDATES, self.query, &params).await;
             omnigraph_dst::cost::set_label("_update_verify");
-            assert_eq!(result.unwrap().affected_nodes, 1);
+            let affected = if self.query == "copy_all" { 4 } else { 1 };
+            assert_eq!(result.unwrap().affected_nodes, affected);
         }
     }
 
@@ -2985,6 +3000,15 @@ query replace_existing() {
             "load_replace_existing",
             None,
             "LoadReplaceBlob1M",
+        ),
+        (SCHEMA, 8, 1024 * 1024, "copy_one", None, "UpdateCopyBlob1M"),
+        (
+            SCHEMA,
+            8,
+            1024 * 1024,
+            "copy_all",
+            None,
+            "ReplaceCopy4Blob1M",
         ),
     ] {
         rows.push_str(&labeled_cost_rows(

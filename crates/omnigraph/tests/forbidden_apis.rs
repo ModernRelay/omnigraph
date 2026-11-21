@@ -4560,6 +4560,7 @@ fn lance_batched_blob_read_call_counts_are_pinned() {
                 "db/omnigraph/export.rs".to_string(),
                 1
             ),
+            ("managed_blob_payloads", "exec/blob_copy.rs".to_string(), 1),
             ("managed_blob_payloads", "table_store.rs".to_string(), 1),
             ("read_blobs", "table_store.rs".to_string(), 1),
             ("take_blobs", "blob.rs".to_string(), 1),

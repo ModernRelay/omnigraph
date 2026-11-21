@@ -23,16 +23,17 @@ pub mod write;
 /// The stage is the code's record, never the message's (the RFC's `T86`
 /// rule): a refusal names its construct and says this release does not
 /// support it yet, since a stage named in the message would go stale when
-/// the stage ships. Every refusal of [`read::ReadShape`] and
+/// the stage ships. A refusal of [`read::ReadShape`] and
 /// [`write::WriteShape`] is stage [`ProgrammeStage::B`] unless its call site
-/// sets another; the closure table (`B_IN_PROGRESS` and `LATER` in the
-/// type checker's lowering tests) lists each construct with its stage.
+/// sets another, and none is: B ships when no `T86` names it. The closure
+/// table (`LATER` in the type checker's lowering tests) lists each refused
+/// construct with its stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgrammeStage {
-    /// The break: edition 3 as sections 1 to 7 state it. This release ships
-    /// it in part; a construct of the break the planner does not lower yet
-    /// is a defect that blocks B, reached by lowering the core term
-    /// directly.
+    /// The break: edition 3 as sections 1 to 7 state it. A construct of the
+    /// break the planner does not lower would be a defect that blocks B,
+    /// reached by lowering the core term directly; the lowering tests hold
+    /// that none is.
     B,
     /// Recursion: the `Fix` evaluator.
     Rec,

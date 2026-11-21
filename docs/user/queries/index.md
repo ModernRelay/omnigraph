@@ -259,9 +259,9 @@ than the limit. BM25 reads every matching entity before the final limit.
 
 ## Blobs
 
-A Blob property is not a read value: it cannot be projected, filtered, ordered
-or aggregated (`T24`). Read one Blob cell with the CLI or HTTP Blob endpoint in
-[Blobs](../blobs.md); a Blob parameter remains valid in a mutation assignment.
+A Blob property is not a read value: it cannot be projected, filtered, ordered,
+aggregated, bound by `let` or tested with `is null` (`T24`). [Blobs](../blobs.md)
+reads one cell, and a mutation may [copy one from the row](../blobs.md#copying-a-blob-from-a-row).
 
 ## Branches and historical reads
 

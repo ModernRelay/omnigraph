@@ -3,11 +3,11 @@
 //! planner does not lower is `T86` at its construct, naming the construct
 //! and saying this release does not support it yet, and the closure table
 //! is the test. Every freeze-list row of section 6 that the RFC marks as
-//! working is represented by texts that type check and shape; a construct
-//! of a row this release does not lower yet is `T86`. The stage that adds
-//! each refused construct is recorded here ([`B_IN_PROGRESS`] for stage B,
-//! [`LATER`] for later stages) and by the shaper's [`crate::shape::ProgrammeStage`], and
-//! the two must agree; no message names a stage.
+//! working is represented by texts that type check and shape; stage B ships
+//! when no `T86` names it, so every such text lowers. The stage that adds
+//! each construct a shaper still refuses is recorded here ([`LATER`]) and by
+//! the shaper's [`crate::shape::ProgrammeStage`], and the two must agree; no
+//! message names a stage.
 
 use super::SCHEMA;
 use crate::catalog::{Catalog, build_catalog};
@@ -38,35 +38,6 @@ struct Row {
     surface: &'static str,
     texts: &'static [(&'static str, Outcome)],
 }
-
-/// A construct of a row the RFC marks as working that this build does not
-/// lower yet: `T86` of stage B, at the shaper's refusal whose term is
-/// `site` (its text, a `format!` string's literal parts in order).
-struct InProgress {
-    construct: &'static str,
-    site: &'static str,
-    text: &'static str,
-}
-
-/// Every construct the RFC marks as working that this build refuses with
-/// `T86`, each of stage B. Stage B ships in part: the list must shrink to
-/// empty before the release ships B whole, and it is the acceptance test of
-/// the planner's direct lowering of the core term, which reaches these
-/// forms. Every refusal of the shapers of stage B has an entry here, one
-/// per call site at least
-/// ([`every_refusal_of_the_shapers_is_pinned`]); a term the type checker
-/// never writes is a [`crate::shape::ShapeError::Internal`] defect, not a
-/// refusal, and has none.
-const B_IN_PROGRESS: &[InProgress] = &[
-    // `ReadShape`: a ranking drawn as a read of its own.
-    // `ReadShape`: return items and order keys.
-    // `WriteShape`.
-    InProgress {
-        construct: "an assignment reading a Blob from a row",
-        site: "an assignment that reads a Blob from a row (`{property}`)",
-        text: "query q() { match { $f: File, $g: File } where $f.name = \"a\" and $g.name = \"b\" update $g set { data: $f.data } }",
-    },
-];
 
 /// The shapers' refusals of a later stage, each with the stage, its term
 /// and a text that reaches it.
@@ -453,6 +424,56 @@ const CLOSURE: &[Row] = &[
             ),
         ],
     },
+    // A Blob read from a row, in each statement and through each term the
+    // type checker writes for one: a cell of a node, of an edge whose
+    // binding matches two types, of an `optional`'s node, under `if` and
+    // `coalesce` beside a parameter and `null`; and a String row value
+    // assigned to a Blob, the Blob's input spelling.
+    Row {
+        surface: "Mutation body: a Blob read from a row",
+        texts: &[
+            (
+                "query q() { match { $f: File, $g: File } where $f.name = \"a\" and $g.name = \"b\" update $g set { data: $f.data } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $f: File } insert File { name: concat($f.name, \"-copy\"), data: $f.data } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $f: File } upsert File { name: concat($f.name, \"-copy\"), data: $f.data } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $f: File } replace File { name: concat($f.name, \"-copy\"), data: $f.data } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $f: File, $f $e:(holds | keeps) $g } update $g set { data: $e.data } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $f: File, $f holds $g } update $g set { data: $f.data } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $f: File, optional { $g: File, $f holds $g } } update $f set { data: $g.data } }",
+                Lowers,
+            ),
+            (
+                "query q($b: Blob?) { match { $f: File, $f holds $g } update $f set { data: coalesce($g.data, $f.data, $b) } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $f: File, $f holds $g } update $f set { data: if($g.note = \"x\", $g.data, null) } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $f: File } update $f set { data: $f.note } }",
+                Lowers,
+            ),
+        ],
+    },
     Row {
         surface: "Traversal",
         texts: &[
@@ -543,7 +564,7 @@ const CLOSURE: &[Row] = &[
 /// assignment may read from a row.
 fn catalog() -> Catalog {
     let schema = format!(
-        "{SCHEMA}\nnode File {{ name: String @key  data: Blob? }}\nnode Memo {{ slug: String @key  text: String @index(fulltext, analyzer = \"standard_v1\")  embedding: Vector(3) @index }}\n"
+        "{SCHEMA}\nnode File {{ name: String @key  data: Blob?  note: String? }}\nedge Holds: File -> File {{ data: Blob? }}\nedge Keeps: File -> File {{ data: Blob? }}\nnode Memo {{ slug: String @key  text: String @index(fulltext, analyzer = \"standard_v1\")  embedding: Vector(3) @index }}\n"
     );
     build_catalog(&parse_schema(&schema).expect("the schema parses")).unwrap()
 }
@@ -606,7 +627,6 @@ fn refused_stage(d: &QueryDiagnostic, text: &str) -> &'static str {
 
 #[test]
 fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
-    let mut pending = Vec::new();
     for row in CLOSURE {
         for (text, want) in row.texts {
             let got = match outcome(text) {
@@ -625,18 +645,14 @@ fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
                 }
             };
             assert_eq!(got, *want, "{}:\n{text}", row.surface);
-            if got == Refused("B") {
-                pending.push(*text);
-            }
+            // Stage B ships: no `T86` names it.
+            assert_ne!(
+                got,
+                Refused("B"),
+                "{}: a T86 of stage B:\n{text}",
+                row.surface
+            );
         }
-    }
-    // A row the RFC marks as working that this build refuses is stage B in
-    // progress: a listed construct.
-    for text in pending {
-        assert!(
-            B_IN_PROGRESS.iter().any(|entry| entry.text == text),
-            "a stage B refusal that `B_IN_PROGRESS` does not list:\n{text}"
-        );
     }
 }
 
@@ -757,12 +773,11 @@ fn names_site(message: &str, site: &str) -> bool {
         })
 }
 
-/// Every refusal the shapers can make is pinned: a refusal of stage B by
-/// the constructs of [`B_IN_PROGRESS`] that reach it, at least one per
-/// call site, and one of a later stage by [`LATER`]. Each text type checks
-/// to `T86` stating the site's term, and the shaper records the entry's
-/// stage, so a new refusal without an entry, an entry whose refusal is gone,
-/// an entry whose stage moved, or a text that no longer reaches its refusal
+/// Every refusal the shapers can make is pinned, each of a later stage
+/// ([`LATER`]): no shaper refuses a term of stage B. Each text type checks to
+/// `T86` stating the site's term, and the shaper records the entry's stage,
+/// so a new refusal without an entry, an entry whose refusal is gone, an
+/// entry whose stage moved, or a text that no longer reaches its refusal
 /// fails here.
 #[test]
 fn every_refusal_of_the_shapers_is_pinned() {
@@ -785,27 +800,13 @@ fn every_refusal_of_the_shapers_is_pinned() {
     for site in distinct {
         let calls = sites.iter().filter(|s| *s == site).count();
         let later = LATER.iter().filter(|(_, s, _)| s == site).count();
-        let in_progress = B_IN_PROGRESS.iter().filter(|e| e.site == site).count();
-        if later + in_progress < calls {
+        if later < calls {
             unpinned.push(format!("{site} ({calls} calls)"));
         }
     }
     assert!(unpinned.is_empty(), "refusals with no entry: {unpinned:#?}");
-    for entry in B_IN_PROGRESS {
-        assert!(
-            sites.iter().any(|s| s == entry.site),
-            "`{}` names a refusal no shaper makes: {}",
-            entry.construct,
-            entry.site
-        );
-        let (message, named) = stage(entry.text);
-        assert_eq!(named, "B", "{}: {message}", entry.construct);
-        assert!(
-            names_site(&message, entry.site),
-            "{}: the refusal is not `{}`: {message}",
-            entry.construct,
-            entry.site
-        );
+    for (want, _, _) in LATER {
+        assert_ne!(*want, "B", "a shaper refusal of stage B");
     }
     for (want, site, text) in LATER {
         assert!(sites.iter().any(|s| s == site), "no shaper refuses {site}");

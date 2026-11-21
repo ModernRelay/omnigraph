@@ -14,26 +14,31 @@
 //! per row, the identity of each `update` or `delete` variable and the value
 //! of each assignment that reads the row; that statement then selects exactly
 //! those identities, and an `insert` runs once per row. An `insert` with no
-//! clauses runs once.
+//! clauses runs once. A Blob is no read value, so an assignment of a Blob
+//! read from the row is lowered to the cells it copies ([`BlobValue`]): the
+//! read returns the identity of each node or edge whose Blob it names, the
+//! `if` conditions that choose among them, and an edge's type where its
+//! binding matches more than one, and the engine reads the cells those rows
+//! select at the same snapshot.
 //!
 //! Every group selects on the write's one snapshot, never on the effects the
 //! groups before it staged, so the type checker refuses a group whose
 //! selection reads a table an earlier group of the write changes (`T91`,
 //! [`earlier_group_change`]): there the snapshot and the staged effects
-//! would answer differently. A selection the read shaper does not lower, and
-//! an assignment that reads a Blob from a row, are not lowered in this
-//! release.
+//! would answer differently. A selection the read shaper does not lower is
+//! not lowered in this release.
 
 use std::collections::BTreeSet;
 
+use super::ShapeError;
 use super::read::ReadShape;
-use super::{Construct, ShapeError, Unlowered};
 use crate::catalog::Catalog;
 use crate::ir::IRExpr;
 use crate::ir::IRParam;
 use crate::ir::core::{
     AssignValue, CoreRead, CoreWrite, MutationTarget, RelTy, Sink, Term, Ty, WriteGroup,
 };
+use crate::ir::expr::ScalarFunc;
 use crate::query::file::Param;
 use crate::query::syntax::InsertMode;
 use crate::query::value::{BinaryOp, Literal};
@@ -49,12 +54,52 @@ pub struct Assignment {
     pub value: IRExpr,
 }
 
-/// An assignment whose value reads its group's row: the property and the
-/// selection read's result column that holds the value.
+/// An assignment whose value reads its group's row: the property and where
+/// the selection read holds its value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowValue {
     pub property: String,
-    pub column: usize,
+    pub value: RowSource,
+}
+
+/// Where a row-read assignment's value is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowSource {
+    /// The selection read's result column at this index. A String assigned
+    /// to a Blob property is the Blob's input spelling, as a constant's is.
+    Column(usize),
+    /// A Blob read from the row: the cells the row selects.
+    Blob(BlobValue),
+}
+
+/// A Blob value an assignment reads from its group's row, as the term the
+/// type checker built states it, over the selection read's result columns.
+/// The engine reads the cells each row selects at the write's snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BlobValue {
+    /// The Blob `property` of the node or edge whose identity is in the
+    /// column `id`, stored in the table of one of `sources`: the one, or for
+    /// an edge binding that matches several types the one the column
+    /// `edge_type` names. No cell, a null value, where the identity is null
+    /// (an `optional` that matched nothing).
+    Cell {
+        sources: Vec<MutationTarget>,
+        property: String,
+        id: usize,
+        edge_type: Option<usize>,
+    },
+    /// A value that reads no row, a parameter or `null`: the Blob's input
+    /// spelling, evaluated once.
+    Constant(IRExpr),
+    /// `if(c, a, b)`: `then` where the column `condition` is true, else
+    /// `otherwise`.
+    If {
+        condition: usize,
+        then: Box<BlobValue>,
+        otherwise: Box<BlobValue>,
+    },
+    /// `coalesce(a, …)`: the first argument that is not null, else null.
+    Coalesce(Vec<BlobValue>),
 }
 
 /// The rows of a group's selection read that one statement runs over.
@@ -145,11 +190,6 @@ pub struct WriteShape {
     /// The core read of each selection, at the same index: what plan
     /// acceptance derives the placement of its conjuncts from.
     pub selection_reads: Vec<CoreRead>,
-}
-
-/// A term of the break that this release does not lower, at `construct`.
-fn unsupported(name: &str, what: impl std::fmt::Display, construct: Construct) -> ShapeError {
-    ShapeError::unlowered(Unlowered::new(name, what, construct))
 }
 
 impl WriteShape {
@@ -404,11 +444,7 @@ fn lower_selected(
             items.len() - 1
         }
     };
-    let identity = |var: &str| IRExpr::PropAccess {
-        variable: var.to_string(),
-        property: catalog.system_columns.id.to_string(),
-        ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, false)),
-    };
+    let identity = |var: &str| identity_of(catalog, var);
     let mut ops = Vec::new();
     for (i, sink) in group.sinks.iter().enumerate() {
         let statement = format!("statement {} of group {}", i + 1, g + 1);
@@ -435,28 +471,17 @@ fn lower_selected(
             let AssignValue::Expr(e) = value else {
                 unreachable!("a null reads no row")
             };
-            if blob_property(catalog, target, property)
-                || matches!(
-                    e.ty(),
-                    ExprType::Value {
-                        scalar: ScalarType::Blob,
-                        ..
-                    }
-                )
-            {
-                return Err(unsupported(
-                    name,
-                    format!("an assignment that reads a Blob from a row (`{property}`)"),
-                    Construct::Assignment(g, i, property.clone()),
-                ));
-            }
-            let item = match e {
-                IRExpr::Variable(var, ExprType::Node { .. }) => identity(var),
-                other => other.clone(),
+            let value = if is_blob(e.ty()) {
+                RowSource::Blob(blob_value(name, e, &group.input, catalog, &mut column)?)
+            } else {
+                RowSource::Column(column(match e {
+                    IRExpr::Variable(var, ExprType::Node { .. }) => identity(var),
+                    other => other.clone(),
+                }))
             };
             values.push(RowValue {
                 property: property.clone(),
-                column: column(item),
+                value,
             });
         }
         let rows = |identity: Option<usize>| SelectedRows {
@@ -535,17 +560,206 @@ fn lower_selected(
     Ok((core, shape, ops))
 }
 
-fn blob_property(catalog: &Catalog, target: &MutationTarget, property: &str) -> bool {
-    match target {
-        MutationTarget::Node { type_name } => catalog
-            .node_types
-            .get(type_name)
-            .is_some_and(|t| t.blob_properties.contains(property)),
-        MutationTarget::Edge { type_name } => catalog
-            .edge_types
-            .get(type_name)
-            .is_some_and(|t| t.blob_properties.contains(property)),
+/// The identity of the node or edge `var` holds.
+fn identity_of(catalog: &Catalog, var: &str) -> IRExpr {
+    IRExpr::PropAccess {
+        variable: var.to_string(),
+        property: catalog.system_columns.id.to_string(),
+        ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, false)),
     }
+}
+
+fn is_blob(ty: &ExprType) -> bool {
+    matches!(
+        ty,
+        ExprType::Value {
+            scalar: ScalarType::Blob,
+            ..
+        }
+    )
+}
+
+/// `e`, a Blob value an assignment of `write` reads from the row of
+/// `input`, as the cells it copies, each column it reads added through
+/// `column`. The type checker reads a Blob as a value only there and in the
+/// `if` branches and `coalesce` arguments that are the value, so every other
+/// term is a defect.
+fn blob_value(
+    write: &str,
+    e: &IRExpr,
+    input: &Term,
+    catalog: &Catalog,
+    column: &mut impl FnMut(IRExpr) -> usize,
+) -> Result<BlobValue> {
+    crate::stack::deep(|| {
+        if e.columns_empty() {
+            return Ok(BlobValue::Constant(e.clone()));
+        }
+        match e {
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => {
+                let binding = binding_in(input, variable);
+                let nullable = binding.as_ref().is_some_and(Ty::nullable);
+                let sources = match binding {
+                    Some(Ty::Node { type_name, .. }) => {
+                        vec![MutationTarget::Node { type_name }]
+                    }
+                    Some(Ty::Edge { type_name, .. }) => type_name
+                        .split('|')
+                        .map(|name| MutationTarget::Edge {
+                            type_name: name.to_string(),
+                        })
+                        .collect(),
+                    _ => {
+                        return Err(ShapeError::Internal(format!(
+                            "`{write}` assigns the Blob `${variable}.{property}`, which its selection binds to no node or edge"
+                        )));
+                    }
+                };
+                // Both columns are null on a row an `optional` kept without
+                // a match, where the binding is nullable.
+                let nullable_string =
+                    ExprType::from_prop(&PropType::scalar(ScalarType::String, nullable));
+                let edge_type = (sources.len() > 1).then(|| {
+                    column(IRExpr::PropAccess {
+                        variable: variable.clone(),
+                        property: crate::traversal::EDGE_TYPE_COLUMN.to_string(),
+                        ty: nullable_string.clone(),
+                    })
+                });
+                Ok(BlobValue::Cell {
+                    sources,
+                    property: property.clone(),
+                    id: column(IRExpr::PropAccess {
+                        variable: variable.clone(),
+                        property: catalog.system_columns.id.to_string(),
+                        ty: nullable_string,
+                    }),
+                    edge_type,
+                })
+            }
+            IRExpr::Call {
+                func: ScalarFunc::If,
+                args,
+                ..
+            } => match args.as_slice() {
+                [condition, then, otherwise] => Ok(BlobValue::If {
+                    condition: column(condition.clone()),
+                    then: Box::new(blob_value(write, then, input, catalog, column)?),
+                    otherwise: Box::new(blob_value(write, otherwise, input, catalog, column)?),
+                }),
+                _ => Err(ShapeError::Internal(format!(
+                    "`{write}` assigns an `if` of {} arguments",
+                    args.len()
+                ))),
+            },
+            IRExpr::Call {
+                func: ScalarFunc::Coalesce,
+                args,
+                ..
+            } => Ok(BlobValue::Coalesce(
+                args.iter()
+                    .map(|arg| blob_value(write, arg, input, catalog, column))
+                    .collect::<Result<_>>()?,
+            )),
+            other => Err(ShapeError::Internal(format!(
+                "`{write}` assigns the Blob value `{other}`, which the type checker does not write"
+            ))),
+        }
+    })
+}
+
+/// The node or edge type `variable` holds where `term` binds it: a node
+/// type, or an edge type or selector (`A|B`).
+fn binding_in(term: &Term, variable: &str) -> Option<Ty> {
+    let reference = |ty: &ExprType| match ty {
+        ExprType::Node {
+            type_name,
+            nullable,
+        } => Some(Ty::Node {
+            type_name: type_name.clone(),
+            nullable: *nullable,
+        }),
+        ExprType::Edge {
+            type_name,
+            nullable,
+        } => Some(Ty::Edge {
+            type_name: type_name.clone(),
+            nullable: *nullable,
+        }),
+        ExprType::Value { .. } | ExprType::ExactInteger { .. } => None,
+    };
+    crate::stack::deep(|| match term {
+        Term::Unit | Term::RecRef { .. } => None,
+        Term::Env(cols) => cols
+            .iter()
+            .find(|col| col.name == variable && col.ty.is_reference())
+            .map(|col| col.ty.clone()),
+        Term::Scan { var, ty } => (var == variable && ty.is_reference()).then(|| ty.clone()),
+        Term::Expand {
+            input,
+            src,
+            dst,
+            src_type,
+            dst_type,
+            edges,
+            edge_var,
+            ..
+        } => {
+            if dst == variable {
+                Some(Ty::Node {
+                    type_name: dst_type.clone(),
+                    nullable: false,
+                })
+            } else if src == variable {
+                Some(Ty::Node {
+                    type_name: src_type.clone(),
+                    nullable: false,
+                })
+            } else if edge_var.as_deref() == Some(variable) {
+                Some(Ty::Edge {
+                    type_name: edges
+                        .members()
+                        .iter()
+                        .map(|member| member.edge_type.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                    nullable: false,
+                })
+            } else {
+                binding_in(input, variable)
+            }
+        }
+        Term::Project { input, items, .. } => items
+            .iter()
+            .find(|(name, _)| name == variable)
+            .and_then(|(_, e)| reference(e.ty()))
+            .or_else(|| binding_in(input, variable)),
+        Term::Group { input, keys, .. } => keys
+            .iter()
+            .find(|(name, _)| name == variable)
+            .and_then(|(_, e)| reference(e.ty()))
+            .or_else(|| binding_in(input, variable)),
+        Term::Filter { input, .. }
+        | Term::Order { input, .. }
+        | Term::Cut { input, .. }
+        | Term::Score { input, .. }
+        | Term::ApproxTopK { input, .. } => binding_in(input, variable),
+        Term::Correlate { outer, inner, .. } => {
+            binding_in(inner, variable).or_else(|| binding_in(outer, variable))
+        }
+        // An `optional` is the union of its pattern and a row of nulls where
+        // the pattern matched nothing: a name either arm reads as nullable
+        // is nullable.
+        Term::Union { left, right } => {
+            let (left, right) = (binding_in(left, variable), binding_in(right, variable));
+            let nullable = left.iter().chain(&right).any(Ty::nullable);
+            left.or(right).map(|ty| ty.with_nullable(nullable))
+        }
+        Term::Fuse { arms, .. } => arms.first().and_then(|arm| binding_in(arm, variable)),
+        Term::Fix { body, .. } | Term::Call { body, .. } => binding_in(body, variable),
+    })
 }
 
 /// A write group whose selection reads a table an earlier group of the same

@@ -5,7 +5,7 @@ use crate::engine::{
     MAX_NULL_SPLIT_COLUMNS, evaluate_constant, exceeds_null_split_columns, fill_declared_params,
     id_in_list_expr, ir_expr_to_df_expr, literal_at, validate_params,
 };
-use crate::exec::write_plan::{InsertRows, SelectedRows, Selection};
+use crate::exec::write_plan::{InsertRows, RowSource, SelectedRows, Selection};
 use crate::instrumentation::record_mutation_table_open;
 use crate::loader::append_blob_value;
 use crate::seams::{decide_seam, fail};
@@ -832,6 +832,7 @@ fn apply_assignments(
     assignments: &HashMap<String, Literal>,
     blob_properties: &HashSet<String>,
     write_budget: WriteBudget,
+    row_values: Option<&RowValues>,
 ) -> Result<RecordBatch> {
     preflight_blob_assignments(assignments, blob_properties, batch.num_rows(), write_budget)?;
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(full_schema.fields().len());
@@ -851,6 +852,11 @@ fn apply_assignments(
                         "Blob property '{}' assigned non-string constant {other:?}",
                         field.name()
                     )));
+                }
+                // Assigned per row: left out of the scan, a placeholder the
+                // row values replace (`apply_row_values`).
+                None if row_values.is_some_and(|values| values.assigns(field.name())) => {
+                    build_null_blob_array(batch.num_rows())?
                 }
                 // Unassigned: the materializing scan must have normalized the
                 // committed value (or pending value) to the logical blob
@@ -1001,14 +1007,21 @@ impl RowValues {
     }
 
     /// `constants` with each per-row property at the value whose one-row
-    /// array is widest: what a column patch plans its bytes from.
+    /// array is widest: what a column patch plans its bytes from. A Blob
+    /// property is planned at null: Lance patches no Blob column, so its
+    /// presence alone takes the update off the patch path.
     fn widest(
         &self,
         schema: &Schema,
         constants: &HashMap<String, Literal>,
+        blob_properties: &HashSet<String>,
     ) -> Result<HashMap<String, Literal>> {
         let mut planned = constants.clone();
         for (p, property) in self.properties.iter().enumerate() {
+            if blob_properties.contains(property) {
+                planned.insert(property.clone(), Literal::Null);
+                continue;
+            }
             let field = schema.field_with_name(property).map_err(|_| {
                 OmniError::manifest_internal(format!("update assigns unknown column '{property}'"))
             })?;
@@ -1089,6 +1102,8 @@ fn apply_row_values(
     batch: RecordBatch,
     values: Option<&RowValues>,
     id_column: &str,
+    blob_properties: &HashSet<String>,
+    write_budget: WriteBudget,
 ) -> Result<RecordBatch> {
     let Some(values) = values else {
         return Ok(batch);
@@ -1105,20 +1120,38 @@ fn apply_row_values(
         let (index, field) = schema.column_with_name(property).ok_or_else(|| {
             OmniError::manifest_internal(format!("update batch lacks column '{property}'"))
         })?;
+        let value_at = |row: usize| {
+            values
+                .by_id
+                .get(ids.value(row))
+                .map(|entity| &entity[p])
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "update matched '{}', which its selection did not select",
+                        ids.value(row)
+                    ))
+                })
+        };
+        // A Blob value is the Blob's input spelling, built by the Blob
+        // write path as a constant's is.
+        if blob_properties.contains(property) {
+            let mut builder = BlobArrayBuilder::new(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                match value_at(row)? {
+                    Literal::String(value) => append_blob_value(&mut builder, value, write_budget)?,
+                    Literal::Null => builder.push_null().map_err(OmniError::lance_internal)?,
+                    other => {
+                        return Err(OmniError::manifest_internal(format!(
+                            "Blob property '{property}' assigned non-string value {other:?}"
+                        )));
+                    }
+                }
+            }
+            columns[index] = builder.finish().map_err(OmniError::lance_internal)?;
+            continue;
+        }
         let rows = (0..batch.num_rows())
-            .map(|row| {
-                let value = values
-                    .by_id
-                    .get(ids.value(row))
-                    .map(|entity| &entity[p])
-                    .ok_or_else(|| {
-                        OmniError::manifest_internal(format!(
-                            "update matched '{}', which its selection did not select",
-                            ids.value(row)
-                        ))
-                    })?;
-                literal_to_typed_array(value, field.data_type(), 1)
-            })
+            .map(|row| literal_to_typed_array(value_at(row)?, field.data_type(), 1))
             .collect::<Result<Vec<_>>>()?;
         let rows: Vec<&dyn Array> = rows.iter().map(|row| row.as_ref()).collect();
         columns[index] = if rows.is_empty() {
@@ -1178,11 +1211,30 @@ fn id_membership(ids: &[String], id_column: &str) -> IRExpr {
     }
 }
 
-/// The value at `row` of each row-read assignment of `rows`.
-fn row_literals(batch: &RecordBatch, rows: &SelectedRows, row: usize) -> Result<Vec<Literal>> {
+/// The value at `row` of each row-read assignment of `rows`: a column's
+/// value, or a Blob's from `blobs` ([`super::blob_copy::BlobCopy::values`]),
+/// taken from it.
+fn row_literals(
+    batch: &RecordBatch,
+    rows: &SelectedRows,
+    row: usize,
+    blobs: &mut [Option<Vec<Literal>>],
+) -> Result<Vec<Literal>> {
     rows.values
         .iter()
-        .map(|value| literal_at(batch.column(value.column), row))
+        .zip(blobs.iter_mut())
+        .map(|(value, blob)| match (&value.value, blob) {
+            (RowSource::Column(column), _) => literal_at(batch.column(*column), row),
+            (RowSource::Blob(_), Some(values)) => Ok(std::mem::replace(
+                values.get_mut(row).ok_or_else(|| {
+                    OmniError::manifest_internal("a copied Blob value is missing its row")
+                })?,
+                Literal::Null,
+            )),
+            (RowSource::Blob(_), None) => Err(OmniError::manifest_internal(
+                "a Blob row value was not read",
+            )),
+        })
         .collect()
 }
 
@@ -1196,19 +1248,27 @@ fn two_values(
     property: &str,
     one: &Literal,
     other: &Literal,
+    blob: bool,
 ) -> OmniError {
-    let (one, other) = (one.to_string(), other.to_string());
-    let (first, second) = if one <= other {
-        (one, other)
+    // A Blob is shown by neither its bytes nor its URI, so two Blob values
+    // are named only as different.
+    let values = if blob {
+        format!("two different Blob values for `{property}`")
     } else {
-        (other, one)
+        let (one, other) = (one.to_string(), other.to_string());
+        let (first, second) = if one <= other {
+            (one, other)
+        } else {
+            (other, one)
+        };
+        format!("two values for `{property}`, {first} and {second}")
     };
     OmniError::Compiler(omnigraph_compiler::error::CompilerError::query(
         omnigraph_compiler::query::diagnostic::QueryDiagnostic::execution(
             omnigraph_compiler::query::codes::E4,
             format!(
-                "`{name}`: the rows of {} give {entity} two values for `{property}`, {first} \
-                 and {second}; the rows of one statement must agree on each entity's value",
+                "`{name}`: the rows of {} give {entity} {values}; the rows of one statement \
+                 must agree on each entity's value",
                 rows.statement
             ),
         ),
@@ -1226,11 +1286,12 @@ fn literal_bytes(literal: &Literal) -> usize {
         }
 }
 
-fn selected_entities(
+async fn selected_entities(
     name: &str,
     target: &MutationTarget,
     rows: &SelectedRows,
     read: &crate::engine::SelectionRead,
+    copy: &mut super::blob_copy::BlobCopy<'_>,
 ) -> Result<SelectedEntities> {
     let identity = rows.identity.ok_or_else(|| {
         OmniError::manifest_internal("an update or delete selection names no identity column")
@@ -1254,13 +1315,14 @@ fn selected_entities(
                     column.data_type()
                 ))
             })?;
+        let mut blobs = copy.values(rows, batch).await?;
         for row in 0..batch.num_rows() {
             // A row whose variable is unbound names no entity.
             if id_values.is_null(row) {
                 continue;
             }
             let id = id_values.value(row);
-            let values = row_literals(batch, rows, row)?;
+            let values = row_literals(batch, rows, row, &mut blobs)?;
             match by_id.get(id) {
                 None => {
                     added += 1;
@@ -1277,6 +1339,7 @@ fn selected_entities(
                             &rows.values[p].property,
                             &earlier[p],
                             &values[p],
+                            matches!(rows.values[p].value, RowSource::Blob(_)),
                         ));
                     }
                 }
@@ -1303,7 +1366,8 @@ fn selected_entities(
 /// `E4`; an unkeyed insert writes one entity per row. The maps, and the key
 /// index of a keyed insert, are charged to the selection read's pool through
 /// the returned charge, which the caller holds as long as the maps.
-fn inserted_entities(
+#[allow(clippy::too_many_arguments)]
+async fn inserted_entities(
     name: &str,
     catalog: &Catalog,
     target: &MutationTarget,
@@ -1311,6 +1375,7 @@ fn inserted_entities(
     rows: &SelectedRows,
     read: &crate::engine::SelectionRead,
     params: &ParamMap,
+    copy: &mut super::blob_copy::BlobCopy<'_>,
 ) -> Result<(Vec<HashMap<String, Literal>>, crate::engine::PoolCharge)> {
     let charge = read.charge("write selection inserts")?;
     let read = read.result();
@@ -1347,12 +1412,18 @@ fn inserted_entities(
     };
     let mut out: Vec<HashMap<String, Literal>> = Vec::new();
     let mut keyed: HashMap<Vec<Literal>, usize> = HashMap::new();
+    let blob_properties = UpdatedType::of(catalog, target)?.blob_properties;
     for batch in read.batches() {
         charge.work(batch.num_rows() as u64)?;
         let (mut kept, mut entries, mut bytes) = (0usize, 0usize, 0usize);
+        let mut blobs = copy.values(rows, batch).await?;
         for row in 0..batch.num_rows() {
             let mut values = constants.clone();
-            for (value, literal) in rows.values.iter().zip(row_literals(batch, rows, row)?) {
+            for (value, literal) in rows
+                .values
+                .iter()
+                .zip(row_literals(batch, rows, row, &mut blobs)?)
+            {
                 values.insert(value.property.clone(), literal);
             }
             let Some(key) = &key else {
@@ -1394,6 +1465,7 @@ fn inserted_entities(
                             property,
                             earlier.get(property).unwrap_or(&Literal::Null),
                             &values[property],
+                            blob_properties.contains(property.as_str()),
                         ));
                     }
                 }
@@ -2440,6 +2512,13 @@ impl Omnigraph {
                             let read =
                                 selection_rows(ir, rows.read, &mut selected, params, txn, reader)
                                     .await?;
+                            let mut copy = super::blob_copy::BlobCopy::new(
+                                &txn.base,
+                                &txn.catalog,
+                                params,
+                                &ir.name,
+                                staging.write_budget(),
+                            );
                             let (rows, charge) = inserted_entities(
                                 &ir.name,
                                 &txn.catalog,
@@ -2448,7 +2527,9 @@ impl Omnigraph {
                                 rows,
                                 read,
                                 params,
-                            )?;
+                                &mut copy,
+                            )
+                            .await?;
                             (rows, Some(charge))
                         }
                     };
@@ -2488,7 +2569,15 @@ impl Omnigraph {
                             let read =
                                 selection_rows(ir, rows.read, &mut selected, params, txn, reader)
                                     .await?;
-                            let entities = selected_entities(&ir.name, target, rows, read)?;
+                            let mut copy = super::blob_copy::BlobCopy::new(
+                                &txn.base,
+                                &txn.catalog,
+                                params,
+                                &ir.name,
+                                staging.write_budget(),
+                            );
+                            let entities =
+                                selected_entities(&ir.name, target, rows, read, &mut copy).await?;
                             if entities.ids.is_empty() {
                                 MutationResult::default()
                             } else {
@@ -2517,7 +2606,15 @@ impl Omnigraph {
                         let read =
                             selection_rows(ir, rows.read, &mut selected, params, txn, reader)
                                 .await?;
-                        let entities = selected_entities(&ir.name, target, rows, read)?;
+                        let mut copy = super::blob_copy::BlobCopy::new(
+                            &txn.base,
+                            &txn.catalog,
+                            params,
+                            &ir.name,
+                            staging.write_budget(),
+                        );
+                        let entities =
+                            selected_entities(&ir.name, target, rows, read, &mut copy).await?;
                         // A chunk of ids at a time, so no predicate the delete
                         // evaluates grows with the selection. The chunks are
                         // disjoint, and each statement's scan leaves out the
@@ -2862,12 +2959,16 @@ impl Omnigraph {
         }
         let blob_props = node_type.blob_properties.clone();
         preflight_blob_assignments(&resolved, &blob_props, 1, staging.write_budget())?;
-        // Catalog order is kept: `concat_match_batches_to_schema` binds by position.
+        // Catalog order is kept: `concat_match_batches_to_schema` binds by
+        // position. A Blob a row value assigns is left out as a constant's
+        // is: its old cell is never read.
         let assigned_blobs = schema
             .fields()
             .iter()
             .filter(|field| {
-                blob_props.contains(field.name()) && resolved.contains_key(field.name())
+                blob_props.contains(field.name())
+                    && (resolved.contains_key(field.name())
+                        || row_values.is_some_and(|values| values.assigns(field.name())))
             })
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
@@ -2933,7 +3034,7 @@ impl Omnigraph {
         // The plan reads the assigned columns and the widest value each one
         // takes, a per-row value at its widest.
         let planned = match row_values {
-            Some(values) => values.widest(&schema, &resolved)?,
+            Some(values) => values.widest(&schema, &resolved, node_type.blob_properties)?,
             None => resolved.clone(),
         };
         let id_column = catalog.system_columns.id;
@@ -2989,8 +3090,15 @@ impl Omnigraph {
                         &resolved,
                         &blob_props,
                         staging.write_budget(),
+                        row_values,
                     )?;
-                    let updated = apply_row_values(updated, row_values, id_column)?;
+                    let updated = apply_row_values(
+                        updated,
+                        row_values,
+                        id_column,
+                        &blob_props,
+                        staging.write_budget(),
+                    )?;
                     let updated = rows_that_change(&matched, updated, &resolved, row_values)?;
                     staging.append_column_patch(&table_key, updated, plan.patch_columns.clone())
                 };
@@ -3009,8 +3117,15 @@ impl Omnigraph {
                         &resolved,
                         &blob_props,
                         staging.write_budget(),
+                        row_values,
                     )?;
-                    let updated = apply_row_values(updated, row_values, id_column)?;
+                    let updated = apply_row_values(
+                        updated,
+                        row_values,
+                        id_column,
+                        &blob_props,
+                        staging.write_budget(),
+                    )?;
                     let updated = rows_that_change(&matched, updated, &resolved, row_values)?;
                     let updated_schema = updated.schema();
                     // A refused row rewrite takes the patch, so admission
@@ -3105,8 +3220,15 @@ impl Omnigraph {
             &resolved,
             &blob_props,
             staging.write_budget(),
+            row_values,
         )?;
-        let updated = apply_row_values(updated, row_values, id_column)?;
+        let updated = apply_row_values(
+            updated,
+            row_values,
+            id_column,
+            &blob_props,
+            staging.write_budget(),
+        )?;
         let updated = rows_that_change(&matched, updated, &resolved, row_values)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
