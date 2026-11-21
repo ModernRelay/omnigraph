@@ -5712,7 +5712,8 @@ async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
         .sum();
     assert!(
         report.cost.table_opens <= listed,
-        "each listed manifest opens at most once, a chain link at the open that finds its predecessor; {} opens exceed the {listed} listed manifests: {:?}",
+        "each listed manifest opens at most once, a chain link at the open that finds its predecessor; {} opens exceed the {listed} listed manifests: {:?}. \
+         The bound holds only while no table forks: `table_opens` also counts the opens of native-tree versions that retained forks borrow from, which no plan lists",
         report.cost.table_opens,
         report.cost
     );

@@ -432,9 +432,9 @@ async fn delete_files(
 }
 
 /// Delete one object and return its size (`known` when the listing gave it).
-/// An object an earlier pass removed counts nothing when the store reports it
-/// absent; S3 reports a delete of an absent key as done, so a `known` size
-/// counts there.
+/// An object an earlier pass removed counts nothing only on a store that
+/// reports it absent: S3 and the read-through store report the delete of an
+/// absent key as done, so a `known` size counts there.
 async fn delete_object(
     store: &lance::io::ObjectStore,
     path: &object_store::path::Path,
