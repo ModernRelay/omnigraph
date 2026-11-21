@@ -185,9 +185,10 @@ branch ref files are unlinked after it.
   `created_at`, attempt id), a `-` under a retired branch's key, and a
   tombstone on a deleted branch's own chain. `supports_branch_rows` keys on
   `main`'s stamp: at or above 18 the binary reads the branch set from the rows,
-  writes no ref file, and refuses to write a row or a tombstone on a chain
-  stamped below 18 (`require_branch_rows`); below 18 the ref protocol runs
-  untouched. A v17 binary refuses the stamp before any open. No publication
+  writes no ref file, and refuses to write a row on a main stamped below 18
+  (`require_branch_rows`); a tombstone lands on a chain whatever its stamp,
+  since a branch forked from a version of main written before the upgrade
+  carries that version's; below 18 the ref protocol runs untouched. A v17 binary refuses the stamp before any open. No publication
   raises a branch to 18. The stamp-only route of `omnigraph upgrade` stamps a
   v14 to v17 graph: main's stamp commit carries a `branch` row per live ref
   and a retired row per retired ref, each other live ref takes its own

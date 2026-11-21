@@ -3033,7 +3033,13 @@ fn storage_upgrade_preserves_history(
     assert_eq!(upgraded["observed_format"], source_format);
     assert_eq!(upgraded["target_format"], current);
     assert_eq!(upgraded["completed_handlers"], serde_json::json!([handler]));
-    assert_eq!(upgraded["last_durable_completed_boundary"], "activated");
+    let boundary = upgraded["last_durable_completed_boundary"]
+        .as_str()
+        .unwrap();
+    assert!(
+        boundary.starts_with("unlinked:ref '") && boundary.ends_with('\''),
+        "the route ends on the last ref file it unlinked after activation: {boundary}"
+    );
     assert_eq!(upgraded["findings"], serde_json::json!([]));
     assert!(upgraded["recovery"].is_null(), "{upgraded}");
     assert_eq!(
@@ -3045,6 +3051,14 @@ fn storage_upgrade_preserves_history(
         after.contains_key(Path::new("__history/legacy/locator/directory.oglx")),
         "{:?}",
         after.keys().collect::<Vec<_>>()
+    );
+    let refs_left: Vec<_> = after
+        .keys()
+        .filter(|path| path.starts_with("__manifest/_refs/branches"))
+        .collect();
+    assert!(
+        refs_left.is_empty(),
+        "the upgrade unlinks every ref file: {refs_left:?}"
     );
     if let Some(predecessor_schema) = predecessor_schema {
         for object in ROOT_SCHEMA_OBJECTS.map(Path::new) {
