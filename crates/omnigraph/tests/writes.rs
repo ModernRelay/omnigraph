@@ -2550,9 +2550,8 @@ async fn blob_put_carries_siblings_by_value_and_never_reads_its_target() {
 /// in `update`, `insert`, `upsert` and `replace`. A write over several rows
 /// reads each source column's chosen cells in one batched read, and only the
 /// cells a row chooses; their bytes are charged to `write_max_bytes` before
-/// any is read; two rows giving one entity two different Blobs are `E4`; a
-/// ranged external reference is refused without naming its URI. Each write
-/// publishes once.
+/// any is read; two rows giving one entity two different Blobs are `E4`.
+/// Each write publishes once. A ranged source is the next test's.
 #[tokio::test]
 async fn blob_read_from_a_row_copies_the_cell_its_row_selects() {
     use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
@@ -2776,8 +2775,20 @@ edge Feeds: Document -> Document {
         "{two}"
     );
     assert_eq!(version().await, before);
+}
 
-    // A ranged external reference is refused without naming its URI.
+/// A Blob read from a row whose cell holds a ranged external reference is
+/// refused, without naming its URI and before anything publishes: its
+/// whole-object spelling would widen it. No public write path creates one,
+/// so the fixture writes it raw.
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+async fn blob_read_from_a_row_refuses_a_ranged_external_source() {
+    let copy = |source: &str, statement: &str| {
+        format!(
+            "query copy() {{ match {{ $s: Document }} where $s.title = \"{source}\" {statement} }}"
+        )
+    };
     let ranged_dir = tempfile::tempdir().unwrap();
     let ranged_uri = ranged_dir.path().to_str().unwrap();
     let ranged_db = Omnigraph::init(
