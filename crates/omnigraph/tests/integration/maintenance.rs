@@ -6228,6 +6228,15 @@ async fn vector_ivf_partition_sizing_issue_485_issue_486() {
     );
 
     let ds2 = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let indices2 = ds2.load_indices().await.unwrap();
+    let vec_idx2 = indices2
+        .iter()
+        .find(|idx| idx.name == vec_idx.name)
+        .expect("vector index must exist");
+    assert_ne!(
+        vec_idx2.uuid, vec_idx.uuid,
+        "optimize fold must actively rebuild the vector index with a new uuid"
+    );
     let stats_json2 = ds2.index_statistics(&vec_idx.name).await.unwrap();
     let stats2: serde_json::Value = serde_json::from_str(&stats_json2).unwrap();
     let num_partitions2 = first_num_partitions(&stats2).unwrap_or(0);
@@ -6262,6 +6271,15 @@ async fn vector_ivf_partition_sizing_issue_485_issue_486() {
     );
 
     let ds3 = helpers::open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let indices3 = ds3.load_indices().await.unwrap();
+    let vec_idx3 = indices3
+        .iter()
+        .find(|idx| idx.name == vec_idx.name)
+        .expect("vector index must exist");
+    assert_ne!(
+        vec_idx3.uuid, vec_idx2.uuid,
+        "optimize fold must actively rebuild and resize the vector index with a new uuid"
+    );
     let stats_json3 = ds3.index_statistics(&vec_idx.name).await.unwrap();
     let stats3: serde_json::Value = serde_json::from_str(&stats_json3).unwrap();
     let num_partitions3 = first_num_partitions(&stats3).unwrap_or(0);
