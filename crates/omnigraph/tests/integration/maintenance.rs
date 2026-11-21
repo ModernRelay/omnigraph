@@ -5705,6 +5705,17 @@ async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
         report.cost.table_opens,
         report.cost
     );
+    let listed: u64 = report
+        .tables
+        .iter()
+        .map(|plan| (plan.present_manifests.len() + plan.linear_present.len()) as u64)
+        .sum();
+    assert!(
+        report.cost.table_opens <= listed,
+        "each listed manifest opens at most once, a chain link at the open that finds its predecessor; {} opens exceed the {listed} listed manifests: {:?}",
+        report.cost.table_opens,
+        report.cost
+    );
     assert!(
         report.cost.index_reads <= report.cost.table_opens + pins,
         "every index read is one of those opens, plus one per root for the bases it borrows: {:?}",

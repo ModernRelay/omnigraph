@@ -406,8 +406,10 @@ async fn delete_paths(
 /// sends as `DeleteObjects` requests of up to 1,000 keys and other stores
 /// delete concurrently, in no order: these files belong only to manifests
 /// the sweep removes after them, so any subset a stopped pass leaves is
-/// planned again. Returns the bytes of the files the store removed, at each
-/// file's `(path, size)`; an absent file counts nothing.
+/// planned again. Returns the bytes of the files the store reported removed,
+/// at each file's `(path, size)`. An absent file counts nothing only on a
+/// store that reports it absent: S3 `DeleteObjects` and the read-through
+/// store report it removed, so its listed size counts.
 async fn delete_files(
     store: &lance::io::ObjectStore,
     files: Vec<(object_store::path::Path, u64)>,
@@ -429,8 +431,10 @@ async fn delete_files(
     Ok(bytes)
 }
 
-/// Delete one object and return its size (`known` when the listing gave it);
-/// an absent object was removed by an earlier pass and counts nothing.
+/// Delete one object and return its size (`known` when the listing gave it).
+/// An object an earlier pass removed counts nothing when the store reports it
+/// absent; S3 reports a delete of an absent key as done, so a `known` size
+/// counts there.
 async fn delete_object(
     store: &lance::io::ObjectStore,
     path: &object_store::path::Path,
@@ -2005,7 +2009,8 @@ async fn plan_sweep(
         .collect();
     let mut swept_paths = traced.swept_paths;
     for version in candidates.iter() {
-        if !linear_candidates.contains(version) && traced.versions.contains(version) {
+        // A traced version is a detached chain link, never a linear candidate.
+        if traced.versions.contains(version) {
             plan.sweep.push(*version);
             continue;
         }
