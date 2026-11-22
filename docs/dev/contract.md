@@ -484,7 +484,7 @@ Full rules: [writes](writes.md), [mutations](../user/mutations/index.md).
    concurrent when neither is an ancestor of the other, so history is a
    total order on one branch and a partial order across branches, by
    ancestry and never by a clock.
-2. `merge:2` The same change on both sides is kept once, deletes included.
+2. `merge:2` ✓ The same change on both sides is kept once, deletes included.
    Different changes to one entity are a conflict: `divergent_insert`,
    `divergent_update`, `delete_vs_update`. Changes to different entities
    never conflict, unless together they break a constraint.
