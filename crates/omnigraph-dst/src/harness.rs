@@ -3874,6 +3874,17 @@ async fn assert_physical_matches(db: &Session, world: &WorldModel, where_: &str)
 /// path relies on that property, and a future member with durable effects
 /// would silently break it. The dead-target member below covers ops whose
 /// model target a ruling removed.
+/// A branch create resent after a lost acknowledgement meets the branch its
+/// first attempt created: graph writes carry no request identity (contract
+/// `E4`, gap `G7`), so the resend is refused `branch_exists` naming that same
+/// branch, and reconcile decides from the store whether the first one landed.
+fn retry_meets_its_own_create(err: &OmniError, wop: &WorldOp) -> bool {
+    matches!(
+        (err, wop),
+        (OmniError::BranchExists { branch, .. }, WorldOp::BranchCreate { name }) if branch == name
+    )
+}
+
 fn is_legal_rejection(
     err: &OmniError,
     world: &WorldModel,
@@ -6462,6 +6473,7 @@ impl UniverseScenario<RustResources> for Scenario {
                             let retry = Box::pin(exec_world_op(&db, &wop)).await;
                             if let Err(retry_err) = &retry
                                 && !(matches!(retry_err, OmniError::RecoveryRequired { .. })
+                                    || retry_meets_its_own_create(retry_err, &wop)
                                     || is_legal_rejection(
                                         retry_err,
                                         &world,
