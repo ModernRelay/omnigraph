@@ -225,13 +225,13 @@ def git(*args: str, cwd: Path = ROOT) -> subprocess.CompletedProcess:
 
 
 def build_commit(name: str, row: dict, packages: dict, work: Path, into: Path) -> None:
+    """Build `row` in `work`, an empty directory its caller owns and removes."""
     commit, toolchain = row["commit"], row["toolchain"]
     if git("cat-file", "-e", f"{commit}^{{commit}}").returncode != 0:
         fetched = git("fetch", "--no-tags", "--depth=1", "origin", commit)
         if fetched.returncode != 0:
             raise RegistryError(f"cannot fetch {commit} for {name}: {fetched.stderr.strip()}")
     checkout, target = work / "checkout", work / "target"
-    shutil.rmtree(work, ignore_errors=True)
     git("worktree", "prune")
     added = git("worktree", "add", "--detach", "--force", str(checkout), commit)
     if added.returncode != 0:
@@ -242,7 +242,7 @@ def build_commit(name: str, row: dict, packages: dict, work: Path, into: Path) -
             raise RegistryError(f"the checkout of {name} is at {head}, not {commit}")
         if shutil.which("rustup"):
             subprocess.run(
-                ["rustup", "toolchain", "install", toolchain, "--profile", "minimal"],
+                ["rustup", "toolchain", "install", toolchain, "--profile", "minimal", "--no-self-update"],
                 check=True, stdout=sys.stderr,
             )
         selection = []
@@ -262,7 +262,6 @@ def build_commit(name: str, row: dict, packages: dict, work: Path, into: Path) -
             shutil.copy2(target / "debug" / binary, into / binary)
     finally:
         git("worktree", "remove", "--force", str(checkout))
-        shutil.rmtree(work, ignore_errors=True)
 
 
 def provision_row(name: str, row: dict, packages: dict, asset: str, store: Path) -> None:
@@ -279,7 +278,10 @@ def provision_row(name: str, row: dict, packages: dict, asset: str, store: Path)
             for binary in row["binaries"]:
                 shutil.copy2(Path(installed) / binary, row_dir / binary)
     else:
-        build_commit(name, row, packages, store / "work" / name, row_dir)
+        # Outside this repository: Cargo merges every ancestor `.cargo/config.toml`,
+        # so a checkout nested in this tree would build with its flags and linker too.
+        with tempfile.TemporaryDirectory(prefix=f"omnigraph-predecessor-{name}-") as work:
+            build_commit(name, row, packages, Path(work), row_dir)
     for binary in row["binaries"]:
         if not os.access(row_dir / binary, os.X_OK):
             raise RegistryError(f"{name} provided no executable {binary}")
@@ -403,6 +405,12 @@ class Tests(unittest.TestCase):
         self.assertEqual(available(registry, "linux-arm64"), ["stamp-1"])
         checked_in = load_registry()
         self.assertEqual(available(checked_in, CI_PLATFORM), list(checked_in["predecessors"]))
+
+    def test_a_source_row_builds_outside_this_repository(self):
+        source = Path(__file__).read_text()
+        provision = source[source.index("def provision_row("):source.index("def manifest(")]
+        self.assertIn("tempfile.TemporaryDirectory(", provision)
+        self.assertFalse(Path(tempfile.gettempdir()).resolve().is_relative_to(ROOT))
 
     def test_child_output_never_reaches_stdout(self):
         from unittest import mock

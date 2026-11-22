@@ -108,7 +108,9 @@ python3 scripts/predecessors.py provision --all
 Then run the cases as usual, for example
 `cargo dev-test --test integration crossversion_upgrade::`. Name rows instead
 of `--all` to provision fewer: a source row builds a debug CLI from scratch
-(about 25 minutes cold) in a target directory it removes afterwards.
+(about 25 minutes cold) in a temporary directory outside the repository, so
+only the predecessor's own Cargo configuration applies, and removes it
+afterwards.
 
 In CI a job names the rows it needs with the `./.github/actions/predecessors`
 action (`rows:`, and `require: true` where a skipped journey must fail), which
