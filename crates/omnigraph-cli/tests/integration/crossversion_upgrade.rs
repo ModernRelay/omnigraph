@@ -9,42 +9,38 @@
 //! 2. the documented `export → init → load` rebuild round-trips the data,
 //!    including a `Vector` column, off a genuine v3 export.
 //!
-//! The v3 case uses `OMNIGRAPH_OLD_BIN` (0.7.2), and the v4 case uses
-//! `OMNIGRAPH_PREVIOUS_BIN` (0.8.1). The immediate-predecessor v5 case uses
-//! `OMNIGRAPH_V5_BIN` (built from the final internal-v5 commit) and proves both
-//! directions of the v5/v10 format fence. Each case skips only when its variable
-//! is unset; a set but invalid path fails loudly.
-//! `OMNIGRAPH_V09_BIN` selects the released v0.9 CLI for the end-to-end
-//! journey of a fully exercised v6 graph — branches, edges, vectors,
-//! full-text and blobs — which the current binary refuses and which is
-//! rebuilt from a 0.9 export.
-//! `OMNIGRAPH_V6_BIN` (the released 0.10.x CLI) proves both directions of the
-//! v6/v10 fence (RFC 0062 registration clock, RFC 0042 native-ref retirement
-//! metadata and RFC 0040 system columns); that case skips when the variable
-//! is unset, as the older fences do.
-//! `OMNIGRAPH_V13_BIN` (a main build that writes storage format 13, CI builds
-//! `c0a4519f`) and `OMNIGRAPH_V011_BIN` (the released 0.11.0 CLI, which writes
-//! storage format 9 and converts a 0.10.x graph to format 8 or 9) drive the
-//! in-place route: the offline `omnigraph upgrade` of a genuine stamp-13,
-//! stamp-9 or stamp-8 root to the current format with its branches and commit history
-//! kept. Those two, and `OMNIGRAPH_V6_BIN` where a journey starts from a 0.10.x
-//! graph, fall back to a binary under `target/storage-upgrade-binaries/`; with
-//! `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` an unresolved predecessor of a
-//! journey fails instead of skipping.
-//! `OMNIGRAPH_LANCE11_BIN` selects exact main0a62bb7b, a Lance11 writer of
-//! graph format16, for candidate/rollback reads without any storage conversion.
-//! It uses the same required/fallback resolver and is enrolled in the gate.
-//! The ignored 0.12.0 cluster-ledger journey is manual release qualification:
-//! storage is served at 14 until the candidate's first publish stamps a branch
-//! 16, followed by live deployment without restart.
-//! Explicit invocation requires `OMNIGRAPH_V012_BIN` and
-//! `OMNIGRAPH_V012_SERVER_BIN` from the official release; it never skips.
+//! Each case runs one or two predecessors of `.github/predecessors.toml`,
+//! resolved by `support::predecessors::predecessor`: it skips with a line
+//! when its row is not provisioned, and fails when the job provisioned with
+//! `--require` (docs/dev/testing.md, Predecessor binaries).
+//!
+//! - `release-0.7.2` (v3), `release-0.8.1` (v4) and `stamp-5` (the final
+//!   internal-v5 commit): the current binary refuses and rebuilds their
+//!   graphs, and `stamp-5` refuses the current graph in turn.
+//! - `release-0.9.0`: the end-to-end journey of a fully exercised v6 graph
+//!   (branches, edges, vectors, full-text and Blobs), refused by the current
+//!   binary and rebuilt from a 0.9 export.
+//! - `release-0.10.0`: both directions of the v6/v10 fence (RFC 0062
+//!   registration clock, RFC 0042 native-ref retirement metadata and RFC 0040
+//!   system columns), and the graph the stamp-8 and stamp-9 journeys start
+//!   from.
+//! - `stamp-13` and `release-0.11.0` (storage format 9, converting a 0.10.x
+//!   graph to format 8 or 9): the in-place route, the offline
+//!   `omnigraph upgrade` of a genuine stamp-13, stamp-9 or stamp-8 root to the
+//!   current format with its branches and commit history kept.
+//! - `lance-11`: a Lance 11 writer of graph format 16, for candidate and
+//!   rollback reads without any storage conversion.
+//! - `release-0.12.0`: the ignored cluster-ledger journey, manual release
+//!   qualification: storage is served at 14 until the candidate's first
+//!   publish stamps a branch 16, followed by live deployment without restart.
+//!   It never skips.
 
 use crate::support;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::support::predecessors::predecessor;
 use crate::support::{
     HERMETIC_OPERATOR_HOME, apply_cluster_fixture, cli, fixture, only_target_report,
     output_failure, output_success, unlock_cluster_fixture,
@@ -52,27 +48,6 @@ use crate::support::{
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::{BlobCell, BlobContent, EntityKind};
 use tempfile::tempdir;
-
-/// Explicit release qualification requires both published executables.
-#[cfg(unix)]
-fn v012_binaries() -> (PathBuf, PathBuf) {
-    let binary = |variable| {
-        let path =
-            PathBuf::from(std::env::var_os(variable).unwrap_or_else(|| {
-                panic!("manual cluster upgrade qualification requires {variable}")
-            }));
-        assert!(
-            path.is_file(),
-            "required {variable} is not a binary file: {}",
-            path.display()
-        );
-        path
-    };
-    (
-        binary("OMNIGRAPH_V012_BIN"),
-        binary("OMNIGRAPH_V012_SERVER_BIN"),
-    )
-}
 
 /// Process/transport and genuine predecessor bytes cannot be expressed in GQT.
 /// SIGTERM + successful process exit precedes exact-ID lock release; no graph
@@ -89,7 +64,9 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     use std::fs;
     use std::time::Duration;
 
-    let (old, old_server) = v012_binaries();
+    let release = predecessor("release-0.12.0")
+        .expect("manual cluster upgrade qualification requires the release-0.12.0 predecessor");
+    let (old, old_server) = (release.omnigraph(), release.binary("omnigraph-server"));
     let current = assert_cmd::cargo::cargo_bin("omnigraph");
     let current_server = std::env::var_os("CARGO_BIN_EXE_omnigraph-server")
         .map(PathBuf::from)
@@ -97,7 +74,6 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         .expect("build the candidate server before the cluster upgrade journey");
     let version = output_success(cli_at(&old).arg("version"));
     let version = String::from_utf8(version.stdout).unwrap();
-    assert_eq!(version.lines().next(), Some("omnigraph 0.12.0"));
     assert!(version.contains("internal-schema 14 (serves v14 to v14)"));
     let candidate_version = output_success(cli_at(&current).arg("version"));
     assert!(
@@ -404,143 +380,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     unlock(&current);
 }
 
-/// Resolve the old (0.7.2) binary. `None` ONLY when `OMNIGRAPH_OLD_BIN` is
-/// unset — the legitimate skip. A var that is SET but points at a missing path
-/// is a misconfiguration (wrong install path / renamed binary) and must fail
-/// loudly, never skip vacuously: in CI the var is deliberately set so the test
-/// is expected to run.
-fn old_bin() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("OMNIGRAPH_OLD_BIN")?);
-    assert!(
-        path.exists(),
-        "OMNIGRAPH_OLD_BIN is set but does not exist: {} \
-         (unset it to skip, or point it at a real 0.7.2 omnigraph binary)",
-        path.display(),
-    );
-    Some(path)
-}
-fn previous_bin() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("OMNIGRAPH_PREVIOUS_BIN")?);
-    assert!(
-        path.exists(),
-        "OMNIGRAPH_PREVIOUS_BIN is set but does not exist: {} \
-         (unset it to skip, or point it at a real 0.8.1 omnigraph binary)",
-        path.display(),
-    );
-    Some(path)
-}
-
-/// Resolve the final internal-v5 binary. This is deliberately separate from
-/// `OMNIGRAPH_PREVIOUS_BIN`: the latter is the released v4 baseline, while this
-/// seam is built from the repository commit immediately before v6 activation.
-fn v5_bin() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("OMNIGRAPH_V5_BIN")?);
-    assert!(
-        path.exists() && path.is_file(),
-        "OMNIGRAPH_V5_BIN is set but is not a binary file: {} \
-         (unset it to skip, or point it at the omnigraph binary built from the final internal-v5 commit)",
-        path.display(),
-    );
-    Some(path)
-}
-
-/// Resolve the final internal-v6 binary for the v6/v10 fence: the last release
-/// that wrote internal schema v6, from `OMNIGRAPH_V6_BIN` alone. Unset skips,
-/// as for the older fences; the fence is never required.
-fn v6_bin() -> Option<PathBuf> {
-    let Some(path) = std::env::var_os("OMNIGRAPH_V6_BIN").map(PathBuf::from) else {
-        eprintln!(
-            "skipping immediate-predecessor v6 upgrade test: OMNIGRAPH_V6_BIN is not set to a 0.10.x binary"
-        );
-        return None;
-    };
-    assert!(
-        path.is_file(),
-        "OMNIGRAPH_V6_BIN is set but is not a binary file: {} \
-         (unset it to skip, or point it at the released 0.10.x omnigraph binary (the last internal-v6 writer))",
-        path.display(),
-    );
-    Some(released_v6(path))
-}
-
-/// Resolve the 0.10.x CLI a storage upgrade journey starts its graph with:
-/// `OMNIGRAPH_V6_BIN`, else `target/storage-upgrade-binaries/v0.10.0/`, and
-/// required under `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS`.
-fn v6_bin_for_storage_upgrade() -> Option<PathBuf> {
-    storage_upgrade_predecessor(
-        "OMNIGRAPH_V6_BIN",
-        "v0.10.0",
-        "the released 0.10.x omnigraph binary (the last internal-v6 writer)",
-    )
-    .map(released_v6)
-}
-
-/// `path`, once it has reported itself as a released 0.10.x binary.
-fn released_v6(path: PathBuf) -> PathBuf {
-    let version = run_old(&path, &["version"]);
-    assert_ok("v6 version", &version);
-    let reported = String::from_utf8_lossy(&version.stdout);
-    assert!(
-        reported.contains("omnigraph 0.10."),
-        "OMNIGRAPH_V6_BIN must be a released 0.10.x binary (the last internal-v6 writer), got: {reported}",
-    );
-    path
-}
-
-/// Resolve the stamp-13 predecessor: `OMNIGRAPH_V13_BIN`, else a binary under
-/// `target/storage-upgrade-binaries/stamp-13/`. The journey proves the stamp
-/// by behaviour, so any main build that writes format 13 serves locally.
-fn v13_bin() -> Option<PathBuf> {
-    storage_upgrade_predecessor(
-        "OMNIGRAPH_V13_BIN",
-        "stamp-13",
-        "an omnigraph binary built from a stamp-13 main commit",
-    )
-}
-
-/// Resolve the released 0.11.0 CLI: `OMNIGRAPH_V011_BIN`, else a binary under
-/// `target/storage-upgrade-binaries/v0.11.0/`. Main builds 10 to 13 print the
-/// same version, so the journeys prove the stamp it writes by behaviour.
-fn v011_bin() -> Option<PathBuf> {
-    storage_upgrade_predecessor(
-        "OMNIGRAPH_V011_BIN",
-        "v0.11.0",
-        "the released 0.11.0 omnigraph binary",
-    )
-}
-
-/// A predecessor of the in-place route: `variable`, else the binary under
-/// `target/storage-upgrade-binaries/<directory>/`. Neither one skips, or
-/// fails under `OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS`.
-fn storage_upgrade_predecessor(
-    variable: &str,
-    directory: &str,
-    described: &str,
-) -> Option<PathBuf> {
-    let local = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/storage-upgrade-binaries")
-        .join(directory)
-        .join(format!("omnigraph{}", std::env::consts::EXE_SUFFIX));
-    let selected = std::env::var_os(variable)
-        .map(PathBuf::from)
-        .or_else(|| local.is_file().then_some(local));
-    let Some(path) = selected else {
-        assert!(
-            std::env::var_os("OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS").is_none(),
-            "required storage upgrade predecessor {variable} is unset"
-        );
-        eprintln!("skipping genuine {directory} storage upgrade: {variable} is unset");
-        return None;
-    };
-    assert!(
-        path.is_file(),
-        "{variable} is not a binary file: {} (unset it to skip, or point it at {described})",
-        path.display(),
-    );
-    Some(path)
-}
-
-/// Run the OLD (0.7.2) binary hermetically (no developer `~/.omnigraph`).
+/// Run a predecessor binary hermetically (no developer `~/.omnigraph`).
 fn run_old(bin: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin)
         .env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME)
@@ -811,12 +651,10 @@ fn assert_rebuilt_blob_bytes(graph: &Path, expected: &[u8]) {
 
 #[test]
 fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
-    let Some(old) = old_bin() else {
-        eprintln!(
-            "skipping cross-version upgrade test: OMNIGRAPH_OLD_BIN is not set to a 0.7.2 binary"
-        );
+    let Some(old) = predecessor("release-0.7.2") else {
         return;
     };
+    let old = old.omnigraph();
 
     let temp = tempdir().unwrap();
     let old_graph = temp.path().join("old-v3.omni");
@@ -902,12 +740,10 @@ fn current_binary_refuses_and_rebuilds_a_genuine_v3_graph() {
 
 #[test]
 fn current_v10_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v10() {
-    let Some(previous) = previous_bin() else {
-        eprintln!(
-            "skipping immediate-predecessor upgrade test: OMNIGRAPH_PREVIOUS_BIN is not set to a 0.8.1 binary"
-        );
+    let Some(previous) = predecessor("release-0.8.1") else {
         return;
     };
+    let previous = previous.omnigraph();
 
     let temp = tempdir().unwrap();
     let old_graph = temp.path().join("old-v4.omni");
@@ -989,12 +825,10 @@ fn current_v10_refuses_and_rebuilds_genuine_v4_and_v4_refuses_v10() {
 
 #[test]
 fn current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10() {
-    let Some(v5) = v5_bin() else {
-        eprintln!(
-            "skipping immediate-predecessor v5 upgrade test: OMNIGRAPH_V5_BIN is not set to a final internal-v5 binary"
-        );
+    let Some(v5) = predecessor("stamp-5") else {
         return;
     };
+    let v5 = v5.omnigraph();
 
     let temp = tempdir().unwrap();
     let v5_graph = temp.path().join("old-v5.omni");
@@ -1163,9 +997,10 @@ fn current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10() {
 
 #[test]
 fn current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10() {
-    let Some(v6) = v6_bin() else {
+    let Some(v6) = predecessor("release-0.10.0") else {
         return;
     };
+    let v6 = v6.omnigraph();
 
     let temp = tempdir().unwrap();
     let v6_graph = temp.path().join("old-v6.omni");
@@ -1436,17 +1271,10 @@ fn current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end() {
     use serde_json::json;
     use std::fs;
 
-    let Some(old) = std::env::var_os("OMNIGRAPH_V09_BIN").map(PathBuf::from) else {
-        eprintln!("skipping v0.9 upgrade e2e: OMNIGRAPH_V09_BIN is unset");
+    let Some(old) = predecessor("release-0.9.0") else {
         return;
     };
-    let version = run_old(&old, &["version"]);
-    assert_ok("version", &version);
-    assert_eq!(
-        String::from_utf8_lossy(&version.stdout).lines().next(),
-        Some("omnigraph 0.9.0"),
-        "the predecessor must be the released v0.9.0 binary"
-    );
+    let old = old.omnigraph();
 
     // Extend the existing search fixture, retaining its vector values, with
     // real edges and a Blob. All persisted state is minted by the old CLI.
@@ -2165,13 +1993,10 @@ fn genuine_lance11_storage_upgrade_round_trip() {
     use serde_json::{Value, json};
     use std::fs;
 
-    let Some(old) = storage_upgrade_predecessor(
-        "OMNIGRAPH_LANCE11_BIN",
-        "lance-11",
-        "the Lance 11 CLI built from main commit 0a62bb7b",
-    ) else {
+    let Some(old) = predecessor("lance-11") else {
         return;
     };
+    let old = old.omnigraph();
     let current = assert_cmd::cargo::cargo_bin("omnigraph");
     let temp = tempdir().unwrap();
     let graph = temp.path().join("lance-transition.omni");
@@ -2595,9 +2420,10 @@ query nullable_vectors() {
 
 #[test]
 fn genuine_v13_storage_upgrade_preserves_history() {
-    let Some(old) = v13_bin() else {
+    let Some(old) = predecessor("stamp-13") else {
         return;
     };
+    let old = old.omnigraph();
     storage_upgrade_preserves_history(&old, 13, V13_HANDLER, None);
 }
 
@@ -2605,9 +2431,10 @@ fn genuine_v13_storage_upgrade_preserves_history() {
 /// `optimize` in its history and no predecessor `cleanup`.
 #[test]
 fn genuine_v0_11_0_storage_upgrade_preserves_history() {
-    let Some(old) = v011_bin() else {
+    let Some(old) = predecessor("release-0.11.0") else {
         return;
     };
+    let old = old.omnigraph();
     storage_upgrade_preserves_history(&old, 9, V9_HANDLER, None);
 }
 
@@ -2616,9 +2443,12 @@ fn genuine_v0_11_0_storage_upgrade_preserves_history() {
 /// receipts of the two earlier routes.
 #[test]
 fn genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history() {
-    let (Some(old), Some(born_with)) = (v011_bin(), v6_bin_for_storage_upgrade()) else {
+    let (Some(old), Some(born_with)) =
+        (predecessor("release-0.11.0"), predecessor("release-0.10.0"))
+    else {
         return;
     };
+    let (old, born_with) = (old.omnigraph(), born_with.omnigraph());
     let born_with = BornWith {
         binary: &born_with,
         to_format: Some(8),
@@ -2631,9 +2461,12 @@ fn genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history() {
 /// pre-respelling commits pin `id`/`src`/`dst` tables under the one `__id` root contract.
 #[test]
 fn genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history() {
-    let (Some(old), Some(born_with)) = (v011_bin(), v6_bin_for_storage_upgrade()) else {
+    let (Some(old), Some(born_with)) =
+        (predecessor("release-0.11.0"), predecessor("release-0.10.0"))
+    else {
         return;
     };
+    let (old, born_with) = (old.omnigraph(), born_with.omnigraph());
     let born_with = BornWith {
         binary: &born_with,
         to_format: None,
@@ -3363,9 +3196,10 @@ fn storage_upgrade_preserves_history(
 #[test]
 fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
     const LIVE_BRANCHES: [&str; 2] = ["main", "review"];
-    let Some(old) = v011_bin() else {
+    let Some(old) = predecessor("release-0.11.0") else {
         return;
     };
+    let old = old.omnigraph();
     let old = old.as_path();
     let temp = tempdir().unwrap();
     let graph = temp.path().join("cleaned.omni");

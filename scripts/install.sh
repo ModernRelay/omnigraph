@@ -9,6 +9,10 @@ VERSION="${VERSION:-}"
 # when the GitHub CLI is installed and signed in; require: refuse without it;
 # off: skip. Releases before v0.14 carry no attestation.
 VERIFY_ATTESTATION="${VERIFY_ATTESTATION:-auto}"
+# When set, the archive's SHA256 must also equal this digest, so a pinned
+# release cannot change under its tag. The published `.sha256` is checked
+# either way.
+ARCHIVE_SHA256="${ARCHIVE_SHA256:-}"
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR=""
 SELECTED_CHANNEL=""
@@ -113,6 +117,10 @@ verify_checksum() {
   actual="$($tool "$archive" | awk '{print $1}')"
 
   [ "$actual" = "$expected" ] || die "checksum verification failed for $(basename "$archive")"
+  if [ -n "$ARCHIVE_SHA256" ]; then
+    [ "$actual" = "$ARCHIVE_SHA256" ] \
+      || die "$(basename "$archive") does not match ARCHIVE_SHA256: got $actual"
+  fi
 }
 
 # Download one release file. Returns 2 when the release or the file is not

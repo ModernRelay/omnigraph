@@ -110,32 +110,24 @@ names. Details and the recovery
 routes: [branch-protection.md](branch-protection.md), CI Gate.
 
 `Storage Upgrade Compatibility` (`storage_upgrade_compatibility` in `ci.yml`)
-runs on every change and in the merge queue. It builds the genuine stamp-13
-CLI from the immutable `STAMP_13_SOURCE_COMMIT` in a detached worktree into
-the job's target directory, copies the binary out, cleans the path-package
-artifacts through both manifests (the predecessor and current packages share
-names and versions) and exports `OMNIGRAPH_V13_BIN`. It builds the Lance 11
-CLI from `LANCE11_SOURCE_COMMIT` the same way and exports
-`OMNIGRAPH_LANCE11_BIN`. The step
-`Install released v0.10.0 and v0.11.0 CLIs` downloads the two releases with
-`scripts/install.sh` and exports `OMNIGRAPH_V6_BIN` and `OMNIGRAPH_V011_BIN`:
+runs on every change and in the merge queue. It provisions four rows of the
+[predecessor registry](testing.md#predecessor-binaries) with the
+`./.github/actions/predecessors` action and `require: true`: `stamp-13` and
+`lance-11`, each built from its pinned commit in its own checkout and target
+directory, and the releases `release-0.10.0` and `release-0.11.0`, installed by
+`scripts/install.sh` against their pinned archive digests, three attempts each.
 0.11.0 writes stamp 9, and 0.10.0 followed by the 0.11.0 `upgrade` gives the
 stamp-8 source (`--to-format 8`) and the stamp-9 source its default target
-leaves. The step trusts the release assets exactly as the `test` job's
-v0.9.0 and v0.10.0 installs do: `install.sh` downloads the archive and its
-`.sha256` from the same GitHub release and verifies the one against the other
-before extracting; no digest is pinned in the workflow. Each download gets
-three attempts (`install_release`), the only retry in the job; a failed
-attempt leaves no binary behind. With
-`OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` a missing binary fails the six
-genuine journeys (`genuine_v13_storage_upgrade_preserves_history`,
+leaves. The action caches the provisioned rows under a key of what they are
+made from, so a cold source build runs only when a row, the provisioner or
+the installer changes. With `require`, a missing row fails the six genuine
+journeys (`genuine_v13_storage_upgrade_preserves_history`,
 `genuine_lance11_storage_upgrade_round_trip`,
 `genuine_v0_11_0_storage_upgrade_preserves_history`,
 `genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
 `genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history`,
 `genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`)
-instead of skipping them; the v6 format fence in the `test` job keeps its own
-resolver and skips, never panics, without `OMNIGRAPH_V6_BIN`. Four
+instead of skipping them; the `test` job provisions its rows without it. Four
 scopes then run, each checked against its log by
 `scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
 cases of `crossversion_upgrade.rs` (a module of the CLI's `integration`
@@ -152,13 +144,11 @@ graph, the one `Test Workspace` builds, and the engine scopes reuse the
 crossversion scope's build; a scope that selects `-p omnigraph-engine
 --features failpoints` resolves a third graph, about 20 minutes warm. The
 script's `--self-test` pins
-the scopes, the predecessor build and install scripts (compared exactly) and
-the required case names, so removing or altering one fails `Check Workflow Action Pins` and
-this job. The 120-minute budget covers three cold builds into one target
-directory: the stamp-13 and Lance 11 predecessor CLIs (one package, one bin,
-no test features each), then the current tree's test targets, whose dev-dependency features
-(`test-util`) differ, so only dependency artifacts with matching features are
-reused.
+the scopes, the predecessor step (with `require` and every row the
+`storage_upgrade` cases ask for) and the required case names, so removing or
+altering one fails `Check Workflow Action Pins` and this job. The 120-minute
+budget covers a cold predecessor cache, two source builds of about 25 minutes
+each, then the current tree's test targets.
 
 The released 0.12 cluster-ledger journey is separate
 [manual release qualification](test-ownership.md#manual-012-cluster-upgrade-qualification).
@@ -527,7 +517,7 @@ The remaining jobs own contracts that need special infrastructure. They run afte
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
   disabled; see above).
-- **V5 ↔ V10 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every pull request that changes engine input, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
+- **V5 ↔ V10 format fence** provisions the `stamp-5` predecessor (the final v5-writing commit, built from source) and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every pull request that changes engine input, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every pull request that changes engine input, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards before clicking Merge when ready. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
 - **Azurite Azure integration** exercises configured storage, admission-lease,
   recovery, cluster, server, and CLI owners against a digest-pinned Azurite
@@ -641,6 +631,7 @@ python3 scripts/check-workflow-action-pins.py
 python3 scripts/check-classify-copy.py --self-test && python3 scripts/check-classify-copy.py       # after a workflow edit: the classifier copies match
 python3 scripts/check-change-classes.py --self-test && python3 scripts/check-change-classes.py     # after a classifier or path-filter edit
 python3 scripts/check-storage-upgrade-ci.py --self-test
+python3 scripts/predecessors.py --self-test   # after a predecessor row, a `predecessor("…")` request or a workflow `rows:` edit
 python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit; also pins the CI Gate wiring
 python3 scripts/ci_gate.py --self-test   # after a ci.yml job `if:` change or an edit to the gate's needs/table
 python3 scripts/check-pr-title.py --self-test
