@@ -79,7 +79,7 @@ do not introduce historical schema-language semantics. See
 
 ## Pending storage conversion
 
-The offline upgrade to stamp 17, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
+The offline upgrade to stamp 18, from stamp 8, 9 or 13, sets `UPGRADE_PENDING_KEY`
 (`omnigraph:storage_upgrade_pending`) on main's `__manifest` from its fence
 commit to its activation commit; the value is the `UpgradeIntent`, whose
 `source_format` names the route. Ordinary
@@ -227,31 +227,56 @@ make that entire entrypoint read-only.
 
 ## Graph branch controls
 
-Native branch create/delete residue is different from a data-table effect.
-An unreferenced clone-only tree is reclaimable only when no physical
-`BranchContents` exists, including a logically retired native ref. No table
-fork is created for a graph branch: a branch write stages detached on the
-dataset and native ref its inherited registration names. A fork a branch
-created before format v11 is garbage once no registration references it and
-the graph branch incarnation in its name is gone; explicit cleanup reclaims
-it after proving that live table pins, tags and Lance ancestry no longer
-require it. An old owner's absence from the logical branch list alone is not
-proof.
+At or above the branch-row stamp (storage format 18) a graph branch exists as
+a `branch` row of `main`'s catalog, carried in `main`'s version file and
+published through the publisher as a strict zero-retry overwrite of `main`'s
+version (RFC 2026-11-19, "Branch existence in the catalog"). Create publishes
+the row, then writes the branch's tree as a shallow clone of the fork point. A
+process that dies between the two leaves a not-ready branch: listed by name,
+refusing reads and writes with `branch_not_ready`, retired by `branch delete`
+in one commit on `main` (no tombstone, since no chain exists), and left alone
+by `cleanup`, which keeps its fork point's tree while the row names it. Delete
+publishes a tombstone on the branch's own chain, settles its history, then
+publishes the retired row (`-` under the branch's key) on `main`. A crash
+between the two leaves a tombstoned branch that refuses reads and writes with
+`branch_deleted` and lists as retirement pending; the next `branch delete`
+finishes it, since a delete that finds its tombstone already landed completes
+the retirement. Two creates of one name race on `main`'s version: the loser
+reloads, finds the name live and refuses `branch_exists` before it has written
+a tree. No ref file is written and no marker, archive or unlink runs. The
+collector reclaims every tree under `__manifest/tree/` that no live row names
+by `remove_dir_all` of that tree alone, keeps a tree a tag pins, a not-ready
+row's fork point and every tree a kept head's `base_paths` reach, and removes
+a retired row's entry through `UpdateConfig` once its tree is reclaimed,
+deferring an entry a concurrent publication conflicts with. The row and the
+retired row assert `main`'s writer epoch, the tombstone asserts none: a
+process that claimed `main` is the one that creates and deletes branches, and
+`branch create` or `branch delete` run beside it is refused `writer_fenced`.
+The upgrade's stamp route writes a row per live ref in `main`'s stamp commit
+and unlinks the ref files as its follow-up.
 
-Graph-branch deletion writes the reserved `omnigraph.retired_manifest_branch`
-metadata value through Lance's public `Branches::replace_metadata`, preserving
-unrelated metadata. The versioned marker binds the native name and identifier;
-unknown fields, versions, or mismatched identity fail closed. Retirement then
-archives the exact `BranchContents` inside the native tree before unlinking the
-active ref. A retry validates that identity in the ref or archive; bare absence
-is not proof of completed retirement. Required native history remains readable
-through the archive, while branch-name reads and writes require an unretired
-ref. Existing process-local branch controls serialize retirement; they are not
-distributed fencing. Explicit cleanup reclaims unneeded table forks and retired
-manifest trees with their archives after checking native dependencies, tags,
-table roots and historical merge-base providers. Delayed staging is classified
-from a complete post-list identity inventory and final capture validation.
-The v8 storage fence keeps older binaries from exposing retired branches.
+Below the stamp the ref protocol runs untouched. Deletion writes the reserved
+`omnigraph.retired_manifest_branch` metadata value through Lance's public
+`Branches::replace_metadata`, preserving unrelated metadata; the versioned
+marker binds the native name and identifier, and unknown fields, versions, or
+mismatched identity fail closed. Retirement then archives the exact
+`BranchContents` inside the native tree before unlinking the active ref. A
+retry validates that identity in the ref or archive; bare absence is not proof
+of completed retirement. Required native history remains readable through the
+archive, while branch-name reads and writes require an unretired ref. Explicit
+cleanup reclaims unneeded table forks and retired manifest trees with their
+archives after checking native dependencies, tags, table roots and historical
+merge-base providers; delayed staging is classified from a complete post-list
+identity inventory and final capture validation. The v8 storage fence keeps
+older binaries from exposing retired branches.
+
+Under either protocol no table fork is created for a graph branch: a branch
+write stages detached on the dataset and native branch its inherited
+registration names. A fork a branch created before format v11 is garbage once
+no registration references it and the graph branch incarnation in its name is
+gone; explicit cleanup reclaims it after proving that live table pins, tags
+and Lance ancestry no longer require it. An old owner's absence from the
+logical branch list alone is not proof.
 
 ## Test ownership
 

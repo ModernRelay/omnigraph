@@ -313,6 +313,19 @@ pub async fn retired_manifest_branches(
     Ok(retired)
 }
 
+/// The native names of the retired lifetimes whose trees `main` still names:
+/// its retired rows at or above the branch-row stamp, the retired refs and
+/// archives below it.
+pub async fn retired_native_names(main: &Dataset) -> Result<Vec<String>> {
+    if crate::layout::has_branch_rows(main) {
+        return Ok(crate::BranchRows::decode(main.manifest())?
+            .retired()
+            .map(str::to_string)
+            .collect());
+    }
+    Ok(retired_manifest_branches(main).await?.into_keys().collect())
+}
+
 impl ManifestCoordinator {
     /// Resolve a logical graph commit by immutable physical coordinates. A
     /// recreated logical name may reuse its version number, but never its
@@ -342,6 +355,25 @@ impl ManifestCoordinator {
         let mut candidates = Vec::new();
         match commit.graph_branch.as_deref() {
             None | Some("main") => candidates.push(None),
+            Some(logical) if crate::layout::has_branch_rows(&main) => {
+                let rows = crate::BranchRows::decode(main.manifest())?;
+                candidates.extend(
+                    rows.live()
+                        .filter(|row| {
+                            row.logical() == logical
+                                && row.parent_version < commit.graph_manifest_version
+                        })
+                        .map(|row| Some(row.native.clone())),
+                );
+                candidates.extend(
+                    rows.retired()
+                        .filter(|native| {
+                            crate::branch_names::logical_branch_name(native) == logical
+                        })
+                        .map(|native| Some(native.to_string())),
+                );
+                candidates.sort();
+            }
             Some(logical) => {
                 let mut physical = crate::branch_control::list_all_branch_contents(&main).await?;
                 physical.extend(retired_manifest_branches(&main).await?);
@@ -410,6 +442,10 @@ impl ManifestCoordinator {
         .await
     }
 
+    /// The commit graph of every retired lifetime whose tree holds a head,
+    /// the name retired last first. A retired name whose tree holds no
+    /// version, as the delete of a not-ready branch leaves, holds no history
+    /// and is passed over.
     pub async fn retired_commit_graphs_with_session(
         root_uri: &str,
         history: &HistoryCache,
@@ -417,17 +453,18 @@ impl ManifestCoordinator {
     ) -> Result<Vec<(String, CommitGraph)>> {
         let main =
             super::open_manifest_dataset_native_with_session(root_uri, None, session).await?;
-        let mut names = retired_manifest_branches(&main)
-            .await?
-            .into_keys()
-            .collect::<Vec<_>>();
+        let mut names = retired_native_names(&main).await?;
         names.sort();
         let mut graphs = Vec::new();
         for native in names.into_iter().rev() {
-            let dataset = main
+            let dataset = match main
                 .checkout_version(Ref::Version(Some(native.clone()), None))
                 .await
-                .map_err(OmniError::storage)?;
+            {
+                Ok(dataset) => dataset,
+                Err(error) if crate::layout::tree_has_no_head(&error) => continue,
+                Err(error) => return Err(OmniError::storage(error)),
+            };
             let session = dataset.session();
             let (head, buffer, registry) =
                 match crate::legacy::retired_head(root_uri, &session, history.objects(), &dataset)

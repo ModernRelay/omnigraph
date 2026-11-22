@@ -114,6 +114,39 @@ fn branch_delete_manifest_reads_bounded_per_surviving_branch() {
     });
 }
 
+/// On a main its process holds, `branch_list` answers from main's held rows
+/// and sends no request, whatever the number of branches.
+#[test]
+fn branch_list_on_a_held_main_sends_no_request() {
+    use crate::helpers::cost::last_manifest_reads;
+    on_big_stack(|| {
+        cost_harness(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db = local_graph(&dir).await;
+            db.branch_create("alpha").await.unwrap();
+            db.branch_create("beta").await.unwrap();
+            assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+            db.branch_list().await.unwrap();
+
+            let (names, io) = measure(db.branch_list()).await;
+            assert_eq!(names.unwrap(), ["main", "alpha", "beta"]);
+            eprintln!("LIST on a held main: {io:?}");
+            assert_eq!(
+                (
+                    io.manifest_reads,
+                    io.manifest_writes,
+                    io.data_reads,
+                    io.data_writes
+                ),
+                (0, 0, 0, 0),
+                "a listing on a held main sends no request: {:#?}",
+                last_manifest_reads()
+            );
+            assert_eq!(io.version_probes, 0, "{io:?}");
+        })
+    });
+}
+
 /// What `branch_list_detailed` may spend per listed branch, from a measured
 /// curve. Scans are the same on every backend: one of the branch's latest
 /// `__manifest` version, and one of the version it was created from once it has

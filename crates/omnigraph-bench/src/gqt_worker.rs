@@ -178,6 +178,15 @@ async fn execute_request(
             )
             .await
         }
+        crate::gqt_protocol::RepetitionInputV2::OwnedServer { input } => {
+            crate::gqt_runner::execute_owned_server_rep_signaled(
+                request.repetition,
+                &validated,
+                input,
+                signals,
+            )
+            .await
+        }
     }
 }
 

@@ -1,0 +1,68 @@
+# issue: none
+# notes: A delete whose first load of main's catalog meets a retryable contention loads again and
+# notes: lands: the branch leaves the listing and its name is created again from main.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query add_bob_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- seam
+at: publish.load_state
+occurrence: 1
+action: contention
+scope: next_step
+
+--- mutate
+branch delete b
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- query branch: b
+query names_on_recreated_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

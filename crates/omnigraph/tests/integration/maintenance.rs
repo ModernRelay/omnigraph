@@ -4402,114 +4402,107 @@ async fn cleanup_age_window_preserves_recent_ref_absent_descendant() {
     );
 }
 
-/// Backdate the live `__manifest` branch `branch`: its ref's `create_at` to
-/// zero and every file of its ref and tree to the epoch, so `cleanup`'s age
-/// window has passed for them. Returns the ref and tree paths.
-async fn age_manifest_branch(
-    root: &std::path::Path,
-    branch: &str,
-) -> (std::path::PathBuf, std::path::PathBuf) {
-    let manifest_uri = root.join("__manifest");
-    let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
-    let native = manifest
-        .list_branches()
-        .await
-        .unwrap()
-        .into_keys()
-        .find(|name| name.starts_with(&format!("{branch}.")))
-        .unwrap();
-    let live_ref = manifest_uri
-        .join("_refs/branches")
-        .join(format!("{native}.json"));
-    let mut contents: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&live_ref).unwrap()).unwrap();
-    contents["create_at"] = serde_json::json!(0);
-    std::fs::write(&live_ref, serde_json::to_vec(&contents).unwrap()).unwrap();
-    let tree = manifest_uri.join("tree").join(&native);
-    let mut paths = vec![tree.clone(), live_ref.clone()];
-    while let Some(path) = paths.pop() {
-        if path.is_dir() {
-            paths.extend(
-                std::fs::read_dir(&path)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path()),
-            );
-        } else {
-            std::fs::File::open(path)
-                .unwrap()
-                .set_times(
-                    std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
-                )
-                .unwrap();
-        }
-    }
-    (live_ref, tree)
-}
-
-/// The archive begins a retirement age window, then leaves with its unneeded tree.
-/// Native lifecycle contents and filesystem timestamps require the Rust owner.
+/// A delete retires the row and leaves the tree to `cleanup`, which removes
+/// the tree no live row names, then the retired entry, and counts both on the
+/// `__manifest` row. The directory layout and the row set need the Rust owner.
 #[tokio::test]
-async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
+async fn cleanup_reclaims_a_retired_branch_tree_and_its_entry() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
     let manifest_uri = dir.path().join("__manifest");
     let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
-    let (live_ref, tree) = age_manifest_branch(dir.path(), "feature").await;
-    db.branch_delete("feature").await.unwrap();
-    assert!(!live_ref.exists());
-    let archive = tree.join("_omnigraph_retired_branch.json");
-    let retired: lance::dataset::refs::BranchContents =
-        serde_json::from_slice(&std::fs::read(&archive).unwrap()).unwrap();
+    let native = helpers::native_ref_for(&manifest, "feature").await.unwrap();
+    let tree = manifest_uri.join("tree").join(&native);
     assert!(
-        retired
-            .metadata
-            .contains_key("omnigraph.retired_manifest_branch")
+        tree.join("_versions").is_dir(),
+        "test setup: the create wrote the tree"
     );
+    db.branch_delete("feature").await.unwrap();
     assert!(
         helpers::native_ref_for(&manifest, "feature")
             .await
             .is_none()
     );
     assert!(
-        std::fs::metadata(&archive).unwrap().modified().unwrap()
-            > std::time::SystemTime::UNIX_EPOCH,
-        "retirement writes a recent archive even when the tree is old"
+        helpers::branch_rows(&manifest)
+            .await
+            .retired()
+            .any(|retired| retired == native),
+        "the delete retires the row"
     );
-    db.cleanup_as(
-        CleanupPolicyOptions {
-            keep_versions: None,
-            older_than: Some(Duration::from_secs(30 * 24 * 60 * 60)),
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(
-        archive.exists(),
-        "an old branch's recent retirement starts its explicit age window"
-    );
-    assert!(
-        tree.exists(),
-        "the recent retirement metadata must protect the aged physical tree"
-    );
-    db.cleanup_as(
-        CleanupPolicyOptions {
-            keep_versions: None,
-            older_than: Some(Duration::ZERO),
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(
-        !archive.exists(),
-        "unneeded retirement evidence is reclaimed after its age window"
+    assert!(tree.exists(), "the tree stays until cleanup");
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    let manifest_row = rows
+        .iter()
+        .find(|row| row.type_key == "__manifest")
+        .unwrap();
+    assert_eq!(
+        (
+            manifest_row.manifest_trees_removed,
+            manifest_row.branch_entries_removed,
+            manifest_row.branch_entries_deferred,
+            manifest_row.ref_files_unlinked,
+        ),
+        (1, 1, 0, 0)
     );
     assert!(
         !tree.exists(),
-        "unneeded native history is reclaimed with its archive"
+        "no live row names the tree: it is reclaimed"
     );
+    assert_eq!(
+        helpers::branch_rows(&manifest).await.retired().count(),
+        0,
+        "the retired entry leaves main once its tree is gone"
+    );
+    assert_eq!(count_rows_branch(&db, "main", "node:Person").await, 4);
+}
+
+/// A branch named through a Lance layout directory (`a/data/b`) keeps its tree
+/// in `cleanup`: its objects belong to the row's native name, never to the
+/// shorter name before the layout segment; a deleted one is still reclaimed.
+#[tokio::test]
+async fn cleanup_keeps_live_trees_named_through_a_layout_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let manifest_uri = dir.path().join("__manifest");
+    let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
+    let mut trees = Vec::new();
+    for branch in ["a/data/b", "a/_indices/c", "a/data/gone"] {
+        db.branch_create(branch).await.unwrap();
+        insert_person(&db, branch, "on-branch").await;
+        let native = helpers::native_ref_for(&manifest, branch).await.unwrap();
+        trees.push(manifest_uri.join("tree").join(&native));
+    }
+    db.branch_delete("a/data/gone").await.unwrap();
+    assert!(
+        trees.iter().all(|tree| tree.join("_versions").is_dir()),
+        "test setup: each create wrote its tree, and the delete leaves it to cleanup"
+    );
+
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    let manifest_row = rows
+        .iter()
+        .find(|row| row.type_key == "__manifest")
+        .unwrap();
+    assert_eq!(
+        (
+            manifest_row.manifest_trees_removed,
+            manifest_row.branch_entries_removed,
+        ),
+        (1, 1),
+        "the deleted branch's tree and entry, and no live tree"
+    );
+    assert!(!trees[2].exists(), "the deleted branch's tree is reclaimed");
+    for (branch, tree) in ["a/data/b", "a/_indices/c"].into_iter().zip(&trees) {
+        assert!(
+            tree.join("_versions").is_dir(),
+            "the live branch '{branch}' keeps its tree"
+        );
+        assert_eq!(count_rows_branch(&db, branch, "node:Person").await, 5);
+    }
 }
 
 /// A handle that found a commit on a branch looks there first for the other
@@ -4538,17 +4531,11 @@ async fn commit_lookup_past_a_reclaimed_branch_tree_reads_history() {
         first,
         "test setup: the scan finds the commit on `feature` and remembers its block there"
     );
-    let (_, tree) = age_manifest_branch(dir.path(), "feature").await;
+    let manifest = Dataset::open(&format!("{uri}/__manifest")).await.unwrap();
+    let native = helpers::native_ref_for(&manifest, "feature").await.unwrap();
+    let tree = dir.path().join("__manifest/tree").join(&native);
     db.branch_delete("feature").await.unwrap();
-    db.cleanup_as(
-        CleanupPolicyOptions {
-            keep_versions: None,
-            older_than: Some(Duration::ZERO),
-        },
-        None,
-    )
-    .await
-    .unwrap();
+    db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(
         !tree.exists(),
         "test setup: cleanup reclaimed the deleted branch's tree"
@@ -5110,7 +5097,9 @@ async fn collector_retains_malformed_witnesses_after_retirement_history_is_gone(
         .await
         .unwrap();
     let native = helpers::native_ref_for(&manifest, "retired").await.unwrap();
-    let identity = manifest.branches().get(&native).await.unwrap().identifier;
+    let identity = helpers::branch_identifier_for(&manifest, "retired")
+        .await
+        .unwrap();
     assert_ne!(identity, BranchIdentifier::main());
     db.branch_delete("retired").await.unwrap();
     let rows = db.cleanup_as(keep_one(), None).await.unwrap();
