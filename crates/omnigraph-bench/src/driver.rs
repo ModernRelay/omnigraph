@@ -716,7 +716,7 @@ warmup_seconds: 0
 duration_seconds: 1
 
 --- concurrent measured
-writer x2: load generate: v1 seed: 42 mode: append
+writer x2: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -725,8 +725,8 @@ writer x2: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 5}
         n: {kind: ordinal, start: 1000, step: 1}
-reader: query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.n } }
-toucher: query touch() { update Chunk set { n: 7 } where slug = "seed-07" }
+reader: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.n } }
+toucher: query touch() { match { $c: Chunk } where $c.slug = "seed-07" update $c set { n: 7 } }
 folder: branch merge side into main
 --- expect
 writer: ok
