@@ -15,6 +15,7 @@ pub(crate) use omnigraph_core::{
     lance_access, lance_clone, lance_commit, manifest_request, metadata, seams, staging, storage,
 };
 pub mod branch_detail;
+pub mod branch_rows;
 pub mod commit_graph;
 
 mod commit;
@@ -67,6 +68,7 @@ pub mod unpublished;
 mod writer_epoch;
 pub use branch_detail::{GraphBranchDetail, GraphBranchListing, list_graph_branches_detailed};
 pub use branch_names::is_merge_input_tag;
+pub use branch_rows::{BranchRow, BranchRows, TombstoneRow};
 pub use migrations::{
     UNATTACHED_BRANCHES_STAMP, UNPUBLISHED_COMMITS_STAMP, require_unattached_branches,
     require_unpublished_commits, supports_unattached_branches, supports_unpublished_commits,
@@ -95,7 +97,7 @@ use layout::{
     open_manifest_dataset_native_at_with_session, open_manifest_dataset_native_with_session,
     open_manifest_dataset_with_session, resolve_native_manifest_branch, table_uri_for_path,
 };
-pub use layout::{history_uri, manifest_uri};
+pub use layout::{has_branch_rows, history_uri, manifest_uri};
 pub use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{
@@ -105,8 +107,8 @@ pub use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub use publisher::{
-    CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition, UnattachedIntent,
-    UnattachedOutcome, UnattachedWriteBase,
+    CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition, RowAttempt,
+    RowIntent, UnattachedIntent, UnattachedOutcome, UnattachedWriteBase,
 };
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub use state::DatasetEntry;
@@ -293,6 +295,10 @@ pub struct Snapshot {
     /// The `schema_contract` row's head from this SAME pinned manifest
     /// version (see `ManifestState::schema_contract`).
     schema_contract: Option<SchemaContractHead>,
+    /// The branch rows of this SAME pinned manifest version (see
+    /// `ManifestState::branch_rows`): the live branch set on a main-bound
+    /// view, empty on every other.
+    branch_rows: Arc<BranchRows>,
     contract_source: ContractSource,
     manifest_dataset: Option<Arc<Dataset>>,
     /// The control session of the `__manifest` this view was read from. Every
@@ -679,6 +685,14 @@ impl Snapshot {
         self.schema_contract.as_ref()
     }
 
+    /// The branch rows of this snapshot's own pinned manifest version: every
+    /// live branch on a main-bound snapshot, the surface the tests and the DST
+    /// assert over; empty on a branch-bound snapshot, whose coordinator's main
+    /// is a copy as of its last refresh (RFC "Branch existence in the catalog").
+    pub fn branch_rows(&self) -> &BranchRows {
+        &self.branch_rows
+    }
+
     /// Whether both snapshots captured the same immutable manifest image.
     pub fn same_manifest_image(&self, other: &Self) -> bool {
         self.root_uri == other.root_uri
@@ -891,7 +905,14 @@ impl HistoryRecord {
         native: Option<&str>,
         session: &Arc<lance::session::Session>,
     ) -> Result<Snapshot> {
-        let state = state::manifest_state(&self.tables, &self.commit, None, version, native)?;
+        let state = state::manifest_state(
+            &self.tables,
+            &self.commit,
+            None,
+            &Arc::default(),
+            version,
+            native,
+        )?;
         let mut snapshot =
             ManifestCoordinator::snapshot_from_state(root_uri, state, Arc::clone(session));
         snapshot.contract_source = ContractSource::Archive(self.commit.schema_content_hash.clone());
@@ -954,12 +975,20 @@ pub struct CapturedManifestProbe {
     dataset: Dataset,
     active_branch: Option<String>,
     captured: ManifestIncarnation,
+    /// The main the branch resolved through, whose rows answer the lifetime
+    /// without a request; `None` on main.
+    main: Option<Dataset>,
 }
 
 impl CapturedManifestProbe {
     pub async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
         crate::instrumentation::record_probe();
-        probe_dataset_latest_incarnation(&self.dataset, self.active_branch.as_deref()).await
+        probe_dataset_latest_incarnation(
+            &self.dataset,
+            self.active_branch.as_deref(),
+            self.main.as_ref(),
+        )
+        .await
     }
 
     pub async fn is_current(&self) -> Result<bool> {
@@ -1017,9 +1046,13 @@ async fn latest_attached_version(dataset: &Dataset) -> lance::Result<u64> {
     dataset.latest_version_id().await
 }
 
+/// The latest incarnation of `dataset`'s branch: main's version number; a
+/// named branch's chain version with its row's identifier when `main` is held
+/// at or above the branch-row stamp, with the ref's identifier otherwise.
 async fn probe_dataset_latest_incarnation(
     dataset: &Dataset,
     active_branch: Option<&str>,
+    main: Option<&Dataset>,
 ) -> Result<ManifestIncarnation> {
     if active_branch.is_none() {
         return Ok(ManifestIncarnation {
@@ -1032,6 +1065,11 @@ async fn probe_dataset_latest_incarnation(
         });
     }
     let branch = active_branch.expect("named-branch arm checked above");
+    if let Some(main) = main
+        && migrations::supports_branch_rows(migrations::guard_stamp(main)?)
+    {
+        return probe_latest_incarnation_by_rows(dataset, branch, main).await;
+    }
     // A named branch's native identifier is its lifetime witness. Pair it with
     // the branch-local latest version instead of loading the manifest body:
     // version changes catch ordinary commits, while the identifier catches a
@@ -1076,6 +1114,60 @@ async fn probe_dataset_latest_incarnation(
         e_tag: None,
         timestamp_nanos: None,
         branch_identifier,
+    })
+}
+
+/// The row arm of [`probe_dataset_latest_incarnation`]: the held chain's
+/// latest version under its row's identifier, or, for a chain that cannot be
+/// listed, `branch` resolved again through main's latest rows.
+async fn probe_latest_incarnation_by_rows(
+    dataset: &Dataset,
+    branch: &str,
+    main: &Dataset,
+) -> Result<ManifestIncarnation> {
+    let native = dataset.manifest().branch.as_deref().ok_or_else(|| {
+        OmniError::manifest_internal("named coordinator has no native manifest tree")
+    })?;
+    let rows = BranchRows::decode(main.manifest())?;
+    let held = match rows.branch(native) {
+        Some(row) => latest_attached_version(dataset)
+            .await
+            .map_err(OmniError::storage)
+            .map(|version| ManifestIncarnation {
+                version,
+                e_tag: None,
+                timestamp_nanos: None,
+                branch_identifier: row.identifier.clone(),
+            }),
+        None => Err(OmniError::BranchNotFound {
+            branch: branch.to_string(),
+        }),
+    };
+    match held {
+        Ok(incarnation) => return Ok(incarnation),
+        Err(OmniError::BranchNotFound { .. } | OmniError::Storage(_)) => {}
+        Err(error) => return Err(error),
+    }
+    let latest = main.latest_version_id().await.map_err(OmniError::storage)?;
+    let main = main
+        .checkout_version(latest)
+        .await
+        .map_err(OmniError::storage)?;
+    let row = BranchRows::decode(main.manifest())?
+        .by_logical(branch)
+        .cloned()
+        .ok_or_else(|| OmniError::BranchNotFound {
+            branch: branch.to_string(),
+        })?;
+    let replacement = main
+        .checkout_branch(&row.native)
+        .await
+        .map_err(|error| layout::branch_tree_error(error, branch))?;
+    Ok(ManifestIncarnation {
+        version: replacement.version().version,
+        e_tag: None,
+        timestamp_nanos: None,
+        branch_identifier: row.identifier,
     })
 }
 
@@ -1171,14 +1263,23 @@ impl CollectorBranch {
         &self.identifier
     }
 
-    /// A fresh authority inventory; the held dataset caches no branch refs.
+    /// A fresh authority inventory: main's latest rows at or above the
+    /// branch-row stamp, the refs below it; the held dataset caches neither.
     pub async fn live_identifiers(&self) -> Result<Vec<lance::dataset::refs::BranchIdentifier>> {
-        let mut identifiers =
-            crate::branch_control::list_live_manifest_branch_contents(&self.dataset)
+        let main =
+            open_manifest_dataset_with_session(&self.root_uri, None, &self.dataset.session())
+                .await?;
+        let mut identifiers = match layout::has_branch_rows(&main) {
+            true => BranchRows::decode(main.manifest())?
+                .live()
+                .map(|row| row.identifier.clone())
+                .collect::<Vec<_>>(),
+            false => crate::branch_control::list_live_manifest_branch_contents(&self.dataset)
                 .await?
                 .into_values()
                 .map(|contents| contents.identifier)
-                .collect::<Vec<_>>();
+                .collect(),
+        };
         identifiers.push(lance::dataset::refs::BranchIdentifier::main());
         Ok(identifiers)
     }
@@ -1430,6 +1531,28 @@ pub struct PreparedManifestOpen {
     dataset: Dataset,
 }
 
+/// What a refresh found at the branch's latest version (RFC "Branch
+/// existence in the catalog" §Readers): the held image, a version carrying the
+/// held rows under another config map, or rows read again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The held version is the latest: nothing moved.
+    Unchanged,
+    /// A later version with the same data files and schema: the dataset and
+    /// the branch rows were swapped, every row, pin and cache keyed on them
+    /// stands.
+    MetadataOnly,
+    /// The rows were read again from the latest version.
+    Reloaded,
+}
+
+impl RefreshOutcome {
+    /// Whether the refresh replaced the table state a read cache is keyed on.
+    pub fn reloaded_rows(self) -> bool {
+        self == Self::Reloaded
+    }
+}
+
 pub struct ManifestCoordinator {
     captured_contract: Option<Arc<SchemaContractRow>>,
     root_uri: String,
@@ -1445,7 +1568,14 @@ pub struct ManifestCoordinator {
     /// `known_state`. A named ref keeps this value across ordinary commits and
     /// receives a new value after delete/recreate.
     branch_identifier: lance::dataset::refs::BranchIdentifier,
+    /// The main `__manifest` a branch-bound coordinator resolved its branch
+    /// through, whose rows hold the branch's existence and identifier (RFC
+    /// "Branch existence in the catalog" §Readers); `None` when main-bound.
+    main: Option<Dataset>,
     publisher: Arc<dyn ManifestBatchPublisher>,
+    /// A branch-bound coordinator's publisher of main, built on its first
+    /// control fact and kept, so its acknowledged image serves the next.
+    main_publisher: std::sync::OnceLock<Arc<dyn ManifestBatchPublisher>>,
     /// The head commit's record and the `table` rows of the `__manifest`
     /// version `known_state` was read at.
     head: Arc<HistoryRecord>,
@@ -1471,6 +1601,130 @@ decide_seam! {
     pub static READ_REFRESH_POST_STATE_PRE_LINEAGE = ("read.refresh_post_state_pre_lineage", Unreachable, [Fail]);
 }
 
+decide_seam! {
+    /// After a create's row landed on main and before its tree is written: a
+    /// failure leaves a live row with no tree, the not-ready branch, which
+    /// `branch delete` removes and `cleanup` keeps the fork point for.
+    pub static BRANCH_CREATE_POST_ROW = ("branch_create.post_row", BranchCreate, [Fail]);
+}
+
+decide_seam! {
+    /// After a create's tree is written and before main is probed for a
+    /// delete that overtook the row: the branch exists; only the probe and
+    /// the acknowledgement are lost.
+    pub static BRANCH_CREATE_POST_TREE = ("branch_create.post_tree", BranchCreate, [Fail]);
+}
+
+decide_seam! {
+    /// After a delete's tombstone landed on the branch's chain and before
+    /// its retired row on main: the branch refuses reads and writes
+    /// `branch_deleted` and still lists; the next `branch delete` of the
+    /// name settles the history again and finishes.
+    pub static BRANCH_DELETE_POST_TOMBSTONE = ("branch_delete.post_tombstone", BranchDelete, [Fail]);
+}
+
+decide_seam! {
+    /// Before a delete's first effect at or above the branch-row stamp, the
+    /// tombstone, once the row resolved, the fence was read and the tree's
+    /// readiness is known: a failure here leaves the branch as it was.
+    pub static BRANCH_DELETE_PRE_TOMBSTONE = ("branch_delete.pre_tombstone", BranchDelete, [Fail]);
+}
+
+decide_seam! {
+    /// After a delete's retired row landed on main and before the process
+    /// releases its claim: the branch is gone; only the acknowledgement is lost.
+    pub static BRANCH_DELETE_POST_RETIRED_ROW = ("branch_delete.post_retired_row", BranchDelete, [Fail]);
+}
+
+/// Where a create takes its fork point: main's version each attempt loads,
+/// so the row forks from the version it lands beside, or a fixed version
+/// of the source, whose schema contract main's must still be.
+enum ForkPoint {
+    MainAtAttempt,
+    Fixed {
+        version: u64,
+        contract: Option<SchemaContractHead>,
+        commit: String,
+    },
+}
+
+/// One create's row as every attempt builds it: the names and identity the
+/// create minted before its first attempt, and where the branch starts.
+struct CreateRow {
+    name: String,
+    native: String,
+    attempt_id: String,
+    created_at: u64,
+    fork: ForkPoint,
+    source_native: Option<String>,
+    source_identifier: lance::dataset::refs::BranchIdentifier,
+}
+
+impl CreateRow {
+    /// The row over what `attempt` loaded (RFC "Branch existence in the
+    /// catalog" §Create): its own row unchanged once a put of this create
+    /// landed it, else every check of the create over the loaded rows.
+    fn row_for(&self, attempt: &RowAttempt<'_>) -> Result<BranchRow> {
+        let landed = attempt.branch_rows.branch(&self.native);
+        if let Some(own) = landed.filter(|row| row.attempt_id == self.attempt_id) {
+            return Ok(own.clone());
+        }
+        if attempt.branch_rows.is_retired(&self.native) {
+            return Err(OmniError::BranchDeleted {
+                branch: self.name.clone(),
+            });
+        }
+        attempt.branch_rows.refuse_create_overlap(&self.name)?;
+        let parent_version = match &self.fork {
+            ForkPoint::MainAtAttempt => attempt.version,
+            ForkPoint::Fixed {
+                version,
+                contract,
+                commit,
+            } => {
+                if attempt.schema_contract != contract.as_ref() {
+                    return Err(OmniError::branch_start_refused(
+                        commit.clone(),
+                        crate::error::BranchStartRefusal::SchemaChanged,
+                    ));
+                }
+                *version
+            }
+        };
+        let parent = match &self.source_native {
+            None => MAIN_BRANCH_HEAD_KEY.to_string(),
+            Some(source_native) => {
+                let live = attempt
+                    .branch_rows
+                    .branch(source_native)
+                    .is_some_and(|row| row.identifier == self.source_identifier);
+                if !live {
+                    return Err(OmniError::BranchDeleted {
+                        branch: crate::branch_names::logical_branch_name(source_native).to_string(),
+                    });
+                }
+                source_native.clone()
+            }
+        };
+        Ok(BranchRow {
+            native: self.native.clone(),
+            identifier: lance::dataset::refs::BranchIdentifier::new(
+                &self.source_identifier,
+                parent_version,
+            ),
+            parent,
+            parent_version,
+            created_at: self.created_at,
+            attempt_id: self.attempt_id.clone(),
+        })
+    }
+}
+
+/// The wall clock in Unix seconds: what a branch row and a tombstone record.
+fn unix_seconds() -> Result<u64> {
+    Ok(u64::try_from(omnigraph_core::metadata::now_micros()? / 1_000_000).unwrap_or_default())
+}
+
 impl ManifestCoordinator {
     /// Take an operation-local copy of this exact immutable view. The caller
     /// still checks its authority after acquiring the operation's gates.
@@ -1483,12 +1737,24 @@ impl ManifestCoordinator {
             active_branch: self.active_branch.clone(),
             native_branch: self.native_branch.clone(),
             branch_identifier: self.branch_identifier.clone(),
+            main: self.main.clone(),
             publisher: Arc::clone(&self.publisher),
+            main_publisher: self.shared_main_publisher(),
             head: Arc::clone(&self.head),
             buffer: Arc::clone(&self.buffer),
             registry: Arc::clone(&self.registry),
             history: self.history.clone(),
         }
+    }
+
+    /// The main-publisher cell, filled first when this coordinator is
+    /// branch-bound, so a capture shares the publisher and the acknowledged
+    /// image its row commits leave behind.
+    fn shared_main_publisher(&self) -> std::sync::OnceLock<Arc<dyn ManifestBatchPublisher>> {
+        if self.active_branch.is_some() {
+            self.main_publisher();
+        }
+        self.main_publisher.clone()
     }
 
     fn default_batch_publisher(
@@ -1512,6 +1778,7 @@ impl ManifestCoordinator {
             rows,
             branch_identifier,
             native_branch,
+            main,
         } = opened;
         let publisher =
             Self::default_batch_publisher(root_uri, active_branch.as_deref(), dataset.session());
@@ -1531,7 +1798,9 @@ impl ManifestCoordinator {
             active_branch,
             native_branch,
             branch_identifier,
+            main,
             publisher,
+            main_publisher: std::sync::OnceLock::new(),
             head: Arc::new(HistoryRecord {
                 commit: head,
                 tables,
@@ -1556,6 +1825,7 @@ impl ManifestCoordinator {
                 .map(|entry| (entry.type_key.clone(), entry))
                 .collect(),
             schema_contract: state.schema_contract,
+            branch_rows: state.branch_rows,
             contract_source: ContractSource::Manifest,
             captured_contract: None,
             manifest_dataset: None,
@@ -1722,7 +1992,7 @@ impl ManifestCoordinator {
         control_session: &Arc<lance::session::Session>,
     ) -> Result<PreparedManifestOpen> {
         let root = root_uri.trim_end_matches('/');
-        let dataset = open_manifest_dataset_with_session(root, None, control_session).await?;
+        let dataset = layout::open_main_manifest_of_graph(root, control_session).await?;
         migrations::refuse_if_stamp_unsupported(migrations::guard_stamp(&dataset)?)?;
         Ok(PreparedManifestOpen {
             root_uri: root.to_string(),
@@ -1747,9 +2017,7 @@ impl ManifestCoordinator {
         let captured = Box::pin(Self::project_opened_with_lineage(
             root,
             None,
-            dataset,
-            lance::dataset::refs::BranchIdentifier::main(),
-            None,
+            layout::OpenedBranch::main(dataset),
             true,
         ))
         .await;
@@ -1773,9 +2041,7 @@ impl ManifestCoordinator {
                 Box::pin(Self::project_opened_with_lineage(
                     root,
                     None,
-                    current,
-                    lance::dataset::refs::BranchIdentifier::main(),
-                    None,
+                    layout::OpenedBranch::main(current),
                     true,
                 ))
                 .await?
@@ -1803,17 +2069,9 @@ impl ManifestCoordinator {
         // Retain the fold accumulators alongside the state (the incremental merge-authority projection): the
         // scan this open pays anyway becomes the base a later refresh folds
         // deltas into, instead of a sunk cost repeated per refresh.
-        let (dataset, branch_identifier, native_branch) =
-            open_manifest_branch_with_identifier(root, branch, control_session).await?;
-        Self::project_opened_with_lineage(
-            root,
-            branch,
-            dataset,
-            branch_identifier,
-            native_branch,
-            read_contract,
-        )
-        .await
+        let opened = open_manifest_branch_with_identifier(root, branch, control_session).await?;
+        layout::refuse_tombstoned(&opened, branch)?;
+        Self::project_opened_with_lineage(root, branch, opened, read_contract).await
     }
 
     pub async fn open_with_lineage_and_contract(
@@ -1838,16 +2096,21 @@ impl ManifestCoordinator {
     async fn project_opened_with_lineage(
         root: &str,
         branch: Option<&str>,
-        dataset: Dataset,
-        branch_identifier: lance::dataset::refs::BranchIdentifier,
-        native_branch: Option<String>,
+        opened: layout::OpenedBranch,
         _read_contract: bool,
     ) -> Result<(
         Self,
         Vec<GraphLineageRow>,
         Option<Result<SchemaContractRow>>,
     )> {
-        let (rows, contract) = state::read_manifest_rows_with_contract(&dataset).await?;
+        let layout::OpenedBranch {
+            dataset,
+            branch_identifier,
+            native_branch,
+            main,
+        } = opened;
+        let (rows, contract, batch) =
+            state::read_manifest_rows_with_contract_and_batch(&dataset).await?;
         let known_state = rows.state(dataset.version().version, native_branch.as_deref())?;
         let opened = OpenedManifest {
             dataset,
@@ -1855,8 +2118,15 @@ impl ManifestCoordinator {
             rows,
             branch_identifier,
             native_branch,
+            main,
         };
         let coordinator = Self::from_opened(root, opened, branch.map(str::to_string));
+        if let Some(batch) = batch {
+            coordinator
+                .publisher
+                .adopt_image(&coordinator.dataset, batch)
+                .await;
+        }
         Ok((coordinator, Vec::new(), Some(contract)))
     }
 
@@ -2022,8 +2292,11 @@ impl ManifestCoordinator {
         branch: Option<&str>,
         control_session: &Arc<lance::session::Session>,
     ) -> Result<CollectorBranch> {
-        let (dataset, identifier, _native) =
-            open_manifest_branch_with_identifier(root_uri, branch, control_session).await?;
+        let layout::OpenedBranch {
+            dataset,
+            branch_identifier: identifier,
+            ..
+        } = open_manifest_branch_with_identifier(root_uri, branch, control_session).await?;
         Ok(CollectorBranch {
             root_uri: root_uri.trim_end_matches('/').to_string(),
             branch: branch
@@ -2067,6 +2340,87 @@ impl ManifestCoordinator {
             dataset: self.dataset.clone(),
             active_branch: self.active_branch.clone(),
             captured: self.incarnation(),
+            main: self.main.clone(),
+        }
+    }
+
+    /// The main `__manifest` this coordinator holds: its own when main-bound,
+    /// else the main its branch resolved through.
+    pub fn main_manifest(&self) -> &Dataset {
+        self.main.as_ref().unwrap_or(&self.dataset)
+    }
+
+    /// The identifier of `branch`'s live row on the held main; `None` when no
+    /// row is live, and below the branch-row stamp.
+    pub fn live_row_identifier(
+        &self,
+        branch: &str,
+    ) -> Result<Option<lance::dataset::refs::BranchIdentifier>> {
+        let main = self.main_manifest();
+        if !layout::has_branch_rows(main) {
+            return Ok(None);
+        }
+        Ok(BranchRows::decode(main.manifest())?
+            .by_logical(branch)
+            .map(|row| row.identifier.clone()))
+    }
+
+    /// The publisher of main for this coordinator's control facts, the branch
+    /// row and the retired row among them (RFC "Branch existence in the
+    /// catalog" §Readers): its own when main-bound, else one over the root
+    /// whose epoch assertion reads the process's holders, built once and
+    /// kept so its acknowledged image serves every later control fact.
+    /// This coordinator's own publisher: the branch's chain publisher when
+    /// branch-bound, main's when main-bound.
+    pub fn publisher(&self) -> Arc<dyn ManifestBatchPublisher> {
+        Arc::clone(&self.publisher)
+    }
+
+    pub fn main_publisher(&self) -> Arc<dyn ManifestBatchPublisher> {
+        match self.active_branch {
+            None => Arc::clone(&self.publisher),
+            Some(_) => Arc::clone(self.main_publisher.get_or_init(|| {
+                self.publisher
+                    .main_publisher(&self.root_uri, self.dataset.session())
+            })),
+        }
+    }
+
+    /// Whether this main-bound coordinator holds main's latest branch rows:
+    /// its process holds main's writer epoch with its last publication there
+    /// installed, at or above the branch-row stamp.
+    fn holds_current_main_rows(&self) -> bool {
+        self.active_branch.is_none()
+            && layout::has_branch_rows(self.main_manifest())
+            && self
+                .held_writer_version()
+                .is_some_and(|landed| self.version() >= landed)
+    }
+
+    /// The held main at its latest version: the held one when the freshness
+    /// probe (two or three existence requests) finds nothing after it, else
+    /// one read of the version it found.
+    async fn latest_main(&self) -> Result<Dataset> {
+        let main = self.main_manifest();
+        let latest = latest_attached_version(main)
+            .await
+            .map_err(OmniError::storage)?;
+        if latest == main.version().version {
+            return Ok(main.clone());
+        }
+        main.checkout_version(latest)
+            .await
+            .map_err(OmniError::storage)
+    }
+
+    /// Install the main a control fact landed on: this coordinator's own
+    /// view when main-bound, else the main its branch resolves through.
+    fn adopt_main(&mut self, outcome: PublishOutcome) {
+        match self.active_branch {
+            None => {
+                self.install_outcome(outcome, Vec::new());
+            }
+            Some(_) => self.main = Some(outcome.dataset),
         }
     }
 
@@ -2085,21 +2439,57 @@ impl ManifestCoordinator {
     /// Main's native branch identifier and numeric version survive a replacement
     /// of the root, so the held view is kept only while the complete immutable
     /// manifest image still matches its held pin.
-    pub async fn refresh(&mut self) -> Result<()> {
+    pub async fn refresh(&mut self) -> Result<RefreshOutcome> {
         Box::pin(self.refresh_inner()).await
+    }
+
+    /// Whether `next` carries the rows `held` does, the same data files and
+    /// schema whatever the fragment ids and version stamps, so only its config
+    /// map and version differ (RFC "Branch existence in the catalog" §Readers).
+    pub(crate) fn same_rows_image(
+        held: &lance_table::format::Manifest,
+        next: &lance_table::format::Manifest,
+    ) -> bool {
+        let data_files = |manifest: &lance_table::format::Manifest| {
+            manifest
+                .fragments
+                .iter()
+                .map(|fragment| {
+                    (
+                        fragment
+                            .files
+                            .iter()
+                            .map(|file| file.path.clone())
+                            .collect::<Vec<_>>(),
+                        fragment.deletion_file.clone(),
+                        fragment.physical_rows,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        data_files(held) == data_files(next)
+            && held.schema == next.schema
+            && held.schema.metadata == next.schema.metadata
     }
 
     /// The body of [`Self::refresh`], boxed there: it is awaited deep inside
     /// the merge future, the engine's known stack-depth hazard, and the box
     /// keeps its layout out of every caller's generator frame.
-    async fn refresh_inner(&mut self) -> Result<()> {
+    async fn refresh_inner(&mut self) -> Result<RefreshOutcome> {
         let control_session = self.dataset.session();
-        let (dataset, branch_identifier, native_branch) = open_manifest_branch_with_identifier(
+        let opened = open_manifest_branch_with_identifier(
             &self.root_uri,
             self.active_branch.as_deref(),
             &control_session,
         )
         .await?;
+        layout::refuse_tombstoned(&opened, self.active_branch.as_deref())?;
+        let layout::OpenedBranch {
+            dataset,
+            branch_identifier,
+            native_branch,
+            main,
+        } = opened;
         crate::instrumentation::record_projection_incremental_refresh();
         let recreated = branch_identifier != self.branch_identifier;
         let mut replaced_root = false;
@@ -2110,25 +2500,43 @@ impl ManifestCoordinator {
                 &dataset,
             );
             if held_image_still_pinned {
-                return Ok(());
+                self.main = main;
+                return Ok(RefreshOutcome::Unchanged);
             }
             tracing::debug!(
                 "manifest refresh: manifest image changed at the held version; root replaced, full read"
             );
             replaced_root = true;
         }
-        let rows = state::read_manifest_rows_with_contract(&dataset).await?.0;
+        if !recreated
+            && !replaced_root
+            && Self::same_rows_image(self.dataset.manifest(), dataset.manifest())
+        {
+            let branch_rows = Arc::new(BranchRows::decode(dataset.manifest())?);
+            fail(&READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
+            self.dataset = dataset;
+            self.known_state.version = self.dataset.version().version;
+            self.known_state.branch_rows = branch_rows;
+            self.main = main;
+            self.publisher.rekey_image(&self.dataset).await;
+            return Ok(RefreshOutcome::MetadataOnly);
+        }
+        let (rows, _, batch) = state::read_manifest_rows_with_contract_and_batch(&dataset).await?;
         let known_state = rows.state(dataset.version().version, native_branch.as_deref())?;
         fail(&READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
         self.dataset = dataset;
         self.known_state = known_state;
         self.branch_identifier = branch_identifier;
         self.native_branch = native_branch;
+        self.main = main;
         if replaced_root {
             self.history.reset();
         }
         self.install_head(rows, Vec::new());
-        Ok(())
+        if let Some(batch) = batch {
+            self.publisher.adopt_image(&self.dataset, batch).await;
+        }
+        Ok(RefreshOutcome::Reloaded)
     }
 
     /// Replace the head and the buffer with those of `rows`. The commits this
@@ -2416,6 +2824,7 @@ impl ManifestCoordinator {
             schema_contract,
             registry,
             writer_epoch,
+            branch_rows,
         } = outcome;
         self.dataset = dataset;
         self.known_state = known_state;
@@ -2427,6 +2836,7 @@ impl ManifestCoordinator {
             schema_contract,
             registry,
             writer_epoch,
+            branch_rows,
         };
         self.install_head(rows, merged);
         head
@@ -2471,26 +2881,35 @@ impl ManifestCoordinator {
     /// commit is found while `__history` does not hold it yet. One open of
     /// `__manifest`, one listing of its branches, and one scan per branch
     /// until the commit is found: the branch of this coordinator, then main,
-    /// then the other live branches, the one created last first.
+    /// then the other live branches, the one created last first. A live row
+    /// whose tree is not written, the not-ready branch, holds no commit and
+    /// is passed over.
     pub async fn record_in_live_branches(
         &self,
         graph_commit_id: &str,
     ) -> Result<Option<HistoryRecord>> {
         let session = self.dataset.session();
         let main = open_manifest_dataset_with_session(&self.root_uri, None, &session).await?;
-        let mut others: Vec<(u64, Option<String>, String)> =
-            list_live_manifest_branch_contents(&main)
+        let lifetimes: Vec<(String, u64)> = match layout::has_branch_rows(&main) {
+            true => BranchRows::decode(main.manifest())?
+                .live()
+                .map(|row| (row.native.clone(), row.created_at))
+                .collect(),
+            false => list_live_manifest_branch_contents(&main)
                 .await?
                 .into_iter()
-                .filter(|(native, _)| {
-                    native != "main" && Some(native) != self.native_branch.as_ref()
-                })
-                .map(|(native, contents)| {
-                    let (_, incarnation) = crate::branch_names::split_native_branch_name(&native);
-                    let incarnation = incarnation.map(str::to_string);
-                    (contents.create_at, incarnation, native)
-                })
-                .collect();
+                .map(|(native, contents)| (native, contents.create_at))
+                .collect(),
+        };
+        let mut others: Vec<(u64, Option<String>, String)> = lifetimes
+            .into_iter()
+            .filter(|(native, _)| native != "main" && Some(native) != self.native_branch.as_ref())
+            .map(|(native, created_at)| {
+                let (_, incarnation) = crate::branch_names::split_native_branch_name(&native);
+                let incarnation = incarnation.map(str::to_string);
+                (created_at, incarnation, native)
+            })
+            .collect();
         others.sort_by(|a, b| b.cmp(a));
         let own = self.native_branch.clone().map(Some);
         let natives = own
@@ -2503,6 +2922,7 @@ impl ManifestCoordinator {
                 Some(native) => match main.checkout_branch(native).await {
                     Ok(branch) => branch,
                     Err(lance::Error::RefNotFound { .. }) => continue,
+                    Err(error) if layout::tree_never_written(&error) => continue,
                     Err(error) => return Err(OmniError::storage(error)),
                 },
             };
@@ -2637,6 +3057,14 @@ impl ManifestCoordinator {
         branch: &str,
     ) -> Result<lance::dataset::refs::BranchIdentifier> {
         let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
+        if migrations::supports_branch_rows(migrations::guard_stamp(&main)?) {
+            return BranchRows::decode(main.manifest())?
+                .by_logical(branch)
+                .map(|row| row.identifier.clone())
+                .ok_or_else(|| OmniError::BranchNotFound {
+                    branch: branch.to_string(),
+                });
+        }
         let native = resolve_native_manifest_branch(&main, branch).await?;
         crate::branch_control::get_branch_identifier(&main, &native)
             .await
@@ -2713,7 +3141,12 @@ impl ManifestCoordinator {
     /// timestamp when both lifetimes fork the same source; the native branch
     /// identifier is therefore part of the freshness result as well.
     pub async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
-        probe_dataset_latest_incarnation(&self.dataset, self.active_branch.as_deref()).await
+        probe_dataset_latest_incarnation(
+            &self.dataset,
+            self.active_branch.as_deref(),
+            self.main.as_ref(),
+        )
+        .await
     }
 
     /// Create the logical branch `name` as a fresh native incarnation.
@@ -2733,6 +3166,18 @@ impl ManifestCoordinator {
     ) -> Result<()> {
         crate::branch_names::ensure_logical_branch_name(name)?;
         let version = self.version();
+        if layout::has_branch_rows(self.main_manifest()) {
+            let source = self.dataset.clone();
+            let fork = match self.active_branch {
+                None => ForkPoint::MainAtAttempt,
+                Some(_) => ForkPoint::Fixed {
+                    version,
+                    contract: self.known_state.schema_contract.clone(),
+                    commit: self.head().graph_commit_id.clone(),
+                },
+            };
+            return self.create_branch_by_row(source, fork, name, binding).await;
+        }
         Self::create_branch_from(self.dataset.clone(), name, version, binding).await
     }
 
@@ -2769,20 +3214,122 @@ impl ManifestCoordinator {
             )
             .before_effect());
         }
-        let head = state::read_manifest_rows_projected(&dataset)
+        let rows = state::read_manifest_rows_projected(&dataset)
             .await
-            .map_err(OmniError::before_effect)?
-            .head;
-        if head.graph_commit_id != graph_commit_id {
+            .map_err(OmniError::before_effect)?;
+        if rows.head.graph_commit_id != graph_commit_id {
             return Err(OmniError::manifest_internal(format!(
                 "`__manifest` version {version} of {} holds head commit '{}', not '{graph_commit_id}' \
                  its record names; no branch was created",
                 self.native_branch.as_deref().unwrap_or("main"),
-                head.graph_commit_id
+                rows.head.graph_commit_id
             ))
             .before_effect());
         }
+        if layout::has_branch_rows(self.main_manifest()) {
+            let fork = ForkPoint::Fixed {
+                version,
+                contract: rows.schema_contract_head.clone(),
+                commit: graph_commit_id.to_string(),
+            };
+            return self
+                .create_branch_by_row(dataset, fork, name, binding)
+                .await;
+        }
         Self::create_branch_from(dataset, name, version, binding).await
+    }
+
+    /// RFC "Branch existence in the catalog" §Create: the row on main with
+    /// every check run per attempt, the tree as a shallow clone of `source`
+    /// at the fork point the landed row names, one probe of main.
+    async fn create_branch_by_row(
+        &mut self,
+        source: Dataset,
+        fork: ForkPoint,
+        name: &str,
+        binding: Option<&crate::storage::CapturedStorageBinding>,
+    ) -> Result<()> {
+        let source_native = source.manifest().branch.clone();
+        let source_logical = self
+            .active_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string());
+        if BranchRows::decode(source.manifest())?.tombstone().is_some() {
+            return Err(OmniError::BranchDeleted {
+                branch: source_logical,
+            }
+            .before_effect());
+        }
+        let native =
+            crate::branch_names::native_branch_name(name, &crate::branch_names::mint_incarnation());
+        lance::dataset::refs::check_valid_branch(&native)
+            .map_err(|error| OmniError::manifest(error.to_string()).before_effect())?;
+        let create = CreateRow {
+            name: name.to_string(),
+            native: native.clone(),
+            attempt_id: crate::branch_names::mint_incarnation(),
+            created_at: unix_seconds()?,
+            fork,
+            source_native: source_native.clone(),
+            source_identifier: self.branch_identifier.clone(),
+        };
+        let intent = RowIntent::branch_row(create.attempt_id.clone(), move |attempt| {
+            create.row_for(attempt)
+        });
+        let outcome = self.main_publisher().publish_rows(&intent).await?;
+        let row = outcome
+            .branch_rows
+            .branch(&native)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the row of branch '{name}' is missing from the version its publication landed"
+                ))
+            })?;
+        self.adopt_main(outcome);
+        fail(&BRANCH_CREATE_POST_ROW)?;
+        let source = match source_native {
+            None if source.version().version != row.parent_version => self
+                .main_manifest()
+                .checkout_version(row.parent_version)
+                .await
+                .map_err(OmniError::storage)?,
+            _ => source,
+        };
+        crate::lance_clone::create_branch_tree(&source, &native, row.parent_version, binding)
+            .await
+            .map_err(OmniError::storage)?;
+        fail(&BRANCH_CREATE_POST_TREE)?;
+        self.refuse_if_row_retired(&native, name).await
+    }
+
+    /// RFC §Create step 4: one probe of main for a version after the row's;
+    /// a main that moved is read once, and a row retired meanwhile refuses
+    /// `BranchDeleted`, the tree left to the collector.
+    async fn refuse_if_row_retired(&mut self, native: &str, name: &str) -> Result<()> {
+        let main = self.main_manifest();
+        let latest = latest_attached_version(main)
+            .await
+            .map_err(OmniError::storage)?;
+        if latest == main.version().version {
+            return Ok(());
+        }
+        let moved = main
+            .checkout_version(latest)
+            .await
+            .map_err(OmniError::storage)?;
+        if BranchRows::decode(moved.manifest())?
+            .branch(native)
+            .is_none()
+        {
+            return Err(OmniError::BranchDeleted {
+                branch: name.to_string(),
+            });
+        }
+        if self.active_branch.is_some() {
+            self.main = Some(moved);
+        }
+        Ok(())
     }
 
     /// Create `name` as a clone of `ds`, checked out at `version`.
@@ -2837,6 +3384,12 @@ impl ManifestCoordinator {
                     .records()
             }
         };
+        self.settle_records(records, native).await
+    }
+
+    /// [`Self::settle_head_of`] from `records`, the branch's buffer and head
+    /// as the caller already holds them, so nothing is read again.
+    async fn settle_records(&self, records: BranchRecords, native: &str) -> Result<()> {
         let mut closed = history::ClosedBlocks::default();
         history::closed_blocks(records.commits(), &mut closed)?;
         let records: Vec<_> = records
@@ -2852,6 +3405,12 @@ impl ManifestCoordinator {
 
     #[doc(hidden)]
     pub async fn delete_branch(&mut self, name: &str) -> Result<()> {
+        if layout::has_branch_rows(self.main_manifest()) {
+            return self
+                .delete_branch_by_row(name, None, None)
+                .await
+                .map_err(OmniError::without_pre_effect_evidence);
+        }
         let ds = self.open_branch_control_dataset().await?;
         let branches = list_live_manifest_branch_contents(&ds).await?;
         let native =
@@ -2905,6 +3464,26 @@ impl ManifestCoordinator {
         name: &str,
         expected_identifier: &lance::dataset::refs::BranchIdentifier,
     ) -> Result<()> {
+        self.delete_branch_through(name, expected_identifier, None)
+            .await
+    }
+
+    /// [`Self::delete_branch_with_expected`] with `chain`, the publisher of a
+    /// coordinator this process holds on the branch, publishing the tombstone
+    /// from its acknowledged image at or above the branch-row stamp; `None`
+    /// opens the chain.
+    #[doc(hidden)]
+    pub async fn delete_branch_through(
+        &mut self,
+        name: &str,
+        expected_identifier: &lance::dataset::refs::BranchIdentifier,
+        chain: Option<Arc<dyn ManifestBatchPublisher>>,
+    ) -> Result<()> {
+        if layout::has_branch_rows(self.main_manifest()) {
+            return self
+                .delete_branch_by_row(name, Some(expected_identifier), chain)
+                .await;
+        }
         let ds = self
             .open_branch_control_dataset()
             .await
@@ -2917,10 +3496,99 @@ impl ManifestCoordinator {
             .await
     }
 
+    /// RFC "Branch existence in the catalog" §Delete: main's epoch checked
+    /// up front, the tombstone on the chain unless the row has no tree, the
+    /// history settled, the retired row on main, the claim released.
+    async fn delete_branch_by_row(
+        &mut self,
+        name: &str,
+        expected_identifier: Option<&lance::dataset::refs::BranchIdentifier>,
+        chain: Option<Arc<dyn ManifestBatchPublisher>>,
+    ) -> Result<()> {
+        let row = BranchRows::decode(self.main_manifest().manifest())?
+            .by_logical(name)
+            .cloned()
+            .ok_or_else(|| {
+                OmniError::BranchNotFound {
+                    branch: name.to_string(),
+                }
+                .before_effect()
+            })?;
+        if expected_identifier.is_some_and(|expected| *expected != row.identifier) {
+            return Err(OmniError::manifest_conflict(format!(
+                "branch '{name}' changed before retirement"
+            ))
+            .before_effect());
+        }
+        let main_publisher = self.main_publisher();
+        main_publisher
+            .refuse_if_fenced()
+            .await
+            .map_err(OmniError::before_effect)?;
+        let attempt_id = crate::branch_names::mint_incarnation();
+        let held = self.native_branch.as_deref() == Some(row.native.as_str());
+        let ready = held
+            || chain.is_some()
+            || match self.main_manifest().checkout_branch(&row.native).await {
+                Ok(_) => true,
+                Err(error) if layout::tree_has_no_head(&error) => false,
+                Err(error) => return Err(OmniError::storage(error).before_effect()),
+            };
+        fail(&BRANCH_DELETE_PRE_TOMBSTONE).map_err(OmniError::before_effect)?;
+        self.publisher.withdraw_held_version(name);
+        if ready {
+            let tombstone = TombstoneRow {
+                attempt_id: attempt_id.clone(),
+                deleted_at: unix_seconds()?,
+            };
+            let branch_publisher = match (held, chain) {
+                (true, _) => Arc::clone(&self.publisher),
+                (false, Some(chain)) => chain,
+                (false, None) => Self::default_batch_publisher(
+                    &self.root_uri,
+                    Some(name),
+                    self.dataset.session(),
+                ),
+            };
+            let ended = branch_publisher
+                .publish_rows(&RowIntent::tombstone(&row.native, &tombstone))
+                .await?;
+            fail(&BRANCH_DELETE_POST_TOMBSTONE)?;
+            let records = BranchRecords {
+                buffer: ended.buffer.clone(),
+                head: history::HistoryRecord {
+                    commit: ended.head.clone(),
+                    tables: ended.tables.clone(),
+                },
+                merge_base: None,
+                registry: ended.registry.clone(),
+            };
+            if held {
+                self.install_outcome(ended, Vec::new());
+            }
+            self.settle_records(records, &row.native).await?;
+        }
+        let retired = main_publisher
+            .publish_rows(&RowIntent::retired_row(&row.native, attempt_id))
+            .await?;
+        fail(&BRANCH_DELETE_POST_RETIRED_ROW)?;
+        self.publisher.release_writer_epoch(name, &row.native);
+        self.adopt_main(retired);
+        Ok(())
+    }
+
     /// Logical graph branches, `main` first. Each live native ref maps to
-    /// exactly one logical name; a duplicate incarnation fails loudly.
+    /// exactly one logical name; a duplicate incarnation fails loudly. A
+    /// main-bound coordinator whose process holds main at or above the
+    /// branch-row stamp lists the rows it holds and sends no request, since
+    /// every row and retired row on main asserts main's writer epoch.
     pub async fn list_graph_branches(&self) -> Result<Vec<String>> {
-        let named = branch_detail::live_named_branches(&self.dataset).await?;
+        let main = if self.holds_current_main_rows() {
+            self.main_manifest().clone()
+        } else {
+            self.latest_main().await?
+        };
+        let named = branch_detail::live_named_branches(&main).await?;
         Ok(std::iter::once("main".to_string())
             .chain(named.into_iter().map(|branch| branch.name))
             .collect())

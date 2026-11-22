@@ -67,13 +67,17 @@ async fn text(store: &dyn ObjectStore, key: &str) -> Option<String> {
     }
 }
 
+/// The keys `store` lists under `prefix`, sorted: a listing's order is the
+/// store's, and a local filesystem lists in directory order.
 async fn keys(store: &dyn ObjectStore, prefix: Option<&str>) -> Vec<String> {
-    store
+    let mut keys: Vec<String> = store
         .list(prefix.map(Path::from).as_ref())
         .map_ok(|meta| meta.location.to_string())
         .try_collect()
         .await
-        .unwrap()
+        .unwrap();
+    keys.sort();
+    keys
 }
 
 /// Every object of `store` with its text, sorted by key: the base's bytes.

@@ -695,10 +695,45 @@ pub(crate) async fn missing_marked_paths(
         .await
 }
 
+/// One table pin of a `__manifest` version: the table, its branch and the
+/// physical version pinned.
+type TablePinKey = (String, Option<String>, u64);
+
+fn table_pin_keys(entries: &[DatasetEntry]) -> Vec<TablePinKey> {
+    let mut keys: Vec<TablePinKey> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.dataset_path.clone(),
+                entry.native_dataset_branch.clone(),
+                entry.published_dataset_version,
+            )
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Whether a branch whose version moved since the capture still has the
+/// captured head and pins: a control row advanced it and nothing it reads
+/// changed, so the capture stands.
+async fn cut_unchanged(current: &CollectorBranch, view: &BranchView) -> Result<bool> {
+    let head = current
+        .snapshot()
+        .await?
+        .graph_head(view.branch.as_deref())
+        .map(str::to_string);
+    Ok(head == view.head && table_pin_keys(&current.rows().await?) == view.cut)
+}
+
 struct BranchView {
     branch: Option<String>,
     identifier: String,
     manifest_version: u64,
+    /// The pins of the captured version, which a control row on main (a
+    /// branch row, a retired row, an epoch claim) leaves as they are while it
+    /// advances the version.
+    cut: Vec<TablePinKey>,
     head: Option<String>,
     commit_graph: CommitGraph,
     /// The lineage of the captured head, read when a staging's judgement
@@ -1044,14 +1079,47 @@ async fn open_inventory_branch(db: &Omnigraph, branch: Option<&str>) -> Result<C
     })
 }
 
-/// Plan one run over `branches` (every live graph branch), deleting nothing.
+/// The snapshot a not-ready branch's tree starts from once its create writes
+/// it: the row's parent at `parent_version`, read from `main`'s rows. `None`
+/// when no live row names the branch or its parent has no tree to read.
+async fn fork_point_snapshot(
+    db: &Omnigraph,
+    main: &CollectorBranch,
+    logical: &str,
+) -> Result<Option<CatalogSnapshot>> {
+    let rows = crate::db::manifest::BranchRows::decode(main.dataset().manifest())?;
+    let Some(row) = rows.by_logical(logical) else {
+        return Ok(None);
+    };
+    let parent = if row.parent_is_main() {
+        main.clone()
+    } else {
+        let Some(parent) = rows.branch(&row.parent) else {
+            return Ok(None);
+        };
+        match open_inventory_branch(db, Some(parent.logical())).await {
+            Ok(opened)
+                if opened.dataset().manifest().branch.as_deref() == Some(row.parent.as_str()) =>
+            {
+                opened
+            }
+            Ok(_) | Err(OmniError::BranchNotReady { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    };
+    parent.snapshot_at(row.parent_version, &db.history).await
+}
+
+/// Plan one run over `branches` (every live graph branch), deleting nothing;
+/// a not-ready row names no tree, so its branch contributes its fork point
+/// alone (RFC "Branch existence in the catalog" §The collector).
 pub(crate) async fn plan_collection(
     db: &Omnigraph,
     options: &CleanupPolicyOptions,
     branches: &[Option<String>],
 ) -> Result<CollectorReport> {
     let now = crate::dst_clock::now_utc();
-    let cutoff = options.older_than.map(|older_than| now - older_than);
+    let cutoff = options.cutoff(|| now)?;
     let mut report = CollectorReport::default();
     let mut views = Vec::new();
     let mut captured_lineages = Vec::new();
@@ -1070,7 +1138,18 @@ pub(crate) async fn plan_collection(
             None => main.take().ok_or_else(|| {
                 OmniError::manifest_internal("collector captured main more than once")
             })?,
-            Some(_) => open_inventory_branch(db, branch.as_deref()).await?,
+            Some(logical) => match open_inventory_branch(db, Some(logical.as_str())).await {
+                Ok(opened) => opened,
+                Err(OmniError::BranchNotReady { .. }) => {
+                    let fork_point = fork_point_snapshot(db, &registry, logical).await?;
+                    if let Some(fork_point) = fork_point {
+                        report.cost.manifest_snapshots += 1;
+                        record_roots(db, &fork_point, &mut roots, &mut tables);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            },
         };
         report.cost.manifest_snapshots += 1;
         report
@@ -1092,7 +1171,9 @@ pub(crate) async fn plan_collection(
             &mut report.cost,
         )
         .await?;
-        for entry in opened.rows().await? {
+        let entries = opened.rows().await?;
+        let cut = table_pin_keys(&entries);
+        for entry in entries {
             let full_path = format!("{}/{}", db.root_uri(), entry.dataset_path);
             let location = table_location(&full_path, entry.native_dataset_branch.as_deref());
             tables.entry(location.clone()).or_insert_with(|| {
@@ -1123,6 +1204,7 @@ pub(crate) async fn plan_collection(
             branch: branch.clone(),
             identifier: incarnation_key(opened.identifier())?,
             manifest_version: head_version,
+            cut,
             head: snapshot.graph_head(branch.as_deref()).map(str::to_string),
             commit_graph: graph,
             ancestry: None,
@@ -1310,8 +1392,9 @@ pub(crate) async fn plan_collection(
     for view in &views {
         let current = open_inventory_branch(db, view.branch.as_deref()).await?;
         report.cost.manifest_rechecks += 1;
-        if current.head_version() != view.manifest_version
-            || incarnation_key(current.identifier())? != view.identifier
+        if incarnation_key(current.identifier())? != view.identifier
+            || (current.head_version() != view.manifest_version
+                && !cut_unchanged(&current, view).await?)
         {
             return Err(OmniError::manifest_conflict(format!(
                 "collector branch '{}' changed during capture; retry cleanup",

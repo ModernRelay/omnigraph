@@ -8,9 +8,7 @@ use crate::case::{
     Attribution, Backend, LocalFilesystem, LocalStorageClass, NetworkPosition, Protocol, ResetMode,
     Schedule, Timer, ValidatedCase,
 };
-use crate::gqt_case::{
-    self, GqtCaseV1, GqtEnvironment, GqtFixture, GqtScenario, GqtWorkload, MeasuredStep, PlannedGqt,
-};
+use crate::gqt_case::{self, GqtEnvironment, GqtFixture, MeasuredStep, PlannedGqt, ScenarioCase};
 use crate::model::{Diagnostic, declared_version, read_yaml_file, strict_yaml, valid_kebab_id};
 use crate::suite::{
     MAX_REPETITIONS_PER_CASE, MAX_SUITE_RUNS, MAX_TOTAL_REPETITIONS, ResolvedRun, ResolvedSuite,
@@ -96,7 +94,10 @@ pub struct Scenario {
     pub id: String,
     pub fixture: FixtureInput,
     pub workload: PathBuf,
-    pub measured_step: MeasuredStep,
+    /// Absent when the workload's `--- concurrent measured` block is the
+    /// measured step: the loader reads the ordinal and the text off the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_step: Option<MeasuredStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repetitions: Option<u32>,
     #[serde(
@@ -119,7 +120,7 @@ impl Scenario {
     /// unless the protocol overrides say otherwise. The catalog's defaults
     /// describe the embedded protocol; a served point derives `reset: none`
     /// and `attribution: off`, which only the scenario's own block overrides.
-    pub fn expand(&self, defaults: &Defaults, environment: &GqtEnvironment) -> (GqtCaseV1, u32) {
+    pub fn expand(&self, defaults: &Defaults, environment: &GqtEnvironment) -> (ScenarioCase, u32) {
         self.expand_with(defaults, environment, None)
     }
 
@@ -132,7 +133,7 @@ impl Scenario {
         defaults: &Defaults,
         environment: &GqtEnvironment,
         run_reset: Option<ResetMode>,
-    ) -> (GqtCaseV1, u32) {
+    ) -> (ScenarioCase, u32) {
         let environment = environment.clone();
         let served = environment.target == crate::gqt_case::Target::Server;
         let derived = if served {
@@ -184,15 +185,11 @@ impl Scenario {
                 .unwrap_or(Timer::Monotonic),
         };
         (
-            GqtCaseV1 {
-                version: 1,
+            ScenarioCase {
                 id: self.id.clone(),
-                scenario: GqtScenario::GqtV1,
                 fixture: self.fixture.definition(),
-                workload: GqtWorkload {
-                    queries: self.workload.clone(),
-                    measured_step: self.measured_step.clone(),
-                },
+                queries: self.workload.clone(),
+                step: self.measured_step.clone(),
                 environment,
                 protocol,
             },
@@ -336,10 +333,37 @@ impl Catalog {
         environment: &GqtEnvironment,
         run_reset: Option<ResetMode>,
     ) -> Result<PlannedGqt, Vec<Diagnostic>> {
+        let mut points = self.points_with(id, environment, run_reset)?.plans;
+        Ok(points.swap_remove(0))
+    }
+
+    /// The scenario's points in the host's local default environment.
+    pub fn points(&self, id: &str) -> Result<gqt_case::ScenarioPoints, Vec<Diagnostic>> {
+        self.points_with(id, &local_environment(), None)
+    }
+
+    /// The repetitions every point of `scenario` runs when the command line
+    /// names none: the entry's, else its workload's `--- bench` section's,
+    /// else the defaults'.
+    pub fn repetitions(&self, scenario: &Scenario, points: &gqt_case::ScenarioPoints) -> u32 {
+        scenario
+            .repetitions
+            .or(points.repetitions)
+            .or(self.definition.defaults.repetitions)
+            .unwrap_or(5)
+    }
+
+    /// Every point the scenario plans: one per value its workload sweeps,
+    /// one for a workload that sweeps nothing.
+    pub fn points_with(
+        &self,
+        id: &str,
+        environment: &GqtEnvironment,
+        run_reset: Option<ResetMode>,
+    ) -> Result<gqt_case::ScenarioPoints, Vec<Diagnostic>> {
         let scenario = self.scenario(id)?;
-        let (definition, _) =
-            scenario.expand_with(&self.definition.defaults, environment, run_reset);
-        gqt_case::load_with_root(&self.path, definition, &self.root)
+        let (case, _) = scenario.expand_with(&self.definition.defaults, environment, run_reset);
+        gqt_case::load_points(&self.path, case, &self.root)
             .map_err(|message| vec![Diagnostic::error("invalid_scenario", id, message)])
     }
 
@@ -370,42 +394,40 @@ impl Catalog {
         run_reset: Option<ResetMode>,
     ) -> Result<ResolvedSuite, Vec<Diagnostic>> {
         let ids = select(&self.definition, selector)?;
-        let configured: Vec<_> = ids
-            .iter()
-            .map(|id| {
-                let scenario = self.scenario(id)?;
-                let repetitions =
-                    repetitions.unwrap_or(scenario.repetitions(&self.definition.defaults));
-                check_repetitions(repetitions)?;
-                Ok((id, repetitions))
-            })
-            .collect::<Result<_, Vec<Diagnostic>>>()?;
-        if configured
-            .iter()
-            .map(|(_, reps)| u64::from(*reps))
-            .sum::<u64>()
-            > MAX_TOTAL_REPETITIONS
-        {
-            return Err(vec![error(
-                "repetition_budget_exceeded",
-                "selection exceeds 100000 repetitions",
-            )]);
-        }
+        self.admit_named_repetitions(&ids, repetitions)?;
         let mut runs = Vec::with_capacity(ids.len());
         let mut identities = BTreeSet::new();
-        for (id, repetitions) in configured {
-            let plan = self.plan_with(id, environment, run_reset)?;
-            if !identities.insert(plan.planned_sha256.clone()) {
-                return Err(vec![error(
-                    "duplicate_planned_identity",
-                    format!("scenario '{id}' duplicates an experiment in this selection"),
-                )]);
+        let mut total = 0u64;
+        for id in &ids {
+            let scenario = self.scenario(id)?;
+            let points = self.points_with(id, environment, run_reset)?;
+            let repetitions = repetitions.unwrap_or_else(|| self.repetitions(scenario, &points));
+            check_repetitions(repetitions)?;
+            for plan in points.plans {
+                total += u64::from(repetitions);
+                if total > MAX_TOTAL_REPETITIONS {
+                    return Err(budget_exceeded());
+                }
+                if runs.len() == MAX_SUITE_RUNS {
+                    return Err(vec![error(
+                        "selection_budget_exceeded",
+                        format!(
+                            "the selection plans more than {MAX_SUITE_RUNS} runs; a swept scenario is one run per value"
+                        ),
+                    )]);
+                }
+                if !identities.insert(plan.planned_sha256.clone()) {
+                    return Err(vec![error(
+                        "duplicate_planned_identity",
+                        format!("scenario '{id}' duplicates an experiment in this selection"),
+                    )]);
+                }
+                runs.push(ResolvedRun {
+                    case_path: self.path.clone(),
+                    repetitions,
+                    case: ValidatedCase::Gqt(plan),
+                });
             }
-            runs.push(ResolvedRun {
-                case_path: self.path.clone(),
-                repetitions,
-                case: ValidatedCase::Gqt(plan),
-            });
         }
         Ok(ResolvedSuite {
             definition: SuiteV1 {
@@ -417,6 +439,35 @@ impl Catalog {
             runs,
         })
     }
+
+    /// Refuses, before any source is read, a selection that exceeds the
+    /// budget by the repetitions the command line and the entries name alone;
+    /// a workload's own count and its swept points are added once it is read.
+    fn admit_named_repetitions(
+        &self,
+        ids: &[String],
+        repetitions: Option<u32>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut least = 0u64;
+        for id in ids {
+            let named = repetitions.or(self.scenario(id)?.repetitions);
+            if let Some(named) = named {
+                check_repetitions(named)?;
+            }
+            least += u64::from(named.unwrap_or(1));
+        }
+        if least > MAX_TOTAL_REPETITIONS {
+            return Err(budget_exceeded());
+        }
+        Ok(())
+    }
+}
+
+fn budget_exceeded() -> Vec<Diagnostic> {
+    vec![error(
+        "repetition_budget_exceeded",
+        "selection exceeds 100000 repetitions",
+    )]
 }
 
 pub fn find_config(explicit: Option<&Path>) -> Result<PathBuf, Vec<Diagnostic>> {
@@ -479,13 +530,13 @@ fn validate(config: &ConfigV2) -> Result<(), Vec<Diagnostic>> {
                 ),
             )]);
         }
-        let (definition, repetitions) = scenario.expand(&config.defaults, &local_environment());
+        let (case, repetitions) = scenario.expand(&config.defaults, &local_environment());
         check_repetitions(repetitions)?;
-        gqt_case::validate_definition(&definition)
+        case.validate()
             .map_err(|e| vec![Diagnostic::error("invalid_scenario", &scenario.id, e)])?;
-        for path in fixture_paths(&definition.fixture)
+        for path in fixture_paths(&case.fixture)
             .into_iter()
-            .chain([definition.workload.queries.as_path()])
+            .chain([case.queries.as_path()])
         {
             if path.is_absolute()
                 || path.as_os_str().is_empty()

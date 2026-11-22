@@ -1477,6 +1477,7 @@ pub async fn conversion_batch(
         schema_contract: Some(contract),
         registry: Default::default(),
         writer_epoch: None,
+        branch_rows: Default::default(),
     };
     let schema = crate::record::manifest_storage_schema(metadata);
     let batch = crate::record::compact_to_storage(&rows.to_batch()?, &schema)?;

@@ -241,11 +241,50 @@ pub fn is_incarnation_of(name: &str, logical: &str) -> bool {
         })
 }
 
-/// The Lance ref on `ds` that is an incarnation of the LOGICAL branch name:
-/// the ULID-suffixed native ref when one exists, else the bare (legacy) name
-/// if present, else `None`. More than one listed incarnation is a fixture
-/// bug — fail loudly rather than pick one.
+/// The rows of main's latest version of the `__manifest` `ds` is a handle of,
+/// at or above the branch-row stamp.
+pub async fn branch_rows(ds: &lance::Dataset) -> omnigraph_catalog::BranchRows {
+    assert!(
+        omnigraph_catalog::has_branch_rows(ds),
+        "branch rows are read at or above the branch-row stamp"
+    );
+    let latest = ds.latest_version_id().await.unwrap();
+    let main = ds.checkout_version(latest).await.unwrap();
+    omnigraph_catalog::BranchRows::decode(main.manifest()).unwrap()
+}
+
+/// The lifetime identifier of the live LOGICAL branch: from its row at or
+/// above the branch-row stamp, from its native ref below it; `None` when the
+/// branch is not live.
+pub async fn branch_identifier_for(
+    ds: &lance::Dataset,
+    logical: &str,
+) -> Option<lance::dataset::refs::BranchIdentifier> {
+    if omnigraph_catalog::has_branch_rows(ds) {
+        return branch_rows(ds)
+            .await
+            .by_logical(logical)
+            .map(|row| row.identifier.clone());
+    }
+    let native = native_ref_for(ds, logical).await?;
+    Some(ds.branches().get(&native).await.unwrap().identifier)
+}
+
+/// The live native name of the LOGICAL branch on the `__manifest` `ds` is a
+/// handle of: at or above the branch-row stamp the live row of main's latest
+/// version, below it the ULID-suffixed native ref when one exists, else the
+/// bare (legacy) name if present; `None` when the branch is not live. More
+/// than one listed incarnation is a fixture bug — fail loudly rather than
+/// pick one.
 pub async fn native_ref_for(ds: &lance::Dataset, logical: &str) -> Option<String> {
+    if omnigraph_catalog::has_branch_rows(ds) {
+        let latest = ds.latest_version_id().await.unwrap();
+        let main = ds.checkout_version(latest).await.unwrap();
+        return omnigraph_catalog::BranchRows::decode(main.manifest())
+            .unwrap()
+            .by_logical(logical)
+            .map(|row| row.native.clone());
+    }
     let branches = ds.list_branches().await.unwrap();
     let mut lives = Vec::new();
     for (name, contents) in branches {

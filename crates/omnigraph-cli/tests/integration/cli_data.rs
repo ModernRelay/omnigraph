@@ -5483,6 +5483,16 @@ fn cleanup_against_local_scope_executes_with_confirm() {
             "cleanup requires at least one of --keep or --older-than",
         ),
         (
+            vec!["--older-than", "307445734561825861m"],
+            false,
+            "invalid duration '307445734561825861m'",
+        ),
+        (
+            vec!["--older-than", "18446744073709551615s", "--confirm"],
+            false,
+            "earliest representable time",
+        ),
+        (
             vec!["--older-than", "invalid", "--confirm"],
             false,
             "invalid duration 'invalid'",
@@ -6188,18 +6198,130 @@ fn commit_show_accepts_long_uri_flag() {
     assert!(!human.contains("manifest_branch:"));
 }
 
+/// A root that holds no graph (a typo, or a graph not yet initialized) is
+/// refused as not found before anything is written. A data write reports
+/// effects none and exits 1 like any refusal that did not start, not an
+/// unknown outcome to reconcile, and a read names it the same way. Nothing is
+/// created at the root.
 #[test]
-fn cli_fails_for_missing_graph() {
+fn cli_refuses_a_missing_graph_as_not_found_before_any_write() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
+    let data = fixture("test.jsonl");
+    let schema = fixture("test.pg");
 
     let output = output_failure(cli().arg("snapshot").arg("--target").arg(&graph));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("_schema.pg")
-            || stderr.contains("No such file")
-            || stderr.contains("not found")
+    assert!(stderr.contains("no graph at"), "{stderr}");
+
+    let commands: [(&str, Vec<&std::ffi::OsStr>); 5] = [
+        (
+            "load",
+            vec![
+                "load".as_ref(),
+                "--mode".as_ref(),
+                "append".as_ref(),
+                "--data".as_ref(),
+                data.as_os_str(),
+            ],
+        ),
+        (
+            "mutate",
+            vec![
+                "mutate".as_ref(),
+                "-e".as_ref(),
+                "query q() { insert Person { name: \"a\" } }".as_ref(),
+            ],
+        ),
+        (
+            "branch create",
+            vec!["branch".as_ref(), "create".as_ref(), "feature".as_ref()],
+        ),
+        (
+            "schema apply",
+            vec![
+                "schema".as_ref(),
+                "apply".as_ref(),
+                "--schema".as_ref(),
+                schema.as_os_str(),
+            ],
+        ),
+        (
+            "query",
+            vec![
+                "query".as_ref(),
+                "-e".as_ref(),
+                "query q() { match { $p: Person } return { $p.name } }".as_ref(),
+            ],
+        ),
+    ];
+    for (command, args) in commands {
+        let output = cli()
+            .args(args)
+            .arg("--json")
+            .arg("--target")
+            .arg(&graph)
+            .output()
+            .unwrap();
+        let refused = parse_stdout_json(&output);
+        assert_eq!(refused["code"], "not_found", "{command}: {refused}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("no graph at"),
+            "{command}: {refused}"
+        );
+        assert_eq!(
+            refused["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{command}: {refused}"
+        );
+        assert_eq!(output.status.code(), Some(1), "{command}: {refused}");
+        assert!(!graph.exists(), "{command} created {}", graph.display());
+    }
+}
+
+/// Under `--base`, building read-through storage writes a new clone root's
+/// `__clone/created` marker before the engine opens the graph. When the base
+/// holds no graph, the open's not-found refusal covers the open alone: the
+/// marker stays, so the command does not report effects none. Once the root
+/// holds the marker, the same refusal writes nothing and reports effects none.
+#[test]
+fn cli_does_not_report_no_effects_after_writing_a_clone_marker() {
+    let temp = tempdir().unwrap();
+    let base = temp.path().join("base");
+    fs::create_dir(&base).unwrap();
+    let clone = temp.path().join("clone.omni");
+    let marker = clone.join("__clone").join("created");
+    let branch_create = || {
+        cli()
+            .args(["branch", "create", "feature", "--json", "--target"])
+            .arg(&clone)
+            .arg("--base")
+            .arg(&base)
+            .output()
+            .unwrap()
+    };
+
+    let output = branch_create();
+    let refused = parse_stdout_json(&output);
+    assert_eq!(refused["code"], "not_found", "{refused}");
+    assert_eq!(
+        refused["disposition"],
+        json!({"effects": "unknown", "action": "reconcile"}),
+        "{refused}"
     );
+    assert_eq!(output.status.code(), Some(2), "{refused}");
+    assert!(marker.exists(), "{}", marker.display());
+
+    let output = branch_create();
+    let refused = parse_stdout_json(&output);
+    assert_eq!(refused["code"], "not_found", "{refused}");
+    assert_eq!(
+        refused["disposition"],
+        json!({"effects": "none", "action": "fix"}),
+        "{refused}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{refused}");
+    assert_eq!(fs::read_dir(&clone).unwrap().count(), 1);
 }
 
 #[test]

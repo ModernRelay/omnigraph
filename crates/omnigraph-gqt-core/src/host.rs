@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::concurrent::{ConcurrentStep, Pass, permutation};
 use crate::runner_config::SeamDirective;
+use crate::served::ServerTarget;
 use crate::{Case, Item, QueryStep, Step, StepFail};
 
 /// The most workers one label of a block declares on a host with a scripted
@@ -21,16 +22,58 @@ pub const SCRIPTED_HOST_WORKERS: usize = 8;
 /// Refuses a case whose block declares more workers under one label than a
 /// scripted host runs.
 pub fn admit_workers(case: &Case) -> Result<(), String> {
+    admit_workers_within(case, "a scripted host", |_| SCRIPTED_HOST_WORKERS)
+}
+
+/// Refuses a case one of whose blocks declares more workers under one label
+/// than `bound` gives that block on `host`.
+pub fn admit_workers_within(
+    case: &Case,
+    host: &str,
+    bound: impl Fn(&ConcurrentStep) -> usize,
+) -> Result<(), String> {
     for item in &case.items {
-        if let Item::Step(Step::Concurrent(block)) = item
-            && block.max_workers() > SCRIPTED_HOST_WORKERS
-        {
-            return Err(format!(
-                "unsupported_environment: a scripted host runs at most {SCRIPTED_HOST_WORKERS} workers under one label; step {} declares {}",
-                block.ordinal,
-                block.max_workers()
-            ));
+        if let Item::Step(Step::Concurrent(block)) = item {
+            let most = bound(block);
+            if block.max_workers() > most {
+                return Err(format!(
+                    "unsupported_environment: {host} runs at most {most} workers under one label; step {} declares {}",
+                    block.ordinal,
+                    block.max_workers()
+                ));
+            }
         }
+    }
+    Ok(())
+}
+
+/// The admission of a host without the DST runner's gate and without the
+/// reference engine: no seam, no scripted block, no `same as v1` expect, and
+/// no block over the worker bound `bound` gives it on `host`.
+pub fn admit_ungated_case(
+    case: &Case,
+    host: &str,
+    bound: impl Fn(&ConcurrentStep) -> usize,
+) -> Result<(), String> {
+    if case.needs_dst() {
+        return Err(
+            "unsupported_environment: this executor cannot run seams or scripted concurrent blocks"
+                .into(),
+        );
+    }
+    admit_workers_within(case, host, bound)?;
+    if case.items.iter().any(|item| {
+        let steps = match item {
+            Item::Step(step) => std::slice::from_ref(step),
+            Item::Loop { steps, .. } => steps,
+        };
+        steps
+            .iter()
+            .any(|step| matches!(step, Step::Query(query) if query.same_as_v1))
+    }) {
+        return Err(
+            "unsupported_environment: this executor cannot compare the reference engine".into(),
+        );
     }
     Ok(())
 }
@@ -40,27 +83,7 @@ pub trait ExecutionHost: Sync {
     type StepGuard: Send;
 
     fn admit_case(&self, case: &Case) -> Result<(), String> {
-        if case.needs_dst() {
-            return Err(
-                "unsupported_environment: this executor cannot run seams or scripted concurrent blocks"
-                    .into(),
-            );
-        }
-        admit_workers(case)?;
-        if case.items.iter().any(|item| {
-            let steps = match item {
-                Item::Step(step) => std::slice::from_ref(step),
-                Item::Loop { steps, .. } => steps,
-            };
-            steps
-                .iter()
-                .any(|step| matches!(step, Step::Query(query) if query.same_as_v1))
-        }) {
-            return Err(
-                "unsupported_environment: this executor cannot compare the reference engine".into(),
-            );
-        }
-        Ok(())
+        admit_ungated_case(case, "a scripted host", |_| SCRIPTED_HOST_WORKERS)
     }
 
     fn arm_seams(&self, seams: &[SeamDirective], step: &Step) -> Result<Self::StepGuard, String>;
@@ -118,9 +141,7 @@ pub trait ExecutionHost: Sync {
         .boxed()
     }
 
-    /// A free-running block runs its sessions once each, one after another in
-    /// declaration order, on the case session; a block with an `order:` line
-    /// needs the DST runner's gate and is refused here.
+    /// A block as [`run_block_once`] runs it.
     fn concurrent_step<'a>(
         &'a self,
         session: &'a Session,
@@ -130,17 +151,45 @@ pub trait ExecutionHost: Sync {
     where
         Self: Sized,
     {
-        if step.is_free_running() {
-            let order = permutation(step.sessions.len(), Pass(0));
-            return async move { crate::run_free_running_block(self, session, step, &order).await }
-                .boxed();
-        }
+        run_block_once(self, session, step)
+    }
+
+    /// The measured block of a workload against a server. Only a host that
+    /// measures runs one, each session over a client of its own.
+    fn served_block<'a>(
+        &'a self,
+        _target: &'a ServerTarget,
+        _case: &'a Case,
+        step: &'a ConcurrentStep,
+    ) -> BoxFuture<'a, Result<(), StepFail>> {
         futures::future::ready(Err(StepFail::new(
             format!("step {} (concurrent)", step.ordinal),
-            "unsupported_environment: a concurrent block with an `order:` line requires the DST runner".into(),
+            "unsupported_environment: a measured block against a server requires a measuring host"
+                .into(),
         )))
         .boxed()
     }
+}
+
+/// A block on a host without the DST runner's gate. A free-running block runs
+/// its sessions once each, one after another in declaration order, on the
+/// case session; a block with an `order:` line is refused.
+pub fn run_block_once<'a>(
+    host: &'a impl ExecutionHost,
+    session: &'a Session,
+    step: &'a ConcurrentStep,
+) -> BoxFuture<'a, Result<(), StepFail>> {
+    if step.is_free_running() {
+        let order = permutation(step.sessions.len(), Pass(0));
+        return async move { crate::run_free_running_block(host, session, step, &order).await }
+            .boxed();
+    }
+    futures::future::ready(Err(StepFail::new(
+        format!("step {} (concurrent)", step.ordinal),
+        "unsupported_environment: a concurrent block with an `order:` line requires the DST runner"
+            .into(),
+    )))
+    .boxed()
 }
 
 /// Ordinary execution without runner observations or test-only capabilities.

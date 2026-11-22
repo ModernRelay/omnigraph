@@ -44,8 +44,9 @@ Their fixture sizes, cache preparation and repetition boundaries differ from
 the historical Rust instruments; their timing series must not be combined.
 
 Unsupported workloads are preserved temporarily in [deferred/](deferred/README.md).
-Cleanup and optimization require GQ support. Concurrent and streaming instruments require an executor that preserves their
-scheduling and transport. Their preserved sources are outside Cargo discovery
+Cleanup and optimization require GQ support. The HTTP concurrency and streaming
+instruments require an executor that preserves their transport; embedded
+concurrency is a [measured block](#measured-concurrent-blocks). The preserved sources are outside Cargo discovery
 and are not active scenarios. Read-only HTTP acquisition runs the same
 scenarios against a server, below.
 Raw Lance and Rust collection comparisons are retired from the benchmark suite.
@@ -85,7 +86,10 @@ Large histories and registered FinBench require explicit selection.
 - `fixtures/finbench/` keeps a registered graph's logical reference and GQT
   preparation together. The invocation supplies its physical source bundle.
 - `workloads/*.gqt` omits schema/seed and contains optional preparation reads,
-  the selected operation, then explicit verification.
+  the selected operation, then explicit verification. A workload whose
+  selected operation is a `--- concurrent measured` block carries its run in a
+  `--- bench` section, and its scenario names no `measured_step`
+  ([measured blocks](#measured-concurrent-blocks)).
 - `defaults` supplies repetitions, deadline and the embedded protocol settings;
   a scenario may override them. A served run derives `reset: none` and
   `attribution: off`, which only the scenario's own `protocol` block overrides.
@@ -116,7 +120,9 @@ run's: `--server` names a server, `--store` a fixture store (a directory or an
 `s3://` prefix, the latter with `--backend`) at the `clone` reset level, whose
 completed records the store keeps and `report` reads back as a series, and
 `--at <ref>` beside it measures a commit's `omnigraph` from the store's
-`builds/`; and
+`builds/`, and `--server-product` beside a local store starts the build's
+`omnigraph-server` for every repetition, at the `rebuild` reset level
+([below](#the-same-block-against-the-builds-server)); and
 without either the host's local default applies (APFS/clonefile on macOS,
 qualified XFS/plain-copy elsewhere), so the one file runs on a macOS
 workstation and on a qualified Linux XFS volume alike; the reset level follows
@@ -200,7 +206,8 @@ release counter fired, and they do not model an optimize, index-build, or
 cache-capacity threshold. There is no maintenance or cleanup step in these
 pairs. Concurrent interleavings, held-snapshot lifetimes, and historical row
 images need their own observations; these sequential cases do not establish
-those properties.
+those properties, and a [measured block](#measured-concurrent-blocks) names
+no interleaving either.
 
 Dataset and query basenames use the same scenario names with underscores.
 The history operations share `workloads/very_long_history_{read,write,reopen}.gqt`
@@ -233,6 +240,123 @@ These inputs have not been run as a scale campaign. Their authored scale is
 not a timing claim; no one-million-update recipe is included. The suites use
 one repetition by default. Cache construction and verification remain outside
 the selected operation timer.
+
+## Measured concurrent blocks
+
+The `concurrency` suite holds scenarios whose measured step is the workload's
+`--- concurrent measured` block; the
+[GQT runner README](../crates/omnigraph-gqt/README.md#measured-block) owns the
+block and its `--- bench` section. The entry names no `measured_step`: the
+block is the measured step, and the section gives its warmup, its duration,
+optionally its repetitions, and one swept name.
+
+| Scenario | Fixture and block | Sweep and run |
+| --- | --- | --- |
+| `concurrent-writes` | 4096 keyed `Chunk` rows on `main`. `W` writers each append one dealt row per statement beside four readers that look one seeded row up by key. | `W` in 1, 2, 4, 8, 16; 5 seconds of warmup and 30 measured, one repetition per value. |
+
+```bash
+omnigraph-bench show concurrent-writes
+target/release/omnigraph-bench run concurrent-writes --dataset-cache /qualified/cache --json
+target/release/omnigraph-bench run concurrent-writes --warmup-seconds 2 --duration-seconds 10   --dataset-cache /qualified/cache --json
+```
+
+A swept scenario plans one point per value, so one `run` of this scenario is
+five runs with five point ids; `show` lists them under `points` and the
+block's run under `block`. `--warmup-seconds` and `--duration-seconds`
+replace the section's two values for one run. They are outside the point's
+identity, and every sample and record states the values used. A selection
+that holds a scenario without a measured block refuses both flags before
+anything runs.
+
+Every repetition restores the fixture, starts every worker on a task of its
+own over one engine handle, and loops each worker's statement through the
+warmup and then the duration. A statement counts in the measured window when
+it started inside it. One failed statement stops every worker and fails the
+repetition. After the workers stop, a fresh handle reads every acknowledged
+dealt key in one scan of its table and compares up to eight rows of each
+writer column by column; then the workload's verification steps run.
+
+A sample carries one row per label: the acknowledged statements and their
+rate, the fewest and the most statements one worker was acknowledged for,
+service time p50, p99 and max, the authority conflicts, and the
+acknowledgements of each measured second. Its `elapsed_us` is the whole
+block, warmup and drain included, and its store calls are the measured
+window's and the drain's.
+
+The driver is closed-loop: a worker issues its next statement when the last
+one is acknowledged, so a slow statement delays the ones behind it and a
+service time is less than what an arriving caller would have waited
+(coordinated omission). Every sample and record therefore states `driver:
+closed-loop` and `claim_grade: false`, and no number of a measured block is
+a throughput or latency claim.
+
+The scenario's `deadline_seconds` and the workload's `timeout_ms` count past
+the block's warmup and duration: they bound its drain and the rest of the
+file, whatever run the command line gave it. A measured block runs embedded
+on a restored store, or against a server the run starts (next section). A
+provisioned server (`--server`) and the `clone` reset level of `--store`
+refuse it, and no driver issues statements at a set rate.
+
+### The same block against the build's server
+
+`run <scenario> --store <directory> --server-product[=<path>]` plans the
+scenario as a server point at the reset level `rebuild`: every repetition
+gets an `omnigraph-server` of its own, started by the bench and stopped when
+the repetition ends. The workload lists `omnigraph-server` among its
+environments; `concurrent-writes` does.
+
+```bash
+target/release/omnigraph-bench run concurrent-writes --store /qualified/store   --product /build/omnigraph --server-product=/build/omnigraph-server   --dataset-cache /qualified/cache --json
+target/release/omnigraph-bench run concurrent-writes --store /qualified/store   --at main=/builds/main/omnigraph --at topic=/builds/topic/omnigraph --server-product   --dataset-cache /qualified/cache --json
+```
+
+`--server-product=<path>` names the server binary. Without a value it is
+`omnigraph-server` in the directory of the product binary. Under `--at` only
+that form is accepted and every `--at` names its `omnigraph` as
+`<ref>=<path>`, so each commit runs beside the server of its own build. The
+store is a local directory, the route runs on Unix, and a block holds at most
+64 sessions.
+
+One repetition, in order:
+
+1. The product's `omnigraph cluster apply` writes a cluster with the
+   fixture's schema into an empty root under the store's `servers/`. Its
+   policy names one actor for the workload's own steps and one per session
+   of the block, each with a token made for the repetition.
+2. The bench starts `omnigraph-server` over that root on a loopback port the
+   system picks and waits until `/readyz` reports no graph loading. A server
+   that names another commit than the `omnigraph` beside it is refused.
+3. The worker runs the fixture file through the server: the schema is held
+   against the graph's, the seed goes through `POST /load`, the file's
+   branches and steps run, and every node and edge table is counted against
+   the fixture's frozen base in the store.
+4. The block runs with one HTTP client per session, each under its own
+   actor's token. A statement's service time is from the request sent to the
+   answer decoded.
+5. A client no worker held reads the acknowledged dealt rows back through
+   `POST /query`, and the workload's verification steps run.
+6. The bench stops the server with SIGTERM, reads its peak resident set, and
+   deletes the root.
+
+The embedded point and the server point of one scenario are two points with
+two ids. The record names both binaries; each sample's `peak_rss_bytes` is
+the server's over its whole life in the repetition, the fixture load
+included, and `client_peak_rss_bytes` is the worker's. A server exposes no
+store-call counters, so a sample carries none.
+
+Three numbers read differently from the embedded ones. A 409 that names a
+read-set conflict and applied nothing is run again and counted in
+`authority_conflicts`; the server's own retries behind an acknowledged write
+are not on the wire, so the count is the reruns alone. A request the server refuses at a workload limit
+(HTTP 429) fails the repetition, because waiting it out would put the wait
+inside a service time. And the operating system's page cache is as the
+fixture load left it, a condition the route does not control.
+
+A server that exits before it is ready, does not leave on SIGTERM inside 40
+seconds, or leaves with a failure fails the repetition. The error of a failed
+repetition carries the last output of the server's stdout and stderr, and
+unless the failure is one the bench knows left nothing behind, its cluster
+root and scratch directory are kept and named.
 
 ## Validate and inspect
 
@@ -538,7 +662,8 @@ verified at its snapshot and dropped; `branch-merge-d50-as-commit` and
 ## Add a scenario
 
 1. Add a fixture GQT and schema-less workload GQT with explicit expectations.
-2. Use `show --workload FILE` and `init` to generate the exact measured selector.
+2. Use `show --workload FILE` and `init` to generate the exact measured selector;
+   on a `--- concurrent measured` block `init` writes a scenario without one.
 3. Add the scenario to `benchmarks.yaml`, or keep the custom config separately.
 4. Inspect it with `show NAME --config FILE`; optionally add its ID to a suite.
 5. Run the explicit selection on a qualified release host.

@@ -1059,27 +1059,44 @@ fn read_optional_bounded_utf8(
 
 #[cfg(any(target_os = "linux", test))]
 fn linux_cpu_model(cpuinfo: &str) -> Result<String, MachineIdentityError> {
-    const CANDIDATES: [&str; 4] = ["model name", "hardware", "cpu model", "processor"];
-    let mut found: [Option<&str>; CANDIDATES.len()] = [None; CANDIDATES.len()];
+    const NAMED: [&str; 4] = ["model name", "hardware", "cpu model", "processor"];
+    const ARM: [&str; 4] = ["cpu implementer", "cpu variant", "cpu part", "cpu revision"];
+    let mut named: [Option<&str>; NAMED.len()] = [None; NAMED.len()];
+    let mut arm: [Option<&str>; ARM.len()] = [None; ARM.len()];
     for line in cpuinfo.lines() {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        let name = name.trim();
-        for (index, candidate) in CANDIDATES.iter().enumerate() {
+        let (name, value) = (name.trim(), value.trim());
+        if value.is_empty() {
+            continue;
+        }
+        for (index, candidate) in NAMED.iter().enumerate() {
             if name.eq_ignore_ascii_case(candidate)
-                && !value.trim().is_empty()
-                && !(*candidate == "processor"
-                    && value.trim().bytes().all(|byte| byte.is_ascii_digit()))
+                && !(*candidate == "processor" && value.bytes().all(|byte| byte.is_ascii_digit()))
             {
-                found[index].get_or_insert(value);
+                named[index].get_or_insert(value);
+            }
+        }
+        for (index, field) in ARM.iter().enumerate() {
+            if name.eq_ignore_ascii_case(field) {
+                arm[index].get_or_insert(value);
             }
         }
     }
-    let model = found.into_iter().flatten().next().ok_or_else(|| {
-        MachineIdentityError::probe("cpu_model", "cpuinfo contains no CPU model field")
-    })?;
-    canonical_fact("cpu_model", model)
+    if let Some(model) = named.into_iter().flatten().next() {
+        return canonical_fact("cpu_model", model);
+    }
+    let [Some(implementer), Some(variant), Some(part), Some(revision)] = arm else {
+        return Err(MachineIdentityError::probe(
+            "cpu_model",
+            "cpuinfo contains no CPU model field and no complete ARM identification",
+        ));
+    };
+    canonical_fact(
+        "cpu_model",
+        &format!("arm implementer {implementer} variant {variant} part {part} revision {revision}"),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1958,6 +1975,31 @@ mod tests {
             25_769_803_776
         );
         assert!(linux_total_memory_bytes("MemTotal: 1 MB\n").is_err());
+    }
+
+    #[test]
+    fn derives_cpu_model_from_arm_identification_when_cpuinfo_names_none() {
+        let cpu = |index: u32, part: &str| {
+            format!(
+                "processor\t: {index}\nBogoMIPS\t: 2000.00\nFeatures\t: fp asimd evtstrm\nCPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x0\nCPU part\t: {part}\nCPU revision\t: 1\n\n"
+            )
+        };
+        let cpuinfo = cpu(0, "0xd4f") + &cpu(1, "0xd0b");
+        assert_eq!(
+            linux_cpu_model(&cpuinfo).unwrap(),
+            "arm implementer 0x41 variant 0x0 part 0xd4f revision 1"
+        );
+
+        let named = format!("{cpuinfo}model name : Example 9000\n");
+        assert_eq!(linux_cpu_model(&named).unwrap(), "Example 9000");
+
+        let incomplete = "processor\t: 0\nCPU implementer\t: 0x41\nCPU part\t: 0xd4f\n";
+        let error = linux_cpu_model(incomplete).unwrap_err();
+        assert_eq!(
+            (error.code, error.field),
+            ("machine_probe_failed", "cpu_model")
+        );
+        assert!(linux_cpu_model("processor\t: 0\nBogoMIPS\t: 2000.00\n").is_err());
     }
 
     #[test]
