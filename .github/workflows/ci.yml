@@ -1189,7 +1189,7 @@ jobs:
       # comparison).
       - name: Build the edition-2 GQT runner and CLI
         env:
-          EDITION_2_SOURCE_COMMIT: 42013036b50ecfff3d63f071f32db951be9cbd54
+          EDITION_2_SOURCE_COMMIT: 84dbead889727260d0d547b3bbe33e079bfba4ec
         run: |
           set -euo pipefail
           e2_source="$RUNNER_TEMP/omnigraph-edition-2"
