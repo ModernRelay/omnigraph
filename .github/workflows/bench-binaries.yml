@@ -1,13 +1,15 @@
 name: Bench Binaries
 
-# The benchmark lab's two binaries, built where the commit lands. One job on
+# The benchmark lab's three binaries, built where the commit lands. One job on
 # GitHub's arm64 runner inside the Amazon Linux 2023 container the lab's
 # campaign machine runs (glibc 2.34; a binary linked on Ubuntu 24.04 needs
 # 2.39 and does not start there): `cargo build --release --locked` of
-# `omnigraph-cli` and of `omnigraph-bench`, one package per call so neither
-# binary's features depend on the other's manifest, RUSTFLAGS empty as the
-# lab and the release archives build. The artifact `bench-binaries-<sha>` is
-# what the lab shelves under `binaries/<sha>/`: the two binaries, their
+# `omnigraph-cli`, of `omnigraph-bench` and of `omnigraph-server`, one package
+# per call so no binary's features depend on another's manifest, RUSTFLAGS
+# empty as the lab and the release archives build. The server is the one
+# `omnigraph-bench run --server-product` starts beside the `omnigraph` of the
+# same commit. The artifact `bench-binaries-<sha>` is what the lab shelves
+# under `binaries/<sha>/`: the three binaries, their
 # `sha256sum` lines, the public catalog `benchmarks/` and `build.json`. The
 # sha is the commit built: a pull request's head, never GitHub's merge commit.
 # Nothing here talks to AWS; the lab pulls the artifact.
@@ -94,14 +96,19 @@ jobs:
       - name: Build omnigraph-bench
         run: cargo build --release --locked -p omnigraph-bench
 
+      - name: Build omnigraph-server
+        run: cargo build --release --locked -p omnigraph-server
+
       # The CLI has no `--version` flag (`disable_version_flag`); `version` is
-      # its subcommand. The harness takes the flag.
+      # its subcommand. The harness takes the flag. The server has neither and
+      # serves only from a cluster, so `--help` is the call that starts it.
       - name: Check the binaries start
         shell: bash
         run: |
           set -euo pipefail
           target/release/omnigraph version
           target/release/omnigraph-bench --version
+          target/release/omnigraph-server --help > /dev/null
 
       # The artifact is named by SOURCE_SHA, and the harness records nothing
       # unless it was compiled from a whole commit and a clean tree. Its long
@@ -122,8 +129,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          install -m 0755 target/release/omnigraph target/release/omnigraph-bench dist/
-          (cd dist && sha256sum omnigraph > omnigraph.sha256 && sha256sum omnigraph-bench > omnigraph-bench.sha256)
+          install -m 0755 target/release/omnigraph target/release/omnigraph-bench target/release/omnigraph-server dist/
+          (cd dist && sha256sum omnigraph > omnigraph.sha256 && sha256sum omnigraph-bench > omnigraph-bench.sha256 && sha256sum omnigraph-server > omnigraph-server.sha256)
           tar -czf dist/benchmarks.tar.gz benchmarks
           python3 - dist/build.json <<'PY'
           import json, os, subprocess, sys, time

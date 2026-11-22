@@ -930,6 +930,7 @@ async fn a_host_that_does_not_measure_refuses_a_measured_block_against_a_server(
         &case,
         &target,
         &omnigraph_gqt_core::PlainHost,
+        &(),
         1,
     )
     .await
