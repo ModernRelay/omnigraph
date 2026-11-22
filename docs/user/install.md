@@ -211,10 +211,12 @@ is the commit a packaged build was compiled from; a plain source build reports
 it as null and prints no `commit` line. The server reports the same commit as
 `source_version` on `GET /healthz`.
 
-A binary that speaks GQ 3 also prints `query-language gq3` after the
-`http-contract` line, `"query_language": "gq3"` in `--json` and on `GET
-/healthz`. An earlier binary prints no query-language line, so the two tell
-apart even where their versions and contract numbers agree
+A binary that speaks GQ 3 also prints its GQ language version, `major.minor`,
+after the `http-contract` line: `gq-language 3.0`, and `"gq_language": "3.0"`
+in `--json` and on `GET /healthz`. The minor number rises when the language
+only accepts more, the major when it accepts less or changes a shape it
+produces. A binary that reports no GQ language version is a GQ language 2 build,
+so the two tell apart even where their versions and contract numbers agree
 ([Upgrading queries to GQ 3](queries/upgrading-to-gq3.md)).
 
 `internal_schema.writes` is the storage format of a graph this binary

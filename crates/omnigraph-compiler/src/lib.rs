@@ -1,8 +1,3 @@
-/// The query language this build compiles: `omnigraph version` and
-/// `/healthz` name it, so an operator can tell this binary from one that
-/// speaks edition 2, which names none.
-pub const QUERY_LANGUAGE: &str = "gq3";
-
 #[cfg(any(test, feature = "test-util"))]
 pub mod arbitrary;
 pub mod budget;
@@ -58,6 +53,14 @@ pub use ir::ParamMap;
 /// `(3, 0)` is GQ 3, which replaces the
 /// language whole.
 pub const GQ_LANGUAGE_VERSION: (u16, u16) = (3, 0);
+
+/// [`GQ_LANGUAGE_VERSION`] rendered `major.minor` (`"3.0"`): the one spelling
+/// `omnigraph version` and `/healthz` report as `gq_language`, so an operator
+/// can tell builds apart; a binary that reports none is a GQ language 2 build.
+pub fn gq_language_version() -> String {
+    let (major, minor) = GQ_LANGUAGE_VERSION;
+    format!("{major}.{minor}")
+}
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use query::descriptor::{
     QueryGraphFact, QueryGraphFactKind, QueryOperationDescriptor, QueryResultFieldDescriptor,

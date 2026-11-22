@@ -38,7 +38,9 @@ binary:
    server, apply the bundle directly with the new CLI (`omnigraph cluster
    apply --target <cluster-root> --config <bundle>`; direct apply requires
    stopped serving), then start the new server. The old server never reads
-   a GQ 3 source.
+   a GQ 3 source. The new CLI and server report `gq_language` `3.0`
+   (`omnigraph version`, `GET /healthz`); an old one reports none
+   ([Verify](../install.md#verify)).
 
 A stored query that still fails to compile does not stop its graph. Each
 declaration of a stored file compiles on its own: one the new binary refuses

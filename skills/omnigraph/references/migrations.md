@@ -12,9 +12,10 @@ dispatch or graph access. Earlier prerelease 0.14 builds share the header and
 header admission cannot distinguish their older shapes; refresh clients,
 server and integrations together. See [server policy](server-policy.md).
 
-`omnigraph version` prints `query-language gq3` (`query_language` in `--json`
-and in `/healthz`); a binary that speaks the older query syntax prints none,
-under the same version and contract numbers.
+`omnigraph version` prints the GQ language version, `gq-language 3.0`
+(`gq_language: "3.0"` in `--json` and in `/healthz`); a binary that reports
+none is a GQ language 2 build, which speaks the older query syntax under the
+same version and contract numbers.
 
 ## Upgrade to the 0.14 HTTP API
 

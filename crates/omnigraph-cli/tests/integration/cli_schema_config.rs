@@ -20,6 +20,10 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
         INTERNAL_MANIFEST_SCHEMA_VERSION as WRITES, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION as LOWEST,
     };
     use omnigraph_api_types::HTTP_API_CONTRACT;
+    // The GQ language version is spelled once, as this tuple; both outputs
+    // must render it `major.minor`.
+    let (gq_major, gq_minor) = omnigraph_compiler::GQ_LANGUAGE_VERSION;
+    let gq_language = format!("{gq_major}.{gq_minor}");
 
     // The release workflows stamp both at compile time; the test binary is
     // built with whatever this build was given, normally neither.
@@ -33,7 +37,7 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
     };
 
     // The first two lines keep their earlier text and position; the contract
-    // line follows them, then the query language, then the commit of a
+    // line follows them, then the GQ language version, then the commit of a
     // packaged build.
     let output = output_success(cli().arg("version"));
     let stdout = stdout_string(&output);
@@ -41,7 +45,7 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
         format!("omnigraph {version}"),
         format!("internal-schema {WRITES} (serves v{LOWEST} to v{WRITES})"),
         format!("http-contract {HTTP_API_CONTRACT}"),
-        "query-language gq3".to_string(),
+        format!("gq-language {gq_language}"),
     ];
     expected.extend(commit.map(|commit| format!("commit {commit}")));
     assert_eq!(stdout.lines().collect::<Vec<_>>(), expected);
@@ -64,7 +68,7 @@ fn version_command_prints_cli_version_http_contract_and_storage_formats_issue_97
             "channel": channel,
             "commit": commit,
             "http_contract": HTTP_API_CONTRACT,
-            "query_language": "gq3",
+            "gq_language": gq_language,
             "protocols": {"studio": 1, "target": 2, "credential": 2, "access": 2},
             "internal_schema": { "writes": WRITES, "serves": [LOWEST, WRITES] },
         }),

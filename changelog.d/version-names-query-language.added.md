@@ -1,3 +1,3 @@
-- `omnigraph version` and `/healthz` name the query language (`query_language: gq3`). See [verify][query-language-guide].
+- `omnigraph version` and `/healthz` report the GQ language version (`gq_language: "3.0"`, text `gq-language 3.0`). See [verify][gq-language-guide].
 
-[query-language-guide]: ../docs/user/install.md#verify
+[gq-language-guide]: ../docs/user/install.md#verify

@@ -2493,10 +2493,10 @@ pub struct HealthOutput {
     pub internal_schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
-    /// The query language this server compiles, `gq3`. A server before the
-    /// GQ 3 break omits the field.
+    /// The GQ language version this server compiles, `major.minor` (`"3.0"`).
+    /// A server that omits the field is a GQ language 2 build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query_language: Option<String>,
+    pub gq_language: Option<String>,
 }
 
 /// The readiness witness of one replica (`GET /readyz`, RFC 0049): whether

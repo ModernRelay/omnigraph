@@ -582,8 +582,10 @@ async fn healthz_succeeds_after_startup() {
         Some(source_version) => assert_eq!(body["source_version"], source_version),
         None => assert!(body.get("source_version").is_none()),
     }
-    // The query language tells this server from one before the GQ 3 break.
-    assert_eq!(body["query_language"], "gq3");
+    // The GQ language version tells builds apart; it is
+    // `GQ_LANGUAGE_VERSION` rendered `major.minor`, spelled nowhere else.
+    let (gq_major, gq_minor) = omnigraph_compiler::GQ_LANGUAGE_VERSION;
+    assert_eq!(body["gq_language"], format!("{gq_major}.{gq_minor}"));
 
     for path in ["/healthz", "/readyz", "/openapi.json"] {
         for method in [Method::GET, Method::HEAD] {
