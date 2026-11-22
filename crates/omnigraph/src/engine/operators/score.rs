@@ -74,17 +74,19 @@ const RESCAN: &str = "exact lexical rescan";
 const RESCAN_ID_BYTES: u64 = 1024;
 /// The fewest and the most input rows a two-pass slice gathers.
 const RESCAN_SLICE_FLOOR: u64 = 256;
-const RESCAN_SLICE_CEILING: u64 = 8192;
+const RESCAN_SLICE_CEILING: u64 = 16_384;
 
 /// The input rows the two-pass side gathers before it reads their text
 /// again, under a query pool of `pool` bytes, the plan's memory limit: the
-/// rows an eighth of the pool holds at [`RESCAN_ID_BYTES`] each, between
-/// 256 and 8,192. One read per slice (the last may hold fewer): with no
-/// index on the identity column a read scans the identities of the whole
-/// table, so the slice bounds the reads, and the gathered rows carry no
-/// text.
+/// rows the match table's budget holds at [`RESCAN_ID_BYTES`] each (the
+/// budget the switch released, [`omnigraph_planner::bm25_match_table_bytes`]),
+/// between 256 and 16,384. One read per slice (the last may hold fewer):
+/// with no index on the identity column a read scans the identities of the
+/// whole table, so the slice bounds the reads, and the gathered rows carry
+/// no text.
 pub(crate) fn rescan_slice_rows(pool: u64) -> usize {
-    let rows = (pool / 8 / RESCAN_ID_BYTES).clamp(RESCAN_SLICE_FLOOR, RESCAN_SLICE_CEILING);
+    let rows = (omnigraph_planner::bm25_match_table_bytes(pool) / RESCAN_ID_BYTES)
+        .clamp(RESCAN_SLICE_FLOOR, RESCAN_SLICE_CEILING);
     usize::try_from(rows).unwrap_or(usize::MAX)
 }
 
