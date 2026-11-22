@@ -75,11 +75,15 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     let version = output_success(cli_at(&old).arg("version"));
     let version = String::from_utf8(version.stdout).unwrap();
     assert!(version.contains("internal-schema 14 (serves v14 to v14)"));
-    let candidate_version = output_success(cli_at(&current).arg("version"));
+    // The candidate must serve the format 0.12 writes, whatever it writes itself.
+    let candidate_version: Value = parse_stdout_json(&output_success(
+        cli_at(&current).args(["version", "--json"]),
+    ));
+    let serves = &candidate_version["internal_schema"]["serves"];
+    let (lowest, highest) = (serves[0].as_u64().unwrap(), serves[1].as_u64().unwrap());
     assert!(
-        String::from_utf8(candidate_version.stdout)
-            .unwrap()
-            .contains("internal-schema 18 (serves v14 to v18)")
+        (lowest..=highest).contains(&14),
+        "the candidate must serve storage format 14, got {serves}"
     );
 
     let temp = tempdir().unwrap();
@@ -288,7 +292,8 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         "upgrade-ledger",
         "--json",
     ]));
-    assert_eq!(refused.status.code(), Some(2));
+    // A command line the parser refuses exits `EX_USAGE`.
+    assert_eq!(refused.status.code(), Some(64));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--writers-stopped"));
     assert_eq!(fs::read(&state_path).unwrap(), old_bytes);
     output_success(cli_at(&current).args([
