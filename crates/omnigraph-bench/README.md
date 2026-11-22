@@ -45,7 +45,7 @@ contains a driver.
 | Part | Role | Code |
 |---|---|---|
 | Harness | Everything around a measurement. It plans the points, prepares and resets the fixture, runs each repetition in a fresh process, verifies, and writes the record. | this crate |
-| Host | Runs one frozen GQT program inside the repetition's process. It takes the timings and the store-call counts, and tells the supervisor when the measured interval opens and closes. | `BenchHost` in `src/gqt_runner.rs`, an `ExecutionHost` |
+| Host | Runs one frozen GQT program inside the repetition's process. It takes the timings and the store-call counts, and tells the supervisor when the measured interval opens and closes. | `BenchHost` in `src/gqt_runner.rs`, an `ExecutionHost` (the store and the measured block) and an `Observer` (the clock and the records) |
 | Driver | Issues the statements of a measured block, again and again, and times each one. | `drive` and `work` in `src/driver.rs` |
 
 One repetition crosses one process boundary, and a second one when the run
