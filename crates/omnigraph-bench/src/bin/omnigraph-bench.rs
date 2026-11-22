@@ -91,7 +91,7 @@ enum Command {
         #[command(subcommand)]
         command: ArchiveCommand,
     },
-    /// Rebuild and query the disposable OmniGraph telemetry projection.
+    /// Rebuild and query the disposable Omnigraph telemetry projection.
     Projection {
         #[command(subcommand)]
         command: ProjectionCommand,

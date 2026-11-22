@@ -777,6 +777,61 @@ impl OmniError {
         )
     }
 
+    /// Whether the type of this failure is a refusal: the step that raised it
+    /// refused before its first durable effect, or before its publication
+    /// with every earlier effect of its own unreachable, so the step did not
+    /// move the graph. This is what a typed outcome states. Completion
+    /// evidence the owning operation attaches composes over it: an earlier
+    /// publication of the same operation still stands beside the refusal,
+    /// and explicit uncertainty wins. An opaque failure, one that needs
+    /// recovery or a rebuild, and an internal surprise are not refusals.
+    /// The match is exhaustive, so a new variant decides.
+    pub fn is_refusal(&self) -> bool {
+        match self.without_evidence() {
+            Self::Compiler(_)
+            | Self::MergeConflicts(_)
+            | Self::KeyConflict { .. }
+            | Self::ResourceLimitExceeded { .. }
+            | Self::ChangeCursorRejected { .. }
+            | Self::BranchNotFound { .. }
+            | Self::BranchExists { .. }
+            | Self::BranchDeleted { .. }
+            | Self::BranchNotReady { .. }
+            | Self::ReadTargetNotFound { .. }
+            | Self::AmbiguousReadTarget { .. }
+            | Self::BranchStartRefused { .. }
+            | Self::ChangeFeedGap { .. }
+            | Self::CommitHasNoParent { .. }
+            | Self::ChangeSchemaBoundary { .. }
+            | Self::ExternalBlobPolicy { .. }
+            | Self::ExternalBlobSource { .. }
+            | Self::StoredExternalBlobDenied { .. }
+            | Self::BlobRangeNotSatisfiable { .. }
+            | Self::PreconditionFailed { .. }
+            | Self::BlobWritePreconditionFailed { .. }
+            | Self::Policy(_)
+            | Self::AlreadyInitialized { .. }
+            | Self::InitializationClaimed { .. } => true,
+            Self::Manifest(ManifestError {
+                kind,
+                publication_in_doubt,
+                ..
+            }) => publication_in_doubt.is_none() && *kind != ManifestErrorKind::Internal,
+            Self::Storage(_)
+            | Self::Io(_)
+            | Self::DataFusion(_)
+            | Self::BlobIntegrity { .. }
+            | Self::RetryableCommitConflict(_)
+            | Self::HistoricalVersionReclaimed { .. }
+            | Self::FullTextIndexRebuildRequired { .. }
+            | Self::FullTextIndexRequired { .. }
+            | Self::RecoveryRequired { .. }
+            | Self::InitializationCommitted { .. }
+            | Self::InitializationIndeterminate { .. } => false,
+            Self::Completion { .. } => unreachable!("completion evidence was unwrapped"),
+        }
+    }
+
     /// Remove a sub-operation's definite proof (no effect, or no
     /// publication) when composing it after earlier durable work that may
     /// have published, a failing step's proof under a recorded earlier
@@ -1631,6 +1686,7 @@ mod tests {
             OmniError::manifest_internal("coordinator view is stale"),
         ] {
             let message = opaque.to_string();
+            assert!(!opaque.is_refusal(), "{message}");
             assert_eq!(
                 opaque.unpublished().completion_evidence(),
                 Some(CompletionEvidence::Unpublished),
@@ -1638,10 +1694,13 @@ mod tests {
             );
         }
 
-        // A typed outcome already says what happened: it keeps its shape, so
-        // a caller matching on the variant sees the same error.
+        // A typed outcome already says what happened, that its step refused
+        // before it moved the graph: it keeps its shape, so a caller matching
+        // on the variant sees the same error, and its type is a refusal.
         for typed in [
             OmniError::manifest("bad request"),
+            OmniError::manifest_not_found("branch 'b' not found"),
+            OmniError::external_blob_policy("<redacted>", "base overlaps a storage root"),
             OmniError::manifest_conflict("authority conflict"),
             OmniError::manifest_read_set_changed("graph_head:main", None, None),
             OmniError::KeyConflict {
@@ -1656,7 +1715,10 @@ mod tests {
             OmniError::Policy("denied".into()),
         ] {
             let message = typed.to_string();
+            assert!(typed.is_refusal(), "{message}");
+            assert!(!typed.outcome_opaque(), "{message}");
             let marked = typed.unpublished();
+            assert!(marked.is_refusal(), "{message}");
             assert_eq!(marked.completion_evidence(), None, "{message}");
             assert!(!matches!(marked, OmniError::Completion { .. }), "{message}");
         }
@@ -1669,6 +1731,13 @@ mod tests {
         ] {
             let message = uncertain.to_string();
             let marked = uncertain.unpublished();
+            // Uncertainty is not a refusal of a publication in doubt or of
+            // a pending recovery; a refusal's evidence still says it was.
+            assert_eq!(
+                marked.is_refusal(),
+                message == "returned after effects",
+                "{message}"
+            );
             assert_eq!(
                 marked.completion_evidence(),
                 Some(CompletionEvidence::Uncertain),

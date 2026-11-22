@@ -7,7 +7,7 @@ use omnigraph_vocabulary_guard::{
 };
 
 #[derive(Debug, Parser)]
-#[command(about = "Guard classified vocabulary at public OmniGraph boundaries")]
+#[command(about = "Guard classified vocabulary at public Omnigraph boundaries")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
