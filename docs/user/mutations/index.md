@@ -205,13 +205,14 @@ paths beneath an `embedded_only` base. A graph with no policy denies every
 source; a URI outside every base, an unsupported scheme, and an object over the
 [`load_source_max_bytes`](../queries/settings.md) setting (default 32 MiB) are
 refused before any byte is read, and every read of the object (each range an
-overwrite's partition reads, or the one read of a keyed mode) is bounded
-by a 120-second deadline. A refused source names `csv_source_bytes`; raising the
+overwrite's partition reads, or the one read of a keyed mode) is bounded by a
+120-second deadline. A refused source names `csv_source_bytes`; raising the
 setting in the statement's `set` prefix (or the request's `settings` field)
-admits a larger object. A direct `omnigraph mutate` run installs an embedded-
-only base over a `file://` source's directory for that statement, so the file is
-admitted by the same rule; a served run refuses a `file://` source, since the
-server reads only what it may reach.
+admits a larger object. A direct `omnigraph mutate` run installs an
+embedded-only base over a `file://` source's directory for that statement, so
+the file is admitted by the same rule, unless it overlaps the cluster's storage
+root (by default its config directory; a standalone graph's own root); a served
+run refuses a `file://` source. A refusal has `effects: none`, `action: fix`.
 
 `explain` before a `load csv` statement prints the load's plan, the same
 document a query's explain prints: the source, the one validation with each

@@ -28,6 +28,7 @@ mod authorization;
 mod config;
 mod deployment;
 mod diff;
+mod graph_id;
 mod graph_read;
 mod lease;
 mod operations;
@@ -60,6 +61,7 @@ use config::{
 pub use config::{StoredQueryFiles, stored_query_files};
 pub use deployment::*;
 use diff::{ResourceKind, compute_blast_radius, resource_kind};
+pub use graph_id::{GRAPH_ID_MAX_LEN, graph_id_violation};
 pub use graph_read::GraphReadAuthority;
 pub use operations::{
     AdmissionRefusal, AdmissionScope, Admitted, CLUSTER_OPERATIONS_FILE, KindStates,

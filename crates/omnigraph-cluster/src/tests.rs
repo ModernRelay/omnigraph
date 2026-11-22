@@ -234,6 +234,66 @@ fn future_phase_field_rejection() {
     assert_eq!(out.diagnostics[0].code, "future_phase_field");
 }
 
+/// A graph id the server refuses at boot is refused when the configuration is
+/// validated, before apply writes anything (issue 1490). So is one the server
+/// accepts but deployment addresses do not (a digit or `-` first). Other names
+/// keep the wider resource charset.
+#[tokio::test]
+async fn graph_id_follows_the_server_rule_issue_1490() {
+    let dir = fixture();
+    let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    let long = "g".repeat(65);
+    for refused in [
+        "probe_under",
+        "_lead",
+        "policies",
+        long.as_str(),
+        "1tenant",
+        "-tenant",
+    ] {
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            config.replace("knowledge", refused),
+        )
+        .unwrap();
+        let out = validate_config_dir(dir.path());
+        assert!(!out.ok, "{refused}: {:?}", out.diagnostics);
+        let diagnostic = out
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.path == format!("graphs.{refused}"))
+            .unwrap_or_else(|| panic!("{refused}: {:?}", out.diagnostics));
+        assert_eq!(diagnostic.code, "invalid_resource_id");
+        // The server's own refusal text (`GraphId` applies the same rule),
+        // or, for an id the server accepts, the cluster's letter-first rule.
+        let rule = crate::graph_id_violation(refused)
+            .unwrap_or_else(|| format!("graph_id '{refused}' must start with an ASCII letter"));
+        assert_eq!(diagnostic.message, format!("graph id `{refused}`: {rule}"));
+
+        let caller = DeploymentCaller::storage_owner(None);
+        let error = apply_deployment(dir.path(), None, &caller, |_, _, _| {
+            panic!("{refused}: apply admitted an id the server refuses")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.message.contains(refused), "{error:?}");
+        assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+        assert!(!dir.path().join("graphs").exists());
+    }
+
+    // The control: a hyphen is in both rules, and an underscore stays valid
+    // in a policy name and a query name (`find_person`).
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config
+            .replace("knowledge", "probe-dash")
+            .replace("  base:", "  base_policy:"),
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(out.ok, "{:?}", out.diagnostics);
+}
+
 #[test]
 fn duplicate_yaml_key_rejection() {
     let dir = fixture();
@@ -674,7 +734,7 @@ fn external_blob_config_rejects_unsafe_and_overlapping_bases() {
             r#"
 version: 1
 graphs:
-  unsafe_file:
+  unsafe-file:
     schema: ./people.pg
     external_blobs:
       allow:
@@ -719,7 +779,7 @@ fn overlap_diagnostic_paths(outcome: &LoadOutcome) -> Vec<String> {
             assert!(
                 diagnostic
                     .message
-                    .contains("overlaps an OmniGraph storage root"),
+                    .contains("overlaps an Omnigraph storage root"),
                 "{diagnostic:?}"
             );
         })

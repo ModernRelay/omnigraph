@@ -916,7 +916,8 @@ fn parity_load() {
     for (arm, output) in [("local", &l), ("remote", &r)] {
         assert_eq!(output.status.code(), Some(2), "{arm}: {output:?}");
         let output = parse_stdout_json(output);
-        assert_eq!(output["disposition"]["effects"], "unknown", "{arm}");
+        // The branch was created and the refused rows were not: part.
+        assert_eq!(output["disposition"]["effects"], "partial", "{arm}");
         assert_ne!(output["disposition"]["action"], "retry", "{arm}");
     }
     let (l, r) = p.run(&["branch", "list", "--json"]);

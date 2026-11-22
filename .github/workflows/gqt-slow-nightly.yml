@@ -52,7 +52,7 @@ jobs:
       # holds the two pins equal).
       - name: Build the edition-2 CLI
         env:
-          EDITION_2_SOURCE_COMMIT: 84dbead889727260d0d547b3bbe33e079bfba4ec
+          EDITION_2_SOURCE_COMMIT: 9ad7c8ef91594463636a3048ea20bbb557720cc6
         run: |
           set -euo pipefail
           e2_source="$RUNNER_TEMP/omnigraph-edition-2"

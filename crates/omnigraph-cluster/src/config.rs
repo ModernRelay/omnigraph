@@ -1052,12 +1052,15 @@ fn load_desired_captured(
     }
 
     for (graph_id, graph) in &raw.graphs {
-        validate_id(
-            "graph id",
-            &format!("graphs.{graph_id}"),
-            graph_id,
-            &mut diagnostics,
-        );
+        // A declared graph the server would refuse to serve, or recorded state
+        // would refuse to address, is refused before apply writes.
+        if let Some(violation) = crate::graph_id::declared_graph_id_violation(graph_id) {
+            diagnostics.push(Diagnostic::error(
+                "invalid_resource_id",
+                format!("graphs.{graph_id}"),
+                format!("graph id `{graph_id}`: {violation}"),
+            ));
+        }
         let graph_address = graph_address(graph_id);
         let schema_address = schema_address(graph_id);
         graph_external_blob_policies.insert(

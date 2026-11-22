@@ -60,7 +60,7 @@ pub(super) const BEST_PRACTICES: &[BestPractice] = &[
 
 pub(super) fn best_practices_index() -> String {
     let mut text = String::from(
-        "# OmniGraph best-practices index\n\nThese references come from the OmniGraph agent skill shipped with this server.\n\n| Resource | Read before |\n|---|---|\n",
+        "# Omnigraph best-practices index\n\nThese references come from the Omnigraph agent skill shipped with this server.\n\n| Resource | Read before |\n|---|---|\n",
     );
     for topic in BEST_PRACTICES {
         text.push_str(&format!("| `{}` | {} |\n", topic.uri(), topic.description));

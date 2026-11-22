@@ -524,7 +524,7 @@ mod tests {
     /// An embedded load's policy refusal ran nothing, its fork included: the
     /// engine checks policy before any publication. A refusal the engine marks
     /// as following an earlier publication, as a load's refusal after its
-    /// fork is, left that publication standing, and an untyped error after it
+    /// fork is, left that publication standing, and an opaque error after it
     /// may have done more.
     #[test]
     fn an_embedded_compound_write_reports_what_the_engine_did() {
@@ -544,13 +544,18 @@ mod tests {
         );
         assert_eq!(disposition(&alone)["effects"], "none");
         assert_eq!(alone.exit, 1);
-        // A refusal says what to read again; an untyped error must be
+        // A refusal says what to fix or read again; an opaque error must be
         // reconciled against the graph.
         for (after_fork, effects, action) in [
             (
-                OmniError::manifest("not valid graph NDJSON"),
+                OmniError::manifest_internal("staged table commit lost"),
                 "unknown",
                 "reconcile",
+            ),
+            (
+                OmniError::manifest("not valid graph NDJSON"),
+                "partial",
+                "fix",
             ),
             (
                 OmniError::key_conflict("node:Person", "Bob"),

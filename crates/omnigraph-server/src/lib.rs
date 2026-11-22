@@ -524,8 +524,9 @@ pub struct ApiError {
     /// as the fork a load makes of a missing branch does, so a refusal of a
     /// later step follows that publication.
     compound: bool,
-    /// Set when the engine proved the failing step published nothing itself,
-    /// with no-effect or no-publication evidence, whatever its type.
+    /// Set when the failing step published nothing itself: the engine proved
+    /// it with no-effect or no-publication evidence, whatever the failure's
+    /// type, or the failure's type is a refusal (`OmniError::is_refusal`).
     unpublished: bool,
     /// The outcome is unknown only for storage requests whose uncertainty
     /// is scoped to their own keys: a publication in doubt, whose late
@@ -1632,9 +1633,11 @@ impl ApiError {
     /// forks before its rows. Otherwise only the refusals a write meets before
     /// it starts (authentication, the contract, the actor assertion, policy,
     /// admission capacity, a request precondition), the typed refusals an
-    /// engine gives before its one publication, and a step the engine proved
-    /// published nothing took none; after an earlier step published, those
-    /// leave that step's effects alone.
+    /// engine gives before its one publication, whether or not they carry
+    /// details (a refused source or a malformed row answers a plain
+    /// `bad_request`), and a step the engine proved published nothing took
+    /// none; after an earlier step published, those leave that step's effects
+    /// alone.
     ///
     /// The action is what the failing step asks of its caller, unless its
     /// effects are unknown, which must be reconciled first.
@@ -1726,6 +1729,9 @@ impl ApiError {
     /// an internal error, which takes no completion evidence from it.
     fn translated(err: OmniError) -> Self {
         let (err, evidence) = err.into_completion_evidence();
+        // The engine's type of the failure says whether its step refused
+        // before it moved the graph, whatever status and details it maps to.
+        let refusal = err.is_refusal();
         let storage_outcome = err.is_manifest_publish_in_doubt()
             || matches!(&err, OmniError::Storage(_) | OmniError::Io(_));
         // Keep completion classification separate from HTTP status. Generic
@@ -2018,6 +2024,7 @@ impl ApiError {
             OmniError::Completion { .. } => unreachable!("completion evidence was unwrapped"),
         };
         response.completion_uncertain |= uncertain;
+        response.unpublished = refusal;
         // The engine's evidence is the authority: a definite failure, before
         // any effect or after detached effects no manifest names, keeps the
         // process serving whatever status it maps to. Without evidence the
@@ -2035,7 +2042,7 @@ impl ApiError {
             }
             // The graph moved before this failure. A failing step that proved
             // it published nothing settled; without that proof, what it did is
-            // what its status says, as with no evidence.
+            // what its type and status say, as with no evidence.
             Some(omnigraph::error::CompletionEvidence::PartlyPublished { step_unpublished }) => {
                 response.compound = true;
                 if step_unpublished {

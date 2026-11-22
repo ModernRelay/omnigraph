@@ -105,6 +105,12 @@ route.
   unchanged retry need not succeed. Use `--if-commit` to refuse a write when
   the head moved. Commit conflicts use generic `conflict`,
   so HTTP `409` alone does not identify a retryable case.
+- A load refused before its first effect (a malformed, unknown or invalid row,
+  a missing edge endpoint, a `load csv` source the external Blob policy refuses)
+  answers `400` `bad_request` with `effects: none` and `action: fix`, on
+  `/load`, `/load/ndjson` and `/mutate` alike: correct the input. After a
+  `from` fork of a missing branch the same refusal is `effects: partial`: the
+  fork stands.
 - `key_conflict`: an `insert` statement or load found an existing id. Decide
   whether that entity is the intended one; a retried job should have used
   `upsert` or `replace`, but do not switch silently.
