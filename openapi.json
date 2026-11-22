@@ -5958,7 +5958,7 @@
                     "0.14"
                   ]
                 },
-                "description": "Supported OmniGraph HTTP API contract."
+                "description": "Supported Omnigraph HTTP API contract."
               }
             },
             "content": {
