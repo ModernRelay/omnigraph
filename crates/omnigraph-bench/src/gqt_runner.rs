@@ -1,14 +1,20 @@
-//! One engine operation selected from a frozen GQT program. Dataset building,
-//! process supervision, result assertions and archive work are outside its clock.
+//! The run loop and the host. The run loop (`execute_run` and the owners it
+//! calls) resets the fixture and supervises one worker process per
+//! repetition; the owner of a server the run starts is `gqt_owned_server`.
+//! Inside the worker the host, `BenchHost`, runs the frozen GQT
+//! program and times the selected step: one operation, which the executor
+//! issues once, or a measured block, which the host hands to the driver
+//! ([`crate::driver`]). Dataset building, process supervision, result
+//! assertions and archive work are outside its clock.
 use crate::case::{Backend, ResetMode};
-use crate::concurrent_host::{ConcurrentObservation, Driver, ReadbackObservation};
 use crate::counting::LogicalCallCounter;
 use crate::dataset_cache::DatasetManifestV1;
+use crate::driver::{ConcurrentObservation, Driven, Driver, ReadbackObservation};
 use crate::gqt_case::{
     BlockRun, BoundGqt, DatasetBuildPlan, PlannedGqt, SERVED_READ_KINDS, Target, engine_preparation,
 };
 use crate::gqt_evidence::{
-    CloneInput, LocalRoute, LocalRouteKind, PreparationProofV2, RepetitionInputV2,
+    CloneInput, LocalRoute, LocalRouteKind, OwnedServerInput, PreparationProofV2, RepetitionInputV2,
 };
 use crate::gqt_served::{ServedInput, ServerDeploymentReceiptV1};
 use crate::preparation::{PreparationWriteGate, guard_preparation_writes};
@@ -33,8 +39,8 @@ use omnigraph::storage::StorageAdapter;
 use omnigraph_compiler::settings::Engine;
 use omnigraph_gqt_core::runner_config::SeamDirective;
 use omnigraph_gqt_core::{
-    Case, ConcurrentStep, ExecutionHost, PlainHost, Step, StepFail, StepKind, case_session,
-    execute_steps, readback_acked_rows, run_block_once,
+    Case, ConcurrentStep, ExecutionHost, PlainHost, Readback, ServedSession, ServerTarget, Step,
+    StepFail, StepKind, case_session, execute_steps, readback_acked_rows, run_block_once,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -130,6 +136,12 @@ pub struct GqtRepObservation {
     /// through; absent on the other routes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_manifest_sha256: Option<String>,
+    /// The digest of the `omnigraph-server` binary a `reset: rebuild`
+    /// repetition ran against, started for it by the run; absent on the other
+    /// routes. On that route `peak_rss_bytes` is the server's, over its whole
+    /// life in the repetition, the fixture load included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_executable_sha256: Option<String>,
     /// The measured block's run, when the measured step is a `--- concurrent
     /// measured` block: `elapsed_us` is then the whole block, warmup and
     /// drain included, and the rates are in here.
@@ -160,6 +172,17 @@ pub struct RunOptions {
     /// The commit `run --at` resolved the product from, recorded beside what
     /// the binary says of itself.
     pub product_commit: Option<String>,
+    /// The `omnigraph-server` a `reset: rebuild` run starts per repetition,
+    /// over a cluster the product binary applies under the store.
+    pub server_product: Option<ServerProduct>,
+}
+/// Where a `reset: rebuild` run finds the `omnigraph-server` it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerProduct {
+    /// `omnigraph-server` in the product binary's directory: the two binaries
+    /// of one build.
+    Beside,
+    Path(PathBuf),
 }
 /// The product binary a clone-reset run measured: what `omnigraph version
 /// --json` said about it and the digest of the file that said it.
@@ -174,6 +197,51 @@ pub struct ProductBinary {
     pub source_commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_commit: Option<String>,
+    /// The server binary of a `reset: rebuild` run, started per repetition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<ServerBinary>,
+}
+/// The `omnigraph-server` a `reset: rebuild` run started: its resolved path
+/// and the digest of the file. The product binary beside it names the build
+/// in the record, and a started server that names another commit at
+/// `GET /healthz` is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServerBinary {
+    pub path: PathBuf,
+    pub executable_sha256: String,
+}
+impl ProductBinary {
+    /// The commit the run's rows are named by, which a server beside this
+    /// product has to answer to: the one the binary names, else the run's.
+    pub fn measured_commit(&self) -> Option<&str> {
+        self.source_commit
+            .as_deref()
+            .or(self.requested_commit.as_deref())
+    }
+
+    /// The product with the server binary `server` names, read and digested.
+    pub fn with_server(mut self, server: &ServerProduct) -> RunnerResult<Self> {
+        let named = match server {
+            ServerProduct::Path(path) => path.clone(),
+            ServerProduct::Beside => self
+                .path
+                .parent()
+                .map(|directory| directory.join("omnigraph-server"))
+                .ok_or_else(|| failure("the product binary has no directory"))?,
+        };
+        let path = std::fs::canonicalize(&named).map_err(|e| {
+            RunnerError::new(
+                "product_binary_unreadable",
+                format!("the server binary {}: {e}", named.display()),
+            )
+        })?;
+        let executable_sha256 = sha256_file(&path)?;
+        self.server = Some(ServerBinary {
+            path,
+            executable_sha256,
+        });
+        Ok(self)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunExecution {
@@ -342,8 +410,11 @@ struct BenchHost<'a, S> {
     /// the selected step is that block.
     block: Option<BlockRun>,
     sweep: BTreeMap<String, u64>,
+    /// Against a server the run started: the measured block's sessions in
+    /// declaration order, each addressed with its own actor's token.
+    sessions: Vec<ServerTarget>,
 }
-fn failure(message: impl std::fmt::Display) -> RunnerError {
+pub(crate) fn failure(message: impl std::fmt::Display) -> RunnerError {
     RunnerError::new("gqt_prepare_failed", message.to_string())
 }
 impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
@@ -526,8 +597,8 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
             .block
             .ok_or("the plan carries no run for the measured block")?;
         self.operation_started(step.ordinal)?;
-        let driven =
-            crate::concurrent_host::drive(session, step, run, || self.rebaseline()).await?;
+        let runners = step.sessions.iter().map(|_| session.clone()).collect();
+        let driven = crate::driver::drive(runners, step, run, || self.rebaseline()).await?;
         self.operation_finished(step.ordinal)?;
         let (uri, route) = {
             let state = self.state.lock().unwrap();
@@ -543,6 +614,38 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
             .map_err(|error| format!("the readback's handle failed to open: {error}"))?;
         let reader = case_session(db, case, Engine::V2)?;
         let readback = readback_acked_rows(&PlainHost, &reader, step, &driven.acked_runs).await?;
+        self.observe_block(run, driven, readback);
+        Ok(())
+    }
+
+    /// [`measured_block`](Self::measured_block) against a server: one client
+    /// per session of the block, then the readback on a client no worker
+    /// held. The route has no counters to discard where the window opens.
+    async fn measured_served_block(
+        &self,
+        target: &ServerTarget,
+        case: &Case,
+        step: &ConcurrentStep,
+    ) -> Result<(), String> {
+        let run = self
+            .block
+            .ok_or("the plan carries no run for the measured block")?;
+        let timeout = Duration::from_millis(case.runner.timeout_ms);
+        let runners = self
+            .sessions
+            .iter()
+            .map(|session| ServedSession::open(session, timeout))
+            .collect::<Result<Vec<_>, _>>()?;
+        let reader = ServedSession::open(target, timeout)?;
+        self.operation_started(step.ordinal)?;
+        let driven = crate::driver::drive(runners, step, run, || Ok(())).await?;
+        self.operation_finished(step.ordinal)?;
+        let readback = readback_acked_rows(&PlainHost, &reader, step, &driven.acked_runs).await?;
+        self.observe_block(run, driven, readback);
+        Ok(())
+    }
+
+    fn observe_block(&self, run: BlockRun, driven: Driven, readback: Readback) {
         self.state.lock().unwrap().concurrent = Some(ConcurrentObservation {
             driver: Driver::ClosedLoop,
             claim_grade: false,
@@ -558,7 +661,6 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
             },
             labels: driven.labels,
         });
-        Ok(())
     }
 }
 impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
@@ -584,6 +686,20 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
             .boxed();
         }
         run_block_once(self, session, step)
+    }
+    fn served_block<'a>(
+        &'a self,
+        target: &'a ServerTarget,
+        case: &'a Case,
+        step: &'a ConcurrentStep,
+    ) -> BoxFuture<'a, Result<(), StepFail>> {
+        let label = format!("step {} (concurrent)", step.ordinal);
+        async move {
+            self.measured_served_block(target, case, step)
+                .await
+                .map_err(|message| StepFail::new(label, message))
+        }
+        .boxed()
     }
     fn arm_seams(&self, seams: &[SeamDirective], _: &Step) -> Result<(), String> {
         if seams.is_empty() {
@@ -718,6 +834,7 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
             attribution: bound.plan.definition.protocol.attribution,
             block: bound.plan.block,
             sweep: bound.plan.queries.sweep.clone(),
+            sessions: Vec::new(),
             state: Mutex::new(HostState::new(Some(LocalInstrumentation {
                 root: root.into(),
                 uri: uri.into(),
@@ -794,6 +911,7 @@ pub(crate) async fn execute_served_rep_signaled<S: MeasurementSignals + Send>(
         attribution: bound.plan.definition.protocol.attribution,
         block: None,
         sweep: BTreeMap::new(),
+        sessions: Vec::new(),
         state: Mutex::new(HostState::new(None)),
     };
     let result = tokio::time::timeout(
@@ -810,6 +928,81 @@ pub(crate) async fn execute_served_rep_signaled<S: MeasurementSignals + Send>(
     .map_err(|message| crate::gqt_served::redact_error(message, input.target.token.as_deref()));
     let proof = PreparationProofV2::Served {
         server_receipt_sha256: input.receipt.digest().map_err(failure)?,
+    };
+    finish_execution(&host, result, bound, repetition, &proof)
+}
+
+/// One `reset: rebuild` repetition against the server the parent started for
+/// it: the dataset executed and counted through the server's own routes, then
+/// the workload, its measured block one client per session.
+pub(crate) async fn execute_owned_server_rep_signaled<S: MeasurementSignals + Send>(
+    repetition: u32,
+    bound: &BoundGqt,
+    input: &OwnedServerInput,
+    signals: &mut S,
+) -> RunnerResult<GqtRepObservation> {
+    bound.revalidate().map_err(failure)?;
+    if bound.identity.environment.target != Target::Server
+        || bound.plan.definition.protocol.reset != ResetMode::Rebuild
+    {
+        return Err(failure(
+            "an owned server input requires a server point under reset: rebuild",
+        ));
+    }
+    let crate::gqt_case::DatasetRecipe::Gqt { source } = &bound.plan.dataset else {
+        return Err(failure(
+            "a server started per repetition is provisioned from an authored dataset",
+        ));
+    };
+    let redact = |message: String| {
+        input.tokens().fold(message, |message, token| {
+            crate::gqt_served::redact_error(message, Some(token))
+        })
+    };
+    let dataset = source.parse().map_err(failure)?;
+    omnigraph_gqt_core::provision_served(
+        &input.target,
+        &dataset,
+        &input.tables,
+        &input.edge_tables,
+    )
+    .await
+    .map_err(|message| failure(redact(message)))?;
+    let case = bound.plan.queries.parse().map_err(failure)?;
+    let selected = bound.plan.definition.workload.measured_step.ordinal;
+    let host = BenchHost {
+        signals: Mutex::new(signals),
+        selected,
+        kinds: case
+            .steps()
+            .into_iter()
+            .map(|s| (s.ordinal, s.kind))
+            .collect(),
+        expected_reads: bound.plan.cache_condition.iterations,
+        attribution: bound.plan.definition.protocol.attribution,
+        block: bound.plan.block,
+        sweep: bound.plan.queries.sweep.clone(),
+        sessions: input
+            .session_tokens
+            .iter()
+            .map(|token| ServerTarget {
+                token: Some(token.clone()),
+                ..input.target.clone()
+            })
+            .collect(),
+        state: Mutex::new(HostState::new(None)),
+    };
+    let result = tokio::time::timeout(
+        bound
+            .plan
+            .past_declared_run(Duration::from_millis(case.runner.timeout_ms)),
+        omnigraph_gqt_core::execute_measured_served(&case, &input.target, &host, selected),
+    )
+    .await
+    .unwrap_or_else(|_| Err("queries whole-file timeout exceeded".into()))
+    .map_err(redact);
+    let proof = PreparationProofV2::OwnedServer {
+        server_sha256: input.server_sha256.clone(),
     };
     finish_execution(&host, result, bound, repetition, &proof)
 }
@@ -902,7 +1095,7 @@ pub const CHILD_ENVIRONMENT: [&str; 24] = [
     "HOME",
 ];
 
-fn child_environment() -> Vec<(String, String)> {
+pub(crate) fn child_environment() -> Vec<(String, String)> {
     CHILD_ENVIRONMENT
         .iter()
         .filter_map(|name| {
@@ -955,6 +1148,7 @@ pub(crate) async fn execute_clone_rep_signaled<S: MeasurementSignals + Send>(
         attribution: bound.plan.definition.protocol.attribution,
         block: None,
         sweep: BTreeMap::new(),
+        sessions: Vec::new(),
         state: Mutex::new(HostState::new(None)),
     };
     let mut environment = input.environment.clone();
@@ -1016,16 +1210,24 @@ fn finish_execution<S: MeasurementSignals + Send>(
     let Some(elapsed_us) = state.elapsed else {
         return Err(error.unwrap_or_else(|| failure("selected operation never executed")));
     };
-    let (physical, receipt, base) = match proof {
+    let (physical, receipt, base, server) = match proof {
         PreparationProofV2::Embedded {
             physical_digest, ..
-        } => (Some(physical_digest.digest_sha256.clone()), None, None),
+        } => (
+            Some(physical_digest.digest_sha256.clone()),
+            None,
+            None,
+            None,
+        ),
         PreparationProofV2::Served {
             server_receipt_sha256,
-        } => (None, Some(server_receipt_sha256.clone()), None),
+        } => (None, Some(server_receipt_sha256.clone()), None, None),
         PreparationProofV2::Clone {
             base_manifest_sha256,
-        } => (None, None, Some(base_manifest_sha256.clone())),
+        } => (None, None, Some(base_manifest_sha256.clone()), None),
+        PreparationProofV2::OwnedServer { server_sha256 } => {
+            (None, None, None, Some(server_sha256.clone()))
+        }
     };
     let mut sample = GqtRepObservation {
         repetition,
@@ -1050,6 +1252,7 @@ fn finish_execution<S: MeasurementSignals + Send>(
         server_receipt_sha256: receipt,
         client_peak_rss_bytes: None,
         base_manifest_sha256: base,
+        server_executable_sha256: server,
         concurrent: state.concurrent.take(),
     };
     if let Some(error) = error {
@@ -1096,13 +1299,15 @@ fn validate_evidence(
     parent: bool,
     failed: bool,
 ) -> RunnerResult<()> {
-    let clone = bound.plan.definition.protocol.reset == ResetMode::Clone;
-    if !matches!(
-        (input, bound.identity.environment.target, clone),
-        (PreparationProofV2::Embedded { .. }, Target::Engine, false)
-            | (PreparationProofV2::Served { .. }, Target::Server, false)
-            | (PreparationProofV2::Clone { .. }, Target::Engine, true)
-    ) {
+    let reset = bound.plan.definition.protocol.reset;
+    let paired = match (input, bound.identity.environment.target) {
+        (PreparationProofV2::Embedded { .. }, Target::Engine) => reset != ResetMode::Clone,
+        (PreparationProofV2::Clone { .. }, Target::Engine) => reset == ResetMode::Clone,
+        (PreparationProofV2::Served { .. }, Target::Server) => reset != ResetMode::Rebuild,
+        (PreparationProofV2::OwnedServer { .. }, Target::Server) => reset == ResetMode::Rebuild,
+        _ => false,
+    };
+    if !paired {
         return Err(failure("sample proof target mismatch"));
     }
     let selected = bound.plan.definition.workload.measured_step.ordinal;
@@ -1141,7 +1346,7 @@ fn validate_evidence(
     match (&sample.concurrent, bound.plan.block, case.measured_block()) {
         (None, None, _) => {}
         (None, Some(_), _) if failed => {}
-        (Some(observed), Some(run), Some(step)) => crate::concurrent_host::validate(
+        (Some(observed), Some(run), Some(step)) => crate::driver::validate(
             observed,
             step,
             run,
@@ -1218,6 +1423,7 @@ pub(crate) fn sample_evidence_matches(
                 && sample.control_store_calls.is_some()
                 && sample.server_receipt_sha256.is_none()
                 && sample.base_manifest_sha256.is_none()
+                && sample.server_executable_sha256.is_none()
                 && sample.client_peak_rss_bytes.is_none()
                 && rss_matches(sample.peak_rss_bytes)
         }
@@ -1227,6 +1433,7 @@ pub(crate) fn sample_evidence_matches(
             sample.server_receipt_sha256.as_ref() == Some(server_receipt_sha256)
                 && sample.input_physical_digest_sha256.is_none()
                 && sample.base_manifest_sha256.is_none()
+                && sample.server_executable_sha256.is_none()
                 && sample.logical_store_calls.is_none()
                 && sample.control_store_calls.is_none()
                 && sample.peak_rss_bytes.is_none()
@@ -1240,6 +1447,7 @@ pub(crate) fn sample_evidence_matches(
             sample.base_manifest_sha256.as_ref() == Some(base_manifest_sha256)
                 && sample.input_physical_digest_sha256.is_none()
                 && sample.server_receipt_sha256.is_none()
+                && sample.server_executable_sha256.is_none()
                 && sample
                     .logical_store_calls
                     .as_ref()
@@ -1247,6 +1455,17 @@ pub(crate) fn sample_evidence_matches(
                 && sample.control_store_calls.is_none()
                 && sample.merge.is_none()
                 && sample.peak_rss_bytes.is_some_and(|n| n > 0)
+                && rss_matches(sample.client_peak_rss_bytes)
+        }
+        PreparationProofV2::OwnedServer { server_sha256 } => {
+            sample.server_executable_sha256.as_ref() == Some(server_sha256)
+                && sample.input_physical_digest_sha256.is_none()
+                && sample.server_receipt_sha256.is_none()
+                && sample.base_manifest_sha256.is_none()
+                && sample.logical_store_calls.is_none()
+                && sample.control_store_calls.is_none()
+                && sample.merge.is_none()
+                && sample.peak_rss_bytes.is_none_or(|n| parent && n > 0)
                 && rss_matches(sample.client_peak_rss_bytes)
         }
     }
@@ -1397,6 +1616,7 @@ pub(crate) fn sample_byte_upper_bound(plan: &PlannedGqt) -> RunnerResult<usize> 
         server_receipt_sha256: Some("0".repeat(64)),
         client_peak_rss_bytes: Some(u64::MAX),
         base_manifest_sha256: Some("0".repeat(64)),
+        server_executable_sha256: Some("0".repeat(64)),
         steps,
         verification: GqtVerification {
             selected_assertion_passed: false,
@@ -1407,7 +1627,7 @@ pub(crate) fn sample_byte_upper_bound(plan: &PlannedGqt) -> RunnerResult<usize> 
         concurrent: plan
             .block
             .zip(case.measured_block())
-            .map(|(run, step)| crate::concurrent_host::upper_bound(step, run)),
+            .map(|(run, step)| crate::driver::upper_bound(step, run)),
     };
     serde_json::to_vec(&sample)
         .map(|v| v.len())
@@ -1477,6 +1697,9 @@ fn execute_owned(
         return execute_served_owned(run, plan, &options, input);
     }
     if let Some(store) = &options.store {
+        if plan.definition.environment.target == Target::Server {
+            return execute_owned_server(run, plan, &options, store);
+        }
         return execute_clone_owned(run, plan, &options, store);
     }
     let cache = options
@@ -1638,6 +1861,11 @@ pub fn validate_run_options(plan: &PlannedGqt, options: &RunOptions) -> RunnerRe
     plan.revalidate().map_err(failure)?;
     match (plan.definition.environment.target, &options.served) {
         (Target::Engine, None) => {
+            if options.server_product.is_some() {
+                return Err(failure(
+                    "--server-product starts the server of a server scenario; this point runs embedded",
+                ));
+            }
             let clone = plan.definition.protocol.reset == ResetMode::Clone;
             let s3 = matches!(plan.definition.environment.backend, Backend::S3 { .. });
             match (&options.store, clone) {
@@ -1666,8 +1894,36 @@ pub fn validate_run_options(plan: &PlannedGqt, options: &RunOptions) -> RunnerRe
                 (None, true) => Err(failure("the clone reset level requires --store")),
             }
         }
+        (Target::Server, None) => {
+            let rebuild = plan.definition.protocol.reset == ResetMode::Rebuild;
+            let Some(store) = options.store.as_deref().filter(|_| rebuild) else {
+                return Err(failure(
+                    "a server scenario runs against a provisioned server (--server with its deployment receipt) or, under reset: rebuild, against a server the run starts (--store with --server-product)",
+                ));
+            };
+            if options.server_product.is_none() {
+                return Err(failure(
+                    "reset: rebuild starts a server per repetition and requires --server-product",
+                ));
+            }
+            if store.starts_with("s3://") || options.backend.is_some() {
+                return Err(failure(
+                    "a server the run starts serves a cluster root under a local store; an s3:// store and --backend do not apply",
+                ));
+            }
+            if options.local_route != LocalRouteKind::Direct {
+                return Err(failure(
+                    "a server the run starts is reached over HTTP; a local route applies to engine-target scenarios only",
+                ));
+            }
+            Ok(())
+        }
         (Target::Server, Some(input)) => {
-            if options.store.is_some() || options.backend.is_some() || options.product.is_some() {
+            if options.store.is_some()
+                || options.backend.is_some()
+                || options.product.is_some()
+                || options.server_product.is_some()
+            {
                 return Err(failure(
                     "served graphs are pre-provisioned; a fixture store does not apply",
                 ));
@@ -1827,7 +2083,7 @@ fn execute_served_owned(
 /// The product binary of a `--store` run (`--product`, else `omnigraph`
 /// beside the worker executable), inspected once so the record names what it
 /// measured and a binary writing another storage format is refused.
-fn resolve_product(
+pub(crate) fn resolve_product(
     options: &RunOptions,
     environment: &[(String, String)],
 ) -> RunnerResult<ProductBinary> {
@@ -1842,7 +2098,11 @@ fn resolve_product(
                 failure("--product or a worker executable with a directory is required")
             })?,
     };
-    inspect_product(&path, options.product_commit.clone(), environment)
+    let product = inspect_product(&path, options.product_commit.clone(), environment)?;
+    match &options.server_product {
+        Some(server) => product.with_server(server),
+        None => Ok(product),
+    }
 }
 
 /// How long a product's `version --json` may take before the binary is
@@ -1851,7 +2111,7 @@ const PRODUCT_VERSION_DEADLINE: Duration = Duration::from_secs(30);
 
 /// `Command::output` with a deadline: the child is killed when it outlives
 /// it, and the error names the deadline.
-fn output_within(
+pub(crate) fn output_within(
     mut command: std::process::Command,
     deadline: Duration,
 ) -> std::io::Result<std::process::Output> {
@@ -1973,6 +2233,7 @@ pub fn inspect_product(
         executable_sha256,
         source_commit: version.commit,
         requested_commit,
+        server: None,
     })
 }
 
@@ -2204,7 +2465,23 @@ fn execute_clone_owned(
     }
 }
 
-fn summarize_wall_clock(samples: &[GqtRepObservation]) -> WallClockSummary {
+#[cfg(unix)]
+use crate::gqt_owned_server::execute_owned_server;
+
+#[cfg(not(unix))]
+fn execute_owned_server(
+    _: crate::suite::ResolvedRun,
+    _: PlannedGqt,
+    _: &RunOptions,
+    _: &str,
+) -> RunnerResult<RunExecution> {
+    Err(RunnerError::new(
+        "unsupported_worker_platform",
+        "starting a server per repetition is unavailable on this platform",
+    ))
+}
+
+pub(crate) fn summarize_wall_clock(samples: &[GqtRepObservation]) -> WallClockSummary {
     let mut times: Vec<_> = samples.iter().map(|s| s.elapsed_us).collect();
     times.sort_unstable();
     let count = times.len();
@@ -2217,7 +2494,7 @@ fn summarize_wall_clock(samples: &[GqtRepObservation]) -> WallClockSummary {
         p95_supported: count >= 20,
     }
 }
-fn binding<'a>(
+pub(crate) fn binding<'a>(
     recipe: &crate::gqt_case::DatasetRecipe,
     bindings: &'a [String],
 ) -> RunnerResult<Option<&'a str>> {

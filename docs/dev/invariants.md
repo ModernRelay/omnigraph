@@ -38,8 +38,10 @@ five more changes like this one?**
 
 3. **Every operation uses one coherent accepted view.** A read holds one
    immutable snapshot for its lifetime. A writer captures schema, catalog,
-   branch, graph head, native ref identity, and table baselines from one
-   attempt, then revalidates that complete authority before effects. A retry
+   branch, graph head, branch identity (the identifier of the branch's row in
+   `main`'s catalog at or above format 18, of its native ref below), and table
+   baselines from one attempt, then revalidates that complete authority before
+   effects. A retry
    starts a new attempt; it never combines fresh and stale facts.
 
 4. **A mutation publishes once.** `mutate`, `load`, schema apply, merge, and
@@ -195,9 +197,13 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
 - The writer epoch fences publications that move a branch's head, on a branch
   some process claimed ([writes](writes.md#writer-epoch)). Only the embedded
   engine claims: no command or route does, so a claimed branch refuses the
-  server and the CLI. Ref metadata and ref deletes, the collector's
-  deletes, `optimize`'s configuration commit and the stamp-only route of
-  `omnigraph upgrade` are not fenced. The process that holds
+  server and the CLI. Branch create and delete are fenced through `main`'s
+  epoch at or above format 18: the branch row and the retired row are
+  publications on `main`, and the tombstone on the branch's chain asserts no
+  epoch. The collector's deletes and its removal of a retired row's entry,
+  `optimize`'s configuration commit, the stamp-only route of
+  `omnigraph upgrade`, and below format 18 the ref metadata and ref deletes
+  are not fenced. The process that holds
   its handle's bound branch reads it, and opens and revalidates its writes on
   it, with no head probe ([writes](writes.md#writer-epoch) lists the sites and
   the captures that still probe), so the reads of an owner another process

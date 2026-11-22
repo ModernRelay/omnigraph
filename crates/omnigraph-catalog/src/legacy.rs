@@ -25,7 +25,6 @@ use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, UInt64Array
 use datafusion::prelude::{col, lit};
 use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::refs::BranchContents;
 use lance::session::Session;
 
 use crate::error::{OmniError, Result};
@@ -541,7 +540,7 @@ pub(crate) async fn record_at(
             named(native)
         )));
     };
-    let mut refs: Option<HashMap<String, BranchContents>> = None;
+    let mut refs: Option<HashMap<String, (Option<String>, u64)>> = None;
     let mut walked = BTreeSet::new();
     let (mut at, mut upto) = (native.map(str::to_string), version);
     loop {
@@ -597,9 +596,9 @@ pub(crate) async fn record_at(
         if refs.is_none() {
             refs = Some(manifest_refs(root_uri, session).await?);
         }
-        if let Some(contents) = refs.as_ref().and_then(|refs| refs.get(&name)) {
-            upto = upto.min(contents.parent_version);
-            at = contents.parent_branch.clone();
+        if let Some((parent, parent_version)) = refs.as_ref().and_then(|refs| refs.get(&name)) {
+            upto = upto.min(*parent_version);
+            at = parent.clone();
             continue;
         }
         let Some(orphan) = writers.first() else {
@@ -696,16 +695,30 @@ async fn own_at(
         .cloned())
 }
 
-/// Every ref of `__manifest`, live or retired, by native name.
+/// Every lifetime main names with the branch and version it forked from, by
+/// native name: the live rows at or above the branch-row stamp (a retired row
+/// keeps no fork point), every ref, live or retired, below it.
 async fn manifest_refs(
     root_uri: &str,
     session: &Arc<Session>,
-) -> Result<HashMap<String, BranchContents>> {
+) -> Result<HashMap<String, (Option<String>, u64)>> {
     let main =
         crate::layout::open_manifest_dataset_native_with_session(root_uri, None, session).await?;
+    if crate::layout::has_branch_rows(&main) {
+        return Ok(crate::BranchRows::decode(main.manifest())?
+            .live()
+            .map(|row| {
+                let parent = (!row.parent_is_main()).then(|| row.parent.clone());
+                (row.native.clone(), (parent, row.parent_version))
+            })
+            .collect());
+    }
     let mut refs = crate::branch_control::list_all_branch_contents(&main).await?;
     refs.extend(crate::retention::retired_manifest_branches(&main).await?);
-    Ok(refs)
+    Ok(refs
+        .into_iter()
+        .map(|(native, contents)| (native, (contents.parent_branch, contents.parent_version)))
+        .collect())
 }
 
 /// The upgrade routes a source root may have completed, as the

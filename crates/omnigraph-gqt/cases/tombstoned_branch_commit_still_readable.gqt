@@ -1,0 +1,63 @@
+# issue: none
+# notes: A commit written on a branch whose delete stopped after its tombstone still answers a
+# notes: read at that commit and a diff from it to main.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query write_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $b1
+
+--- seam
+at: branch_delete.post_tombstone
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch delete b
+
+--- expect error: injected failpoint triggered: branch_delete.post_tombstone
+
+--- query snapshot: $b1
+query names_at_b1() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- query
+branch diff "${b1}" to main
+
+--- expect ordered
+{"before":{"properties":{"age":41,"name":"bob"}},"id":"bob","kind":"node","op":"delete","type":"Person"}

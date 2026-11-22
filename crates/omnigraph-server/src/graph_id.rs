@@ -4,26 +4,17 @@
 //! `GraphId`. The newtype prevents `graph_id` strings from escaping the storage
 //! root via path traversal or colliding with engine-reserved filenames.
 //!
-//! Regex: `^[a-zA-Z0-9-]{1,64}$`
-//!
-//! The engine reserves every filename starting with `_` at the graph root
-//! (`_schema.pg`, `_schema.ir.json`, `__schema_state.json`, `__manifest/`,
-//! `__recovery/`, etc.). Disallowing leading underscores at the regex level
-//! means a `graph_id` can never collide with engine-managed files. Path
-//! traversal (`..`, `/`) is unrepresentable.
-//!
-//! `policies` is additionally reserved as a future-proofing measure for a
-//! potential `/graphs/policies/...` cluster route.
+//! The rule itself is `omnigraph_cluster::graph_id_violation`, shared with
+//! `cluster.yaml` validation so `cluster apply` refuses every id the server
+//! would refuse: `^[a-zA-Z0-9-]{1,64}$`, minus a few reserved route names.
 
 use std::fmt;
-use std::sync::OnceLock;
 
 use color_eyre::eyre::{Result, bail};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// Maximum length of a `GraphId` value.
-pub const GRAPH_ID_MAX_LEN: usize = 64;
+pub use omnigraph_cluster::GRAPH_ID_MAX_LEN;
 
 /// Validated registry-level identity for a graph.
 ///
@@ -84,51 +75,10 @@ impl<'de> Deserialize<'de> for GraphId {
 }
 
 fn validate(value: &str) -> Result<()> {
-    if value.is_empty() {
-        bail!("graph_id must not be empty");
+    match omnigraph_cluster::graph_id_violation(value) {
+        Some(violation) => bail!(violation),
+        None => Ok(()),
     }
-    if value.len() > GRAPH_ID_MAX_LEN {
-        bail!(
-            "graph_id '{}' is {} chars; max {}",
-            value,
-            value.len(),
-            GRAPH_ID_MAX_LEN
-        );
-    }
-    if !regex().is_match(value) {
-        bail!(
-            "graph_id '{}' must match ^[a-zA-Z0-9-]{{1,64}}$ — \
-             no underscores (engine reserves them), no path separators, no unicode",
-            value
-        );
-    }
-    if is_reserved(value) {
-        bail!(
-            "graph_id '{}' is reserved (would collide with engine-managed names or \
-             future cluster routes)",
-            value
-        );
-    }
-    Ok(())
-}
-
-fn regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9-]{1,64}$").expect("regex literal"))
-}
-
-/// Reserved `graph_id` values that the regex alone wouldn't catch.
-/// The leading-underscore rule already excludes every engine-managed
-/// filename pattern (`_schema.pg`, `__manifest`, etc.); the regex
-/// `^[a-zA-Z0-9-]{1,64}$` (see `regex()`) additionally rejects every
-/// dot-containing name structurally — `openapi.json` and friends
-/// never reach this check.
-///
-/// This list only needs to cover route-prefix collisions and
-/// top-level endpoint names whose spellings DO satisfy the regex
-/// (no dots, no underscores).
-fn is_reserved(value: &str) -> bool {
-    matches!(value, "policies" | "healthz" | "openapi" | "graphs")
 }
 
 #[cfg(test)]

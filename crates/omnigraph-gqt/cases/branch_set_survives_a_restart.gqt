@@ -1,0 +1,116 @@
+# issue: none
+# notes: A branch exists as an entry of main's catalog, so a reopened graph lists the same
+# notes: branches, reads each one's own writes, and a deleted branch is gone from the list and
+# notes: from reads; a branch created again under the name starts from main.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate
+branch create c
+
+--- expect ok
+
+--- mutate branch: b
+query insert_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "b"}
+{"name": "c"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query branch: b
+query names_on_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- query branch: c
+query names_on_c() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+branch delete b
+
+--- expect ok
+
+--- restart
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "c"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query branch: b
+query names_on_deleted_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: branch 'b' not found
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- query branch: b
+query names_on_recreated_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

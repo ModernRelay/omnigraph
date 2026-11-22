@@ -1,0 +1,80 @@
+# issue: none
+# notes: A branch whose delete stopped between its tombstone and its retirement blocks a create of
+# notes: a name below it; the delete that finishes the retirement frees the name below, and the
+# notes: branch created there starts from main.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query write_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- seam
+at: branch_delete.post_tombstone
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch delete b
+
+--- expect error: injected failpoint triggered: branch_delete.post_tombstone
+
+--- mutate
+branch create "b/x"
+
+--- expect error: cannot create branch 'b/x' while live branch 'b' shares its physical Lance path
+
+--- mutate
+branch delete b
+
+--- expect ok
+
+--- mutate
+branch create "b/x"
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "b/x"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query branch: b/x
+query names_on_b_x() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

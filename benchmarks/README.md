@@ -120,7 +120,9 @@ run's: `--server` names a server, `--store` a fixture store (a directory or an
 `s3://` prefix, the latter with `--backend`) at the `clone` reset level, whose
 completed records the store keeps and `report` reads back as a series, and
 `--at <ref>` beside it measures a commit's `omnigraph` from the store's
-`builds/`; and
+`builds/`, and `--server-product` beside a local store starts the build's
+`omnigraph-server` for every repetition, at the `rebuild` reset level
+([below](#the-same-block-against-the-builds-server)); and
 without either the host's local default applies (APFS/clonefile on macOS,
 qualified XFS/plain-copy elsewhere), so the one file runs on a macOS
 workstation and on a qualified Linux XFS volume alike; the reset level follows
@@ -291,8 +293,70 @@ a throughput or latency claim.
 The scenario's `deadline_seconds` and the workload's `timeout_ms` count past
 the block's warmup and duration: they bound its drain and the rest of the
 file, whatever run the command line gave it. A measured block runs embedded
-on a restored store. A served run and the `clone` reset level of `--store`
+on a restored store, or against a server the run starts (next section). A
+provisioned server (`--server`) and the `clone` reset level of `--store`
 refuse it, and no driver issues statements at a set rate.
+
+### The same block against the build's server
+
+`run <scenario> --store <directory> --server-product[=<path>]` plans the
+scenario as a server point at the reset level `rebuild`: every repetition
+gets an `omnigraph-server` of its own, started by the bench and stopped when
+the repetition ends. The workload lists `omnigraph-server` among its
+environments; `concurrent-writes` does.
+
+```bash
+target/release/omnigraph-bench run concurrent-writes --store /qualified/store   --product /build/omnigraph --server-product=/build/omnigraph-server   --dataset-cache /qualified/cache --json
+target/release/omnigraph-bench run concurrent-writes --store /qualified/store   --at main=/builds/main/omnigraph --at topic=/builds/topic/omnigraph --server-product   --dataset-cache /qualified/cache --json
+```
+
+`--server-product=<path>` names the server binary. Without a value it is
+`omnigraph-server` in the directory of the product binary. Under `--at` only
+that form is accepted and every `--at` names its `omnigraph` as
+`<ref>=<path>`, so each commit runs beside the server of its own build. The
+store is a local directory, the route runs on Unix, and a block holds at most
+64 sessions.
+
+One repetition, in order:
+
+1. The product's `omnigraph cluster apply` writes a cluster with the
+   fixture's schema into an empty root under the store's `servers/`. Its
+   policy names one actor for the workload's own steps and one per session
+   of the block, each with a token made for the repetition.
+2. The bench starts `omnigraph-server` over that root on a loopback port the
+   system picks and waits until `/readyz` reports no graph loading. A server
+   that names another commit than the `omnigraph` beside it is refused.
+3. The worker runs the fixture file through the server: the schema is held
+   against the graph's, the seed goes through `POST /load`, the file's
+   branches and steps run, and every node and edge table is counted against
+   the fixture's frozen base in the store.
+4. The block runs with one HTTP client per session, each under its own
+   actor's token. A statement's service time is from the request sent to the
+   answer decoded.
+5. A client no worker held reads the acknowledged dealt rows back through
+   `POST /query`, and the workload's verification steps run.
+6. The bench stops the server with SIGTERM, reads its peak resident set, and
+   deletes the root.
+
+The embedded point and the server point of one scenario are two points with
+two ids. The record names both binaries; each sample's `peak_rss_bytes` is
+the server's over its whole life in the repetition, the fixture load
+included, and `client_peak_rss_bytes` is the worker's. A server exposes no
+store-call counters, so a sample carries none.
+
+Three numbers read differently from the embedded ones. A 409 that names a
+read-set conflict and applied nothing is run again and counted in
+`authority_conflicts`; the server's own retries behind an acknowledged write
+are not on the wire, so the count is the reruns alone. A request the server refuses at a workload limit
+(HTTP 429) fails the repetition, because waiting it out would put the wait
+inside a service time. And the operating system's page cache is as the
+fixture load left it, a condition the route does not control.
+
+A server that exits before it is ready, does not leave on SIGTERM inside 40
+seconds, or leaves with a failure fails the repetition. The error of a failed
+repetition carries the last output of the server's stdout and stderr, and
+unless the failure is one the bench knows left nothing behind, its cluster
+root and scratch directory are kept and named.
 
 ## Validate and inspect
 

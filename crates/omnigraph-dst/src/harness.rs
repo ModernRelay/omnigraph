@@ -936,6 +936,18 @@ pub const REACH_EXPECTED_DARK: &[(&str, &str)] = &[
         "branch_merge.adopt_between_insert_chunks",
         "a merge adopts a delta only from a forked source table (adopt_advances_head)",
     ),
+    (
+        "branch_create.post_native",
+        "the ref protocol this seam guarded is gone (RFC 2026-11-19)",
+    ),
+    (
+        "branch_delete.post_native",
+        "the ref protocol this seam guarded is gone (RFC 2026-11-19)",
+    ),
+    (
+        "branch_delete.post_archive",
+        "the ref protocol this seam guarded is gone (RFC 2026-11-19)",
+    ),
 ];
 
 /// Why `window` is in [`REACH_EXPECTED_DARK`], if it is.
@@ -1342,6 +1354,22 @@ impl Model {
 /// not the axis under test (hostile keys stay in data); a bounded pool keeps
 /// the model's bookkeeping trivial while still cycling create/merge/delete.
 const BRANCH_POOL: [&str; 2] = ["b0", "b1"];
+/// How [`WorldModel::render`] and [`observe_world`] spell a branch whose
+/// row is live and whose tree a failed create never wrote.
+const NOT_READY_SUFFIX: &str = " (not ready)";
+/// How they spell a branch whose tree a delete tombstoned before its
+/// retired row landed.
+const RETIREMENT_PENDING_SUFFIX: &str = " (retirement pending)";
+
+/// Where a branch stands in the engine (RFC "Branch existence in the
+/// catalog"): row and tree, the row alone, or a tombstoned tree under a
+/// live row; the two half-states refuse reads and only a delete moves them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchPhase {
+    Ready,
+    NotReady,
+    RetirementPending,
+}
 /// Owned "main" for call sites needing `&[String]` (per-check
 /// mode differential runs main-only; final audit covers every branch).
 static MAIN_BRANCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| "main".to_string());
@@ -1358,6 +1386,9 @@ struct BranchSlot {
     /// The process claimed this incarnation's writer epoch. Evidence only:
     /// `render` does not read it.
     claimed: bool,
+    /// Ready, or the half-state a failed create or delete left; `state` and
+    /// `base` are read only while ready.
+    phase: BranchPhase,
 }
 
 /// The differential model made branch-aware: main plus one replica per live
@@ -1399,21 +1430,34 @@ impl WorldModel {
         model.mint_edge_row(rows, pair);
     }
     /// Branch-absence-safe sibling of [`Self::state_of`]: `None` for a branch
-    /// the model does not hold. Callers judging state that can lag or lead
-    /// the model (a keep-serving ruling may have removed a branch between an
-    /// op's sampling and its judgment) use this, never the panicking form.
+    /// the model does not hold or holds in a half-state, for callers judging
+    /// state that can lag or lead the model (a keep-serving ruling).
     fn state_of_opt(&self, branch: &str) -> Option<&Model> {
         if branch == "main" {
             Some(&self.main)
         } else {
-            self.branches.get(branch).map(|slot| &slot.state)
+            self.branches
+                .get(branch)
+                .filter(|slot| slot.phase == BranchPhase::Ready)
+                .map(|slot| &slot.state)
         }
     }
-    /// Deterministic observation order: main first, then branches by name.
-    fn branch_names(&self) -> Vec<String> {
+    /// Deterministic observation order: main first, then the ready branches
+    /// by name; the half-state branches answer no read.
+    fn ready_branch_names(&self) -> Vec<String> {
         let mut names = vec!["main".to_string()];
-        names.extend(self.branches.keys().cloned());
+        names.extend(
+            self.branches
+                .iter()
+                .filter(|(_, slot)| slot.phase == BranchPhase::Ready)
+                .map(|(name, _)| name.clone()),
+        );
         names
+    }
+    fn is_ready(&self, branch: &str) -> bool {
+        self.branches
+            .get(branch)
+            .is_some_and(|slot| slot.phase == BranchPhase::Ready)
     }
     fn is_claimed(&self, branch: &str) -> bool {
         if branch == "main" {
@@ -1430,12 +1474,23 @@ impl WorldModel {
         }
     }
     fn render(&self) -> WorldState {
-        self.branch_names()
-            .iter()
-            .map(|name| {
-                let m = self.state_of(name);
-                (name.clone(), m.person_rows(), m.edge_pairs())
-            })
+        let main = &self.main;
+        std::iter::once(("main".to_string(), main.person_rows(), main.edge_pairs()))
+            .chain(self.branches.iter().map(|(name, slot)| match slot.phase {
+                BranchPhase::Ready => (
+                    name.clone(),
+                    slot.state.person_rows(),
+                    slot.state.edge_pairs(),
+                ),
+                BranchPhase::NotReady => {
+                    (format!("{name}{NOT_READY_SUFFIX}"), Vec::new(), Vec::new())
+                }
+                BranchPhase::RetirementPending => (
+                    format!("{name}{RETIREMENT_PENDING_SUFFIX}"),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            }))
             .collect()
     }
 }
@@ -1866,13 +1921,13 @@ fn sample_world_op(
                 },
             };
         }
-        let names = world.branch_names();
+        let names = world.ready_branch_names();
         let branch = names[rng.below(names.len() as u64) as usize].clone();
         let op = sample_op(rng, world.state_of(&branch), next_ver, hostile);
         return WorldOp::Data { branch, op };
     }
     if writer_claims && die == base + u64::from(schema_ops) {
-        let names = world.branch_names();
+        let names = world.ready_branch_names();
         let branch = names[rng.below(names.len() as u64) as usize].clone();
         return WorldOp::WriterClaim { branch };
     }
@@ -1973,7 +2028,7 @@ fn sample_world_op(
             let cands: Vec<&String> = world
                 .branches
                 .iter()
-                .filter(|(_, slot)| !slot.merged)
+                .filter(|(_, slot)| !slot.merged && slot.phase == BranchPhase::Ready)
                 .map(|(name, _)| name)
                 .collect();
             if !cands.is_empty() {
@@ -1990,7 +2045,7 @@ fn sample_world_op(
         }
         _ => {}
     }
-    let names = world.branch_names();
+    let names = world.ready_branch_names();
     let branch = names[rng.below(names.len() as u64) as usize].clone();
     let op = sample_op(rng, world.state_of(&branch), next_ver, hostile);
     WorldOp::Data { branch, op }
@@ -2200,6 +2255,7 @@ fn apply_world(world: &mut WorldModel, wop: &WorldOp) {
                     base: world.main.clone(),
                     merged: false,
                     claimed: false,
+                    phase: BranchPhase::Ready,
                 },
             );
         }
@@ -2242,6 +2298,7 @@ fn apply_world(world: &mut WorldModel, wop: &WorldOp) {
                     base: world.main.clone(),
                     merged: false,
                     claimed: false,
+                    phase: BranchPhase::Ready,
                 },
             );
         }
@@ -2271,8 +2328,34 @@ fn apply_fork_only(world: &mut WorldModel, wop: &WorldOp) {
                 base: world.main.clone(),
                 merged: false,
                 claimed: false,
+                phase: BranchPhase::Ready,
             },
         );
+    }
+}
+
+/// Apply the registered half-state (see `ReconcileOutcome::Registered`).
+fn apply_registered(world: &mut WorldModel, wop: &WorldOp) {
+    if let WorldOp::BranchCreate { name } = wop {
+        world.branches.insert(
+            name.clone(),
+            BranchSlot {
+                state: world.main.clone(),
+                base: world.main.clone(),
+                merged: false,
+                claimed: false,
+                phase: BranchPhase::NotReady,
+            },
+        );
+    }
+}
+
+/// Apply the tombstoned half-state (see `ReconcileOutcome::Tombstoned`).
+fn apply_tombstoned(world: &mut WorldModel, wop: &WorldOp) {
+    if let WorldOp::BranchDelete { name } = wop
+        && let Some(slot) = world.branches.get_mut(name.as_str())
+    {
+        slot.phase = BranchPhase::RetirementPending;
     }
 }
 
@@ -3554,6 +3637,21 @@ async fn observe_world(db: &Session) -> WorldState {
     ordered.extend(names.into_iter().filter(|n| n != "main"));
     let mut out = Vec::new();
     for name in ordered {
+        match Box::pin(db.snapshot_of(ReadTarget::branch(&name))).await {
+            Err(OmniError::BranchNotReady { .. }) => {
+                out.push((format!("{name}{NOT_READY_SUFFIX}"), Vec::new(), Vec::new()));
+                continue;
+            }
+            Err(OmniError::BranchDeleted { .. }) => {
+                out.push((
+                    format!("{name}{RETIREMENT_PENDING_SUFFIX}"),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+                continue;
+            }
+            _ => {}
+        }
         // Boxed: the read path's future state is large and this runs nested
         // inside crash/reconcile frames (2 MiB test stack).
         let persons = Box::pin(person_rows_on(db, &name)).await;
@@ -3753,7 +3851,7 @@ async fn graph_diff_changes(
 /// branch, `export_jsonl` (no query machinery) must equal the model's physical
 /// expectation — persons exactly, Knows = every row ∪ ghosts, duplicates kept.
 async fn assert_physical_matches(db: &Session, world: &WorldModel, where_: &str) {
-    for branch in world.branch_names() {
+    for branch in world.ready_branch_names() {
         let (persons, knows) = Box::pin(physical_view_on(db, &branch)).await;
         let m = world.state_of(&branch);
         assert_eq!(
@@ -3863,6 +3961,12 @@ fn schema_apply_outcome(
 enum ReconcileOutcome {
     /// The op left no trace (rolled back / never landed).
     NotApplied,
+    /// A create's row landed and its tree did not: the branch is listed by
+    /// name and refuses reads `branch_not_ready` until a delete retires it.
+    Registered,
+    /// A delete's tombstone landed and its retired row did not: the branch is
+    /// listed by name and refuses reads `branch_deleted` until a delete reruns.
+    Tombstoned,
     /// The fork-survives half-state: a crashed `LoadFork`'s implicit fork
     /// survived while the load itself rolled back — a durable base-state
     /// branch with none of the payload. Known, documented behavior (Azim's
@@ -3880,6 +3984,8 @@ impl ReconcileOutcome {
     fn apply(self, world: &mut WorldModel, wop: &WorldOp) {
         match self {
             ReconcileOutcome::NotApplied => {}
+            ReconcileOutcome::Registered => apply_registered(world, wop),
+            ReconcileOutcome::Tombstoned => apply_tombstoned(world, wop),
             ReconcileOutcome::ForkOnly => apply_fork_only(world, wop),
             ReconcileOutcome::Applied => apply_world(world, wop),
             ReconcileOutcome::AppliedTwice => {
@@ -4125,8 +4231,7 @@ async fn maintenance_obligations(
             // (3) Index-data consistency, immediately — the traversal funnel
             // reused under the MAINTENANCE tag (a red here is the obligation
             // firing, not the standalone differential).
-            let mut branches = vec!["main".to_string()];
-            branches.extend(world.branches.keys().cloned());
+            let branches = world.ready_branch_names();
             detectors::tagged(
                 DET_MAINTENANCE,
                 at_op,
@@ -4247,7 +4352,7 @@ async fn collector_images(
     fork_bases: &BTreeMap<String, (String, Model)>,
 ) -> Vec<(String, Model)> {
     let mut images = Vec::new();
-    for branch in world.branch_names() {
+    for branch in world.ready_branch_names() {
         let head = Box::pin(db.resolve_snapshot(&branch))
             .await
             .expect("resolve collector oracle head");
@@ -4427,7 +4532,7 @@ async fn branch_heads(
     }
     crate::cost::set_label("_heads");
     let mut heads = Vec::new();
-    for name in world.branch_names() {
+    for name in world.ready_branch_names() {
         match branch_head_commit(db, &name).await {
             Some(head) => heads.push((name, head)),
             None => detectors::violation(
@@ -4497,22 +4602,41 @@ async fn reconcile_after_failure(
         }
         _ => None,
     };
+    let as_registered = match wop {
+        WorldOp::BranchCreate { .. } if target_live => {
+            let mut w = world.clone();
+            apply_registered(&mut w, wop);
+            Some(w.render())
+        }
+        _ => None,
+    };
+    let as_tombstoned = match wop {
+        WorldOp::BranchDelete { .. } if target_live => {
+            let mut w = world.clone();
+            apply_tombstoned(&mut w, wop);
+            Some(w.render())
+        }
+        _ => None,
+    };
     let legal = |state: &WorldState| {
         *state == as_with
             || (retry != RetryEffect::Applied
-                && (*state == as_model || as_fork_only.as_ref() == Some(state)))
+                && (*state == as_model
+                    || as_fork_only.as_ref() == Some(state)
+                    || as_registered.as_ref() == Some(state)
+                    || as_tombstoned.as_ref() == Some(state)))
     };
     if !legal(&visible) {
         detectors::violation(
             DET_CRASH_CONTRACT,
             at_op,
             format!("{label}: PARTIAL application (op={wop:?}); visible={visible:?}"),
-            "atomicity: the post-failure world renders as base, applied, or fork-only",
+            "atomicity: the post-failure world renders as base, applied, fork-only, registered or tombstoned",
         );
     }
     let insertion_branch = insertion_branch(wop, world);
     let moved: Vec<String> = world
-        .branch_names()
+        .ready_branch_names()
         .into_iter()
         .filter(|name| {
             with.state_of_opt(name).is_some_and(|with_state| {
@@ -4532,6 +4656,8 @@ async fn reconcile_after_failure(
     };
     let committed = visible == as_with;
     let fork_was_visible = as_fork_only.as_ref() == Some(&visible);
+    let registered_was_visible = as_registered.as_ref() == Some(&visible);
+    let tombstoned_was_visible = as_tombstoned.as_ref() == Some(&visible);
 
     let db = if keep_handle {
         // Liveness contract: the same live handle keeps serving and, once
@@ -4574,10 +4700,30 @@ async fn reconcile_after_failure(
             "recovery monotonicity: a durably created fork branch survives recovery",
         );
     }
+    if registered_was_visible && after == as_model {
+        detectors::violation(
+            DET_CRASH_CONTRACT,
+            at_op,
+            format!("{label}: recovery DELETED a branch row that had landed"),
+            "recovery monotonicity: a landed branch row survives recovery",
+        );
+    }
+    if tombstoned_was_visible && after == as_model {
+        detectors::violation(
+            DET_CRASH_CONTRACT,
+            at_op,
+            format!("{label}: recovery REVIVED a tombstoned branch"),
+            "recovery monotonicity: a landed tombstone survives recovery",
+        );
+    }
     let mut outcome = if target_live && after == as_with {
         ReconcileOutcome::Applied
     } else if as_fork_only.as_ref() == Some(&after) {
         ReconcileOutcome::ForkOnly
+    } else if as_registered.as_ref() == Some(&after) {
+        ReconcileOutcome::Registered
+    } else if as_tombstoned.as_ref() == Some(&after) {
+        ReconcileOutcome::Tombstoned
     } else {
         // Includes the dead-target case: `as_with == as_model` there, and
         // the Applied arm above is gated off so the collapse cannot be
@@ -4683,9 +4829,14 @@ async fn reconcile_after_failure(
                 .count();
             let retried = retry != RetryEffect::None;
             let legal = match (predicted, &outcome) {
-                (false, _) | (true, ReconcileOutcome::NotApplied | ReconcileOutcome::ForkOnly) => {
-                    writer_commits == 0
-                }
+                (false, _)
+                | (
+                    true,
+                    ReconcileOutcome::NotApplied
+                    | ReconcileOutcome::Registered
+                    | ReconcileOutcome::Tombstoned
+                    | ReconcileOutcome::ForkOnly,
+                ) => writer_commits == 0,
                 (true, ReconcileOutcome::Applied) => {
                     writer_commits == 1 || (retried && writer_commits == 2)
                 }
@@ -5313,7 +5464,7 @@ pub fn run_open_crash_universe(root: &'static str, window: &'static str) -> bool
 fn op_targets_live(world: &WorldModel, wop: &WorldOp) -> bool {
     match wop {
         WorldOp::Data { branch, .. } => world.state_of_opt(branch).is_some(),
-        WorldOp::BranchMerge { source } => world.branches.contains_key(source),
+        WorldOp::BranchMerge { source } => world.is_ready(source),
         WorldOp::BranchDelete { name } => world.branches.contains_key(name),
         WorldOp::BranchCreate { name } => !world.branches.contains_key(name),
         WorldOp::LoadFork { .. } => true,
@@ -6637,7 +6788,7 @@ impl UniverseScenario<RustResources> for Scenario {
             Box::pin(assert_traversal_modes_agree(
                 &db,
                 &world,
-                &world.branch_names(),
+                &world.ready_branch_names(),
                 "final reopen",
             )),
         )
@@ -6706,7 +6857,7 @@ impl UniverseScenario<RustResources> for Scenario {
         // OCC invariant, per branch (cross-branch id reuse is legal — shared
         // fork lineage — so uniqueness is asserted within each history).
         let mut ids: Vec<String> = Vec::new();
-        for name in world.branch_names() {
+        for name in world.ready_branch_names() {
             let commits = db
                 .list_commits(Some(name.as_str()))
                 .await

@@ -1,0 +1,81 @@
+# issue: none
+# notes: While a branch's delete has stopped after its tombstone, a create from that branch's live
+# notes: child lands and holds the child's rows; the next delete of the parent leaves both listed.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query bob_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create c from b
+
+--- expect ok
+
+--- seam
+at: branch_delete.post_tombstone
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch delete b
+
+--- expect error: injected failpoint triggered: branch_delete.post_tombstone
+
+--- mutate
+branch create d from c
+
+--- expect ok
+
+--- query branch: d
+query names_on_d() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+branch delete b
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "c"}
+{"name": "d"}
+{"name": "main"}
+
+--- expect shape
+name: String

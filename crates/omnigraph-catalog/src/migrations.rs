@@ -15,7 +15,7 @@
 //!
 //! ## Served stamps
 //!
-//! Normal open accepts `MIN_SUPPORTED..=CURRENT`, v14 to v17: every served
+//! Normal open accepts `MIN_SUPPORTED..=CURRENT`, v14 to v18: every served
 //! graph may carry table pins that name a detached Lance version and no
 //! linear one (RFC "Detached-only tables"), which an older binary would
 //! misread as reclaimed history. Both RFC 0040 system column vintages
@@ -23,8 +23,9 @@
 //! stamp; the vintage is read from the schema IR, never from the stamp. v15
 //! adds row kinds a v14 reader refuses, v16 adds a reserved tag kind a v15
 //! reader would protect forever, v17 adds control-fact rows a v16 reader
-//! refuses, and none needs anything of an older row set, so a branch below
-//! v17 is read as it is. A publish under this binary stamps a v14 or v15
+//! refuses, v18 adds the branch rows of main's config map a v17 reader never
+//! reads, and none needs anything of an older row set, so a branch below
+//! v18 is read as it is. A publish under this binary stamps a v14 or v15
 //! branch 16 in its CAS and writes back the stamp of any other branch
 //! ([`stamp_after_publish`]); only `omnigraph upgrade`'s stamp-only route
 //! raises a branch to 17. Normal open never converts: a v8, v9 or v13
@@ -164,20 +165,30 @@ use crate::state::{SchemaContractHead, SchemaContractRow};
 ///   stamps a served graph's live refs 17, with every process on the graph
 ///   stopped. A graph this binary creates is born at 17.
 ///
+/// - v18 — a branch's existence is a `branch` row in main's version file:
+///   `omnigraph.branch.<native>` in the config map, holding the lifetime
+///   identifier, the parent, the fork point, the creation time and the
+///   creating attempt's id, retired as the value `-` by `branch delete`, and
+///   a tree's chain ends with `omnigraph.tombstone` (RFC "Branch existence in
+///   the catalog"). Below it a branch's existence is Lance's ref file under
+///   `_refs/branches/`, and the binary writes no row. Like v17 it is raised
+///   only by `omnigraph upgrade`'s stamp-only route, which writes main's rows
+///   beside its stamp. A graph this binary creates is born at 18.
+///
 /// v1–v13 graphs are not served by this binary (see `MIN_SUPPORTED`); the
 /// history is kept for provenance and to document what each stamp value meant.
-/// A v8, v9 or v13 standalone root reaches v17 through the offline
-/// `omnigraph upgrade`, which also stamps a v14, v15 or v16 graph's live refs
-/// v17.
-pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 17;
+/// A v8, v9 or v13 standalone root reaches v18 through the offline
+/// `omnigraph upgrade`, which also stamps a v14, v15, v16 or v17 graph's live
+/// refs v18.
+pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 18;
 
-/// Normal open serves formats 14 to 17: a v15 row set is a v14 row set plus
-/// registry rows, a v16 row set is a v15 row set and a v17 row set is a v16
-/// row set plus control-fact rows, so a branch below 17 is read as it is, and
-/// a v14 or v15 branch is stamped 16 by its first publish. A v8, v9 or v13
-/// standalone root is converted by the offline `omnigraph upgrade`; a graph at
-/// any other lower stamp, and a cluster-managed graph, is rebuilt by export
-/// and load.
+/// Normal open serves formats 14 to 18: a v15 row set is a v14 row set plus
+/// registry rows, a v16 row set is a v15 row set, a v17 row set is a v16 row
+/// set plus control-fact rows and a v18 row set is a v17 row set plus the
+/// config-map rows, so a branch below 18 is read as it is, and a v14 or v15
+/// branch is stamped 16 by its first publish. A v8, v9 or v13 standalone root
+/// is converted by the offline `omnigraph upgrade`; a graph at any other lower
+/// stamp, and a cluster-managed graph, is rebuilt by export and load.
 pub const MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION: u32 = 14;
 
 /// The first stamp whose `__manifest` versions may hold cold block registry
@@ -258,9 +269,39 @@ pub(crate) fn require_control_facts(stamp: u32) -> Result<()> {
     )))
 }
 
+/// The first stamp whose main `__manifest` records every branch as a `branch`
+/// row in its version file's config map and whose trees carry a tombstone
+/// (RFC "Branch existence in the catalog"): below it a branch's existence is
+/// Lance's ref file under `_refs/branches/`, and the binary writes no row.
+/// Like [`CONTROL_FACTS_STAMP`] it is raised only by `omnigraph upgrade`'s
+/// stamp-only route, which writes the rows beside main's stamp.
+pub const BRANCH_ROWS_STAMP: u32 = 18;
+
+/// Whether a graph whose main is stamped `stamp` records its branches as rows.
+pub fn supports_branch_rows(stamp: u32) -> bool {
+    stamp >= BRANCH_ROWS_STAMP
+}
+
+/// Refuse to write a branch row or a retired row on a main stamped below
+/// [`BRANCH_ROWS_STAMP`], naming the explicit upgrade. A tombstone is gated
+/// by main's stamp through the delete that publishes it, never by the stamp
+/// of the chain it ends, which a branch forked from a pre-upgrade version of
+/// main carries.
+pub fn require_branch_rows(stamp: u32) -> Result<()> {
+    if supports_branch_rows(stamp) {
+        return Ok(());
+    }
+    Err(OmniError::manifest(format!(
+        "__manifest is stamped at internal schema v{stamp}; branch rows need \
+         v{BRANCH_ROWS_STAMP}. Stop every process on the graph, retain a verified backup and \
+         run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`; the \
+         upgrade writes main's branch rows and changes the stamp of each live branch."
+    )))
+}
+
 /// The stamp a publish writes over a version it loaded at `loaded`: that
 /// stamp, and 16 for a v14 or v15 branch. No publish raises a branch to
-/// [`CONTROL_FACTS_STAMP`].
+/// [`CONTROL_FACTS_STAMP`] or above it.
 pub(crate) fn stamp_after_publish(loaded: u32) -> u32 {
     loaded.max(CONTROL_FACTS_STAMP - 1)
 }
@@ -321,6 +362,7 @@ pub fn release_for_internal_schema_version(stamp: u32) -> &'static str {
         }
         15 => "a main development build from 2026-10-10 to 2026-10-11 (block registry)",
         16 => "0.14.x or 0.15.0",
+        17 => "0.16.x",
         _ => "an unrecognized older release",
     }
 }
@@ -818,8 +860,21 @@ pub fn branch_completed(
 /// keeping every other key and every row (the stamp-only route).
 #[doc(hidden)]
 pub fn stamp_operation(target: u32) -> Operation {
+    stamp_rows_operation(target, Vec::new())
+}
+
+/// The stamp commit of main that raises it to [`BRANCH_ROWS_STAMP`]: the
+/// stamp in the schema metadata and `rows`, one `branch` row per live ref and
+/// one retired row per retired ref, in the config map (RFC "Branch existence
+/// in the catalog" §Upgrade); keeps every other key and every row.
+#[doc(hidden)]
+pub fn stamp_rows_operation(target: u32, rows: Vec<(String, String)>) -> Operation {
+    let config_updates = (!rows.is_empty()).then(|| UpdateMap {
+        update_entries: rows.into_iter().map(Into::into).collect(),
+        replace: false,
+    });
     Operation::UpdateConfig {
-        config_updates: None,
+        config_updates,
         table_metadata_updates: None,
         field_metadata_updates: HashMap::new(),
         schema_metadata_updates: Some(UpdateMap {
@@ -909,24 +964,25 @@ mod tests {
     /// the floor or above the ceiling.
     #[test]
     fn unsupported_guard_accepts_exactly_the_supported_range() {
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 17);
-        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 17);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_LEGACY).unwrap(), 18);
+        assert_eq!(stamp_for_system_columns(SYSTEM_COLUMNS_V3).unwrap(), 18);
         assert!(stamp_for_system_columns(omnigraph_compiler::SYSTEM_COLUMNS_META).is_err());
         assert_eq!(
             (
                 MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
                 INTERNAL_MANIFEST_SCHEMA_VERSION
             ),
-            (14, 17)
+            (14, 18)
         );
         assert_eq!(
             (
                 UNPUBLISHED_COMMITS_STAMP,
                 BLOCK_REGISTRY_STAMP,
                 UNATTACHED_BRANCHES_STAMP,
-                CONTROL_FACTS_STAMP
+                CONTROL_FACTS_STAMP,
+                BRANCH_ROWS_STAMP
             ),
-            (15, 15, 16, INTERNAL_MANIFEST_SCHEMA_VERSION)
+            (15, 15, 16, 17, INTERNAL_MANIFEST_SCHEMA_VERSION)
         );
         assert!(require_unpublished_commits(15).is_ok());
         let fenced = require_unattached_branches(15).unwrap_err().to_string();
@@ -945,7 +1001,7 @@ mod tests {
         let below = refuse_if_stamp_unsupported(MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1)
             .expect_err("a sub-floor stamp must be refused")
             .to_string();
-        assert!(below.contains("reads only v14 to v17"), "got: {below}");
+        assert!(below.contains("reads only v14 to v18"), "got: {below}");
         assert!(
             below.contains(release_for_internal_schema_version(
                 MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION - 1
@@ -1028,18 +1084,36 @@ mod tests {
             future.contains(&format!("internal schema v{future_stamp}")),
             "got: {future}"
         );
-        assert!(future.contains("reads only v14 to v17"), "got: {future}");
+        assert!(future.contains("reads only v14 to v18"), "got: {future}");
         assert!(future.contains("upgrade omnigraph"), "got: {future}");
     }
 
     /// A publish writes back the stamp it loaded and raises a v14 or v15
-    /// branch to 16, never any branch to the control-fact stamp.
+    /// branch to 16, never any branch to the control-fact stamp or above it.
     #[test]
     fn v17_a_publish_writes_back_the_loaded_stamp_with_a_floor_of_16() {
         assert_eq!(
-            [14, 15, 16, 17].map(stamp_after_publish),
-            [16, 16, 16, CONTROL_FACTS_STAMP]
+            [14, 15, 16, 17, 18].map(stamp_after_publish),
+            [16, 16, 16, CONTROL_FACTS_STAMP, BRANCH_ROWS_STAMP]
         );
+    }
+
+    /// The branch-row stamp follows the control-fact stamp; a chain below it
+    /// holds no row, and the refusal names the upgrade that writes them.
+    #[test]
+    fn v18_branch_rows_need_their_stamp() {
+        assert_eq!(BRANCH_ROWS_STAMP, CONTROL_FACTS_STAMP + 1);
+        assert!(!supports_branch_rows(CONTROL_FACTS_STAMP));
+        assert!(supports_branch_rows(BRANCH_ROWS_STAMP));
+        let refused = require_branch_rows(CONTROL_FACTS_STAMP)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("branch rows need v18")
+                && refused.contains("`omnigraph upgrade <graph>`"),
+            "got: {refused}"
+        );
+        assert!(require_branch_rows(BRANCH_ROWS_STAMP).is_ok());
     }
 
     /// The refusal names the release line that wrote each stamp so an operator
