@@ -372,14 +372,16 @@ fn strings<'b>(batch: &'b RecordBatch, name: &str) -> Result<&'b StringArray> {
         })
 }
 
-/// Stream `type_name`'s `property` with its identity at `snapshot`, calling
-/// `row` with each row's identity and value.
+/// Stream `type_name`'s `property` with its identity at `snapshot`, every
+/// row or, under `filter`, the rows it keeps, calling `row` with each row's
+/// identity and value.
 async fn scan_field(
     snapshot: &Snapshot,
     catalog: &Catalog,
     type_name: &str,
     property: &str,
     memory: &WorkMemory,
+    filter: Option<datafusion::prelude::Expr>,
     mut row: impl FnMut(&str, Option<&str>) -> Result<()>,
 ) -> Result<()> {
     let id_column = catalog.system_columns.id;
@@ -398,6 +400,10 @@ async fn scan_field(
             scanner.batch_size(rows);
             scanner.batch_size_bytes(bytes as u64);
             scanner.pipelined();
+            if let Some(filter) = filter {
+                scanner.filter_expr(filter);
+                scanner.prefilter(true);
+            }
             Ok(())
         },
     )
@@ -501,6 +507,7 @@ pub(crate) async fn members(
         type_name,
         property,
         memory,
+        None,
         |id, value| {
             let matched = match value {
                 Some(value) => match scan.document(value)? {
@@ -556,8 +563,8 @@ impl Corpus {
         checked_score(self.total(idf, len, hits))
     }
 
-    /// [`Self::score`]'s sum, before [`checked_score`] admits it.
-    #[cfg(test)]
+    /// [`Self::score`]'s sum, before [`checked_score`] admits it: the
+    /// alternatives in query-term order, as one pass keeps them.
     fn total(&self, idf: &[f64], len: u64, hits: &[Vec<(u8, u64)>]) -> f64 {
         self.total_of(
             idf,
@@ -616,7 +623,7 @@ impl Hit {
 }
 
 /// A `bm25_v1` sum as a score: `E3` unless it is finite and positive.
-fn checked_score(total: f64) -> Result<f64> {
+pub(crate) fn checked_score(total: f64) -> Result<f64> {
     if !total.is_finite() || total <= 0.0 {
         return Err(numeric_failure(
             E3,
@@ -649,14 +656,107 @@ impl Bm25Scores {
 /// count and the range of its alternatives in the pass's one list of them.
 type Matching = (String, u64, std::ops::Range<usize>);
 
+/// What a `bm25`'s corpus pass leaves, by the side it ran.
+pub(crate) enum Bm25Answer {
+    /// The one-pass side: every matching document scored, by identity.
+    Scores(Bm25Scores),
+    /// The two-pass side: the match table outgrew its limit, so the pass
+    /// counted the statistics alone, and each population row is scored from
+    /// its own text, read again ([`Bm25Scorer::rescore`]).
+    Statistics(Bm25Scorer),
+}
+
+/// What scoring a value by `bm25_v1` needs once its field corpus has been
+/// counted: the field's analyzer profile, the query, and the corpus
+/// statistics with each query term's IDF. It holds nothing per document.
+pub(crate) struct Bm25Scorer {
+    profile: AnalyzerProfile,
+    query: LexicalQuery,
+    corpus: Corpus,
+    idf: Vec<f64>,
+}
+
+impl Bm25Scorer {
+    /// The `bm25_v1` sums of the entities among `ids` whose `property`
+    /// matches: one read of `type_name` at `snapshot` restricted to `ids`,
+    /// each value analyzed again as the corpus pass analyzed it and scored
+    /// against the complete statistics, so a sum is the one the one-pass
+    /// side computes. The sums are charged to `memory`, which the caller
+    /// releases with them; a sum is checked when a row reads it.
+    pub(crate) async fn rescore(
+        &self,
+        snapshot: &Snapshot,
+        catalog: &Catalog,
+        type_name: &str,
+        property: &str,
+        ids: &[String],
+        memory: &WorkMemory,
+    ) -> Result<HashMap<String, f64>> {
+        let mut totals = HashMap::new();
+        if self.query.matches_nothing() || ids.is_empty() {
+            return Ok(totals);
+        }
+        memory
+            .entries::<datafusion::prelude::Expr>(ids.len())
+            .map_err(|error| memory.error(error))?;
+        memory
+            .string(ids.iter().map(String::len).sum())
+            .map_err(|error| memory.error(error))?;
+        let filter = super::scan::id_in_list_expr(ids, catalog.system_columns.id);
+        let mut scan = FieldScan::new(Analyzer::of(self.profile)?, &self.query, memory)?;
+        scan_field(
+            snapshot,
+            catalog,
+            type_name,
+            property,
+            memory,
+            Some(filter),
+            |id, value| {
+                let document = match value {
+                    Some(value) => scan.document(value)?,
+                    None => None,
+                };
+                if let Some(document) = document {
+                    let hits = scan.hits(&document)?;
+                    if hits.matched(self.query.all) {
+                        memory
+                            .string(id.len())
+                            .map_err(|error| memory.error(error))?;
+                        memory
+                            .entries::<(String, f64)>(1)
+                            .map_err(|error| memory.error(error))?;
+                        let total = self.corpus.total(&self.idf, document.len, &hits.by_term);
+                        totals.insert(id.to_string(), total);
+                    }
+                }
+                scan.row_done();
+                Ok(())
+            },
+        )
+        .await?;
+        scan.report();
+        Ok(totals)
+    }
+}
+
 /// The `bm25_v1` scores of `type_name`'s `property` at `snapshot` for
 /// `query`: one streamed pass over the field that counts the field corpus,
-/// its tokens and each query term's document frequency, and keeps each
-/// matching document's identity, token count and alternatives (one entry per
-/// matched term and edit distance, in one list), charged to `memory` like
-/// the identities `match_terms` keeps. After
-/// the pass every kept document is scored against the complete statistics,
-/// and only the scores stay charged, for as long as `memory` lives.
+/// its tokens and each query term's document frequency.
+///
+/// The one-pass side also keeps each matching document's identity, token
+/// count and alternatives (one entry per matched term and edit distance, in
+/// one list), the match table, charged to `memory` like the identities
+/// `match_terms` keeps; after the pass every kept document is scored against
+/// the complete statistics, and only the scores stay charged, for as long as
+/// `memory` lives.
+///
+/// Under `table_limit`, the bytes the plan lets the table hold, a matching
+/// document whose entries would carry the table past it switches the pass to
+/// its two-pass side: the table is released, the rest of the pass counts
+/// the statistics alone, and the answer is the scorer. The table's bytes are
+/// a sum over the matching documents, so whether a pass switches depends on
+/// the limit and the data at the snapshot alone, not on their order or on
+/// what else the pool holds. `None` declares no switch.
 pub(crate) async fn bm25(
     snapshot: &Snapshot,
     catalog: &Catalog,
@@ -664,7 +764,8 @@ pub(crate) async fn bm25(
     property: &str,
     query: LexicalQuery,
     memory: &WorkMemory,
-) -> Result<Bm25Scores> {
+    table_limit: Option<u64>,
+) -> Result<Bm25Answer> {
     let profile = declared_profile(catalog, type_name, property).ok_or_else(|| {
         OmniError::manifest_internal(format!(
             "the exact lexical scan reads `{type_name}.{property}`, whose index declares no analyzer"
@@ -672,15 +773,16 @@ pub(crate) async fn bm25(
     })?;
     // No document matches a query of no term, so the corpus is not read.
     if query.matches_nothing() {
-        return Ok(Bm25Scores::default());
+        return Ok(Bm25Answer::Scores(Bm25Scores::default()));
     }
     let mut corpus = Corpus {
         holding: vec![0; query.terms.len()],
         ..Corpus::default()
     };
     let base = memory.charged();
-    let mut matching: Vec<Matching> = Vec::new();
-    let mut alternatives: Vec<Hit> = Vec::new();
+    // The match table, `None` once the pass switched to its two-pass side.
+    let mut table: Option<(Vec<Matching>, Vec<Hit>)> = Some((Vec::new(), Vec::new()));
+    let mut table_bytes = 0u64;
     let mut scan = FieldScan::new(Analyzer::of(profile)?, &query, memory)?;
     scan_field(
         snapshot,
@@ -688,6 +790,7 @@ pub(crate) async fn bm25(
         type_name,
         property,
         memory,
+        None,
         |id, value| {
             let document = match value {
                 Some(value) => scan.document(value)?,
@@ -707,23 +810,32 @@ pub(crate) async fn bm25(
                     *holding = checked(*holding, 1, "a term's document frequency")?;
                 }
             }
-            if hits.matched(query.all) {
-                let start = alternatives.len();
-                for (term, hits) in hits.by_term.iter().enumerate() {
-                    for &(edits, occurrences) in hits {
-                        alternatives.push(Hit::new(term, edits, occurrences));
+            if hits.matched(query.all)
+                && let Some((matching, alternatives)) = table.as_mut()
+            {
+                let count = hits.by_term.iter().map(Vec::len).sum::<usize>();
+                // The document's entries: its identity, its table entry and
+                // one entry per alternative.
+                let entry = WorkMemory::string_bytes(id.len())
+                    .saturating_add(WorkMemory::entry_bytes::<Matching>())
+                    .saturating_add(WorkMemory::entry_bytes::<Hit>().saturating_mul(count));
+                let entry = u64::try_from(entry).unwrap_or(u64::MAX);
+                if table_limit.is_some_and(|limit| table_bytes.saturating_add(entry) > limit) {
+                    table = None;
+                    memory.shrink_to(base);
+                } else {
+                    let start = alternatives.len();
+                    for (term, hits) in hits.by_term.iter().enumerate() {
+                        for &(edits, occurrences) in hits {
+                            alternatives.push(Hit::new(term, edits, occurrences));
+                        }
                     }
+                    memory
+                        .grow(usize::try_from(entry).unwrap_or(usize::MAX))
+                        .map_err(|error| memory.error(error))?;
+                    table_bytes = table_bytes.saturating_add(entry);
+                    matching.push((id.to_string(), document.len, start..alternatives.len()));
                 }
-                memory
-                    .string(id.len())
-                    .map_err(|error| memory.error(error))?;
-                memory
-                    .entries::<Matching>(1)
-                    .map_err(|error| memory.error(error))?;
-                memory
-                    .entries::<Hit>(alternatives.len() - start)
-                    .map_err(|error| memory.error(error))?;
-                matching.push((id.to_string(), document.len, start..alternatives.len()));
             }
             scan.row_done();
             Ok(())
@@ -733,6 +845,14 @@ pub(crate) async fn bm25(
     scan.report();
     drop(scan);
     let idf = corpus.idf();
+    let Some((matching, alternatives)) = table else {
+        return Ok(Bm25Answer::Statistics(Bm25Scorer {
+            profile,
+            query,
+            corpus,
+            idf,
+        }));
+    };
     let mut totals = HashMap::with_capacity(matching.len());
     let mut id_bytes = 0usize;
     for (id, len, range) in matching {
@@ -749,7 +869,7 @@ pub(crate) async fn bm25(
     memory
         .entries::<(String, f64)>(totals.len())
         .map_err(|error| memory.error(error))?;
-    Ok(Bm25Scores { totals })
+    Ok(Bm25Answer::Scores(Bm25Scores { totals }))
 }
 
 #[cfg(test)]

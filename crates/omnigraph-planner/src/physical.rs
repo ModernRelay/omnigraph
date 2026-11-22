@@ -865,7 +865,10 @@ physical_nodes! {
     /// score retains; every input row whose `property` matches it leaves with
     /// `bm25_v1` against the field corpus (every entity of `type_name` with
     /// a non-empty analyzed value, before any filter) appended as
-    /// `<binding>._score` (`F64`), and every other row drops.
+    /// `<binding>._score` (`F64`), and every other row drops. A `bm25`
+    /// runs its one-pass side and declares `fallback`, the side a match
+    /// table past [`crate::bm25_match_table_bytes`] of the plan's memory
+    /// limit takes instead (`two_pass`); a `distance` declares none.
     Score {
         input: NodeId,
         binding: String,
@@ -873,6 +876,7 @@ physical_nodes! {
         property: String,
         kind: ScoreKind,
         query: IRExpr,
+        fallback: Option<crate::Bm25Pass>,
     } => "Score" [input: NodeId]
         shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
     /// `let $name = value` whose value can fail, the core's `Project`
@@ -1522,6 +1526,7 @@ impl PhysicalPlan {
                     property,
                     kind,
                     query,
+                    fallback,
                     ..
                 } => json!({
                     "node": node.name(),
@@ -1529,6 +1534,7 @@ impl PhysicalPlan {
                     "type_name": type_name,
                     "property": property,
                     "kind": score_kind_name(*kind),
+                    "fallback": fallback,
                     "typed_query": crate::typed::expr(query),
                 }),
                 PhysicalNode::Let { name, value, .. } => json!({

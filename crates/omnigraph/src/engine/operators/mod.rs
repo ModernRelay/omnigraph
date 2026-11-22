@@ -96,7 +96,8 @@ pub(super) use validate::ValidateExec;
 const SWITCH: &str = "switch";
 
 /// One side of a switch the plan declares on a node: the access path a
-/// `HashJoin` ran through, the mode an `Expand` ended on.
+/// `HashJoin` ran through, the mode an `Expand` ended on, the pass an exact
+/// `bm25` `Score` scored by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Switch {
@@ -104,10 +105,19 @@ pub(crate) enum Switch {
     IdLookup,
     Csr,
     IndexedScan,
+    OnePass,
+    TwoPass,
 }
 
 impl Switch {
-    const ALL: [Self; 4] = [Self::HashJoin, Self::IdLookup, Self::Csr, Self::IndexedScan];
+    const ALL: [Self; 6] = [
+        Self::HashJoin,
+        Self::IdLookup,
+        Self::Csr,
+        Self::IndexedScan,
+        Self::OnePass,
+        Self::TwoPass,
+    ];
 
     fn from_slot(slot: usize) -> Option<Self> {
         Self::ALL.get(slot.checked_sub(1)?).copied()

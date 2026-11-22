@@ -3721,6 +3721,14 @@ impl Lowering<'_> {
                 ..
             } => {
                 let lowered = self.lower(*input)?;
+                // A `bm25` runs its one-pass side and may finish by its
+                // two-pass side; a `distance` holds nothing to switch.
+                let fallback = match kind {
+                    omnigraph_compiler::ir::core::ScoreKind::Bm25 => {
+                        crate::Bm25Pass::OnePass.declared_fallback()
+                    }
+                    omnigraph_compiler::ir::core::ScoreKind::Distance => None,
+                };
                 Ok(self.physical.add(PhysicalNode::Score {
                     input: lowered,
                     binding: binding.clone(),
@@ -3728,6 +3736,7 @@ impl Lowering<'_> {
                     property: property.clone(),
                     kind: *kind,
                     query: query.clone(),
+                    fallback,
                 }))
             }
             LogicalNode::Let {
@@ -4699,6 +4708,26 @@ fn derive_properties(
                     work_bytes: input.work_bytes,
                     retained_limit: None,
                     sources: Vec::new(),
+                }
+            }
+            PhysicalNode::Score {
+                input,
+                fallback: Some(_),
+                ..
+            } => {
+                let input = props(plan, *input)?;
+                let retained = crate::bm25_match_table_bytes(bounds.query_memory_pool_bytes);
+                Properties {
+                    schema: input.schema.clone(),
+                    ordering: ordering.clone(),
+                    rows: input.rows,
+                    work_bytes: input.work_bytes,
+                    retained_limit: Some(retained),
+                    sources: vec![StatisticSource {
+                        statistic: "retained_limit".to_string(),
+                        value: retained.to_string(),
+                        origin: "query memory pool / 4".to_string(),
+                    }],
                 }
             }
             PhysicalNode::TargetCut { input, .. }

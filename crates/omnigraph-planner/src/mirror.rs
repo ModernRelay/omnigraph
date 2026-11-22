@@ -283,6 +283,7 @@ pub enum NodeMirror {
         property: String,
         kind: ScoreKindMirror,
         query: ExprMirror,
+        fallback: Option<crate::Bm25Pass>,
     },
     Let {
         input: NodeId,
@@ -496,6 +497,7 @@ impl From<&PhysicalNode> for NodeMirror {
                 property,
                 kind,
                 query,
+                fallback,
             } => Self::Score {
                 input: *input,
                 binding: binding.clone(),
@@ -503,6 +505,7 @@ impl From<&PhysicalNode> for NodeMirror {
                 property: property.clone(),
                 kind: ScoreKindMirror::from(*kind),
                 query: ExprMirror::from(query),
+                fallback: *fallback,
             },
             PhysicalNode::Let { input, name, value } => Self::Let {
                 input: *input,
@@ -795,6 +798,7 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 property,
                 kind,
                 query,
+                fallback,
             } => Self::Score {
                 input,
                 binding,
@@ -802,6 +806,7 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 property,
                 kind: ScoreKind::from(kind),
                 query: IRExpr::from(query),
+                fallback,
             },
             NodeMirror::Let { input, name, value } => Self::Let {
                 input,

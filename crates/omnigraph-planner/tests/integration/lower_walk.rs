@@ -116,6 +116,7 @@ impl Lower for Trace {
         _: &str,
         _: omnigraph_compiler::ir::core::ScoreKind,
         _: &IRExpr,
+        _: Option<omnigraph_planner::Bm25Pass>,
         input: String,
     ) -> Result<String, PlanError> {
         self.call("score", id, &[&input])

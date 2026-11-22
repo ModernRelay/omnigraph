@@ -789,7 +789,12 @@ impl WorkMemory {
     }
 
     pub(in crate::engine) fn string(&self, bytes: usize) -> DfResult<()> {
-        self.grow(bytes.saturating_mul(2).saturating_add(32))
+        self.grow(Self::string_bytes(bytes))
+    }
+
+    /// What [`Self::string`] charges for a string of `bytes`.
+    pub(in crate::engine) fn string_bytes(bytes: usize) -> usize {
+        bytes.saturating_mul(2).saturating_add(32)
     }
 
     pub(in crate::engine) fn hold(&self, batch: &RecordBatch) -> DfResult<()> {

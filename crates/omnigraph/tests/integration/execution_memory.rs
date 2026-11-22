@@ -2309,30 +2309,72 @@ query pairs() {
     }
 }
 
-/// The exact `bm25` reads its field corpus once: as it counts the corpus
-/// statistics it keeps each matching document's identity, token count and
-/// alternatives, never its text, scores those documents after the pass, and
-/// gives a row of its population its score by identity. So its memory is
-/// the matches', not the corpus's: thirty thousand documents whose text
-/// holds several times the 4 MiB pool, a tenth of them matching the query,
-/// answer the ten best within it. When every document matches each of forty
-/// query terms, the kept alternatives outgrow the pool and the read is
-/// refused with `query_memory_bytes`, as `match_terms` is when its matches
-/// do. Both release the pool.
-#[tokio::test]
-#[serial]
-async fn bm25_scores_a_corpus_several_times_the_pool_within_it() {
+/// One `bm25` read under a pool of `limit` bytes: its rows as (slug, the
+/// bits of its F64 score) in their order, and the side its `Score` ran.
+async fn bm25_run(
+    db: &omnigraph::Session,
+    query: &str,
+    q: &str,
+    limit: u64,
+) -> (Vec<(String, u64)>, serde_json::Value) {
+    let probes = QueryMemoryProbes::default();
+    let run = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(
+            limit,
+            db.query_inspected(
+                ReadTarget::branch("main"),
+                query,
+                "best",
+                &params(&[("q", q)]),
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    let batch = run.result.concat_batches().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let scores = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let rows = (0..batch.num_rows())
+        .map(|row| (slugs.value(row).to_string(), scores.value(row).to_bits()))
+        .collect();
+    let report = serde_json::to_value(&run.report).unwrap();
+    let sides: Vec<serde_json::Value> = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["operator"] == "ScoreExec")
+        .map(|row| row["attempts"][0]["ran"].clone())
+        .collect();
+    let [side] = sides.as_slice() else {
+        panic!("one exact score: {report}");
+    };
+    drop(run);
+    assert_released(&probes);
+    (rows, side.clone())
+}
+
+/// `documents` documents, each holding forty terms, `term(d % 40)` once
+/// more, a pad and a filler, and every tenth `needle` once to seven times:
+/// with `filler` 200 the corpus holds several times a 4 MiB pool.
+async fn bm25_corpus(dir: &tempfile::TempDir, documents: usize) -> (omnigraph::Session, usize) {
     const SCHEMA: &str = r#"
 node Doc { slug: String @key  text: String @index(fulltext, analyzer = "standard_v1") }
 "#;
-    let dir = tempfile::tempdir().unwrap();
     let db = session(
         Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
             .await
             .unwrap(),
     );
-    let words: Vec<String> = (0..40).map(|w| format!("term{w:02}")).collect();
-    let documents = 30_000;
+    let words = bm25_words();
     let mut lines = Vec::with_capacity(documents);
     let mut corpus_bytes = 0;
     for d in 0..documents {
@@ -2359,39 +2401,72 @@ node Doc { slug: String @key  text: String @index(fulltext, analyzer = "standard
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    assert!(corpus_bytes > 3 * 4 * MIB as usize, "{corpus_bytes}");
-    let query = r#"query best($q: String) {
-        match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
-        return { $d.slug, $score }
-        order { $score desc }
-        limit 10
-    }"#;
-    let probes = QueryMemoryProbes::default();
-    let result = with_query_memory_probes(
-        probes.clone(),
-        with_query_memory_limit(
-            4 * MIB,
-            query_main(&db, query, "best", &params(&[("q", "needle")])),
-        ),
-    )
-    .await
-    .unwrap();
-    let batch = result.concat_batches().unwrap();
-    assert_eq!(batch.num_rows(), 10);
-    assert_released(&probes);
+    (db, corpus_bytes)
+}
 
-    let probes = QueryMemoryProbes::default();
-    let error = with_query_memory_probes(
-        probes.clone(),
-        with_query_memory_limit(
-            4 * MIB,
-            query_main(&db, query, "best", &params(&[("q", &words.join(" "))])),
-        ),
-    )
-    .await
-    .unwrap_err();
-    assert_memory_refusal(error, 4 * MIB);
-    assert_released(&probes);
+fn bm25_words() -> Vec<String> {
+    (0..40).map(|w| format!("term{w:02}")).collect()
+}
+
+const BM25_BEST: &str = r#"query best($q: String) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
+    return { $d.slug, $score }
+    order { $score desc }
+    limit 10
+}"#;
+
+/// The exact `bm25` reads its field corpus once: as it counts the corpus
+/// statistics it keeps each matching document's identity, token count and
+/// alternatives (the match table), never its text, scores those documents
+/// after the pass, and gives a row of its population its score by
+/// identity. So on its one-pass side its memory is the matches', not the
+/// corpus's: thirty thousand documents whose text holds several times the
+/// 4 MiB pool, a tenth of them matching the query, answer the ten best
+/// within it.
+///
+/// When every document matches each of forty query terms, the match table
+/// would outgrow the quarter of the pool the plan gives it (contract `E5`:
+/// a read the engine answered before stays answered), so the `Score` takes
+/// its declared `two_pass` side: the pass keeps the statistics alone and
+/// each population row is scored from its own text, read again. Before the
+/// fallback this read was refused with `query_memory_bytes`. Every run
+/// releases the pool.
+#[tokio::test]
+#[serial]
+async fn bm25_scores_a_corpus_several_times_the_pool_within_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, corpus_bytes) = bm25_corpus(&dir, 30_000).await;
+    assert!(corpus_bytes > 3 * 4 * MIB as usize, "{corpus_bytes}");
+    let (rows, side) = bm25_run(&db, BM25_BEST, "needle", 4 * MIB).await;
+    assert_eq!(rows.len(), 10);
+    assert_eq!(side, "one_pass");
+
+    let (rows, side) = bm25_run(&db, BM25_BEST, &bm25_words().join(" "), 4 * MIB).await;
+    assert_eq!(rows.len(), 10);
+    assert_eq!(
+        side, "two_pass",
+        "a match table past a quarter of the pool falls back"
+    );
+}
+
+/// The two sides answer alike: on a corpus whose match table fits a quarter
+/// of a 64 MiB pool and not of a 2 MiB one, the same read runs `one_pass`
+/// under the first and `two_pass` under the second, with the same rows in
+/// the same order and bit-identical F64 scores, for the forty-term query and
+/// a two-term one.
+#[tokio::test]
+#[serial]
+async fn bm25_two_pass_answers_the_rows_and_scores_of_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = bm25_corpus(&dir, 2_000).await;
+    for q in [bm25_words().join(" "), "needle term07".to_string()] {
+        let (one_pass, side) = bm25_run(&db, BM25_BEST, &q, 64 * MIB).await;
+        assert_eq!(side, "one_pass", "{q}");
+        assert_eq!(one_pass.len(), 10, "{q}");
+        let (two_pass, side) = bm25_run(&db, BM25_BEST, &q, 2 * MIB).await;
+        assert_eq!(side, "two_pass", "{q}");
+        assert_eq!(two_pass, one_pass, "{q}");
+    }
 }
 
 /// What a write keeps of its group's selection read is charged to that

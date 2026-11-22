@@ -1,0 +1,156 @@
+# issue: none
+# notes: An exact `bm25` `Score` declares a switch: its one-pass side keeps a match table
+# notes: (per matching document its identity, token count and one entry per matched term)
+# notes: and scores every match in its corpus pass; when that table would pass a quarter of
+# notes: the plan's memory limit, the `two_pass` fallback keeps the corpus statistics alone
+# notes: and scores each population row from its own text, read again by identity. Eighty
+# notes: documents, each matching thirty of sixty query terms, hold about 180 KB of table: at the
+# notes: default pool the read runs `one_pass`, at a 512 KiB pool `two_pass`, with the same
+# notes: rows, the same order and the same F64 scores (contract E5: a read the engine answered
+# notes: before keeps its answer when a faster mechanism lands). The plan claims and the
+# notes: pool setting are engine-only.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index(fulltext, analyzer = "standard_v1")
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d00","text":"w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w00 pad"}}
+{"type":"Doc","data":{"slug":"d01","text":"w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w08 w08 pad pad"}}
+{"type":"Doc","data":{"slug":"d02","text":"w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w16 w16 w16 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d03","text":"w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w24 w24 w24 w24 pad"}}
+{"type":"Doc","data":{"slug":"d04","text":"w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w32 w32 w32 w32 w32 pad pad"}}
+{"type":"Doc","data":{"slug":"d05","text":"w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w40 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d06","text":"w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w48 w48 pad"}}
+{"type":"Doc","data":{"slug":"d07","text":"w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w56 w56 w56 pad pad"}}
+{"type":"Doc","data":{"slug":"d08","text":"w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w04 w04 w04 w04 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d09","text":"w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w12 w12 w12 w12 w12 pad"}}
+{"type":"Doc","data":{"slug":"d10","text":"w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w20 pad pad"}}
+{"type":"Doc","data":{"slug":"d11","text":"w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w28 w28 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d12","text":"w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w36 w36 w36 pad"}}
+{"type":"Doc","data":{"slug":"d13","text":"w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w44 w44 w44 w44 pad pad"}}
+{"type":"Doc","data":{"slug":"d14","text":"w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w52 w52 w52 w52 w52 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d15","text":"w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w00 pad"}}
+{"type":"Doc","data":{"slug":"d16","text":"w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w08 w08 pad pad"}}
+{"type":"Doc","data":{"slug":"d17","text":"w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w16 w16 w16 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d18","text":"w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w24 w24 w24 w24 pad"}}
+{"type":"Doc","data":{"slug":"d19","text":"w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w32 w32 w32 w32 w32 pad pad"}}
+{"type":"Doc","data":{"slug":"d20","text":"w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w40 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d21","text":"w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w48 w48 pad"}}
+{"type":"Doc","data":{"slug":"d22","text":"w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w56 w56 w56 pad pad"}}
+{"type":"Doc","data":{"slug":"d23","text":"w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w04 w04 w04 w04 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d24","text":"w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w12 w12 w12 w12 w12 pad"}}
+{"type":"Doc","data":{"slug":"d25","text":"w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w20 pad pad"}}
+{"type":"Doc","data":{"slug":"d26","text":"w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w28 w28 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d27","text":"w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w36 w36 w36 pad"}}
+{"type":"Doc","data":{"slug":"d28","text":"w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w44 w44 w44 w44 pad pad"}}
+{"type":"Doc","data":{"slug":"d29","text":"w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w52 w52 w52 w52 w52 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d30","text":"w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w30 pad"}}
+{"type":"Doc","data":{"slug":"d31","text":"w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w38 w38 pad pad"}}
+{"type":"Doc","data":{"slug":"d32","text":"w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w46 w46 w46 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d33","text":"w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w54 w54 w54 w54 pad"}}
+{"type":"Doc","data":{"slug":"d34","text":"w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w02 w02 w02 w02 w02 pad pad"}}
+{"type":"Doc","data":{"slug":"d35","text":"w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w10 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d36","text":"w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w18 w18 pad"}}
+{"type":"Doc","data":{"slug":"d37","text":"w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w26 w26 w26 pad pad"}}
+{"type":"Doc","data":{"slug":"d38","text":"w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w34 w34 w34 w34 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d39","text":"w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w42 w42 w42 w42 w42 pad"}}
+{"type":"Doc","data":{"slug":"d40","text":"w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w50 pad pad"}}
+{"type":"Doc","data":{"slug":"d41","text":"w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w58 w58 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d42","text":"w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w06 w06 w06 pad"}}
+{"type":"Doc","data":{"slug":"d43","text":"w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w14 w14 w14 w14 pad pad"}}
+{"type":"Doc","data":{"slug":"d44","text":"w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w22 w22 w22 w22 w22 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d45","text":"w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w30 pad"}}
+{"type":"Doc","data":{"slug":"d46","text":"w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w38 w38 pad pad"}}
+{"type":"Doc","data":{"slug":"d47","text":"w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w46 w46 w46 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d48","text":"w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w54 w54 w54 w54 pad"}}
+{"type":"Doc","data":{"slug":"d49","text":"w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w02 w02 w02 w02 w02 pad pad"}}
+{"type":"Doc","data":{"slug":"d50","text":"w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w10 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d51","text":"w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w18 w18 pad"}}
+{"type":"Doc","data":{"slug":"d52","text":"w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w26 w26 w26 pad pad"}}
+{"type":"Doc","data":{"slug":"d53","text":"w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w34 w34 w34 w34 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d54","text":"w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w42 w42 w42 w42 w42 pad"}}
+{"type":"Doc","data":{"slug":"d55","text":"w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w50 pad pad"}}
+{"type":"Doc","data":{"slug":"d56","text":"w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w58 w58 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d57","text":"w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w06 w06 w06 pad"}}
+{"type":"Doc","data":{"slug":"d58","text":"w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w14 w14 w14 w14 pad pad"}}
+{"type":"Doc","data":{"slug":"d59","text":"w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w22 w22 w22 w22 w22 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d60","text":"w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w00 pad"}}
+{"type":"Doc","data":{"slug":"d61","text":"w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w08 w08 pad pad"}}
+{"type":"Doc","data":{"slug":"d62","text":"w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w16 w16 w16 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d63","text":"w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w24 w24 w24 w24 pad"}}
+{"type":"Doc","data":{"slug":"d64","text":"w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w32 w32 w32 w32 w32 pad pad"}}
+{"type":"Doc","data":{"slug":"d65","text":"w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w40 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d66","text":"w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w48 w48 pad"}}
+{"type":"Doc","data":{"slug":"d67","text":"w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w56 w56 w56 pad pad"}}
+{"type":"Doc","data":{"slug":"d68","text":"w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w04 w04 w04 w04 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d69","text":"w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w12 w12 w12 w12 w12 pad"}}
+{"type":"Doc","data":{"slug":"d70","text":"w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w20 pad pad"}}
+{"type":"Doc","data":{"slug":"d71","text":"w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w28 w28 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d72","text":"w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w36 w36 w36 pad"}}
+{"type":"Doc","data":{"slug":"d73","text":"w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w44 w44 w44 w44 pad pad"}}
+{"type":"Doc","data":{"slug":"d74","text":"w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w52 w52 w52 w52 w52 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d75","text":"w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w00 pad"}}
+{"type":"Doc","data":{"slug":"d76","text":"w52 w53 w54 w55 w56 w57 w58 w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w08 w08 pad pad"}}
+{"type":"Doc","data":{"slug":"d77","text":"w59 w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w16 w16 w16 pad pad pad"}}
+{"type":"Doc","data":{"slug":"d78","text":"w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w24 w24 w24 w24 pad"}}
+{"type":"Doc","data":{"slug":"d79","text":"w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w32 w32 w32 w32 w32 pad pad"}}
+
+--- query
+query best($q: String) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from bm25($pop, $d.text, $q) as $score,
+    }
+    return { $d.slug, $score }
+    order { $score desc }
+    limit 6
+}
+--- params
+{"q": "w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59"}
+--- expect ordered
+{"d.slug":"d30","score":22.433671959798}
+{"d.slug":"d06","score":22.331655183381}
+{"d.slug":"d66","score":22.331655183381}
+{"d.slug":"d15","score":22.28006777495}
+{"d.slug":"d75","score":22.28006777495}
+{"d.slug":"d40","score":22.279312775079}
+--- expect shape
+d.slug: String
+score: F64
+--- expect plan
+score $d: bm25 fallback two_pass ran one_pass
+
+--- query
+set query_memory_bytes = 524288;
+query best($q: String) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from bm25($pop, $d.text, $q) as $score,
+    }
+    return { $d.slug, $score }
+    order { $score desc }
+    limit 6
+}
+--- params
+{"q": "w00 w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59"}
+--- expect ordered
+{"d.slug":"d30","score":22.433671959798}
+{"d.slug":"d06","score":22.331655183381}
+{"d.slug":"d66","score":22.331655183381}
+{"d.slug":"d15","score":22.28006777495}
+{"d.slug":"d75","score":22.28006777495}
+{"d.slug":"d40","score":22.279312775079}
+--- expect shape
+d.slug: String
+score: F64
+--- expect plan
+score $d: bm25 fallback two_pass ran two_pass

@@ -147,7 +147,7 @@ impl LexicalSource {
             source: self.clone(),
             type_name: type_name.to_string(),
             call: call.clone(),
-            scores: OnceLock::new(),
+            answer: OnceLock::new(),
             held: Mutex::new(None),
         })
     }
@@ -246,17 +246,26 @@ impl LexicalColumns {
     }
 }
 
-/// The exact `bm25` of one `Score` node: the `bm25_v1` score of every
-/// matching document of its field corpus, read in one pass when the operator
-/// first runs and held, charged to the query's pool, for the operator's
-/// lifetime; a row of the population takes its score by its identity.
+/// The exact `bm25` of one `Score` node: what one pass over its field corpus
+/// leaves, read when the operator first runs and held, charged to the
+/// query's pool, for the operator's lifetime. On the one-pass side that is
+/// the `bm25_v1` score of every matching document, which a row of the
+/// population takes by its identity; on the two-pass side, the corpus
+/// statistics alone, and each population row is scored from its own text,
+/// read again ([`Self::rescore`]).
 pub(crate) struct LexicalScore {
     source: LexicalSource,
     type_name: String,
     call: IRExpr,
-    scores: OnceLock<Arc<super::lexical_scan::Bm25Scores>>,
-    /// The charge the scores hold for the operator's lifetime.
+    answer: OnceLock<Arc<Answered>>,
+    /// The charge the answer holds for the operator's lifetime.
     held: Mutex<Option<WorkMemory>>,
+}
+
+/// A corpus pass's answer and the field it read.
+struct Answered {
+    property: String,
+    answer: super::lexical_scan::Bm25Answer,
 }
 
 impl std::fmt::Debug for LexicalScore {
@@ -266,10 +275,12 @@ impl std::fmt::Debug for LexicalScore {
 }
 
 impl LexicalScore {
-    /// Read the field corpus once, its work and its scores charged to
-    /// `memory`, which the scores keep.
-    pub(crate) async fn answer(&self, memory: WorkMemory) -> Result<()> {
-        if self.scores.get().is_some() {
+    /// Read the field corpus once, its work and what it keeps charged to
+    /// `memory`, which the answer keeps. `table_limit` is the bytes the
+    /// one-pass side's match table may hold before the pass switches to its
+    /// two-pass side; `None` when the plan declares no fallback.
+    pub(crate) async fn answer(&self, memory: WorkMemory, table_limit: Option<u64>) -> Result<()> {
+        if self.answer.get().is_some() {
             return Ok(());
         }
         let snapshot = self.source.snapshot()?;
@@ -279,31 +290,63 @@ impl LexicalScore {
             &self.call,
             &self.source.params,
         )?;
-        let scores = super::lexical_scan::bm25(
+        let answer = super::lexical_scan::bm25(
             snapshot,
             &self.source.catalog,
             &self.type_name,
             &property,
             query,
             &memory,
+            table_limit,
         )
         .await?;
-        let _ = self.scores.set(Arc::new(scores));
+        let _ = self.answer.set(Arc::new(Answered { property, answer }));
         *super::operators::memory::locked(&self.held) = Some(memory);
         Ok(())
     }
 
-    /// The corpus's scores. An error before the corpus was read.
-    pub(crate) fn scores(&self) -> Result<&super::lexical_scan::Bm25Scores> {
-        self.scores
+    /// The corpus pass's answer. An error before the corpus was read.
+    pub(crate) fn answered(&self) -> Result<&super::lexical_scan::Bm25Answer> {
+        self.answer
             .get()
-            .map(|scores| scores.as_ref())
+            .map(|answered| &answered.answer)
             .ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "the exact `bm25` over `{}` was read before its scan ran",
                     self.call
                 ))
             })
+    }
+
+    /// On the two-pass side, the sums of the entities among `ids` whose
+    /// field matches, their text read again at the pinned snapshot and
+    /// charged to `memory`.
+    pub(crate) async fn rescore(
+        &self,
+        scorer: &super::lexical_scan::Bm25Scorer,
+        ids: &[String],
+        memory: &WorkMemory,
+    ) -> Result<std::collections::HashMap<String, f64>> {
+        let property = self
+            .answer
+            .get()
+            .map(|answered| answered.property.as_str())
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the exact `bm25` over `{}` rescored before its scan ran",
+                    self.call
+                ))
+            })?;
+        scorer
+            .rescore(
+                self.source.snapshot()?,
+                &self.source.catalog,
+                &self.type_name,
+                property,
+                ids,
+                memory,
+            )
+            .await
     }
 }
 

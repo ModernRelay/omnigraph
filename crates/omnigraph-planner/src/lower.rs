@@ -217,6 +217,7 @@ pub trait Lower {
         property: &str,
         kind: ScoreKind,
         query: &IRExpr,
+        fallback: Option<crate::Bm25Pass>,
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
@@ -547,9 +548,10 @@ impl PhysicalPlan {
                 property,
                 kind,
                 query,
+                fallback,
             } => {
                 let input = self.lower_node(*input, l)?;
-                l.score(id, binding, property, *kind, query, input)
+                l.score(id, binding, property, *kind, query, *fallback, input)
             }
             PhysicalNode::Let { input, name, value } => {
                 let input = self.lower_node(*input, l)?;

@@ -16,14 +16,23 @@
 //! matches leaves with its `bm25_v1` score appended under the binding's
 //! `_score` column, `F64`; every other row drops (its value is null,
 //! token-empty or does not match). The scan runs when the consumer first
-//! polls the operator, before its input is pulled, and scores every matching
-//! document as it reads the field, so a row is looked up by its identity and
-//! the input carries no text ([`crate::engine::lexical`]).
+//! polls the operator, before its input is pulled ([`crate::engine::lexical`]),
+//! and the input carries no text. The switch the `Score` node declares is a
+//! branch here. On the one-pass side the scan scores every matching
+//! document as it reads the field, and a row is looked up by its identity.
+//! When that match table would pass its limit, a quarter of the plan's
+//! memory limit ([`omnigraph_planner::bm25_match_table_bytes`]), and the
+//! node declares the `two_pass` fallback, the scan keeps the statistics
+//! alone; the input is then gathered into slices ([`rescan_slice_rows`]),
+//! each slice's text read again by identity and analyzed, and each row
+//! scored from its own text against the complete statistics, the sums the
+//! one-pass side computes, in input order. The report's `ran` names the
+//! side.
 
 use std::fmt;
 use std::sync::Arc;
 
-use crate::engine::lexical::{LexicalScore, answered_first};
+use crate::engine::lexical::LexicalScore;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, RecordBatch,
@@ -40,9 +49,15 @@ use omnigraph_compiler::query::codes::E3;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::schema::vector::VectorDistance;
 
+use datafusion::physical_plan::metrics::Gauge;
+use futures::future::BoxFuture;
+use omnigraph_planner::Bm25Pass;
+
+use super::Switch;
 use super::external;
 use super::memory::WorkMemory;
-use super::shape::{Mapped, Streaming};
+use super::shape::{BatchSender, Flow, Mapped, Streamed, Streaming, work};
+use crate::engine::lexical_scan::Bm25Answer;
 use crate::error::{OmniError, Result};
 
 /// The refusal name the pool reports when a scored batch does not fit.
@@ -50,6 +65,28 @@ const OUTPUT: &str = "score output";
 /// The refusal name the pool reports when the exact lexical scan's scores
 /// do not fit.
 const LEXICAL_SCAN: &str = "exact lexical scan";
+/// The refusal name the pool reports when a two-pass slice does not fit.
+const RESCAN: &str = "exact lexical rescan";
+
+/// What one gathered row costs a two-pass slice beside its input row: its
+/// identity's entries in the read's `IN` list, the identity list and the
+/// sums the read keeps.
+const RESCAN_ID_BYTES: u64 = 1024;
+/// The fewest and the most input rows a two-pass slice gathers.
+const RESCAN_SLICE_FLOOR: u64 = 256;
+const RESCAN_SLICE_CEILING: u64 = 8192;
+
+/// The input rows the two-pass side gathers before it reads their text
+/// again, under a query pool of `pool` bytes, the plan's memory limit: the
+/// rows an eighth of the pool holds at [`RESCAN_ID_BYTES`] each, between
+/// 256 and 8,192. One read per slice (the last may hold fewer): with no
+/// index on the identity column a read scans the identities of the whole
+/// table, so the slice bounds the reads, and the gathered rows carry no
+/// text.
+pub(crate) fn rescan_slice_rows(pool: u64) -> usize {
+    let rows = (pool / 8 / RESCAN_ID_BYTES).clamp(RESCAN_SLICE_FLOOR, RESCAN_SLICE_CEILING);
+    usize::try_from(rows).unwrap_or(usize::MAX)
+}
 
 pub(crate) struct ScoreExec {
     input: Arc<dyn ExecutionPlan>,
@@ -68,7 +105,8 @@ pub(crate) struct ScoreExec {
 #[derive(Clone)]
 enum ScoreSource {
     Distance(Arc<Vec<f32>>, VectorDistance),
-    Bm25(Arc<LexicalScore>),
+    /// The scan's answer and the fallback the node declares.
+    Bm25(Arc<LexicalScore>, Option<Bm25Pass>),
 }
 
 impl ScoreExec {
@@ -80,7 +118,13 @@ impl ScoreExec {
         id_column: String,
         score: String,
         scores: Arc<LexicalScore>,
+        fallback: Option<Bm25Pass>,
     ) -> Result<Self> {
+        if let Some(side @ Bm25Pass::OnePass) = fallback {
+            return Err(OmniError::manifest_internal(format!(
+                "an exact `bm25` declares the two_pass fallback or none, not {side:?}"
+            )));
+        }
         let input_schema = input.schema();
         match input_schema
             .field_with_name(&id_column)
@@ -100,7 +144,7 @@ impl ScoreExec {
             input,
             column: id_column,
             score,
-            source: ScoreSource::Bm25(scores),
+            source: ScoreSource::Bm25(scores, fallback),
             shape,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -152,11 +196,11 @@ impl ScoreExec {
 }
 
 /// `batch` with each member's `bm25_v1` score appended and every other row
-/// removed, each row looked up by the identity in its `column`.
+/// removed, each row's score looked up by the identity in its `column`.
 fn lexically_scored(
     batch: &RecordBatch,
     column: usize,
-    scores: &crate::engine::lexical_scan::Bm25Scores,
+    score_of: impl Fn(&str) -> Result<Option<f64>>,
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     let ids = batch
@@ -166,7 +210,7 @@ fn lexically_scored(
         .ok_or_else(|| OmniError::manifest_internal("the scored identity is not a string"))?;
     let scored = (0..ids.len())
         .map(|row| match ids.is_valid(row) {
-            true => scores.score(ids.value(row)),
+            true => score_of(ids.value(row)),
             false => Ok(None),
         })
         .collect::<Result<Vec<_>>>()?;
@@ -295,11 +339,17 @@ impl DisplayAs for ScoreExec {
                 self.column,
                 query.len()
             ),
-            ScoreSource::Bm25(scores) => write!(
-                f,
-                "ScoreExec: {}=bm25_v1 ({scores:?}) by {}",
-                self.score, self.column
-            ),
+            ScoreSource::Bm25(scores, fallback) => {
+                write!(
+                    f,
+                    "ScoreExec: {}=bm25_v1 ({scores:?}) by {}",
+                    self.score, self.column
+                )?;
+                match fallback {
+                    Some(Bm25Pass::TwoPass) => write!(f, ", fallback=two_pass"),
+                    Some(Bm25Pass::OnePass) | None => write!(f, ", fallback=none"),
+                }
+            }
         }
     }
 }
@@ -336,11 +386,12 @@ impl ExecutionPlan for ScoreExec {
                     Arc::clone(query),
                     *distance,
                 ),
-                ScoreSource::Bm25(scores) => Self::bm25(
+                ScoreSource::Bm25(scores, fallback) => Self::bm25(
                     child,
                     self.column.clone(),
                     self.score.clone(),
                     Arc::clone(scores),
+                    *fallback,
                 ),
             }
             .map_err(external)?,
@@ -354,13 +405,29 @@ impl ExecutionPlan for ScoreExec {
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "ScoreExec has one partition");
         let column = self.input.schema().index_of(&self.column)?;
-        let mut input = self.input.execute(0, Arc::clone(&ctx))?;
-        if let ScoreSource::Bm25(scores) = &self.source {
-            let mut scan = WorkMemory::new(Arc::clone(&ctx), LEXICAL_SCAN)?;
-            scan.set_metrics(self.metrics.clone());
-            let scores = Arc::clone(scores);
-            input = answered_first(input, async move { scores.answer(scan).await });
+        if let ScoreSource::Bm25(scores, fallback) = &self.source {
+            let memory = work(Arc::clone(&ctx), "ScoreExec", &self.metrics)?;
+            let body = Bm25Rows {
+                scores: Arc::clone(scores),
+                fallback: *fallback,
+                ctx: Arc::clone(&ctx),
+                metrics: self.metrics.clone(),
+                column,
+                schema: self.schema(),
+                switch: Switch::gauge(&self.metrics),
+                pending: Vec::new(),
+                pending_rows: 0,
+                held: None,
+            };
+            let input = Arc::clone(&self.input);
+            return Ok(self.shape.produce(
+                memory,
+                &self.metrics,
+                move || input.execute(0, ctx),
+                body,
+            ));
         }
+        let input = self.input.execute(0, Arc::clone(&ctx))?;
         let memory = WorkMemory::new(ctx, OUTPUT)?;
         let source = self.source.clone();
         let schema = self.schema();
@@ -369,9 +436,9 @@ impl ExecutionPlan for ScoreExec {
                 ScoreSource::Distance(query, distance) => {
                     scored(&batch, column, query, *distance, &schema)
                 }
-                ScoreSource::Bm25(scores) => scores
-                    .scores()
-                    .and_then(|scores| lexically_scored(&batch, column, scores, &schema)),
+                ScoreSource::Bm25(..) => Err(OmniError::manifest_internal(
+                    "an exact `bm25` streams through its own body",
+                )),
             }
             .map_err(external)?;
             let lease = memory.child(OUTPUT)?;
@@ -381,6 +448,160 @@ impl ExecutionPlan for ScoreExec {
                 lease: Some(lease),
             })
         }))
+    }
+}
+
+/// The per-batch body of an exact `bm25`: `open` runs the corpus pass
+/// before the input executes and records the side it left; each input
+/// batch is then scored by identity (`one_pass`), or gathered into a slice
+/// whose text is read again and analyzed (`two_pass`).
+struct Bm25Rows {
+    scores: Arc<LexicalScore>,
+    fallback: Option<Bm25Pass>,
+    ctx: Arc<TaskContext>,
+    metrics: ExecutionPlanMetricsSet,
+    column: usize,
+    schema: SchemaRef,
+    switch: Gauge,
+    /// The input gathered for the next two-pass slice, held by `held`.
+    pending: Vec<RecordBatch>,
+    pending_rows: usize,
+    held: Option<WorkMemory>,
+}
+
+impl Bm25Rows {
+    /// Send `out`, held under its own lease until the consumer takes it.
+    async fn send(
+        out: RecordBatch,
+        memory: &Arc<WorkMemory>,
+        sender: &BatchSender,
+    ) -> DfResult<()> {
+        let lease = Arc::new(memory.child(OUTPUT)?);
+        lease.hold(&out)?;
+        sender.send_bounded(out, lease).await
+    }
+
+    /// Read the gathered slice's text again, score its rows and send them in
+    /// input order.
+    async fn flush(&mut self, memory: &Arc<WorkMemory>, sender: &BatchSender) -> DfResult<()> {
+        let Some(gathered) = self.held.take() else {
+            return Ok(());
+        };
+        let pending = std::mem::take(&mut self.pending);
+        self.pending_rows = 0;
+        let Bm25Answer::Statistics(scorer) = self.scores.answered().map_err(external)? else {
+            return Err(external(OmniError::manifest_internal(
+                "an exact `bm25` gathered a slice on its one-pass side",
+            )));
+        };
+        let work = memory.child(RESCAN)?;
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for batch in &pending {
+            let column = batch
+                .column(self.column)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    external(OmniError::manifest_internal(
+                        "the scored identity is not a string",
+                    ))
+                })?;
+            for id in column.iter().flatten() {
+                if seen.insert(id) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        work.entries::<String>(ids.len())?;
+        work.string(ids.iter().map(String::len).sum())?;
+        drop(seen);
+        let totals = self
+            .scores
+            .rescore(scorer, &ids, &work)
+            .await
+            .map_err(external)?;
+        for batch in pending {
+            let out = lexically_scored(
+                &batch,
+                self.column,
+                |id| {
+                    totals
+                        .get(id)
+                        .copied()
+                        .map(crate::engine::lexical_scan::checked_score)
+                        .transpose()
+                },
+                &self.schema,
+            )
+            .map_err(external)?;
+            Self::send(out, memory, sender).await?;
+        }
+        drop((totals, work, gathered));
+        Ok(())
+    }
+}
+
+impl Streamed for Bm25Rows {
+    fn open<'a>(&'a mut self, memory: &'a Arc<WorkMemory>) -> BoxFuture<'a, DfResult<bool>> {
+        Box::pin(async move {
+            let mut scan = WorkMemory::new(Arc::clone(&self.ctx), LEXICAL_SCAN)?;
+            scan.set_metrics(self.metrics.clone());
+            let table_limit = self
+                .fallback
+                .map(|_| omnigraph_planner::bm25_match_table_bytes(memory.pool_bytes()));
+            self.scores
+                .answer(scan, table_limit)
+                .await
+                .map_err(external)?;
+            match self.scores.answered().map_err(external)? {
+                Bm25Answer::Scores(_) => Switch::OnePass.record(&self.switch),
+                Bm25Answer::Statistics(_) => Switch::TwoPass.record(&self.switch),
+            }
+            Ok(true)
+        })
+    }
+
+    fn batch<'a>(
+        &'a mut self,
+        batch: RecordBatch,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<Flow>> {
+        Box::pin(async move {
+            if batch.num_rows() == 0 {
+                return Ok(Flow::Continue);
+            }
+            match self.scores.answered().map_err(external)? {
+                Bm25Answer::Scores(scores) => {
+                    let out =
+                        lexically_scored(&batch, self.column, |id| scores.score(id), &self.schema)
+                            .map_err(external)?;
+                    Self::send(out, memory, sender).await?;
+                }
+                Bm25Answer::Statistics(_) => {
+                    let held = match &self.held {
+                        Some(held) => held,
+                        None => self.held.insert(memory.child(RESCAN)?),
+                    };
+                    held.hold(&batch)?;
+                    self.pending_rows += batch.num_rows();
+                    self.pending.push(batch);
+                    if self.pending_rows >= rescan_slice_rows(memory.pool_bytes()) {
+                        self.flush(memory, sender).await?;
+                    }
+                }
+            }
+            Ok(Flow::Continue)
+        })
+    }
+
+    fn finish<'a>(
+        &'a mut self,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<()>> {
+        Box::pin(self.flush(memory, sender))
     }
 }
 

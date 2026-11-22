@@ -917,8 +917,15 @@ impl Lower for Walk<'_, '_> {
         property: &str,
         kind: ScoreKind,
         query: &IRExpr,
+        fallback: Option<omnigraph_planner::Bm25Pass>,
         input: Plan,
     ) -> Lowers<Plan> {
+        if kind != ScoreKind::Bm25 && fallback.is_some() {
+            return Err(OmniError::manifest_internal(format!(
+                "the `distance` score {id} of `${binding}.{property}` declares a fallback"
+            ))
+            .into());
+        }
         if kind == ScoreKind::Bm25 {
             let PhysicalNode::Score { type_name, .. } = self.lowering.node(id)? else {
                 return Err(OmniError::manifest_internal(format!(
@@ -946,7 +953,7 @@ impl Lower for Walk<'_, '_> {
                 "{binding}.{}",
                 omnigraph_compiler::query::value::SCORE_COLUMN
             );
-            let exec = ScoreExec::bm25(input, id_column, score, scores)?;
+            let exec = ScoreExec::bm25(input, id_column, score, scores, fallback)?;
             return self.built(id, exec);
         }
         let column = format!("{binding}.{property}");

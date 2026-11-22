@@ -38,8 +38,10 @@ use crate::physical::{NodeId, PhysicalPlan};
 /// shaping and planning charged to it, which a replay's compile must
 /// charge again. Version 17 adds to version 16 the `collect` aggregate and
 /// its `list` accumulator. Version 18 adds to version 17 the `stddev` and
-/// `percentile` aggregates and an aggregate's `fraction`.
-pub const BOUND_PLAN_VERSION: u32 = 18;
+/// `percentile` aggregates and an aggregate's `fraction`. Version 19 adds
+/// to version 18 an exact `Score`'s `fallback`, the `two_pass` side a
+/// `bm25` may finish by.
+pub const BOUND_PLAN_VERSION: u32 = 19;
 
 /// The envelope omits top-level `plan` and `values` so unversioned readers reject it.
 #[derive(Serialize, Deserialize)]

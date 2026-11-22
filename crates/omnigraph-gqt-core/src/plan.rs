@@ -11,6 +11,7 @@
 //! scan Doc as $d: access id_lookup
 //! hash join $d
 //! hash join $d ran id_lookup
+//! score $d: bm25 fallback two_pass ran two_pass
 //! anti join $x: key_set
 //! scan Doc as $d: ranked nearest fetch 10
 //! scan Doc as $d: ranked nearest fetch 10 nprobes 20
@@ -40,10 +41,12 @@ use serde_json::Value;
 use crate::load_plan::PipelineClaim;
 use crate::report::Report;
 
-const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>[ <btree|bitmap|label_list|ngram>]`, `hash join $var[ ran <hash_join|id_lookup>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `fuse $var: arms [nearest, bm25, distance, ordered, rrf][ per outer row]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `no scan <Type> as $var`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
+const FORMS: &str = "forms: `scan <Type>[ as $var]: columns [a, b]`, `scan <Type>[ as $var]: not columns [a, b]`, `scan <Type>[ as $var]: filter reads [v.a]`, `scan <Type>[ as $var]: no filter`, `scan <Type>[ as $var]: access id_lookup`, `scan <Type>[ as $var]: access sequential`, `scan <Type>[ as $var]: access index_probe <column>[ <btree|bitmap|label_list|ngram>]`, `hash join $var[ ran <hash_join|id_lookup>]`, `score $var: <bm25|distance>[ fallback <two_pass|none>][ ran <one_pass|two_pass>]`, `anti join $var: <correlated|key_set>`, `scan <Type>[ as $var]: ranked <nearest|bm25>[ fetch <n>][ nprobes <n>][ diagnostics present]`, `scan <Type>[ as $var]: runtime filter <column>`, `scan <Type>[ as $var]: no runtime filter`, `contains join $h.x contains $n.y`, `cross join $h.x contains $n.y`, `expand $src <Edge> $dst: mode <csr|indexed_scan>[ ran <csr|indexed_scan>]`, `filter reads [a.x, b.y]`, `sort tiebreak [$a.@id, $e.@type]`, `fuse $var: arms [nearest, bm25, distance, ordered, rrf][ per outer row]`, `expand $a $b: selection alternation [Knows out, Likes in]`, `sort no tiebreak`, `aggregate <column>: <func>([distinct ]<Type>) <accumulator> <overflow> -> <Type>`, `block aggregate <gq>: <func>(<Type>) <accumulator> <overflow> -> <Type>`, `result columns [<name>: <Type>, ...]`, `type <gq>: <Type>`, `cast <gq>: <Type> -> <Type>`, `no cast <gq>`, `no scan <Type> as $var`, `hydrate $var: columns [a, b]`, `pass <name>`, `not pass <name>`, `validation scope <exact_subset|invariants_only>`, `pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ after <n>[, <m>]]`";
 
 const ID_LOOKUP: &str = "id_lookup";
 const JOIN_SIDES: [&str; 2] = ["hash_join", "id_lookup"];
+const SCORE_KINDS: [&str; 2] = ["bm25", "distance"];
+const SCORE_SIDES: [&str; 2] = ["one_pass", "two_pass"];
 const EXPAND_MODES: [&str; 2] = ["csr", "indexed_scan"];
 const ANTI_JOIN_STRATEGIES: [&str; 2] = ["correlated", "key_set"];
 
@@ -127,6 +130,15 @@ pub(crate) enum PlanLine {
     /// join's declared switch.
     HashJoin {
         binding: String,
+        ran: Option<String>,
+    },
+    /// Every physical exact `Score` of `$binding` is of kind `score`; when claimed,
+    /// it declares `fallback` (`None` within: `fallback none`), and the run
+    /// took the side `ran` of the switch a `bm25` declares.
+    Score {
+        binding: String,
+        score: String,
+        fallback: Option<Option<String>>,
         ran: Option<String>,
     },
     /// Every physical `AntiJoin` correlated on `$outer_var` reaches its
@@ -505,6 +517,51 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             });
             continue;
         }
+        if let Some(rest) = line.strip_prefix("score ") {
+            let usage = "claims `score $var: <bm25|distance>[ fallback <two_pass|none>][ ran <one_pass|two_pass>]`";
+            let (binding, claim) = rest.split_once(':').ok_or_else(|| refused(usage))?;
+            let binding = binding
+                .trim()
+                .strip_prefix('$')
+                .filter(|binding| identifier(binding))
+                .ok_or_else(|| refused("names the scored binding with `$`"))?;
+            let mut words = claim.split_whitespace();
+            let kind = words
+                .next()
+                .filter(|kind| SCORE_KINDS.contains(kind))
+                .ok_or_else(|| refused(usage))?;
+            let mut fallback = None;
+            let mut ran = None;
+            let mut next = words.next();
+            if next == Some("fallback") {
+                fallback = match words.next() {
+                    Some("none") => Some(None),
+                    Some("two_pass") => Some(Some("two_pass".to_string())),
+                    _ => return Err(refused(usage)),
+                };
+                next = words.next();
+            }
+            if next == Some("ran") {
+                ran = Some(
+                    words
+                        .next()
+                        .filter(|side| SCORE_SIDES.contains(side))
+                        .ok_or_else(|| refused(usage))?
+                        .to_string(),
+                );
+                next = words.next();
+            }
+            if next.is_some() {
+                return Err(refused(usage));
+            }
+            lines.push(PlanLine::Score {
+                binding: binding.to_string(),
+                score: kind.to_string(),
+                fallback,
+                ran,
+            });
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("anti join ") {
             let claim = rest.split_once(':').and_then(|(outer_var, strategy)| {
                 let outer_var = outer_var
@@ -555,7 +612,7 @@ pub(crate) fn parse_plan_body(body: &[(usize, &str)]) -> Result<Vec<PlanLine>, S
             (rest, true)
         } else {
             return Err(refused(
-                "knows fifteen line heads: `scan`, `hash join`, `anti join`, `contains join`, `cross join`, `expand`, `filter`, `sort`, `rank fuse`, `aggregate`, `result columns`, `type`, `cast`, `no cast`, `pass`",
+                "knows sixteen line heads: `scan`, `hash join`, `score`, `anti join`, `contains join`, `cross join`, `expand`, `filter`, `sort`, `rank fuse`, `aggregate`, `result columns`, `type`, `cast`, `no cast`, `pass`",
             ));
         };
         let Some((selector, claim)) = rest.split_once(':') else {
@@ -985,6 +1042,16 @@ struct PlannedJoin {
     binding: String,
 }
 
+/// One exact `Score` of the explain document's physical plan: its binding,
+/// its kind and the fallback it declares.
+#[derive(Debug)]
+struct PlannedScore {
+    id: Option<u64>,
+    binding: String,
+    kind: String,
+    fallback: Option<String>,
+}
+
 /// One `ContainsJoin` of the explain document's physical plan: the two
 /// columns it pairs by, each `binding.property`.
 #[derive(Debug)]
@@ -1053,6 +1120,7 @@ struct PlannedNodes {
     modes: Vec<PlannedExpandMode>,
     accesses: Vec<PlannedAccess>,
     joins: Vec<PlannedJoin>,
+    scores: Vec<PlannedScore>,
     /// `(outer_var, strategy)` of every physical `AntiJoin`.
     anti_joins: Vec<(String, String)>,
     contains_joins: Vec<PlannedContainsJoin>,
@@ -1422,6 +1490,15 @@ fn planned_physical(node: &Value, out: &mut PlannedNodes) {
         Some("HashJoin") => out.joins.push(PlannedJoin {
             id,
             binding: text("binding"),
+        }),
+        Some("Score") => out.scores.push(PlannedScore {
+            id,
+            binding: text("binding"),
+            kind: text("kind"),
+            fallback: node
+                .get("fallback")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         Some("ContainsJoin") => out.contains_joins.push(PlannedContainsJoin {
             haystack: text("haystack").trim_start_matches('$').to_string(),
@@ -2074,6 +2151,55 @@ pub(crate) fn plan_mismatch(
                     };
                     let what = format!("the hash join over `${binding}`");
                     match ran_side(report, join.id, &what) {
+                        Err(mismatch) => return Some(mismatch),
+                        Ok(side) if side != *ran => {
+                            return Some(format!(
+                                "expect plan: {what} ran `{side}`, expected `ran {ran}`"
+                            ));
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            }
+            PlanLine::Score {
+                binding,
+                score: kind,
+                fallback,
+                ran,
+            } => {
+                let selected: Vec<&PlannedScore> = nodes
+                    .scores
+                    .iter()
+                    .filter(|score| score.binding == *binding)
+                    .collect();
+                if selected.is_empty() {
+                    let known: Vec<String> = nodes
+                        .scores
+                        .iter()
+                        .map(|score| format!("${}", score.binding))
+                        .collect();
+                    return Some(format!(
+                        "expect plan: no exact score of `${binding}` in the physical plan; it scores {known:?}"
+                    ));
+                }
+                for score in selected {
+                    let what = format!("the {} score of `${binding}`", score.kind);
+                    if score.kind != *kind {
+                        return Some(format!("expect plan: {what} is not a {kind} score"));
+                    }
+                    if let Some(fallback) = fallback
+                        && score.fallback != *fallback
+                    {
+                        return Some(format!(
+                            "expect plan: {what} declares fallback {}, expected {}",
+                            score.fallback.as_deref().unwrap_or("none"),
+                            fallback.as_deref().unwrap_or("none")
+                        ));
+                    }
+                    let Some(ran) = ran else {
+                        continue;
+                    };
+                    match ran_side(report, score.id, &what) {
                         Err(mismatch) => return Some(mismatch),
                         Ok(side) if side != *ran => {
                             return Some(format!(
@@ -2968,6 +3094,76 @@ mod tests {
                 .unwrap()
                 .contains("recorded no side of a declared switch")
         );
+    }
+
+    /// A `score` line claims a physical exact `Score`'s kind and declared
+    /// fallback, and with `ran` the side of the `bm25` switch the run took.
+    #[test]
+    fn score_claims_read_the_kind_fallback_and_side() {
+        let explain = json!({
+            "physical_plan": {"node": "Projection", "id": 3, "inputs": [
+                {"node": "Score", "id": 2, "binding": "d", "kind": "bm25", "fallback": "two_pass", "inputs": [
+                    {"node": "Scan", "id": 1, "table": "node:Doc", "binding": "d"}
+                ]},
+                {"node": "Score", "id": 5, "binding": "v", "kind": "distance", "fallback": null, "inputs": [
+                    {"node": "Scan", "id": 4, "table": "node:Doc", "binding": "v"}
+                ]}
+            ]},
+        });
+        let report: Report = serde_json::from_value(json!({"rows": [
+            {"id": 2, "operator": "ScoreExec", "status": "executed",
+             "attempts": [{"rung": 0, "ran": "two_pass", "actual_rows": 3}]},
+            {"id": 5, "operator": "ScoreExec", "status": "executed",
+             "attempts": [{"rung": 0, "ran": true, "actual_rows": 2}]}
+        ]}))
+        .unwrap();
+        let lines = parse_plan_body(&[
+            (0, "score $d: bm25 fallback two_pass ran two_pass"),
+            (1, "score $v: distance fallback none"),
+            (2, "score $d: bm25"),
+        ])
+        .unwrap();
+        assert_eq!(
+            lines[0],
+            PlanLine::Score {
+                binding: "d".to_string(),
+                score: "bm25".to_string(),
+                fallback: Some(Some("two_pass".to_string())),
+                ran: Some("two_pass".to_string()),
+            }
+        );
+        assert_eq!(plan_mismatch(&lines, &explain, Some(&report)), None);
+        for (claim, message) in [
+            (
+                "score $d: bm25 ran one_pass",
+                "ran `two_pass`, expected `ran one_pass`",
+            ),
+            ("score $d: distance", "is not a distance score"),
+            (
+                "score $d: bm25 fallback none",
+                "declares fallback two_pass, expected none",
+            ),
+            ("score $x: bm25", "no exact score of `$x`"),
+            (
+                "score $v: distance ran one_pass",
+                "recorded no side of a declared switch",
+            ),
+        ] {
+            let lines = parse_plan_body(&[(0, claim)]).unwrap();
+            let mismatch = plan_mismatch(&lines, &explain, Some(&report)).unwrap();
+            assert!(mismatch.contains(message), "{claim}: {mismatch}");
+        }
+        for refused in [
+            "score $d bm25",
+            "score d: bm25",
+            "score $d: rank",
+            "score $d: bm25 ran",
+            "score $d: bm25 ran csr",
+            "score $d: bm25 fallback one_pass",
+            "score $d: bm25 ran two_pass fallback two_pass",
+        ] {
+            assert!(parse_plan_body(&[(0, refused)]).is_err(), "{refused}");
+        }
     }
 
     #[test]

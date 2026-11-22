@@ -95,6 +95,45 @@ pub const HASH_JOIN_RATIO: u64 = 8;
 /// side may take at most one part in this many of the memory pool.
 pub const HASH_JOIN_POOL_DIVISOR: u64 = 4;
 
+/// How an exact `bm25` `Score` scores its population. `OnePass` keeps, as
+/// its corpus pass reads the field, each matching document's identity,
+/// token count and alternatives (the match table), scores them after the
+/// pass and gives a row its score by identity. `TwoPass` keeps nothing per
+/// document: the corpus pass counts only the statistics, then the
+/// population's own text is read again by identity and analyzed row by
+/// row. The plan declares `TwoPass` as the fallback of `OnePass`; the run
+/// takes it when the match table would outgrow [`bm25_match_table_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bm25Pass {
+    OnePass,
+    TwoPass,
+}
+
+impl Bm25Pass {
+    /// The side a run may take instead of `self`: `two_pass` under a
+    /// `one_pass`, nothing under a `two_pass`.
+    pub fn declared_fallback(self) -> Option<Self> {
+        match self {
+            Self::OnePass => Some(Self::TwoPass),
+            Self::TwoPass => None,
+        }
+    }
+}
+
+/// The one-pass `bm25`'s match table may hold at most one part in this many
+/// of the memory pool, as a hash join's build side does: past it the score
+/// falls back to its two-pass side.
+pub const BM25_TABLE_POOL_DIVISOR: u64 = 4;
+
+/// The bytes an exact `bm25`'s match table may hold under a query pool of
+/// `pool` bytes, the plan's recorded memory limit: a quarter. The planner
+/// declares it as the `Score` node's `retained_limit`; the operator switches
+/// to its two-pass side when the next matching document would pass it.
+pub fn bm25_match_table_bytes(pool: u64) -> u64 {
+    (pool / BM25_TABLE_POOL_DIVISOR).max(1)
+}
+
 /// A query's return-only columns are fetched by row address for the rows a
 /// root `limit` keeps once the binding's table holds more than this many
 /// rows per kept row: a take reads each kept row's pages apart, where the
