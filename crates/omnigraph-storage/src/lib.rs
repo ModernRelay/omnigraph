@@ -3165,8 +3165,38 @@ fn parse_s3_uri(uri: &str) -> Result<S3Location> {
     })?;
     Ok(S3Location {
         bucket: bucket.to_string(),
-        key: url.path().trim_start_matches('/').to_string(),
+        key: s3_object_key(uri, &url),
     })
+}
+
+/// The key the `s3://` URI `uri`, parsed as `url`, names: its URL path as
+/// `url` spelled it through 2.5.8, which the store takes literally. From 2.5.9
+/// a `^` is written `%5E`; here it stays a caret, so no `url` release moves an object.
+#[doc(hidden)]
+pub fn s3_object_key(uri: &str, url: &Url) -> String {
+    let path = url.path().trim_start_matches('/');
+    let tilde_for_caret = uri
+        .contains('^')
+        .then(|| Url::parse(&uri.replace('^', "~")).ok())
+        .flatten();
+    let Some(tilde_for_caret) = tilde_for_caret else {
+        return path.to_string();
+    };
+    let mut twin = tilde_for_caret.path().trim_start_matches('/');
+    let mut rest = path;
+    let mut key = String::with_capacity(path.len());
+    while let Some(character) = rest.chars().next() {
+        if twin.starts_with('~') && !rest.starts_with('~') {
+            key.push('^');
+            rest = rest.strip_prefix("%5E").unwrap_or(&rest[1..]);
+            twin = &twin[1..];
+        } else {
+            key.push(character);
+            rest = &rest[character.len_utf8()..];
+            twin = twin.get(character.len_utf8()..).unwrap_or_default();
+        }
+    }
+    key
 }
 
 fn storage_backend_error(action: &str, uri: &str, err: object_store::Error) -> StorageError {
@@ -5951,6 +5981,48 @@ mod tests {
         let location = parse_s3_uri("s3://bucket/graph/_schema.pg").unwrap();
         assert_eq!(location.bucket, "bucket");
         assert_eq!(location.key, "graph/_schema.pg");
+    }
+
+    /// GQT cannot name its store's root, and only an `s3://` path has this key.
+    #[test]
+    fn s3_key_keeps_a_caret_as_written() {
+        for (uri, key) in [
+            ("s3://bucket/a^b/x", "a^b/x"),
+            ("s3://bucket/a%5Eb^c", "a%5Eb^c"),
+            ("s3://bucket/a%5eb^c", "a%5eb^c"),
+            ("s3://bucket/x^/../y^z~^", "y^z~^"),
+        ] {
+            assert_eq!(parse_s3_uri(uri).unwrap().key, key, "{uri}");
+        }
+    }
+
+    /// A `url` release that spells one more character differently moves an
+    /// object under such a path; this test fails first.
+    #[test]
+    fn s3_key_spelling_is_fixed_for_printable_ascii() {
+        for byte in b' '..=b'~' {
+            let character = char::from(byte);
+            if matches!(character, '/' | '?' | '#') {
+                continue;
+            }
+            let spelled = match character {
+                ' ' => "%20".to_string(),
+                '"' => "%22".to_string(),
+                '<' => "%3C".to_string(),
+                '>' => "%3E".to_string(),
+                '`' => "%60".to_string(),
+                '{' => "%7B".to_string(),
+                '}' => "%7D".to_string(),
+                other => other.to_string(),
+            };
+            assert_eq!(
+                parse_s3_uri(&format!("s3://bucket/a{character}b"))
+                    .unwrap()
+                    .key,
+                format!("a{spelled}b"),
+                "{character:?}"
+            );
+        }
     }
 
     #[test]
