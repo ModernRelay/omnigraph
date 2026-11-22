@@ -18,9 +18,7 @@ use std::time::{Duration, Instant};
 use omnigraph::Session;
 use omnigraph::instrumentation::{capture_query_io_probes, with_query_io_probes};
 use omnigraph_gqt_core::concurrent::SessionKind;
-use omnigraph_gqt_core::{
-    ConcurrentStep, PlainHost, ServedSession, SessionOp, SessionReport, run_session,
-};
+use omnigraph_gqt_core::{ConcurrentStep, ServedSession, SessionOp, SessionReport, run_session};
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, JoinSet};
 
@@ -246,7 +244,7 @@ pub(crate) trait SessionRunner: Send + 'static {
 
 impl SessionRunner for Session {
     async fn run_once(&self, op: &SessionOp, seq: u64) -> Result<SessionReport, String> {
-        run_session(&PlainHost, self, op, seq).await
+        run_session(&(), self, op, seq).await
     }
 }
 
