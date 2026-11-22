@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-11-21
-updated: 2026-11-21
+updated: 2026-11-22
 discussion: null
 supersedes: []
 superseded_by: []
@@ -34,15 +34,16 @@ is a separate journey with its own workload, chosen when its format was new.
 This RFC makes cross-version coverage one ***matrix***: the rows of the
 predecessor registry (`.github/predecessors.toml`, PR 1507) against the routes
 the current binary takes, with one workload and one set of checks per route.
-A row declares what its binary writes, and provisioning proves it. The current
+A row declares its binary's version on each compatibility surface it is
+tested on, and provisioning proves each one. The current
 binary's own support range selects the route, so no table copies it. A checker
 requires a row for every release that writes a format in the window, so a
 missing writer is a red check, not a gap found by reading.
 
-The query edition is a second axis of the same matrix, with the same shape: a
-row says which edition its binary parses, the candidate's own parser and lint
-pick the route, and a difference passes only when a sanctioned-difference
-table names it. It adds no other mechanism.
+The GQ language is a second surface of the same matrix, with the same shape:
+a row says which GQ language version its binary parses, the candidate's own
+parser and lint pick the route, and a difference passes only when a
+sanctioned-difference table names it. It adds no other mechanism.
 
 The RFC also narrows the window's lower edge from a conversion route to a
 bridge. Graphs below format 14 are refused with the name of the ***bridge
@@ -121,9 +122,12 @@ refused today.
 
 ## Design
 
-### Rows say what they write
+### Rows say what they speak
 
-Each registry row gains a `writes` table:
+Each registry row gains a `surfaces` table: the row's version on each
+compatibility surface the matrix tests, keyed by the names the
+[compatibility surfaces RFC](2026-09-14-compatibility-surfaces.md) (draft)
+gives its record. A new surface under test is a new key, never a new field:
 
 ```toml
 [predecessors."release-0.14.0"]
@@ -131,31 +135,45 @@ release = "v0.14.0"
 sha256 = { … }
 binaries = ["omnigraph", "omnigraph-server"]
 reports = "omnigraph 0.14.0"
-writes = { storage = 16, lance = "13.0.0", cli = "targets" }
+surfaces = { storage_format = 16, gq_language = "2.3" }
+lance = "13.0.0"
+dialect = "targets"
 retire_when = "format 16 leaves the window"
 ```
 
-`storage` is the stamp a graph this binary creates carries. `edition` (not in
-the example) is the query edition the binary parses, set on a row whose
-binaries include `omnigraph-gqt`. Provisioning
-proves it: it creates an empty graph with the row's binary and requires
-`snapshot --json` to report `internal_schema_version` equal to it, as the
-stamp-13 journey does by hand today. `lance` is the manifest writer version
-the Lance journey checks today. `cli` names the command dialect of the
-binary (below). A row whose writes cannot be proven is not provisioned.
+`storage_format` is the stamp a graph this binary creates carries
+(`INTERNAL_MANIFEST_SCHEMA_VERSION`). Provisioning proves it: it creates an
+empty graph with the row's binary and requires `snapshot --json` to report
+`internal_schema_version` equal to it, as the stamp-13 journey does by hand
+today.
+
+`gq_language` is the GQ language version the binary parses
+(`GQ_LANGUAGE_VERSION`, major and minor). No released binary reports it, so
+provisioning reads the constant at the row's source,
+`git show <release or commit>:crates/omnigraph-compiler/src/lib.rs`, and
+requires it to equal the row's value: `2.1` for 0.12 and 0.13, `2.3` for 0.14
+to 0.16. Once the compatibility surfaces record ships, `omnigraph version
+--json` reports `surfaces.gq_language`, and a row whose binary reports it is
+proven by that report instead.
+
+Two fields are not surfaces. `lance` is the manifest writer version the Lance
+journey checks today; it is a dependency's version, read from the manifest a
+row's binary writes. `dialect` names the argv shape of the binary's CLI
+(below), which no surface versions. A row whose surfaces or `lance` cannot be
+proven is not provisioned.
 
 ### The route comes from the candidate
 
 The candidate already decides what it does with a format: `version --json`
 reports `internal_schema.serves`, and `upgrade --check` reports the route.
-The matrix asks it, for each row's `storage`, and runs the route's checks.
+The matrix asks it, for each row's `storage_format`, and runs the route's checks.
 No table of routes exists outside the binary:
 
 | Route | When | Checks |
 |---|---|---|
-| ***accepted*** | `storage` in `serves` | the canonical workload's rows, history and branches read the same through the candidate; the candidate writes, merges and runs `cleanup`; the row's binary then opens the graph and either reads it (same stamp) or refuses it before any read (higher stamp), never misreads it (Boundary, Versions) |
-| ***stamped*** | `storage` in `serves` and below the stamp the candidate writes | as accepted, after `upgrade`; `upgrade` is a stamp-only commit per live branch and rewrites no table row |
-| ***bridged*** | `storage` below `serves` | the candidate refuses naming `bridge_release`; the bridge row's `upgrade` converts; the candidate's `upgrade` stamps; then the accepted checks |
+| ***accepted*** | `storage_format` in `serves` | the canonical workload's rows, history and branches read the same through the candidate; the candidate writes, merges and runs `cleanup`; the row's binary then opens the graph and either reads it (same stamp) or refuses it before any read (higher stamp), never misreads it (Boundary, Versions) |
+| ***stamped*** | `storage_format` in `serves` and below the stamp the candidate writes | as accepted, after `upgrade`; `upgrade` is a stamp-only commit per live branch and rewrites no table row |
+| ***bridged*** | `storage_format` below `serves` | the candidate refuses naming `bridge_release`; the bridge row's `upgrade` converts; the candidate's `upgrade` stamps; then the accepted checks |
 
 The bridged route is where induction is sound: it is the user's real path for
 an old graph, and the only one that produces a graph with retained
@@ -167,7 +185,7 @@ The workload is a list of steps, not a test per row: initialize from a schema
 with nodes, edges, vectors, full-text and Blobs; load rows; create, write,
 merge, delete and recreate branches; apply an additive schema change;
 `optimize`; `cleanup`. Steps a row's binary does not have (a feature newer than
-it) are skipped by that row's `writes` capabilities, and each skip is counted
+it) are skipped by that row's surface versions, and each skip is counted
 in the run's report.
 
 The row's binary runs each step through its ***dialect***, the argv shape of
@@ -194,18 +212,25 @@ predecessor's graph is never written. A case whose schema the row's binary
 refuses is skipped as unsupported by that row and counted; a case the row's
 binary loads and the candidate then fails is a red cell.
 
-### The query edition axis
+### The GQ language axis
 
-A query edition is a language break, not a format: the GQ 3 break (PR 1316,
+The route on this surface follows from `GQ_LANGUAGE_VERSION`'s rule: a minor
+only accepts more, a major accepts less or changes a produced shape. A row
+with the candidate's major and a lower minor takes only the as-written route
+below, and every one of its texts must take it. A row with another major is a
+language break.
+
+A break is not a format. The GQ 3 break (PR 1316,
 [the GQ 3 RFC](https://github.com/ragnorc/omnigraph/blob/rfc/gq-3/docs/rfcs/2026-11-07-gq-3.md),
-"The break") replaces edition 2 with no edition line and no compatibility
-path, so the candidate never accepts edition-2 text under a declared edition.
-Its parser and `omnigraph lint` decide one of three routes for each text an
-edition-2 row parses:
+"The break"; that RFC calls a major an *edition*) replaces major 2 with no
+way to declare the version of a text and no compatibility path: the candidate
+parses one version, never major-2 text on request. Its parser and
+`omnigraph lint` decide one of three routes for each text a major-2 row
+parses:
 
 | Route | When | Checks |
 |---|---|---|
-| ***as written*** | the text is valid in both editions (1,463 of the 2,504 texts in the repository, measured by #1316) | the row's runner and the candidate's run the case; every step's columns, types, rows, affected counts and error match, apart from the sanctioned differences |
+| ***as written*** | the text is valid under both majors (1,463 of the 2,504 texts in the repository, measured by #1316) | the row's runner and the candidate's run the case; every step's columns, types, rows, affected counts and error match, apart from the sanctioned differences |
 | ***fixed*** | the candidate refuses the text and `omnigraph lint --fix` applies the fix each refusal prints (1,000 more) | as written, on the rewritten text |
 | ***refused*** | no machine fix exists (41 texts) | the refusal and its code are listed; no comparison runs |
 
@@ -219,22 +244,22 @@ manifest (`OMNIGRAPH_PREDECESSORS`) and the row's cases from
 `git show <commit>:<path>`, since provisioning keeps no checkout; the table
 changes only in the pull request that changes the rows.
 
-Rows: `edge-20261118-fd4d61f` (the published edition-2 CLI) is already a
+Rows: `edge-20261118-fd4d61f` (the published major-2 CLI) is already a
 release row for the storage rollback checks, which are this matrix's accepted
-route run backwards, the edition-2 binary reading graphs the candidate wrote.
-The edition axis adds one source row, `42013036`, the merge base the break was
+route run backwards, the major-2 binary reading graphs the candidate wrote.
+The GQ axis adds one source row, `42013036`, the merge base the break was
 measured against, with `binaries = ["omnigraph", "omnigraph-gqt"]`, because
 releases ship no GQT runner.
 
-Lifetime: an edition row serves one break. The comparison gates #1316, and the
+Lifetime: a source row on this axis serves one break. The comparison gates #1316, and the
 `42013036` row and `cross-edition.tsv` retire together once 0.17.0 ships,
-since no case written after the break has an edition-2 form. The rollback
+since no case written after the break has a major-2 form. The rollback
 check on `edge-20261118-fd4d61f` is a storage row and follows the storage
 window.
 
 ### Coverage is a check, not a reading
 
-`scripts/predecessors.py --self-test` gains three requirements:
+`scripts/predecessors.py --self-test` gains four requirements:
 
 1. Every format in the candidate's `serves` range that a release wrote has a
    release row writing it, newest patch of each minor.
@@ -305,7 +330,8 @@ tests of encoded bytes).
   binary replaces the bespoke journeys of `crossversion_upgrade.rs`; the
   cluster-path refusal and the fresh-graph report stay where they are.
 - The matrix is itself tested: a planted row whose binary writes another
-  stamp than `writes` says fails provisioning; a planted candidate that
+  stamp than its `storage_format` says, or whose source holds another
+  `GQ_LANGUAGE_VERSION` than its `gq_language` says, fails provisioning; a planted candidate that
   misreads a higher stamp fails the accepted route; a removed release row
   fails the coverage check.
 - Each phase below shows the matrix passing against every row it adds before
@@ -317,7 +343,7 @@ tests of encoded bytes).
 
 ## Rollout
 
-1. **Rows and proofs.** Add `writes` and its proof; add rows for 0.13.0,
+1. **Rows and proofs.** Add `surfaces` and its proofs; add rows for 0.13.0,
    0.14.0, 0.15.0 and 0.16.0; run the 0.12 ledger journey in Storage Upgrade
    Compatibility instead of `#[ignore]`.
 2. **The matrix.** Land `crossversion_matrix` with the accepted and stamped
@@ -334,7 +360,7 @@ tests of encoded bytes).
    list in `check-storage-upgrade-ci.py`.
 5. **The corpus.** Add the runner mode and the nightly GQT corpus run.
 
-The edition axis has no phase here: #1316 adds the `42013036` row and points
+The GQ axis has no phase here: #1316 adds the `42013036` row and points
 `cross-edition.py` at the manifest once PR 1507 merges, and retires both with
 0.17.0.
 
@@ -364,3 +390,11 @@ phase 5.
   on #1316). Three routes, decided by the candidate: as written, fixed by
   `lint --fix`, refused. No declared-edition route exists, since GQ 3 has
   none. The counts are #1316's. Removed the open question on the edition axis.
+- 2026-11-22: the axis is named by its surface, the GQ language version
+  (`GQ_LANGUAGE_VERSION`), not "edition". An edition, in Rust's sense, is a
+  version a text declares and that coexists with the others; GQ 3 has
+  neither. A row's `writes` table becomes `surfaces`, keyed by the compatibility
+  surfaces RFC's record names (`storage_format`, `gq_language`), so a new
+  surface under test is a key; `lance` and `dialect` stay separate fields
+  because they version no surface. The GQ 3 RFC's own wording, and #1316's
+  `cross-edition.*` files, are that RFC's to name.
