@@ -3675,10 +3675,13 @@ query nearest_docs($q: Vector(2)) {
 /// person's documents, scored exactly and cut to the person's two nearest
 /// by the read's own window, all outer rows in one evaluation of the
 /// population; an `rrf` correlated on each outer person, a `bm25` arm
-/// and a `nearest` arm over the person's documents fused per person; and a
+/// and a `nearest` arm over the person's documents fused per person; a
 /// `bm25` over every document (`Bm25Body`), which reads the field once: its
 /// corpus pass scores each matching document, and its population scan reads
-/// no text.
+/// no text; and a `bm25` over notes that each match all twenty-four query
+/// words, at the default pool (`Bm25Notes`, one pass) and under a pool whose
+/// quarter their match table passes (`Bm25NotesTwoPass`), which counts the
+/// corpus, scans the population, then reads its text again by identity.
 fn ranking_read_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = r#"
 node Person {
@@ -3690,6 +3693,10 @@ node Doc {
     embedding: Vector(2) @index
 }
 edge Authored: Person -> Doc
+node Note {
+    slug: String @key
+    text: String @index(fulltext)
+}
 "#;
     const QUERIES: &str = r#"
 query nearest_per_author($q: Vector(2)) {
@@ -3716,8 +3723,22 @@ query bm25_body($s: String) {
     }
     return { $d.slug, $score }
 }
+
+query bm25_notes($s: String) {
+    match {
+        let $pop = { match { $n: Note } return { $n } },
+        from bm25($pop, $n.text, $s) as $score
+    }
+    return { $n.slug, $score }
+}
 "#;
-    const LABELS: [&str; 3] = ["NearestCorrelated", "RrfCorrelated", "Bm25Body"];
+    const LABELS: [&str; 5] = [
+        "NearestCorrelated",
+        "RrfCorrelated",
+        "Bm25Body",
+        "Bm25Notes",
+        "Bm25NotesTwoPass",
+    ];
 
     struct RankingReadCost;
 
@@ -3760,6 +3781,13 @@ query bm25_body($s: String) {
                 seed.push(format!(
                     r#"{{"edge":"Authored","from":"p{}","to":"d{row:02}"}}"#,
                     row % 4
+                ));
+                // Each note holds the twenty-four words and one of them
+                // again, so each matches every word of a query of them.
+                seed.push(format!(
+                    r#"{{"type":"Note","data":{{"slug":"n{row:02}","text":"{words} w{extra:02}"}}}}"#,
+                    words = (0..24).map(|w| format!("w{w:02}")).collect::<Vec<_>>().join(" "),
+                    extra = row % 24
                 ));
             }
             writer
@@ -3834,6 +3862,49 @@ query bm25_body($s: String) {
                 rows.as_array().unwrap().len(),
                 8,
                 "the eight documents about graphs: {rows}"
+            );
+            // Sixteen notes, each matching every one of twenty-four query
+            // words. The first read opens the note table, unlabeled; then
+            // the read at the default pool runs its one-pass side, and under
+            // a 64 KiB pool, whose quarter the match table passes, its
+            // two-pass side, which reads the population's text again by
+            // identity in one slice.
+            let words = (0..24).map(|w| format!("w{w:02}")).collect::<Vec<_>>();
+            params.insert("s".to_string(), Literal::String(words.join(" ")));
+            let notes = || {
+                reader.query_inspected(
+                    omnigraph::db::ReadTarget::branch("main"),
+                    QUERIES,
+                    "bm25_notes",
+                    &params,
+                )
+            };
+            fn side(report: serde_json::Value) -> Vec<serde_json::Value> {
+                report["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row["operator"] == "ScoreExec")
+                    .map(|row| row["attempts"][0]["ran"].clone())
+                    .collect()
+            }
+            notes().await.unwrap();
+            omnigraph_dst::cost::set_label(LABELS[3]);
+            let one_pass = notes().await.unwrap();
+            omnigraph_dst::cost::set_label(LABELS[4]);
+            let two_pass = omnigraph::instrumentation::with_query_memory_limit(64 * 1024, notes())
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("_ranking_read_verify");
+            let ran = |report| side(serde_json::to_value(report).unwrap());
+            assert_eq!(ran(&one_pass.report), [serde_json::json!("one_pass")]);
+            assert_eq!(ran(&two_pass.report), [serde_json::json!("two_pass")]);
+            let one_pass = one_pass.result.to_rust_json().unwrap();
+            assert_eq!(one_pass.as_array().unwrap().len(), 16, "{one_pass}");
+            assert_eq!(
+                two_pass.result.to_rust_json().unwrap(),
+                one_pass,
+                "both sides answer alike"
             );
         }
     }
