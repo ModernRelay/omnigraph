@@ -2,11 +2,13 @@
 """Provision the predecessor binaries of `.github/predecessors.toml`.
 
   provision [--store DIR] [--require] (--all | ROW...)
-      Install or build each named row, or every row, into DIR/rows/<row>/ (default
+      Install or build each named row, or with --all every row, into DIR/rows/<row>/ (default
       target/predecessors), reusing a row already there when it was made from
       the same registry entry and still reports its version. Then write
       DIR/manifest.json, naming every provisioned row in DIR, and print its
-      path. A test reads the manifest named by OMNIGRAPH_PREDECESSORS, else
+      path, the only line it writes to stdout (child output goes to stderr).
+      --all takes every row this platform can provision. A test reads the
+      manifest named by OMNIGRAPH_PREDECESSORS, else
       target/predecessors/manifest.json. With --require, a test that asks for
       a row the manifest lacks fails instead of skipping.
   cache-key ROW...
@@ -125,6 +127,14 @@ def select(registry: dict, names: list[str]) -> dict:
     return {name: rows[name] for name in dict.fromkeys(names)}
 
 
+def available(registry: dict, asset: str) -> list[str]:
+    """The rows this platform can provision: every source row, and each release that pins its asset."""
+    return [
+        name for name, row in registry["predecessors"].items()
+        if "release" not in row or asset in row["sha256"]
+    ]
+
+
 def platform_asset() -> str:
     """The `scripts/install.sh` asset stem for this host."""
     system, machine = platform.system(), platform.machine()
@@ -201,7 +211,8 @@ def install_release(row: dict, asset: str, into: Path) -> None:
     }
     # A failed download leaves nothing behind; three attempts, the only retry.
     for attempt in (1, 2, 3):
-        if subprocess.run(["bash", str(INSTALLER)], env=environment).returncode == 0:
+        # The installer's summary goes to stderr: stdout carries only the manifest path.
+        if subprocess.run(["bash", str(INSTALLER)], env=environment, stdout=sys.stderr).returncode == 0:
             return
         log(f"install of {row['release']} failed on attempt {attempt}/3")
         if attempt < 3:
@@ -230,7 +241,10 @@ def build_commit(name: str, row: dict, packages: dict, work: Path, into: Path) -
         if head != commit:
             raise RegistryError(f"the checkout of {name} is at {head}, not {commit}")
         if shutil.which("rustup"):
-            subprocess.run(["rustup", "toolchain", "install", toolchain, "--profile", "minimal"], check=True)
+            subprocess.run(
+                ["rustup", "toolchain", "install", toolchain, "--profile", "minimal"],
+                check=True, stdout=sys.stderr,
+            )
         selection = []
         for package in dict.fromkeys(packages[binary] for binary in row["binaries"]):
             selection += ["--package", package]
@@ -242,7 +256,7 @@ def build_commit(name: str, row: dict, packages: dict, work: Path, into: Path) -
         log(f"building {name} from {commit} with Rust {toolchain}")
         subprocess.run(
             ["cargo", f"+{toolchain}", "build", "--locked", *selection, "--target-dir", str(target)],
-            cwd=checkout, check=True,
+            cwd=checkout, check=True, stdout=sys.stderr,
         )
         for binary in row["binaries"]:
             shutil.copy2(target / "debug" / binary, into / binary)
@@ -383,6 +397,31 @@ class Tests(unittest.TestCase):
         broken(lambda rows: rows.update({"Stamp 2": rows["stamp-1"]}))
         broken(lambda rows: rows.clear())
 
+    def test_all_selects_the_rows_this_platform_can_provision(self):
+        registry = self.registry()
+        self.assertEqual(available(registry, CI_PLATFORM), ["release-1.0.0", "stamp-1"])
+        self.assertEqual(available(registry, "linux-arm64"), ["stamp-1"])
+        checked_in = load_registry()
+        self.assertEqual(available(checked_in, CI_PLATFORM), list(checked_in["predecessors"]))
+
+    def test_child_output_never_reaches_stdout(self):
+        from unittest import mock
+        registry = self.registry()
+        calls = []
+
+        def run(command, **options):
+            calls.append((command, options))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(subprocess, "run", run), tempfile.TemporaryDirectory() as temp:
+            install_release(registry["predecessors"]["release-1.0.0"], CI_PLATFORM, Path(temp))
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][1].get("stdout"), sys.stderr)
+        # Every streaming child of a build sends stdout to stderr too.
+        source = Path(__file__).read_text()
+        build = source[source.index("def build_commit("):source.index("def provision_row(")]
+        self.assertEqual(build.count("stdout=sys.stderr"), build.count("subprocess.run("))
+
     def test_selection_refuses_unknown_and_empty_names(self):
         registry = self.registry()
         self.assertEqual(list(select(registry, ["stamp-1", "stamp-1"])), ["stamp-1"])
@@ -500,7 +539,11 @@ def main() -> int:
             if args.all == bool(args.rows):
                 parser.error("provision takes either --all or row names")
             registry = load_registry()
-            names = list(registry["predecessors"]) if args.all else args.rows
+            names = args.rows
+            if args.all:
+                names = available(registry, platform_asset())
+                for name in sorted(set(registry["predecessors"]) - set(names)):
+                    log(f"{name}: no archive is pinned for {platform_asset()}; not provisioned")
             print(provision(names, args.store.resolve(), args.require, registry))
         elif args.command == "cache-key":
             print(cache_key(load_registry(), args.rows, platform_asset()))
