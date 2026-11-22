@@ -93,7 +93,9 @@ yourself must embed the source value the same way to be comparable with text
 queries.
 
 When `model` is recorded, a text `nearest` query is rejected unless the active
-provider resolves to exactly that model id. Changing the recorded source or
+provider resolves to exactly that model id. For a cluster-served graph,
+`cluster validate`, `plan` and apply refuse a bound provider that resolves to
+another model (`embedding_model_mismatch`). Changing the recorded source or
 model is not an in-place schema migration; rebuild or re-embed the data instead.
 
 `@embed` does not populate the property during a load, even with an embedding

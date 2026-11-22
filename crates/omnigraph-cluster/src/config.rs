@@ -1026,6 +1026,15 @@ fn load_desired_captured(
             }
         });
 
+        if let (Some(catalog), Some(profile)) = (
+            catalog.as_ref(),
+            graph_embedding_providers
+                .get(graph_id)
+                .and_then(|address| embedding_providers.get(address)),
+        ) {
+            validate_embedding_models(graph_id, catalog, profile, &mut diagnostics);
+        }
+
         let graph_queries = resolve_query_decls(
             &config_dir,
             graph_id,
@@ -1305,6 +1314,59 @@ fn load_desired_captured(
         diagnostics,
         config_dir,
         config_file,
+    }
+}
+
+/// Refuse a graph whose bound embedding provider resolves to a model other
+/// than one its schema records with `@embed(..., model = "...")`. The query
+/// path refuses the same mismatch on the first text `nearest`
+/// (`resolve_nearest_query_vec`); checking here moves that failure from the
+/// first query to plan and apply. A profile whose model depends on the
+/// serving process's environment (a `mock` profile without `model`) is not
+/// judged here, and an invalid profile is already diagnosed by its own
+/// validation.
+pub(crate) fn validate_embedding_models(
+    graph_id: &str,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    profile: &EmbeddingProviderConfig,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if profile.kind.as_deref() == Some("mock") && profile.model.is_none() {
+        return;
+    }
+    let Ok(resolved) = omnigraph::embedding::EmbeddingConfig::from_parts(
+        profile.kind.as_deref(),
+        profile.base_url.clone(),
+        profile.model.clone(),
+        String::new(),
+    ) else {
+        return;
+    };
+    let model = resolved.model.as_str();
+    let mut mismatches = catalog
+        .node_types
+        .iter()
+        .flat_map(|(type_name, node)| {
+            node.embed_sources
+                .iter()
+                .filter_map(move |(property, embed)| match &embed.model {
+                    Some(recorded) if recorded != model => {
+                        Some((type_name.clone(), property.clone(), recorded.clone()))
+                    }
+                    _ => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    mismatches.sort();
+    for (type_name, property, recorded) in mismatches {
+        diagnostics.push(Diagnostic::error(
+            "embedding_model_mismatch",
+            format!("graphs.{graph_id}.embedding_provider"),
+            format!(
+                "{type_name}.{property} records @embed model '{recorded}', but the bound embedding provider resolves to model '{}'; text nearest() on it would be refused. Bind a provider with that model or change the schema's recorded model",
+                resolved.model
+            ),
+        ));
     }
 }
 
