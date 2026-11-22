@@ -49,6 +49,33 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::{BlobCell, BlobContent, EntityKind};
 use tempfile::tempdir;
 
+/// `served` reports every field `old` reports, with the same value; fields the
+/// wire contract has added since are allowed. Arrays match element by element.
+fn assert_reports_every_field_of(label: &str, served: &serde_json::Value, old: &serde_json::Value) {
+    use serde_json::Value;
+    fn walk(path: &str, served: &Value, old: &Value, label: &str) {
+        match (served, old) {
+            (Value::Object(served), Value::Object(old)) => {
+                for (key, value) in old {
+                    let field = format!("{path}.{key}");
+                    let found = served
+                        .get(key)
+                        .unwrap_or_else(|| panic!("{label}: {field} is no longer reported"));
+                    walk(&field, found, value, label);
+                }
+            }
+            (Value::Array(served), Value::Array(old)) => {
+                assert_eq!(served.len(), old.len(), "{label}: {path} changed length");
+                for (index, (found, value)) in served.iter().zip(old).enumerate() {
+                    walk(&format!("{path}[{index}]"), found, value, label);
+                }
+            }
+            _ => assert_eq!(served, old, "{label}: {path} changed"),
+        }
+    }
+    walk("", served, old, label);
+}
+
 /// Process/transport and genuine predecessor bytes cannot be expressed in GQT.
 /// SIGTERM + successful process exit precedes exact-ID lock release; no graph
 /// storage conversion, receipt fabrication or source rewrite stands in for it.
@@ -313,9 +340,24 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         receipt.as_object_mut().unwrap().remove("activation");
     }
     expected["state_revision"] = json!(old_state["state_revision"].as_u64().unwrap() + 1);
+    // A 0.12 commit record has no `published` field and reads as published;
+    // the conversion writes it back with that default.
+    fn published_by_default(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                if object.contains_key("graph_commit_id") {
+                    object.entry("published").or_insert(json!(true));
+                }
+                object.values_mut().for_each(published_by_default);
+            }
+            Value::Array(items) => items.iter_mut().for_each(published_by_default),
+            _ => {}
+        }
+    }
+    published_by_default(&mut expected["deployment_results"]);
     assert_eq!(
         converted, expected,
-        "only obsolete runtime claims and ledger revision change"
+        "only obsolete runtime claims, defaulted commit fields and ledger revision change"
     );
     assert!(!root.join("__cluster/lock.json").exists());
 
@@ -324,9 +366,10 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     let contract = omnigraph_api_types::HTTP_API_CONTRACT;
     assert_eq!(reported_contract(&candidate.base_url), contract);
     assert_eq!(served(&current, &candidate, &["snapshot"]), old_snapshot);
-    assert_eq!(
-        served(&current, &candidate, &["commit", "list"]),
-        old_history
+    assert_reports_every_field_of(
+        "commit list",
+        &served(&current, &candidate, &["commit", "list"]),
+        &old_history,
     );
     assert_eq!(
         served(&current, &candidate, &historical_args)["rows"],
@@ -365,9 +408,10 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
         original_domain
     );
     let history = served(&current, &candidate, &["commit", "list"]);
-    assert_eq!(
-        &history["commits"].as_array().unwrap()[1..],
-        old_history["commits"].as_array().unwrap()
+    assert_reports_every_field_of(
+        "commit list after apply",
+        &json!(history["commits"].as_array().unwrap()[1..]),
+        &old_history["commits"],
     );
     fs::write(root.join("graph.policy.yaml"), policy).unwrap();
     assert_eq!(apply(&current, &candidate)["active"], true);
@@ -382,7 +426,8 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
     );
     assert_eq!(candidate.id(), pid);
     candidate.stop_gracefully();
-    unlock(&current);
+    // A clean stop of the candidate releases its own cluster lock.
+    assert!(!root.join("__cluster/lock.json").exists());
 }
 
 /// Run a predecessor binary hermetically (no developer `~/.omnigraph`).
