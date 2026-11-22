@@ -93,24 +93,27 @@ pub(crate) async fn open_read_only_with_binding(
 /// opens the graph with; it runs only once the graph is admitted, since
 /// building a read-through adapter under `--base` writes the clone marker.
 /// `external_blob_policy`, when given, is installed on the opened handle as
-/// part of the open. A base over the graph's own storage root is refused
-/// first, before the command takes a cluster's admission, which it would
-/// retain, so that refusal leaves nothing behind; the handle refuses the same
-/// base again at install. Either refusal, like the open's own, is the engine's
-/// typed error, which says the write did not start.
+/// part of the open. A base over the storage root that holds the graph is
+/// refused first: the cluster's root for a cluster graph, which holds every
+/// graph root, the ledger and the policies, as `cluster validate` judges a
+/// configured Blob base, or the graph's own root for a standalone graph. The check
+/// runs before the command takes a cluster's admission, which it would retain,
+/// so that refusal leaves nothing behind; the handle refuses a base over the
+/// graph's root again at install. Either refusal, like the open's own, is the
+/// engine's typed error, which says the write did not start.
 pub(crate) async fn open_writable(
     binding: &CapturedStorageBinding,
     storage: impl Future<Output = Result<Arc<dyn omnigraph::storage::StorageAdapter>>>,
     external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
     stderr: &mut dyn Write,
 ) -> Result<omnigraph::db::Omnigraph> {
+    let cluster_root = omnigraph_cluster::cluster_root_for_graph_binding(binding)
+        .await
+        .map_err(report)?;
     if let Some(policy) = &external_blob_policy {
-        policy
-            .ensure_disjoint_from_storage_root(binding.uri())
-            .map_err(omnigraph::StorageRootConflict::into_error)
-            .engine_write()?;
+        refuse_source_over_root(policy, cluster_root.as_deref().unwrap_or(binding.uri()))?;
     }
-    let policy = match ensure_graph_with_binding(binding, stderr).await? {
+    let policy = match ensure_graph_with_binding(binding, cluster_root, stderr).await? {
         Some(owner) => owner.graph_policy(binding.uri()).await.map_err(report)?,
         None => None,
     };
@@ -132,18 +135,40 @@ pub(crate) async fn open_writable(
     })
 }
 
+/// Refuse an external source policy with a base over the storage root that
+/// holds the graph at `binding`: the cluster's root for a cluster graph, or
+/// the graph's own root for a standalone graph. `explain load csv` judges its
+/// source here, as the load it explains does in [`open_writable`].
+pub(crate) async fn refuse_source_over_holding_root(
+    binding: &CapturedStorageBinding,
+    policy: &omnigraph::ExternalBlobPolicy,
+) -> Result<()> {
+    let cluster_root = omnigraph_cluster::cluster_root_for_graph_binding(binding)
+        .await
+        .map_err(report)?;
+    refuse_source_over_root(policy, cluster_root.as_deref().unwrap_or(binding.uri()))
+}
+
+/// `policy`'s refusal of a base over `root`, as the engine's typed error.
+fn refuse_source_over_root(policy: &omnigraph::ExternalBlobPolicy, root: &str) -> Result<()> {
+    policy
+        .ensure_disjoint_from_storage_root(root)
+        .map_err(omnigraph::StorageRootConflict::into_error)
+        .engine_write()
+}
+
 /// Acquire before the writable opener (including its capability probe), and
 /// reuse only the same canonical root's admission during this command. The
-/// admission a cluster graph is under, or `None` for a standalone graph.
+/// admission a cluster graph is under, or `None` for a standalone graph;
+/// `cluster_root` is the binding's cluster root, as
+/// [`omnigraph_cluster::cluster_root_for_graph_binding`] reports it.
 async fn ensure_graph_with_binding(
     binding: &CapturedStorageBinding,
+    cluster_root: Option<String>,
     stderr: &mut dyn Write,
 ) -> Result<Option<ClusterAdmission>> {
     let uri = binding.uri();
-    let Some(root) = omnigraph_cluster::cluster_root_for_graph_binding(binding)
-        .await
-        .map_err(report)?
-    else {
+    let Some(root) = cluster_root else {
         return Ok(None);
     };
     let key = binding.for_uri(&root)?.identity();

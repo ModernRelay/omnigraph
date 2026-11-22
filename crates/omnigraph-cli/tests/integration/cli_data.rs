@@ -3277,9 +3277,10 @@ fn load_statement_answers_the_executed_plan_beside_the_change() {
 }
 
 /// A `load csv` whose source lies inside the graph's storage root is refused
-/// while the CLI installs the source's read permission, after the writable open
-/// and before the load starts. Nothing ran, so the failure reports no effects
-/// and asks for a fixed request, never a reconcile, and the graph does not move.
+/// while the CLI installs the source's read permission, before the writable
+/// open and before the load starts. Nothing ran, so the failure reports no
+/// effects and asks for a fixed request, never a reconcile, and the graph does
+/// not move. `explain load csv` refuses the same source.
 #[test]
 fn load_statement_refused_before_its_first_effect_reports_no_effects() {
     let temp = tempdir().unwrap();
@@ -3313,6 +3314,25 @@ fn load_statement_refused_before_its_first_effect_reports_no_effects() {
     assert_eq!(
         refused["disposition"],
         json!({"effects":"none","action":"fix"}),
+        "{refused}"
+    );
+
+    let output = cli()
+        .arg("query")
+        .arg("--target")
+        .arg(&graph)
+        .arg("-e")
+        .arg(format!("explain {statement}"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = parse_stdout_json(&output);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("overlaps an Omnigraph storage root"),
         "{refused}"
     );
     assert_eq!(manifest_dataset_version(&graph), version_before);

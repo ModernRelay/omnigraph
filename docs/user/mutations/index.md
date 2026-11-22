@@ -204,9 +204,9 @@ by a 120-second deadline. A refused source names `csv_source_bytes`; raising
 the setting in the statement's `set` prefix (or the request's `settings` field)
 admits a larger object. A direct `omnigraph mutate` run installs an
 embedded-only base over a `file://` source's directory for that statement, so
-the file is admitted by the same rule, unless that directory overlaps the
-graph's storage root; a served run refuses a `file://` source. A refused source
-has `effects: none` and `action: fix`.
+the file is admitted by the same rule, unless it overlaps the cluster's storage
+root (by default its config directory; a standalone graph's own root); a served
+run refuses a `file://` source. A refusal has `effects: none`, `action: fix`.
 
 `explain` before a `load csv` statement prints the load's plan, the same
 document a query's explain prints: the source, the one validation with each

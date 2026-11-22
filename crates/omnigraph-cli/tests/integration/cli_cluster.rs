@@ -3287,50 +3287,89 @@ fn optimize_resolves_a_cluster_graph_by_id() {
     );
 }
 
-/// A direct `load csv` whose source lies inside a cluster graph's storage
-/// root is refused before the command takes the cluster's admission: it
-/// reports no effects, retains no admission lock, and the graph does not move,
-/// so the corrected load is not blocked.
+/// A direct `load csv` whose source lies anywhere inside the cluster's
+/// storage root (the graph's own root, the root itself, another graph's root,
+/// or the ledger directory) is refused before the command takes the
+/// cluster's admission, as `cluster validate` refuses a configured Blob base
+/// there: it reports no effects, retains no admission lock, and the graph
+/// does not move, so the corrected load is not blocked. `explain load csv`
+/// refuses the same sources, and a source outside the cluster root loads.
 #[test]
-fn load_statement_over_a_cluster_graph_root_is_refused_before_admission() {
+fn load_statement_over_the_cluster_root_is_refused_before_admission() {
     let temp = applied_knowledge_cluster();
     let graph = temp.path().join("graphs/knowledge.omni");
-    let csv_path = graph.join("people.csv");
-    fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+    let other_graph = temp.path().join("graphs/other.omni");
+    fs::create_dir_all(&other_graph).unwrap();
     let version_before = manifest_dataset_version(&graph);
-
-    let output = cli()
-        .arg("mutate")
-        .arg("--target")
-        .arg(temp.path())
-        .args(["--graph", "knowledge", "--as", "act-operator", "-e"])
-        .arg(format!(
+    let run = |statement: String| {
+        cli()
+            .arg("mutate")
+            .arg("--target")
+            .arg(temp.path())
+            .args(["--graph", "knowledge", "--as", "act-operator", "-e"])
+            .arg(statement)
+            .arg("--json")
+            .output()
+            .unwrap()
+    };
+    let load = |csv_path: &std::path::Path| {
+        format!(
             "load csv \"file://{}\" into node:Person mode append header",
             csv_path.display()
-        ))
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    let refused = parse_stdout_json(&output);
-    assert!(
-        refused["error"]
-            .as_str()
-            .unwrap()
-            .contains("overlaps an Omnigraph storage root"),
-        "{refused}"
-    );
+        )
+    };
+
+    for directory in [
+        graph.clone(),
+        temp.path().to_path_buf(),
+        other_graph.clone(),
+        temp.path().join("__cluster"),
+    ] {
+        let csv_path = directory.join("people.csv");
+        fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+        let explain = cli()
+            .arg("query")
+            .arg("--target")
+            .arg(temp.path())
+            .args(["--graph", "knowledge", "-e"])
+            .arg(format!("explain {}", load(&csv_path)))
+            .arg("--json")
+            .output()
+            .unwrap();
+        for output in [run(load(&csv_path)), explain] {
+            assert_eq!(output.status.code(), Some(1), "{csv_path:?}: {output:?}");
+            let refused = parse_stdout_json(&output);
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("overlaps an Omnigraph storage root"),
+                "{csv_path:?}: {refused}"
+            );
+            assert_eq!(
+                refused["disposition"],
+                serde_json::json!({"effects": "none", "action": "fix"}),
+                "{csv_path:?}: {refused}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("cluster admission retained"),
+                "{csv_path:?}: {output:?}"
+            );
+        }
+        assert!(!temp.path().join("__cluster/lock.json").exists());
+        assert_eq!(manifest_dataset_version(&graph), version_before);
+    }
+
+    let outside = tempdir().unwrap();
+    let csv_path = outside.path().join("people.csv");
+    fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+    let output = run(load(&csv_path));
+    assert!(output.status.success(), "{output:?}");
     assert_eq!(
-        refused["disposition"],
-        serde_json::json!({"effects": "none", "action": "fix"}),
-        "{refused}"
-    );
-    assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("cluster admission retained"),
+        parse_stdout_json(&output)["affected_nodes"],
+        1,
         "{output:?}"
     );
-    assert!(!temp.path().join("__cluster/lock.json").exists());
-    assert_eq!(manifest_dataset_version(&graph), version_before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

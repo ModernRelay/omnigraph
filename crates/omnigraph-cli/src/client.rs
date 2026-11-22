@@ -474,7 +474,8 @@ impl GraphClient {
 
     /// An embedded read session, with `external_blob_policy` installed on
     /// its fresh handle when given: `explain load csv "file://…"` probes its
-    /// source under the same base a direct load installs.
+    /// source under the same base a direct load installs, and refuses the
+    /// same base over the storage root that holds the graph.
     async fn open_read_session_with_external_blob_policy(
         _uri: &str,
         binding: &CapturedStorageBinding,
@@ -483,6 +484,9 @@ impl GraphClient {
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
     ) -> Result<Session> {
         let (defaults, sources) = omnigraph::settings::from_env()?;
+        if let Some(policy) = &external_blob_policy {
+            crate::admission::refuse_source_over_holding_root(binding, policy).await?;
+        }
         let db = crate::admission::open_read_only_with_binding(binding, base, None).await?;
         let db = match external_blob_policy {
             Some(policy) => db.with_external_blob_policy(policy)?,
