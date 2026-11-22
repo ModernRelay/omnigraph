@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-11-20
 discussion: null
 supersedes: []
 superseded_by: []
@@ -47,7 +47,7 @@ query passes_in_order() {
 - A served catalogue read is authorized with the resource `og_catalog` and no branch by the policy bound to `graph.og_catalog`; with no bound policy the no-policy rules of a stored graph apply (static tokens read, signed data credentials need a permit, explicit unauthenticated mode stays open).
 - `insert`, `update`, `delete` and `load` targeting an `@` type refuse at the check with "catalogue type `@Operator` is read-only"; `search`, `fuzzy`, `match_text`, `bm25`, `nearest` and `rrf` over a catalogue binding refuse at the check. Scalar predicates, projection, aggregation, ordering, limits and joins work as on any type.
 - `explain` reports `source: catalogue` on a catalogue scan, `access sequential`, no manifest count and no hydration.
-- A deployment cannot create a graph whose id starts with `og_` (`reserved_graph_id`); a graph already applied under such a name keeps its recorded identity. A managed graph named exactly `og_catalog` cannot be served, as the server's graph id grammar already refuses it.
+- A deployment cannot create a graph whose id starts with `og_`: configuration validation refuses every graph id with `_`, as the server does, and `reserved_graph_id` remains as defence in depth. The root of a graph an older binary applied under such a name keeps its recorded identity, but a configuration that still declares it is refused until the graph is renamed or removed. A managed graph named exactly `og_catalog` cannot be served, as the server's graph id grammar already refuses it.
 - The server reports no readiness for the catalogue: it is outside managed graph creation, deletion, readiness counts and storage-root checks.
 
 | Evasion of the read-only rule | What stops it |
@@ -86,7 +86,7 @@ No invariant is weakened; no deny-list item is touched.
 - Wire: `SchemaOutput` gains the optional `catalogue_source`; `ReadOutput` under `og_catalog` carries null `branch`, `snapshot` and `graph_commit_id`, all existing optional fields. The HTTP contract version is unchanged.
 - Plans: `BoundPlan` serialization changes shape (`TableRef` carries `source`; `Assumptions` gains `catalogue`), so saved plans from earlier binaries replan; `BOUND_PLAN_VERSION` is bumped with the change.
 - Storage: nothing is written; no migration.
-- Ids: new graphs cannot take an `og_` prefix; previously applied `og_*` graphs keep their identity.
+- Ids: new graphs cannot take an `og_` prefix; the root of a previously applied `og_*` graph keeps its identity, and a configuration that still declares one is refused at validation.
 - Revert: deleting the catalogue module, the grammar admission and the scope routes restores the previous behavior; the generated registries stay, since they only re-express the enums.
 
 ## Alternatives
@@ -130,3 +130,4 @@ None before acceptance.
 ## Decision log
 
 - 2026-10-16: catalogue types spelled `@Operator`; all five types in the first cut; no `lowers_to` column, the operator row is the explain name with its admitted input counts; the reserved scope `og_catalog` with the `og_` prefix reserved for system graph ids; no `introspect` command; no edges; the catalogue is a node type whose `NodeTypeSpec` says `source: Catalogue`; catalogue access never calls Lance.
+- 2026-11-20 (amendment, #1490): `cluster.yaml` validation applies the server's graph id rule, which refuses `_`. This supersedes "a graph already applied under such a name keeps its recorded identity" (User and operational behavior) and "previously applied `og_*` graphs keep their identity" (Compatibility and reversibility): the root keeps its identity, but its declaration is refused until the graph is renamed or removed.

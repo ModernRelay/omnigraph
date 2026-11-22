@@ -282,6 +282,10 @@ pub(crate) fn write_cleanup(
                 "unpublished_manifests": s.unpublished_manifests,
                 "unpublished_bytes": s.unpublished_bytes,
                 "foreign_versions": s.foreign_versions,
+                "manifest_trees_removed": s.manifest_trees_removed,
+                "branch_entries_removed": s.branch_entries_removed,
+                "branch_entries_deferred": s.branch_entries_deferred,
+                "ref_files_unlinked": s.ref_files_unlinked,
             })).collect::<Vec<_>>(),
         });
         write_json(&value, stdout)?;
@@ -302,6 +306,21 @@ pub(crate) fn write_cleanup(
             total_bytes,
             stats.len() - failed.len()
         )?;
+        let branches = stats.iter().fold([0_u64; 4], |sum, s| {
+            [
+                sum[0] + s.manifest_trees_removed,
+                sum[1] + s.branch_entries_removed,
+                sum[2] + s.branch_entries_deferred,
+                sum[3] + s.ref_files_unlinked,
+            ]
+        });
+        if branches.iter().sum::<u64>() > 0 {
+            writeln!(
+                stdout,
+                "  branches: {} trees removed, {} entries removed ({} deferred), {} refs unlinked",
+                branches[0], branches[1], branches[2], branches[3]
+            )?;
+        }
         if !failed.is_empty() {
             writeln!(
                 stdout,
@@ -1085,7 +1104,9 @@ pub(crate) fn write_change_human(output: &ChangeOutput, writer: &mut dyn Write) 
 /// One line per branch: its name, then with details its head, where it
 /// started, and its creation and last-move times, under the keys the JSON
 /// output uses. A branch without details (one the caller may not read) writes
-/// its name alone.
+/// its name alone; a branch whose tree a delete tombstoned writes
+/// `<name> deleted (retirement pending)`; one whose create wrote no tree
+/// writes `<name> not_ready` with where it started and its creation time.
 pub(crate) fn write_branch_list_human(
     list: &BranchListOutput,
     writer: &mut dyn Write,
@@ -1096,14 +1117,27 @@ pub(crate) fn write_branch_list_human(
             writeln!(writer, "{branch}")?;
             continue;
         };
-        let mut line = format!("{branch} head={}", detail.head.graph_commit_id);
-        if let (Some(from), Some(from_commit_id)) = (&detail.from, &detail.from_commit_id) {
-            line.push_str(&format!(" from={from} from_commit_id={from_commit_id}"));
+        if detail.retirement_pending {
+            writeln!(writer, "{branch} deleted (retirement pending)")?;
+            continue;
+        }
+        let mut line = match &detail.head {
+            Some(head) => format!("{branch} head={}", head.graph_commit_id),
+            None => format!("{branch} not_ready"),
+        };
+        if let Some(from) = &detail.from {
+            line.push_str(&format!(" from={from}"));
+        }
+        if let Some(from_commit_id) = &detail.from_commit_id {
+            line.push_str(&format!(" from_commit_id={from_commit_id}"));
         }
         if let Some(created_at) = detail.created_at {
             line.push_str(&format!(" created_at={created_at}"));
         }
-        writeln!(writer, "{line} updated_at={}", detail.updated_at)?;
+        if let Some(updated_at) = detail.updated_at {
+            line.push_str(&format!(" updated_at={updated_at}"));
+        }
+        writeln!(writer, "{line}")?;
     }
     Ok(())
 }
@@ -2144,6 +2178,10 @@ mod tests {
                 unpublished_manifests: 5,
                 unpublished_bytes: 6,
                 foreign_versions: vec![7, 8],
+                manifest_trees_removed: 0,
+                branch_entries_removed: 0,
+                branch_entries_deferred: 0,
+                ref_files_unlinked: 0,
             },
             DatasetCleanupStats {
                 type_key: "edge:Knows".into(),
@@ -2154,6 +2192,10 @@ mod tests {
                 unpublished_manifests: 0,
                 unpublished_bytes: 0,
                 foreign_versions: vec![],
+                manifest_trees_removed: 0,
+                branch_entries_removed: 0,
+                branch_entries_deferred: 0,
+                ref_files_unlinked: 0,
             },
         ];
         let description = "keep 2 versions, remove anything older than 60s";
@@ -2166,8 +2208,8 @@ mod tests {
             serde_json::json!({
                 "uri":"graph", "keep_versions":2,"older_than_secs":60,
                 "datasets":[
-                    {"type_key":"node:Person","bytes_removed":12,"old_versions_removed":3,"error":null,"manifests_removed":4,"unpublished_manifests":5,"unpublished_bytes":6,"foreign_versions":[7,8]},
-                    {"type_key":"edge:Knows","bytes_removed":2,"old_versions_removed":1,"error":"access denied","manifests_removed":0,"unpublished_manifests":0,"unpublished_bytes":0,"foreign_versions":[]},
+                    {"type_key":"node:Person","bytes_removed":12,"old_versions_removed":3,"error":null,"manifests_removed":4,"unpublished_manifests":5,"unpublished_bytes":6,"foreign_versions":[7,8],"manifest_trees_removed":0,"branch_entries_removed":0,"branch_entries_deferred":0,"ref_files_unlinked":0},
+                    {"type_key":"edge:Knows","bytes_removed":2,"old_versions_removed":1,"error":"access denied","manifests_removed":0,"unpublished_manifests":0,"unpublished_bytes":0,"foreign_versions":[],"manifest_trees_removed":0,"branch_entries_removed":0,"branch_entries_deferred":0,"ref_files_unlinked":0},
                 ],
             }),
             |json, writer| {

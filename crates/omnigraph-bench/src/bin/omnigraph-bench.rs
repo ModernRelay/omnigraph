@@ -184,6 +184,17 @@ struct RunArgs {
     /// from an archive on a miss and put there); `<ref>=<path>` names it.
     #[arg(long = "at", requires = "store", conflicts_with = "archive")]
     at: Vec<String>,
+    /// Start the build's `omnigraph-server` per repetition (reset level
+    /// `rebuild`) and run server scenarios against it: `=<path>` names the
+    /// binary, the bare flag takes the one beside the product binary.
+    #[arg(
+        long,
+        requires = "store",
+        value_name = "PATH",
+        num_args = 0..=1,
+        require_equals = true
+    )]
+    server_product: Option<Option<PathBuf>>,
     #[arg(long)]
     json: bool,
 }
@@ -712,6 +723,7 @@ async fn main() -> ExitCode {
                 backend,
                 product,
                 at,
+                server_product,
                 json,
             } = *args;
             let served = match server_args.resolve() {
@@ -722,6 +734,22 @@ async fn main() -> ExitCode {
                 Ok(backend) => backend,
                 Err(diagnostic) => return bench_cli::failure(vec![diagnostic], json),
             };
+            let server_product = server_product.map(|path| match path {
+                Some(path) => omnigraph_bench::gqt_runner::ServerProduct::Path(path),
+                None => omnigraph_bench::gqt_runner::ServerProduct::Beside,
+            });
+            if server_product.is_some()
+                && (backend.is_some() || store.as_deref().is_some_and(|s| s.starts_with("s3://")))
+            {
+                return bench_cli::failure(
+                    vec![Diagnostic::error(
+                        "invalid_run_input",
+                        "server-product",
+                        "--server-product starts the server over a cluster root under a local store; an s3:// store and --backend do not apply",
+                    )],
+                    json,
+                );
+            }
             let store_environment = match (&store, &backend) {
                 (Some(store), Some(backend)) if store.starts_with("s3://") => Some(
                     omnigraph_bench::gqt_case::GqtEnvironment::embedded(backend.clone()),
@@ -748,9 +776,11 @@ async fn main() -> ExitCode {
                 }
                 _ => None,
             };
-            let run_reset = store
-                .is_some()
-                .then_some(omnigraph_bench::case::ResetMode::Clone);
+            let run_reset = store.is_some().then_some(if server_product.is_some() {
+                omnigraph_bench::case::ResetMode::Rebuild
+            } else {
+                omnigraph_bench::case::ResetMode::Clone
+            });
             let legacy = if config.is_none() && catalog.is_empty() {
                 match case.as_deref().map(bench_cli::legacy_input).transpose() {
                     Ok(legacy) => legacy.unwrap_or(false),
@@ -812,6 +842,12 @@ async fn main() -> ExitCode {
                         input.receipt.backend.clone(),
                         *position,
                     ),
+                    (None, _) if server_product.is_some() => {
+                        omnigraph_bench::catalog::served_environment(
+                            omnigraph_bench::catalog::local_environment().backend,
+                            omnigraph_bench::case::NetworkPosition::SameHost,
+                        )
+                    }
                     (None, Some(environment)) => environment,
                     (None, None) => omnigraph_bench::catalog::local_environment(),
                 };
@@ -829,6 +865,7 @@ async fn main() -> ExitCode {
                         at,
                         store,
                         backend,
+                        server_product,
                         dataset_cache,
                         no_build,
                         fixtures,
@@ -849,6 +886,7 @@ async fn main() -> ExitCode {
                         store,
                         backend,
                         product,
+                        server_product,
                         ..Default::default()
                     },
                     archive,
@@ -934,6 +972,7 @@ async fn main() -> ExitCode {
                     store,
                     backend,
                     product,
+                    server_product,
                     ..Default::default()
                 },
                 archive,
@@ -1507,6 +1546,7 @@ async fn run_suite(command: SuiteCommand) -> ExitCode {
                 backend: None,
                 product: None,
                 product_commit: None,
+                server_product: None,
             };
             if let Some(file) = file {
                 return run_suite_execution(&file, case.as_deref(), options, archive, json).await;
@@ -1761,6 +1801,18 @@ fn select_runs<'a>(
         ));
     }
     Ok(selected)
+}
+
+/// The suite's scenario ids in run order, each once: a swept scenario is one
+/// run per value under one id, and [`select_runs`] takes them all by that id.
+fn scenario_ids(suite: &ResolvedSuite) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for run in &suite.runs {
+        if !ids.iter().any(|id| id == run.case.id()) {
+            ids.push(run.case.id().to_owned());
+        }
+    }
+    ids
 }
 
 fn classify_censored_prefix<T>(
@@ -2184,11 +2236,23 @@ async fn run_at(
     at: Vec<String>,
     store: String,
     backend: Option<omnigraph_bench::case::Backend>,
+    server_product: Option<omnigraph_bench::gqt_runner::ServerProduct>,
     dataset_cache: PathBuf,
     no_build: bool,
     fixtures: Vec<String>,
     json: bool,
 ) -> ExitCode {
+    use omnigraph_bench::gqt_runner::ServerProduct;
+    if matches!(server_product, Some(ServerProduct::Path(_))) {
+        return print_cli_failure(
+            Diagnostic::error(
+                "invalid_run_input",
+                "server-product",
+                "under --at each commit has its own server binary: give --server-product without a value, and the server is `omnigraph-server` beside each --at binary",
+            ),
+            json,
+        );
+    }
     let environment = omnigraph_bench::gqt_runner::product_environment();
     let fixture_store = match omnigraph_bench::store::FixtureStore::open(&store) {
         Ok(store) => store,
@@ -2228,16 +2292,30 @@ async fn run_at(
     for (reference, commit, path) in references {
         let path = match path {
             Some(path) => path,
+            None if server_product.is_some() => {
+                return print_cli_failure(
+                    Diagnostic::error(
+                        "invalid_run_input",
+                        "at",
+                        format!(
+                            "`--at {reference}` takes the commit's `omnigraph` from the store's builds, which hold no `omnigraph-server`; under --server-product name the binary: --at {reference}=<path to omnigraph>"
+                        ),
+                    ),
+                    json,
+                );
+            }
             None => match product_at(&fixture_store, &commit, &scratch).await {
                 Ok(path) => path,
                 Err(diagnostic) => return print_cli_failure(diagnostic, json),
             },
         };
-        let product = match omnigraph_bench::gqt_runner::inspect_product(
-            &path,
-            Some(commit.clone()),
-            &environment,
-        ) {
+        let inspected =
+            omnigraph_bench::gqt_runner::inspect_product(&path, Some(commit.clone()), &environment)
+                .and_then(|product| match &server_product {
+                    Some(server) => product.with_server(server),
+                    None => Ok(product),
+                });
+        let product = match inspected {
             Ok(product) => product,
             Err(error) if error.code == "product_schema_mismatch" => {
                 return print_cli_failure(
@@ -2258,11 +2336,7 @@ async fn run_at(
         };
         targets.push((reference.to_string(), commit, product));
     }
-    let scenarios: Vec<String> = suite
-        .runs
-        .iter()
-        .map(|run| run.case.id().to_owned())
-        .collect();
+    let scenarios = scenario_ids(&suite);
     let mut outputs: Vec<(Ulid, AtOutput)> = targets
         .into_iter()
         .map(|(reference, commit, product)| {
@@ -2301,6 +2375,7 @@ async fn run_at(
         backend: backend.clone(),
         product: Some(target.product.path.clone()),
         product_commit: Some(target.commit.clone()),
+        server_product: server_product.clone(),
         ..Default::default()
     };
     let selected = match select_runs(&suite, None) {
@@ -2583,7 +2658,7 @@ struct ReportRow {
 /// recorded, in repetition order; nothing is summarized across repetitions.
 #[derive(Debug, Serialize)]
 struct ReportBlock {
-    driver: omnigraph_bench::concurrent_host::Driver,
+    driver: omnigraph_bench::driver::Driver,
     claim_grade: bool,
     warmup_seconds: u32,
     measured_seconds: u32,
@@ -2604,7 +2679,7 @@ struct ReportLabel {
 
 /// One row per label, each column holding what every repetition recorded.
 fn report_labels<'a>(
-    observed: impl Iterator<Item = &'a omnigraph_bench::concurrent_host::ConcurrentObservation>,
+    observed: impl Iterator<Item = &'a omnigraph_bench::driver::ConcurrentObservation>,
 ) -> Vec<ReportLabel> {
     let mut labels: Vec<ReportLabel> = Vec::new();
     for observation in observed {
@@ -2864,7 +2939,11 @@ fn report_row(record: &omnigraph_bench::gqt_record::GqtRunRecordV1, uri: String)
                 .map(|machine| machine.machine_label.clone()),
         ),
         GqtSutIdentityV1::Product(sut) => (
-            "product-binary",
+            if sut.server_executable_sha256.is_some() {
+                "product-server"
+            } else {
+                "product-binary"
+            },
             sut.source_commit
                 .clone()
                 .or_else(|| sut.requested_commit.clone()),
@@ -3447,7 +3526,7 @@ mod tests {
 
     #[test]
     fn a_block_report_keeps_every_repetition_of_a_label_in_order() {
-        use omnigraph_bench::concurrent_host::{
+        use omnigraph_bench::driver::{
             ConcurrentObservation, Driver, LabelKind, LabelObservation, PerWorker,
             ReadbackObservation, ServiceTime,
         };

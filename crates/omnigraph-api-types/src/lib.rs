@@ -449,7 +449,8 @@ pub struct BranchListQuery {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchListOutput {
-    /// Every live branch, sorted by name in byte order.
+    /// Every branch the graph holds, sorted by name in byte order, a branch
+    /// that is not ready or whose retirement is pending included.
     pub branches: Vec<String>,
     /// Present only with `detailed=true`: one entry per branch the caller
     /// may `read`, in the order of `branches`. A branch the caller may not
@@ -462,13 +463,18 @@ pub struct BranchListOutput {
 /// `from_commit_id` say where the branch started, as its `POST /branches`
 /// receipt did. A branch deleted and created again under the same name is a
 /// new lifetime: its start and creation time are the later creation's. The
-/// optional fields are absent on `main`.
+/// optional fields are absent on `main`; `head`, `from_commit_id` and
+/// `updated_at` are absent on a branch that is not ready (a create that
+/// registered the branch and wrote no tree) and on one whose retirement is
+/// pending.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchDetailOutput {
     pub name: String,
     /// The commit a read of the branch sees: its newest commit, or the commit
-    /// it started at while it has written none.
-    pub head: CommitOutput,
+    /// it started at while it has written none. Absent while the branch has
+    /// no tree to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<CommitOutput>,
     /// The branch this one started from, as that branch was named then; it
     /// may since have been deleted or recreated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -484,8 +490,16 @@ pub struct BranchDetailOutput {
     pub created_at: Option<i64>,
     /// When the head last moved, as Unix epoch microseconds: the time of the
     /// branch's newest commit, or `created_at` while it has written none.
+    /// Absent with `head`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = 1714000000000000i64)]
-    pub updated_at: i64,
+    pub updated_at: Option<i64>,
+    /// `true` when the branch's tree carries a tombstone: a delete crashed
+    /// before it retired the branch, or finished after this listing read the
+    /// branch set. Reads of the branch refuse with `branch_deleted`; the next
+    /// `DELETE /branches/{branch_name}` finishes the retirement.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retirement_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2472,6 +2486,18 @@ error_codes! {
     /// the branch, or the serving process holds no claim on it; see
     /// `writer_fenced`. Nothing was written.
     WriterFenced = "writer_fenced", [409];
+    /// `branch create` names a branch that exists: a live branch has the
+    /// name, or one above or below it in the `/` hierarchy. Nothing was
+    /// created.
+    BranchExists = "branch_exists", [409];
+    /// The branch was deleted: a read or write of a branch whose delete has
+    /// begun, or a `branch create` whose source was deleted under it. Nothing
+    /// was written.
+    BranchDeleted = "branch_deleted", [409];
+    /// The branch is not ready: its create wrote the branch and no tree, so
+    /// reads and writes refuse until `branch delete` removes it and a new
+    /// `branch create` starts it again. Nothing was written.
+    BranchNotReady = "branch_not_ready", [409];
     /// The request body, or the work it asks for, exceeds a bounded limit;
     /// `resource_limit` names the limit when it is the operation's. Split or
     /// reduce the request.
@@ -2574,6 +2600,9 @@ impl ErrorCode {
             | Self::PreconditionFailed
             | Self::Conflict
             | Self::WriterFenced
+            | Self::BranchExists
+            | Self::BranchDeleted
+            | Self::BranchNotReady
             | Self::ExternalBlobSource
             | Self::ChangeFeedGap
             | Self::Internal => DispositionAction::Refresh,
@@ -3286,11 +3315,12 @@ pub fn branch_list_output(listing: &omnigraph::db::BranchListing) -> BranchListO
 pub fn branch_detail_output(detail: &omnigraph::db::BranchDetail) -> BranchDetailOutput {
     BranchDetailOutput {
         name: detail.name.clone(),
-        head: commit_output(&detail.head),
+        head: detail.head.as_ref().map(commit_output),
         from: detail.from.clone(),
         from_commit_id: detail.from_commit_id.clone(),
         created_at: detail.created_at,
         updated_at: detail.updated_at,
+        retirement_pending: detail.retirement_pending,
     }
 }
 

@@ -1,0 +1,115 @@
+# issue: none
+# notes: A branch whose delete stopped after its tombstone and a branch whose create stopped after
+# notes: its catalog entry are refused as merge source and as merge target, as deleted and as not
+# notes: ready; main keeps its rows, and after a delete each name answers not found.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query add_bob_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- seam
+at: branch_delete.post_tombstone
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch delete b
+
+--- expect error: injected failpoint triggered: branch_delete.post_tombstone
+
+--- mutate
+branch merge b into main
+
+--- expect error: branch 'b' was deleted
+
+--- mutate
+branch merge main into b
+
+--- expect error: branch 'b' was deleted
+
+--- seam
+at: branch_create.post_row
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch create nr
+
+--- expect error: injected failpoint triggered: branch_create.post_row
+
+--- mutate
+branch merge nr into main
+
+--- expect error: branch 'nr' is not ready
+
+--- mutate
+branch merge main into nr
+
+--- expect error: branch 'nr' is not ready
+
+--- query
+query rows_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+branch delete b
+
+--- expect ok
+
+--- mutate
+branch delete nr
+
+--- expect ok
+
+--- mutate
+branch merge b into main
+
+--- expect error: branch 'b' not found
+
+--- mutate
+branch merge nr into main
+
+--- expect error: branch 'nr' not found
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "main"}
+
+--- expect shape
+name: String
