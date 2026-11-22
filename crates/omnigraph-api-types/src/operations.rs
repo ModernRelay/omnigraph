@@ -714,7 +714,7 @@ pub const CLI_ONLY_OPERATIONS: &[CliOnlyOperation] = &[
     ),
     cli_only(
         "studio",
-        "Opens OmniGraph Studio on an existing server target through a link; it sends no request to the server and is not a graph HTTP command.",
+        "Opens Omnigraph Studio on an existing server target through a link; it sends no request to the server and is not a graph HTTP command.",
     ),
     cli_only("skill export", LOCAL),
     cli_only("skill show", LOCAL),

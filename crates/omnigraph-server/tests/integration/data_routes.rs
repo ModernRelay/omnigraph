@@ -1785,6 +1785,81 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     );
 }
 
+/// A load the engine refuses before its first effect answers a plain code,
+/// with no typed details: a malformed or unknown row, a missing key or a
+/// missing endpoint. Nothing ran, so on either load route the
+/// answer is no effects and a fixed request, never a reconcile, and the head
+/// does not move. After a fork of a missing branch the same refusal follows
+/// that fork's publication, which stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_refused_before_its_first_effect_reports_no_effects() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let head = main_head_commit_id(&app).await;
+    let ndjson = |query: &str, data: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(&format!("/load/ndjson?{query}")))
+            .method(Method::POST)
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(data.to_string()))
+            .unwrap()
+    };
+    let refused = [
+        ("{not json", "invalid"),
+        (r#"{"type":"Nope","data":{}}"#, "unknown node type 'Nope'"),
+        (r#"{"type":"Person","data":{"age":3}}"#, "'name'"),
+        (
+            r#"{"edge":"Knows","from":"nobody","to":"nada","data":{}}"#,
+            "'nobody' not found",
+        ),
+    ];
+    for (data, needle) in refused {
+        for request in [
+            ndjson("branch=main&mode=append", data),
+            json_post(
+                "/load",
+                &json!({"branch": "main", "mode": "append", "data": data}),
+            ),
+        ] {
+            let path = request.uri().path().to_string();
+            let (status, body) = json_response(&app, request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {data}: {body}");
+            assert_eq!(body["code"], "bad_request", "{path} {data}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains(needle),
+                "{path} {data}: {body}"
+            );
+            assert_eq!(
+                body["disposition"],
+                json!({"effects": "none", "action": "fix"}),
+                "{path} {data}: {body}"
+            );
+        }
+    }
+    assert_eq!(main_head_commit_id(&app).await, head);
+
+    let (status, body) = json_response(
+        &app,
+        ndjson("branch=forked&from=main&mode=append", "{not json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["disposition"],
+        json!({"effects": "partial", "action": "fix"}),
+        "the fork published before the rows: {body}"
+    );
+    let (_, branches) =
+        json_response(&app, json_post("/query", &json!({"query": "branch list"}))).await;
+    assert!(
+        branches["rows"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name": "forked"})),
+        "{branches}"
+    );
+}
+
 /// Whether a load forked its branch is the engine's fact, not the route's. A
 /// branch deleted after the route authorized the load, while its body is still
 /// arriving, is forked by the load itself, and a refusal of the rows then
@@ -2936,6 +3011,11 @@ async fn load_csv_statement_is_denied_served_without_a_policy_and_moves_no_head(
         assert!(
             error.contains("ingress is denied for this graph"),
             "{request}: {error}"
+        );
+        assert_eq!(
+            body["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{request}: {body}"
         );
     }
     assert_eq!(
