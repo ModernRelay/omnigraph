@@ -39,6 +39,11 @@ binary's own support range selects the route, so no table copies it. A checker
 requires a row for every release that writes a format in the window, so a
 missing writer is a red check, not a gap found by reading.
 
+The query edition is a second axis of the same matrix, with the same shape: a
+row says which edition its binary parses, the candidate's own parser and lint
+pick the route, and a difference passes only when a sanctioned-difference
+table names it. It adds no other mechanism.
+
 The RFC also narrows the window's lower edge from a conversion route to a
 bridge. Graphs below format 14 are refused with the name of the ***bridge
 release***, the newest release whose `omnigraph upgrade` converts them (0.16.x
@@ -130,7 +135,9 @@ writes = { storage = 16, lance = "13.0.0", cli = "targets" }
 retire_when = "format 16 leaves the window"
 ```
 
-`storage` is the stamp a graph this binary creates carries. Provisioning
+`storage` is the stamp a graph this binary creates carries. `edition` (not in
+the example) is the query edition the binary parses, set on a row whose
+binaries include `omnigraph-gqt`. Provisioning
 proves it: it creates an empty graph with the row's binary and requires
 `snapshot --json` to report `internal_schema_version` equal to it, as the
 stamp-13 journey does by hand today. `lance` is the manifest writer version
@@ -187,6 +194,44 @@ predecessor's graph is never written. A case whose schema the row's binary
 refuses is skipped as unsupported by that row and counted; a case the row's
 binary loads and the candidate then fails is a red cell.
 
+### The query edition axis
+
+A query edition is a language break, not a format: the GQ 3 break (PR 1316,
+[the GQ 3 RFC](https://github.com/ragnorc/omnigraph/blob/rfc/gq-3/docs/rfcs/2026-11-07-gq-3.md),
+"The break") replaces edition 2 with no edition line and no compatibility
+path, so the candidate never accepts edition-2 text under a declared edition.
+Its parser and `omnigraph lint` decide one of three routes for each text an
+edition-2 row parses:
+
+| Route | When | Checks |
+|---|---|---|
+| ***as written*** | the text is valid in both editions (1,463 of the 2,504 texts in the repository, measured by #1316) | the row's runner and the candidate's run the case; every step's columns, types, rows, affected counts and error match, apart from the sanctioned differences |
+| ***fixed*** | the candidate refuses the text and `omnigraph lint --fix` applies the fix each refusal prints (1,000 more) | as written, on the rewritten text |
+| ***refused*** | no machine fix exists (41 texts) | the refusal and its code are listed; no comparison runs |
+
+The comparison is #1316's `scripts/cross-edition.py`: steps pair by ordinal,
+binding and session, and a difference passes only when
+`crates/omnigraph-gqt/cross-edition.tsv` lists it with the bullet of the GQ 3
+RFC that sanctions it. A listed difference that no longer occurs fails, so the
+table never outlives what it excuses. The storage axis uses the same form for
+its sanctioned differences. The script takes the row's runner from the
+manifest (`OMNIGRAPH_PREDECESSORS`) and the row's cases from
+`git show <commit>:<path>`, since provisioning keeps no checkout; the table
+changes only in the pull request that changes the rows.
+
+Rows: `edge-20261118-fd4d61f` (the published edition-2 CLI) is already a
+release row for the storage rollback checks, which are this matrix's accepted
+route run backwards, the edition-2 binary reading graphs the candidate wrote.
+The edition axis adds one source row, `42013036`, the merge base the break was
+measured against, with `binaries = ["omnigraph", "omnigraph-gqt"]`, because
+releases ship no GQT runner.
+
+Lifetime: an edition row serves one break. The comparison gates #1316, and the
+`42013036` row and `cross-edition.tsv` retire together once 0.17.0 ships,
+since no case written after the break has an edition-2 form. The rollback
+check on `edge-20261118-fd4d61f` is a storage row and follows the storage
+window.
+
 ### Coverage is a check, not a reading
 
 `scripts/predecessors.py --self-test` gains three requirements:
@@ -198,6 +243,8 @@ binary loads and the candidate then fails is a red cell.
    workspace version is the clock).
 3. Each bridge release named by the candidate is a row, and so is one release
    below the window to start the bridged route from.
+4. A sanctioned-difference table names the row it compares against; the
+   table and the row exist together.
 
 A format that only `main` builds wrote (v15) has no release to row; the
 fixtures of `db/upgrade/tests.rs` stay its owner, and the support matrix says
@@ -287,6 +334,10 @@ tests of encoded bytes).
    list in `check-storage-upgrade-ci.py`.
 5. **The corpus.** Add the runner mode and the nightly GQT corpus run.
 
+The edition axis has no phase here: #1316 adds the `42013036` row and points
+`cross-edition.py` at the manifest once PR 1507 merges, and retires both with
+0.17.0.
+
 `implementation` moves to `in-progress` with phase 1 and `complete` with
 phase 5.
 
@@ -299,11 +350,6 @@ phase 5.
 - **The readers of converted history.** They stay here. Retiring them needs
   a rule for graphs that still hold `__history/legacy/` (for example: refuse
   until `cleanup` has removed every legacy version, naming that).
-- **The query edition axis.** The GQ 3 break (PR 1316) gives the CLI a new
-  language edition. The workload's writer side uses `load` and CLI branch
-  commands, so it needs no query edition; whether edition-2 rows join the
-  same matrix as a third axis, or stay in the cross-edition comparison, is
-  open.
 - **Object stores.** The matrix runs on the local filesystem, as the
   journeys do today. Running rows against RustFS or Azurite is a separate
   qualification.
@@ -313,3 +359,8 @@ phase 5.
 - 2026-11-21: draft opened. Facts above measured on `291214830`; the bridge
   claim checked against `docs/user/operations/upgrade.md` at `v0.16.0`
   (converts v8, v9 and v13 to v17 in place, serves v14 to v17).
+- 2026-11-21: the query edition joins the matrix as a second axis, with the
+  owner of the GQ 3 break (the "Query language evaluation" session working
+  on #1316). Three routes, decided by the candidate: as written, fixed by
+  `lint --fix`, refused. No declared-edition route exists, since GQ 3 has
+  none. The counts are #1316's. Removed the open question on the edition axis.
