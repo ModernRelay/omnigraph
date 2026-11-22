@@ -227,7 +227,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 - `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(@src, @dst)`). Members must be scalar: Blob, list and vector members are rejected at schema admission.
 - `@index(prop1, prop2)` — composite index intent. Composite and edge intents are accepted but are not currently materialized as property indexes.
 - `@range(prop, min..max)` — node-only inclusive numeric bounds, compared exactly; a list property bounds each element; either bound may be omitted
-- `@check(prop, "regex")` — node-only String regular-expression constraint
+- `@check(prop, "regex")` — node-only String regular-expression constraint; a list property is refused, since only `@range` bounds elements
 
 Integer bounds must fit `I64`; `..max` is upper-only and `min..` is lower-only.
 Decimal bounds use `F64`. Existing accepted schemas retain their bounds: before
