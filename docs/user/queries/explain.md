@@ -90,7 +90,13 @@ A `nearest` scan's `policy` declares what the run may do when an attempt
 leaves it short: `probe_factor` (each rescan multiplies the probe cap),
 `flat_rescan_on_unreached`, `uncapped_on_missing_counters` and
 `flat_when_eligible_within_fetch`. A `bm25` ranks no scan: it is an exact
-`Score` row, which reads no full-text index. A
+`Score` row, which reads no full-text index. A physical `Score` row carries
+`binding`, `type_name`, `property`, `kind` (`distance` or `bm25`) and
+`fallback`, the side the run may take instead of its first: `two_pass` on a
+`bm25`, whose one-pass side keeps a table of the matching documents, taken
+when that table would pass the row's `retained_limit` (a quarter of the
+plan's memory limit), and then reads the population's text again by
+identity; `null` on a `distance`. A
 physical
 `Fuse` row has one input per `rrf` arm, each the subtree the arm's ranking
 runs standing alone (a `nearest` window's ranked `Scan`, `Sort` and
@@ -218,7 +224,8 @@ and its operator's JSON report in `detail`:
 `ran` is `true` or `false` on an operator without a choice, and on the
 operator of a declared switch it is the side that ran: `hash_join` or
 `id_lookup` on the `HashJoinExec` of a `HashJoin`, `csr` or `indexed_scan`
-on the `ExpandExec` of an `Expand`, the mode the traversal ended on. After
+on the `ExpandExec` of an `Expand`, the mode the traversal ended on, and
+`one_pass` or `two_pass` on the `ScoreExec` of a `bm25` `Score`. After
 the node rows, one row per search decision the run took within its plan's
 declared policy: `node` `gate` (a pre-pass gate's `plan`, `prefilter`,
 `postfilter` or `proven_empty`, with its `fallback`, `forced`, `eligible` and
@@ -238,7 +245,7 @@ documents only before it) carry a pipeline `id` and `depends_on`, with
 `physical_plan` node ids; an operator's emission is set by the shape wrapper
 the engine builds its stream through, the one the planner's cut names, so the
 printed pipelines are the executed ones. Saved physical
-plans use a `bound_plan_version: 17` envelope whose `body` contains `plan` and
+plans use a `bound_plan_version: 19` envelope whose `body` contains `plan` and
 `values`. Unversioned plans and other versions are refused with a regeneration
 instruction, including plans without traversal nodes.
 

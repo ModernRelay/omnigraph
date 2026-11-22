@@ -101,7 +101,14 @@ every matching document, and the population's rows take their scores without
 reading their text again. Its memory follows the matches, not the field's
 text: for each matching document it keeps the identity, the length and the
 query terms it holds, charged to the query's memory pool for that query
-alone. Keep such calls to node types whose text fits the latency you need.
+alone. When those would pass a quarter of the pool (`query_memory_bytes`),
+the read is not refused: the pass keeps the corpus's statistics alone, and
+the population's text is read again by identity and analyzed, with the same
+rows and scores. That side holds nothing per document but reads the text
+twice: on a 100,000-document corpus it took about twice as long as the
+single pass. A query's [explain](../queries/explain.md) shows that `Score`
+fallback, and its profile says which side ran. Keep such calls to node
+types whose text fits the latency you need.
 
 `match_terms($d.f, terms($q, mode: all | any, max_edits: n))` is true where
 every (`all`, the default) or some (`any`) distinct analyzed term of `$q` has

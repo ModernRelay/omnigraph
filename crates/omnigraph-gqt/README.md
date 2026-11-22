@@ -845,9 +845,12 @@ claims the strategy of every physical `AntiJoin` correlated on `$var` (a `not`,
 `exists`, `count` or aggregate block): `correlated` starts its inner tree from
 the outer rows, `key_set` runs it once from the block's own bounded binding
 (pass `anti_join_strategy`); it fails when no such block is in the physical
-plan or one took the other strategy. The `hash join` and `expand` lines take a
+plan or one took the other strategy. A `score $var: <bm25|distance>[ fallback
+<two_pass|none>]` line claims the kind of every physical exact `Score` of
+`$var` and the fallback it declares; it fails when no such score is in the
+physical plan. The `hash join`, `expand` and `score` lines take a
 trailing `ran <side>` (`hash join $e ran id_lookup`, `mode indexed_scan ran
-csr`): the side of the node's declared switch the run took, read from the
+csr`, `score $d: bm25 ran two_pass`): the side of the node's declared switch the run took, read from the
 execution report of the same run (the last attempt of the node's row, joined
 to the explain row by the node's `id`); it fails when the run recorded no
 side on that node or another side. A `scan <Type>[ as $var]: ranked

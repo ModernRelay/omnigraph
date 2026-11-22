@@ -9,7 +9,9 @@
 //! call's matches, which a null or token-empty document never joins; a
 //! `Score` appends each matching row's `bm25_v1` score, which the scan
 //! computed for every matching document and the row takes by its identity,
-//! so the population reads no text. The operator runs the
+//! so the population reads no text; past the match table's limit the scan
+//! keeps the statistics alone and each row is scored from its own text, read
+//! again by identity (the `Score` node's declared `two_pass` fallback). The operator runs the
 //! scan when its consumer first polls it, before it pulls its input, so a
 //! node that never runs (below a `Limit` of 0, say) scans nothing. The scan
 //! reads the field's table at the pinned snapshot under the engine's scan

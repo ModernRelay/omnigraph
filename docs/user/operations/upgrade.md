@@ -34,9 +34,8 @@ refuses a branch still at v14 or v15. A standalone graph can use the offline
 command before using those features. Cluster graphs must first have an ordinary
 0.14 publication on the affected branch; `upgrade` cannot stamp cluster graphs.
 
-A v16 graph, written by 0.14.x or 0.15.0, and a v17 graph, written by 0.16.0,
-open as they are and their branches stay at their format: no
-publication stamps a branch v17 or v18. Only `omnigraph upgrade` does, with
+A v16 graph, written by 0.14.x or 0.15.0, and a v17 graph, written by 0.16.0, open as they
+are and their branches stay at their format: no publication stamps a branch v17 or v18. Only `omnigraph upgrade` does, with
 every process on the graph stopped. A binary that serves up to v17 then refuses
 the graph, so upgrade every binary first. A graph this binary creates is born
 at v18. A cluster graph created by an earlier binary stays at its format, since
