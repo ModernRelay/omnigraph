@@ -7,10 +7,10 @@ finishes it is in [recovery.md](recovery.md)
 Every successful graph-content write has one visibility point: a conditional
 `__manifest` publication. Table effects happen earlier, but as detached Lance
 commits of the pinned base that nothing references until that publication
-([RFC 0067](../rfcs/0067-detached-table-commits.md)). A detached commit is
+([RFC 0067](../decisions/0067-detached-table-commits.md)). A detached commit is
 the table's version for its whole life: nothing replays it onto the table's
 linear history, and a graph table's linear HEAD stays at its creation version
-([RFC: Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md)).
+([RFC: Detached-only tables](../decisions/2026-09-21-detached-only-tables.md)).
 
 ## The protocol
 
@@ -176,7 +176,7 @@ Finalization acquires the root-shared gate order:
    contract-lifecycle pass such as schema apply or the system-column
    upgrade, and branch create, whose namespace inventory no CAS covers,
    take it exclusively, so cross-branch writers do not serialize on it; see
-   [RFC 2026-09-18-shared-schema-gate](../rfcs/2026-09-18-shared-schema-gate.md));
+   [RFC 2026-09-18-shared-schema-gate](../decisions/2026-09-18-shared-schema-gate.md));
 2. target branch;
 3. `(table_key, branch)` queue entries in sorted order: the touched tables for
    a mutation, load or index build, the whole catalog for merge, optimize and
@@ -220,8 +220,8 @@ the root's epoch equals it.
 
 A process that holds its handle's bound branch does not probe that branch's
 head at the sites below: no other process's publication can land on it, and
-the writers the fence does not cover are listed under the
-[support boundary](invariants.md#current-support-boundaries). The holder
+the writers the fence does not cover are listed under
+[what the fence covers](#what-the-fence-covers). The holder
 entry records the `__manifest` version of the process's last publication on
 the branch, the claim included. A handle whose installed view is at or above
 that version reads and writes from the installed head with no request; a
@@ -292,6 +292,21 @@ own chain asserts no epoch, since it ends the chain, so a delete of a branch
 another process holds proceeds, the holder's next publish is refused
 `branch_deleted`, and the chain keeps its last `writer_epoch` row.
 
+### What the fence covers
+
+The writer epoch fences publications that move a branch's head, on a branch
+some process claimed. Only the embedded engine claims: no command or route
+does, so a claimed branch refuses the server and the CLI. Branch create and
+delete are fenced through `main`'s epoch at or above format 18: the branch
+row and the retired row are publications on `main`, and the tombstone on the
+branch's chain asserts no epoch.
+
+Not fenced: the collector's deletes and its removal of a retired row's
+entry, `optimize`'s configuration commit, the stamp-only route of
+`omnigraph upgrade`, and below format 18 the ref metadata and ref deletes.
+One mutation-capable writer process per cluster remains the supported
+topology ([contract](contract.md#gaps) `G2`).
+
 ## Writer adapters
 
 All current graph-visible writers share the publication door but have different
@@ -304,8 +319,8 @@ physical-effect proofs:
 | BranchMerge | Per table. A table the target left at the merge base: a pointer switch, the target's registration taking the source's pin. A table both sides changed: a chain of detached chunk commits on the target's pin (the bounded ordered diff), published as one pin per table (`exec/merge.rs`) | One target-branch graph commit |
 | EnsureIndices / full-text rebuild | One detached `CreateIndex` batch per productive table, published as a pin like a mutation's effect (RFC 0067); ordinary ensure leaves untrainable vector work pending, explicit FTS rebuild replaces postings from rows | One graph publication when work lands |
 | Optimize | One detached compaction `Rewrite` per productive table (Lance's plan plus every fragment still holding a dropped column), chained with a detached whole rebuild of each index whose coverage lags and a detached build of each declared-but-unbuilt index, published as pins (RFC 0067) | One main-branch graph commit with an exact CAS on the pins the batch was planned from |
-| Mutation or BranchMerge `as commit` | The writer's own physical adapter, unchanged | One unpublished commit ([RFC](../rfcs/2026-10-10-unpublished-graph-commits.md)): the complete result rows written as a detached version `D` of the target's `__manifest` with the recipe of their publication in the transaction property `omnigraph.unpublished_graph_commit`, addressed by the reserved root tag `unpublished_<id>` created put-if-absent at `D` under the same `ExactGraphHead` authority; the branch head is unchanged, a merge keeps its merge-input tags, and `commit publish "<id>"` later replays the recipe through this same door under the captured authority, required to allocate the same id |
-| Mutation `as unattached branch [on <id>]` | The writer's own physical adapter over the base's table pins: a root stages against the recorded target's live head, a child against its base snapshot's detached pins (`WriteTxn.unattached_base`, `revalidate_unattached_base`) | One unattached snapshot ([RFC](../rfcs/2026-10-11-unattached-graph-branches.md)): the complete result rows written as a detached version `D` of the recorded target's `__manifest` with the version 2 candidate property (`UnattachedCommitProperty`: id, root, parent, no row clock), addressed by the reserved tag `unattached_<root>_<C>` created put-if-absent at `D` and acknowledged only after the root authority is revalidated (`stage_unattached` + `confirm_unattached`); the branch head is unchanged, a child's `parent_commit_id` is its base, `commit publish` answers `unattached_cannot_publish` (409), `commit drop` cascades descendants-first, and every tag of a root expires with the captured target authority; never published |
+| Mutation or BranchMerge `as commit` | The writer's own physical adapter, unchanged | One unpublished commit ([RFC](../decisions/2026-10-10-unpublished-graph-commits.md)): the complete result rows written as a detached version `D` of the target's `__manifest` with the recipe of their publication in the transaction property `omnigraph.unpublished_graph_commit`, addressed by the reserved root tag `unpublished_<id>` created put-if-absent at `D` under the same `ExactGraphHead` authority; the branch head is unchanged, a merge keeps its merge-input tags, and `commit publish "<id>"` later replays the recipe through this same door under the captured authority, required to allocate the same id |
+| Mutation `as unattached branch [on <id>]` | The writer's own physical adapter over the base's table pins: a root stages against the recorded target's live head, a child against its base snapshot's detached pins (`WriteTxn.unattached_base`, `revalidate_unattached_base`) | One unattached snapshot ([RFC](../decisions/2026-10-11-unattached-graph-branches.md)): the complete result rows written as a detached version `D` of the recorded target's `__manifest` with the version 2 candidate property (`UnattachedCommitProperty`: id, root, parent, no row clock), addressed by the reserved tag `unattached_<root>_<C>` created put-if-absent at `D` and acknowledged only after the root authority is revalidated (`stage_unattached` + `confirm_unattached`); the branch head is unchanged, a child's `parent_commit_id` is its base, `commit publish` answers `unattached_cannot_publish` (409), `commit drop` cascades descendants-first, and every tag of a root expires with the captured target authority; never published |
 
 Native graph-branch create/delete is a control exception. At or above format
 18 the `branch` row of `main`'s catalog is the logical authority (RFC
@@ -315,7 +330,7 @@ the retired row are control facts that go through the publisher. Below the
 stamp `BranchContents` is that authority, and clone/delete residue is
 reclaimed only when its target is provable from it. Neither invents an
 alternate graph-content publisher. Each branch life owns a native name
-`{logical}.{ULID}` (see [RFC 0042](../rfcs/0042-incarnation-suffixed-branch-refs.md)),
+`{logical}.{ULID}` (see [the branch row in the catalog](../decisions/2026-11-19-branch-row-in-the-catalog.md)),
 the key of its row and the path of its tree; a recreated branch therefore
 never shares a path with its dead predecessor, and what the predecessor left
 (its tree, its unpublished stagings, and the table forks a pre-v11 branch
@@ -414,7 +429,7 @@ conflict so the next run re-plans. A failure before publication leaves
 unpublished staging the collector reclaims once it is dead.
 
 A mutation, load or Blob write prepared before such a publication is carried
-over it ([RFC](../rfcs/2026-11-10-writes-carried-over-row-preserving-publications.md)).
+over it ([RFC](../decisions/2026-11-10-writes-carried-over-row-preserving-publications.md)).
 Under its gates, when the head moved, `revalidate_write_txn_carrying` checks
 that the schema contract, the table set and every registration's identity,
 location, native ref and row count are unchanged, and that every moved pin
@@ -635,7 +650,7 @@ existing table path; the final CAS decides publication. A pre-publication
 failure leaves the previous contract and graph visible. After publication,
 both are complete and only the disposable in-memory view may need refresh.
 The system-column upgrade uses the same publication
-boundary. See [Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
+boundary. See [Schema contract in the manifest](../decisions/2026-09-30-schema-contract-in-manifest.md).
 
 `prepare_schema_apply_as` binds the canonical root and schema identity domain,
 exact main-branch authority, numeric manifest base, desired contract, actor and
@@ -677,7 +692,7 @@ contract into the achieved projection, or proves accepted native I/O has stopped
 exclusive admission and protected evidence remain caller obligations. These
 engine boundaries do not enable online server activation; the deployment
 protocol remains in the
-[server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md).
+[server runtime RFC](../decisions/2026-09-29-server-runtime-and-online-deployment.md).
 
 Branch merge follows it too, table by table. A table the target has not
 changed since the merge base is a pointer switch on every target: the
@@ -724,7 +739,7 @@ Delete transactions remain serial. The setting changes only
 fragment preparation: every participant still commits detached and crosses
 one graph-manifest publication.
 
-The D2 rule keeps one mutation query constructive (insert/update) or
+The mutation-mode rule (`write:1`) keeps one mutation query constructive (insert/update) or
 destructive (delete), never both. Compose mixed work through separate
 mutations, or through a branch when a later merge must expose one combined
 result.
@@ -1069,8 +1084,8 @@ A new writer must:
 - prove bounds and crash windows at the owning layer.
 
 Design rationale and rejected alternatives live in
-[RFC: Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md),
-[RFC 0067](../rfcs/0067-detached-table-commits.md),
-[RFC 0022](../rfcs/0022-unified-write-path.md),
-[RFC 0023](../rfcs/0023-key-conflict-fencing.md), and
-[RFC 0028](../rfcs/0028-stable-schema-identity.md).
+[RFC: Detached-only tables](../decisions/2026-09-21-detached-only-tables.md),
+[RFC 0067](../decisions/0067-detached-table-commits.md),
+[RFC 0022](../decisions/0022-unified-write-path.md),
+[RFC 0023](../decisions/0023-key-conflict-fencing.md), and
+[RFC 0028](../decisions/0028-stable-schema-identity.md).

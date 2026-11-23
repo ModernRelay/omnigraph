@@ -26,9 +26,9 @@ carries one `schema_contract` row containing the accepted schema source,
 compiled IR and identity. Fresh initialization writes it in the genesis
 Create; schema apply and the system-column upgrade replace it in the same
 publication as their table references. Normal serving has no root-file
-fallback. See [Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
+fallback. See [Schema contract in the manifest](../decisions/2026-09-30-schema-contract-in-manifest.md).
 
-Both system-column vintages of [RFC 0040](../rfcs/0040-system-column-namespace.md),
+Both system-column vintages of [RFC 0040](../decisions/0040-system-column-namespace.md),
 `id`/`src`/`dst` and `__id`/`__src`/`__dst`, remain supported. The schema IR's
 feature set determines the vintage, never the storage stamp.
 `omnigraph schema upgrade-system-columns` converts the spellings on a
@@ -46,13 +46,13 @@ branch ref files are unlinked after it.
 - v6 preserves v5 and adds exact non-null physical `id` fencing through
   Lance's unenforced primary-key metadata. It is the 0.9.x/0.10.x format.
 - v7 preserves v6's columns and re-keys `__manifest` registration and
-  tombstone rows ([RFC 0062](../rfcs/0062-manifest-version-clock.md)): the
+  tombstone rows ([RFC 0062](../decisions/0062-manifest-version-clock.md)): the
   trailing segment of a `table_version:` / `table_tombstone:` `object_id` is
   the `__manifest` version that wrote the row, and a table's current
   registration is the one with the greatest manifest version, not the greatest
   per-native-ref Lance version.
 - v8 preserves v7's registration clock and adds logical retirement metadata
-  on native graph refs ([RFC 0042](../rfcs/0042-incarnation-suffixed-branch-refs.md)).
+  on native graph refs.
   Branch deletion retains exact native parent history while removing logical
   branch authority. Older binaries do not interpret this metadata and could
   expose retired branches; they must refuse v8 graphs before reading or
@@ -127,8 +127,8 @@ branch ref files are unlinked after it.
   under `legacy/data/` and the flat locator objects under `legacy/locator/`
   that find a commit by id and a writer by native name. A root born at 14 has
   no `legacy/`. The layout and its bounds are in
-  [RFC 0068](../rfcs/0068-graph-commit-record.md#amendment-legacy-commits-of-the-stamp-13-upgrade).
-  A converted root lands at the current stamp, 17, so every binary that serves
+  [RFC 0068](../decisions/0068-graph-commit-record.md).
+  A converted root lands at the current stamp, 18, so every binary that serves
   only lower stamps refuses it before any open.
 - v15 adds the block registry to a branch's `__manifest`: one `history_block`
   row per released first-parent run of a `__history` block (the block, its
@@ -143,7 +143,7 @@ branch ref files are unlinked after it.
   refuses it before any open. A v14 graph is served as it is and each branch is stamped 16 by its first publish under this binary, in the CAS that
   writes its first rows; nothing is converted offline and no rows are
   backfilled. Design:
-  [block registry RFC](../rfcs/2026-10-10-merge-base-block-registry.md).
+  [block registry RFC](../decisions/2026-10-10-merge-base-block-registry.md).
   The same stamp fences the one other thing a v14 binary cannot interpret:
   the reserved `unpublished_<commit id>` tags that name a detached
   `__manifest` version holding an unpublished graph commit (RFC "Unpublished
@@ -164,7 +164,7 @@ branch ref files are unlinked after it.
   route stamps the ref.
 - v17 adds control facts to a branch's `__manifest`: rows that change no
   `table` row and no schema contract and record no graph commit
-  ([Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md#engine-control-facts-on-the-version-cas)).
+  ([Graph access and cross-process writes](../decisions/2026-10-16-graph-access-serving-and-cross-process-writes.md)).
   The first kind is the `writer_epoch` row, at most one per version, whose
   payload (`epoch`, `native`, `attempt_id`) is the JSON of the `metadata`
   column, as the `schema_contract` row's is. Every publish rewrites the hot
@@ -369,7 +369,7 @@ Stamps 10 to 13 were written by main development builds only, 13 from
 rebuild-only. Stamps that exist only between releases get no
 conversion unless a route is written for them, as for 13; each layout change
 still takes a new stamp, so a graph written in between is refused and never
-misread. [RFC 0064](../rfcs/0064-explicit-storage-upgrades.md) holds the
+misread. [RFC 0064](../decisions/0064-explicit-storage-upgrades.md) holds the
 offline protocol.
 
 ## Recovery sidecars
@@ -452,7 +452,7 @@ without credentials and with a five-second discovery bound, then validates the
 actual response header before consuming its body. Discovery failure means that
 request was not sent; a response mismatch after dispatch leaves effects unknown.
 Graph HTTP requests follow no redirects and retry nothing automatically. See the
-[HTTP admission decision](../rfcs/2026-09-30-v012-http-admission.md) and
+[HTTP admission decision](../decisions/2026-09-30-v012-http-admission.md) and
 [operator guidance](../user/operations/server.md).
 
 Upgrade CLI, server and integrations together. The shared contract identifier is
@@ -498,8 +498,8 @@ GitHub Releases, and the TypeScript SDK ships through npm. Do not document
    plus refusal and rebuild fallback evidence.
 5. Update the upgrade guide and release notes.
 
-No publication raises a branch's stamp, so a stamp above 16 reaches a served
-branch only by an explicit `omnigraph upgrade` route.
+No publication raises a branch's stamp above 16, so an existing branch reaches a
+stamp above 16 only by an explicit `omnigraph upgrade` route.
 
 ### Pins and schema contracts
 

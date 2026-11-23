@@ -8,8 +8,8 @@ rules and decision authority behind it live in [GOVERNANCE.md](GOVERNANCE.md).
 | I want to… | Go to | Notes |
 |---|---|---|
 | **Report broken existing functionality**, incorrect results, or a regression | **[Bug report](../../issues/new?template=bug_report.yml)** | Include a concrete reproduction. Maintainers review classification and decide acceptance. |
-| **Request a new capability or change to intended behavior or architecture** | **[Feature or design proposal](../../issues/new?template=feature_request.yml)** | Includes RFC ideas and amendments. Maintainers decide whether the same issue needs an RFC. |
-| **Fix something / implement a change** | **A pull request** | Must link an `accepted` issue or accepted RFC — unless it's trivial (below). |
+| **Request a new capability or change to intended behavior or architecture** | **[Feature or design proposal](../../issues/new?template=feature_request.yml)** | Includes design ideas and changes to a decision. Maintainers decide whether the same issue needs an RFC. |
+| **Fix something / implement a change** | **A pull request** | Must link an `accepted` issue or a decision record — unless it's trivial (below). |
 | **Report a security vulnerability** | **[SECURITY.md](SECURITY.md)** | Do **not** open a public Issue. |
 
 GitHub Discussions are not used — Issues are the only inbound channel.
@@ -23,11 +23,13 @@ Both forms automatically apply `needs-triage`. The bug form also applies `bug`,
 and the feature or design proposal form applies `feature`. These initial labels
 do not imply acceptance; maintainers can correct them during triage.
 
-An RFC is a later design step, not a separate intake form. Wait for maintainer
-agreement before writing one. Maintainers apply `needs-rfc` to the existing issue,
-which then tracks the RFC and implementation. Do not open a second issue for it.
-Implementation requires the RFC's explicit `status: accepted`; merging a draft
-does not accept it. See the [RFC process](docs/rfcs/README.md).
+An RFC is a later design step, not a separate intake form, and it is a pull
+request, not a file: it changes [the contract](docs/dev/contract.md) and adds a
+one-page [decision record](docs/decisions/README.md), before the code. Wait for
+maintainer agreement before opening one. Maintainers apply `needs-rfc` to the
+existing issue, which then tracks the RFC and implementation. Do not open a
+second issue for it. Implementation starts when the RFC merges. See
+[GOVERNANCE.md](GOVERNANCE.md#rfcs).
 
 ### Bug reports
 
@@ -44,12 +46,12 @@ checkout. If you ran it, include the command and failure output.
 A reproduction does not automatically accept a report; maintainers decide acceptance.
 
 ### When can I just open a PR?
-The **trivial fast-lane** — open directly, no prior issue/RFC needed, when the
+The **trivial fast-lane** — open directly, no prior issue or RFC needed, when the
 change is clearly broken-fixing with small blast radius and no design impact:
 typo and wording fixes, doc corrections, dependency bumps, comment fixes,
 obvious one-line CI tweaks. **If you cannot tell trivial from real, it is real
 — open the issue.** Anything more substantial needs a backing `accepted` issue
-or accepted RFC first, so the *why* is agreed before the *how* is reviewed. A PR
+or merged RFC first, so the *why* is agreed before the *how* is reviewed. A PR
 that turns out to be non-trivial will be redirected — that's about process, not
 the merit of the change.
 
@@ -136,15 +138,14 @@ CI runs both.
     adds the `skip-changelog` label when users can see nothing of it.
   - the description starts lowercase (a backtick or a digit is fine), has no
     trailing period, and the whole title stays within 100 characters.
-  - an RFC PR is `rfc: <the RFC's subject>`, not `docs(rfc):`; RFC numbers
-    stay out of titles (RFCs are named by date and slug). A revert is
+  - an RFC PR is `rfc: <the design's subject>`, not `docs(rfc):`. A revert is
     `revert: <what is undone>`; retitle GitHub's `Revert "…"` default.
   - examples: `feat(server): return exact merge publication receipts`,
     `fix(merge): decide fast_forward by the target's state`,
     `test(gq): cover inherited indexes after fast-forward`,
     `docs: fix a broken link in the upgrade guide`.
-- **Link the backing `accepted` issue or accepted RFC** (`Closes #123`, or
-  reference the RFC) — or mark the PR as trivial per the fast-lane.
+- **Link the backing `accepted` issue or decision record** (`Closes #123`, or
+  the record's path) — or mark the PR as trivial per the fast-lane.
 - Keep changes focused; one logical change per PR.
 - Include tests for behavior changes when practical.
 - Update public docs when the user-facing surface changes.

@@ -1,6 +1,6 @@
 <!--
   Thanks for contributing! See CONTRIBUTING.md and GOVERNANCE.md.
-  A substantive PR needs a backing accepted issue or accepted RFC.
+  A substantive PR needs a backing accepted issue or decision record.
   Title: `type(scope)!: lowercase description` (types and examples in
   CONTRIBUTING.md, Pull Requests); the `PR Title` check refuses anything else.
 
@@ -34,7 +34,7 @@
   The four questions, in this order:
 
   1. What was wrong or missing, and what it cost; open with `Closes #N` or the
-     RFC path. A trivial change (typo, docs, comment, dependency bump,
+     decision record's path. A trivial change (typo, docs, comment, dependency bump,
      one-line CI; CONTRIBUTING.md) has neither and deletes the `Closes #`
      line. A feature: what could not be done. A fix: what failed, on which
      input. A refactor: what made the next change hard. Docs or CI: what a

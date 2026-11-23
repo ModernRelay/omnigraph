@@ -370,7 +370,7 @@ before duplicating destination rows per edge.
 Limits remain above destination hydration and filtering; no expansion cap
 can discard candidates before those operators decide which rows survive.
 
-Pass 6 (`late_materialization`) also runs on a query plan
+The `late_materialization` pass also runs on a query plan
 (`optimizer::materialize_returns_late`). A return column that nothing but the
 output reads (a bare `$b.property` item: not a key, the identity, a `Blob`, a
 sort key, a column a filter, join, traversal or aggregate reads, or a return
@@ -1104,7 +1104,7 @@ Statement execution accumulates logical changes in `MutationStaging`:
 - insert and update append pending row batches;
 - update reads the committed snapshot plus prior pending batches;
 - delete records predicates and stages one deletion transaction at finalize;
-- the D2 rule rejects a query that mixes constructive
+- the mutation-mode rule (`write:1`) rejects a query that mixes constructive
   (insert/update) and destructive (delete) statements.
 
 No statement advances a production table HEAD. After every statement and
@@ -1114,7 +1114,7 @@ touched table and enters the shared write protocol. See
 
 ## Loads and graph batches
 
-All load modes share the mutation publisher and recovery protocol:
+All load modes share the mutation publisher and its detached-commit write protocol:
 
 | Mode | Current physical intent |
 |---|---|
@@ -1235,7 +1235,7 @@ the node-side count as the typed `source_cardinality` check; the overwrite
 judge (`validate/load.rs`) refuses a plan whose minimum lacks the scan, and
 append and merge reach the evaluator.
 
-Validation completes before recovery arm and table effects. For selected
+Validation completes before any table effect. For selected
 external Blob inputs, policy and retained-metadata accounting complete before
 target I/O; source probing, any required materialization, and payload-size
 admission complete before durable graph movement. See [blob.md](blob.md).
@@ -1257,7 +1257,7 @@ a separate design, not a hidden loader behavior.
 
 Schema apply, mutation, and Load publish logical data and index intent only.
 `ensure_indices` materializes declared missing indexes and rebuilds BTREE and
-vector indexes whose coverage lags, on any branch, through the shared recovery
-protocol; `optimize` does the same on `main` after compaction. Reads
+vector indexes whose coverage lags, on any branch, and publishes them in one
+graph commit; `optimize` does the same on `main` after compaction. Reads
 remain correct through Lance's indexed-plus-unindexed scan behavior while
 coverage converges.

@@ -1,67 +1,169 @@
 # Documentation guide
 
-Documentation is part of Omnigraph's public contract. Keep each fact in one
-place, at the narrowest audience that needs it.
+**Audience:** anyone, an agent included, who writes or changes a document
+**Authority:** which documents exist, what each may hold, and the checks that
+keep them small
 
-## Content ownership
+Agents write the code here and read the documents before every change. A
+person reads little of either. So a document earns its place only by holding
+what the code cannot say, and a long or partly stale page is worse than no
+page: an agent takes all of it as true.
 
-| Location | Owns | Does not own |
-|---|---|---|
-| `docs/user/` | Supported behavior, concepts, workflows, configuration, limits, and operator action | Code structure, recovery protocols, test evidence, design history |
-| `docs/dev/` | Current architecture, invariants, support boundaries, and how to change/test the system | Roadmaps, stale implementation plans, release history |
-| `docs/rfcs/` | Proposals, decisions, rationale, alternatives, evidence, and disposition | The current user manual or a second implementation reference |
-| `changelog.d/` | Permanent notes written with each user-visible change | Current user instructions |
-| `docs/releases/` | Published release history and generated version snapshots | Evergreen instructions |
-| Code and tests | Exact types, fields, constants, and executable assertions | Long-form product guidance |
-| Issue tracker | Open work, sequencing, and ownership | Current architecture |
+## The test
 
-Git history is the archive for superseded drafts. Do not keep a stale design in
-`docs/dev/` merely because it may be interesting later.
+Before writing a sentence, ask: **can the code say this itself?** If it can,
+the sentence is a second copy that goes stale. Put it in the code, as a type,
+a test or a doc comment, and leave it out of `docs/`.
+
+The code cannot say four things:
+
+1. What a caller is promised, before the code keeps the promise.
+2. What the system is optimized for.
+3. What an implementation must never do, when nothing in the code refuses it.
+4. Why a design was chosen, and what was turned down.
+
+Each has one home below. A fact has one owner; every other page cites it.
+
+## Kinds of document
+
+| Kind | Where | Holds | Loaded | Budget |
+|---|---|---|---|---|
+| Contract | [contract.md](contract.md) | What each operation promises its caller: the target, the gaps and the open decisions | Every session | 53,000 bytes |
+| Work | [workload.md](workload.md) | What the system is optimized for, and the evidence | On demand | 36,000 bytes |
+| Rules | [invariants.md](invariants.md) | What an implementation must never do, each with its reason | Every session | 12,500 bytes |
+| Map | [`AGENTS.md`](../../AGENTS.md) | Which crate owns what, which page to read, the commands and the change discipline | Every session | 14,500 bytes |
+| Decision | [`docs/decisions/`](../decisions/README.md) | Why one design was chosen and what was rejected | On demand | 5,000 bytes each |
+| Testing rules | [testing.md](testing.md) | Where a test goes and the rules for adding one | Every session | 8,500 bytes |
+| Guide | the rest of `docs/dev/` | What spans more than one module and so has no single doc comment to live in | On demand | 60,000 bytes each |
+| User guide | `docs/user/` | Supported behavior, for someone who uses the CLI, the HTTP API or a deployment | By users | 350 lines each |
+| Release note | `changelog.d/`, `docs/releases/` | What changed for a user, written with the change | By users | see [Release notes](#release-notes) |
+
+`scripts/check-docs.py` holds the budgets and fails a page that passes its
+own. Three guides are over the guide budget today (`execution.md`,
+`test-ownership.md`, `writes.md`); each has a ceiling there that only goes
+down. A page over budget is split by owner or cut; a budget is raised only in
+a pull request whose description says what the page could not lose.
+
+Nothing else is kept:
+
+- **How a mechanism works** is the module's own doc comment, beside the code
+  it describes, reviewed in the same diff. A guide keeps only what crosses
+  modules: an order of steps, an authority boundary, a protocol.
+- **History** is git. No "previously", no account of how a design changed.
+- **Plans and status** are issues. No phase list, no "not yet", no "next".
+- **Evidence** is a checked-in test or benchmark. A page names it and repeats
+  none of its numbers.
+- **Proposals** are pull requests. Nothing on `main` is a draft.
+
+## Two readers
+
+Every page is written for an agent first: exact, complete, one term for one
+meaning. Precision comes before ease of reading.
+
+A page that every session loads also opens with a section for a person, in
+[ASD-STE100 Simplified Technical English](contract.md#editing-this-page):
+sentences of 25 words or fewer, active voice, simple tenses, each term
+defined at its first use. It adds no fact. It changes in the same pull
+request as the statement it summarizes.
+
+## Writing a page
+
+- Open with **Audience** and **Authority**: who reads the page, and which
+  facts it owns and which it leaves to another page.
+- State what is true now, in the present tense. A statement about the code
+  is checked against the code before it is written.
+- Name a thing by what it is. A file path, a type or a test name is better
+  than a description of it.
+- Cite [the contract](contract.md#citing) by address (`E2`, `write:3`,
+  `G2`) wherever a page relies on a promise. Do not restate the promise.
+- Do not cite a pull request, an issue, a date or a person as the reason for
+  a statement. Give the reason.
+- Do not write a source line number. It is stale after the next edit.
+- Spell the product `Omnigraph`.
+
+## Decisions
+
+A decision record answers one question for an agent about to change a
+design: was this shape chosen on purpose, and what was already tried? The
+format is in [`docs/decisions/README.md`](../decisions/README.md).
+
+- **When one is needed.** A change that is costly to reverse: a storage or
+  wire format, a recovery protocol, a query-language or API contract, a new
+  substrate dependency, or an exception to the
+  [deny-list](invariants.md#deny-list). The record lands in the pull request
+  that makes the decision, with the contract statements it changes. An
+  irreversible storage, protocol or substrate decision also lands its
+  compatibility, refusal, crash and rebuild evidence as tests
+  ([invariant 13](invariants.md#hard-invariants)).
+- **A proposal is a pull request**, an RFC, titled `rfc: …`
+  ([GOVERNANCE.md](../../GOVERNANCE.md#rfcs)). Its description carries the problem, the
+  alternatives and the argument, and its thread carries the debate. To agree
+  on a design before the code exists, open a pull request that changes the
+  contract and adds the record: the contract is the target, so its statement
+  may land first, with a row under [Gaps](contract.md#gaps) until the code
+  follows.
+- **One decision, one record.** A record that a later decision replaces is
+  deleted in the same pull request; the later record's **Rejected** section
+  says what the earlier design was and why it lost.
+- **A rejected idea is one line.** When a design is turned down and likely
+  to be proposed again, it becomes an entry of the
+  [deny-list](invariants.md#deny-list): what not to build, and why.
+- **A record follows the code.** A change that makes a record's statement
+  false changes the record in the same pull request. A record whose design
+  is fully removed is deleted.
+- **Code cites a record by its file name** or, for the records that code
+  already names by number, by `RFC NNNN`: the record's **Cited as** line
+  carries that label.
+
+The design files that came before this system, under `docs/rfcs/`, are in
+git history. The last commit that holds them is `65e38056c`:
+
+```bash
+git show 65e38056c:docs/rfcs/README.md
+```
+
+They are history, not guidance: many describe designs that were never built
+or were replaced.
 
 ## User documentation
 
-Write for someone using the CLI, HTTP API, or deployment—not for a contributor
-reading the implementation.
+Write for someone using the CLI, HTTP API, or deployment, not for a
+contributor reading the implementation.
 
 - Lead with the task or guarantee.
 - Show one canonical command or request, then link to the reference.
 - Explain public consequences of atomicity, recovery, and indexing without
   naming internal tables, structs, sidecars, or protocol generations.
-- Document supported behavior only. Put planned work in an issue or draft RFC.
+- Document supported behavior only. Planned work is an issue.
 - State limits when they change what a user must do; omit internal tuning and
   implementation evidence.
 - Give a concept one owner. Other pages use a sentence and a link rather than a
   second explanation.
 - Prefer current canonical names. Mention deprecated aliases only in a compact
   compatibility section.
+- Do not link to a decision record. A user page states the behavior itself.
 
 Most authored user pages should fit in 80–220 lines. Longer reference material
 must earn its size and should be generated from the defining schema when
 practical.
 
-## Developer documentation
+## Where a fact goes
 
-Developer docs answer three questions: what is true now, why must it remain
-true, and where should a change be made and tested?
+| The fact | Goes in |
+|---|---|
+| A caller can observe it | [The contract](contract.md), then the user guide |
+| The code must never do it | [Invariants](invariants.md) |
+| Why this design, and not that one | A [decision record](../decisions/README.md) |
+| How one module works | That module's doc comment |
+| How several modules work together | The guide that owns the flow ([index](index.md)) |
+| Which suite tests it | [Test ownership](test-ownership.md) |
+| A Lance behavior relied on | [Lance compatibility fences](lance-fences.md) |
+| A measurement | A checked-in test or benchmark |
+| Work that is not done | An issue |
+| What changed for a user | A `changelog.d` note |
 
-- Describe stable components and flows, not mutable source line numbers.
-- Link to code for exact serialized shapes and constants.
-- Link to an RFC for rationale, rejected alternatives, or historical evidence.
-- Keep benchmarks and migration evidence with the release or RFC that used
-  them; do not grow an evergreen ledger.
-- Remove a plan after it lands. Transfer only the durable outcome into current
-  architecture or invariants.
-- Name unsupported boundaries plainly without presenting a speculative design
-  as current architecture.
-
-## RFCs
-
-Every project RFC lives directly under `docs/rfcs/` and follows the metadata,
-filename, lifecycle, and template in [the RFC guide](../rfcs/README.md). There
-is one namespace and one lifecycle for public and maintainer-authored RFCs.
-
-An RFC remains a decision record after implementation. Update its disposition,
-but keep day-to-day instructions in user or developer docs.
+Do not create a new page for a fact this table places. A new guide needs a
+flow that no existing guide owns.
 
 ## Documentation tools
 
@@ -341,13 +443,12 @@ Every release runs these steps in order.
 
 Before merging documentation:
 
-1. Verify behavior against current code, CLI help, OpenAPI, and existing tests.
-2. Check whether another page already owns the concept.
-3. Remove future promises and internal detail from user docs.
-4. Remove stale plans, evidence ledgers, and duplicated RFC content from
-   developer docs.
-5. Use relative Markdown links and run the documentation checks.
-6. Read the rendered diff for examples, headings, and scanability.
+1. Could the code say this itself? Then it does not belong in `docs/`.
+2. Verify behavior against current code, CLI help, OpenAPI, and existing tests.
+3. Check whether another page already owns the fact; cite it, do not repeat it.
+4. Remove plans, status, history, evidence ledgers and internal detail.
+5. Check the page against its budget.
+6. Use relative Markdown links and run the documentation checks.
 
 After [activating the documentation environment](#documentation-tools):
 

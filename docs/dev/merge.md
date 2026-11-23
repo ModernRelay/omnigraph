@@ -30,7 +30,7 @@ block without rows is walked from its records. Registry rows past
 reuses by reference. A registry push repacks smaller cold fragments; a merge
 caches them by data-file path and imports only rows absent from the target.
 `optimize` preserves this fragment layout; only the catalog publisher repacks it.
-See the [block registry RFC](../rfcs/2026-10-10-merge-base-block-registry.md).
+See the [block registry RFC](../decisions/2026-10-10-merge-base-block-registry.md).
 
 ## Per-table decision
 
@@ -437,7 +437,7 @@ carries `None`, and a dry run reports its outcome with `commit: None`. Return th
 HEAD or history: a concurrent writer may have advanced the target already.
 Optional source deletion is a subsequent action with its own authorization and
 structured error; it cannot replace the successful merge receipt. See
-[Exact merge receipts](../rfcs/2026-09-30-exact-merge-receipts.md).
+[Exact merge receipts](../decisions/2026-09-30-exact-merge-receipts.md).
 
 ## Owners
 
@@ -465,4 +465,4 @@ structured error; it cannot replace the successful merge receipt. See
 - `crates/omnigraph-core/src/instrumentation.rs` — route and timing probes.
 
 See [writes.md](writes.md), [recovery.md](recovery.md), and
-[RFC 0023](../rfcs/0023-key-conflict-fencing.md).
+[RFC 0023](../decisions/0023-key-conflict-fencing.md).

@@ -168,7 +168,7 @@ jobs:
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
 
-      - name: Verify documentation structure and RFC registry
+      - name: Verify documentation structure, decision records and budgets
         run: python3 scripts/check-docs.py
 
       - name: Test release-note composition

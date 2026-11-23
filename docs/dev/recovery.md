@@ -7,9 +7,9 @@ A graph write becomes visible at its branch's `__manifest` publication. The
 published table references and accepted schema contract are complete together;
 normal open never installs a contract from root files. No writer arms a
 recovery sidecar, classifier, roll-forward, rollback, `Restore` compensation or
-recovery audit ([RFC 0067](../rfcs/0067-detached-table-commits.md)). Table pins
+recovery audit ([RFC 0067](../decisions/0067-detached-table-commits.md)). Table pins
 are not promoted onto linear history
-([Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md)). Ordinary open neither starts nor resumes a storage
+([Detached-only tables](../decisions/2026-09-21-detached-only-tables.md)). Ordinary open neither starts nor resumes a storage
 conversion and refuses a graph that carries a pending one; the offline
 `omnigraph upgrade` owns it ([Pending storage conversion](#pending-storage-conversion)).
 
@@ -75,7 +75,7 @@ across a binary swap is prepared again, never settled by the other build.
 Historical queries keep the accepted live contract and rebind its aliases by
 stable identity to the selected historical table image. Retained contract rows
 do not introduce historical schema-language semantics. See
-[Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
+[Schema contract in the manifest](../decisions/2026-09-30-schema-contract-in-manifest.md).
 
 ## Pending storage conversion
 
@@ -308,10 +308,10 @@ logical branch list alone is not proof.
 - Cluster recovery has a separate control-plane protocol described in
   [control-plane.md](control-plane.md); it never substitutes for graph recovery.
 
-The design rationale is [RFC 0067](../rfcs/0067-detached-table-commits.md),
+The design rationale is [RFC 0067](../decisions/0067-detached-table-commits.md),
 which supersedes the sidecar protocol of
-[RFC 0022](../rfcs/0022-unified-write-path.md), and
-[RFC: Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md),
+[RFC 0022](../decisions/0022-unified-write-path.md), and
+[RFC: Detached-only tables](../decisions/2026-09-21-detached-only-tables.md),
 which removes RFC 0067's promotion. The
-[schema-contract RFC](../rfcs/2026-09-30-schema-contract-in-manifest.md)
+[schema-contract RFC](../decisions/2026-09-30-schema-contract-in-manifest.md)
 replaces its separate contract installation.

@@ -256,7 +256,8 @@ after every apply.
 
 `.github/CODEOWNERS` names the reviewers GitHub requests for workspace
 members: one anchored line per member directory (under `crates/`, `tools/`
-and `skills/`), plus one for `/deny.toml`, the dependency allowlist. A member
+and `skills/`) except `omnigraph-gqt-core`, `omnigraph-gqt-served` and
+`omnigraph-mcp`, plus one for `/deny.toml`, the dependency allowlist. A member
 without a line, like every other path, requests nobody. GitHub reads the copy on `main`,
 requests the listed people when a pull request is opened ready for review,
 marked ready, or gains a matching path in a later push, and never requests the

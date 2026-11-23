@@ -46,8 +46,8 @@ five more changes like this one?**
 
 4. **A mutation publishes once.** `mutate`, `load`, schema apply, merge, and
    equivalent multi-table operations stage all participants and publish once.
-   They do not acknowledge or publish per statement or per table. The D2
-   constructive-versus-destructive mutation split remains explicit.
+   They do not acknowledge or publish per statement or per table. A mutation
+   holds inserts and updates, or deletes, never both (`write:1`).
 
 5. **Crash convergence is part of the commit protocol.** An effect that is
    durable before publication must be unreachable: a detached version or a
@@ -55,9 +55,9 @@ five more changes like this one?**
    collector reclaims such a version only when the publication authority
    its transaction properties record is provably gone; age does not prove
    abandonment. The two explicitly requested exceptions are the publishable
-   proposal (`as commit`, [RFC](../rfcs/2026-10-10-unpublished-graph-commits.md))
+   proposal (`as commit`, [decision](../decisions/2026-10-10-unpublished-graph-commits.md))
    and the nonpublishable snapshot (`as unattached branch`,
-   [RFC](../rfcs/2026-10-11-unattached-graph-branches.md)): each writes a
+   [decision](../decisions/2026-10-11-unattached-graph-branches.md)): each writes a
    detached `__manifest` version reachable by its graph commit id through a
    reserved tag, `unpublished_<id>` for the proposal and
    `unattached_<root>_<C>` for the snapshot, which acknowledges durable
@@ -131,15 +131,17 @@ five more changes like this one?**
     full history on every call.
 
 13. **Evidence matches the boundary.** Test the layer whose contract changed.
-    Irreversible storage, protocol, or substrate decisions require an RFC plus
-    compatibility, refusal, crash, and rebuild evidence. Cost claims require a
+    Irreversible storage, protocol, or substrate decisions require a
+    [decision record](documentation.md#decisions) plus compatibility, refusal,
+    crash, and rebuild evidence. Cost claims require a
     checked-in instrument. Extend the existing owner
     ([testing.md](testing.md), [test ownership](test-ownership.md)) before
     adding a parallel fixture.
 
 ## Deny-list
 
-Treat these shapes as rejected until an RFC demonstrates why the case is
+Treat these shapes as rejected until a
+[decision record](documentation.md#decisions) argues why the case is
 different:
 
 - a custom WAL, transaction manager, buffer pool, or storage primitive already
@@ -160,61 +162,30 @@ different:
 - process-local locks presented as distributed writer fencing;
 - silent retries, partial results, swallowed errors, or acknowledgement before
   durable graph visibility;
-- maintained parallel truth or cold full-history reconstruction per request.
+- maintained parallel truth or cold full-history reconstruction per request;
+- an ingest tier that acknowledges a write before the graph shows it, a
+  Lance MemWAL included: per-table durability still needs graph-level
+  validation, a fold and one cross-table publication, and that coordination
+  costs more than the commit it defers ([ingestion](ingestion.md));
+- a node or edge type the engine writes into a user's graph on its own, such
+  as an automatic actor node: it changes the schema format for every reader,
+  and an export then holds rows that a load refuses.
 
-Cases an RFC has argued: the flat locator objects and legacy data files under
+Cases a decision record has argued: the flat locator objects and legacy data files under
 `__history/legacy/`, written once by the storage upgrade (from stamp 8, 9 or 13), in the
-[RFC 0068 amendment](../rfcs/0068-graph-commit-record.md#why-this-is-not-a-deny-list-shape).
+[legacy commit files](../decisions/0068-graph-commit-record.md).
 
-## Current support boundaries
+## Support boundaries
 
-- The server is cluster-only and ledger v2 is the sole operational protocol.
-  Server-owned apply activates schemas, queries, policies, provider/Blob bindings
-  under existing writer admission.
-  Runtime views share engine authority and retain immutable request bindings.
-  Direct apply bootstraps or deploys while serving is stopped. Legacy ledger
-  conversion is explicit and preserves data; no v1 executor remains. Removing
-  a graph declaration authorizes deletion of its exact managed root and all
-  retained history, after affected admission closes and admitted work drains.
-  The existing ledger records deletion intent before effects and owns resumption
-  through verified root absence. Adoption and missing-root recreation remain
-  unsupported; unexpected roots and schema drift refuse rather than infer
-  identity from matching text.
-  One outstanding durable authority owns completion/recovery. Generic drain
-  does not prove native-I/O settlement. Clean server release additionally closes
-  its explicit storage scope, drains accepted backend mutations and refuses
-  sticky uncertainty; a converged direct apply releases by the same proof.
-  S3 release/reacquisition uses the same lock key by CAS.
-  Excluding raw and older writers remains an operator obligation.
-- Azure writes require the admission wrapper and remain a qualification preview
-  pending the adversarial live-Azure matrix. The narrower managed-identity
-  smoke proof is complete.
-- Schema apply retains its main-only, single-live-branch restriction and
-  process-local gate ordering. Its contract and table references publish
-  together; the removed file-installation protocol supplies no distributed
-  lock. Branch creation/deletion and cleanup retain their existing
-  single-writer-process control boundary.
-- The writer epoch fences publications that move a branch's head, on a branch
-  some process claimed ([writes](writes.md#writer-epoch)). Only the embedded
-  engine claims: no command or route does, so a claimed branch refuses the
-  server and the CLI. Branch create and delete are fenced through `main`'s
-  epoch at or above format 18: the branch row and the retired row are
-  publications on `main`, and the tombstone on the branch's chain asserts no
-  epoch. The collector's deletes and its removal of a retired row's entry,
-  `optimize`'s configuration commit, the stamp-only route of
-  `omnigraph upgrade`, and below format 18 the ref metadata and ref deletes
-  are not fenced. The process that holds
-  its handle's bound branch reads it, and opens and revalidates its writes on
-  it, with no head probe ([writes](writes.md#writer-epoch) lists the sites and
-  the captures that still probe), so the reads of an owner another process
-  replaced, or whose branch another process deleted, are stale until its next
-  publish on the branch. One mutation-capable writer process per cluster
-  remains the supported topology.
-- Physical index reconciliation is explicit; there is no background scheduler
-  whose queue is a second authority.
-
-These are constraints, not roadmap ledgers. Change one only with the owning
-code, tests, guide, and—when irreversible—RFC.
+What Omnigraph supports today is stated where a caller observes it, in
+[the contract](contract.md#gaps): one writing process per cluster (`G2`,
+`G13`), Azure writes as a preview (`G4`), schema apply on `main` with no
+other live branch (`D6`), and maintenance only when asked (`maintain:1`).
+The mechanism behind each boundary has one owner:
+[control plane](control-plane.md#support-boundaries) for serving, apply and
+graph removal, and [writer epoch](writes.md#writer-epoch) for what the fence
+covers. Change a boundary only with the owning code, tests, guide and, when
+it is costly to reverse, a [decision record](documentation.md#decisions).
 
 ## Review checklist
 

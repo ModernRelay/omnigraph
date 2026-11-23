@@ -192,7 +192,7 @@ pub(super) fn kept_rows(mask: &BooleanArray) -> BooleanArray {
 /// non-finite floats), and so are the type and cast checks `evaluate_expr`
 /// runs on the rows it evaluates. An operand that can fail must not be
 /// evaluated on unselected rows at any share: the rule of
-/// `docs/rfcs/2026-09-24-shared-expression-model.md` that keeps a fallible
+/// `docs/decisions/2026-09-24-shared-expression-model.md` that keeps a fallible
 /// conjunct behind the conjuncts guarding it. The change that adds such an
 /// operand takes the gather path for it whatever the share.
 pub(super) fn evaluate_filter_where(

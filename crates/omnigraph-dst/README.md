@@ -165,4 +165,4 @@ edges, a compile-fail guard on the `dst` feature boundary — are tracked
 by issue only; until those land, strict-replay claims are scoped to the
 report projection and the labeled deterministic arms. The full gap index
 is the "Deferred to v2" table in
-`docs/rfcs/0037-deterministic-simulation-harness.md`.
+`docs/decisions/0037-deterministic-simulation-harness.md`.

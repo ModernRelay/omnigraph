@@ -312,8 +312,8 @@ title edit after queueing cannot change what lands unchecked
 checked on the pull request, so the merge-group run does not check them again.
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
-validates local documentation links, user/developer audience boundaries, RFC
-location and metadata, registry agreement, and the absence of committed
+validates local documentation links, user/developer audience boundaries, the
+format of decision records, the byte budget of each page, and the absence of committed
 merge-conflict markers in Markdown. Before the documentation checks run,
 the same context also rejects any pull request whose own diff adds a
 conflict-marker line in any file type (a pull-request-only step; the

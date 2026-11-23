@@ -822,7 +822,7 @@ impl Omnigraph {
     }
 
     /// Open a shallow clone of the graph at `base_uri`, rooted at `root_uri`
-    /// (`docs/rfcs/2026-11-10-graph-shallow-clone.md`): the clone starts with
+    /// (`docs/decisions/2026-11-10-graph-shallow-clone.md`): the clone starts with
     /// every branch, version, commit and index of the base, every write lands
     /// under `root_uri`, and the base is never written. Both are local
     /// directories or `s3://` prefixes of one endpoint, and `root_uri` is an

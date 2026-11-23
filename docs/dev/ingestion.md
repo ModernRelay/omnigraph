@@ -2,7 +2,7 @@
 
 Omnigraph has one durable ingestion model: a bounded batch becomes visible through the ordinary `Load` writer and one graph commit. There is no separate streaming database, WAL, token ledger, lane lifecycle, or acknowledgement tier.
 
-The rejected designs are retained in [RFC 0018](../rfcs/0018-ingest-wal.md) and [RFC 0026](../rfcs/0026-memwal-streaming-ingest.md). They are history, not implementation guidance.
+A streaming tier in front of the commit was built and removed; the [deny-list](invariants.md#deny-list) says why.
 
 ## Current surfaces
 

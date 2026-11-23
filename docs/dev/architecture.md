@@ -194,7 +194,7 @@ not inherit either. Version 1 rejects custom destination CA combined with an
 HTTPS proxy; HTTP CONNECT proxies support custom destination CAs. Workload federation, cloud-direct
 schemas, BYOC private-route attestation and additional transports are not implied
 by the config rewrite. See the
-[operator RFC](../rfcs/2026-10-20-operator-connections-and-credential-providers.md)
+[operator RFC](../decisions/2026-10-20-operator-connections-and-credential-providers.md)
 for rationale and [user reference](../user/cli/targets.md) for the supported contract.
 
 `commands/query` owns `query`, `mutate` and alias execution. Its
@@ -304,7 +304,7 @@ gates for single-writer ownership.
 
 ## Concurrency and support boundary
 
-- Reads are snapshot-isolated. A read-view capture takes a shared schema
+- A read sees one commit for its whole run (contract `E1`). A read-view capture takes a shared schema
   permit (so it cannot observe a contract mid-swap) and no branch or table
   gate, so it does not wait for writers on other handles. It does wait for
   an exclusive pass on any handle of the process (schema apply, the
@@ -327,9 +327,10 @@ gates for single-writer ownership.
   authority and Lance transaction identity.
 - The gates prevent same-process races and deadlocks; manifest preconditions,
   Lance transactions, and accepted manifest identities provide durable correctness.
-- Some maintenance and destructive-recovery classifiers intentionally retain
-  a one-mutation-process support boundary. Do not infer distributed writer
-  safety from an in-process mutex. [recovery.md](recovery.md) names the modes.
+- Branch create and delete, schema apply, dropping a proposal and `cleanup`
+  intentionally retain a one-mutation-process support boundary. Do not infer
+  distributed writer safety from an in-process mutex. Gap `G2` of
+  [the contract](contract.md#gaps) names them.
 - Missing physical indexes or stale cache entries may change cost, never query
   meaning. Explicit reconciliation restores physical coverage.
 
@@ -342,7 +343,7 @@ instead of flattening Lance, `object_store`, or filesystem failures into
 strings. `StorageFailure::is_transient()` is true only for positive transient
 evidence; it is not permission to replay an operation. The operation that owns
 the effect boundary still decides whether a retry is safe, and unknown evidence
-stays unknown. [RFC 0038](../rfcs/0038-typed-storage-failures.md) records the
+stays unknown. [RFC 0038](../decisions/0038-typed-storage-failures.md) records the
 rationale and compatibility change.
 
 ## Storage backends
@@ -364,7 +365,7 @@ version, including correlated inner reads. `PlanSource` exposes one fact per
 index name and keyed column. Coverage unions same-name segments and intersects
 current fragments; missing bitmaps remain unknown. The planner prices Expand
 as fully indexed only when every required endpoint has complete usable BTREE
-coverage across its candidates. See the [index-facts decision](../rfcs/2026-10-08-index-facts-as-planner-input.md).
+coverage across its candidates. See the [index-facts decision](../decisions/2026-10-08-index-facts-as-planner-input.md).
 
 Saved Expand inputs carry coverage provenance. Fresh plans use pinned facts;
 accepted older plans with no provenance default to the legacy runtime probe.

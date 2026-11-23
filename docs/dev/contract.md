@@ -623,18 +623,18 @@ statement. "See" names the invariant or the design that bears on it.
 | Gap | Where | Today | See |
 |---|---|---|---|
 | `G1` | `E4` | On a local filesystem an acknowledged commit survives a crash of the process, not necessarily a power loss. On an object store it is stored for good at success | Invariants deny-list: no acknowledgement before durable visibility |
-| `G2` | Boundary, Processes | One writing server or program per cluster is supported. Across two, a `write`, `merge`, `schema` or `maintain` that loses the race for a head is checked against the new head or refused; branch create and delete, schema apply, dropping a proposal and `cleanup` are safe from one only. Writers through one server are served in arrival order; across two, a writer that keeps losing the race is refused after five attempts and nothing keeps it from starving. A writer that was displaced while it was stalled can no longer publish over a head that moved; it can still delete a branch or finish a `cleanup` | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md), accepted, in progress |
+| `G2` | Boundary, Processes | One writing server or program per cluster is supported. Across two, a `write`, `merge`, `schema` or `maintain` that loses the race for a head is checked against the new head or refused; branch create and delete, schema apply, dropping a proposal and `cleanup` are safe from one only. Writers through one server are served in arrival order; across two, a writer that keeps losing the race is refused after five attempts and nothing keeps it from starving. A writer that was displaced while it was stalled can no longer publish over a head that moved; it can still delete a branch or finish a `cleanup` | [Graph access and cross-process writes](../decisions/2026-10-16-graph-access-serving-and-cross-process-writes.md), Not built |
 | `G3` | `E7`, `maintain.changes` | Building a full-text index can change `bm25` scores, their order and a limited result | Invariant 7 |
-| `G4` | Boundary, The store | Azure writes are a preview, and need a separate guard that admits one writer | [RFC 0029](../rfcs/0029-azure-blob-storage.md), accepted, in progress |
+| `G4` | Boundary, The store | Azure writes are a preview, and need a separate guard that admits one writer | [Azure Blob storage](../decisions/0029-azure-blob-storage.md), Not built |
 | `G5` | `read+reclaim` | Nothing coordinates `cleanup` with a running read. A read of a commit the keep rule drops is refused as reclaimed if the removal came first, and can fail with an untyped error if the removal lands while it runs. No test covers it | Invariant 3 |
-| `G6` | `write.changes` | A write that changes no value still publishes a commit, and so does a load with no rows | No design yet |
+| `G6` | `write.changes` | A write that matches a row and leaves every value as it was still publishes a commit, and so does a load with no rows. A mutation that matches no row and a `blob clear` of a null cell publish none | No design yet |
 | `G7` | `E4` | Graph writes carry no request identity. Only a write with a named head or a keyed upsert is safe to send again, the second at the cost of a commit. Recorded operations do carry one | No design yet |
 | `G8` | `write:4` | There is no revert. Undo is a hand-written inverse commit, or a branch started at the earlier commit | No design yet |
 | `G9` | Definitions, Commit | A commit records its actor only | No design yet |
 | `G10` | `read:8` | The feed is polled. It filters by kind, type and operation, with no condition over the changed entities | No design yet |
 | `G11` | `branch:3` | A branch listing shows head, origin and times, not owner, task or changed entities | No design yet |
 | `G12` | `read:9` | Types and properties carry descriptions, and nothing searches them | No design yet |
-| `G13` | Boundary, Processes | One server serves a cluster, and read-only CLI commands may read beside it. There is no read-only serving mode | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md) |
+| `G13` | Boundary, Processes | One server serves a cluster, and read-only CLI commands may read beside it. There is no read-only serving mode | [Graph access and cross-process writes](../decisions/2026-10-16-graph-access-serving-and-cross-process-writes.md) |
 | `G14` | `read:11`, `E7` | A `limit` without an `order` returns the first rows in physical order, which `optimize` can change. No test pins it | [GQ 3](https://github.com/ModernRelay/omnigraph/pull/1302), draft: one total order for every read |
 
 ## Decisions
@@ -714,9 +714,10 @@ says so in its contract line.
   graph, and every statement on this page holds whichever of them answers
   `G2` `G13`. A reader added for capacity still reads the head at start: it
   never answers from a head it has not checked (`read:2`).
-- **Versions.** An older release refuses a graph that a newer release has
-  written to, before it reads anything, and never misreads it. So every
-  process on a graph is upgraded together `D23`. A newer release opens the
+- **Versions.** A release refuses a graph whose storage version is newer
+  than the ones it knows, before it reads anything, and never misreads it.
+  A newer release can raise that version when it writes, so every process
+  on a graph is upgraded together `D23`. A newer release opens the
   storage versions its support matrix lists and refuses the others, naming
   `upgrade` or a rebuild. A client and a server speak one HTTP contract
   version, and a mismatch is refused before anything runs. Nothing is

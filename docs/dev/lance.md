@@ -138,7 +138,9 @@ Omnigraph's deltas over stock Lance 13 are in
 [Lance compatibility fences](lance-fences.md), one section per surface with
 its test owners. The rules an unrelated change breaks most easily:
 
-- Every production write selects the stable V2_2 file format. Experimental
+- Every production write writes the stable V2_2 file format: a write that
+  creates a dataset selects it, and a write into one that leaves the version
+  unset takes the dataset's recorded V2_2. Experimental
   V2_3, spilled row lineage and stable-row-ID fragment-reuse indexes are not
   graph capabilities ([file format](lance-fences.md#file-format)).
 - Every graph-table write is a detached commit and stays the table's version
@@ -147,8 +149,10 @@ its test owners. The rules an unrelated change breaks most easily:
 - Stock `cleanup_old_versions` is never called: it does not trace detached
   manifests, so it can delete files a retained snapshot needs
   ([cleanup](lance-fences.md#cleanup)).
-- Every `__manifest` publish is a strict overwrite with zero retries, the
-  version CAS ([catalog publication](lance-fences.md#catalog-publication)).
+- Every `__manifest` publish that moves a branch is a strict overwrite with
+  zero retries, the version CAS; a detached `__manifest` version and a
+  graph-table detached commit retry only to pick an unused random version id
+  ([catalog publication](lance-fences.md#catalog-publication)).
 - Strict insert and upsert go through the sealed filter-bearing adapter; raw
   keyed Append is forbidden ([graph keys](lance-fences.md#graph-keys)).
 - Indexes are derived, so reads combine indexed and scan paths

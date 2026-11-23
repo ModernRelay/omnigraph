@@ -2,7 +2,7 @@
 
 Omnigraph treats a Blob as one property cell on an existing node or edge. Lance owns the Blob-v2 physical placement; Omnigraph owns logical identity, snapshot selection, authorization, external-source admission, bounded delivery, and graph-level publication.
 
-This page describes the implemented read, ingestion and cell-write behavior proposed by [RFC 0033](../rfcs/0033-blob-management.md).
+This page describes the implemented read, ingestion and cell-write behavior proposed by [RFC 0033](../decisions/0033-blob-management.md).
 
 ## Logical states
 

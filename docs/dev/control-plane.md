@@ -40,7 +40,7 @@ endpoint. Whole-document structural validation precedes selected credential and
 runtime capability checks. Registration consumes authenticated endpoint attestation;
 refresh verifies unchanged incarnation and never synthesizes a route. This does
 not qualify BYOC private routing. See the [operator reference](../user/cli/targets.md)
-and [decision](../rfcs/2026-10-20-operator-connections-and-credential-providers.md).
+and [decision](../decisions/2026-10-20-operator-connections-and-credential-providers.md).
 
 Pending/accepted lifecycle evidence remains separate from configuration and
 credential custody. Preserve it across removal, logout and upgrade. Retiring the
@@ -58,7 +58,7 @@ client exchanges; the provider owns credential rotation and session authority.
 The API verifies provider access and maps it to a stable principal. An uncertain
 exchange never authorizes a write replay.
 The protocol and cache compatibility boundaries are specified in
-[the identity and applied-policy RFC](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients); user behavior and limits
+[the identity and applied-policy RFC](../decisions/2026-09-09-identity-credentials-and-applied-policy.md); user behavior and limits
 are in the [CLI reference](../user/cli/reference.md#managed-cluster-commands).
 
 Ordinary managed deployment uses immutable `/plans` previews and scoped
@@ -232,7 +232,7 @@ actor label. Authenticated identity callers recheck current cluster
 under `ConfigManage`, without requiring data access on unrelated graphs.
 Original authority stays immutable; recovery records the current executor while
 preserving the authored engine receipt. The accepted
-[server runtime RFC](../rfcs/2026-09-29-server-runtime-and-online-deployment.md)
+[server runtime RFC](../decisions/2026-09-29-server-runtime-and-online-deployment.md)
 owns the protocol rationale and qualification limits.
 
 ## Concurrency
@@ -436,9 +436,12 @@ takeover leaves the old lease directory, claim included: an owner whose
 clock stopped, as in a suspended VM, resumes with its timer still ahead, and
 the claim, or the replaced record, stops it at its next beat. A clean release stops
 beating, deletes the lease directory, then releases as above. The lease
-coordinates liveness only; requests a dead owner sent before it fenced are
-fresh keys, conditional publications or audited mutable keys, which the
-storage-outcomes RFC (2026-10-19) argues cannot corrupt state. Local roots
+coordinates liveness only: a request a dead owner sent before it fenced can
+still land after a takeover. A fresh key stays unreachable until a manifest
+names it, and a conditional publication cannot replace one its successor
+made; a request to a mutable key (a ref, the version hint, a control object,
+a delete) has no such guard, and the owner's storage scope only records its
+outcome as unknown, in that process. Local roots
 have no conditional update, so a successor could not replace `lock.json`
 without racing an exact-owner delete the old owner already sent; local
 locks, Azure locks and version-1 locks from older binaries carry no lease and
@@ -532,7 +535,7 @@ managed control-plane API and standard MCP/OAuth protocols are separate surfaces
 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
-The optional [offline signed-token trust](../rfcs/0053-offline-data-token-verification.md)
+The optional [offline signed-token trust](../decisions/0053-offline-data-token-verification.md)
 uses immutable public trust loaded before graph open. The Core's opt-in
 root-bound serving snapshot supplies the canonical storage root from the same
 resolution as the applied revision; the server checks that root against trust
@@ -543,7 +546,7 @@ gate requires applied Cedar policy for protected operations, with no token-deriv
 graph/action ceiling. Static credential authority remains unchanged. Issuer
 reachability is outside the serving request path. The profile boundary and
 applied-policy ownership are described in
-[Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
+[Identity credentials and applied policy authorization](../decisions/2026-09-09-identity-credentials-and-applied-policy.md).
 
 `GET /graphs/discovery` accepts only the verified identity profile and returns IDs and display names for every graph in the current
 serving registry (loading, ready, transitioning or blocked), as last installed
@@ -670,7 +673,7 @@ retains the same engine and immutable read-tail owners, finishes interfering
 writers/controls, and never reclaims old inputs. Native accepted-I/O settlement,
 protected completion capacity, generic engine reuse and a process-RSS bound
 remain unqualified. The accepted
-[Owned server operations](../rfcs/2026-09-30-owned-server-operations.md) decision
+[Owned server operations](../decisions/2026-09-30-owned-server-operations.md) decision
 owns this boundary and its evidence; the [workload module](../../crates/omnigraph-server/src/workload.rs)
 owns admission limits.
 
@@ -727,6 +730,32 @@ pending. Treat Azure as a qualification preview.
 
 Every mutation-capable Azure server, apply job, direct writer, and maintenance process must run through `omnigraph-azure-admission`. The admission crate may depend downward on shared storage; storage, engine, cluster, server, and CLI must not depend upward on it.
 
+## Support boundaries
+
+- The server is cluster-only and ledger v2 is the sole operational protocol.
+  Server-owned apply activates schemas, queries, policies, provider/Blob bindings
+  under existing writer admission.
+  Runtime views share engine authority and retain immutable request bindings.
+  Direct apply bootstraps or deploys while serving is stopped. Legacy ledger
+  conversion is explicit and preserves data; no v1 executor remains. Removing
+  a graph declaration authorizes deletion of its exact managed root and all
+  retained history, after affected admission closes and admitted work drains.
+  The existing ledger records deletion intent before effects and owns resumption
+  through verified root absence. Adoption and missing-root recreation remain
+  unsupported; unexpected roots and schema drift refuse rather than infer
+  identity from matching text.
+  One outstanding durable authority owns completion/recovery. Generic drain
+  does not prove native-I/O settlement. Clean server release additionally closes
+  its explicit storage scope, drains accepted backend mutations and refuses
+  sticky uncertainty; a converged direct apply releases by the same proof.
+  S3 release/reacquisition uses the same lock key by CAS.
+  Excluding raw and older writers remains an operator obligation.
+- Schema apply retains its main-only, single-live-branch restriction and
+  process-local gate ordering. Its contract and table references publish
+  together; the removed file-installation protocol supplies no distributed
+  lock. Branch creation/deletion and cleanup retain their existing
+  single-writer-process control boundary.
+
 ## Owners
 
 - Configuration, diffing, deployment, recovery, and serving projection: `crates/omnigraph-cluster/src/`.
@@ -747,7 +776,7 @@ The server reads no provider secret and performs no request-time network calls.
 An external publisher refreshes a bounded, revisioned snapshot; local checks
 run every five seconds and access refuses at the original 300-second snapshot
 or token expiry. The exact format and limits are in
-[Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients).
+[Identity credentials and applied policy authorization](../decisions/2026-09-09-identity-credentials-and-applied-policy.md).
 
 The server mounts `/mcp` whenever it has a bearer credential source: static
 tokens, signed data tokens or OIDC. OIDC additionally enables

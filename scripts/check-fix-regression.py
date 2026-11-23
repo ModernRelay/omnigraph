@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fix Regression Gate: every issue a PR body closes by keyword needs a
 matching regression addition in the diff, or the PR carries the `no-repro`
-label. Specified in docs/rfcs/0045-gq-logic-tests.md (User and operational
+label. Specified in docs/decisions/0045-gq-logic-tests.md (User and operational
 behavior, "Fix-PR gate").
 
 The gate reads the three closing forms GitHub's own parser closes on,

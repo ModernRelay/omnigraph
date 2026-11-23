@@ -14,7 +14,11 @@ Rationale and bump evidence belong in the owning RFC or release note.
 
 ### File format
 
-Every production write explicitly selects stable V2_2. Experimental V2_3,
+Every production write writes stable V2_2. A write that creates a dataset
+selects `LanceFileVersion::V2_2` explicitly; the appends and the streamed
+overwrite in `table_store.rs` that leave `data_storage_version` unset write into
+an existing dataset, where Lance 13's insert path takes the format the
+dataset's manifest records, V2_2 (Lance 13's own default is V2_2 as well). Experimental V2_3,
 spilled row lineage and stable-row-ID fragment-reuse indexes are not enabled as
 graph capabilities.
 
@@ -181,7 +185,7 @@ unchanged.
 The audited analyzer dependency set has exact pins and a resolved-lockfile
 guard. Any change needs a compatibility audit before keeping or changing the
 certificate generation. See
-[RFC 0043](../rfcs/0043-full-text-index-compatibility.md) for the decision and
+[RFC 0043](../decisions/0043-full-text-index-compatibility.md) for the decision and
 [the operator procedure](../user/operations/upgrade.md#full-text-index-upgrade).
 
 ### Pushed filter simplification
@@ -699,7 +703,7 @@ create, and the registration's `omnigraph.last_linear_version` records where the
 linear history stopped. Every manifest names its transaction file
 `{read_version}-{uuid}.txn`, which is how the engine matches a pin's
 `transaction_uuid` and follows a chain of detached commits by `read_version`
-links without a second request (the collector, `walk_chain`); the pure-insert
+links without a second request (the collector, `discover_published`); the pure-insert
 merge proof follows the same links and also reads each link's transaction file
 to certify it, crossing a `CreateIndex` link as moving no row because Lance
 applies it with every fragment of the version it read. A detached commit never
@@ -712,14 +716,18 @@ triggers Lance auto-cleanup: `auto_cleanup_hook` runs only from
 
 ### Catalog publication
 
-Every `__manifest` publish is an `Operation::Overwrite` committed through
-`CommitBuilder::with_max_retries(0)`. Lance 13 treats that as a strict
+Every `__manifest` publish that moves a branch is an `Operation::Overwrite`
+committed through `CommitBuilder::with_max_retries(0)`. Lance 13 treats that as a strict
 overwrite: it skips conflict resolution and writes
 `_versions/{read_version + 1}.manifest` only if absent, so a concurrent commit
 fails the publish with `CommitConflict` instead of being rebased over; the
 publisher maps that to `RowLevelCasContention` and retries from a fresh load. A
 Lance release that rebased overwrites under zero retries would break this
-version CAS.
+version CAS. A detached `__manifest` version (an unpublished commit or an
+unattached snapshot) commits with `DETACHED_VERSION_RETRIES` (20), and a
+graph-table detached commit takes Lance's default of 20: a detached commit
+retries only to pick an unused random version id, and zero retries would
+never commit one.
 
 **Owners:** `omnigraph-catalog`
 `stale_overwrite_loses_the_version_cas_without_replacing_the_winner` (the stale

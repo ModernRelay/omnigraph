@@ -289,7 +289,7 @@ fixture does not qualify a version-1 operator transport: Unix socket targets are
 unsupported. Keep lower-level transport coverage distinct from public resolver
 capability/refusal tests.
 
-Server suites are organized by public route: `auth_policy`, `data_routes`, `schema_routes`, `stored_queries`, `multi_graph`, `boot_settings`, object-store coverage in `s3`, and the generated contract in `openapi`.
+Server suites are organized by public route: `auth_policy`, `catalogue_routes`, `data_routes`, `mcp`, `schema_routes`, `stored_queries`, object-store coverage in `s3` and the generated contract in `openapi` in the `integration` binary, and `multi_graph`, `boot_settings` and `operation_routes` as their own binaries.
 
 The OpenAPI owner checks the [HTTP conventions](http-api.md), their named
 exceptions, and required error responses. Its negative cases remove a required
@@ -601,7 +601,9 @@ libtest-shaped output; no per-case gutter runnable exists, since no source
 item does). `--test-threads=<n>` bounds how many cases run
 concurrently (default: the machine's available parallelism). Each case fails
 when it runs past the `timeout_ms` its `--- runner` section declares; the field
-is required, and the corpus refuses a value above 10000 before the case runs.
+is required, and the required corpus under `cases/` refuses a value above
+10000 (`corpus_timeout`) before the case runs; a case under `cases_slow/` may
+declare up to 600000.
 No environment variable changes a budget: a set
 `OMNIGRAPH_GQ_CASE_TIMEOUT_SECS` makes every case fail with `invalid_case`. On
 a loaded host, run fewer cases at once with a lower `--test-threads`.
