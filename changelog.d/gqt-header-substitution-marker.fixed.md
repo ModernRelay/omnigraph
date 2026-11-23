@@ -1,0 +1,1 @@
+- `omnigraph-gqt` and `omnigraph-bench` read a case whose `# notes:` or `# red_on:` line spells `${`; the parser refused it as a misplaced substitution.

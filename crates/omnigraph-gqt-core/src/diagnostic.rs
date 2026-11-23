@@ -184,7 +184,7 @@ impl CaseErrorCode {
                 "a `${name}` operand, a `snapshot: $name` or a `from commit ${name}` names a commit bound by an earlier `--- bind commit $name`"
             }
             CaseErrorCode::SubstitutionPlacement => {
-                "`${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit, or is `${branch}` in a branches recipe; a `${` in the branches header is refused as on any header line; the name a `--- bench` section sweeps is replaced by its value before anything is parsed"
+                "`${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit, or is `${branch}` in a branches recipe; a `${` in the branches header is refused as on any section header; a `# <key>: <value>` header before the first section is outside this rule; the name a `--- bench` section sweeps is replaced by its value before anything is parsed"
             }
             CaseErrorCode::BatchBound => {
                 "a generated load's batch stays within 16 MiB and 4096 rows, with `commits` in 1..=rows and `batch_rows` producing exactly `commits` nonempty batches"
