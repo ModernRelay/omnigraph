@@ -719,7 +719,9 @@ its `omnigraph` taken from the store's `builds/<sha>/<triple>/omnigraph` or,
 on a miss, built from `git archive <sha>` in a scratch directory under the
 dataset cache with `cargo build --release --locked -p omnigraph-cli --bin
 omnigraph` and put there (a clean tree by construction); `<ref>=<path>` names
-the binary instead and puts nothing. Every ref is resolved, then every ref's
+the binary instead and puts nothing, and a full lowercase 40-character commit
+sha in that form is the commit as written, so it needs neither `git` nor a
+repository. Every ref is resolved, then every ref's
 binary is inspected, before any run: a product writing another storage format
 refuses the whole command as `not_comparable`, and a binary whose `version
 --json` names another commit than its ref is refused as
