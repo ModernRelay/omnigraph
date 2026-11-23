@@ -2300,8 +2300,15 @@ fn dst_report(
         }
     }
     let _seams = omnigraph::seams::FailScenario::setup();
+    let root = match input.environment.execution {
+        crate::runner_config::Execution::Dst {
+            storage: crate::runner_config::Storage::S3Compatible,
+            ..
+        } => "s3://gqt-dst/case",
+        _ => "shared-memory://gqt-dst/case",
+    };
     let environment = omnigraph_dst::memory::MemoryEnvironment::new(
-        "shared-memory://gqt-dst/case",
+        root,
         seed,
         omnigraph_dst::UniverseProcess::Isolated,
     );

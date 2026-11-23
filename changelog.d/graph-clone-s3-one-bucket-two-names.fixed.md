@@ -1,0 +1,1 @@
+- An `s3://` clone root whose key overlaps its base's is refused when the two bucket names address one bucket, or the root's bucket holds a copy of the base at that key.
