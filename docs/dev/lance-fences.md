@@ -842,7 +842,11 @@ reports the recorded size and ETag, not the store's, and passes the pin's
 witness check (`TableVersionMetadata::witnesses`) for any ETag the row holds.
 The change feed's and the Blob read's re-opens of a named branch, which make
 that check, open through `open_dataset_entry` instead, where a detached
-version reports no ETag and the transaction uuid decides. `RecordedManifest`,
+version reports no ETag and the transaction uuid decides. Only those re-opens
+make it: a table on no named branch cannot be deleted and recreated at its
+path, its manifest is written once, and the pinned open already checks a
+twin's transaction, so `TableStore::open_at_entry_verified` and `read_blob_at`
+check nothing there. `RecordedManifest`,
 `pinned_commit_handler` and `recorded_manifest` are crate-private to
 `omnigraph-core`, and the catalog opener to `omnigraph-catalog`; the core
 opener stays `pub` for the catalog, so
