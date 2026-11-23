@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -228,15 +229,35 @@ def resolve_mapping(path_str: str, repo_root: Path | None = None) -> TestMapping
                 notes="Traversal source file: fastest coverage via traversal_indexed:: module",
             )
 
-        mod_filter = stem
-        if stem == "tests":
+        file_name = Path(sub_path).name
+        crate_src_dir = repo_root / matching_prefix / "src"
+        parent_dir = repo_root / matching_prefix / Path(sub_path).parent
+
+        # 1. Check if file is mounted from crate root (lib.rs or main.rs)
+        crate_root_mount = None
+        for root_file in (crate_src_dir / "lib.rs", crate_src_dir / "main.rs"):
+            if root_file.is_file():
+                try:
+                    root_text = root_file.read_text(encoding="utf-8", errors="ignore")
+                    m = re.search(
+                        rf'#\[path\s*=\s*"{re.escape(file_name)}"\]\s*(?:#\[[^\]]+\]\s*)*mod\s+([a-zA-Z0-9_]+)',
+                        root_text,
+                    )
+                    if m:
+                        crate_root_mount = m.group(1)
+                        break
+                except OSError:
+                    pass
+
+        if crate_root_mount:
+            mod_filter = crate_root_mount
+        elif stem == "tests":
             parent_name = Path(sub_path).parent.name
             mod_filter = "tests" if parent_name == "src" else parent_name
         else:
+            mod_filter = stem
             # Check if this file is mounted under a sibling module via #[path]
             # e.g. parser_tests.rs mounted in parser.rs via #[path = "parser_tests.rs"]
-            file_name = Path(sub_path).name
-            parent_dir = repo_root / matching_prefix / Path(sub_path).parent
             candidate_base = stem[:-6] if stem.endswith("_tests") else (stem[:-5] if stem.endswith("_test") else None)
             if candidate_base:
                 sibling_file = parent_dir / f"{candidate_base}.rs"
@@ -293,6 +314,7 @@ def self_test() -> None:
         ("crates/omnigraph-compiler/src/lexer.rs", "omnigraph-compiler", "--lib lexer::"),
         ("crates/omnigraph-compiler/src/query/parser_tests.rs", "omnigraph-compiler", "--lib parser::"),
         ("crates/omnigraph-catalog/src/tests.rs", "omnigraph-catalog", "--lib tests::"),
+        ("crates/omnigraph-cli/src/main_tests.rs", "omnigraph-cli", "--lib tests::"),
         ("crates/omnigraph-bench/src/gqt_tests.rs", "omnigraph-bench", "--lib gqt_tests::"),
         ("crates/omnigraph-cli/src/operator_schema/schema_tests.rs", "omnigraph-cli", "--lib schema_tests::"),
         ("crates/omnigraph-gqt/cases/match_simple.gqt", "omnigraph-gqt", "gq_logic_tests -- match_simple"),
