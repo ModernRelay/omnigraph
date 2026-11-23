@@ -1437,13 +1437,29 @@ impl ObjectStorageAdapter {
 
     fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
-        let (store, retrying) = s3_clients(&location.bucket, root_uri, scope.is_some())?;
+        Self::s3_from_builder(
+            s3_bucket_builder(&location.bucket),
+            location.bucket,
+            root_uri,
+            scope,
+        )
+    }
+
+    /// The one `s3://` adapter construction ([`s3_clients_from`]), whether
+    /// `builder` was captured or read from the environment: a scoped adapter
+    /// reads through a retrying client and writes single-attempt, whatever
+    /// retry `builder` carries; an unscoped one keeps `builder`'s retry.
+    fn s3_from_builder(
+        builder: AmazonS3Builder,
+        bucket: String,
+        root_uri: &str,
+        scope: Option<StorageIoScope>,
+    ) -> Result<Self> {
+        let (store, retrying) = s3_clients_from(builder, root_uri, scope.is_some())?;
         Ok(Self::remote(
             store,
             retrying,
-            UriCodec::S3 {
-                bucket: location.bucket,
-            },
+            UriCodec::S3 { bucket },
             scope,
         ))
     }
@@ -3239,18 +3255,27 @@ fn s3_bucket_builder(bucket: &str) -> AmazonS3Builder {
 }
 
 /// The client of `bucket`, built from the `AWS_*` environment as `configure`
-/// leaves it. In a test or a DST build a simulated bucket that answers to the
-/// name is the client, and nothing is built.
+/// leaves it ([`build_s3_store`]).
 fn s3_store(
     bucket: &str,
     root_uri: &str,
     configure: impl FnOnce(AmazonS3Builder) -> AmazonS3Builder,
 ) -> Result<Arc<DynObjectStore>> {
+    build_s3_store(configure(s3_bucket_builder(bucket)), root_uri)
+}
+
+/// The client `builder` describes, whether its configuration was captured or
+/// read from the environment. In a test or a DST build a simulated bucket that
+/// answers to the bucket `builder` names is the client, and nothing is built.
+fn build_s3_store(builder: AmazonS3Builder, root_uri: &str) -> Result<Arc<DynObjectStore>> {
     #[cfg(any(test, feature = "dst"))]
-    if let Some(simulated) = simulated_bucket::bucket(simulated_bucket::Provider::S3, bucket) {
+    if let Some(simulated) = builder
+        .get_config_value(&object_store::aws::AmazonS3ConfigKey::Bucket)
+        .and_then(|bucket| simulated_bucket::bucket(simulated_bucket::Provider::S3, &bucket))
+    {
         return Ok(simulated);
     }
-    match configure(s3_bucket_builder(bucket)).build() {
+    match builder.build() {
         Ok(store) => Ok(Arc::new(store)),
         Err(err) => Err(StorageError::backend(
             classify_object_store_error(&err),
@@ -3267,11 +3292,28 @@ fn s3_clients(
     root_uri: &str,
     scoped: bool,
 ) -> Result<(Arc<DynObjectStore>, Option<Arc<DynObjectStore>>)> {
+    s3_clients_from(s3_bucket_builder(bucket), root_uri, scoped)
+}
+
+/// [`s3_clients`] from a configured `builder`, the one construction every
+/// `s3://` adapter uses, captured or not: [`remote_clients`] over
+/// [`build_s3_store`], so a scoped root's reads retry by
+/// [`scoped_read_retry_config`] and its writes are single-attempt whatever
+/// `builder` carries, and an unscoped root keeps `builder`'s own retry.
+fn s3_clients_from(
+    builder: AmazonS3Builder,
+    root_uri: &str,
+    scoped: bool,
+) -> Result<(Arc<DynObjectStore>, Option<Arc<DynObjectStore>>)> {
     remote_clients(scoped, |retry| {
-        s3_store(bucket, root_uri, |builder| match retry {
-            Some(retry) => builder.with_retry(retry),
-            None => builder,
-        })
+        let builder = builder.clone();
+        build_s3_store(
+            match retry {
+                Some(retry) => builder.with_retry(retry),
+                None => builder,
+            },
+            root_uri,
+        )
     })
 }
 
@@ -4183,6 +4225,100 @@ mod tests {
             served
         });
         (endpoint, server)
+    }
+
+    /// Serves one HEAD answer per entry of `statuses`, in order, and returns
+    /// how many it served.
+    fn spawn_head_server(statuses: Vec<u16>) -> (String, tokio::task::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local head server");
+        listener
+            .set_nonblocking(true)
+            .expect("configure local head server");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("local server address")
+        );
+        let server = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            for status in statuses {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "head server accept timed out");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("head server accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("configure blocking head connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("configure head server read timeout");
+                let mut request = [0_u8; 16 * 1024];
+                let mut request_len = 0;
+                while !request[..request_len]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+                {
+                    let read = stream
+                        .read(&mut request[request_len..])
+                        .expect("read local head request");
+                    assert!(read != 0, "head request ended before its headers");
+                    request_len += read;
+                }
+                assert!(
+                    request[..request_len].starts_with(b"HEAD "),
+                    "the probe must be a real object-store HEAD"
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nETag: \"e\"\r\nLast-Modified: Mon, 23 Nov 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write local head response");
+                stream.flush().expect("flush local head response");
+                served += 1;
+            }
+            served
+        });
+        (endpoint, server)
+    }
+
+    /// A scoped `s3://` adapter reads through its retrying client whatever
+    /// retry its builder carries: a captured binding's builder and the
+    /// environment's go through the same construction.
+    #[tokio::test]
+    async fn a_scoped_s3_adapter_retries_its_reads_whatever_its_builder_carries() {
+        let (endpoint, server) = spawn_head_server(vec![503, 200]);
+        let builder = AmazonS3Builder::new()
+            .with_bucket_name("test-bucket")
+            .with_region("us-east-1")
+            .with_access_key_id("test-access-key")
+            .with_secret_access_key("test-secret-key")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_retry(single_attempt_retry_config());
+        let adapter = ObjectStorageAdapter::s3_from_builder(
+            builder,
+            "test-bucket".into(),
+            "s3://test-bucket/root",
+            Some(StorageIoScope::new()),
+        )
+        .expect("scoped S3 adapter");
+        assert!(
+            adapter
+                .exists("s3://test-bucket/root/object")
+                .await
+                .expect("a retried read answers")
+        );
+        assert_eq!(server.await.expect("head server"), 2);
     }
 
     async fn exhausted_s3_status_error(status: u16) -> object_store::Error {

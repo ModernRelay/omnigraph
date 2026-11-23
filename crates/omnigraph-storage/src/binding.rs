@@ -390,32 +390,13 @@ impl CapturedStorageBinding {
                         builder = builder.with_config(key, value);
                     }
                 }
-                builder = builder.with_retry(if scope.is_some() {
-                    single_attempt_retry_config()
-                } else {
-                    captured_retry_config(
-                        self.options.get("client_max_retries").map(String::as_str),
-                        self.options.get("client_retry_timeout").map(String::as_str),
-                    )?
-                });
-                let store = builder.build().map_err(|_| binding_error("failed to initialize the captured S3 destination; verify its native credentials and transport options"))?;
-                let adapter = ObjectStorageAdapter {
-                    store: Arc::new(store),
-                    scope: None,
-                    codec: UriCodec::S3 {
-                        bucket: location.bucket,
-                    },
-                    supports_conditional_update: true,
-                    #[cfg(test)]
-                    omit_read_etag: false,
-                    #[cfg(test)]
-                    omit_write_etag: false,
-                    read_through: None,
-                };
-                Ok(match scope {
-                    Some(scope) => adapter.with_scope(scope),
-                    None => adapter,
-                })
+                // The retry an unscoped adapter keeps; a scoped one replaces it.
+                let builder = builder.with_retry(captured_retry_config(
+                    self.options.get("client_max_retries").map(String::as_str),
+                    self.options.get("client_retry_timeout").map(String::as_str),
+                )?);
+                ObjectStorageAdapter::s3_from_builder(builder, location.bucket, &self.uri, scope)
+                .map_err(|_| binding_error("failed to initialize the captured S3 destination; verify its native credentials and transport options"))
             }
         }
     }
