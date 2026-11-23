@@ -1,11 +1,15 @@
-//! The measured free-running block. Every worker of a `--- concurrent
-//! measured` block loops its statement on a task of its own for the bench
-//! section's warmup and duration, each over a clone of the case session. The
-//! loop is closed: a worker issues its next statement when the last one is
-//! acknowledged, so a slow statement delays the ones behind it and a service
-//! time is less than what an arriving caller would have waited (coordinated
-//! omission). Every observation carries `driver` and `claim_grade` for that
-//! reason, and nothing here is a throughput or latency claim.
+//! The driver: it issues the statements of a measured block and times each
+//! one. The host calls `drive` when the selected step is a `--- concurrent
+//! measured` block; a single operation is issued once by the GQT executor and
+//! no driver runs. Every worker of the block loops its statement on a task of
+//! its own for the bench section's warmup and duration, each over a session
+//! of its own: a clone of the case session in process, an HTTP client against
+//! a server. The loop is closed: a worker issues its next statement when the
+//! last one is acknowledged, so a slow statement delays the ones behind it
+//! and a service time is less than what an arriving caller would have waited
+//! (coordinated omission). Every observation carries `driver` and
+//! `claim_grade` for that reason, and nothing here is a throughput or latency
+//! claim.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -14,7 +18,7 @@ use std::time::{Duration, Instant};
 use omnigraph::Session;
 use omnigraph::instrumentation::{capture_query_io_probes, with_query_io_probes};
 use omnigraph_gqt_core::concurrent::SessionKind;
-use omnigraph_gqt_core::{ConcurrentStep, PlainHost, SessionOp, run_session};
+use omnigraph_gqt_core::{ConcurrentStep, ServedSession, SessionOp, SessionReport, run_session};
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, JoinSet};
 
@@ -98,7 +102,9 @@ pub struct LabelObservation {
     pub per_worker: PerWorker,
     pub service_time_us: ServiceTime,
     /// The times a statement of the window was prepared again after the
-    /// authority moved, inside the engine or by the host.
+    /// authority moved, inside the engine or by the host. Against a server
+    /// only the host's own re-runs are counted: what the server prepared
+    /// again behind an acknowledged write is not on the wire.
     pub authority_conflicts: u64,
     /// The acknowledgements of each declared second of the window.
     pub acked_by_second: Vec<u64>,
@@ -226,10 +232,32 @@ fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// What a worker loops: one run of its session's statement, under the one
+/// rule of [`run_session`] wherever the statement runs.
+pub(crate) trait SessionRunner: Send + 'static {
+    fn run_once(
+        &self,
+        op: &SessionOp,
+        seq: u64,
+    ) -> impl Future<Output = Result<SessionReport, String>> + Send;
+}
+
+impl SessionRunner for Session {
+    async fn run_once(&self, op: &SessionOp, seq: u64) -> Result<SessionReport, String> {
+        run_session(&(), self, op, seq).await
+    }
+}
+
+impl SessionRunner for ServedSession {
+    async fn run_once(&self, op: &SessionOp, seq: u64) -> Result<SessionReport, String> {
+        self.run(op, seq).await
+    }
+}
+
 /// One worker: its statement again and again until the stop, each run
 /// counted in the phase it started in. A failed run stops every worker.
 async fn work(
-    session: Session,
+    runner: impl SessionRunner,
     op: SessionOp,
     clock: Arc<Clock>,
     seconds: u32,
@@ -249,7 +277,7 @@ async fn work(
             return Ok(tally);
         }
         let begun = Instant::now();
-        let outcome = run_session(&PlainHost, &session, &op, seq).await;
+        let outcome = runner.run_once(&op, seq).await;
         let ended = Instant::now();
         let report = match outcome {
             Ok(report) => report,
@@ -311,15 +339,23 @@ fn open_window(clock: &Clock, flip: &impl Fn() -> Result<(), String>) -> Result<
     Ok(())
 }
 
-/// Runs the block for `run`: every session of `step` on a task over a clone
-/// of `session`. `flip` is called where the window opens, so the host can
-/// discard what its counters saw of a warmup; with none, no worker has run.
+/// Runs the block for `run`: every session of `step` on a task over its
+/// runner, `runners` in the order the block declares its sessions. `flip` is
+/// called where the window opens, so the host can discard what its counters
+/// saw of a warmup; with none, no worker has run.
 pub(crate) async fn drive(
-    session: &Session,
+    runners: Vec<impl SessionRunner>,
     step: &ConcurrentStep,
     run: BlockRun,
     flip: impl Fn() -> Result<(), String>,
 ) -> Result<Driven, String> {
+    if runners.len() != step.sessions.len() {
+        return Err(format!(
+            "the block declares {} sessions and was given {} runners",
+            step.sessions.len(),
+            runners.len()
+        ));
+    }
     let clock = Arc::new(Clock {
         phase: AtomicU8::new(WARMUP),
         measured_at: OnceLock::new(),
@@ -330,13 +366,8 @@ pub(crate) async fn drive(
         open_window(&clock, &flip)?;
     }
     let mut workers = JoinSet::new();
-    for (index, op) in step.sessions.iter().enumerate() {
-        let work = work(
-            session.clone(),
-            op.clone(),
-            Arc::clone(&clock),
-            run.duration_seconds,
-        );
+    for (index, (runner, op)) in runners.into_iter().zip(&step.sessions).enumerate() {
+        let work = work(runner, op.clone(), Arc::clone(&clock), run.duration_seconds);
         let probes = probes.clone();
         workers.spawn(async move {
             let tally = match probes {
@@ -585,6 +616,7 @@ pub(crate) fn upper_bound(step: &ConcurrentStep, run: BlockRun) -> ConcurrentObs
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn nearest_rank_counts_every_statement_of_every_worker() {
@@ -666,5 +698,186 @@ mod tests {
         assert_eq!(rate_millis(3, 2_000_000), 1500);
         assert_eq!(rate_millis(1, 3_000_000), 333);
         assert_eq!(rate_millis(5, 0), 0);
+    }
+
+    const EVERY_KIND: &str = r#"# issue: none
+# notes: One label of every statement kind a block admits.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- bench
+warmup_seconds: 0
+duration_seconds: 1
+
+--- concurrent measured
+writer x2: load generate: v1 seed: 42 mode: append
+  tables:
+    - kind: node
+      name: Chunk
+      rows: 40960
+      commits: 10
+      columns:
+        slug: {kind: key, prefix: cw-, width: 5}
+        n: {kind: ordinal, start: 1000, step: 1}
+reader: query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.n } }
+toucher: query touch() { update Chunk set { n: 7 } where slug = "seed-07" }
+folder: branch merge side into main
+--- expect
+writer: ok
+reader: ok
+toucher: ok
+folder: ok
+"#;
+
+    /// A runner that answers from a script: every run reports `conflicts`,
+    /// the run `fails_at` fails, and `runs` counts the runs it began.
+    struct Scripted {
+        conflicts: u32,
+        fails_at: Option<u64>,
+        runs: Arc<AtomicU64>,
+    }
+
+    impl SessionRunner for Scripted {
+        async fn run_once(&self, op: &SessionOp, seq: u64) -> Result<SessionReport, String> {
+            self.runs.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if self.fails_at == Some(seq) {
+                return Err(format!("the scripted {} was refused", op.kind.name()));
+            }
+            Ok(SessionReport {
+                conflicts: self.conflicts,
+            })
+        }
+    }
+
+    /// One runner per session of `step`, scripted by `script` as the conflicts
+    /// of a run and the run that fails, with the count of runs each one began.
+    fn scripted(
+        step: &ConcurrentStep,
+        script: impl Fn(&SessionOp) -> (u32, Option<u64>),
+    ) -> (Vec<Scripted>, Vec<Arc<AtomicU64>>) {
+        step.sessions
+            .iter()
+            .map(|op| {
+                let (conflicts, fails_at) = script(op);
+                let runs = Arc::new(AtomicU64::new(0));
+                let runner = Scripted {
+                    conflicts,
+                    fails_at,
+                    runs: Arc::clone(&runs),
+                };
+                (runner, runs)
+            })
+            .unzip()
+    }
+
+    fn began(runs: &[Arc<AtomicU64>]) -> Vec<u64> {
+        runs.iter()
+            .map(|runs| runs.load(Ordering::Relaxed))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_statement_kind_is_driven_and_reported_under_its_label() {
+        let case = omnigraph_gqt_core::parse_case("every_kind", EVERY_KIND).unwrap();
+        let step = case.measured_block().unwrap();
+        let (runners, runs) = scripted(step, |op| {
+            let conflicts = match op.kind {
+                SessionKind::Mutation => 1,
+                SessionKind::Merge(_) => 2,
+                SessionKind::Query | SessionKind::Load(_) => 0,
+            };
+            (conflicts, None)
+        });
+        let run = BlockRun {
+            warmup_seconds: 0,
+            duration_seconds: 1,
+        };
+        let driven = drive(runners, step, run, || Ok(())).await.unwrap();
+        assert!(
+            driven.window_us >= 1_000_000,
+            "the window is the declared second"
+        );
+        let began = began(&runs);
+        assert_eq!(
+            driven.acked_runs, began,
+            "every run a worker began is acknowledged, the ones in the drain too"
+        );
+        let rows: Vec<_> = driven
+            .labels
+            .iter()
+            .map(|label| (label.label.as_str(), label.kind, label.workers))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("writer", LabelKind::Load, 2),
+                ("reader", LabelKind::Query, 1),
+                ("toucher", LabelKind::Mutate, 1),
+                ("folder", LabelKind::BranchMerge, 1),
+            ],
+            "one row per label, in declaration order"
+        );
+        assert_eq!(driven.labels[0].acked, began[0] + began[1]);
+        for (label, per_run) in driven.labels.iter().zip([0, 0, 1, 2]) {
+            let name = &label.label;
+            assert!(label.acked > 0, "{name}: no statement was acknowledged");
+            assert_eq!(
+                label.authority_conflicts,
+                label.acked * per_run,
+                "{name}: the conflicts every run reports are summed under its label"
+            );
+            assert_eq!(
+                label.acked_by_second.iter().sum::<u64>() + label.acked_in_drain,
+                label.acked,
+                "{name}: every acknowledgement lands in the second or in the drain"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_ends_the_block_and_names_its_session_and_its_run() {
+        let case = omnigraph_gqt_core::parse_case("every_kind", EVERY_KIND).unwrap();
+        let step = case.measured_block().unwrap();
+        let (runners, runs) = scripted(step, |op| {
+            (0, matches!(op.kind, SessionKind::Merge(_)).then_some(3))
+        });
+        let run = BlockRun {
+            warmup_seconds: 0,
+            duration_seconds: 30,
+        };
+        let started = Instant::now();
+        let refusal = drive(runners, step, run, || Ok(())).await.err();
+        assert_eq!(
+            refusal.as_deref(),
+            Some("session `folder` on its run 3: the scripted branch merge was refused")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the block ends at the failed run, not after its declared 30 s"
+        );
+        assert_eq!(began(&runs)[4], 4, "the failed run is the session's last");
+    }
+
+    #[tokio::test]
+    async fn a_block_is_driven_with_one_runner_per_session() {
+        let case = omnigraph_gqt_core::parse_case("every_kind", EVERY_KIND).unwrap();
+        let step = case.measured_block().unwrap();
+        let (mut runners, runs) = scripted(step, |_| (0, None));
+        runners.pop();
+        let run = BlockRun {
+            warmup_seconds: 0,
+            duration_seconds: 1,
+        };
+        let refusal = drive(runners, step, run, || Ok(())).await.err();
+        assert_eq!(
+            refusal.as_deref(),
+            Some("the block declares 5 sessions and was given 4 runners")
+        );
+        assert_eq!(began(&runs), [0; 5], "no worker ran");
     }
 }

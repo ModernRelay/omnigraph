@@ -3276,6 +3276,68 @@ fn load_statement_answers_the_executed_plan_beside_the_change() {
     }
 }
 
+/// A `load csv` whose source lies inside the graph's storage root is refused
+/// while the CLI installs the source's read permission, before the writable
+/// open and before the load starts. Nothing ran, so the failure reports no
+/// effects and asks for a fixed request, never a reconcile, and the graph does
+/// not move. `explain load csv` refuses the same source.
+#[test]
+fn load_statement_refused_before_its_first_effect_reports_no_effects() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let csv_path = graph.join("people.csv");
+    fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+    let statement = format!(
+        "load csv \"file://{}\" into node:Person mode append header",
+        csv_path.display()
+    );
+    let version_before = manifest_dataset_version(&graph);
+
+    let output = cli()
+        .arg("mutate")
+        .arg("--target")
+        .arg(&graph)
+        .arg("-e")
+        .arg(&statement)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = parse_stdout_json(&output);
+    let message = refused["error"].as_str().unwrap();
+    assert!(
+        message.contains("overlaps an Omnigraph storage root"),
+        "{refused}"
+    );
+    assert!(!message.contains("OmniGraph"), "{refused}");
+    assert_eq!(
+        refused["disposition"],
+        json!({"effects":"none","action":"fix"}),
+        "{refused}"
+    );
+
+    let output = cli()
+        .arg("query")
+        .arg("--target")
+        .arg(&graph)
+        .arg("-e")
+        .arg(format!("explain {statement}"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = parse_stdout_json(&output);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("overlaps an Omnigraph storage root"),
+        "{refused}"
+    );
+    assert_eq!(manifest_dataset_version(&graph), version_before);
+}
+
 /// GitHub #365: the embedded transport must preserve the typed stale-head
 /// details all the way through the CLI boundary. A writable open may complete
 /// older work, so this cannot claim whole-command no effects or exit 4.
@@ -3829,11 +3891,11 @@ fn an_embedded_load_reports_its_fork_from_the_engine() {
     assert_eq!(forked.status.code(), Some(2), "{forked:?}");
     let body = parse_stdout_json(&forked);
     // The fork published, and the engine marks the load's later error as
-    // following it without proving that the failing step wrote nothing, so
-    // the whole command's effects are unknown.
+    // following it. That error's type is a refusal of the rows, so the failing
+    // step wrote nothing: the fork alone stands, and the request needs fixing.
     assert_eq!(
         body["disposition"],
-        json!({"effects":"unknown","action":"reconcile"}),
+        json!({"effects":"partial","action":"fix"}),
         "{body}"
     );
     assert!(branches().contains("fresh"), "the fork published");

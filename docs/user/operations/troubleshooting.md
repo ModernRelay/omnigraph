@@ -33,7 +33,7 @@ for `not_retained`.
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
 | 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
 | 408 | The request body did not arrive before its deadline (`request_timeout`) | Send the request again; nothing was admitted |
-| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, a branch whose writer epoch refuses the writing process (`writer_fenced`), or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable |
+| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, a branch whose writer epoch refuses the writing process (`writer_fenced`), a `branch create` of a name a branch holds (`branch_exists`), a branch that was deleted (`branch_deleted`) or whose create wrote no tree (`branch_not_ready`), or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable. A not-ready branch is removed by `branch delete`; a deleted branch's retirement is finished by the next `branch delete` |
 | 410 | Required change-feed history was reclaimed, or the commit a branch start names (`branch_start_refusal`, `not_retained`) | Capture and durably install a new baseline, then resume from its terminal cursor; start the branch at a retained commit |
 | 412 | Blob entity-tag or graph-commit precondition failed (`precondition_failed`), or `Omnigraph-If-Actor` named another actor than the credential (`actor_mismatch`) | For `precondition_failed`, refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit. For `actor_mismatch` nothing ran: use the named actor's credential or correct the header; retrying unchanged fails again |
 | 413 | Request or operation exceeded a bounded resource limit (`payload_too_large`) | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
@@ -84,8 +84,8 @@ the request it answered by the first row that matches:
 |---|---|---|
 | Any error before the request submitted a write | `none` | the refusal's own |
 | A write whose completion the server could not settle; `code` becomes `outcome_unknown` unless the action is `recover` | `unknown` | `reconcile`, or `recover` |
-| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a writer-epoch refusal, a resource limit, an external Blob source, a query diagnostic), or a failure the engine proved published nothing, such as a storage failure before publication; `code` is kept | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
-| Any other error after a write, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
+| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), a refusal the engine gives before its one publication, with or without details (a malformed, unknown or invalid row, a missing edge endpoint, a source or Blob URI the external Blob policy refuses, a merge, key, read-set or dataset-version conflict, a writer-epoch refusal, a resource limit, an external Blob source, a query diagnostic), or a failure the engine proved published nothing, such as a storage failure before publication; `code` is kept | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
+| Any other error after a write, one the engine cannot type as a refusal, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
 
 A refusal's own action follows its code: `recover` for a recovery intent or a
 full-text index to build, `retry` for `too_many_requests`,
@@ -95,7 +95,8 @@ full-text index to build, `retry` for `too_many_requests`,
 `branch_start_refusal`, `payload_too_large`, `unsupported_media_type` and
 `range_not_satisfiable`, and
 `refresh` for the rest: `forbidden`, `precondition_failed`, `conflict`,
-`writer_fenced`, `external_blob_source`, `change_feed_gap` and `internal`. A write the server
+`writer_fenced`, `branch_exists`, `branch_deleted`, `branch_not_ready`,
+`external_blob_source`, `change_feed_gap` and `internal`. A write the server
 could not settle answers `500`.
 
 The CLI reports the server's disposition when that request was the command's
@@ -167,9 +168,9 @@ The disposition covers the entire command. A later refused subrequest cannot
 undo an earlier branch creation, load or publication. An embedded write's own
 refusal says what the engine did, projected as a server would project it: a
 policy refusal precedes every publication, a `load --from` fork included, so it
-has `effects: none` on both planes. The engine marks an error that follows a
-fork which did publish: a typed refusal then has `effects: partial` on both
-planes, and an error the engine cannot prove wrote nothing has `unknown`. A
+has `effects: none` on both planes, as does a `load csv` source over a storage
+root. After a fork that published, a typed refusal has `effects: partial` on
+both planes, and an error the engine cannot prove wrote nothing has `unknown`. A
 `load --from` onto a branch that already exists forks nothing. Any later
 failure, such as rendering a committed receipt, stays `unknown`.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps

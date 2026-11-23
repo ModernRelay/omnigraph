@@ -1,0 +1,117 @@
+# issue: none
+# notes: A grandchild branch keeps reading its parent's and grandparent's writes after both are
+# notes: deleted, before and after a reopen, and writes on.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create g
+
+--- expect ok
+
+--- mutate branch: g
+query write_on_g() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create p from g
+
+--- expect ok
+
+--- mutate branch: p
+query write_on_p() {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch create c from p
+
+--- expect ok
+
+--- mutate
+branch delete p
+
+--- expect ok
+
+--- mutate
+branch delete g
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "c"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- restart
+
+--- query branch: c
+query names_on_c() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- mutate branch: c
+query write_on_c() {
+    insert Person { name: "dave", age: 63 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query branch: c
+query names_on_c_after_write() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+{"p.name": "dave"}
+
+--- expect shape
+p.name: String
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

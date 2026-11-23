@@ -1785,6 +1785,81 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     );
 }
 
+/// A load the engine refuses before its first effect answers a plain code,
+/// with no typed details: a malformed or unknown row, a missing key or a
+/// missing endpoint. Nothing ran, so on either load route the
+/// answer is no effects and a fixed request, never a reconcile, and the head
+/// does not move. After a fork of a missing branch the same refusal follows
+/// that fork's publication, which stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_refused_before_its_first_effect_reports_no_effects() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let head = main_head_commit_id(&app).await;
+    let ndjson = |query: &str, data: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(&format!("/load/ndjson?{query}")))
+            .method(Method::POST)
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(data.to_string()))
+            .unwrap()
+    };
+    let refused = [
+        ("{not json", "invalid"),
+        (r#"{"type":"Nope","data":{}}"#, "unknown node type 'Nope'"),
+        (r#"{"type":"Person","data":{"age":3}}"#, "'name'"),
+        (
+            r#"{"edge":"Knows","from":"nobody","to":"nada","data":{}}"#,
+            "'nobody' not found",
+        ),
+    ];
+    for (data, needle) in refused {
+        for request in [
+            ndjson("branch=main&mode=append", data),
+            json_post(
+                "/load",
+                &json!({"branch": "main", "mode": "append", "data": data}),
+            ),
+        ] {
+            let path = request.uri().path().to_string();
+            let (status, body) = json_response(&app, request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {data}: {body}");
+            assert_eq!(body["code"], "bad_request", "{path} {data}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains(needle),
+                "{path} {data}: {body}"
+            );
+            assert_eq!(
+                body["disposition"],
+                json!({"effects": "none", "action": "fix"}),
+                "{path} {data}: {body}"
+            );
+        }
+    }
+    assert_eq!(main_head_commit_id(&app).await, head);
+
+    let (status, body) = json_response(
+        &app,
+        ndjson("branch=forked&from=main&mode=append", "{not json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["disposition"],
+        json!({"effects": "partial", "action": "fix"}),
+        "the fork published before the rows: {body}"
+    );
+    let (_, branches) =
+        json_response(&app, json_post("/query", &json!({"query": "branch list"}))).await;
+    assert!(
+        branches["rows"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name": "forked"})),
+        "{branches}"
+    );
+}
+
 /// Whether a load forked its branch is the engine's fact, not the route's. A
 /// branch deleted after the route authorized the load, while its body is still
 /// arriving, is forked by the load itself, and a refusal of the rows then
@@ -2195,9 +2270,7 @@ impl omnigraph::seams::Decide for MergeReturnHold {
 /// This is router cancellation evidence, not an HTTP/2 reset claim.
 #[tokio::test(flavor = "multi_thread")]
 async fn disconnected_writes_keep_admission_until_the_original_operation_finishes() {
-    use omnigraph::seams::catalog::{
-        BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE, SCHEMA_RELOAD_BEFORE_CONTRACT_READ,
-    };
+    use omnigraph::seams::catalog::{BRANCH_CREATE_POST_ROW, SCHEMA_RELOAD_BEFORE_CONTRACT_READ};
     const ATOMIC: &str = r#"query atomic() {
         insert Person { name: "Owned", age: 41 }
         insert Company { name: "OwnedCo" }
@@ -2314,7 +2387,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
         });
         let hold = Arc::new(omnigraph::seams::Hold::default());
         let seam = if door == "/branches/merge" {
-            &BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE
+            &BRANCH_CREATE_POST_ROW
         } else {
             &SCHEMA_RELOAD_BEFORE_CONTRACT_READ
         };
@@ -2938,6 +3011,11 @@ async fn load_csv_statement_is_denied_served_without_a_policy_and_moves_no_head(
         assert!(
             error.contains("ingress is denied for this graph"),
             "{request}: {error}"
+        );
+        assert_eq!(
+            body["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{request}: {body}"
         );
     }
     assert_eq!(
@@ -5694,7 +5772,7 @@ async fn query_rows_omit_null_cells() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_branch_list_create_merge_flow_works() {
-    let (temp, app) = app_for_loaded_graph().await;
+    let (_temp, app) = app_for_loaded_graph().await;
 
     // Native name validation is a refusal before any branch effect. Both
     // creation doors must leave admission open for the valid flow below.
@@ -5761,23 +5839,7 @@ async fn remote_branch_list_create_merge_flow_works() {
         "the receipt names the head the branch starts at"
     );
 
-    // Target namespace inventory reads the ancestor ref before it can clone
-    // or reclaim anything. A failed read must leave server admission open.
-    let refs = graph_path(temp.path()).join("__manifest/_refs/branches");
-    let feature_ref = fs::read_dir(refs)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("feature.")
-        })
-        .unwrap();
-    let original = fs::read(&feature_ref).unwrap();
-    fs::write(&feature_ref, b"{").unwrap();
-    let (status, _) = json_response(
+    let (status, body) = json_response(
         &app,
         json_post(
             "/branches",
@@ -5785,8 +5847,11 @@ async fn remote_branch_list_create_merge_flow_works() {
         ),
     )
     .await;
-    fs::write(&feature_ref, original).unwrap();
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a name below a live branch shares its physical path and is refused on main's rows: {body}"
+    );
 
     let (list_status, list_body) = json_response(
         &app,
@@ -6256,7 +6321,7 @@ async fn branch_merge_delete_branch_refusal_is_non_fatal() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial(branch_merge_pre_return)]
 async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_slow_reads() {
-    use omnigraph::seams::catalog::BRANCH_MERGE_PRE_RETURN;
+    use omnigraph::seams::catalog::BRANCH_DELETE_PRE_TOMBSTONE;
     for compound in [false, true] {
         let temp = init_loaded_graph().await;
         let graph = graph_path(temp.path());
@@ -6305,64 +6370,38 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
             .unwrap();
         assert_eq!(held_read.status(), StatusCode::OK);
         assert_eq!(operations.snapshot().active_reads, 1);
-        let mut branch_refs = fs::read_dir(graph.join("__manifest/_refs/branches"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(branch_refs.len(), 1, "the fixture has one named branch");
-        let branch_ref = branch_refs.pop().unwrap();
-        let saved = fs::read(&branch_ref).unwrap();
-        let (status, output) = if compound {
-            let request_app = app.clone();
-            let (start, started) = std::sync::mpsc::channel();
-            let request = std::thread::spawn(move || {
-                started.recv().unwrap();
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(json_response(
-                        &request_app,
-                        json_post(
-                            "/branches/merge",
-                            &json!({"source": "feature", "delete_branch": true}),
-                        ),
-                    ))
-            });
-            let thread = request.thread().id();
-            let source = branch_ref.clone();
-            let guard = BRANCH_MERGE_PRE_RETURN.observe(move || {
-                if std::thread::current().id() == thread {
-                    fs::write(&source, b"{").unwrap();
-                }
-            });
-            start.send(()).unwrap();
-            let result = request.join().unwrap();
-            drop(guard);
-            result
-        } else {
-            fs::write(&branch_ref, b"{").unwrap();
-            json_response(
-                &app,
-                Request::builder()
-                    .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                    .uri(g("/branches/feature"))
-                    .method(Method::DELETE)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+        let (status, output) = {
+            let _before_any_effect = BRANCH_DELETE_PRE_TOMBSTONE.fire_always();
+            if compound {
+                json_response(
+                    &app,
+                    json_post(
+                        "/branches/merge",
+                        &json!({"source": "feature", "delete_branch": true}),
+                    ),
+                )
+                .await
+            } else {
+                json_response(
+                    &app,
+                    Request::builder()
+                        .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                        .uri(g("/branches/feature"))
+                        .method(Method::DELETE)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+            }
         };
-        fs::write(&branch_ref, &saved).unwrap();
         if compound {
             assert_eq!(status, StatusCode::OK, "{output}");
             assert_eq!(output["outcome"], "fast_forward");
             assert_eq!(output["branch_deleted"], false);
-            assert_eq!(output["branch_delete_error_details"]["code"], "internal");
+            assert_eq!(
+                output["branch_delete_error_details"]["code"], "bad_request",
+                "the injected seam failure is a manifest error: {output}"
+            );
             assert!(
                 !output["commit"]["graph_commit_id"]
                     .as_str()
@@ -6370,11 +6409,12 @@ async fn pre_effect_delete_failure_preserves_receipt_and_write_capacity_under_sl
                     .is_empty()
             );
         } else {
-            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{output}");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{output}");
+            assert_eq!(output["disposition"]["effects"], "none", "{output}");
         }
         assert!(
             !operations.snapshot().closed,
-            "a proven manifest read failure has no deletion effects"
+            "a failure proven before the delete's first effect closes nothing"
         );
         assert_eq!(workload.snapshot().ingress_count, 0);
         let (status, sentinel) = json_response(

@@ -215,6 +215,62 @@ pub async fn create_branch(
         .await
 }
 
+/// The tree of `native` as a shallow clone of `source` at `source_version`,
+/// and nothing else: the commit Lance's `create_branch` makes before it
+/// writes the branch's ref file, for a store whose branch set is the rows on
+/// main (RFC "Branch existence in the catalog" §Create). The clone context
+/// serves the new tree's manifest requests as [`create_branch`]'s does.
+pub async fn create_branch_tree(
+    source: &Dataset,
+    native: &str,
+    source_version: u64,
+    binding: Option<&crate::storage::CapturedStorageBinding>,
+) -> Result<Dataset> {
+    use lance::dataset::WriteDestination;
+    use lance::dataset::transaction::{Operation, Transaction};
+
+    let mut store_params = source.store_params().cloned().unwrap_or_default();
+    if let Some(binding) = binding {
+        store_params.storage_options_accessor = Some(Arc::new(
+            lance::io::StorageOptionsAccessor::with_static_options(binding.lance_options()),
+        ));
+    }
+    let source_branch = source.manifest().branch.clone();
+    let branch_location = source.branch_location().find_branch(Some(native))?;
+    let source_location = source
+        .branch_location()
+        .find_branch(source_branch.as_deref())?;
+    let operation = Operation::Clone {
+        is_shallow: true,
+        ref_name: source_branch,
+        ref_version: source_version,
+        ref_path: source_location.uri,
+        branch_name: Some(native.to_string()),
+    };
+    let transaction = Transaction::new(source_version, operation, None);
+    let object_store = source.object_store(None).await?;
+    let handler = probed_commit_handler(source, ManifestRequestProbe::new()).await?;
+    let storage_format = source
+        .manifest()
+        .data_storage_format
+        .lance_file_format()
+        .to_selector();
+    let context = CloneContext::capture(source, source_version)?;
+    CLONE_CONTEXT
+        .scope(
+            context,
+            crate::lance_commit::commit_builder(WriteDestination::Uri(
+                branch_location.uri.as_str(),
+            ))
+            .with_store_params(store_params)
+            .with_object_store(object_store)
+            .with_commit_handler(handler)
+            .with_storage_format(storage_format)
+            .execute(transaction),
+        )
+        .await
+}
+
 impl ManifestLocationCommitHandler {
     /// Send the commit's manifest put-if-absent until the store answers it,
     /// by the shared conditional-request policy

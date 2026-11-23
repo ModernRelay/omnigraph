@@ -194,7 +194,7 @@ async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
                 frozen.metadata_digest().clone(),
             )
         }
-        ResetMode::None | ResetMode::S3Versioning => {
+        ResetMode::None | ResetMode::S3Versioning | ResetMode::Rebuild => {
             return failure(
                 "unsupported_runner_axis",
                 "local fixture worker cannot freeze an S3 reset template",
@@ -819,6 +819,7 @@ pub(crate) async fn build_dataset(
         uri,
         None,
         &PlainHost,
+        &(),
     )
     .await?;
     drop(session);

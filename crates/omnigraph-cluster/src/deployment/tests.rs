@@ -1786,9 +1786,12 @@ async fn catalogue_policy_deploys_without_a_managed_graph_and_survives_projectio
         "version: 1\ngraphs:\n  og_reserved:\n    schema: ./people.pg\n",
     )
     .unwrap();
+    // The system prefix contains an underscore, so the server's graph id
+    // rule refuses it when the configuration is validated (issue 1490).
     let error = apply_deployment(dir.path(), None, &owner(), |_, _, _| {})
         .await
         .unwrap_err();
-    assert_eq!(error.code, "reserved_graph_id");
+    assert_eq!(error.code, "invalid_resource_id");
+    assert!(error.message.contains("og_reserved"), "{error:?}");
     assert!(!dir.path().join("graphs/og_reserved.omni").exists());
 }

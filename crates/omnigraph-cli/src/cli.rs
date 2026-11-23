@@ -160,7 +160,7 @@ pub(crate) enum Command {
     /// Initialize a new graph from a schema
     Init(InitArgs),
     /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
-    /// the current format this binary serves (v17); other formats are rebuilt by export and load
+    /// the current format this binary serves (v18); other formats are rebuilt by export and load
     Upgrade(UpgradeArgs),
     /// Compact small Lance fragments in every backing dataset of the graph
     Optimize(OptimizeArgs),
@@ -240,7 +240,7 @@ pub(crate) enum Command {
     /// discovers or hosts a server. stdout carries only MCP messages and
     /// diagnostics go to stderr.
     Mcp(McpArgs),
-    /// Open OmniGraph Studio on an existing server target, print its link
+    /// Open Omnigraph Studio on an existing server target, print its link
     /// and exit.
     ///
     /// The `omnigraph-studio://open` link names the target, `--graph` when

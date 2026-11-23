@@ -747,7 +747,9 @@ cargo test --locked --test scenarios dst_bench_cost_count_golden
 The harness's contract is in the
 [benchmark harness README](../../crates/omnigraph-bench/README.md) and the
 [benchmark catalog](../../benchmarks/README.md). This section records how its
-evidence is produced and which tests own it.
+evidence is produced and which tests own it. The harness, the host inside it
+and the driver inside the host are named in the README's
+[architecture section](../../crates/omnigraph-bench/README.md#architecture).
 
 For embedded execution, the benchmark runner executes `gqt-v1` dataset/query
 pairs through the same
@@ -775,6 +777,13 @@ materialization are timed; expectations remain outside the interval. Server
 identity comes from a declared deployment receipt, while server storage counts
 and RSS remain absent. Client build, machine and RSS evidence stay separate.
 
+A run under `--server-product` starts the build's `omnigraph-server` for every
+repetition, over an empty cluster the product binary applies, loads the fixture
+through the server and runs the workload there, a measured block included
+([a server per repetition](../../crates/omnigraph-bench/README.md#a-server-per-repetition)).
+The record names the server binary's digest and each repetition's server peak
+RSS; server storage counts remain absent.
+
 ```bash
 RUSTFLAGS= cargo run --release --locked -p omnigraph-bench -- \
   run local-fast --dataset-cache /qualified/cache
@@ -796,9 +805,34 @@ with and without a warmup, the concurrent record, the run settings, the
 readback of two labels by their own key columns, the block's failure routes
 (a failed statement, a dealt stream that runs out, an acknowledged row
 missing at the readback), a free-running block beside the measured one, and
-the one-point routes' refusal of a sweep; `concurrent_host` owns the driver's
+the one-point routes' refusal of a sweep; `driver` owns the driver's
 counting, service-time buckets and percentile arithmetic, and `projection` the
-claim eligibility of a concurrent record. `dataset_identity`,
+claim eligibility of a concurrent record. `gqt_owned_server_tests.rs` owns the
+server per repetition against a stand-in HTTP server: the seed, the block and
+the readback over HTTP, which conflict is run again (a 409 that names a
+read-set conflict and applied nothing, up to the host's bound) and which is
+not, a failed block left unsettled, a refusal that repeats a token reaching
+the parent redacted, a seeded graph whose node or edge rows differ from the
+base, the planning and run-option refusals, the record's round trip and
+projection, and the server process's start, readiness, build identity, log
+tails and stop. Its two ignored tests,
+`a_rebuild_repetition_runs_against_the_builds_own_server` and
+`every_statement_kind_runs_against_the_builds_own_server`, run a repetition
+against the built `omnigraph` and `omnigraph-server`, which they take from
+the test executable's profile directory; `tests-slow-nightly.yml` enrolls
+both, after the compile that leaves the binaries there.
+`rustfs_integration_a_rebuild_repetition_runs_against_the_builds_own_server_over_a_bucket`
+runs one repetition with the same two binaries over a prefix of a bucket:
+the apply onto the prefix, the lock read from `cluster status`, the server
+started on the prefix, and the root's deletion. It returns early without
+`OMNIGRAPH_S3_TEST_BUCKET`, and the RustFS job of `ci.yml` enrolls it after
+the call that leaves the binaries in `target/debug`. The release tests of
+`tests/integration/cli.rs` named `the_rebuild_route_…` own the owner loop end
+to end. Each returns early unless the build is release and
+`OMNIGRAPH_BENCH_PRODUCT` and `OMNIGRAPH_BENCH_SERVER_PRODUCT` name the
+build's `omnigraph` and `omnigraph-server`, and the store's volume has to pass
+the backend qualification (APFS on macOS, XFS on EC2 instance-store NVMe on
+Linux), which CI's Linux runners do not; no workflow runs them. `dataset_identity`,
 `dataset_cache`, and `dataset_worker` own logical history, cache integrity,
 and contained building; `gqt_runner`, `gqt_supervisor`, and `gqt_protocol` own
 operation boundaries and worker admission. `registered_fixture`, `reset`, and

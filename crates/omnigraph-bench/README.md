@@ -37,6 +37,57 @@ Missing sources and absent cache entries remain distinct. See `help config`,
 `help cache`, or the versioned `help --json` schema. Inspection/help do not need
 a release build or a dataset cache.
 
+## Architecture
+
+The harness is this crate and its binary. It contains a host, and the host
+contains a driver.
+
+| Part | Role | Code |
+|---|---|---|
+| Harness | Everything around a measurement. It plans the points, prepares and resets the fixture, runs each repetition in a fresh process, verifies, and writes the record. | this crate |
+| Host | Runs one frozen GQT program inside the repetition's process. It takes the timings and the store-call counts, and tells the supervisor when the measured interval opens and closes. | `BenchHost` in `src/gqt_runner.rs`, an `ExecutionHost` (the store and the measured block) and an `Observer` (the clock and the records) |
+| Driver | Issues the statements of a measured block, again and again, and times each one. | `drive` and `work` in `src/driver.rs` |
+
+One repetition crosses one process boundary, and a second one when the run
+starts a server:
+
+```text
+omnigraph-bench run                          parent process
+  plan          catalog.rs, gqt_case.rs        one point per scenario and swept value
+  run loop      gqt_runner.rs                  resets, then one worker per repetition
+                gqt_owned_server.rs            the same around a server it starts
+  supervisor    gqt_supervisor.rs              starts the worker, holds its deadline, reaps it
+      |
+      |  gqt_protocol.rs: the request, Ready, Settled, the sample
+      v
+  worker        gqt_worker.rs                child process, fresh per repetition
+    host        BenchHost                      runs the program, times the selected step
+      driver    driver.rs                      only when the selected step is a measured block
+          |
+          |  HTTP, under --server-product only
+          v
+  server        gqt_server_process.rs        omnigraph-server, a child of the parent,
+                                             started and stopped around the worker
+```
+
+The selected step decides whether a driver runs.
+
+- **One operation.** The GQT executor issues it once. The host times it
+  between `operation_started` and `operation_finished`. No driver runs.
+- **A measured block.** The host calls `drive` between the same two
+  callbacks. The driver spawns one task per worker, and each task loops its
+  statement through a `SessionRunner`, embedded or over HTTP, for the warmup
+  and the duration.
+
+The driver is closed-loop: a worker issues its next statement when the last
+one is acknowledged. `Driver` records that on every observation and record
+as `driver: closed-loop`, and [Measured blocks](#measured-blocks) says what
+follows from it. No driver issues statements at a set rate.
+
+Expectations and verification run after the measured interval closes. The
+supervisor and the run loop then validate the sample, and the harness builds
+the record.
+
 ## Execution and identity boundaries
 
 A scenario is one selected operation on a fixture. Groups select scenario
@@ -249,6 +300,13 @@ projection preserves those absences as nulls and marks the SUT evidence
 `declared-deployment`. Killing or reaping a timed-out client proves only client
 containment, not server-side cancellation. Existing clean-client release and
 archive publication guards still apply.
+
+A run can start the server itself instead. `--store` with `--server-product`
+plans the same scenarios at the `rebuild` reset level: the harness starts the
+build's `omnigraph-server` for every repetition over an empty cluster, loads
+the fixture through it, and a workload may publish writes and run a measured
+block, since no repetition shares a graph with another. No receipt, endpoint
+or token is given; see [A server per repetition](#a-server-per-repetition).
 
 ## Logical references for real graphs
 
@@ -616,6 +674,9 @@ worker declares itself ready, before the measured step begins, to witness that
 the preparation wrote nothing there (the worker holds no store credentials;
 the product's children receive the run's `AWS_*` variables). The clone is deleted
 after a verified repetition and kept for inspection after a failed one. A
+deletion removes the current objects and a listing witnesses it; on a
+versioned bucket the noncurrent versions stay until the bucket's lifecycle
+rule expires them, and the same holds for a server's cluster root. A
 `--- restart` is never the measured step on this route and is a no-op
 elsewhere in the program; `--- schema` and seeds, `--- csv` sections, seams,
 pins, settings and concurrent steps have no command-line form and are refused
@@ -658,14 +719,17 @@ its `omnigraph` taken from the store's `builds/<sha>/<triple>/omnigraph` or,
 on a miss, built from `git archive <sha>` in a scratch directory under the
 dataset cache with `cargo build --release --locked -p omnigraph-cli --bin
 omnigraph` and put there (a clean tree by construction); `<ref>=<path>` names
-the binary instead and puts nothing. Every ref is resolved, then every ref's
+the binary instead and puts nothing, and a full lowercase 40-character commit
+sha in that form is the commit as written, so it needs neither `git` nor a
+repository. Every ref is resolved, then every ref's
 binary is inspected, before any run: a product writing another storage format
 refuses the whole command as `not_comparable`, and a binary whose `version
 --json` names another commit than its ref is refused as
 `product_commit_mismatch` (a development build names no commit and is admitted
 under any ref), and every scenario's run options are checked for every ref, so
 a selection with one point that resets another way is refused whole and
-nothing is measured; then every scenario of the selection runs once per ref, in
+nothing is measured; then every scenario of the selection, a swept one with
+every point it plans, runs once per ref, in
 `--at` order, before the next scenario (the first ref is the baseline a later
 one is read against, and the refs' runs of one scenario are neighbours in time,
 so a drifting machine or store moves both alike), the records of one ref
@@ -711,8 +775,8 @@ A scenario whose workload holds a `--- concurrent measured` block measures
 that block; the [catalog guide](../../benchmarks/README.md#measured-concurrent-blocks)
 has the scenarios and the run flags. The block is the selected step. A
 workload whose measured block is another step than the selected one is
-refused, and so is the block under a served target or the `clone` reset
-level. A label of the block declares up to 256 workers; any other
+refused, and so is the block against a provisioned server or at the `clone`
+reset level. A label of the block declares up to 256 workers; any other
 free-running block of the program keeps the bound of 8 and runs its sessions
 once, in declaration order.
 
@@ -730,8 +794,9 @@ route.
 The worker runs the block between the two protocol signals: `Ready` before
 the warmup's first statement and `Settled` once the last worker returned its
 statement in flight, so `elapsed_us` is warmup, window and drain.
-`concurrent_host::drive` spawns one task per worker over a clone of the case
-session, each under the caller's query I/O probes. A phase flag moves from
+`driver::drive` spawns one task per worker, each over a `SessionRunner` of
+its own (embedded, a clone of the case session) and under the caller's query
+I/O probes. A phase flag moves from
 warmup to measured to stop. A statement is counted in the phase it started
 in, and its acknowledgement lands in the second of the window it arrived in,
 or in `acked_in_drain` at or past the declared duration. At the flip the host
@@ -766,13 +831,120 @@ bounds, and a plain GQT record whose samples carry a block. The projection
 reads the inner record and takes `claim_eligible` from the wrapper, so a
 closed-loop run is never claim-eligible.
 
-`run --archive` publishes the record. A `--store` run is at the `clone`
-reset level and so runs no measured block yet; `report`, which reads a
-store, prints a concurrent record it finds there with its run and, per
-label, every repetition's rate, p50, p99 and conflicts in repetition order.
-It summarizes nothing across repetitions, and its `*_us` columns time whole
-blocks. The supervisor's deadline and the worker's whole-file timeout both
-count past the block's declared warmup and duration.
+`run --archive` publishes the record. A `--store` run at the `clone` reset
+level runs no measured block; one with `--server-product` runs it against a
+server (next section) and puts its record into the store. `report`, which
+reads a store, prints a concurrent record it finds there with its run and,
+per label, every repetition's rate, p50, p99 and conflicts in repetition
+order. It summarizes nothing across repetitions, and its `*_us` columns time
+whole blocks. The supervisor's deadline and the worker's whole-file timeout
+both count past the block's declared warmup and duration.
+
+### A server per repetition
+
+`run --store <directory | s3://bucket/prefix> --server-product[=<path>]`
+plans every selected scenario in the served environment of the store's
+backend, the host's probed local one or the one `--backend` declares for an
+`s3://` store, at `ResetMode::Rebuild`, spelled `rebuild`. A server point at that level is
+`ProcessLifecycle::FreshPerRepetition`, admits a workload step that loads or
+moves a head (the graph is the repetition's own), and admits the measured
+block with at most `SERVED_BLOCK_SESSIONS` (64) sessions. `--server` keeps
+`reset: none` and its refusals. `validate_run_options` requires a store of
+the declared backend's kind (an `s3://` store declares an S3 backend, a local
+store a local one) and the direct route, and refuses the flag on an engine
+point.
+
+`ProductBinary.server` is the server binary's canonical path and file digest:
+the path the flag gives, or `omnigraph-server` beside the product. The record
+names the build through the product's `version --json`, so a started server
+is held to it: once it is ready the owner reads the commit it names at
+`GET /healthz`, and a server that names another commit than the product fails
+the start with `server_commit_mismatch`. A build that names no commit is
+admitted, as the product's is. Under `--at` the flag takes no path and a ref
+without one is refused, since the store's `builds/` holds no server binary.
+
+The owner loop (`execute_owned_server` in `src/gqt_owned_server.rs`, Unix)
+acquires the point's base from the store for two things only, the logical
+digest the point binds and the row count of every node and edge table, and
+never reads it again. Per repetition it:
+
+1. takes `<store>/servers/<run>-<repetition>` from the store, a directory or
+   a prefix of the bucket that a listing shows empty
+   (`FixtureStore::empty_server_root`), and writes a cluster source
+   beside the run's scratch: the fixture's schema, and a policy that lets
+   `act-bench-steps` and one `act-bench-s<n>` per block session read, write,
+   and create, delete, merge, publish and drop on any branch;
+2. runs the product's `omnigraph cluster apply` onto the root, under the
+   run's child environment plus an `OMNIGRAPH_HOME` created empty for the
+   repetition, and refuses a receipt that is not complete and converged, or
+   an admission lock left behind: the lock file under a local root, and
+   under a bucket, where a release keeps the lock's key, a `lock_id` in the
+   product's `cluster status --json`;
+3. starts the server with `--cluster file://<root> --bind 127.0.0.1:0` (a
+   root under a bucket as its `s3://` URI) under
+   the same environment, a `TMPDIR` of its own under the run's scratch and
+   the token map, reads the bound address from its stdout, polls `/readyz`
+   and reads the commit the server names at `/healthz`
+   (`gqt_server_process`);
+4. supervises a worker with `RepetitionInputV2::OwnedServer`: the server's
+   URL, the steps' token, one token per session, the server digest and the
+   expected counts. Tokens are two ULIDs each, made per repetition, sent on
+   the private stdin frame, and redacted from every error;
+5. stops the server (SIGTERM, 40 seconds, then a kill), takes its peak
+   resident set from the reaped process as the sample's `peak_rss_bytes`,
+   and deletes the root through the store, which lists it empty afterwards
+   (`FixtureStore::delete_server_root`).
+
+The worker (`execute_owned_server_rep_signaled`) calls
+`omnigraph_gqt_core::provision_served`, which executes the dataset file
+against the server, counts each node table through `POST /query` and reads
+each edge table's rows from `GET /snapshot` of its branch (the count the
+branch's manifest publishes), then runs the workload with
+`execute_measured_served`. The host's `served_block` opens one
+`ServedSession` per session of the block and hands them to `driver::drive`
+as its `SessionRunner`s, where the embedded block hands it clones of the case
+session, so the phases, the window and the buckets are one implementation.
+The readback asks
+through the `ReadDoor` trait, which a `Session` answers in process and a
+`ServedSession` over HTTP. Over HTTP the readback's scan of a table's keys
+is one `POST /query` answer, and the client reads no answer past 64 MiB: a
+fixture whose keys outgrow one answer ends a correct run with an "over the
+response bound" error.
+
+`ServedSession::run` applies the embedded rule to what the wire shows: an
+HTTP 409 whose body carries `read_set_conflict` is run again up to the
+host's retry bound, each rerun counted, and the session's expect holds
+against the final answer. A conflict whose `disposition` says an earlier
+publication of the same request applied (`effects: partial`) is not run
+again, since the rerun would apply that publication twice; a body without a
+disposition is read as `effects: none`. The server's own reprepares do not
+reach the client, so `authority_conflicts` is lower here than embedded for
+the same work. HTTP 429 fails the run.
+
+Evidence. The proof is `PreparationProofV2::OwnedServer { server_sha256 }`. A
+sample carries `server_executable_sha256` and no receipt, base digest,
+physical digest, store calls or merge evidence; the worker leaves
+`peak_rss_bytes` absent and the owner sets it. The record's SUT is the
+product identity with `server_executable_sha256`, beside the machine, the
+backend (probed for a local store, the run's declaration with
+`probe: "declared"` for a bucket) and the base; a product record names a
+server binary exactly
+when its target is the server. Validation requires the server's peak on
+every sample, and the projection leaves the logical-call columns absent.
+`report` names such a row `product-server`.
+
+A worker error gets the stop's error and the last 4 KiB of each of the
+server's two logs appended: stdout, where the server logs, and stderr. A
+failed start or stop carries the same two tails. A worker failure the cache
+layer classes as contained removes the root. Any other worker failure, and
+every failed apply, start, stop or sample validation, leaves the root and
+the scratch directory, marked quarantined, and names both. A stop that fails
+after a good sample fails the repetition. Every error of a repetition names
+it. Error codes of the parent's side: `server_cluster_apply_failed`,
+`server_start_failed`, `server_commit_mismatch`, `server_stop_failed`.
+
+Not covered: the page cache is uncontrolled, and a bench killed in the
+middle of a repetition leaves its server running.
 
 ## End-to-end query and traversal workloads
 

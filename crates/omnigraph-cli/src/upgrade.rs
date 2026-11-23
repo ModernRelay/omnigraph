@@ -133,6 +133,11 @@ fn write_human(report: &omnigraph::db::UpgradeReport, writer: &mut dyn Write) ->
         "census: {} reads, {} cells",
         work.census_reads, work.census_cells
     )?;
+    writeln!(
+        writer,
+        "rows: {} written, refs: {} unlinked",
+        work.rows_written, work.refs_unlinked
+    )?;
     for finding in &report.findings {
         writeln!(writer, "{}: {}", finding.code, finding.message)?;
     }
@@ -229,7 +234,8 @@ mod tests {
                 "route: none\ncompleted handlers: none\nlast durable completed boundary: none\n",
                 "source: 0 live refs, 0 retired refs, 0 orphan writers, 0 legacy commits, 0 bookkeeping versions, 0 absent parents\n",
                 "legacy objects: 0 data files, 0 id shards, 0 writer shards, 0 schema contents, 0 bytes\n",
-                "census: 0 reads, 0 cells\nunsupported_source: inspect the source\n",
+                "census: 0 reads, 0 cells\nrows: 0 written, refs: 0 unlinked\n",
+                "unsupported_source: inspect the source\n",
                 "Check is advisory. Keep the graph offline: stop all readers, writers and maintenance, retain a verified backup of the whole root, then run `omnigraph upgrade --target <graph>` without `--check`.\n",
             )
         );
@@ -258,7 +264,7 @@ mod tests {
                 "route: convert -> activate\ncompleted handlers: convert\nlast durable completed boundary: converted\n",
                 "source: 0 live refs, 0 retired refs, 0 orphan writers, 0 legacy commits, 0 bookkeeping versions, 0 absent parents\n",
                 "legacy objects: 0 data files, 0 id shards, 0 writer shards, 0 schema contents, 0 bytes\n",
-                "census: 0 reads, 0 cells\nfailed handler: activate\n",
+                "census: 0 reads, 0 cells\nrows: 0 written, refs: 0 unlinked\nfailed handler: activate\n",
                 "recovery executable: the original executable\nrecovery action: keep offline and inspect\n",
             )
         );
