@@ -304,8 +304,8 @@ declares, built before step 1 on every route, so no step, label, report
 row, measure row or DST observation names it; a failure is a setup failure
 as a seed's is. `count` is in `1..=10000`, the loop's cap. `${branch}` is
 the only marker the body admits, and the recipe is validated once with the
-longest name substituted; a `${` in the header is refused as on any header
-line. The section is refused before `--- seed`, after any step, and twice:
+longest name substituted; a `${` in the header is refused as on any section
+header. The section is refused before `--- seed`, after any step, and twice:
 
 ```yaml
 --- branches generate: v1 seed: 0 count: 64 prefix: w from: main

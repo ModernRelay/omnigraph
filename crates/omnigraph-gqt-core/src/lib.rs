@@ -3799,7 +3799,7 @@ fn parse_text(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         ),
         _ => {}
     }
-    for (idx, line) in lines.iter().enumerate() {
+    for (idx, line) in lines.iter().enumerate().skip(header_lines.len()) {
         if line.contains("${") && !substitutable_lines.contains(&idx) {
             errors.push(
                 CaseError::new(
