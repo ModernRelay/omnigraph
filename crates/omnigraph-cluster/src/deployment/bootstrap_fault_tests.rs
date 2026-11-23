@@ -1,7 +1,7 @@
 //! The in-memory backend supplies real atomic create/CAS semantics. This test
 //! adapter records the actual requests and injects lost acknowledgements only
-//! after the backend committed them; no production failpoint substitutes for
-//! an uncertain storage response.
+//! after the backend committed them, and refusals that applied nothing only
+//! before; no production failpoint substitutes for a storage response.
 use super::*;
 use omnigraph_storage::{
     ListDirBounds, ObjectStorageAdapter, Result as StorageResult, StorageAdapter, StorageError,
@@ -29,9 +29,6 @@ enum Point {
     LockCreate,
     /// A same-identity rerun's exact-version replace of its bootstrap lock.
     Reenter,
-    FreshnessReceipt,
-    LedgerReceipt,
-    DeploymentReceipt,
     StateCreate,
     StateAccepted,
     StateTerminal,
@@ -43,6 +40,16 @@ enum Point {
 enum Fault {
     LostResponse,
     CancelAfterCommit,
+    /// A transient error before the backend saw the write: nothing applied.
+    TransientBeforeCommit,
+}
+
+/// A read that fails once, transiently, after the initial deployment
+/// completed (the ledger is at revision 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadFault {
+    TerminalState,
+    TerminalBundle,
 }
 
 #[derive(Debug)]
@@ -57,6 +64,7 @@ struct Controlled {
     claim_attempts: AtomicUsize,
     /// `(only once the lock exists, remaining)` injected `exists()` errors.
     exists_fault: Mutex<Option<(bool, usize)>>,
+    read_fault: Mutex<Option<ReadFault>>,
 }
 
 impl Controlled {
@@ -71,6 +79,7 @@ impl Controlled {
             claim_barrier: Mutex::default(),
             claim_attempts: AtomicUsize::new(0),
             exists_fault: Mutex::default(),
+            read_fault: Mutex::default(),
         }
     }
 
@@ -91,12 +100,6 @@ impl Controlled {
             } else {
                 Point::LockCreate
             })
-        } else if uri.ends_with("/__cluster/bootstrap/freshness.json") {
-            Some(Point::FreshnessReceipt)
-        } else if uri.ends_with("/__cluster/bootstrap/ledger.json") {
-            Some(Point::LedgerReceipt)
-        } else if uri.ends_with("/__cluster/bootstrap/deployment.json") {
-            Some(Point::DeploymentReceipt)
         } else if uri.ends_with("/__cluster/state.json") {
             if !cas {
                 Some(Point::StateCreate)
@@ -134,8 +137,55 @@ impl Controlled {
                 self.committed.notify_one();
                 std::future::pending::<StorageResult<()>>().await
             }
+            Some(Fault::TransientBeforeCommit) => unreachable!("armed before commit"),
             None => Ok(()),
         }
+    }
+
+    /// The storage layer's answer to a write the backend never saw: a
+    /// classified error, not `Unresolved`, so nothing applied.
+    fn before_commit(&self, point: Option<Point>) -> StorageResult<()> {
+        let mut active = self.fault.lock().unwrap();
+        if active.is_some_and(|(expected, fault)| {
+            Some(expected) == point && matches!(fault, Fault::TransientBeforeCommit)
+        }) {
+            active.take();
+            return Err(StorageError::Backend(StorageFailure::new(
+                StorageFailureKind::Transient,
+                "injected throttling before the backend saw the write",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fail this read once when it is the armed one and the ledger is at
+    /// revision 3.
+    async fn read_faulted(&self, uri: &str) -> StorageResult<()> {
+        let fault = if uri.ends_with("/__cluster/state.json") {
+            ReadFault::TerminalState
+        } else if uri.contains("/__cluster/resources/deployment/") {
+            ReadFault::TerminalBundle
+        } else {
+            return Ok(());
+        };
+        if *self.read_fault.lock().unwrap() != Some(fault) {
+            return Ok(());
+        }
+        let terminal = self
+            .inner
+            .read_text_if_exists(self.key(&format!("{ROOT}/{CLUSTER_STATE_FILE}")))
+            .await?
+            .is_some_and(|text| {
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()["state_revision"] == 3
+            });
+        if terminal && self.read_fault.lock().unwrap().take().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "injected stalled response body after the deployment completed",
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn forbid<T>(&self, operation: &str) -> StorageResult<T> {
@@ -195,6 +245,7 @@ impl StorageAdapter for Controlled {
         uri: &str,
         max_bytes: u64,
     ) -> StorageResult<Option<String>> {
+        self.read_faulted(uri).await?;
         self.inner
             .read_text_if_exists_bounded(self.key(uri), max_bytes)
             .await
@@ -237,6 +288,7 @@ impl StorageAdapter for Controlled {
         uri: &str,
         max_bytes: u64,
     ) -> StorageResult<Option<(String, String)>> {
+        self.read_faulted(uri).await?;
         self.inner
             .read_text_versioned_if_exists_bounded(self.key(uri), max_bytes)
             .await
@@ -301,6 +353,7 @@ impl StorageAdapter for Controlled {
     }
 
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> StorageResult<bool> {
+        self.before_commit(Self::point(uri, contents, false))?;
         let created = self
             .inner
             .write_text_if_absent(self.key(uri), contents)
@@ -323,6 +376,7 @@ impl StorageAdapter for Controlled {
         contents: &str,
         expected: &str,
     ) -> StorageResult<Option<String>> {
+        self.before_commit(Self::point(uri, contents, true))?;
         let predecessor = self.inner.read_text_versioned(self.key(uri)).await?;
         if uri.ends_with("/__cluster/lock.json") {
             self.claim_attempts.fetch_add(1, Ordering::SeqCst);
@@ -746,6 +800,7 @@ async fn lost_release_acknowledgement_never_replays_over_the_successor() {
                     () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("release did not reach backend"),
                 }
             }
+            Fault::TransientBeforeCommit => unreachable!("not armed here"),
         }
         assert!(adapter.fault.lock().unwrap().is_none());
         let release = adapter.writes.lock().unwrap().last().unwrap().clone();
@@ -793,9 +848,11 @@ fn lock_json(text: &str) -> serde_json::Value {
 }
 
 /// Leave this identity's lock retained, as the 2026-11-23 failure did: the
-/// freshness probe after the lock keeps failing until its deadline.
+/// freshness probe after the lock keeps failing until the attempt's one probe
+/// budget ends.
 async fn fail_after_lock(store: &ClusterStore, bundle: &CapturedDeployment, adapter: &Controlled) {
     adapter.arm_exists(true, usize::MAX);
+    let start = tokio::time::Instant::now();
     let failure = bootstrap_in_store(
         store,
         bundle,
@@ -804,6 +861,8 @@ async fn fail_after_lock(store: &ClusterStore, bundle: &CapturedDeployment, adap
     )
     .await
     .unwrap_err();
+    // One budget per attempt, not one per check.
+    assert_eq!(start.elapsed(), crate::store::BOOTSTRAP_PROBE_BUDGET);
     adapter.disarm_exists();
     assert_eq!(
         failure.outcome(),
@@ -814,6 +873,75 @@ async fn fail_after_lock(store: &ClusterStore, bundle: &CapturedDeployment, adap
             true
         )
     );
+}
+
+async fn first_attempt(
+    store: &ClusterStore,
+    bundle: &CapturedDeployment,
+) -> Result<BootstrapServingReceipt, BootstrapFailure> {
+    bootstrap_in_store(
+        store,
+        bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+}
+
+async fn rerun(
+    store: &ClusterStore,
+    bundle: &CapturedDeployment,
+) -> Result<BootstrapServingReceipt, BootstrapFailure> {
+    bootstrap_in_store(
+        store,
+        bundle,
+        &super::tests::owner(),
+        &super::tests::resume(),
+    )
+    .await
+}
+
+/// A first attempt that the injected fault at `point` suspends after the
+/// backend committed it, cancelled there as a killed process would be.
+async fn cancel_after_commit(
+    store: &ClusterStore,
+    bundle: &CapturedDeployment,
+    adapter: &Controlled,
+    point: Point,
+) {
+    adapter.arm(point, Fault::CancelAfterCommit);
+    let operation = first_attempt(store, bundle);
+    tokio::pin!(operation);
+    tokio::select! {
+        result = &mut operation => panic!("operation must wait after commit: {result:?}"),
+        () = adapter.committed.notified() => {},
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("injected storage commit was not reached"),
+    }
+}
+
+/// A completed bootstrap leaves its progress in `lock.json` and `state.json`
+/// only: nothing under `__cluster/bootstrap/`.
+async fn assert_no_bootstrap_records(adapter: &Controlled) {
+    assert!(
+        !adapter
+            .inner
+            .exists(adapter.key(&format!("{ROOT}/__cluster/bootstrap")))
+            .await
+            .unwrap()
+    );
+}
+
+/// The rerun completed and its serving receipt is claimable.
+async fn assert_resumed(
+    store: &ClusterStore,
+    adapter: &Controlled,
+    receipt: BootstrapServingReceipt,
+) {
+    let lock = lock_json(&adapter.read(CLUSTER_LOCK_FILE).await);
+    assert_eq!(lock["lock_id"], receipt.bootstrap_lock_id.as_str());
+    assert_no_bootstrap_records(adapter).await;
+    claim_in_store(store, &receipt).await.unwrap();
+    adapter.assert_no_forbidden_calls().await;
 }
 
 // The 2026-11-23 failure: a transient freshness read after the lock.
@@ -837,14 +965,7 @@ async fn same_identity_rerun_resumes_its_retained_lock_with_one_lineage() {
     );
 
     // Without the caller's exclusion proof nothing changes.
-    let refused = bootstrap_in_store(
-        &store,
-        &bundle,
-        &super::tests::owner(),
-        &super::tests::request(),
-    )
-    .await
-    .unwrap_err();
+    let refused = first_attempt(&store, &bundle).await.unwrap_err();
     assert_eq!(
         refused.outcome(),
         outcome(
@@ -856,14 +977,7 @@ async fn same_identity_rerun_resumes_its_retained_lock_with_one_lineage() {
     );
     assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, retained);
 
-    let receipt = bootstrap_in_store(
-        &store,
-        &bundle,
-        &super::tests::owner(),
-        &super::tests::resume(),
-    )
-    .await
-    .unwrap();
+    let receipt = rerun(&store, &bundle).await.unwrap();
     let lock_writes: Vec<_> = adapter
         .writes
         .lock()
@@ -886,17 +1000,7 @@ async fn same_identity_rerun_resumes_its_retained_lock_with_one_lineage() {
     assert_eq!(current["incarnation"], "inc-1");
     assert_eq!(current["request_id"], "req-1");
     assert_ne!(current["lock_id"], first["lock_id"]);
-    assert_eq!(current["lock_id"], receipt.bootstrap_lock_id.as_str());
-    for path in [FRESHNESS_RECEIPT, LEDGER_RECEIPT, DEPLOYMENT_RECEIPT] {
-        assert!(
-            adapter
-                .read(path)
-                .await
-                .contains("\"incarnation\":\"inc-1\"")
-        );
-    }
-    claim_in_store(&store, &receipt).await.unwrap();
-    adapter.assert_no_forbidden_calls().await;
+    assert_resumed(&store, &adapter, receipt).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -904,6 +1008,7 @@ async fn a_retained_lock_of_another_identity_or_a_legacy_lock_is_never_re_entere
     let (_directory, bundle, store, adapter) = fixture();
     fail_after_lock(&store, &bundle, &adapter).await;
     let retained = adapter.read(CLUSTER_LOCK_FILE).await;
+    // A legacy lock names no identity, so it refuses as an identity mismatch.
     let refused = outcome(
         "bootstrap_root_not_fresh",
         BootstrapStep::Lock,
@@ -941,14 +1046,7 @@ async fn a_retained_lock_of_another_identity_or_a_legacy_lock_is_never_re_entere
                 .await
                 .unwrap()
         );
-        let failure = bootstrap_in_store(
-            &store,
-            &bundle,
-            &super::tests::owner(),
-            &super::tests::resume(),
-        )
-        .await
-        .unwrap_err();
+        let failure = rerun(&store, &bundle).await.unwrap_err();
         assert_eq!(failure.outcome(), refused);
         assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, legacy);
         assert!(adapter.writes.lock().unwrap().is_empty());
@@ -961,17 +1059,11 @@ async fn transient_freshness_probe_errors_are_retried_within_the_deadline() {
     let (_directory, bundle, store, adapter) = fixture();
     adapter.arm_exists(true, 3);
     let start = tokio::time::Instant::now();
-    let receipt = bootstrap_in_store(
-        &store,
-        &bundle,
-        &super::tests::owner(),
-        &super::tests::request(),
-    )
-    .await
-    .unwrap();
+    let receipt = first_attempt(&store, &bundle).await.unwrap();
     assert_eq!(adapter.exists_fault.lock().unwrap().unwrap().1, 0);
-    assert!(start.elapsed() < crate::store::BOOTSTRAP_FRESHNESS_DEADLINE);
+    assert!(start.elapsed() < crate::store::BOOTSTRAP_PROBE_BUDGET);
     claim_in_store(&store, &receipt).await.unwrap();
+    assert_no_bootstrap_records(&adapter).await;
     adapter.assert_no_forbidden_calls().await;
 }
 
@@ -980,15 +1072,8 @@ async fn a_persistent_probe_error_before_the_lock_fails_at_the_deadline_with_no_
     let (_directory, bundle, store, adapter) = fixture();
     adapter.arm_exists(false, usize::MAX);
     let start = tokio::time::Instant::now();
-    let failure = bootstrap_in_store(
-        &store,
-        &bundle,
-        &super::tests::owner(),
-        &super::tests::request(),
-    )
-    .await
-    .unwrap_err();
-    assert!(start.elapsed() >= crate::store::BOOTSTRAP_FRESHNESS_DEADLINE);
+    let failure = first_attempt(&store, &bundle).await.unwrap_err();
+    assert_eq!(start.elapsed(), crate::store::BOOTSTRAP_PROBE_BUDGET);
     assert_eq!(
         failure.outcome(),
         outcome(
@@ -1014,101 +1099,201 @@ async fn a_persistent_probe_error_before_the_lock_fails_at_the_deadline_with_no_
     );
     // Nothing was written, so a plain rerun starts over.
     adapter.disarm_exists();
-    bootstrap_in_store(
-        &store,
-        &bundle,
-        &super::tests::owner(),
-        &super::tests::request(),
-    )
-    .await
-    .unwrap();
+    first_attempt(&store, &bundle).await.unwrap();
     adapter.assert_no_forbidden_calls().await;
 }
 
+/// A write that landed whose answer never arrived, or whose attempt was
+/// killed right after, is a state this bootstrap's own steps leave: the lock,
+/// the empty ledger at revision 1, or the completed deployment at revision 3.
+/// An excluded rerun reads it from `lock.json` and `state.json` and completes.
 #[tokio::test]
-async fn an_unconfirmed_write_is_classified_and_a_rerun_refuses_past_it() {
+async fn a_landed_write_whose_answer_was_lost_or_whose_attempt_was_killed_resumes() {
+    for point in [Point::LockCreate, Point::StateCreate, Point::StateTerminal] {
+        for fault in [Fault::LostResponse, Fault::CancelAfterCommit] {
+            let (_directory, bundle, store, adapter) = fixture();
+            match fault {
+                Fault::LostResponse => {
+                    adapter.arm(point, fault);
+                    let failure = first_attempt(&store, &bundle).await.unwrap_err();
+                    assert_eq!(
+                        failure.effects(),
+                        BootstrapEffects::Unconfirmed,
+                        "{point:?}"
+                    );
+                    assert!(!failure.retryable(), "{point:?}");
+                }
+                _ => cancel_after_commit(&store, &bundle, &adapter, point).await,
+            }
+            assert!(
+                adapter.fault.lock().unwrap().is_none(),
+                "{point:?} {fault:?}"
+            );
+            let receipt = rerun(&store, &bundle).await.unwrap();
+            assert_resumed(&store, &adapter, receipt).await;
+        }
+    }
+}
+
+/// A write the store refused before applying it, on the ledger create and on
+/// the step after it (the deployment's acceptance), reports a truthful
+/// `retryable: true`, and the rerun completes.
+#[tokio::test]
+async fn a_transient_write_refusal_that_applied_nothing_is_retryable_and_resumes() {
     for (point, step) in [
         (Point::StateCreate, BootstrapStep::Ledger),
         (Point::StateAccepted, BootstrapStep::Deployment),
     ] {
         let (_directory, bundle, store, adapter) = fixture();
-        adapter.arm(point, Fault::LostResponse);
-        let failure = bootstrap_in_store(
-            &store,
-            &bundle,
-            &super::tests::owner(),
-            &super::tests::request(),
-        )
-        .await
-        .unwrap_err();
-        assert!(adapter.fault.lock().unwrap().is_none());
-        assert_eq!(failure.step(), step, "{point:?}");
+        adapter.arm(point, Fault::TransientBeforeCommit);
+        let failure = first_attempt(&store, &bundle).await.unwrap_err();
+        assert!(adapter.fault.lock().unwrap().is_none(), "{point:?}");
         assert_eq!(
-            failure.effects(),
-            BootstrapEffects::Unconfirmed,
+            failure.outcome(),
+            outcome("state_write_error", step, BootstrapEffects::Confirmed, true),
             "{point:?}"
         );
-        assert!(!failure.retryable(), "{point:?}");
-        let lock = adapter.read(CLUSTER_LOCK_FILE).await;
-        let state = adapter.read(CLUSTER_STATE_FILE).await;
-        // The rerun refuses before it re-enters the lock.
-        let refused = bootstrap_in_store(
-            &store,
-            &bundle,
-            &super::tests::owner(),
-            &super::tests::resume(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            refused.outcome(),
-            outcome(
-                "bootstrap_step_unconfirmed",
-                step,
-                BootstrapEffects::None,
-                false
-            ),
-            "{point:?}"
-        );
-        assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, lock);
-        assert_eq!(adapter.read(CLUSTER_STATE_FILE).await, state);
-        adapter.assert_no_forbidden_calls().await;
+        let receipt = rerun(&store, &bundle).await.unwrap();
+        assert_resumed(&store, &adapter, receipt).await;
     }
 }
 
+/// A transient read after the initial deployment completed, of the ledger or
+/// of the bundle in final verification, is retryable, and the rerun goes
+/// straight to the receipt.
 #[tokio::test]
-async fn a_lost_answer_on_a_step_receipt_that_landed_resumes() {
-    for (point, step) in [
-        (Point::FreshnessReceipt, BootstrapStep::Freshness),
-        (Point::LedgerReceipt, BootstrapStep::Ledger),
-        (Point::DeploymentReceipt, BootstrapStep::Deployment),
+async fn a_transient_read_after_the_deployment_completed_is_retryable_and_resumes() {
+    for (fault, code, step) in [
+        (
+            ReadFault::TerminalState,
+            "state_read_error",
+            BootstrapStep::Deployment,
+        ),
+        (
+            ReadFault::TerminalBundle,
+            "deployment_bundle_read",
+            BootstrapStep::Receipt,
+        ),
     ] {
         let (_directory, bundle, store, adapter) = fixture();
-        adapter.arm(point, Fault::LostResponse);
-        let failure = bootstrap_in_store(
-            &store,
-            &bundle,
-            &super::tests::owner(),
-            &super::tests::request(),
-        )
-        .await
-        .unwrap_err();
-        assert!(adapter.fault.lock().unwrap().is_none());
-        assert_eq!(failure.step(), step, "{point:?}");
+        *adapter.read_fault.lock().unwrap() = Some(fault);
+        let failure = first_attempt(&store, &bundle).await.unwrap_err();
+        assert!(adapter.read_fault.lock().unwrap().is_none(), "{fault:?}");
         assert_eq!(
-            failure.effects(),
-            BootstrapEffects::Unconfirmed,
-            "{point:?}"
+            failure.outcome(),
+            outcome(code, step, BootstrapEffects::Confirmed, true),
+            "{fault:?}"
         );
-        let receipt = bootstrap_in_store(
-            &store,
-            &bundle,
-            &super::tests::owner(),
-            &super::tests::resume(),
+        let state_writes = |adapter: &Controlled| {
+            adapter
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|write| write.uri.ends_with(CLUSTER_STATE_FILE))
+                .count()
+        };
+        let before = state_writes(&adapter);
+        let receipt = rerun(&store, &bundle).await.unwrap();
+        assert_eq!(state_writes(&adapter), before, "the rerun writes no ledger");
+        assert_resumed(&store, &adapter, receipt).await;
+    }
+}
+
+/// The ledger at revision 2 with the initial deployment outstanding is the
+/// one state whose outcome is genuinely unknown. A rerun refuses it with an
+/// explicit code before re-entering the lock, and nothing changes. The
+/// attempt that left it says `retryable: false`, even when its last write was
+/// refused without applying: the rerun cannot make progress.
+#[tokio::test]
+async fn an_outstanding_initial_deployment_refuses_the_rerun_and_changes_nothing() {
+    for (point, fault, effects) in [
+        (
+            Point::StateAccepted,
+            Fault::LostResponse,
+            BootstrapEffects::Unconfirmed,
+        ),
+        (
+            Point::StateTerminal,
+            Fault::TransientBeforeCommit,
+            BootstrapEffects::Confirmed,
+        ),
+    ] {
+        outstanding_initial_deployment_refuses(point, fault, effects).await;
+    }
+}
+
+async fn outstanding_initial_deployment_refuses(
+    point: Point,
+    fault: Fault,
+    effects: BootstrapEffects,
+) {
+    let (_directory, bundle, store, adapter) = fixture();
+    adapter.arm(point, fault);
+    let failure = first_attempt(&store, &bundle).await.unwrap_err();
+    assert!(adapter.fault.lock().unwrap().is_none());
+    assert_eq!(failure.step(), BootstrapStep::Deployment);
+    assert_eq!(failure.effects(), effects, "{point:?}");
+    assert!(!failure.retryable(), "{point:?}");
+    let lock = adapter.read(CLUSTER_LOCK_FILE).await;
+    let state = adapter.read(CLUSTER_STATE_FILE).await;
+    assert_eq!(lock_json(&state)["state_revision"], 2);
+    let writes = adapter.writes.lock().unwrap().len();
+    let refused = rerun(&store, &bundle).await.unwrap_err();
+    assert_eq!(
+        refused.outcome(),
+        outcome(
+            "bootstrap_deployment_outstanding",
+            BootstrapStep::Deployment,
+            BootstrapEffects::None,
+            false
+        )
+    );
+    assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, lock);
+    assert_eq!(adapter.read(CLUSTER_STATE_FILE).await, state);
+    assert_eq!(adapter.writes.lock().unwrap().len(), writes);
+    adapter.assert_no_forbidden_calls().await;
+}
+
+/// Replace the retained lock's attempt counter directly in the backend.
+async fn set_attempt(adapter: &Controlled, attempt: u32) {
+    let mut lock = lock_json(&adapter.read(CLUSTER_LOCK_FILE).await);
+    lock["attempt"] = attempt.into();
+    adapter
+        .inner
+        .write_text(
+            adapter.key(&format!("{ROOT}/{CLUSTER_LOCK_FILE}")),
+            &serde_json::to_string_pretty(&lock).unwrap(),
         )
         .await
         .unwrap();
-        claim_in_store(&store, &receipt).await.unwrap();
-        adapter.assert_no_forbidden_calls().await;
-    }
+}
+
+/// The attempt is an unbounded counter: the caller's admission window bounds
+/// reruns, and only the counter's own overflow refuses.
+#[tokio::test(start_paused = true)]
+async fn the_attempt_counter_is_unbounded_until_it_would_overflow() {
+    let (_directory, bundle, store, adapter) = fixture();
+    fail_after_lock(&store, &bundle, &adapter).await;
+    set_attempt(&adapter, u32::MAX).await;
+    let exhausted = adapter.read(CLUSTER_LOCK_FILE).await;
+    let refused = rerun(&store, &bundle).await.unwrap_err();
+    assert_eq!(
+        refused.outcome(),
+        outcome(
+            "bootstrap_attempts_exhausted",
+            BootstrapStep::Lock,
+            BootstrapEffects::None,
+            false
+        )
+    );
+    assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, exhausted);
+
+    set_attempt(&adapter, 1000).await;
+    let receipt = rerun(&store, &bundle).await.unwrap();
+    assert_eq!(
+        lock_json(&adapter.read(CLUSTER_LOCK_FILE).await)["attempt"],
+        1001
+    );
+    assert_resumed(&store, &adapter, receipt).await;
 }

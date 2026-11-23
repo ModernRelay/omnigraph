@@ -75,23 +75,80 @@ pub(crate) fn canonical_storage_root(root: &str) -> Result<String, Diagnostic> {
     }
 }
 
-fn bootstrap_lock_error(error: StateLockError) -> Diagnostic {
-    let diagnostic =
-        Diagnostic::error("bootstrap_lock_error", CLUSTER_LOCK_FILE, error.to_string());
-    match &error {
-        StateLockError::Storage(storage) => diagnostic.with_storage_failure(storage),
-        _ => diagnostic,
+/// The `ClusterStore` adapter boundary for a failed read: the one conversion
+/// of a control-object read error into a diagnostic. Every such diagnostic
+/// carries the error's failure class, so whatever answers by that class (a
+/// served route, first bootstrap's `retryable`) has it without per-site care.
+///
+/// A failed *write* does not pass through here. `Diagnostic::storage_failure`
+/// is read by the served routes as "this request applied nothing", which a
+/// write's error cannot say for the operation around it. First bootstrap
+/// classifies its own writes in its recording adapter instead; its lock
+/// requests (`bootstrap_lock_error`), which no served route answers, keep the
+/// class of any error that is not unresolved.
+fn read_failure(
+    code: &str,
+    path: impl Into<String>,
+    context: impl std::fmt::Display,
+    error: &StorageError,
+) -> Diagnostic {
+    Diagnostic::error(code, path, format!("{context}: {error}")).with_storage_failure(error)
+}
+
+/// [`read_failure`] reported as a warning, for an observation that continues.
+fn read_warning(
+    code: &str,
+    path: impl Into<String>,
+    context: impl std::fmt::Display,
+    error: &StorageError,
+) -> Diagnostic {
+    Diagnostic {
+        severity: crate::DiagnosticSeverity::Warning,
+        ..read_failure(code, path, context, error)
     }
 }
 
-/// One freshness check's effect-free `exists()` probes share this deadline. A
+fn bootstrap_lock_error(error: StateLockError) -> Diagnostic {
+    match &error {
+        // A refused write keeps no class here; see `read_failure`.
+        StateLockError::Storage(storage) if storage.is_unresolved_conditional() => {
+            Diagnostic::error("bootstrap_lock_error", CLUSTER_LOCK_FILE, error.to_string())
+        }
+        StateLockError::Storage(storage) => read_failure(
+            "bootstrap_lock_error",
+            CLUSTER_LOCK_FILE,
+            "bootstrap lock request failed",
+            storage,
+        ),
+        StateLockError::BootstrapAttemptsExhausted(_) => Diagnostic::error(
+            "bootstrap_attempts_exhausted",
+            CLUSTER_LOCK_FILE,
+            error.to_string(),
+        ),
+        _ => Diagnostic::error("bootstrap_lock_error", CLUSTER_LOCK_FILE, error.to_string()),
+    }
+}
+
+/// Every effect-free `exists()` probe of one bootstrap attempt shares one
+/// deadline, this long after the attempt starts (`BootstrapProbeDeadline`). A
 /// probe whose error is transient or unclassified is retried after a pause of
 /// `BOOTSTRAP_PROBE_FIRST_PAUSE`, doubling to `BOOTSTRAP_PROBE_MAX_PAUSE`, and
-/// each probe is cut off at the deadline. A fresh bootstrap runs two checks,
-/// so its probes stay within 240 seconds of a managed operator's 600-second
-/// attempt bound.
-pub(crate) const BOOTSTRAP_FRESHNESS_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(120);
+/// each probe is cut off at the deadline. So an attempt's probes end within 240
+/// seconds of its start, inside a managed operator's 600-second attempt bound,
+/// however many checks the attempt runs.
+pub(crate) const BOOTSTRAP_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// The one probe deadline of a bootstrap attempt, or of a claim. It is made
+/// only by `start`, and every freshness and graph-or-recovery probe takes it,
+/// so no check starts a budget of its own.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BootstrapProbeDeadline(tokio::time::Instant);
+
+impl BootstrapProbeDeadline {
+    pub(crate) fn start() -> Self {
+        Self(tokio::time::Instant::now() + BOOTSTRAP_PROBE_BUDGET)
+    }
+}
 const BOOTSTRAP_PROBE_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 const BOOTSTRAP_PROBE_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(8);
 
@@ -354,14 +411,15 @@ impl ClusterStore {
         self
     }
 
-    /// Whether `path` exists, by effect-free probes retried inside `deadline`
-    /// (`BOOTSTRAP_FRESHNESS_DEADLINE`). An error is never taken for absence.
+    /// Whether `path` exists, by effect-free probes retried inside the
+    /// attempt's `deadline`. An error is never taken for absence.
     async fn probe_exists(
         &self,
         path: &str,
-        deadline: tokio::time::Instant,
+        deadline: BootstrapProbeDeadline,
     ) -> Result<bool, Diagnostic> {
         use omnigraph_storage::StorageFailureKind;
+        let deadline = deadline.0;
         let uri = self.uri(path);
         let mut pause = BOOTSTRAP_PROBE_FIRST_PAUSE;
         let mut attempts = 0u32;
@@ -375,8 +433,8 @@ impl ClusterStore {
                         "bootstrap_freshness_unknown",
                         path,
                         format!(
-                            "the existence probe did not answer within the {}-second freshness deadline (attempt {attempts})",
-                            BOOTSTRAP_FRESHNESS_DEADLINE.as_secs()
+                            "the existence probe did not answer within the attempt's {}-second probe budget (attempt {attempts})",
+                            BOOTSTRAP_PROBE_BUDGET.as_secs()
                         ),
                     );
                     diagnostic.storage_failure = Some(StorageFailureKind::Transient);
@@ -390,12 +448,12 @@ impl ClusterStore {
                 StorageFailureKind::Transient | StorageFailureKind::Unknown
             ) || now >= deadline
             {
-                return Err(Diagnostic::error(
+                return Err(read_failure(
                     "bootstrap_freshness_unknown",
                     path,
-                    format!("{error} (after {attempts} attempts)"),
-                )
-                .with_storage_failure(&error));
+                    format_args!("existence probe failed after {attempts} attempts"),
+                    &error,
+                ));
             }
             tracing::warn!(
                 path,
@@ -411,7 +469,7 @@ impl ClusterStore {
     async fn require_absent_native_paths(
         &self,
         paths: &[&str],
-        deadline: tokio::time::Instant,
+        deadline: BootstrapProbeDeadline,
     ) -> Result<(), Diagnostic> {
         for path in paths {
             if self.probe_exists(path, deadline).await? {
@@ -425,21 +483,17 @@ impl ClusterStore {
         Ok(())
     }
 
-    /// One freshness check: no native authority, graph data, recovery or
-    /// bootstrap receipts, and no lock unless this bootstrap holds it.
-    pub(crate) async fn require_fresh_bootstrap(&self, own_lock: bool) -> Result<(), Diagnostic> {
-        let deadline = tokio::time::Instant::now() + BOOTSTRAP_FRESHNESS_DEADLINE;
-        self.require_absent_bootstrap_graphs_or_recovery(deadline)
+    /// One freshness check: no native authority, graph data or recovery, and
+    /// no lock unless this bootstrap holds it.
+    pub(crate) async fn require_fresh_bootstrap(
+        &self,
+        own_lock: bool,
+        deadline: BootstrapProbeDeadline,
+    ) -> Result<(), Diagnostic> {
+        self.require_no_bootstrap_graphs_or_recovery(deadline)
             .await?;
-        self.require_absent_native_paths(
-            &[
-                CLUSTER_STATE_FILE,
-                CLUSTER_RESOURCES_DIR,
-                crate::CLUSTER_BOOTSTRAP_DIR,
-            ],
-            deadline,
-        )
-        .await?;
+        self.require_absent_native_paths(&[CLUSTER_STATE_FILE, CLUSTER_RESOURCES_DIR], deadline)
+            .await?;
         if !own_lock {
             self.require_absent_native_paths(&[CLUSTER_LOCK_FILE], deadline)
                 .await?;
@@ -447,16 +501,9 @@ impl ClusterStore {
         Ok(())
     }
 
-    pub(crate) async fn require_no_bootstrap_graphs_or_recovery(&self) -> Result<(), Diagnostic> {
-        self.require_absent_bootstrap_graphs_or_recovery(
-            tokio::time::Instant::now() + BOOTSTRAP_FRESHNESS_DEADLINE,
-        )
-        .await
-    }
-
-    async fn require_absent_bootstrap_graphs_or_recovery(
+    pub(crate) async fn require_no_bootstrap_graphs_or_recovery(
         &self,
-        deadline: tokio::time::Instant,
+        deadline: BootstrapProbeDeadline,
     ) -> Result<(), Diagnostic> {
         self.require_absent_native_paths(
             &[
@@ -516,36 +563,6 @@ impl ClusterStore {
         )
         .await
         .map_err(bootstrap_lock_error)
-    }
-
-    /// A bounded bootstrap step receipt, `None` only when absent.
-    pub(crate) async fn read_bootstrap_record(
-        &self,
-        relative: &str,
-        max_bytes: usize,
-    ) -> Result<Option<String>, Diagnostic> {
-        self.adapter
-            .read_text_if_exists_bounded(&self.uri(relative), max_bytes as u64)
-            .await
-            .map_err(|error| {
-                Diagnostic::error("bootstrap_receipt_read_error", relative, error.to_string())
-                    .with_storage_failure(&error)
-            })
-    }
-
-    /// Create a bootstrap step receipt only if absent.
-    pub(crate) async fn create_bootstrap_record(
-        &self,
-        relative: &str,
-        text: &str,
-    ) -> Result<bool, Diagnostic> {
-        self.adapter
-            .write_text_if_absent(&self.uri(relative), text)
-            .await
-            .map_err(|error| {
-                Diagnostic::error("bootstrap_receipt_write_error", relative, error.to_string())
-                    .with_storage_failure(&error)
-            })
     }
 
     pub(crate) async fn verify_bootstrap_lock(
@@ -741,10 +758,11 @@ impl ClusterStore {
         let mut uris = match self.adapter.list_dir(&dir_uri).await {
             Ok(uris) => uris,
             Err(err) => {
-                diagnostics.push(Diagnostic::warning(
+                diagnostics.push(read_warning(
                     list_error_code,
                     dir,
-                    format!("could not list '{dir}': {err}"),
+                    format_args!("could not list '{dir}'"),
+                    &err,
                 ));
                 return Vec::new();
             }
@@ -767,10 +785,11 @@ impl ClusterStore {
                         format!("could not parse ({err}); leaving it in place"),
                     )),
                 },
-                Err(err) => diagnostics.push(Diagnostic::warning(
+                Err(err) => diagnostics.push(read_warning(
                     parse_error_code,
                     uri.clone(),
-                    format!("could not read ({err}); leaving it in place"),
+                    "could not read, leaving it in place",
+                    &err,
                 )),
             }
         }
@@ -846,10 +865,11 @@ impl ClusterStore {
         let mut uris = match self.adapter.list_dir(&dir_uri).await {
             Ok(uris) => uris,
             Err(err) => {
-                diagnostics.push(Diagnostic::warning(
+                diagnostics.push(read_warning(
                     "recovery_sidecar_read_error",
                     CLUSTER_RECOVERIES_DIR,
-                    format!("could not list '{CLUSTER_RECOVERIES_DIR}': {err}"),
+                    format_args!("could not list '{CLUSTER_RECOVERIES_DIR}'"),
+                    &err,
                 ));
                 return Vec::new();
             }
@@ -920,11 +940,17 @@ impl ClusterStore {
         kind: &ResourceKind,
         digest: &str,
         content: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
+        const CODE: &str = "resource_payload_write_error";
         let Some(relative) = Self::payload_relative(kind, digest) else {
-            return Err("resource kind has no payload".to_string());
+            return Err(Diagnostic::error(
+                CODE,
+                CLUSTER_RESOURCES_DIR,
+                "resource kind has no payload",
+            ));
         };
         self.write_content_addressed(
+            CODE,
             &relative,
             digest,
             content,
@@ -935,23 +961,29 @@ impl ClusterStore {
 
     async fn write_content_addressed(
         &self,
+        code: &str,
         relative: &str,
         digest: &str,
         content: &str,
         max_bytes: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), Diagnostic> {
+        let refused = |message: String| Diagnostic::error(code, CLUSTER_RESOURCES_DIR, message);
         if content.len() > max_bytes {
-            return Err(format!("content exceeds encoded byte limit {max_bytes}"));
+            return Err(refused(format!(
+                "content exceeds encoded byte limit {max_bytes}"
+            )));
         }
         if sha256_hex(content.as_bytes()) != digest {
-            return Err("content does not match its declared digest".to_string());
+            return Err(refused(
+                "content does not match its declared digest".to_string(),
+            ));
         }
         let uri = self.uri(relative);
         if self
             .adapter
             .write_text_if_absent(&uri, content)
             .await
-            .map_err(|err| err.to_string())?
+            .map_err(|err| refused(err.to_string()))?
         {
             return Ok(());
         }
@@ -959,14 +991,23 @@ impl ClusterStore {
             .adapter
             .read_text_versioned_if_exists_bounded(&uri, max_bytes as u64)
             .await
-            .map_err(|err| err.to_string())?
+            .map_err(|err| {
+                read_failure(
+                    code,
+                    CLUSTER_RESOURCES_DIR,
+                    "could not verify existing immutable content",
+                    &err,
+                )
+            })?
         else {
-            return Err("existing immutable content disappeared during verification".to_string());
+            return Err(refused(
+                "existing immutable content disappeared during verification".to_string(),
+            ));
         };
         if sha256_hex(existing.as_bytes()) != digest || existing != content {
-            return Err(
+            return Err(refused(
                 "existing immutable content does not match its recorded digest".to_string(),
-            );
+            ));
         }
         Ok(())
     }
@@ -980,11 +1021,14 @@ impl ClusterStore {
         })?;
         let digest = sha256_hex(text.as_bytes());
         let relative = format!("{CLUSTER_RESOURCES_DIR}/deployment/{digest}.json");
-        self.write_content_addressed(&relative, &digest, &text, MAX_BUNDLE_BYTES)
-            .await
-            .map_err(|err| {
-                Diagnostic::error("deployment_bundle_write", CLUSTER_RESOURCES_DIR, err)
-            })?;
+        self.write_content_addressed(
+            "deployment_bundle_write",
+            &relative,
+            &digest,
+            &text,
+            MAX_BUNDLE_BYTES,
+        )
+        .await?;
         Ok(digest)
     }
 
@@ -1005,10 +1049,11 @@ impl ClusterStore {
             .read_text_if_exists_bounded(&self.uri(&relative), MAX_BUNDLE_BYTES as u64)
             .await
             .map_err(|err| {
-                Diagnostic::error(
+                read_failure(
                     "deployment_bundle_read",
                     CLUSTER_RESOURCES_DIR,
-                    err.to_string(),
+                    "could not read the immutable bundle",
+                    &err,
                 )
             })?
             .ok_or_else(|| {
@@ -1075,15 +1120,15 @@ impl ClusterStore {
             Some(max_bytes) => self.adapter.read_text_if_exists_bounded(&uri, max_bytes as u64).await,
             None => self.adapter.read_text(&uri).await.map(Some),
         }.map_err(|err| {
-            Diagnostic::error(
+            read_failure(
                 "catalog_payload_missing",
                 address,
-                format!(
-                    "catalog blob '{}' unreadable ({err}); restore access to the verified payload or restore its bytes from a trusted copy before deploying",
+                format_args!(
+                    "catalog blob '{}' unreadable; restore access to the verified payload or restore its bytes from a trusted copy before deploying",
                     self.display(&relative)
                 ),
+                &err,
             )
-            .with_storage_failure(&err)
         })?.ok_or_else(|| Diagnostic::error("catalog_payload_missing", address, "applied catalog payload is absent"))?;
         if sha256_hex(text.as_bytes()) != digest {
             return Err(Diagnostic::error(
@@ -1155,12 +1200,12 @@ impl ClusterStore {
                 ));
             }
             Err(err) => {
-                return Err(Diagnostic::error(
+                return Err(read_failure(
                     "state_read_error",
                     CLUSTER_STATE_FILE,
-                    format!("could not read state file: {err}"),
-                )
-                .with_storage_failure(&err));
+                    "could not read state file",
+                    &err,
+                ));
             }
         };
 
@@ -1236,12 +1281,12 @@ impl ClusterStore {
             .map_err(|err| Diagnostic::error("state_write_error", CLUSTER_STATE_FILE, err))?;
         let state_uri = self.uri(CLUSTER_STATE_FILE);
         let current = self.read_versioned_opt(&state_uri).await.map_err(|err| {
-            Diagnostic::error(
+            read_failure(
                 "state_write_error",
                 CLUSTER_STATE_FILE,
-                format!("could not read state file before write: {err}"),
+                "could not read state file before write",
+                &err,
             )
-            .with_storage_failure(&err)
         })?;
         if let Some((text, _)) = &current {
             let (previous, _) = decode_ledger(text, upgrade)?;
@@ -1309,12 +1354,12 @@ impl ClusterStore {
         match self.read_versioned_opt(&uri).await {
             Ok(Some((text, version))) => Ok(Some((crate::operations::decode(&text)?, version))),
             Ok(None) => Ok(None),
-            Err(error) => Err(Diagnostic::error(
+            Err(error) => Err(read_failure(
                 "operation_record_read_error",
                 crate::operations::CLUSTER_OPERATIONS_FILE,
-                format!("could not read the operation record: {error}"),
-            )
-            .with_storage_failure(&error)),
+                "could not read the operation record",
+                &error,
+            )),
         }
     }
 
@@ -1482,12 +1527,12 @@ impl ClusterStore {
                 ));
             }
             Err(err) => {
-                return Err(Diagnostic::error(
+                return Err(read_failure(
                     "state_lock_read_error",
                     CLUSTER_LOCK_FILE,
-                    format!("could not read state lock: {err}"),
-                )
-                .with_storage_failure(&err));
+                    "could not read state lock",
+                    &err,
+                ));
             }
         };
         let lock = parse_lock_file_for_unlock(&text)?;
@@ -1552,14 +1597,12 @@ impl ClusterStore {
                 }
             }
             Ok(None) => {}
-            Err(err) => diagnostics.push(
-                Diagnostic::warning(
-                    "state_lock_read_error",
-                    CLUSTER_LOCK_FILE,
-                    format!("could not read state lock: {err}"),
-                )
-                .with_storage_failure(&err),
-            ),
+            Err(err) => diagnostics.push(read_warning(
+                "state_lock_read_error",
+                CLUSTER_LOCK_FILE,
+                "could not read state lock",
+                &err,
+            )),
         }
     }
 

@@ -23,10 +23,10 @@ const LEASED_LOCK_VERSION: u32 = 3;
 /// A held first-bootstrap lock naming its bootstrap identity (the caller's
 /// cluster incarnation and optional request id) and its attempt number. Only
 /// a rerun of that identity re-enters it, by exact-version CAS. Older binaries
-/// refuse this version, so they neither claim nor re-enter it.
+/// refuse this version, so they neither claim nor re-enter it. The attempt is
+/// an unbounded counter from 1: the caller's admission window bounds reruns,
+/// and only its `u32` overflow refuses (`reenter_bootstrap_lock`).
 const BOOTSTRAP_LOCK_VERSION: u32 = 4;
-/// Attempts one bootstrap identity may make, counting the first.
-pub(crate) const MAX_BOOTSTRAP_ATTEMPTS: u32 = 16;
 const MAX_BOOTSTRAP_IDENTITY_FIELD_BYTES: usize = 128;
 const CLUSTER_LOCK_FILE: &str = "__cluster/lock.json";
 /// The bound on every read of `lock.json`. An owner that reads with a
@@ -45,6 +45,8 @@ pub(crate) enum StateLockError {
     LockVersion(u32),
     #[error("invalid cluster state lock binding: {0}")]
     InvalidBinding(String),
+    #[error("the bootstrap lock's attempt counter is at its maximum {0}")]
+    BootstrapAttemptsExhausted(u32),
     #[error(
         "the cluster lock's lease fenced before its first heartbeat was acknowledged ({0:?}); \
          this process must not serve, and a restart takes the lock over"
@@ -112,7 +114,8 @@ impl StateLockFile {
     }
 
     /// The attempt number of a version 4 bootstrap lock; 0 for every other.
-    pub(crate) fn bootstrap_attempt(&self) -> u32 {
+    #[cfg(test)]
+    fn bootstrap_attempt(&self) -> u32 {
         self.attempt.unwrap_or(0)
     }
 
@@ -151,9 +154,7 @@ impl StateLockFile {
                     .request_id
                     .as_deref()
                     .is_none_or(valid_bootstrap_identity_field)
-                && lock
-                    .attempt
-                    .is_some_and(|attempt| (1..=MAX_BOOTSTRAP_ATTEMPTS).contains(&attempt));
+                && lock.attempt.is_some_and(|attempt| attempt >= 1);
             if !valid {
                 return Err(StateLockError::InvalidBinding(
                     "a version 4 lock is a held bootstrap lock naming its identity and attempt"
@@ -601,14 +602,14 @@ pub(crate) async fn read_bootstrap_lock_state(
         BootstrapLockState::Other("a released lock shows an earlier owner")
     } else if lock.operation != BOOTSTRAP_OPERATION {
         BootstrapLockState::Other("a lock other than a bootstrap lock is held")
-    } else if lock.version != BOOTSTRAP_LOCK_VERSION {
-        BootstrapLockState::Other(
-            "a legacy bootstrap lock names no bootstrap identity and is never re-entered",
-        )
     } else if lock.incarnation.as_deref() != Some(incarnation)
         || lock.request_id.as_deref() != request_id
     {
-        BootstrapLockState::Other("another bootstrap identity holds the lock")
+        // Parsing admits identity fields on version 4 only, so a legacy
+        // bootstrap lock, which names none, is an identity mismatch here.
+        BootstrapLockState::Other(
+            "the lock names another bootstrap identity, or none; it is never re-entered",
+        )
     } else if !valid_version_token(&version) {
         BootstrapLockState::Other("the lock's version token is not usable for an exact CAS")
     } else {
@@ -660,12 +661,11 @@ pub(crate) async fn reenter_bootstrap_lock(
             "only a version 4 bootstrap lock is re-entered".into(),
         ));
     };
-    if attempt >= MAX_BOOTSTRAP_ATTEMPTS {
-        return Err(StateLockError::InvalidBinding(
-            "bootstrap attempts exhausted".into(),
-        ));
-    }
-    let lock = StateLockFile::bootstrap(incarnation, previous.request_id.as_deref(), attempt + 1);
+    // The one attempt bound: the counter's own range.
+    let next = attempt
+        .checked_add(1)
+        .ok_or(StateLockError::BootstrapAttemptsExhausted(attempt))?;
+    let lock = StateLockFile::bootstrap(incarnation, previous.request_id.as_deref(), next);
     let payload = serde_json::to_string_pretty(&lock).map_err(StateLockError::LockEncode)?;
     if adapter
         .write_text_if_match(uri, &payload, version)
@@ -831,9 +831,16 @@ mod tests {
                 .bootstrap_attempt(),
             2
         );
+        // The attempt is an unbounded counter from 1.
+        for attempt in [17, 1000, u32::MAX] {
+            let later = bootstrap.replace("\"attempt\":1", &format!("\"attempt\":{attempt}"));
+            assert_eq!(
+                StateLockFile::parse(&later).unwrap().bootstrap_attempt(),
+                attempt
+            );
+        }
         for refused in [
             bootstrap.replace("\"attempt\":1", "\"attempt\":0"),
-            bootstrap.replace("\"attempt\":1", "\"attempt\":17"),
             bootstrap.replace("\"incarnation\":\"inc-1\"", "\"incarnation\":\"\""),
             bootstrap.replace("\"incarnation\":\"inc-1\"", "\"incarnation\":\"inc/1\""),
             bootstrap.replace(

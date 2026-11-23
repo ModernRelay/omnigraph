@@ -4,7 +4,9 @@
 //! forwards reads, counts each conditional write when it is sent and when it is
 //! answered, and refuses every unconditional mutation before sending it: first
 //! bootstrap issues none. The attempt's [`BootstrapEffects`] is derived from
-//! those counts alone, so no step reports its own effects.
+//! those counts alone, so no step reports its own effects. The class of a
+//! write the store refused without applying it is kept here too, as the one
+//! account of a failed write (`Diagnostic::storage_failure` classifies reads).
 
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +35,9 @@ struct Counts {
     answered: u64,
     applied: u64,
     unresolved: u64,
+    /// The class of the latest write answered with an error that applied
+    /// nothing; a later write answered without an error clears it.
+    refused: Option<StorageFailureKind>,
 }
 
 /// The conditional writes one attempt sent and how each was answered.
@@ -50,12 +55,20 @@ impl EffectLog {
     fn answered(&self, applied: Result<bool, &StorageError>) {
         let mut counts = self.0.lock().unwrap();
         counts.answered += 1;
+        counts.refused = None;
         match applied {
             Ok(true) => counts.applied += 1,
             Ok(false) => {}
             Err(error) if error.is_unresolved_conditional() => counts.unresolved += 1,
-            Err(_) => {}
+            Err(error) => counts.refused = Some(error.failure_kind()),
         }
+    }
+
+    /// The class of a write the store refused without applying it, when that
+    /// is the attempt's latest write answer. First bootstrap stops at its
+    /// first write error, so this is then the failure the attempt ended on.
+    pub(super) fn refused_write(&self) -> Option<StorageFailureKind> {
+        self.0.lock().unwrap().refused
     }
 
     /// A request sent and never answered (its future was dropped) counts as
@@ -235,5 +248,149 @@ mod tests {
         assert_eq!(log.effects(), BootstrapEffects::Unconfirmed, "in flight");
         log.answered(Err(&unresolved()));
         assert_eq!(log.effects(), BootstrapEffects::Unconfirmed);
+        assert_eq!(
+            log.refused_write(),
+            None,
+            "an unknown outcome is no refusal"
+        );
+    }
+
+    #[test]
+    fn a_refused_write_keeps_its_class_until_the_next_answer() {
+        let log = EffectLog::default();
+        log.sent();
+        log.answered(Err(&StorageError::Backend(StorageFailure::new(
+            StorageFailureKind::Transient,
+            "throttled",
+        ))));
+        assert_eq!(log.refused_write(), Some(StorageFailureKind::Transient));
+        assert_eq!(log.effects(), BootstrapEffects::None);
+        log.sent();
+        log.answered(Ok(true));
+        assert_eq!(log.refused_write(), None);
+    }
+
+    /// The storage adapter methods, read from the trait's own source, split by
+    /// what this adapter does with them. A new method fails here until it is
+    /// placed: a mutating one must be recorded or refused below, and a default
+    /// body (which this adapter would inherit unseen) is allowed only for the
+    /// listed effect-free accessors.
+    const FORWARDED_READS: &[&str] = &[
+        "read_text",
+        "read_text_if_exists",
+        "read_text_if_exists_bounded",
+        "read_bytes_if_exists_bounded",
+        "exists",
+        "list_dir",
+        "list_dir_bounded",
+        "read_text_versioned",
+        "read_text_versioned_if_exists_bounded",
+    ];
+    const RECORDED_WRITES: &[&str] = &["write_text_if_absent", "write_text_if_match"];
+    const REFUSED_MUTATIONS: &[&str] = &[
+        "write_text",
+        "write_bytes",
+        "rename_text",
+        "delete",
+        "delete_prefix",
+    ];
+    const DEFAULTED_ACCESSORS: &[&str] = &["io_scope", "read_through_mount"];
+
+    /// `(name, has a default body)` for each `fn` directly inside the block
+    /// that opens at the first `{` after `header`.
+    fn methods(source: &str, header: &str) -> Vec<(String, bool)> {
+        let start = source.find(header).expect("block header") + header.len();
+        let body = &source[start..];
+        let open = body.find('{').unwrap();
+        let mut depth = 0usize;
+        let mut end = open;
+        for (index, character) in body[open..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + index;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let block = &body[open + 1..end];
+        let mut found = Vec::new();
+        let mut depth = 0usize;
+        let mut rest = block;
+        let mut previous = ' ';
+        while !rest.is_empty() {
+            if depth == 0 && previous.is_whitespace() && rest.starts_with("fn ") {
+                let after = &rest[3..];
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let terminator = after.find([';', '{']).unwrap();
+                found.push((name, after.as_bytes()[terminator] == b'{'));
+            }
+            let character = rest.chars().next().unwrap();
+            match character {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            previous = character;
+            rest = &rest[character.len_utf8()..];
+        }
+        found
+    }
+
+    #[test]
+    fn the_method_reader_sees_default_bodies() {
+        let source = "pub trait T {\n    fn kept(&self) -> u8 {\n        1\n    }\n    async fn added(&self, uri: &str) -> Result<()>;\n    async fn silent(&self) -> Result<()> {\n        Ok(())\n    }\n}";
+        assert_eq!(
+            methods(source, "pub trait T"),
+            [
+                ("kept".to_owned(), true),
+                ("added".to_owned(), false),
+                ("silent".to_owned(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_recording_adapter_places_every_storage_adapter_method() {
+        let storage = include_str!("../../../omnigraph-storage/src/lib.rs");
+        let trait_methods = methods(storage, "pub trait StorageAdapter");
+        let mut placed: Vec<&str> = FORWARDED_READS
+            .iter()
+            .chain(RECORDED_WRITES)
+            .chain(REFUSED_MUTATIONS)
+            .chain(DEFAULTED_ACCESSORS)
+            .copied()
+            .collect();
+        placed.sort_unstable();
+        let mut names: Vec<&str> = trait_methods
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, placed, "place every StorageAdapter method");
+        for (name, defaulted) in &trait_methods {
+            assert_eq!(
+                *defaulted,
+                DEFAULTED_ACCESSORS.contains(&name.as_str()),
+                "{name}: only effect-free accessors may have a default body"
+            );
+        }
+        let own = include_str!("bootstrap_effects.rs");
+        let mut overridden: Vec<String> = methods(own, "impl StorageAdapter for RecordingAdapter")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        overridden.sort_unstable();
+        assert_eq!(
+            overridden, names,
+            "the recording adapter overrides every method, defaulted ones included"
+        );
     }
 }

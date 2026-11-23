@@ -1,19 +1,18 @@
 //! A single initial policy deployment with no graph/native-I/O effects.
 //! The retained lock is transferred by CAS, never removed or reconstructed.
 //!
-//! First bootstrap runs as named steps (`BootstrapStep`). The lock step's
-//! record is the lock itself, which names its bootstrap identity; each later
-//! step with a storage effect writes a step receipt under
-//! `__cluster/bootstrap/` once its effect is confirmed. A rerun of the same
-//! identity, whose caller asserts that every earlier attempt is excluded,
-//! re-enters its own retained lock by exact-version CAS, verifies the
-//! receipts and continues at the first step without one. It replays a step
-//! only when the step is idempotent by construction and refuses
-//! `bootstrap_step_unconfirmed` otherwise.
+//! First bootstrap runs as named steps (`BootstrapStep`). Its progress has two
+//! records and no others: `lock.json`, which names the bootstrap identity, and
+//! the ledger `state.json`. A rerun of the same identity, whose caller asserts
+//! that every earlier attempt is excluded, re-enters its own retained lock by
+//! exact-version CAS, reads the ledger and continues from the one state of it
+//! that this bootstrap's own steps leave (`progress`); every other state
+//! refuses and changes nothing.
 
 use super::*;
 use crate::admission::ClusterAdmission;
 use crate::state_lock::{BootstrapLockState, StateLockGuard};
+use crate::store::BootstrapProbeDeadline;
 use omnigraph_storage::{StorageFailureKind, StorageKind};
 use std::sync::Arc;
 
@@ -27,11 +26,6 @@ use effects::{EffectLog, RecordingAdapter};
 mod fault_tests;
 
 pub const MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES: usize = 16 * 1024;
-/// Bound on every step receipt under `__cluster/bootstrap/`.
-pub const MAX_BOOTSTRAP_STEP_RECEIPT_BYTES: usize = 4 * 1024;
-const FRESHNESS_RECEIPT: &str = "__cluster/bootstrap/freshness.json";
-const LEDGER_RECEIPT: &str = "__cluster/bootstrap/ledger.json";
-const DEPLOYMENT_RECEIPT: &str = "__cluster/bootstrap/deployment.json";
 
 /// Who a first bootstrap belongs to: the caller's cluster incarnation and,
 /// when it has one, the request that started it. Omnigraph compares them and
@@ -140,11 +134,19 @@ pub struct BootstrapFailure {
     diagnostic: Diagnostic,
     step: BootstrapStep,
     effects: BootstrapEffects,
+    /// The storage class of the failed request: the diagnostic's, for a read,
+    /// or the recording adapter's, for a write refused without applying.
+    storage_failure: Option<StorageFailureKind>,
+    /// This attempt's initial deployment was accepted and did not complete,
+    /// so a rerun meets it outstanding and refuses.
+    deployment_outstanding: bool,
 }
 
 impl BootstrapFailure {
     fn new(diagnostic: Diagnostic, step: BootstrapStep, effects: BootstrapEffects) -> Self {
         Self {
+            storage_failure: diagnostic.storage_failure,
+            deployment_outstanding: false,
             diagnostic,
             step,
             effects,
@@ -173,12 +175,15 @@ impl BootstrapFailure {
 
     /// A rerun of the same request, with `PriorAttempts::Excluded` once the
     /// failed process is gone, can make progress: no write has an unknown
-    /// outcome, and the failure is a storage read or probe whose class is
+    /// outcome, the attempt left no accepted initial deployment incomplete
+    /// (a rerun refuses that state), and the failure is a storage request (a
+    /// read, a probe, or a write refused without applying) whose class is
     /// transient or unclassified. Advice only; the rerun's checks decide.
     pub fn retryable(&self) -> bool {
         self.effects != BootstrapEffects::Unconfirmed
+            && !self.deployment_outstanding
             && matches!(
-                self.diagnostic.storage_failure,
+                self.storage_failure,
                 Some(StorageFailureKind::Transient | StorageFailureKind::Unknown)
             )
     }
@@ -261,252 +266,159 @@ fn valid_state_cas(cas: &str) -> bool {
         .is_some_and(authorization::valid_digest)
 }
 
-/// The bootstrap a step receipt belongs to: its identity and the exact input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReceiptOwner {
-    incarnation: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    request_id: Option<String>,
-    input_digest: String,
-}
-
-/// `__cluster/bootstrap/freshness.json`: the root was fresh under this
-/// identity's lock. Its bytes are deterministic, so a late copy is identical.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FreshnessReceipt {
-    version: u32,
-    step: BootstrapStep,
-    bootstrap: ReceiptOwner,
-}
-
-/// `__cluster/bootstrap/ledger.json`: this bootstrap created the ledger
-/// `ledger_id`, whose revision 1 bytes have `state_cas`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LedgerReceipt {
-    version: u32,
-    step: BootstrapStep,
-    bootstrap: ReceiptOwner,
+/// What `state.json` shows of this bootstrap's initial deployment once it is
+/// complete: every field the serving receipt takes from the ledger.
+struct Deployed {
     ledger_id: String,
+    state_revision: u64,
     state_cas: String,
-}
-
-/// `__cluster/bootstrap/deployment.json`: the initial deployment completed
-/// and left the ledger at `state_revision` with `state_cas`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeploymentReceipt {
-    version: u32,
-    step: BootstrapStep,
-    bootstrap: ReceiptOwner,
-    ledger_id: String,
     deployment_id: String,
     config_digest: String,
     result_revision: u64,
-    state_revision: u64,
-    state_cas: String,
 }
 
-trait StepReceipt: Serialize + serde::de::DeserializeOwned {
-    const STEP: BootstrapStep;
-    const PATH: &'static str;
-    fn header(&self) -> (u32, BootstrapStep, &ReceiptOwner);
-    fn valid_facts(&self) -> bool;
-}
-
-impl StepReceipt for FreshnessReceipt {
-    const STEP: BootstrapStep = BootstrapStep::Freshness;
-    const PATH: &'static str = FRESHNESS_RECEIPT;
-    fn header(&self) -> (u32, BootstrapStep, &ReceiptOwner) {
-        (self.version, self.step, &self.bootstrap)
-    }
-    fn valid_facts(&self) -> bool {
-        true
-    }
-}
-
-impl StepReceipt for LedgerReceipt {
-    const STEP: BootstrapStep = BootstrapStep::Ledger;
-    const PATH: &'static str = LEDGER_RECEIPT;
-    fn header(&self) -> (u32, BootstrapStep, &ReceiptOwner) {
-        (self.version, self.step, &self.bootstrap)
-    }
-    fn valid_facts(&self) -> bool {
-        Ulid::from_string(&self.ledger_id).is_ok() && valid_state_cas(&self.state_cas)
-    }
-}
-
-impl StepReceipt for DeploymentReceipt {
-    const STEP: BootstrapStep = BootstrapStep::Deployment;
-    const PATH: &'static str = DEPLOYMENT_RECEIPT;
-    fn header(&self) -> (u32, BootstrapStep, &ReceiptOwner) {
-        (self.version, self.step, &self.bootstrap)
-    }
-    fn valid_facts(&self) -> bool {
-        Ulid::from_string(&self.ledger_id).is_ok()
-            && DeploymentId::parse(&self.deployment_id)
-                .is_ok_and(|id| id.ledger == self.ledger_id && id.sequence == 1)
-            && authorization::valid_digest(&self.config_digest)
-            && self.result_revision == 1
-            && self.state_revision == 3
-            && valid_state_cas(&self.state_cas)
-    }
-}
-
-fn receipt_invalid(path: &str, message: impl Into<String>) -> Diagnostic {
-    Diagnostic::error("bootstrap_receipt_invalid", path, message.into())
-}
-
-async fn read_receipt<R: StepReceipt>(
-    store: &ClusterStore,
-    owner: &ReceiptOwner,
-) -> Result<Option<R>, Diagnostic> {
-    let Some(text) = store
-        .read_bootstrap_record(R::PATH, MAX_BOOTSTRAP_STEP_RECEIPT_BYTES)
-        .await?
-    else {
-        return Ok(None);
-    };
-    let receipt: R = serde_json::from_str(&text).map_err(|error| {
-        receipt_invalid(R::PATH, format!("step receipt does not decode: {error}"))
-    })?;
-    let (version, step, recorded) = receipt.header();
-    if version != 1 || step != R::STEP || !receipt.valid_facts() {
-        return Err(receipt_invalid(
-            R::PATH,
-            "step receipt is not a valid version 1 receipt of its step",
-        ));
-    }
-    if recorded != owner {
-        return Err(receipt_invalid(
-            R::PATH,
-            "step receipt names another bootstrap identity or input",
-        ));
-    }
-    Ok(Some(receipt))
-}
-
-/// Create-if-absent. Existing identical bytes are this step's receipt, written
-/// by this attempt's own earlier copy or, for the deterministic freshness
-/// receipt, by an earlier attempt; anything else refuses.
-async fn write_receipt<R: StepReceipt>(
-    store: &ClusterStore,
-    receipt: &R,
-) -> Result<(), Diagnostic> {
-    let text = serde_json::to_string(receipt)
-        .map_err(|error| receipt_invalid(R::PATH, error.to_string()))?;
-    if text.len() > MAX_BOOTSTRAP_STEP_RECEIPT_BYTES {
-        return Err(receipt_invalid(R::PATH, "step receipt exceeds its bound"));
-    }
-    if store.create_bootstrap_record(R::PATH, &text).await? {
-        return Ok(());
-    }
-    match store
-        .read_bootstrap_record(R::PATH, MAX_BOOTSTRAP_STEP_RECEIPT_BYTES)
-        .await?
-    {
-        Some(existing) if existing == text => Ok(()),
-        _ => Err(Diagnostic::error(
-            "bootstrap_receipt_conflict",
-            R::PATH,
-            "another step receipt was created first; never overwrite a receipt",
-        )),
-    }
-}
-
-/// The first step without a receipt, found by reads alone.
+/// Where a bootstrap of one input stands, read from `state.json` alone.
 enum Progress {
+    /// No ledger: check freshness, create the ledger, then deploy.
     Freshness,
-    Ledger,
-    Deployment(LedgerReceipt),
-    Receipt(DeploymentReceipt),
+    /// Exactly the empty ledger at revision 1, which under this identity's
+    /// lock only this bootstrap's own create can leave: deploy.
+    Deployment,
+    /// The initial deployment of this input is complete: verify and return.
+    Receipt(Deployed),
 }
 
-fn unconfirmed(path: &str, message: &str) -> Diagnostic {
-    Diagnostic::error("bootstrap_step_unconfirmed", path, message)
+/// `state` is exactly the ledger `execution::empty_ledger` creates.
+fn is_empty_ledger(state: &ClusterState) -> bool {
+    let empty = ClusterState {
+        ledger_id: state.ledger_id.clone(),
+        ..execution::empty_ledger()
+    };
+    matches!(
+        (serde_json::to_value(state), serde_json::to_value(&empty)),
+        (Ok(found), Ok(expected)) if found == expected
+    )
 }
 
-/// Read the receipts and the ledger and decide where this bootstrap stands.
-/// Run before a lock re-entry, so a rerun that would refuse changes nothing,
-/// and again under the lock, where its answer is the one acted on.
-async fn inspect(
-    store: &ClusterStore,
-    owner: &ReceiptOwner,
+/// The rerun decision table. It reads nothing but the ledger snapshot; the
+/// lock was read, and attributed to this identity, before. Each row is a
+/// state this bootstrap's own steps leave, so no other process's effect is
+/// adopted:
+///
+/// | `state.json` | Decision |
+/// |---|---|
+/// | absent | `Freshness`: repeat the read-only check, create the ledger |
+/// | exactly the empty v2 ledger at revision 1 | `Deployment` |
+/// | revision 3, one converged result of this input, nothing outstanding | `Receipt` |
+/// | revision 2, sequence 1 of this input outstanding | refuse `bootstrap_deployment_outstanding` |
+/// | anything else | refuse `bootstrap_state_mismatch` |
+///
+/// `validate_terminal` then checks every remaining field of a `Receipt`.
+fn progress(
+    snapshot: &crate::store::StateSnapshot,
+    input_digest: &str,
     step: &mut BootstrapStep,
 ) -> Result<Progress, Diagnostic> {
-    *step = BootstrapStep::Freshness;
-    let freshness = read_receipt::<FreshnessReceipt>(store, owner).await?;
-    *step = BootstrapStep::Ledger;
-    let ledger = read_receipt::<LedgerReceipt>(store, owner).await?;
+    let (Some(state), Some(state_cas)) = (&snapshot.state, &snapshot.state_cas) else {
+        *step = BootstrapStep::Freshness;
+        return Ok(Progress::Freshness);
+    };
     *step = BootstrapStep::Deployment;
-    let deployment = read_receipt::<DeploymentReceipt>(store, owner).await?;
-    let snapshot = store.read_state(&mut store.observations()).await?;
-    let state_cas = snapshot.state_cas.as_deref();
-    let ledger_id = snapshot
-        .state
-        .as_ref()
-        .and_then(|state| state.ledger_id.as_deref());
-    match (freshness, ledger, deployment) {
-        (None, None, None) => {
-            *step = BootstrapStep::Freshness;
-            Ok(Progress::Freshness)
-        }
-        (Some(_), None, None) => {
-            *step = BootstrapStep::Ledger;
-            if snapshot.state.is_some() {
-                return Err(unconfirmed(
-                    CLUSTER_STATE_FILE,
-                    "a ledger exists that no ledger receipt attributes to this bootstrap; its creation is unconfirmed",
-                ));
-            }
-            Ok(Progress::Ledger)
-        }
-        (Some(_), Some(ledger), None) => {
-            *step = BootstrapStep::Deployment;
-            if ledger_id != Some(ledger.ledger_id.as_str())
-                || state_cas != Some(ledger.state_cas.as_str())
-            {
-                return Err(unconfirmed(
-                    CLUSTER_STATE_FILE,
-                    "the ledger left its receipted initial revision and no deployment receipt records the outcome",
-                ));
-            }
-            Ok(Progress::Deployment(ledger))
-        }
-        (Some(_), Some(ledger), Some(deployment)) => {
-            *step = BootstrapStep::Receipt;
-            if deployment.ledger_id != ledger.ledger_id {
-                return Err(receipt_invalid(
-                    DEPLOYMENT_RECEIPT,
-                    "deployment receipt names another ledger",
-                ));
-            }
-            if ledger_id != Some(deployment.ledger_id.as_str())
-                || state_cas != Some(deployment.state_cas.as_str())
-            {
-                return Err(refusal(
-                    "bootstrap_state_mismatch",
-                    "the ledger differs from the receipted initial deployment",
-                ));
-            }
-            Ok(Progress::Receipt(deployment))
-        }
-        _ => Err(receipt_invalid(
-            "__cluster/bootstrap",
-            "a step receipt exists without the receipts of the steps before it",
-        )),
+    if is_empty_ledger(state) {
+        return Ok(Progress::Deployment);
     }
+    let first = |id: &str| DeploymentId::parse(id).is_ok_and(|id| id.sequence == 1);
+    if let Some(pending) = state
+        .outstanding
+        .as_ref()
+        .filter(|_| state.state_revision == 2)
+    {
+        if first(&pending.id)
+            && matches!(
+                execution::lookup(state, &pending.id)?,
+                DeploymentLookup::Outstanding { input_digest: ref pending_input, .. }
+                    if pending_input.as_str() == input_digest
+            )
+        {
+            return Err(Diagnostic::error(
+                "bootstrap_deployment_outstanding",
+                CLUSTER_STATE_FILE,
+                format!(
+                    "the initial deployment {} was accepted and its outcome is not recorded; first bootstrap does not reconcile it",
+                    pending.id
+                ),
+            ));
+        }
+    }
+    let complete = match state.deployment_results.as_deref() {
+        Some([result])
+            if state.version == 2
+                && state.state_revision == 3
+                && state.outstanding.is_none()
+                && first(&result.id) =>
+        {
+            match execution::lookup(state, &result.id)? {
+                DeploymentLookup::Complete { result }
+                    if result.converged && result.input_digest == input_digest =>
+                {
+                    Some(result)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    match (complete, state.ledger_id.as_ref()) {
+        (
+            Some(DeploymentResult {
+                id,
+                config_digest: Some(config_digest),
+                result_revision,
+                ..
+            }),
+            Some(ledger_id),
+        ) => {
+            *step = BootstrapStep::Receipt;
+            Ok(Progress::Receipt(Deployed {
+                ledger_id: ledger_id.clone(),
+                state_revision: state.state_revision,
+                state_cas: state_cas.clone(),
+                deployment_id: id,
+                config_digest,
+                result_revision,
+            }))
+        }
+        _ => {
+            if state.state_revision == 1 {
+                *step = BootstrapStep::Ledger;
+            }
+            Err(refusal(
+                "bootstrap_state_mismatch",
+                "the ledger is not a state this bootstrap's own steps leave; nothing is adopted",
+            ))
+        }
+    }
+}
+
+/// Read the ledger and decide where this bootstrap stands. Run before a lock
+/// re-entry, so a rerun that would refuse changes nothing, and again under
+/// the lock, where its answer is the one acted on.
+async fn inspect(
+    store: &ClusterStore,
+    input_digest: &str,
+    step: &mut BootstrapStep,
+) -> Result<Progress, Diagnostic> {
+    let snapshot = store.read_state(&mut store.observations()).await?;
+    progress(&snapshot, input_digest, step)
 }
 
 /// Initialize one fresh S3 cluster with cluster-scoped management policy only.
 /// The private bootstrap owner cannot execute another deployment. Failure or
 /// cancellation after acquisition retains its lock. Only a rerun of the same
 /// identity whose caller asserts `PriorAttempts::Excluded` re-enters it, and
-/// it continues from the step receipts. There is no unlock, graph open or
-/// background engine work here. Transport retries keep their original
-/// preconditions.
+/// it continues from the state the ledger records. There is no unlock, graph
+/// open or background engine work here. Transport retries keep their
+/// original preconditions.
 pub async fn bootstrap_serving(
     config_dir: impl AsRef<Path>,
     caller: &DeploymentCaller,
@@ -570,19 +482,30 @@ async fn bootstrap_in_store(
             as Arc<dyn omnigraph_storage::StorageAdapter>
     });
     let mut step = BootstrapStep::Input;
-    bootstrap_attempt(&recorded, bundle, caller, request, &mut step)
-        .await
-        .map_err(|diagnostic| {
-            let scope_uncertain = recorded
-                .io_scope()
-                .is_some_and(|scope| scope.is_uncertain());
-            let effects = log.effects().max(if scope_uncertain {
-                BootstrapEffects::Unconfirmed
-            } else {
-                BootstrapEffects::None
-            });
-            BootstrapFailure::new(diagnostic, step, effects)
-        })
+    let mut deployment_outstanding = false;
+    bootstrap_attempt(
+        &recorded,
+        bundle,
+        caller,
+        request,
+        &mut step,
+        &mut deployment_outstanding,
+    )
+    .await
+    .map_err(|diagnostic| {
+        let scope_uncertain = recorded
+            .io_scope()
+            .is_some_and(|scope| scope.is_uncertain());
+        let effects = log.effects().max(if scope_uncertain {
+            BootstrapEffects::Unconfirmed
+        } else {
+            BootstrapEffects::None
+        });
+        let mut failure = BootstrapFailure::new(diagnostic, step, effects);
+        failure.storage_failure = failure.storage_failure.or(log.refused_write());
+        failure.deployment_outstanding = deployment_outstanding;
+        failure
+    })
 }
 
 fn not_fresh(reason: &str) -> Diagnostic {
@@ -599,16 +522,16 @@ async fn bootstrap_attempt(
     caller: &DeploymentCaller,
     request: &BootstrapRequest,
     step: &mut BootstrapStep,
+    deployment_outstanding: &mut bool,
 ) -> Result<BootstrapServingReceipt, Diagnostic> {
+    // The one probe budget of this attempt: every freshness and
+    // graph-or-recovery probe below shares it.
+    let deadline = BootstrapProbeDeadline::start();
     *step = BootstrapStep::Input;
     let identity = &request.identity;
     identity.validate()?;
     validate_bootstrap_bundle(bundle, caller)?;
-    let owner = ReceiptOwner {
-        incarnation: identity.incarnation.clone(),
-        request_id: identity.request_id.clone(),
-        input_digest: bundle.input_digest()?,
-    };
+    let input_digest = bundle.input_digest()?;
 
     *step = BootstrapStep::Lock;
     let observed = store
@@ -617,7 +540,7 @@ async fn bootstrap_attempt(
     let (guard, lock_version) = match observed {
         BootstrapLockState::Absent => {
             *step = BootstrapStep::Freshness;
-            store.require_fresh_bootstrap(false).await?;
+            store.require_fresh_bootstrap(false, deadline).await?;
             *step = BootstrapStep::Lock;
             store
                 .acquire_bootstrap_lock(identity.incarnation(), identity.request_id())
@@ -634,18 +557,8 @@ async fn bootstrap_attempt(
             }
             // A rerun that would refuse below refuses here, before the lock
             // changes.
-            inspect(store, &owner, step).await?;
+            inspect(store, &input_digest, step).await?;
             *step = BootstrapStep::Lock;
-            if lock.bootstrap_attempt() >= crate::state_lock::MAX_BOOTSTRAP_ATTEMPTS {
-                return Err(Diagnostic::error(
-                    "bootstrap_attempts_exhausted",
-                    CLUSTER_LOCK_FILE,
-                    format!(
-                        "this bootstrap identity has used all {} attempts",
-                        crate::state_lock::MAX_BOOTSTRAP_ATTEMPTS
-                    ),
-                ));
-            }
             store
                 .reenter_bootstrap_lock(&lock, &version)
                 .await?
@@ -663,44 +576,23 @@ async fn bootstrap_attempt(
     // response is interrupted.
     let admission = ClusterAdmission::from_bootstrap_lock(store.clone(), guard, None);
 
-    let mut progress = inspect(store, &owner, step).await?;
+    let mut progress = inspect(store, &input_digest, step).await?;
     let deployed = loop {
         progress = match progress {
             Progress::Freshness => {
                 *step = BootstrapStep::Freshness;
-                store.require_fresh_bootstrap(true).await?;
-                write_receipt(
-                    store,
-                    &FreshnessReceipt {
-                        version: 1,
-                        step: BootstrapStep::Freshness,
-                        bootstrap: owner.clone(),
-                    },
-                )
-                .await?;
-                Progress::Ledger
-            }
-            Progress::Ledger => {
+                store.require_fresh_bootstrap(true, deadline).await?;
                 *step = BootstrapStep::Ledger;
-                store.require_no_bootstrap_graphs_or_recovery().await?;
-                let state = execution::empty_ledger();
-                let mut observations = store.observations();
-                store.write_state(&state, None, &mut observations).await?;
-                let receipt = LedgerReceipt {
-                    version: 1,
-                    step: BootstrapStep::Ledger,
-                    bootstrap: owner.clone(),
-                    ledger_id: state.ledger_id.clone().expect("an empty ledger has an id"),
-                    state_cas: observations
-                        .state_cas
-                        .expect("a confirmed ledger write records its CAS"),
-                };
-                write_receipt(store, &receipt).await?;
-                Progress::Deployment(receipt)
+                store
+                    .write_state(&execution::empty_ledger(), None, &mut store.observations())
+                    .await?;
+                Progress::Deployment
             }
-            Progress::Deployment(ledger) => {
+            Progress::Deployment => {
                 *step = BootstrapStep::Deployment;
-                store.require_no_bootstrap_graphs_or_recovery().await?;
+                store
+                    .require_no_bootstrap_graphs_or_recovery(deadline)
+                    .await?;
                 let mut effects_started = false;
                 let result = execution::execute_captured_deployment_in_store(
                     store,
@@ -710,40 +602,29 @@ async fn bootstrap_attempt(
                     &admission,
                     &BTreeMap::new(),
                     |_, _, _| {},
-                    |_| {},
+                    |_| *deployment_outstanding = true,
                     &mut effects_started,
                 )
                 .await?;
-                let DeploymentLookup::Complete { result } = result else {
+                *deployment_outstanding = false;
+                if !matches!(result, DeploymentLookup::Complete { .. }) {
                     return Err(refusal(
                         "bootstrap_outcome_unknown",
                         "initial deployment is not terminal",
                     ));
-                };
-                let (state, state_cas) = execution::read_existing(store).await?;
-                let receipt = DeploymentReceipt {
-                    version: 1,
-                    step: BootstrapStep::Deployment,
-                    bootstrap: owner.clone(),
-                    ledger_id: ledger.ledger_id,
-                    deployment_id: result.id,
-                    config_digest: bundle.config_digest.clone(),
-                    result_revision: result.result_revision,
-                    state_revision: state.state_revision,
-                    state_cas,
-                };
-                if state.ledger_id.as_deref() != Some(receipt.ledger_id.as_str())
-                    || !receipt.valid_facts()
-                {
-                    return Err(refusal(
-                        "bootstrap_state_mismatch",
-                        "native state differs from the exact initial policy deployment",
-                    ));
                 }
-                write_receipt(store, &receipt).await?;
-                Progress::Receipt(receipt)
+                // The ledger, not the returned result, is the record acted on.
+                match inspect(store, &input_digest, step).await? {
+                    complete @ Progress::Receipt(_) => complete,
+                    _ => {
+                        return Err(refusal(
+                            "bootstrap_state_mismatch",
+                            "native state differs from the exact initial policy deployment",
+                        ));
+                    }
+                }
             }
-            Progress::Receipt(deployment) => break deployment,
+            Progress::Receipt(deployed) => break deployed,
         }
     };
 
@@ -757,12 +638,12 @@ async fn bootstrap_attempt(
         state_revision: deployed.state_revision,
         state_cas: deployed.state_cas,
         deployment_id: deployed.deployment_id,
-        input_digest: owner.input_digest,
+        input_digest,
         config_digest: deployed.config_digest,
         result_revision: deployed.result_revision,
     };
     receipt.validate()?;
-    validate_terminal(store, &receipt).await?;
+    validate_terminal(store, &receipt, deadline).await?;
     store
         .verify_bootstrap_lock(&receipt.bootstrap_lock_id, &receipt.bootstrap_lock_version)
         .await?;
@@ -801,13 +682,15 @@ async fn claim_in_store(
     receipt: &BootstrapServingReceipt,
 ) -> Result<AdmittedServingSnapshot, Diagnostic> {
     receipt.validate()?;
-    let result = validate_terminal(store, receipt).await?;
+    // A claim is not an attempt; its own probes share one budget.
+    let deadline = BootstrapProbeDeadline::start();
+    let result = validate_terminal(store, receipt, deadline).await?;
     let guard: StateLockGuard = store
         .claim_bootstrap_lock(&receipt.bootstrap_lock_id, &receipt.bootstrap_lock_version)
         .await?;
     // There is intentionally no read/adopt fallback after an uncertain CAS.
     let admission = ClusterAdmission::from_bootstrap_lock(store.clone(), guard, Some(result));
-    validate_terminal(store, receipt).await?;
+    validate_terminal(store, receipt, deadline).await?;
     let snapshot = serve::read_snapshot_with_store(store)
         .await
         .map_err(|mut errors| errors.remove(0))?;
@@ -848,6 +731,7 @@ async fn require_settled_io(store: &ClusterStore) -> Result<(), Diagnostic> {
 async fn validate_terminal(
     store: &ClusterStore,
     receipt: &BootstrapServingReceipt,
+    deadline: BootstrapProbeDeadline,
 ) -> Result<DeploymentResult, Diagnostic> {
     if store.canonical_root()? != receipt.canonical_root {
         return Err(refusal("bootstrap_root_mismatch", "bootstrap root changed"));
@@ -911,7 +795,9 @@ async fn validate_terminal(
         ));
     }
     authorization::AppliedPolicies::load(store, &state).await?;
-    store.require_no_bootstrap_graphs_or_recovery().await?;
+    store
+        .require_no_bootstrap_graphs_or_recovery(deadline)
+        .await?;
     Ok(result.clone())
 }
 
@@ -1076,7 +962,6 @@ mod tests {
             "__cluster/recoveries/old.json",
             "graphs/old.omni/data",
             "__manifest/_versions/1.manifest",
-            "__cluster/bootstrap/freshness.json",
         ] {
             let (_dir, bundle, store, adapter) = fixture();
             adapter

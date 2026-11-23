@@ -259,7 +259,10 @@ pub async fn deployment_receipt(
     ))
 }
 
-fn lookup(state: &ClusterState, requested: &str) -> Result<DeploymentLookup, Diagnostic> {
+pub(super) fn lookup(
+    state: &ClusterState,
+    requested: &str,
+) -> Result<DeploymentLookup, Diagnostic> {
     let id = DeploymentId::parse(requested)?;
     if Some(id.ledger.as_str()) != state.ledger_id.as_deref() {
         return Ok(DeploymentLookup::DifferentLedger);
@@ -2615,10 +2618,7 @@ async fn install_catalog_payloads(
                 continue;
             }
             let source = source_for(bundle, address)?;
-            store
-                .write_payload(&kind, &resource.digest, source)
-                .await
-                .map_err(|error| refusal("resource_payload_write_error", error))?;
+            store.write_payload(&kind, &resource.digest, source).await?;
         }
     }
     Ok(())
