@@ -9682,14 +9682,14 @@ mod tests {
         );
         // A segment that covers no fragment holds no rows and has no
         // statistics; an index of only such segments is rebuilt as the
-        // engine builds a new one.
+        // engine builds a new one (dynamically sized via target_vector_partitions).
         let mut emptied = indices[0].clone();
         emptied.fragment_bitmap.as_mut().unwrap().clear();
         assert_eq!(
             TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied])
                 .await
                 .unwrap(),
-            1
+            TableStore::target_vector_partitions(32)
         );
         assert_eq!(
             TableStore::vector_partition_count(&ds, "embedding_idx", &[&emptied, &indices[0]])
