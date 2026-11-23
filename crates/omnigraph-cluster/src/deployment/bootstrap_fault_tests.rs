@@ -832,7 +832,7 @@ async fn lost_release_acknowledgement_never_replays_over_the_successor() {
 fn outcome(
     code: &str,
     step: BootstrapStep,
-    effects: BootstrapEffects,
+    effects: WriteEffects,
     retryable: bool,
 ) -> BootstrapOutcome {
     BootstrapOutcome {
@@ -869,7 +869,7 @@ async fn fail_after_lock(store: &ClusterStore, bundle: &CapturedDeployment, adap
         outcome(
             "bootstrap_freshness_unknown",
             BootstrapStep::Freshness,
-            BootstrapEffects::Confirmed,
+            WriteEffects::Confirmed,
             true
         )
     );
@@ -971,7 +971,7 @@ async fn same_identity_rerun_resumes_its_retained_lock_with_one_lineage() {
         outcome(
             "bootstrap_exclusion_required",
             BootstrapStep::Lock,
-            BootstrapEffects::None,
+            WriteEffects::None,
             false
         )
     );
@@ -1012,7 +1012,7 @@ async fn a_retained_lock_of_another_identity_or_a_legacy_lock_is_never_re_entere
     let refused = outcome(
         "bootstrap_root_not_fresh",
         BootstrapStep::Lock,
-        BootstrapEffects::None,
+        WriteEffects::None,
         false,
     );
     for identity in [
@@ -1079,7 +1079,7 @@ async fn a_persistent_probe_error_before_the_lock_fails_at_the_deadline_with_no_
         outcome(
             "bootstrap_freshness_unknown",
             BootstrapStep::Freshness,
-            BootstrapEffects::None,
+            WriteEffects::None,
             true
         )
     );
@@ -1116,11 +1116,7 @@ async fn a_landed_write_whose_answer_was_lost_or_whose_attempt_was_killed_resume
                 Fault::LostResponse => {
                     adapter.arm(point, fault);
                     let failure = first_attempt(&store, &bundle).await.unwrap_err();
-                    assert_eq!(
-                        failure.effects(),
-                        BootstrapEffects::Unconfirmed,
-                        "{point:?}"
-                    );
+                    assert_eq!(failure.effects(), WriteEffects::Unconfirmed, "{point:?}");
                     assert!(!failure.retryable(), "{point:?}");
                 }
                 _ => cancel_after_commit(&store, &bundle, &adapter, point).await,
@@ -1150,7 +1146,7 @@ async fn a_transient_write_refusal_that_applied_nothing_is_retryable_and_resumes
         assert!(adapter.fault.lock().unwrap().is_none(), "{point:?}");
         assert_eq!(
             failure.outcome(),
-            outcome("state_write_error", step, BootstrapEffects::Confirmed, true),
+            outcome("state_write_error", step, WriteEffects::Confirmed, true),
             "{point:?}"
         );
         let receipt = rerun(&store, &bundle).await.unwrap();
@@ -1181,7 +1177,7 @@ async fn a_transient_read_after_the_deployment_completed_is_retryable_and_resume
         assert!(adapter.read_fault.lock().unwrap().is_none(), "{fault:?}");
         assert_eq!(
             failure.outcome(),
-            outcome(code, step, BootstrapEffects::Confirmed, true),
+            outcome(code, step, WriteEffects::Confirmed, true),
             "{fault:?}"
         );
         let state_writes = |adapter: &Controlled| {
@@ -1211,23 +1207,19 @@ async fn an_outstanding_initial_deployment_refuses_the_rerun_and_changes_nothing
         (
             Point::StateAccepted,
             Fault::LostResponse,
-            BootstrapEffects::Unconfirmed,
+            WriteEffects::Unconfirmed,
         ),
         (
             Point::StateTerminal,
             Fault::TransientBeforeCommit,
-            BootstrapEffects::Confirmed,
+            WriteEffects::Confirmed,
         ),
     ] {
         outstanding_initial_deployment_refuses(point, fault, effects).await;
     }
 }
 
-async fn outstanding_initial_deployment_refuses(
-    point: Point,
-    fault: Fault,
-    effects: BootstrapEffects,
-) {
+async fn outstanding_initial_deployment_refuses(point: Point, fault: Fault, effects: WriteEffects) {
     let (_directory, bundle, store, adapter) = fixture();
     adapter.arm(point, fault);
     let failure = first_attempt(&store, &bundle).await.unwrap_err();
@@ -1245,7 +1237,7 @@ async fn outstanding_initial_deployment_refuses(
         outcome(
             "bootstrap_deployment_outstanding",
             BootstrapStep::Deployment,
-            BootstrapEffects::None,
+            WriteEffects::None,
             false
         )
     );
@@ -1283,7 +1275,7 @@ async fn the_attempt_counter_is_unbounded_until_it_would_overflow() {
         outcome(
             "bootstrap_attempts_exhausted",
             BootstrapStep::Lock,
-            BootstrapEffects::None,
+            WriteEffects::None,
             false
         )
     );

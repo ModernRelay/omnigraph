@@ -1,10 +1,11 @@
-//! What one bootstrap attempt actually sent to storage.
+//! What one storage operation actually sent: the effects of its writes.
 //!
-//! Every control request of an attempt goes through [`RecordingAdapter`]. It
+//! Every request of the operation goes through [`RecordingAdapter`]. It
 //! forwards reads, counts each conditional write when it is sent and when it is
-//! answered, and refuses every unconditional mutation before sending it: first
-//! bootstrap issues none. The attempt's [`BootstrapEffects`] is derived from
-//! those counts alone, so no step reports its own effects. The class of a
+//! answered, and refuses every unconditional mutation before sending it, so it
+//! serves only operations that write conditionally (today, first bootstrap).
+//! The operation's [`WriteEffects`] is derived from those counts alone, so no
+//! step reports its own effects. The class of a
 //! write the store refused without applying it is kept here too, as the one
 //! account of a failed write (`Diagnostic::storage_failure` classifies reads).
 
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// known: `none` < `confirmed` < `unconfirmed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum BootstrapEffects {
+pub enum WriteEffects {
     /// No write was sent, or every write sent was answered as not applied.
     None,
     /// Every write sent has a known outcome and at least one applied.
@@ -42,7 +43,7 @@ struct Counts {
 
 /// The conditional writes one attempt sent and how each was answered.
 #[derive(Debug, Default)]
-pub(super) struct EffectLog(Mutex<Counts>);
+pub(crate) struct EffectLog(Mutex<Counts>);
 
 impl EffectLog {
     fn sent(&self) {
@@ -65,34 +66,34 @@ impl EffectLog {
     }
 
     /// The class of a write the store refused without applying it, when that
-    /// is the attempt's latest write answer. First bootstrap stops at its
-    /// first write error, so this is then the failure the attempt ended on.
-    pub(super) fn refused_write(&self) -> Option<StorageFailureKind> {
+    /// is the operation's latest write answer. An operation that stops at its
+    /// first write error ends on this failure.
+    pub(crate) fn refused_write(&self) -> Option<StorageFailureKind> {
         self.0.lock().unwrap().refused
     }
 
     /// A request sent and never answered (its future was dropped) counts as
     /// unknown, as an `Unresolved` answer does.
-    pub(super) fn effects(&self) -> BootstrapEffects {
+    pub(crate) fn effects(&self) -> WriteEffects {
         let counts = self.0.lock().unwrap();
         if counts.unresolved > 0 || counts.sent > counts.answered {
-            BootstrapEffects::Unconfirmed
+            WriteEffects::Unconfirmed
         } else if counts.applied > 0 {
-            BootstrapEffects::Confirmed
+            WriteEffects::Confirmed
         } else {
-            BootstrapEffects::None
+            WriteEffects::None
         }
     }
 }
 
 #[derive(Debug)]
-pub(super) struct RecordingAdapter {
+pub(crate) struct RecordingAdapter {
     inner: Arc<dyn StorageAdapter>,
     log: Arc<EffectLog>,
 }
 
 impl RecordingAdapter {
-    pub(super) fn new(inner: Arc<dyn StorageAdapter>, log: Arc<EffectLog>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn StorageAdapter>, log: Arc<EffectLog>) -> Self {
         Self { inner, log }
     }
 
@@ -101,7 +102,7 @@ impl RecordingAdapter {
         Err(StorageError::Backend(StorageFailure::new(
             StorageFailureKind::Configuration,
             format!(
-                "first bootstrap sends only conditional writes; refused an unconditional {operation}"
+                "this operation sends only conditional writes; refused an unconditional {operation}"
             ),
         )))
     }
@@ -231,23 +232,23 @@ mod tests {
     #[test]
     fn effects_follow_the_answers_of_what_was_sent() {
         let log = EffectLog::default();
-        assert_eq!(log.effects(), BootstrapEffects::None);
+        assert_eq!(log.effects(), WriteEffects::None);
         log.sent();
         log.answered(Ok(false));
-        assert_eq!(log.effects(), BootstrapEffects::None);
+        assert_eq!(log.effects(), WriteEffects::None);
         log.sent();
         log.answered(Err(&StorageError::Backend(StorageFailure::new(
             StorageFailureKind::Configuration,
             "refused",
         ))));
-        assert_eq!(log.effects(), BootstrapEffects::None);
+        assert_eq!(log.effects(), WriteEffects::None);
         log.sent();
         log.answered(Ok(true));
-        assert_eq!(log.effects(), BootstrapEffects::Confirmed);
+        assert_eq!(log.effects(), WriteEffects::Confirmed);
         log.sent();
-        assert_eq!(log.effects(), BootstrapEffects::Unconfirmed, "in flight");
+        assert_eq!(log.effects(), WriteEffects::Unconfirmed, "in flight");
         log.answered(Err(&unresolved()));
-        assert_eq!(log.effects(), BootstrapEffects::Unconfirmed);
+        assert_eq!(log.effects(), WriteEffects::Unconfirmed);
         assert_eq!(
             log.refused_write(),
             None,
@@ -264,7 +265,7 @@ mod tests {
             "throttled",
         ))));
         assert_eq!(log.refused_write(), Some(StorageFailureKind::Transient));
-        assert_eq!(log.effects(), BootstrapEffects::None);
+        assert_eq!(log.effects(), WriteEffects::None);
         log.sent();
         log.answered(Ok(true));
         assert_eq!(log.refused_write(), None);
@@ -382,7 +383,7 @@ mod tests {
                 "{name}: only effect-free accessors may have a default body"
             );
         }
-        let own = include_str!("bootstrap_effects.rs");
+        let own = include_str!("write_effects.rs");
         let mut overridden: Vec<String> = methods(own, "impl StorageAdapter for RecordingAdapter")
             .into_iter()
             .map(|(name, _)| name)

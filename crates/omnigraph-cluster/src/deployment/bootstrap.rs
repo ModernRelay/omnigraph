@@ -16,10 +16,7 @@ use crate::store::BootstrapProbeDeadline;
 use omnigraph_storage::{StorageFailureKind, StorageKind};
 use std::sync::Arc;
 
-#[path = "bootstrap_effects.rs"]
-mod effects;
-pub use effects::BootstrapEffects;
-use effects::{EffectLog, RecordingAdapter};
+use super::write_effects::{EffectLog, RecordingAdapter, WriteEffects};
 
 #[cfg(test)]
 #[path = "bootstrap_fault_tests.rs"]
@@ -123,7 +120,7 @@ pub enum BootstrapStep {
 pub struct BootstrapOutcome {
     pub code: String,
     pub step: BootstrapStep,
-    pub effects: BootstrapEffects,
+    pub effects: WriteEffects,
     pub retryable: bool,
 }
 
@@ -133,7 +130,7 @@ pub struct BootstrapOutcome {
 pub struct BootstrapFailure {
     diagnostic: Diagnostic,
     step: BootstrapStep,
-    effects: BootstrapEffects,
+    effects: WriteEffects,
     /// The storage class of the failed request: the diagnostic's, for a read,
     /// or the recording adapter's, for a write refused without applying.
     storage_failure: Option<StorageFailureKind>,
@@ -143,7 +140,7 @@ pub struct BootstrapFailure {
 }
 
 impl BootstrapFailure {
-    fn new(diagnostic: Diagnostic, step: BootstrapStep, effects: BootstrapEffects) -> Self {
+    fn new(diagnostic: Diagnostic, step: BootstrapStep, effects: WriteEffects) -> Self {
         Self {
             storage_failure: diagnostic.storage_failure,
             deployment_outstanding: false,
@@ -169,7 +166,7 @@ impl BootstrapFailure {
         self.step
     }
 
-    pub fn effects(&self) -> BootstrapEffects {
+    pub fn effects(&self) -> WriteEffects {
         self.effects
     }
 
@@ -180,7 +177,7 @@ impl BootstrapFailure {
     /// read, a probe, or a write refused without applying) whose class is
     /// transient or unclassified. Advice only; the rerun's checks decide.
     pub fn retryable(&self) -> bool {
-        self.effects != BootstrapEffects::Unconfirmed
+        self.effects != WriteEffects::Unconfirmed
             && !self.deployment_outstanding
             && matches!(
                 self.storage_failure,
@@ -300,6 +297,18 @@ fn is_empty_ledger(state: &ClusterState) -> bool {
     )
 }
 
+/// The one rule for the state a rerun refuses (`bootstrap_deployment_outstanding`):
+/// this input's initial deployment accepted in the ledger and not complete. A
+/// rerun applies it to the ledger it reads; an attempt applies it to the
+/// ledger entry its acceptance wrote, so `retryable` never advises a rerun
+/// that would refuse.
+fn own_outstanding(lookup: &DeploymentLookup, input_digest: &str) -> bool {
+    matches!(
+        lookup,
+        DeploymentLookup::Outstanding { input_digest: pending, .. } if pending.as_str() == input_digest
+    )
+}
+
 /// The rerun decision table. It reads nothing but the ledger snapshot; the
 /// lock was read, and attributed to this identity, before. Each row is a
 /// state this bootstrap's own steps leave, so no other process's effect is
@@ -334,11 +343,7 @@ fn progress(
         .filter(|_| state.state_revision == 2)
     {
         if first(&pending.id)
-            && matches!(
-                execution::lookup(state, &pending.id)?,
-                DeploymentLookup::Outstanding { input_digest: ref pending_input, .. }
-                    if pending_input.as_str() == input_digest
-            )
+            && own_outstanding(&execution::lookup(state, &pending.id)?, input_digest)
         {
             return Err(Diagnostic::error(
                 "bootstrap_deployment_outstanding",
@@ -424,9 +429,8 @@ pub async fn bootstrap_serving(
     caller: &DeploymentCaller,
     request: &BootstrapRequest,
 ) -> Result<BootstrapServingReceipt, BootstrapFailure> {
-    let before_storage = |diagnostic| {
-        BootstrapFailure::new(diagnostic, BootstrapStep::Input, BootstrapEffects::None)
-    };
+    let before_storage =
+        |diagnostic| BootstrapFailure::new(diagnostic, BootstrapStep::Input, WriteEffects::None);
     let bundle = capture_deployment(config_dir).map_err(before_storage)?;
     require_s3(&bundle.canonical_root).map_err(before_storage)?;
     let store = ClusterStore::for_storage_root(&bundle.canonical_root)
@@ -497,9 +501,9 @@ async fn bootstrap_in_store(
             .io_scope()
             .is_some_and(|scope| scope.is_uncertain());
         let effects = log.effects().max(if scope_uncertain {
-            BootstrapEffects::Unconfirmed
+            WriteEffects::Unconfirmed
         } else {
-            BootstrapEffects::None
+            WriteEffects::None
         });
         let mut failure = BootstrapFailure::new(diagnostic, step, effects);
         failure.storage_failure = failure.storage_failure.or(log.refused_write());
@@ -602,7 +606,7 @@ async fn bootstrap_attempt(
                     &admission,
                     &BTreeMap::new(),
                     |_, _, _| {},
-                    |_| *deployment_outstanding = true,
+                    |accepted| *deployment_outstanding = own_outstanding(&accepted, &input_digest),
                     &mut effects_started,
                 )
                 .await?;
