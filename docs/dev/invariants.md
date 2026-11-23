@@ -169,7 +169,10 @@ different:
   costs more than the commit it defers ([ingestion](ingestion.md));
 - a node or edge type the engine writes into a user's graph on its own, such
   as an automatic actor node: it changes the schema format for every reader,
-  and an export then holds rows that a load refuses.
+  and an export then holds rows that a load refuses;
+- a file in a checkout that carries graphs, credentials or identity (the
+  retired `omnigraph.yaml`): one file with two owners can be neither
+  committed safely nor kept personal, and a checkout could redirect a token.
 
 Cases a decision record has argued: the flat locator objects and legacy data files under
 `__history/legacy/`, written once by the storage upgrade (from stamp 8, 9 or 13), in the
