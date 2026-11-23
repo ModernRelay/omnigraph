@@ -151,9 +151,9 @@ pub(crate) fn validate_setup_url(value: &str) -> color_eyre::eyre::Result<()> {
 pub fn format_bytes(bytes: usize) -> String {
     const KIB: usize = 1024;
     const MIB: usize = 1024 * 1024;
-    if bytes >= MIB && bytes % MIB == 0 {
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
         format!("{} MiB", bytes / MIB)
-    } else if bytes >= KIB && bytes % KIB == 0 {
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
         format!("{} KiB", bytes / KIB)
     } else if bytes == 1 {
         "1 byte".to_owned()

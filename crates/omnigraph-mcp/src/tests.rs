@@ -181,8 +181,10 @@ fn complete_tool_result_including_legacy_text_has_one_byte_bound() {
 }
 
 fn test_service(result_bytes: usize) -> GraphTools<HeldHost> {
-    let mut settings = McpSettings::default();
-    settings.result_bytes = result_bytes;
+    let settings = McpSettings {
+        result_bytes,
+        ..McpSettings::default()
+    };
     GraphTools {
         host: HeldHost::default(),
         version: "test".into(),
@@ -256,9 +258,11 @@ fn instructions_name_the_configured_bound_and_the_setup_step_only_when_configure
     let defaults = instructions(&McpSettings::default());
     assert!(defaults.contains("A result is limited to 1 MiB"));
     assert!(!defaults.contains("`setup`"));
-    let mut settings = McpSettings::default();
-    settings.result_bytes = 128 * 1024;
-    settings.setup_url = Some("https://example.com/setup".into());
+    let settings = McpSettings {
+        result_bytes: 128 * 1024,
+        setup_url: Some("https://example.com/setup".into()),
+        ..McpSettings::default()
+    };
     let configured = instructions(&settings);
     assert!(configured.contains("A result is limited to 128 KiB"));
     assert!(configured.contains("returns a `setup` link"));
