@@ -93,6 +93,8 @@ pub const CLUSTER_STATE_FILE: &str = "__cluster/state.json";
 pub const CLUSTER_LOCK_FILE: &str = "__cluster/lock.json";
 pub const CLUSTER_RESOURCES_DIR: &str = "__cluster/resources";
 pub const CLUSTER_RECOVERIES_DIR: &str = "__cluster/recoveries";
+/// First-bootstrap step receipts, each created once.
+pub const CLUSTER_BOOTSTRAP_DIR: &str = "__cluster/bootstrap";
 
 /// The store for a load outcome: the declared `storage:` root when present,
 /// the config directory itself otherwise. A bad root is a loud error.

@@ -285,6 +285,22 @@ takeover. Later serving owners use clean release rather than replaying the
 bootstrap receipt. The S3 lock key remains continuously present across normal
 release and acquisition, so an older bootstrap create cannot recreate its owner.
 
+The bootstrap lock (version 4) names its bootstrap identity, the caller's
+cluster incarnation and optional request id, and an attempt number. Only a
+rerun of that identity whose caller asserts that every earlier attempt is
+excluded re-enters it, by if-match on the exact version read, with a new lock
+id; a legacy, serving or foreign lock refuses as before. Each step with an
+effect writes a create-if-absent receipt under `__cluster/bootstrap/` after its
+effect is confirmed. A rerun inspects the receipts and the ledger before and
+after re-entry, skips receipted steps, replays the ledger only while
+`state.json` is absent and the deployment only while the ledger holds its
+receipted initial bytes, and otherwise refuses `bootstrap_step_unconfirmed`.
+The attempt's control requests pass through a recording adapter that refuses
+unconditional mutations, so a failure's `effects` (`none`, `confirmed`,
+`unconfirmed`) is derived from what was sent. Freshness probes retry transient
+and unclassified errors inside a 120-second deadline per check. See
+[re-entrant first bootstrap](../rfcs/2026-11-23-re-entrant-first-bootstrap.md).
+
 Clean native shutdown closes logical admission, drains its existing operation
 owners, then closes and drains an explicit `StorageIoScope` shared by control
 adapters and graph Lance sessions. The wrappers count actual mutating requests

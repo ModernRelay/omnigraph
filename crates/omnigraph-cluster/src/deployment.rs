@@ -14,8 +14,9 @@ mod execution;
 pub use execution::*;
 mod bootstrap;
 pub use bootstrap::{
-    BootstrapServingReceipt, MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES, bootstrap_serving,
-    claim_bootstrap_serving,
+    BootstrapEffects, BootstrapFailure, BootstrapIdentity, BootstrapOutcome, BootstrapRequest,
+    BootstrapServingReceipt, BootstrapStep, MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES,
+    MAX_BOOTSTRAP_STEP_RECEIPT_BYTES, PriorAttempts, bootstrap_serving, claim_bootstrap_serving,
 };
 
 pub(crate) const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;

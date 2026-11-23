@@ -4,7 +4,8 @@
 //! an uncertain storage response.
 use super::*;
 use omnigraph_storage::{
-    ListDirBounds, ObjectStorageAdapter, Result as StorageResult, StorageAdapter,
+    ListDirBounds, ObjectStorageAdapter, Result as StorageResult, StorageAdapter, StorageError,
+    StorageFailure, StorageFailureKind,
 };
 use std::sync::{
     Arc, Mutex,
@@ -26,6 +27,11 @@ struct Write {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Point {
     LockCreate,
+    /// A same-identity rerun's exact-version replace of its bootstrap lock.
+    Reenter,
+    FreshnessReceipt,
+    LedgerReceipt,
+    DeploymentReceipt,
     StateCreate,
     StateAccepted,
     StateTerminal,
@@ -49,6 +55,8 @@ struct Controlled {
     committed: Notify,
     claim_barrier: Mutex<Option<Arc<Barrier>>>,
     claim_attempts: AtomicUsize,
+    /// `(only once the lock exists, remaining)` injected `exists()` errors.
+    exists_fault: Mutex<Option<(bool, usize)>>,
 }
 
 impl Controlled {
@@ -62,6 +70,7 @@ impl Controlled {
             committed: Notify::new(),
             claim_barrier: Mutex::default(),
             claim_attempts: AtomicUsize::new(0),
+            exists_fault: Mutex::default(),
         }
     }
 
@@ -72,17 +81,22 @@ impl Controlled {
 
     fn point(uri: &str, payload: &str, cas: bool) -> Option<Point> {
         if uri.ends_with("/__cluster/lock.json") {
-            Some(
-                if serde_json::from_str::<serde_json::Value>(payload).unwrap()["release_id"]
-                    .is_string()
-                {
-                    Point::Release
-                } else if cas {
-                    Point::Claim
-                } else {
-                    Point::LockCreate
-                },
-            )
+            let record = serde_json::from_str::<serde_json::Value>(payload).unwrap();
+            Some(if record["release_id"].is_string() {
+                Point::Release
+            } else if cas && record["operation"] == "bootstrap_serving" {
+                Point::Reenter
+            } else if cas {
+                Point::Claim
+            } else {
+                Point::LockCreate
+            })
+        } else if uri.ends_with("/__cluster/bootstrap/freshness.json") {
+            Some(Point::FreshnessReceipt)
+        } else if uri.ends_with("/__cluster/bootstrap/ledger.json") {
+            Some(Point::LedgerReceipt)
+        } else if uri.ends_with("/__cluster/bootstrap/deployment.json") {
+            Some(Point::DeploymentReceipt)
         } else if uri.ends_with("/__cluster/state.json") {
             if !cas {
                 Some(Point::StateCreate)
@@ -110,11 +124,12 @@ impl Controlled {
             }
         };
         match fault {
-            Some(Fault::LostResponse) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
+            // What the storage layer reports for a conditional write whose
+            // re-issues and read-back did not settle it.
+            Some(Fault::LostResponse) => Err(StorageError::Unresolved(StorageFailure::new(
+                StorageFailureKind::Transient,
                 "injected response lost after backend commit",
-            )
-            .into()),
+            ))),
             Some(Fault::CancelAfterCommit) => {
                 self.committed.notify_one();
                 std::future::pending::<StorageResult<()>>().await
@@ -137,6 +152,16 @@ impl Controlled {
 
     fn arm(&self, point: Point, fault: Fault) {
         *self.fault.lock().unwrap() = Some((point, fault));
+    }
+
+    /// Fail the next `failures` existence probes, only once the lock exists
+    /// when `after_lock`, as a stalled response body does.
+    fn arm_exists(&self, after_lock: bool, failures: usize) {
+        *self.exists_fault.lock().unwrap() = Some((after_lock, failures));
+    }
+
+    fn disarm_exists(&self) {
+        *self.exists_fault.lock().unwrap() = None;
     }
 
     async fn assert_no_forbidden_calls(&self) {
@@ -184,6 +209,24 @@ impl StorageAdapter for Controlled {
             .await
     }
     async fn exists(&self, uri: &str) -> StorageResult<bool> {
+        let locked = self
+            .inner
+            .exists(self.key(&format!("{ROOT}/{CLUSTER_LOCK_FILE}")))
+            .await?;
+        let inject = match self.exists_fault.lock().unwrap().as_mut() {
+            Some((after_lock, remaining)) if *remaining > 0 && (locked || !*after_lock) => {
+                *remaining -= 1;
+                true
+            }
+            _ => false,
+        };
+        if inject {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "injected stalled response body",
+            )
+            .into());
+        }
         self.inner.exists(self.key(uri)).await
     }
     async fn read_text_versioned(&self, uri: &str) -> StorageResult<(String, String)> {
@@ -324,9 +367,14 @@ fn fixture() -> (
 #[tokio::test]
 async fn backend_recorded_late_conditional_writes_cannot_replace_claimed_state() {
     let (_directory, bundle, store, adapter) = fixture();
-    let receipt = bootstrap_in_store(&store, &bundle, &super::tests::owner())
-        .await
-        .unwrap();
+    let receipt = bootstrap_in_store(
+        &store,
+        &bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+    .unwrap();
     let bootstrap_writes = adapter.writes.lock().unwrap().clone();
     let state_writes: Vec<_> = bootstrap_writes
         .iter()
@@ -374,9 +422,14 @@ async fn backend_recorded_late_conditional_writes_cannot_replace_claimed_state()
 #[tokio::test]
 async fn both_claimants_reach_cas_with_the_same_old_etag_but_only_one_wins() {
     let (_directory, bundle, store, adapter) = fixture();
-    let receipt = bootstrap_in_store(&store, &bundle, &super::tests::owner())
-        .await
-        .unwrap();
+    let receipt = bootstrap_in_store(
+        &store,
+        &bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+    .unwrap();
     *adapter.claim_barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
     let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         tokio::join!(
@@ -406,9 +459,14 @@ async fn committed_bootstrap_writes_with_lost_responses_retain_exclusion() {
         let (_directory, bundle, store, adapter) = fixture();
         adapter.arm(point, Fault::LostResponse);
         assert!(
-            bootstrap_in_store(&store, &bundle, &super::tests::owner())
-                .await
-                .is_err()
+            bootstrap_in_store(
+                &store,
+                &bundle,
+                &super::tests::owner(),
+                &super::tests::request()
+            )
+            .await
+            .is_err()
         );
         assert!(
             adapter.fault.lock().unwrap().is_none(),
@@ -416,9 +474,14 @@ async fn committed_bootstrap_writes_with_lost_responses_retain_exclusion() {
         );
         let lock = adapter.read(CLUSTER_LOCK_FILE).await;
         assert!(
-            bootstrap_in_store(&store, &bundle, &super::tests::owner())
-                .await
-                .is_err()
+            bootstrap_in_store(
+                &store,
+                &bundle,
+                &super::tests::owner(),
+                &super::tests::request()
+            )
+            .await
+            .is_err()
         );
         assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, lock);
         adapter.assert_no_forbidden_calls().await;
@@ -428,9 +491,14 @@ async fn committed_bootstrap_writes_with_lost_responses_retain_exclusion() {
 #[tokio::test]
 async fn committed_claim_with_lost_response_grants_no_replay_admission() {
     let (_directory, bundle, store, adapter) = fixture();
-    let receipt = bootstrap_in_store(&store, &bundle, &super::tests::owner())
-        .await
-        .unwrap();
+    let receipt = bootstrap_in_store(
+        &store,
+        &bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+    .unwrap();
     adapter.arm(Point::Claim, Fault::LostResponse);
     assert!(claim_in_store(&store, &receipt).await.is_err());
     assert!(adapter.fault.lock().unwrap().is_none());
@@ -456,7 +524,11 @@ async fn cancellation_after_backend_commit_never_releases_or_adopts_ownership() 
         let (_directory, bundle, store, adapter) = fixture();
         let caller = super::tests::owner();
         let receipt = if point == Point::Claim {
-            Some(bootstrap_in_store(&store, &bundle, &caller).await.unwrap())
+            Some(
+                bootstrap_in_store(&store, &bundle, &caller, &super::tests::request())
+                    .await
+                    .unwrap(),
+            )
         } else {
             None
         };
@@ -466,9 +538,10 @@ async fn cancellation_after_backend_commit_never_releases_or_adopts_ownership() 
                 if let Some(receipt) = &receipt {
                     claim_in_store(&store, receipt).await.map(|_| ())
                 } else {
-                    bootstrap_in_store(&store, &bundle, &caller)
+                    bootstrap_in_store(&store, &bundle, &caller, &super::tests::request())
                         .await
                         .map(|_| ())
+                        .map_err(BootstrapFailure::into_diagnostic)
                 }
             };
             tokio::pin!(operation);
@@ -483,7 +556,11 @@ async fn cancellation_after_backend_commit_never_releases_or_adopts_ownership() 
         if let Some(receipt) = &receipt {
             assert!(claim_in_store(&store, receipt).await.is_err());
         } else {
-            assert!(bootstrap_in_store(&store, &bundle, &caller).await.is_err());
+            assert!(
+                bootstrap_in_store(&store, &bundle, &caller, &super::tests::request())
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, lock);
         adapter.assert_no_forbidden_calls().await;
@@ -495,9 +572,14 @@ async fn clean_release_and_concurrent_reacquisition_keep_delayed_writes_harmless
     use crate::admission::{ClusterAdmissionPurpose, acquire_with_store};
 
     let (_directory, bundle, store, adapter) = fixture();
-    let receipt = bootstrap_in_store(&store, &bundle, &super::tests::owner())
-        .await
-        .unwrap();
+    let receipt = bootstrap_in_store(
+        &store,
+        &bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+    .unwrap();
     let (_, _, owner) = claim_in_store(&store, &receipt).await.unwrap().into_parts();
     let owner = owner.unwrap();
     let old_id = owner.lock_id().to_owned();
@@ -624,9 +706,14 @@ async fn lost_release_acknowledgement_never_replays_over_the_successor() {
 
     for fault in [Fault::LostResponse, Fault::CancelAfterCommit] {
         let (_directory, bundle, store, adapter) = fixture();
-        let receipt = bootstrap_in_store(&store, &bundle, &super::tests::owner())
-            .await
-            .unwrap();
+        let receipt = bootstrap_in_store(
+            &store,
+            &bundle,
+            &super::tests::owner(),
+            &super::tests::request(),
+        )
+        .await
+        .unwrap();
         let (_, _, owner) = claim_in_store(&store, &receipt).await.unwrap().into_parts();
         let owner = owner.unwrap();
         let old_id = owner.lock_id().to_owned();
@@ -683,6 +770,345 @@ async fn lost_release_acknowledgement_never_replays_over_the_successor() {
         assert!(store.release_settled(&old_id).await.is_err());
         assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, current);
         drop(next);
+        adapter.assert_no_forbidden_calls().await;
+    }
+}
+
+fn outcome(
+    code: &str,
+    step: BootstrapStep,
+    effects: BootstrapEffects,
+    retryable: bool,
+) -> BootstrapOutcome {
+    BootstrapOutcome {
+        code: code.into(),
+        step,
+        effects,
+        retryable,
+    }
+}
+
+fn lock_json(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap()
+}
+
+/// Leave this identity's lock retained, as the 2026-11-23 failure did: the
+/// freshness probe after the lock keeps failing until its deadline.
+async fn fail_after_lock(store: &ClusterStore, bundle: &CapturedDeployment, adapter: &Controlled) {
+    adapter.arm_exists(true, usize::MAX);
+    let failure = bootstrap_in_store(
+        store,
+        bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+    .unwrap_err();
+    adapter.disarm_exists();
+    assert_eq!(
+        failure.outcome(),
+        outcome(
+            "bootstrap_freshness_unknown",
+            BootstrapStep::Freshness,
+            BootstrapEffects::Confirmed,
+            true
+        )
+    );
+}
+
+// The 2026-11-23 failure: a transient freshness read after the lock.
+#[tokio::test(start_paused = true)]
+async fn same_identity_rerun_resumes_its_retained_lock_with_one_lineage() {
+    let (_directory, bundle, store, adapter) = fixture();
+    fail_after_lock(&store, &bundle, &adapter).await;
+    let retained = adapter.read(CLUSTER_LOCK_FILE).await;
+    let first = lock_json(&retained);
+    assert_eq!(first["version"], 4);
+    assert_eq!(first["operation"], "bootstrap_serving");
+    assert_eq!(first["incarnation"], "inc-1");
+    assert_eq!(first["request_id"], "req-1");
+    assert_eq!(first["attempt"], 1);
+    assert!(
+        !adapter
+            .inner
+            .exists(adapter.key(&format!("{ROOT}/{CLUSTER_STATE_FILE}")))
+            .await
+            .unwrap()
+    );
+
+    // Without the caller's exclusion proof nothing changes.
+    let refused = bootstrap_in_store(
+        &store,
+        &bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        refused.outcome(),
+        outcome(
+            "bootstrap_exclusion_required",
+            BootstrapStep::Lock,
+            BootstrapEffects::None,
+            false
+        )
+    );
+    assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, retained);
+
+    let receipt = bootstrap_in_store(
+        &store,
+        &bundle,
+        &super::tests::owner(),
+        &super::tests::resume(),
+    )
+    .await
+    .unwrap();
+    let lock_writes: Vec<_> = adapter
+        .writes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|write| write.uri.ends_with(CLUSTER_LOCK_FILE))
+        .cloned()
+        .collect();
+    // One lineage: one create, then one CAS from the exact created version.
+    assert_eq!(lock_writes.len(), 2);
+    assert!(lock_writes[0].expected_version.is_none());
+    let (predecessor, predecessor_version) = lock_writes[1].predecessor.clone().unwrap();
+    assert_eq!(predecessor, retained);
+    assert_eq!(
+        lock_writes[1].expected_version.as_deref(),
+        Some(predecessor_version.as_str())
+    );
+    let current = lock_json(&adapter.read(CLUSTER_LOCK_FILE).await);
+    assert_eq!(current["attempt"], 2);
+    assert_eq!(current["incarnation"], "inc-1");
+    assert_eq!(current["request_id"], "req-1");
+    assert_ne!(current["lock_id"], first["lock_id"]);
+    assert_eq!(current["lock_id"], receipt.bootstrap_lock_id.as_str());
+    for path in [FRESHNESS_RECEIPT, LEDGER_RECEIPT, DEPLOYMENT_RECEIPT] {
+        assert!(
+            adapter
+                .read(path)
+                .await
+                .contains("\"incarnation\":\"inc-1\"")
+        );
+    }
+    claim_in_store(&store, &receipt).await.unwrap();
+    adapter.assert_no_forbidden_calls().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retained_lock_of_another_identity_or_a_legacy_lock_is_never_re_entered() {
+    let (_directory, bundle, store, adapter) = fixture();
+    fail_after_lock(&store, &bundle, &adapter).await;
+    let retained = adapter.read(CLUSTER_LOCK_FILE).await;
+    let refused = outcome(
+        "bootstrap_root_not_fresh",
+        BootstrapStep::Lock,
+        BootstrapEffects::None,
+        false,
+    );
+    for identity in [
+        BootstrapIdentity::new("inc-2", Some("req-1".into())).unwrap(),
+        BootstrapIdentity::new("inc-1", Some("req-2".into())).unwrap(),
+        BootstrapIdentity::new("inc-1", None).unwrap(),
+    ] {
+        let request = BootstrapRequest {
+            identity,
+            prior_attempts: PriorAttempts::Excluded,
+        };
+        let failure = bootstrap_in_store(&store, &bundle, &super::tests::owner(), &request)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.outcome(), refused);
+        assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, retained);
+    }
+    adapter.assert_no_forbidden_calls().await;
+
+    // A legacy bootstrap lock names no identity; a serving lock is not a
+    // bootstrap lock. Neither is ever re-entered.
+    for legacy in [
+        r#"{"version":1,"lock_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","operation":"bootstrap_serving","created_at":"2026-11-23T00:00:00Z","pid":1}"#,
+        r#"{"version":1,"lock_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","operation":"serve","created_at":"2026-11-23T00:00:00Z","pid":1}"#,
+    ] {
+        let (_directory, bundle, store, adapter) = fixture();
+        assert!(
+            adapter
+                .inner
+                .write_text_if_absent(adapter.key(&format!("{ROOT}/{CLUSTER_LOCK_FILE}")), legacy)
+                .await
+                .unwrap()
+        );
+        let failure = bootstrap_in_store(
+            &store,
+            &bundle,
+            &super::tests::owner(),
+            &super::tests::resume(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.outcome(), refused);
+        assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, legacy);
+        assert!(adapter.writes.lock().unwrap().is_empty());
+        adapter.assert_no_forbidden_calls().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn transient_freshness_probe_errors_are_retried_within_the_deadline() {
+    let (_directory, bundle, store, adapter) = fixture();
+    adapter.arm_exists(true, 3);
+    let start = tokio::time::Instant::now();
+    let receipt = bootstrap_in_store(
+        &store,
+        &bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(adapter.exists_fault.lock().unwrap().unwrap().1, 0);
+    assert!(start.elapsed() < crate::store::BOOTSTRAP_FRESHNESS_DEADLINE);
+    claim_in_store(&store, &receipt).await.unwrap();
+    adapter.assert_no_forbidden_calls().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_persistent_probe_error_before_the_lock_fails_at_the_deadline_with_no_effects() {
+    let (_directory, bundle, store, adapter) = fixture();
+    adapter.arm_exists(false, usize::MAX);
+    let start = tokio::time::Instant::now();
+    let failure = bootstrap_in_store(
+        &store,
+        &bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+    .unwrap_err();
+    assert!(start.elapsed() >= crate::store::BOOTSTRAP_FRESHNESS_DEADLINE);
+    assert_eq!(
+        failure.outcome(),
+        outcome(
+            "bootstrap_freshness_unknown",
+            BootstrapStep::Freshness,
+            BootstrapEffects::None,
+            true
+        )
+    );
+    assert!(
+        failure
+            .diagnostic()
+            .message
+            .contains("injected stalled response")
+    );
+    assert!(adapter.writes.lock().unwrap().is_empty());
+    assert!(
+        !adapter
+            .inner
+            .exists(adapter.key(&format!("{ROOT}/{CLUSTER_LOCK_FILE}")))
+            .await
+            .unwrap()
+    );
+    // Nothing was written, so a plain rerun starts over.
+    adapter.disarm_exists();
+    bootstrap_in_store(
+        &store,
+        &bundle,
+        &super::tests::owner(),
+        &super::tests::request(),
+    )
+    .await
+    .unwrap();
+    adapter.assert_no_forbidden_calls().await;
+}
+
+#[tokio::test]
+async fn an_unconfirmed_write_is_classified_and_a_rerun_refuses_past_it() {
+    for (point, step) in [
+        (Point::StateCreate, BootstrapStep::Ledger),
+        (Point::StateAccepted, BootstrapStep::Deployment),
+    ] {
+        let (_directory, bundle, store, adapter) = fixture();
+        adapter.arm(point, Fault::LostResponse);
+        let failure = bootstrap_in_store(
+            &store,
+            &bundle,
+            &super::tests::owner(),
+            &super::tests::request(),
+        )
+        .await
+        .unwrap_err();
+        assert!(adapter.fault.lock().unwrap().is_none());
+        assert_eq!(failure.step(), step, "{point:?}");
+        assert_eq!(
+            failure.effects(),
+            BootstrapEffects::Unconfirmed,
+            "{point:?}"
+        );
+        assert!(!failure.retryable(), "{point:?}");
+        let lock = adapter.read(CLUSTER_LOCK_FILE).await;
+        let state = adapter.read(CLUSTER_STATE_FILE).await;
+        // The rerun refuses before it re-enters the lock.
+        let refused = bootstrap_in_store(
+            &store,
+            &bundle,
+            &super::tests::owner(),
+            &super::tests::resume(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refused.outcome(),
+            outcome(
+                "bootstrap_step_unconfirmed",
+                step,
+                BootstrapEffects::None,
+                false
+            ),
+            "{point:?}"
+        );
+        assert_eq!(adapter.read(CLUSTER_LOCK_FILE).await, lock);
+        assert_eq!(adapter.read(CLUSTER_STATE_FILE).await, state);
+        adapter.assert_no_forbidden_calls().await;
+    }
+}
+
+#[tokio::test]
+async fn a_lost_answer_on_a_step_receipt_that_landed_resumes() {
+    for (point, step) in [
+        (Point::FreshnessReceipt, BootstrapStep::Freshness),
+        (Point::LedgerReceipt, BootstrapStep::Ledger),
+        (Point::DeploymentReceipt, BootstrapStep::Deployment),
+    ] {
+        let (_directory, bundle, store, adapter) = fixture();
+        adapter.arm(point, Fault::LostResponse);
+        let failure = bootstrap_in_store(
+            &store,
+            &bundle,
+            &super::tests::owner(),
+            &super::tests::request(),
+        )
+        .await
+        .unwrap_err();
+        assert!(adapter.fault.lock().unwrap().is_none());
+        assert_eq!(failure.step(), step, "{point:?}");
+        assert_eq!(
+            failure.effects(),
+            BootstrapEffects::Unconfirmed,
+            "{point:?}"
+        );
+        let receipt = bootstrap_in_store(
+            &store,
+            &bundle,
+            &super::tests::owner(),
+            &super::tests::resume(),
+        )
+        .await
+        .unwrap();
+        claim_in_store(&store, &receipt).await.unwrap();
         adapter.assert_no_forbidden_calls().await;
     }
 }

@@ -76,8 +76,24 @@ pub(crate) fn canonical_storage_root(root: &str) -> Result<String, Diagnostic> {
 }
 
 fn bootstrap_lock_error(error: StateLockError) -> Diagnostic {
-    Diagnostic::error("bootstrap_lock_error", CLUSTER_LOCK_FILE, error.to_string())
+    let diagnostic =
+        Diagnostic::error("bootstrap_lock_error", CLUSTER_LOCK_FILE, error.to_string());
+    match &error {
+        StateLockError::Storage(storage) => diagnostic.with_storage_failure(storage),
+        _ => diagnostic,
+    }
 }
+
+/// One freshness check's effect-free `exists()` probes share this deadline. A
+/// probe whose error is transient or unclassified is retried after a pause of
+/// `BOOTSTRAP_PROBE_FIRST_PAUSE`, doubling to `BOOTSTRAP_PROBE_MAX_PAUSE`, and
+/// each probe is cut off at the deadline. A fresh bootstrap runs two checks,
+/// so its probes stay within 240 seconds of a managed operator's 600-second
+/// attempt bound.
+pub(crate) const BOOTSTRAP_FRESHNESS_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(120);
+const BOOTSTRAP_PROBE_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+const BOOTSTRAP_PROBE_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Only explicit stopped-ledger conversion may remove obsolete runtime fields.
 /// The remaining ledger is decoded by the ordinary strict types and validator.
@@ -328,16 +344,77 @@ impl ClusterStore {
         self
     }
 
-    async fn require_absent_native_paths(&self, paths: &[&str]) -> Result<(), Diagnostic> {
-        for path in paths {
-            if self
-                .adapter
-                .exists(&self.uri(path))
-                .await
-                .map_err(|error| {
-                    Diagnostic::error("bootstrap_freshness_unknown", *path, error.to_string())
-                })?
+    /// The same store with every control request sent through `wrap`'s
+    /// adapter, which wraps this store's own. The lease adapter is unchanged.
+    pub(crate) fn with_wrapped_adapter(
+        mut self,
+        wrap: impl FnOnce(Arc<dyn StorageAdapter>) -> Arc<dyn StorageAdapter>,
+    ) -> Self {
+        self.adapter = wrap(self.adapter);
+        self
+    }
+
+    /// Whether `path` exists, by effect-free probes retried inside `deadline`
+    /// (`BOOTSTRAP_FRESHNESS_DEADLINE`). An error is never taken for absence.
+    async fn probe_exists(
+        &self,
+        path: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, Diagnostic> {
+        use omnigraph_storage::StorageFailureKind;
+        let uri = self.uri(path);
+        let mut pause = BOOTSTRAP_PROBE_FIRST_PAUSE;
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            let error = match tokio::time::timeout_at(deadline, self.adapter.exists(&uri)).await {
+                Ok(Ok(found)) => return Ok(found),
+                Ok(Err(error)) => error,
+                Err(_) => {
+                    let mut diagnostic = Diagnostic::error(
+                        "bootstrap_freshness_unknown",
+                        path,
+                        format!(
+                            "the existence probe did not answer within the {}-second freshness deadline (attempt {attempts})",
+                            BOOTSTRAP_FRESHNESS_DEADLINE.as_secs()
+                        ),
+                    );
+                    diagnostic.storage_failure = Some(StorageFailureKind::Transient);
+                    return Err(diagnostic);
+                }
+            };
+            let kind = error.failure_kind();
+            let now = tokio::time::Instant::now();
+            if !matches!(
+                kind,
+                StorageFailureKind::Transient | StorageFailureKind::Unknown
+            ) || now >= deadline
             {
+                return Err(Diagnostic::error(
+                    "bootstrap_freshness_unknown",
+                    path,
+                    format!("{error} (after {attempts} attempts)"),
+                )
+                .with_storage_failure(&error));
+            }
+            tracing::warn!(
+                path,
+                attempts,
+                ?kind,
+                "retrying an effect-free bootstrap freshness probe"
+            );
+            tokio::time::sleep(pause.min(deadline - now)).await;
+            pause = (pause * 2).min(BOOTSTRAP_PROBE_MAX_PAUSE);
+        }
+    }
+
+    async fn require_absent_native_paths(
+        &self,
+        paths: &[&str],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Diagnostic> {
+        for path in paths {
+            if self.probe_exists(path, deadline).await? {
                 return Err(Diagnostic::error(
                     "bootstrap_root_not_fresh",
                     *path,
@@ -348,38 +425,127 @@ impl ClusterStore {
         Ok(())
     }
 
+    /// One freshness check: no native authority, graph data, recovery or
+    /// bootstrap receipts, and no lock unless this bootstrap holds it.
     pub(crate) async fn require_fresh_bootstrap(&self, own_lock: bool) -> Result<(), Diagnostic> {
-        self.require_no_bootstrap_graphs_or_recovery().await?;
-        self.require_absent_native_paths(&[CLUSTER_STATE_FILE, CLUSTER_RESOURCES_DIR])
+        let deadline = tokio::time::Instant::now() + BOOTSTRAP_FRESHNESS_DEADLINE;
+        self.require_absent_bootstrap_graphs_or_recovery(deadline)
             .await?;
+        self.require_absent_native_paths(
+            &[
+                CLUSTER_STATE_FILE,
+                CLUSTER_RESOURCES_DIR,
+                crate::CLUSTER_BOOTSTRAP_DIR,
+            ],
+            deadline,
+        )
+        .await?;
         if !own_lock {
-            self.require_absent_native_paths(&[CLUSTER_LOCK_FILE])
+            self.require_absent_native_paths(&[CLUSTER_LOCK_FILE], deadline)
                 .await?;
         }
         Ok(())
     }
 
     pub(crate) async fn require_no_bootstrap_graphs_or_recovery(&self) -> Result<(), Diagnostic> {
-        self.require_absent_native_paths(&[
-            crate::CLUSTER_GRAPHS_DIR,
-            "__manifest",
-            "__history",
-            CLUSTER_RECOVERIES_DIR,
-            "__cluster/approvals",
-        ])
+        self.require_absent_bootstrap_graphs_or_recovery(
+            tokio::time::Instant::now() + BOOTSTRAP_FRESHNESS_DEADLINE,
+        )
         .await
+    }
+
+    async fn require_absent_bootstrap_graphs_or_recovery(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Diagnostic> {
+        self.require_absent_native_paths(
+            &[
+                crate::CLUSTER_GRAPHS_DIR,
+                "__manifest",
+                "__history",
+                CLUSTER_RECOVERIES_DIR,
+                "__cluster/approvals",
+            ],
+            deadline,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_bootstrap_lock_state(
+        &self,
+        incarnation: &str,
+        request_id: Option<&str>,
+    ) -> Result<crate::state_lock::BootstrapLockState, Diagnostic> {
+        crate::state_lock::read_bootstrap_lock_state(
+            &self.adapter,
+            &self.uri(CLUSTER_LOCK_FILE),
+            incarnation,
+            request_id,
+        )
+        .await
+        .map_err(bootstrap_lock_error)
     }
 
     pub(crate) async fn acquire_bootstrap_lock(
         &self,
-    ) -> Result<(StateLockGuard, String), Diagnostic> {
+        incarnation: &str,
+        request_id: Option<&str>,
+    ) -> Result<Option<(StateLockGuard, String)>, Diagnostic> {
         crate::state_lock::acquire_bootstrap_lock(
             self.adapter.clone(),
             self.kind(),
             &self.uri(CLUSTER_LOCK_FILE),
+            incarnation,
+            request_id,
         )
         .await
         .map_err(bootstrap_lock_error)
+    }
+
+    pub(crate) async fn reenter_bootstrap_lock(
+        &self,
+        previous: &StateLockFile,
+        version: &str,
+    ) -> Result<Option<(StateLockGuard, String)>, Diagnostic> {
+        crate::state_lock::reenter_bootstrap_lock(
+            self.adapter.clone(),
+            self.kind(),
+            &self.uri(CLUSTER_LOCK_FILE),
+            previous,
+            version,
+        )
+        .await
+        .map_err(bootstrap_lock_error)
+    }
+
+    /// A bounded bootstrap step receipt, `None` only when absent.
+    pub(crate) async fn read_bootstrap_record(
+        &self,
+        relative: &str,
+        max_bytes: usize,
+    ) -> Result<Option<String>, Diagnostic> {
+        self.adapter
+            .read_text_if_exists_bounded(&self.uri(relative), max_bytes as u64)
+            .await
+            .map_err(|error| {
+                Diagnostic::error("bootstrap_receipt_read_error", relative, error.to_string())
+                    .with_storage_failure(&error)
+            })
+    }
+
+    /// Create a bootstrap step receipt only if absent.
+    pub(crate) async fn create_bootstrap_record(
+        &self,
+        relative: &str,
+        text: &str,
+    ) -> Result<bool, Diagnostic> {
+        self.adapter
+            .write_text_if_absent(&self.uri(relative), text)
+            .await
+            .map_err(|error| {
+                Diagnostic::error("bootstrap_receipt_write_error", relative, error.to_string())
+                    .with_storage_failure(&error)
+            })
     }
 
     pub(crate) async fn verify_bootstrap_lock(
