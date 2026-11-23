@@ -1640,3 +1640,14 @@ fn child_environment_passes_every_renewing_credential_source() {
         );
     }
 }
+
+/// The endpoint names the harness's own store client reads must reach the
+/// child too, or the product writes to another service than the one the
+/// harness listed.
+#[test]
+fn child_environment_passes_every_endpoint_name_the_store_client_reads() {
+    let names = crate::gqt_runner::CHILD_ENVIRONMENT;
+    for name in ["AWS_ENDPOINT", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"] {
+        assert!(names.contains(&name), "{name} is not passed to the child");
+    }
+}

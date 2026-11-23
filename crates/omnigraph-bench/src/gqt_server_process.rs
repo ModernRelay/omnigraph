@@ -6,6 +6,7 @@
 use crate::gqt_runner::{block_on_own_thread, output_within};
 use crate::gqt_supervisor::wait4_nonblocking;
 use crate::runner::{RunnerError, RunnerResult};
+use crate::store::ServerRoot;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -17,7 +18,8 @@ use std::time::{Duration, Instant};
 pub(crate) const LISTEN_ADDR_PREFIX: &str = "OMNIGRAPH_LISTEN_ADDR=";
 /// The environment name a server reads its actor-to-token map from.
 const BEARER_TOKENS: &str = "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON";
-/// The lock a cluster apply leaves behind only when it could not release it.
+/// The lock a cluster apply leaves behind on a local root only when it could
+/// not release it.
 const CLUSTER_LOCK: &str = "__cluster/lock.json";
 const POLL: Duration = Duration::from_millis(20);
 const READY_PROBE: Duration = Duration::from_secs(2);
@@ -142,7 +144,7 @@ pub(crate) fn cluster_uri(root: &Path) -> RunnerResult<String> {
 pub(crate) fn apply_cluster(
     product: &Path,
     config: &Path,
-    root: &Path,
+    root: &ServerRoot,
     actor: &str,
     environment: &[(String, String)],
     deadline: Duration,
@@ -150,7 +152,7 @@ pub(crate) fn apply_cluster(
     let mut command = child_command(product, environment);
     command
         .args(["--as", actor, "--target"])
-        .arg(root)
+        .arg(root.as_os_str())
         .args(["cluster", "apply", "--config"])
         .arg(config)
         .arg("--json");
@@ -167,28 +169,68 @@ pub(crate) fn apply_cluster(
         || receipt["result"]["converged"] != true
     {
         return Err(apply_failed(format!(
-            "`{} cluster apply` onto {} exited {} without a converged receipt; stdout: {}; stderr: {}",
+            "`{} cluster apply` onto {root} exited {} without a converged receipt; stdout: {}; stderr: {}",
             product.display(),
-            root.display(),
             output.status,
             String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let lock = root.join(CLUSTER_LOCK);
-    let held = lock.try_exists().map_err(|e| {
-        apply_failed(format!(
-            "could not tell whether the converged apply left its admission at {}: {e}",
-            lock.display()
-        ))
-    })?;
-    if held {
+    let held = match root {
+        ServerRoot::Local(path) => {
+            let lock = path.join(CLUSTER_LOCK);
+            let held = lock.try_exists().map_err(|e| {
+                apply_failed(format!(
+                    "could not tell whether the converged apply left its admission at {}: {e}",
+                    lock.display()
+                ))
+            })?;
+            held.then(|| lock.display().to_string())
+        }
+        ServerRoot::S3(_) => reported_lock(product, root, environment, deadline)?
+            .map(|lock| format!("{root} as lock {lock}")),
+    };
+    if let Some(held) = held {
         return Err(apply_failed(format!(
-            "the converged apply left its admission at {}; a server cannot start over a held lock",
-            lock.display()
+            "the converged apply left its admission at {held}; a server cannot start over a held lock"
         )));
     }
     Ok(())
+}
+
+/// The lock `omnigraph cluster status` reports on `root`, `None` once the
+/// admission is released. An object store keeps the lock's key after a
+/// release, so the key being there says nothing.
+fn reported_lock(
+    product: &Path,
+    root: &ServerRoot,
+    environment: &[(String, String)],
+    deadline: Duration,
+) -> RunnerResult<Option<String>> {
+    let mut command = child_command(product, environment);
+    command
+        .arg("--target")
+        .arg(root.as_os_str())
+        .args(["cluster", "status", "--json"]);
+    let output = output_within(command, deadline).map_err(|e| {
+        apply_failed(format!(
+            "could not run `{} cluster status`: {e}",
+            product.display()
+        ))
+    })?;
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or(serde_json::Value::Null);
+    match status.get("lock_id") {
+        Some(serde_json::Value::Null) if output.status.success() => Ok(None),
+        Some(serde_json::Value::String(lock)) if output.status.success() => Ok(Some(lock.clone())),
+        _ => Err(apply_failed(format!(
+            "`{} cluster status` of {root} exited {} without a lock reading; stdout: {}; stderr: {}",
+            product.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
 }
 
 /// A started server: ready at `url`, its output in the two files of `logs`
@@ -216,7 +258,7 @@ impl ServerProcess {
     pub(crate) fn start(
         binary: &Path,
         product_commit: Option<&str>,
-        root: &Path,
+        root: &ServerRoot,
         tokens: &[(String, String)],
         environment: &[(String, String)],
         logs: &Path,
@@ -237,10 +279,14 @@ impl ServerProcess {
         let scratch = logs.join("tmp");
         std::fs::create_dir(&scratch)
             .map_err(|e| start_failed(format!("{}: {e}", scratch.display())))?;
+        let cluster = match root {
+            ServerRoot::Local(path) => cluster_uri(path)?,
+            ServerRoot::S3(uri) => uri.clone(),
+        };
         let mut command = child_command(binary, environment);
         command
             .arg("--cluster")
-            .arg(cluster_uri(root)?)
+            .arg(cluster)
             .args(["--bind", "127.0.0.1:0"])
             .env(BEARER_TOKENS, serde_json::Value::Object(tokens).to_string())
             .env("TMPDIR", &scratch)
