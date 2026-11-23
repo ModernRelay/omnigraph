@@ -1517,12 +1517,11 @@ impl Omnigraph {
                     cell.type_name, cell.property
                 )));
             }
-            // Only this re-open, through Lance's resolution, is a witness. A
-            // table on no named branch cannot be deleted and recreated at
-            // its path, its manifest is written once, and the pinned open
-            // already checks a twin's transaction: as the change feed
-            // (`TableStore::open_at_entry_verified`), it makes no check, and
-            // its open at a commit reports the pin's own identity.
+            // Only a named-branch re-open, through Lance's resolution, is a witness.
+            // Like the change feed (`TableStore::open_at_entry_verified`), a read of a
+            // table on no named branch makes no check: its path carries its incarnation,
+            // its manifest is written once, and `open_pin` already checks a twin's
+            // transaction. Its open at a commit also reports the pin's own identity.
             if !entry.version_metadata.witnesses(&dataset) {
                 return Err(OmniError::blob_integrity(format!(
                     "selected dataset for {} type '{}' opened a different Lance manifest incarnation at published dataset version {}",
