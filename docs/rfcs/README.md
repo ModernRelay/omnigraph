@@ -260,3 +260,4 @@ then dated RFCs by date.
 | [2026-11-10](2026-11-10-writes-carried-over-row-preserving-publications.md) | Writes carried over row-preserving publications | maintainer | draft | in-progress |
 | [2026-11-10](2026-11-10-graph-shallow-clone.md) | Graph shallow clone | maintainer | draft | in-progress |
 | [2026-11-19](2026-11-19-branch-row-in-the-catalog.md) | Branch existence in the catalog | maintainer | draft | not-started |
+| [2026-11-23](2026-11-23-re-entrant-first-bootstrap.md) | Re-entrant first bootstrap with per-step receipts and classified effects | maintainer | draft | in-progress |
