@@ -1,0 +1,1 @@
+- `omnigraph-bench --store s3://…` passes `AWS_ENDPOINT` on to the `omnigraph` and `omnigraph-server` it starts, so they reach the same service as the harness's own store client.

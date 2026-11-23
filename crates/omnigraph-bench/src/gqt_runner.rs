@@ -1076,7 +1076,7 @@ fn process_stats(
 /// The names a `--store` run's child processes inherit from the run: what
 /// the object-store client, Lance and the locale read; everything else is
 /// cleared so the product sees one declared environment.
-pub const CHILD_ENVIRONMENT: [&str; 24] = [
+pub const CHILD_ENVIRONMENT: [&str; 25] = [
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
@@ -1088,6 +1088,7 @@ pub const CHILD_ENVIRONMENT: [&str; 24] = [
     "AWS_ROLE_SESSION_NAME",
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT",
     "AWS_ENDPOINT_URL",
     "AWS_ENDPOINT_URL_S3",
     "AWS_ALLOW_HTTP",

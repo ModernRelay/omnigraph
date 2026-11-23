@@ -674,6 +674,9 @@ worker declares itself ready, before the measured step begins, to witness that
 the preparation wrote nothing there (the worker holds no store credentials;
 the product's children receive the run's `AWS_*` variables). The clone is deleted
 after a verified repetition and kept for inspection after a failed one. A
+deletion removes the current objects and a listing witnesses it; on a
+versioned bucket the noncurrent versions stay until the bucket's lifecycle
+rule expires them, and the same holds for a server's cluster root. A
 `--- restart` is never the measured step on this route and is a no-op
 elsewhere in the program; `--- schema` and seeds, `--- csv` sections, seams,
 pins, settings and concurrent steps have no command-line form and are refused
