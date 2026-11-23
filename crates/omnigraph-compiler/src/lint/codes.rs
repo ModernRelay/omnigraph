@@ -3,8 +3,7 @@
 //! Codes have the form `OG-XXX-NNN` where `XXX` is the family prefix from
 //! [`super::diagnostic::Family`]. Each code carries a default safety
 //! tier, severity, and short description. Codes are stable: once
-//! published, the meaning is frozen and `omnigraph.yaml` may override
-//! severity but never the tier or family.
+//! published, the meaning, the tier and the family are frozen.
 //!
 //! ## v0 catalog
 //!

@@ -1,7 +1,7 @@
 # Architecture
 
 **Audience:** contributors and maintainers
-**Authority:** current system boundaries and ownership; detailed protocols live
+**Authority:** system boundaries and crate ownership; detailed protocols live
 in the linked area guides
 
 Omnigraph is a typed property-graph engine that coordinates many Lance
@@ -12,55 +12,8 @@ cluster deployment state, and public CLI/HTTP surfaces.
 
 ## System shape
 
-```mermaid
-flowchart TB
-    CLI[omnigraph CLI]
-    HTTP[omnigraph-server]
-    MCP[omnigraph-mcp]
-    CLUSTER[omnigraph-cluster]
-    COMPILER[omnigraph-compiler]
-    PLANNER[omnigraph-planner]
-    ENGINE[omnigraph engine]
-    CATALOG[omnigraph-catalog]
-    CORE[omnigraph-core]
-    POLICY[omnigraph-policy]
-    STORAGE[omnigraph-storage]
-    LANCE[Lance datasets]
-    OBJECTS[local FS / S3 / Azure Blob]
-
-        CLI --> CLUSTER
-    CLI --> ENGINE
-    CLI --> HTTP
-    CLI --> POLICY
-
-    HTTP --> ENGINE
-    HTTP --> CLUSTER
-    HTTP --> POLICY
-    HTTP --> MCP
-        CLUSTER --> ENGINE
-    CLUSTER --> POLICY
-    CLUSTER --> COMPILER
-
-    ENGINE --> COMPILER
-    ENGINE --> PLANNER
-    PLANNER --> COMPILER
-    ENGINE --> POLICY
-    ENGINE --> STORAGE
-    ENGINE --> CATALOG
-    ENGINE --> CORE
-        CATALOG --> CORE
-    CATALOG --> STORAGE
-    CATALOG --> COMPILER
-    CORE --> STORAGE
-    CORE --> COMPILER
-    ENGINE --> LANCE
-    CATALOG --> LANCE
-    CORE --> LANCE
-
-    CLUSTER --> STORAGE
-    LANCE --> OBJECTS
-    STORAGE --> OBJECTS
-```
+The crate dependency graph is each crate's `Cargo.toml`
+(`cargo tree -p <crate> --depth 1`).
 
 These are separate libraries and binaries, not one monolithic process. An
 embedded caller may use the engine directly; the CLI may use an embedded store
@@ -115,17 +68,10 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-gqt-core` | GQT format, embedded and served execution, and expectation checks shared by the GQT runner and benchmark harness. It has no build script or test-only engine dependency. |
 | `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. Its input is the pinned `omnigraph_compiler::ir::untyped` read IR, produced by one-way erasure only at the test reference door. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
 | `omnigraph-seams` | The one seam type for test-time behavior substitution: a named slot a test fills and the engine, core, catalog and cluster consult. |
-| `omnigraph-gqt`, `omnigraph-gqt-served` | The `.gqt` logic-test corpus and its runner, one named test per case, and the same corpus run against an in-process `omnigraph-server`. |
-| `omnigraph-dst` | Deterministic simulation testing. |
 | `omnigraph-bench` | Declarative benchmark planning and execution. |
-| `tools/omnigraph-vocabulary-guard` | The audit tool CI's `Graph Vocabulary Guard` job runs. |
 
-The server mounts `omnigraph-mcp` at `/mcp` on its existing listener. Its adapter
-dispatches to the same handlers as HTTP and retains authentication, OAuth
-metadata, graph admission and execution ownership. The adapter projects both
-handler errors and protocol refusals through the server's canonical `ApiError`
-contract, preserving error codes and effect dispositions. The MCP crate bounds
-and wraps those bodies; it opens no graphs and owns no serving lifecycle.
+How the server mounts `omnigraph-mcp` at `/mcp` is in
+[control plane](control-plane.md#oidc-resource-identity-and-mcp).
 
 The CLI's [invocation parser](../../crates/omnigraph-cli/src/invocation.rs) owns
 command construction, explicit argument provenance and cross-level argument
@@ -290,11 +236,9 @@ including identity diagnostics before dispatch.
 
 ## Trust and policy boundaries
 
-HTTP authentication resolves a bearer token to an actor; the client cannot set
-that actor identity. Server handlers enforce read and transport-specific
-policy. Mutating engine entry points enforce Cedar again through their `_as`
-surface, so embedded and CLI-direct writers cannot bypass the graph write gate.
-No-policy embedded development remains an explicit engine configuration.
+Who resolves the actor and where policy is checked is `E6` of
+[the contract](contract.md). No-policy embedded development remains an explicit
+engine configuration.
 
 Admission and authorization are different controls. `WorkloadController`
 bounds served work, and the write queue orders in-process effects; neither is a
@@ -331,32 +275,22 @@ gates for single-writer ownership.
   intentionally retain a one-mutation-process support boundary. Do not infer
   distributed writer safety from an in-process mutex. Gap `G2` of
   [the contract](contract.md#gaps) names them.
-- Missing physical indexes or stale cache entries may change cost, never query
-  meaning. Explicit reconciliation restores physical coverage.
+- Missing physical indexes or stale cache entries never change an answer
+  (`E7`). Explicit reconciliation restores physical coverage.
 
 ## Storage failure boundary
 
-`omnigraph-storage` classifies substrate evidence as `Transient`,
-`Configuration`, `NotFound`, `Precondition`, `Permanent`, or `Unknown`.
-The engine preserves that evidence in `OmniError::Storage(StorageFailure)`
-instead of flattening Lance, `object_store`, or filesystem failures into
-strings. `StorageFailure::is_transient()` is true only for positive transient
-evidence; it is not permission to replay an operation. The operation that owns
-the effect boundary still decides whether a retry is safe, and unknown evidence
-stays unknown. [RFC 0038](../decisions/0038-typed-storage-failures.md) records the
-rationale and compatibility change.
+The storage failure kinds and what they do not authorize are the doc comment
+of `StorageFailureKind` in `crates/omnigraph-storage/src/lib.rs`;
+[RFC 0038](../decisions/0038-typed-storage-failures.md) records the rationale.
 
 ## Storage backends
 
 Graph datasets and cluster control objects support local paths, S3-compatible
-URIs, and native Azure Blob `az://` roots. Azure remains a qualification
-preview while the adversarial live-Azure matrix is pending; the narrower
-managed-identity smoke proof is complete. Any mutation-capable
+URIs, and native Azure Blob `az://` roots. Azure writes are a preview (`G4`).
+Any mutation-capable
 Azure server must run through `omnigraph-azure-admission`; direct server boot is
 for read-only qualification and tests, not writer ownership.
-
-Upstream behavior must be checked against the full matching Lance pages in
-[lance.md](lance.md) before changing a substrate-facing contract.
 
 ## Index facts in read planning
 

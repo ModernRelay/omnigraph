@@ -103,7 +103,7 @@ Three distinct instruments, complementary — none subsumes another:
    each verb needs a workload that reaches its supported methods. Seeded
    engine-effect failures use existing pre-publication decision seams.
    Lance-call weather retains the semantic oracles but is outside strict replay.
-2. **Crash-window hunt**: a named failpoint (53 in `catalog::CRASH_WINDOWS`)
+2. **Crash-window hunt**: a named failpoint (each in `catalog::CRASH_WINDOWS`)
    armed at a seeded op index. Aimed — guarantees a specific dangerous
    moment is exercised.
 3. **Crash-state enumeration** (ALICE-style): kill at completion #k for
@@ -120,8 +120,8 @@ and `tests/integration/lane_b.rs`.
 ## Fault axes
 
 - **Crash windows**: `Scenario::crash_at` arms a named engine failpoint at a
-  seeded op index. The ignored `dst_hunt_crash_window_sweep` test sweeps the
-  53 windows in `catalog::CRASH_WINDOWS`. A window
+  seeded op index. The ignored `dst_hunt_crash_window_sweep` test sweeps
+  the windows in `catalog::CRASH_WINDOWS`. A window
   inside `cleanup`'s per-table pass defers that table instead of failing the
   op; the universe records `deferred:<window>@op<i>` and runs the obligation
   pass a crashed cleanup gets. A window whose precondition is an earlier
@@ -148,21 +148,5 @@ and `tests/integration/lane_b.rs`.
 
 ## Known limits
 
-Racing-writer determinism is blocked on the upstream Lance deterministic-mode
-proposal (4 flag-gated items) — the
-`#[ignore]`d instruments flip on when it lands. Crash-mode universes and engine-effect weather use process-wide decision
+Crash-mode universes and engine-effect weather use process-wide decision
 seams and must be serialized within a test process.
-
-## Deferred work (#527 review)
-
-Known limits raised in the PR #527 review are deferred deliberately.
-Three carry an in-repo mechanism that fires if their premise breaks: a
-tripwire test (multipart bypass), a typed exclusion
-(`write_census::CUT_COVERAGE_EXCLUSIONS`), and a source guard
-(process-env mutation). The rest — instance-owned entropy/ID/clock
-sources, full-trace replay comparison, logical turns for finish/timeout
-edges, a compile-fail guard on the `dst` feature boundary — are tracked
-by issue only; until those land, strict-replay claims are scoped to the
-report projection and the labeled deterministic arms. The full gap index
-is the "Deferred to v2" table in
-`docs/decisions/0037-deterministic-simulation-harness.md`.

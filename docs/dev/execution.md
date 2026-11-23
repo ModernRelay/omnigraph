@@ -1,7 +1,7 @@
 # Query, mutation, and load execution
 
 **Audience:** compiler and engine contributors
-**Authority:** current execution pipeline; public language syntax belongs in
+**Authority:** the execution pipeline; public language syntax belongs in
 [the user query guide](../user/queries/index.md)
 
 ## Read pipeline
@@ -30,14 +30,12 @@ Lowering and result-schema inference consume the checked value and read its
 retained types. Callers use the same accepted catalog for checking, lowering
 and schema inference. Lowering still inserts comparison casts, folds constants
 and substitutes search scores; validation of the resulting IR remains fallible.
-The compiler's occurrence tests check resolution counts independently and
-assert that lowering and schema inference perform no further resolution.
 
-The executor never refreshes a mutable branch head midway through a query.
-Historical reads build from the requested immutable table versions; current
+The executor never refreshes a mutable branch head midway through a query
+(`E1`). Historical reads build from the requested immutable table versions; current
 branch reads may reuse version-keyed derived state.
 
-A historical read plans against the current accepted catalog. Its tables bind
+A historical read (`read:3`) plans against the current accepted catalog. Its tables bind
 by table identity (`Snapshot::bind_catalog_aliases`) and its properties by the
 stable property id each physical column persists as
 `omnigraph.stable_property_id` (`stored_field` in `engine/typed_value.rs`,
@@ -64,8 +62,6 @@ Stable code owners:
 | Pending read-your-writes state | `crates/omnigraph/src/exec/staging.rs` |
 | Loader | `crates/omnigraph/src/loader/mod.rs` |
 
-Avoid line-number links in documentation; these modules are the stable owners.
-
 ## Traversal and joins
 
 Ordinary unbound named traversal and eligible bulk `AntiJoin` probes can use a
@@ -90,12 +86,6 @@ write to the edge table also evicts the old index, but neither is needed. A
 deleted branch's indexes and held table handles stay until the LRUs drop them (8 indexes; 64 handles or 64 MiB). A
 refresh, schema apply, optimize and the system-column upgrade clear the whole
 cache.
-
-The shelf, the last full-catalog decode of the persisted artifact, is cleared
-only by those four and replaced only by a newer decode. It checks each
-requested table's stamp on every serve, so it stops serving a written edge
-table, but on a handle that writes edges after one artifact load it keeps that
-stale full-catalog topology for the handle's life (at most one).
 
 An explicitly bound edge must scan its edge table because topology alone does
 not contain edge properties. Every edge probe (`graph.rs::scan_edges_stream`:
@@ -178,10 +168,8 @@ downstream identity-key list; missing, reordered or duplicate saved keys refuse
 before execution. Historical wildcard refusal checks both captured provenance and live
 wildcard expansions. A selected dataset absent from the captured snapshot fails
 when opened; empty input need not open it. Bound plans use a versioned envelope
-and require regeneration when the stored version is unsupported.
-The current envelope version is `BOUND_PLAN_VERSION` (`omnigraph-planner`
-`bound.rs`, which lists what each version added); a plan saved under any other
-version must be regenerated before replay.
+and require regeneration when the stored version is unsupported
+(`BOUND_PLAN_VERSION` in `omnigraph-planner/src/bound.rs`).
 
 ### Expand path selection
 
@@ -278,12 +266,9 @@ destination, so its shapes never have a bounded binding and stay correlated.
 
 ## Filters and pushdown
 
-A read query runs on engine v2, from a plan. The session setting `engine`
-(`omnigraph_compiler::settings::Engine`, the Session settings RFC) keeps one
-value, `v2`, and refuses `v1` as an unknown value. The doors
-(`Session::query`, `query_with_head`, `run_query_at` in
-`exec/query_doors.rs`) plan every read through `engine::execute_query`. A
-query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user
+A read query runs on engine v2, from a plan (the `engine` setting is in
+[settings](../user/queries/settings.md); the doors are in
+`exec/query_doors.rs`). A query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user
 error on execute, the error `explain_query` gives for it.
 
 Engine v1, the executor v2 replaced, is the crate
@@ -320,8 +305,7 @@ SQL-string filter and no `contains_tokens` call in its typed filters skips
 both.
 
 String-built SQL is retained only at explicitly documented compatibility
-seams. The camel-case regression and its two-parser boundary are recorded in
-[the case study](case-studies/camel-case-filtering.md).
+seams.
 
 Column projection is the second pushdown dimension, the
 `projection_pushdown` pass described below.
@@ -362,8 +346,7 @@ only when something keys rows by it (a whole entity, `@id`, a traversal end, a
 dependent scan, an anti-join's outer binding, a ranked scan, a declared
 tie-break);
 the projected node object's members (never a `Blob` or `Vector` column) for
-a bare `$var` or a binding nothing references, the fail-open of #564 and
-#704; every property an expression or a pushed filter names, a `Vector`
+a bare `$var` or a binding nothing references; every property an expression or a pushed filter names, a `Vector`
 column included when one names it; `count($var)` demands the identity alone. An unused expansion destination
 keeps only identity and key columns. Hydration passes this projection to Lance
 before duplicating destination rows per edge.
@@ -408,27 +391,22 @@ method or setting disables it.
 `engine/lower.rs` lowers the physical tree to one DataFusion physical plan
 (`Arc<dyn ExecutionPlan>`) that `engine/run.rs` executes under the query's
 own `SessionContext` (`engine/context.rs`: `TrackConsumersPool` over
-`FairSpillPool`, one partition, 8,192-row batches) and collects. Every read
-node lowers to exactly one operator, so the lowered tree has the plan's shape
-node for node; every operator is omnigraph's own (`engine/operators/`, backed
-by `engine/scan.rs`, `engine/graph.rs`, `engine/expr.rs` and
-`engine/search.rs`) except the aggregate, which is DataFusion's
-`AggregateExec` over GQ expressions:
+`FairSpillPool`, one partition, 8,192-row batches) and collects. Every
+operator is omnigraph's own (`engine/operators/`, backed by `engine/scan.rs`,
+`engine/graph.rs`, `engine/expr.rs` and `engine/search.rs`) except the
+aggregate ([V2 plan lowering](#v2-plan-lowering-one-node-one-operator)):
 
 | `PhysicalNode` | Operator | Provider |
 |---|---|---|
 | `MetadataCount` | `MetadataCountExec`: exact live-row count from the pinned dataset, with the single output row charged to the query pool | omnigraph |
 | `Scan` | `ScanExec`: `execute_node_scan` with the projection and pushed filters read off the `ScanSpec`, the schema declared before running. A `ranked` scan runs under a `SearchMode` built from its `RankedAccess` (the index, the ranked property, the query argument), the bound plan's value table (the query vector by node id, the parameters) and the pass's `Pass` (the overfetch rung, the gate's eligible set), so Lance ranks while scanning and appends `_distance` or `_score`. A scan whose `ScanSpec` carries a `runtime_filter` marker holds a `RuntimeFilterSlot` its `ContainsJoin` fills before the scan executes, and takes the closed `RuntimeFilter` enum from it (`TextContainsAny` its one variant). Every unranked table read (no `ranked` access, so no search mode), marked or not, is a pipeline operator (`operators/scan/pipelined.rs`): it reads Lance batches of at most `lance_batch_rows(batch_bytes)` rows under the byte target `batch_bytes` (Lance 13 decodes whichever bound is smaller; the explicit row bound takes precedence over the `LANCE_DEFAULT_BATCH_SIZE` fallback), `PIPELINED_READAHEAD` (2) batches decoded ahead and at most `PIPELINED_IO_BUFFER_BYTES` (64 MiB) fetched ahead, both outside the pool; it holds each batch as `v2 scan input`, sieves it when a join left a filter (a batch kept whole or emptied is a slice of itself; a mixed selection is copied only once the batch's `v2 scan batch` charge admits the copy) and releases the input, and kept batches gather under one `v2 scan batch` charge until they reach the session's batch rows (the rows of a `Limit` directly over the scan's projection, when one is there) or the byte target, then leave as one batch held until the consumer takes it: Lance reads a batch per fragment, and a per-batch consumer (an indexed hop's lookup) would otherwise pay once per fragment. The table is never held whole, and a consumer that stops (a `Limit`) stops the read. When that `Limit` sits directly over the projection of a read with no pushed filter, no full-text query and no runtime-filter marker, its rows also reach Lance as `Scanner::limit`: with no filter and no ordering Lance plans only the fragments that hold the first live rows, from the manifest's row and deletion counts (`Scanner::plan_scan_range`), instead of opening up to `fragment_readahead` fragments before the stream is dropped. A filtered read keeps the early stop alone, since Lance pushes no limit through a filter; only a marked scan records `runtime_filter_rows_read` (every row it reads, an inert scan's too), `runtime_filter_rows_dropped` and `runtime_filter_inert`. A ranked scan and its ANN ladder is a breaker through `execute_node_scan`, which collects its batches; a dependent scan reads one slice of its input at a time; all of them build the Lance scanner through one `NodeRead`, and read `_rowaddr` when the plan defers a return column of their binding | omnigraph |
-| `HashJoin` | `HashJoinExec`: the build (a table `ScanExec` of the destination with the pushed filters and projection) drained under the query pool and hashed on `<binding>.<id>`, the traversal (`probe`) joined in its own order, one `take` per side per probe batch, output charged as `hash join output`; the declared `id_lookup` fallback is a branch of the same operator (below); the first probe batch is read before the build, so an empty probe executes nothing on the build | omnigraph |
 | `RankFuse` | `RankFuseExec` over its two arm subtrees, each lowered once with its own ranked `Scan`; the operator ranks each arm by its score column, the fused binding's id and planner-declared downstream row keys before fusing. Selected edge keys place concrete type before id. Fusion identifies and scores the fused node by its id, emits every arm row with the fused sum in `<binding>._rrf` (`F64`) and neither sorts nor cuts: the `Sort fetch N` above orders and the `Limit` cuts rows; body `fuse_arms` | omnigraph |
 | `CrossJoin` | `CrossJoinExec`: the left input collected under the query pool, every left row paired with each right batch, output charged as `cross join output`; an empty left executes nothing on the right. The node's `filters` (conjuncts over both bindings) run in the join; every pair goes through one `PairBuffer`, which charges each right batch's row-size scratch before it grows it, filters the held pairs into a kept batch when it holds the session's batch size of pairs, when their estimated bytes reach the producer's batch bytes, and at each right batch's end, and sends the kept batches as one output once their rows reach the batch size or their bytes the batch bytes (the rest at the end), so an output exceeds the batch size by at most one kept batch | omnigraph |
 | `ContainsJoin` | `ContainsJoinExec`: the planner's join for a `Filter` over a `CrossJoin` holding a `$r.x contains $l.y` conjunct whose `$r` is the unranked table `Scan` on the right and whose two properties are text (`optimizer.rs` `filtered_cross_join`, reported as the `join_algorithm` pass; a search order that later ranks that scan takes the marker off again and turns the join back into the `CrossJoin` of its conjuncts, `Lowering::unmark`, since a ranked scan runs under a search mode and no runtime filter); the filter's other conjuncts are the node's `residual`, and the right scan's `ScanSpec` carries `runtime_filter` (`column`, `needle`, `kind` `text_contains_any`), which the engine's lowering turns into the `RuntimeFilterSlot` both operators share; the lowering refuses a plan (a replayed or edited one) whose marked scan's column or needle differs from its `ContainsJoin`'s, or whose marked plain table scan no `ContainsJoin` fills (a marker on any other scan is not read, and that scan reads unfiltered). The left input is collected under the query pool (`contains join left`); the join admits its `PairBuffer`, then fills that slot (a fill first clears any earlier execution's filter) with one Aho-Corasick automaton over the distinct non-empty `y` values, charged once as `runtime filter needles` and shared with the join (the scan is left unfiltered when a value is empty, since that value is in every text, though the join still pairs through the automaton; none, and the join tests every pair, when the pool refuses it; no right execution when every value is null); both operators print `runtime_filter=$r.x contains any($l.y)`, and `ScanExec` sieves each Lance batch through it as the `Scan` row describes (`runtime_filter_rows_read`, `runtime_filter_rows_dropped`, `runtime_filter_inert`; the join's `runtime_filter_needles`). At its first right batch the join builds its needle rows over that same automaton, which the streaming scan may still be sieving through (`contains_join=aho_corasick`; only the row tables are charged, as `contains join needles`): each non-null text pairs only with the left rows of the needles it holds, the pass over a text stopping once every needle is found and checking for cancellation every 4,096 occurrences, and each empty needle's row pairs with each non-null text; when the pool refuses the needle rows it pairs every row. Every pair goes through the same `PairBuffer` as `CrossJoinExec`, which tests only the `residual` conjuncts on the needle-rows path, whose every pair holds the `contains` conjunct by construction, and the `contains` conjunct with them on the every-row path; with the right scan streaming, the join's memory is the left side plus the shared automaton, the needle rows, one right batch and one output batch, beside the producer queue's two batches in flight. `contains_join_matcher` is 1 when the run paired through the needle rows, 0 when the pool refused them, and absent when no right row reached the join; `contains_join_pairs` counts the pairs found for the non-empty needles before the residual conjuncts, beside a matcher of 1 | omnigraph |
 | `Filter` | `FilterExec`: every `IRFilter` of the node as one conjunction over the wide batch (`evaluate_filter`), so a filter over two bindings reads two columns. A later conjunct, and the right side of `and`/`or`, needs only the rows still undecided (`evaluate_filter_where`): with none it does not run, with at most 20% of the batch it runs on those rows alone, gathered over the columns it reads, and above that share it runs on every row. The result equals evaluation on the undecided rows alone, but whether a decided row is evaluated depends on that share, so an operand that can fail on a row's value must take the gathered path at every share | omnigraph |
 | `Expand` | `ExpandExec`: an unbudgeted named unbound single hop uses one vectorized walk per input batch (`operators/single_hop.rs`); unbudgeted named multi-hop drains its input into the BFS breaker `execute_expand`. Budgeted expansions, including selected multi-hop, consume fixed source windows through `SourceWindows`. Bound edges use the bounded pair producer, spillable pair ordering and incremental hydration within each input batch or budgeted source window. Output chunks contain at most 256 rows (`expand_pairs` counts pairs handed on); dropping the stream at a downstream `Limit` cancels the producer | omnigraph |
-| `AntiJoin` | `AntiJoinMaskExec` over the outer plan and the lowered inner plan. `correlated`: the bulk CSR degree mask when the predicate counts rows and the inner is one single-hop, filter-free, unbound expand over the `OuterReference`; else the outer rows are tagged, the inner plan runs over `OuterReferenceExec` under the same `TaskContext`, each inner batch folds into `SubqueryAggregate` per outer row as it streams, without being held, and the predicate applies to the folded rows. `key_set`: the outer rows are drained, each distinct `<outer_var>.<id>` gets one `SubqueryAggregate` group, the inner plan (no outer leaf) streams and each batch folds into its key's group (an inner key no outer row holds into a discarded group) without being held, and each outer row takes its key's verdict, a null key that of no matches | omnigraph |
 | `OuterReference` | `OuterReferenceExec`: the leaf of an `AntiJoin`'s inner tree, standing for the enclosing rows; lowering refuses one outside an `AntiJoin` inner tree. | omnigraph |
 | `Projection` | `ProjectionExec` over `GqProjectionExpr` per return expression, output charged as `projection output`; above an aggregate it evaluates Boolean expressions over aggregate leaves and group keys, resolving each `AliasRef` by its input column name and emitting the public return columns in written order; when a `Sort` consumes it, every column the sort reads and every declared tie-break metadata column follow the return columns under the hidden prefix `~`, which the sort drops; under a `HydrateColumns` it skips the deferred return items and carries each deferred binding's `_rowaddr` as `^binding` | omnigraph |
-| `HydrateColumns` | `HydrateExec` (`operators/hydrate.rs`): per input batch, in chunks planned from the costliest output row seen (its decoded row and its copy; four rows first), the distinct `^binding` addresses of each binding, sorted and grouped by fragment, read from its pinned table through `FileFragment::open` and `FragmentReader::take` with the deferred columns' projection and one row per decode task. Each decoded row is copied at its own size through `WorkMemory::take_once` (charged as `hydrate fetch`; Lance's row can slice a buffer of the whole read) before the fetch waits for the next, at most `ROWS_IN_FLIGHT` (8) rows decoding at once and `FRAGMENTS_AHEAD` (4) fragments' reads scheduled ahead. A fragment whose data files are in the table's own base is read in one coalesced request through an engine `ScanScheduler`, whose I/O buffer, a quarter of the bound, is reserved for the operator's life as `hydrate read-ahead`; a fragment holding a file Lance reaches through a `base_id`, for which Lance 13 opens its own scheduler unless a per-base cache is supplied, is read one row per request and counted as `single_row_reads` (only a table fork created before v11 holds one; a graph branch's writes stay in the table's own base). An address the table does not hold is an integrity error. The rows are copied to every output row that names them through `WorkMemory::interleave_once`, which admits each copy (one per output row, so a row a join repeats is copied per repetition; a null address costs a null row) as `hydrate output` before Arrow builds it. The bound is `hydrate_chunk_bytes(pool)` (an eighth of the query pool, the node's declared `retained_limit`): the read-ahead reservation, then the decoded rows and their copies within the rest. A fetch stops once its decoded rows pass half of that rest, and the window is planned again from the widest row decoded; a chunk whose copies would exceed it keeps a prefix halved until they fit, the rest starting the next chunk. So the operator holds at most the bound and the row that crosses it, with at most `ROWS_IN_FLIGHT` rows decoded and not yet charged, and Lance's read-ahead past its buffer is at most the request at the head of its queue, which Lance may coalesce from many rows' ranges (up to its maximum I/O size, 16 MiB by default), so the read-ahead share is soft. A chunk is charged as `hydrate chunk`, keeps only its output once built, and is sent as it is built; `hydrated_rows` counts the rows and the `peak_chunk_bytes` gauge records the most one chunk held, every decoded row included | omnigraph |
 | `Sort` | `SortExec`: with a `fetch`, a streaming top-k (every input batch merged into the retained best `fetch` rows and released, so the pool holds one batch and `fetch` rows at a time); without one, the whole input held under the query pool (no spill) and sorted once. Keys are `lexsort_to_indices` over the node's `order_by`, `nulls_first = !descending`, then the metadata columns of the node's declared `tiebreak`, ascending; the `~` columns are dropped on the way out. The planner (`optimizer::sort_tiebreak`) declares identity columns in binding-name order, with selected bound-edge type before its ID. Each metadata key already explicitly ordered is omitted independently; group rows and a `return` whose every expression is an order key need no hidden ties; `projection_pushdown` reads an id only for a declared tie-break, a traversal, a dependent scan, an anti-join, a ranked scan or an expression naming `@id`. The planner writes a search order's score key (`$d._score desc`, `$d._distance asc`) first and the query's plain keys after it, with the limit as `fetch`; a fusion plans one `Sort` above it, led by `<binding>._rrf desc`, and none inside an arm; an aggregate under a search order plans a `Sort` only when the query writes further order keys (those keys, then the group keys) | omnigraph |
 | `Limit` (`Page` in explain JSON) | `LimitExec`: passes batches and cuts the last one at the bound; a limit of zero executes nothing below it | omnigraph |
 | `Aggregate` | `AggregateExec` (`Single`) with the group keys and aggregate arguments as `GqProjectionExpr`s over the wide batch (the compiler stores `AggSignature`, the planner selects `AggregateSpec`, and lowering executes it; integer `sum` uses a `Decimal128(38,0)` accumulator and converts the total once to `Float64`; `avg` and floating-point `sum` use `Float64`); `count($v)` counts the identity column; DataFusion emits group keys before aggregate leaves. An upper `Projection` computes the public results from those columns; without one, `run_plan` restores return order through `lower::in_order` | DataFusion |
@@ -499,7 +477,7 @@ At most 256 pairs are emitted per slice. Destination ids are copied from
 the CSR dictionary only for that slice; source columns use one Arrow `take`
 of the input batch, with both allocations charged per slice. An indexed start (`mode=indexed_scan`) runs one
 `key IN (batch ids)` scan per input batch into a per-batch interner and
-neighbour map, and the #533 policy is evaluated between input batches over
+neighbour map, and the CSR switch policy is evaluated between input batches over
 the rows seen so far, switching the remaining batches to the CSR. The
 multi-hop BFS in `graph.rs` drains the frontier, walks every hop with
 `visited`/`seen_dst` sets, and emits each chunk of at most 256 pairs as it
@@ -533,19 +511,8 @@ Whether an operator holds its input is one planner fact,
 inputs a node drains whole before its streamed input runs are
 `PhysicalNode::collected_sides()`; explain's `pipelines`, the push executor
 and the engine read both. The engine makes the shape a consequence of
-construction (`engine/operators/shape.rs`): every operator holds one shape
-value and builds its output stream only through it. `Breaker` owns the
-materialization (`stream`: one batch sliced out after the body returns;
-`held`: a producer whose collect stage has no sender and whose emit stage has
-no input), `Streaming` drives the operator one input batch at a time
-(`map`: an inline adapter; `produce`: a producer calling the `Streamed`
-body's `open`, then `batch` per input batch, then `finish`, and executing the
-streamed input only after `open`, so a collected side or a filled runtime
-filter is in place first), and `Source` is a leaf's free producer. A join
-drains a side only through `CollectedSide`. The producer channel, the
-breaker's slicer and the poll counter are private to that module, so no
-operator declares an emission beside the stream it builds, and the lowering
-compares nothing but DataFusion's own `AggregateExec`.
+construction (`engine/operators/shape.rs`), so the lowering compares nothing
+but DataFusion's own `AggregateExec`.
 
 `QueryResources` tracks retained Arrow buffers by allocation identity. Child
 arrays and null buffers participate, and shared views or slices reuse one
@@ -592,15 +559,13 @@ there is no separate pool or dummy reservation. This policy does not guarantee
 space for arbitrary wide graph allocations, which can still be refused.
 
 DataFusion operators that support spilling, including sorts, may use the
-query's scratch directory under its 100 GiB quota. Spill files are
-zstd-compressed Arrow IPC (`SPILL_COMPRESSION` in `table_store.rs`, which
-ordered scans use as well), and the quota counts them at their compressed
-size. The custom graph breakers
+query's scratch directory under its 100 GiB quota (`SPILL_COMPRESSION` in
+`table_store.rs`). The custom graph breakers
 do not spill: a refused reservation returns `OmniError::ResourceLimitExceeded`
 with `query_memory_bytes`. Exhausted DataFusion memory and scratch quotas are
 classified as `query_memory_bytes` and `query_scratch_bytes`, respectively.
-The pool is the session's `query_memory_bytes` (default 150 MiB,
-`OMNIGRAPH_QUERY_MEMORY_BYTES`), captured on the plan; a test can install a
+The pool is the session's `query_memory_bytes`
+([settings](../user/queries/settings.md)), captured on the plan; a test can install a
 smaller task-local limit (`instrumentation::with_query_memory_limit`). These quotas do not bound every allocation
 inside Lance or Arrow.
 
@@ -629,8 +594,7 @@ and a cancelled worker stops at its next cooperative `memory.check()`.
 operator and the hash-join build loop run without a check, so a cancelled
 worker inside one of them finishes that stretch first. An aborted blocking job
 that is still queued holds its lease until the blocking pool dequeues it.
-The `/query` route has no route timeout. No benchmark or timing test
-measures the latency this wait adds to a query that errors or stops early.
+The `/query` route has no route timeout.
 
 Custom operators
 publish output-row and elapsed-compute metrics, with `output_batches` for
@@ -911,13 +875,10 @@ read ([test ownership](test-ownership.md#plan-replay)).
 
 ## Plan acceptance
 
-Every read reaches execution through one door: `accept_query` plans the query
-and the planner's validator checks the plan against what the checked
-declaration requires; only that check constructs an `AcceptedPlan`, whose
-fields are private, and `bind` and `execute` take nothing else. The ordinary
-run, `Session::explain_query`, the `explain` statement and the inspected run
-share the path, so explain validates exactly what a run validates and reports
-the outcome as `validation.scope`.
+Every read reaches execution through one door, `accept_query`
+(`omnigraph-planner/src/validate/mod.rs`); `bind` and `execute` take only the
+`AcceptedPlan` it constructs, and explain reports the outcome as
+`validation.scope`.
 
 Acceptance first checks that the plan is well formed: aggregate
 specifications against their typed signatures
@@ -964,16 +925,7 @@ the query returns only order keys or constants, and identities of bindings
 the query does not name (anonymous endpoints, cycle temps) after every named
 one.
 
-A query of one binding, Boolean/integer/String eligibility, an optional
-leading `bm25()` over a String property, direct property sort keys, a limit
-and a projection of properties and the selected score is a member of the
-exact fragment (`validate/subset.rs`). For a member the optimizer records the
-rules it applies (`AbsorbScanFilter`, `PruneScanColumns`, `Lower`,
-`RankBm25Scan`, `HydrateReturnColumns`, `NarrowKey`) over arena references;
-the validator rebuilds the canonical chain
-`Limit(Sort(Project([Search](Filter(Scan)))))` from the typed lowering,
-re-applies every rule against its precondition and requires the result to
-equal the plan. The
+The exact fragment and its checked derivation are in `validate/subset.rs`. The
 checker's arena keeps only each role's current node, releasing a replaced one
 before storing its successor, so its memory is linear in the query. A member
 is accepted as `exact_subset`; every other plan as `invariants_only`.
@@ -1099,13 +1051,8 @@ parameters are refused; omitted nullable parameters bind to null. Expected-head
 checks run before parameter validation, and the request clock is sampled once
 across retries.
 
-Statement execution accumulates logical changes in `MutationStaging`:
-
-- insert and update append pending row batches;
-- update reads the committed snapshot plus prior pending batches;
-- delete records predicates and stages one deletion transaction at finalize;
-- the mutation-mode rule (`write:1`) rejects a query that mixes constructive
-  (insert/update) and destructive (delete) statements.
+Statement execution accumulates logical changes in `MutationStaging`
+(`exec/staging.rs`), under the mutation-mode rule of `write:1`.
 
 No statement advances a production table HEAD. After every statement and
 cross-table validation succeeds, finalize stages one bounded transaction per
@@ -1114,13 +1061,8 @@ touched table and enters the shared write protocol. See
 
 ## Loads and graph batches
 
-All load modes share the mutation publisher and its detached-commit write protocol:
-
-| Mode | Current physical intent |
-|---|---|
-| `Overwrite` | One staged replacement per touched table. |
-| `Append` | Strict insert by exact physical `id`; an existing ID is a typed conflict. The public mode name does not mean a bare Lance Append transaction. |
-| `Merge` | Upsert by exact physical `id`; the last input occurrence wins. |
+All load modes (`write:5`) share the mutation publisher and its
+detached-commit write protocol ([writes](writes.md#keyed-writes)).
 
 A `load csv` overwrite runs as a write plan: the planner routes
 `Operation::Load` to the engine, which lowers `CsvSource → Validate →
@@ -1161,10 +1103,8 @@ search, bounding lookup work even when integer keys share a hash prefix.
 
 Once the sets are admitted, `ValidateExec` carves the run's load budget
 (`operators/load_budget.rs`) from the room `query_memory_bytes` leaves past
-the pool's total: one share per parse partition (52 of 64 parts between
-them), one for the unique holders (8, the partitions' when the plan sizes
-none), four uncharged for lease bookkeeping and the fragment sink's open
-chunks, a copy of rows each partition's reader already charged. A `WorkMemory`
+the pool's total, in the shares
+[settings](../user/queries/settings.md) gives for `query_memory_bytes`. A `WorkMemory`
 in a share (`in_share`) charges the share and then grows the pool infallibly,
 so the pool keeps counting beside the shares; the sink's `WorkMemory` is in the
 `Sink` class, which the pool counts and never refuses. A partition's share is
@@ -1176,39 +1116,13 @@ facts ahead of the sweeper (`admit_facts_ahead`), so neither stacks on that
 transient, and the holders' share only by
 partition 0's sweeper, so a refusal and its `actual` (`LoadBudget::admitting_limit`,
 the smallest limit whose share admits the demand with the pool as it was at
-the carve) follow one thread's own sequence. A share under the admission floor (the partition's source admission
-plus one slice) refuses at the carve, before any partition is polled; a share
-refusal in a run of several partitions marks the source refused so the loader
-reruns it single-partitioned. Lease metadata and registry growth under a share
+the carve) follow one thread's own sequence. Lease metadata and registry growth under a share
 are counted on the pool and never refused.
 
-Mutation insert/update and keyed Load retain the per-table limit of 8,192 rows.
-An immutable `WriteBudget` captures the session's `write_max_bytes` (default
-32 MiB) once, including retries. Retained row data has one allowance per table
-and one across tables; logical Blob payloads have a separate allowance.
-The row account uses Arrow memory size minus typed logical Blob payload buffer
-capacity, retaining descriptor and shared-buffer accounting. Keyed parsing
-checks row estimates and decoded payload bytes independently. Inline and
-copied external payloads are admitted together before payload reads, then
-materialized batches are checked again before staging.
-
-Mutation delete, cascading delete and Overwrite replacement removal scan IDs
-incrementally under their own `write_max_bytes` allowance per operation,
-charging UTF-8 bytes plus one `String` slot before copying. An Overwrite scans
-for removed IDs only when its plan's `removal` is `scan`, a populated node
-target an edge type references; under `none` (an edge target, an unreferenced
-node target, an empty table) nothing is scanned or charged. These checks precede
-the operation's data fragments and publication. They do not bound JSON
-containers, simultaneous conversion copies, predicate/validation state or
-native scan buffers. Overwrite's bulk input retains its separate checks and is
-not subject to keyed aggregate row limits. See [writes.md](writes.md#keyed-writes).
-
-`load_graph_batch_as` is the strict graph-level NDJSON boundary. Each nonblank
-line is one logical node or edge envelope; duplicate members, physical fields,
-unknown properties, invalid values, and noncanonical supplied node IDs are
-rejected before effects. The older loader-compatible `load_as` parser and
-deprecated `ingest*` SDK shims share the transaction machinery but are not a
-second durability path. See [ingestion.md](ingestion.md).
+An immutable `WriteBudget` captures the session's `write_max_bytes` once,
+including retries; the keyed-write limits are in
+[writes.md](writes.md#keyed-writes). The strict graph batch is in
+[ingestion.md](ingestion.md).
 
 ## Validation
 
@@ -1235,7 +1149,7 @@ the node-side count as the typed `source_cardinality` check; the overwrite
 judge (`validate/load.rs`) refuses a plan whose minimum lacks the scan, and
 append and merge reach the evaluator.
 
-Validation completes before any table effect. For selected
+Validation completes before any table effect (`E3`). For selected
 external Blob inputs, policy and retained-metadata accounting complete before
 target I/O; source probing, any required materialization, and payload-size
 admission complete before durable graph movement. See [blob.md](blob.md).
@@ -1250,13 +1164,12 @@ so a document whose source equals the query text is the query's own input; a
 template on either side would put stored and query vectors in different text
 spaces. Ordinary Load does not execute `@embed`
 at ingestion time; callers supply vectors or precompute them. The annotation
-records and validates embedding identity. Any future ingest-time reconciler is
-a separate design, not a hidden loader behavior.
+records and validates embedding identity.
 
 ## Derived indexes
 
-Schema apply, mutation, and Load publish logical data and index intent only.
-`ensure_indices` materializes declared missing indexes and rebuilds BTREE and
+Schema apply, mutation, and Load publish logical data and index intent only
+(`E7`). `ensure_indices_on_as` (`crates/omnigraph/src/db/omnigraph.rs`) materializes declared missing indexes and rebuilds BTREE and
 vector indexes whose coverage lags, on any branch, and publishes them in one
 graph commit; `optimize` does the same on `main` after compaction. Reads
 remain correct through Lance's indexed-plus-unindexed scan behavior while

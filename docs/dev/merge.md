@@ -61,7 +61,7 @@ An optimization miss is not a merge failure. Missing transaction history,
 unknown certificate fields, or an unfamiliar Lance shape
 falls back to the general route.
 
-A dry run (`Session::branch_merge_dry_run`, RFC 0030 §8.4) takes the same
+A dry run (`Session::branch_merge_dry_run`, RFC 0030) takes the same
 path through base resolution, classification and constraint validation, then
 returns before the queue guards and the first detached commit. It is a read:
 it takes neither the schema permit nor the branch gates, pins no merge-input
@@ -75,10 +75,8 @@ table ref, version and pin: the target's registration takes the source's
 `staged_version` in the same dataset, with no fenced insert, keyed update or
 payload copy, and external blob descriptors stay external. Numeric table
 versions are not compared across refs: the publication's manifest version
-orders the registration within the graph branch (RFC 0062). Main is the
-exception twice: after an empty source delta it keeps its own registration
-(see Publication and recovery), and for a source table on a pre-v11 fork it
-applies the delta at a new version of its own lineage.
+orders the registration within the graph branch (RFC 0062). Main's two
+exceptions are in [Publication and recovery](#publication-and-recovery).
 
 The source's registration metadata stays with an adopted pointer. A later
 target write stages detached on that same dataset from the adopted pin; no
@@ -116,7 +114,7 @@ within a 1,024-version limit. Missing or unprovable history falls back.
 The route stages bounded immutable fragments, then commits the same certified
 filter-bearing Update shape. It performs no target MergeInsert join or target
 ID preflight. The marker is not a signature and raw Lance writers remain
-unsupported. RFC 0023 owns the detailed proof and performance evidence.
+unsupported. RFC 0023 owns the detailed proof.
 
 The effective `write_max_bytes` is captured once. It accompanies the exact
 planned chunk rows through staging and publication, so scanner batch choices
@@ -181,8 +179,8 @@ the same cursor (`crates/omnigraph/src/ordered_cursor.rs`):
   validation keeps (see [Constraint validation](#constraint-validation)).
 
 Logical conflicts are computed before effects. Value constraints, uniqueness,
-referential integrity, and cardinality run through the shared validator against
-the target plus the complete selected delta.
+referential integrity, and cardinality (`merge:3`) run through the shared
+validator against the target plus the complete selected delta.
 
 ## Constraint validation
 
@@ -214,9 +212,7 @@ another batch shares. `MergeValidationBudget` charges those columns' bytes as
 each batch is swept (`Sweep::fact_bytes`), and every removed id as it is
 copied out of the delete plan, against `MERGE_VALIDATION_MAX_BYTES` (32 MiB);
 crossing it refuses the merge as `branch-merge retained validation key bytes`
-before the first effect. The charge limits the keys validation takes in; the
-memory of the facts built from them is proportional to that count, not bounded
-by it. Each fact copies its key into an owned string and hash entries of its
+before the first effect. Each fact copies its key into an owned string and hash entries of its
 own, so a short id costs about ten times its bytes; the other staged routes
 leave the same facts unaccounted.
 
@@ -237,19 +233,11 @@ publication still plans its prefixes by `batch_slice_memory_size`, which
 subtracts each Blob payload's offset range: a null's span there can only
 shrink a chunk, never refuse one.
 
-The budget is fixed. It limits what validation keeps, not a write, so
-`write_max_bytes`, which a pointer adoption that writes no row never meets,
-does not move it. It applies to the whole delta since the merge base. The
-supported route past it is a merge in stages: a branch created at an
-intermediate source commit and merged first moves the base of the next merge
-past that commit ([user guide](../user/branching/merge.md#validation-limit)).
-Removing the ceiling needs the cross-row checks to judge in bounded passes:
-uniqueness and `@card` partition cleanly by their key and source, while the
-exemptions that consult the delta's ids (a committed holder or edge the delta
-itself changes or removes) and endpoint settlement need either the whole id
-set or a probe of the staged delta datasets by id. The sweep reads every
-source from storage, so such passes can read it again, and exact accounting
-of each pass's facts against the query memory pool fits there.
+Why the budget is fixed and covers the whole delta is the
+`MergeValidationBudget` doc comment. The supported route past it is a merge
+in stages: a branch created at an intermediate source commit and merged first
+moves the base of the next merge past that commit
+([user guide](../user/branching/merge.md#validation-limit)).
 
 ## Cost model
 
@@ -282,9 +270,8 @@ the bounded hydration takes, so row width raises hydration read cost but not
 sort or spill cost, and a pre-existing wide row cannot fail an unrelated
 merge at the sort's single-row cap.
 
-Ordered scans run in a bounded spill context: each execution has a 150 MiB
-memory pool, a 100 GiB scratch quota, and a 37.5 MiB cap on the batches fed
-into a sort. If spilling is disabled, the scratch quota is exhausted, or an
+Ordered scans run in a bounded spill context (the `ORDERED_SCAN_*` constants
+in `crates/omnigraph/src/table_store.rs`). If spilling is disabled, the scratch quota is exhausted, or an
 indivisible row exceeds the hard cap, merge fails loudly; it never returns a
 partial result. A hard-cap failure reports the byte count Lance measured (the
 `limit + 1` sentinel survives only for an unparseable upstream message), and
@@ -298,8 +285,7 @@ Usable physical indexes reduce uniqueness and relationship probe cost;
 missing coverage falls back to scans without changing correctness. Tables and chunks stage sequentially before the one manifest CAS, and all routes
 defer index construction to reconciliation.
 
-Cost tests cap common fast-forward manifest opens/scans at three and diverged
-merges at four, five for a non-bound target. A `FastForward` whose target head
+A `FastForward` whose target head
 is not the merge base, such as a second merge from the same source, opens the
 base like a diverged merge and compares the two states in memory. Every publish rewrites the hot `__manifest` rows into exactly one new
 fragment and names the cold registry fragments again, so a scan pays no
@@ -311,7 +297,7 @@ and `replaced_table` rows, which `HISTORY_RELEASE_BYTES` (or the lower
 `__history` and are read only when a history read needs them. Read-only scans
 reduce one Arrow batch at a time; the publish scan retains every batch,
 because the copy-on-write publish rewrites them. Each `__manifest` version
-keeps its own copy of the rows and no path prunes `__manifest` versions yet.
+keeps its own copy of the rows and no path prunes `__manifest` versions.
 
 Successful local publication preserves the existing coherent projection after
 lineage adoption, avoiding a full reconstruction on the next unchanged refresh.
@@ -374,7 +360,7 @@ batch sizes, and legacy whole-delta scans. `stage_vector_index_calls` and
 
 ## Conflicts
 
-The engine reports structured conflict kinds:
+The engine reports structured conflict kinds (`merge:2`, `merge:3`):
 
 - `DivergentInsert`
 - `DivergentUpdate`
@@ -384,7 +370,7 @@ The engine reports structured conflict kinds:
 - `CardinalityViolation`
 - `ValueConstraintViolation`
 
-Conflict detection never silently picks a winner. The HTTP layer maps the
+Conflict detection never silently picks a winner (`merge:5`). The HTTP layer maps the
 structured result to its public 409 representation.
 
 ## Publication and recovery
@@ -401,7 +387,10 @@ lineage.
 Pointer-only siblings ride the same manifest CAS, and no table fork is
 created. The pure-insert proof walks the source's commit chain by
 `read_version` links from the source pin to the base pin
-(`try_proven_pure_insert_history`, `proven_chain_fragments`). Lineage
+(`try_proven_pure_insert_history`, `proven_chain_fragments`). The source pin is
+the captured one the merge-input tag retains: a write to the source table
+after capture does not refuse the merge, while a source table whose identity,
+path or native ref changed does (`revalidate_proven_pure_insert_source`). Lineage
 candidate discovery (`plan_lineage_merge`, `lineage_side_candidates`) walks
 no chain and reads no intervening commit: it compares the base and side
 manifests by file identity. Its work follows the fragment count at the three
@@ -442,7 +431,6 @@ structured error; it cannot replace the successful merge receipt. See
 ## Owners
 
 - `crates/omnigraph/src/exec/merge.rs` — classification and execution.
-- `crates/omnigraph/tests/integration/merge_truth_table.rs` — operation-pair semantics.
 - `crates/omnigraph/tests/integration/merge_fast_forward.rs` — pointer/proven-insert routes
   and bounded fallback, and the validation key budget: wide non-key columns
   sweep through (`branch_merge_validation_streams_wide_non_key_columns_issue_1427`)
@@ -459,9 +447,7 @@ structured error; it cannot replace the successful merge receipt. See
   `issue_1427_merge_rows_sharing_a_fragment_with_nulls.gqt` and
   `issue_1427_merge_in_stages_past_validation_key_limit.gqt` own the merge's
   observable validation limit on both routes and the staged recovery.
-- `crates/omnigraph/tests/integration/branching.rs` — branch identity and Blob behavior.
-- `crates/omnigraph/tests/integration/merge_cost.rs` — delta scope and manifest-history
-  cost contracts, not semantics.
+- The other merge suites are in [test ownership](test-ownership.md).
 - `crates/omnigraph-core/src/instrumentation.rs` — route and timing probes.
 
 See [writes.md](writes.md), [recovery.md](recovery.md), and

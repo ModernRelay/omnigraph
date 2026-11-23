@@ -1,4 +1,4 @@
-# OmniGraph benchmark harness
+# Omnigraph benchmark harness
 
 `omnigraph-bench run tiny-read` runs a named GQT benchmark in a supervised
 release worker. One [`benchmarks.yaml`](../../benchmarks/benchmarks.yaml)
@@ -437,7 +437,7 @@ disposable copy, open only that copy read-only, compute the canonical schema,
 payload, and full node/edge content witnesses, check table/index/history
 observations and relocation safety, recheck its physical bytes, and then clean
 it up. They neither download from S3 nor open or mutate the registered source
-as an OmniGraph database.
+as an Omnigraph database.
 
 Registered datasets use the same `gqt-v1` case/suite/cache/archive path. A
 logical reference and schema-less GQT preparation are part of the recipe;
@@ -557,7 +557,7 @@ uses that worker-attested identity rather than a long-lived CLI snapshot.
 
 ## Rebuildable query projection
 
-The team-facing query database is an OmniGraph read model generated from the
+The team-facing query database is an Omnigraph read model generated from the
 complete archive. It is never written in a measured window and has no
 incremental mutation API:
 

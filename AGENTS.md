@@ -183,8 +183,7 @@ environment. Azure suites require `OMNIGRAPH_AZURE_TEST_CONTAINER` and the
 documented Azure/Azurite environment. See [testing](docs/dev/testing.md) and
 [deployment](docs/user/deployment.md).
 
-API changes must regenerate `openapi.json` through the server OpenAPI test.
-Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
+API changes regenerate `openapi.json` ([CONTRIBUTING.md](CONTRIBUTING.md#openapi-spec)).
 
 ## Change discipline
 
@@ -198,10 +197,6 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 - Make the smallest coherent change that closes the behavior and test surface.
 - For a bug, reproduce the predicted failure at the tier the regression rule
   below names, then fix the root cause and prove the regression turns green.
-- Query-behavior tests default to `.gqt` logic tests under
-  `crates/omnigraph-gqt/cases/`; a Rust test needs a reason the
-  logic test format cannot express (mechanism assertions, scale symptoms,
-  process environment, concurrency).
 - Every issue fix lands a regression test at the cheapest tier that catches
   the defect: a `.gqt` logic test when the defect is visible in rows, counts,
   result column types, or errors, a `_issue_NNN` Rust test when it needs mechanism or scale
@@ -225,20 +220,12 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   rows with v1's. A defect seen on v1 is fixed on v2
   (`crates/omnigraph/src/engine/`); a v1 edit needs the pin updated in the
   same PR and a reviewer's eyes.
-- A change to what an operation reads or writes in storage adds or updates
-  its row in the DST storage-cost golden,
-  `crates/omnigraph-dst/cost_table.txt`, and the pull request explains every
-  changed line ([testing](docs/dev/testing.md#dst-storage-cost-golden)).
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Reconcile the agent skill in that same change: every statement in
   `skills/omnigraph` (`SKILL.md` and `references/`) about what the change
   adds, alters or removes. `omnigraph skill export` ships it with the binary,
   so a stale skill instruction is a user-facing bug.
-- Before writing a sentence in `docs/`, ask whether the code can say it
-  itself. [Where a fact goes](docs/dev/documentation.md#where-a-fact-goes)
-  places every kind of fact; do not create a page for one it places. How a
-  module works is that module's doc comment.
 - When a change makes a guide or a decision record false, change it in the
   same pull request. A design that is costly to reverse lands its
   [decision record](docs/dev/documentation.md#decisions): what was chosen,
@@ -257,6 +244,4 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   messages and generated text, never `OmniGraph`. Code identifiers keep their
   spelling (`Omnigraph::open`, `omnigraph-engine`, `omnigraph://`), and so do
   published release documents and the bytes they are verified against.
-- Recheck exact flags, environment variables, routes, and constants in source
-  before documenting them.
 - Keep this file a map. New deep content goes in its audience-owned guide.

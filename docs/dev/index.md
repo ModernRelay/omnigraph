@@ -1,19 +1,13 @@
 # Developer guide
 
-These pages describe the system that exists now: its architecture, invariants,
-change boundaries, and test ownership. Why a design was chosen is in a
+**Audience:** anyone changing Omnigraph, an agent included
+**Authority:** the index of developer guides; what to read before every change
+is in [`AGENTS.md`](../../AGENTS.md#required-reading)
+
+These pages describe the system: its architecture, invariants, change
+boundaries, and test ownership. Why a design was chosen is in a
 [decision record](../decisions/README.md); user behavior belongs in the
 [user guide](../user/).
-
-## Before every change
-
-1. Read [Architectural invariants](invariants.md).
-2. Use the domain map in [Lance alignment](lance.md), read the complete
-   upstream pages relevant to the task, then read the matching
-   [compatibility fences](lance-fences.md).
-3. Use [Testing](testing.md) and [test ownership](test-ownership.md) to find
-   existing coverage and establish a focused baseline before adding or
-   changing tests.
 
 ## Understand the system
 
@@ -45,7 +39,6 @@ change boundaries, and test ownership. Why a design was chosen is in a
 | Understand PR and release workflows | [CI and releases](ci.md) |
 | Change required checks, repository policy, or who is requested to review | [Branch protection](branch-protection.md) |
 | Write or reorganize documentation | [Documentation guide](documentation.md) |
-| Review a parser boundary regression example | [Camel-case filtering case study](case-studies/camel-case-filtering.md) |
 
 The workflow YAML, code, and tests are authoritative for exact command lines,
 serialized fields, constants, and assertions. Developer docs explain ownership

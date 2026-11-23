@@ -24,16 +24,13 @@ five more changes like this one?**
 
 2. **There is one graph-content publication door.** A graph change becomes
    authoritative through one `__manifest` publication containing every
-   visible table pointer, accepted schema contract and graph-lineage update.
+   visible table pointer, accepted schema contract and graph-lineage update
+   (`E2`).
    A write to an existing registered table never moves its linear HEAD: its effects are detached commits the `__manifest`
-   pin `(published_dataset_version, staged_version, transaction_uuid)`
-   names, every pin is a detached version that opens, and the pin is the
-   table's version for its whole life. A graph table's linear HEAD stays at
-   its creation version, recorded per registration as
-   `omnigraph.last_linear_version`; the collector reads it to list foreign
-   versions. Added-type
-   admission may also inspect an unregistered deterministic path, but accepts
-   only its qualified original empty version 1, never an advanced HEAD.
+   pin names, every pin is a detached version that opens, and the pin is the
+   table's version for its whole life. The pin's fields,
+   `omnigraph.last_linear_version` and added-type admission are in
+   [writes](writes.md#mutation-and-load).
    Per-table publication is never graph publication.
 
 3. **Every operation uses one coherent accepted view.** A read holds one
@@ -51,7 +48,7 @@ five more changes like this one?**
 
 5. **Crash convergence is part of the commit protocol.** An effect that is
    durable before publication must be unreachable: a detached version or a
-   staged file nothing references, which a retry ignores. `cleanup`'s
+   staged file nothing references, which a retry ignores (`E2`, `E4`). `cleanup`'s
    collector reclaims such a version only when the publication authority
    its transaction properties record is provably gone; age does not prove
    abandonment. The two explicitly requested exceptions are the publishable
@@ -59,14 +56,11 @@ five more changes like this one?**
    and the nonpublishable snapshot (`as unattached branch`,
    [decision](../decisions/2026-10-11-unattached-graph-branches.md)): each writes a
    detached `__manifest` version reachable by its graph commit id through a
-   reserved tag, `unpublished_<id>` for the proposal and
-   `unattached_<root>_<C>` for the snapshot, which acknowledges durable
+   reserved tag ([writes](writes.md#writer-adapters)), which acknowledges durable
    snapshot addressability with `published: false` and never branch
-   visibility; the branch still changes only at the proposal's later ordinary
-   publication, the snapshot never publishes, and both tags expire with the
-   captured target authority. Published table effects and the accepted schema contract
-   are complete in one manifest publication; no contract-file installation
-   remains. There is no side record to classify. The collector holds two properties
+   visibility, and both tags expire with the captured target authority
+   (`branch:2`). Published table effects and the accepted schema contract
+   are complete in one manifest publication. The collector holds two properties
    on every run: safety, that every pin of every retained `__manifest`
    version on every live branch still opens and every path its manifest
    lists still exists after the run; and progress, that a table version no
@@ -74,7 +68,8 @@ five more changes like this one?**
    nothing else. Foreign movement fails closed: a linear commit above a
    table's last linear version is reported by the collector (`cleanup`'s
    `foreign_versions`), never deleted and never adopted.
-   See [recovery.md](recovery.md).
+   The collector is in [writes](writes.md#mutation-and-load); each crash
+   window's outcome is in [recovery](recovery.md).
 
 6. **Stable identity survives renames, not lifetimes.** Accepted SchemaIR owns
    non-zero type, property, and table-incarnation identities. A rename
@@ -90,8 +85,9 @@ five more changes like this one?**
 8. **Integrity failures are loud.** Type, required-field, uniqueness,
    endpoint, cardinality, schema-lifetime, recovery, and mutation-mode
    violations fail with typed outcomes. The engine does not invent
-   placeholders, silently weaken constraints, return plausible partial state,
-   or reinterpret an unknown persisted format.
+   placeholders, silently weaken constraints (`E3`), return plausible partial
+   state (`E5`), or reinterpret an unknown persisted format (contract
+   Boundary, Versions).
 
 9. **Query semantics are typed structures.** Traversal, search modes, ranking,
    mutations, polymorphism, policy predicates, and future planner capabilities
@@ -110,17 +106,14 @@ five more changes like this one?**
    operator fields may widen nullable flags, but values may not violate a
    declared non-null constraint.
 
-10. **Trust is established at the boundary and enforced at the engine.** HTTP
-    resolves bearer tokens to actors; a client never supplies its trusted actor
-    identity. Token plaintext is not retained. Server reads apply their policy,
-    and every mutating engine `_as` entry point applies the action/scope/actor
-    gate so embedded and CLI-direct writers do not bypass it.
+10. **Trust is established at the boundary and enforced at the engine.** The
+    server resolves the actor and checks every action (`E6`). Token plaintext
+    is not retained. Every mutating engine `_as` entry point applies the
+    action/scope/actor gate so embedded and CLI-direct writers do not bypass
+    it.
 
-11. **Failures and resource use are bounded and observable.** Conflict,
-    timeout, OOM, backpressure, partial-effect, external dependency, and
-    recovery paths have explicit outcomes. Retries are contract-defined and
-    bounded. Hot-path work must scale with the working set, not accumulated
-    history.
+11. **Failures and resource use are bounded and observable** (`E4`, `E5`).
+    Hot-path work must scale with the working set, not accumulated history.
 
 12. **One source of truth, cheaply derived.** Lance, `__manifest`, and the
     accepted schema are authoritative. `__manifest` is a table's only
@@ -194,19 +187,7 @@ it is costly to reverse, a [decision record](documentation.md#decisions).
 
 - Which statements of [the contract](contract.md#citing) does it keep, close,
   decide or change?
-- Does one snapshot or authority token cover the whole operation?
-- Is graph visibility still one manifest publication?
-- Is every pre-publication durable effect unreachable until the manifest names
-  it, and are the table pins and accepted contract complete in that publication?
 - Does it read linear HEAD outside the collector's foreign-version listing or
   qualified original-version admission for an unregistered added-type path, or
   rebuild a row without carrying `omnigraph.last_linear_version` forward?
-- Does the collector's mark set still cover every retained pin, and does its
-  sweep still reach every unretained published version?
-- Are names kept separate from stable identity?
-- Does a missing physical optimization preserve logical correctness?
-- Are retries, memory, I/O, and failure outcomes bounded?
-- Does policy still cover non-HTTP writers?
 - Is current truth stated once and linked elsewhere?
-- Did the change extend the existing test owner and read the complete relevant
-  Lance domain?

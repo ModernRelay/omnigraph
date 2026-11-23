@@ -4,10 +4,7 @@
 //! process-wide seams.
 //!
 //! `fail`, `skip` and `contention` serve a site between two steps, which
-//! declares one effect. `guarded` serves a site that wraps one operation and
-//! declares every outcome that operation can have: the wrapped call runs,
-//! is skipped, or is replaced by an injected error, as the installed decider
-//! chooses per crossing.
+//! declares one effect.
 //!
 //! With the `failpoints` feature off, every helper compiles to its default arm
 //! and no slot is ever read.

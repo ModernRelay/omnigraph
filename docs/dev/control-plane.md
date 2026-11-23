@@ -1,5 +1,13 @@
 # Cluster control plane
 
+**Audience:** contributors changing cluster deployment, admission or serving
+**Authority:** the deployment ledger, cluster admission and lock protocol,
+serving projection and their support boundaries; operator behavior is in
+[Operating a cluster](../user/clusters/index.md) and
+[deployment](../user/deployment.md), the reasons in the linked decision
+records, and storage-request settlement and the lease mechanics in the
+`omnigraph-storage` and `omnigraph-cluster` doc comments named below
+
 The cluster control plane turns a local declarative bundle into a durable applied revision that servers can consume without the source checkout. It owns graph lifecycle, accepted schemas, stored queries, Cedar bundles, embedding-provider bindings, and external-Blob ingress policy. It does not execute row queries or mutations.
 
 ## Authority model
@@ -92,31 +100,22 @@ scope, response validation and refusal tests.
 
 All stored control objects use the shared storage adapter. Filesystem replacement and object-store PUT/CAS details stay below that boundary; higher layers deal in versioned reads, conditional writes, and normalized roots.
 
-The engine has no ordinary graph recovery sidecar: schema, table pins and
-lineage publish together in `__manifest`. Ledger v2 stores prepared schema and
-graph-birth and graph-deletion authority in one outstanding record. Legacy control evidence is
-preserved for explicit conversion checks, never executed by a fallback sweep.
+Ledger v2 stores prepared schema and graph-birth and graph-deletion authority
+in one outstanding record.
 
 ## Operation record
 
 `__cluster/operations.json` (`omnigraph_cluster::OperationRecord`) is
-separate from `state.json`, whose `deny_unknown_fields` ledger older binaries
-must keep reading. It names the cluster's ledger id; a record naming another
-ledger is refused with `operation_record_foreign` and never merged. Only the
-lock holder writes it, and in that process every read a write follows and
-every write hold the admission's record gate (`ClusterAdmission::lock_operations`,
-`update_operations`: read, apply, one conditional put), the server's routes,
-the runs' state changes and the graph deletion's settlement alike; the
-server's live-run set changes under the same gate, so a lookup never meets a
-run that ended while its record was still active. Each write is a conditional put against the version read: at
-acceptance, when the run starts, in the optimize run's before-publish hook
-(`publishing`, with the intent nonce, the input head and the per-table
-outcomes), and at the end. The record is generic over `kind`: the header
-keys its active operations by admission scope and each kind's state by graph
-and kind, and each record names its settlement branch; `optimize` is the
-first kind. A write with no definite answer (`OperationWrite::InDoubt`) stops
-the run's writes; the server's next admission or lookup reads the record
-back and re-applies a run's final change, kept per operation id until a write applies it or the record settled the run another way, to the record as it then stands. A write the store or the process's storage scope refuses is a definite `Refused` outcome (503, nothing accepted), distinct from one with no answer (`InDoubt`, 500 `outcome_unknown`): a scope keeps refusing a key whose earlier request is unsettled until the server is replaced. An `accepted` or `running` operation no live run holds becomes
+described by the doc comments of `crates/omnigraph-cluster/src/operations.rs`
+and `crates/omnigraph-server/src/recorded_operations.rs`. It names the
+cluster's ledger id; a record naming another ledger is refused with
+`operation_record_foreign` and never merged. The record gate is
+`ClusterAdmission::lock_operations` and `update_operations` (read, apply, one
+conditional put). The optimize run's before-publish write (`publishing`)
+carries the intent nonce, the input head and the per-table outcomes. A write
+with no definite answer (`OperationWrite::InDoubt`) stops the run's writes;
+the server's next admission or lookup reads the record back and re-applies a
+run's final change, kept per operation id until a write applies it or the record settled the run another way, to the record as it then stands. A write the store or the process's storage scope refuses is a definite `Refused` outcome (503, nothing accepted), distinct from one with no answer (`InDoubt`, 500 `outcome_unknown`): a scope keeps refusing a key whose earlier request is unsettled until the server is replaced. An `accepted` or `running` operation no live run holds becomes
 `interrupted`, and a `publishing` one joins at most four unresolved
 operations, settled by `Omnigraph::resolve_publication` once the settlement
 branch's graph head moves: one page of the branch's first-parent chain per
@@ -158,7 +157,8 @@ revision. Retained roots, trust and storage format stay fixed. Removing a graph
 from desired configuration deletes its exact managed root, including all branches,
 retained history and managed Blob bytes. It does not follow external Blob
 references or delete peer roots. Adoption, missing-root recreation and catalog
-repair refuse. Normal engine open requires v14 to v18; server HTTP requires v0.14.
+repair refuse. Supported storage formats and the HTTP contract version are in
+[versioning](versioning.md).
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
@@ -237,9 +237,9 @@ owns the protocol rationale and qualification limits.
 
 ## Concurrency
 
-Read-only `plan`, `observe` and deployment status neither acquire writer
-admission nor change the ledger. Live observations are not execution or takeover
-authority. Ledger publication uses the CAS read under the current owner.
+Read-only `plan`, `observe` and deployment status take no writer admission
+and change no ledger ([control-plane seams](../decisions/0049-control-plane-seams.md)).
+Ledger publication uses the CAS read under the current owner.
 
 V2 requires locking. `admission.rs` issues an opaque canonical-root/exact-lock-ID
 capability only after acquiring that same lock and rechecking ledger/inventory.
@@ -287,17 +287,10 @@ release and acquisition, so an older bootstrap create cannot recreate its owner.
 
 Clean native shutdown closes logical admission, drains its existing operation
 owners, then closes and drains an explicit `StorageIoScope` shared by control
-adapters and graph Lance sessions. The wrappers count actual mutating requests
-and multipart lifetimes. Physical settlement depends on the operation and the
-key it names. The wrapper recognizes Lance 13's fresh `data/*.lance` files,
-their `data/<file-key>/*.blob` sidecars, `_transactions/*.txn`,
-`_deletions/*.arrow|*.bin`, flat files in `_indices/<uuid>/`, detached
-`_versions/d*.manifest`, and numbered manifests created only if absent.
-Late fresh files remain unreachable and a conditional create cannot replace
-an existing publication. Such requests settle at the physical scope after
-an error or cancellation, including multipart uploads. This does not prove
-that a graph publication failed: the catalogue still owns the outcome of an
-unacknowledged numbered-manifest publication. The commit handler every
+adapters and graph Lance sessions. How the scope settles each request by the
+key it names is the doc comment of `crates/omnigraph-storage/src/scoped.rs`.
+The catalogue owns the outcome of an unacknowledged numbered-manifest
+publication. The commit handler every
 dataset uses re-issues an ambiguous manifest request until the store answers
 it and records whether a request was sent; the publisher marks a failure with
 no request sent, or one the store refused, `Unpublished`, and only an outcome
@@ -309,42 +302,16 @@ shared handler never does. A manifest that lands late therefore finds its
 transaction file on every open path; the transaction-delete hold below is the
 served process's second line.
 
-Refs, version hints, cluster control objects, unknown paths, if-match
-replacements and recursive deletes remain conservative. A cancelled or
-ambiguous request leaves its key unsettled even if a higher layer consumes the
-error, and the scope logs its key and error. A later request to that key, or a
-recursive delete over it, is refused before it is sent; other keys are
-unaffected. The scope remembers at most `MAX_UNSETTLED_KEYS` (4096) keys and
-past that refuses every mutation. Rename also accounts for removal of its
-source. Single-attempt conditional conflicts, a delete answered "not found", and
-a request the store refused before applying it (permission, authentication,
-missing bucket, invalid path, unsupported operation) are settled refusals: every
-request that can leave a key unsettled goes to the single-attempt client, so no
-earlier copy of a refused one was sent.
-
-A key left unsettled by a conditional request records that request's
-precondition (absent, or the ETag an if-match names) and admits a request with
-the same precondition: its owner's re-issue. The re-issue's success settles the
-key, since the precondition fences the earlier copy. Its conflict does not: S3
-answers 409, which `object_store` reports as "already exists", while another
-conditional write to the key is in flight, and that write may be the earlier
-copy. The storage adapter's `write_text_if_absent` and `write_text_if_match`
-resolve their answers by `omnigraph_storage::conditional`, the one policy the
-manifest commit handler uses too: an ambiguous answer is re-issued unchanged,
-up to `CONDITIONAL_REQUEST_REISSUES` (four) times with pauses doubling from 0.2
-to 1.6 seconds, and the first copy's refusal returns at once. After a conflict
-that an earlier copy may explain or the last lost or refused re-issue, they
-read the key back: equal bytes are this request's, a key that shows the
-precondition failed settles at the scope, and a key that still satisfies it
-leaves the write unresolved. Equal bytes can be read as this request's only
-because every caller's `contents` names its writer: a lock id, a lease
-sequence in the owner's directory, an init claim's attempt id. The prepared
-graph-create claim names its apply for that reason. A state or
-content-addressed object whose bytes are the effect is the same write when the
-bytes match. An unscoped S3 or Azure client retries internally (its
-`max_retries`, and an S3 if-match's 409), so its first conflict is read back
-too and its permission or authentication error is ambiguous, where a scope's
-single-attempt client makes both definite. Local filesystem puts finish before
+The scope logs the key and error of a request it leaves unsettled. The
+storage adapter's `write_text_if_absent` and `write_text_if_match` resolve
+their answers by `omnigraph_storage::conditional`, the one policy the
+manifest commit handler uses too; the re-issue and read-back rules are in the
+doc comments of `conditional.rs`, `scoped.rs` and those two methods. Equal
+bytes can be read as this request's only because every caller's `contents`
+names its writer: a lock id, a lease sequence in the owner's directory, an
+init claim's attempt id. The prepared graph-create claim names its apply for
+that reason. A state or content-addressed object whose bytes are the effect is
+the same write when the bytes match. Local filesystem puts finish before
 they answer and publish last (`LocalFileSystem::new()`, fsync off), so a local
 error is a refusal there. `forbidden_apis.rs`
 (`mutable_key_requests_are_registered_issue_1067`) registers every
@@ -353,25 +320,15 @@ cluster, server and Azure admission crates with why its late landing is
 harmless; a new one fails the guard until it is argued or made conditional or
 fresh.
 
-An unacknowledged manifest write may land after Lance reads it back as absent
-and attempts to delete its transaction file. One sticky flag therefore
-refuses transaction-file deletion throughout that scope, including rename
-source deletion and recursive removal. This intentionally retains other
-datasets' transaction files too, bounding the accounting state. Normal data
-serving can continue, while transaction cleanup can be deferred until a
-replacement scope. The collector must still establish its normal
-reachability, authority and age predicates before reclaiming retained files;
-replacing the scope is not permission to delete them. Definite conditional
-conflicts do not set the hold. A successful multipart abort does not clear a
-hold from an earlier unacknowledged completion.
-
-Scoped stores hold two clients. Reads and fresh immutable writes go to one
-with Lance's own bounded transport and AIMD retries; conditional requests and
-mutable keys go to one that makes a single attempt, so their owners see every
-attempt. Scoped control adapters keep three read retries within three minutes.
-Local Lance uses its object-store file provider so direct file writes cannot
-bypass the scope. Embedded defaults and Azure serving clients are unchanged; the
-automatic scoped shutdown path applies only to local and S3 roots.
+The sticky transaction-delete hold and the two-client routing of a scoped
+store are in the `scoped.rs` doc comment. Normal data serving continues
+under the hold, while transaction cleanup can be deferred until a replacement
+scope. A successful multipart abort does not clear a hold from an earlier
+unacknowledged completion. Scoped control adapters keep three read retries
+within three minutes. Local Lance uses its object-store file provider so
+direct file writes cannot bypass the scope. Embedded defaults and Azure
+serving clients are not scoped; the automatic scoped shutdown path applies
+only to local and S3 roots.
 
 Only unique admission, successful startup and no unsettled key permit final
 release. Original adapters remain permanently closed; a private single-attempt
@@ -380,89 +337,45 @@ S3 release CAS writes a unique version-2 released marker at the existing key;
 ordinary acquisition CAS replaces it with a fresh held owner. Lost release
 acknowledgement is an error, while its delayed CAS cannot affect a successor.
 Local release uses awaited exact-owner deletion; automatic Azure release remains
-unqualified and its prior retained-lock shutdown behavior is unchanged. Older
+unqualified, and Azure shutdown retains the lock. Older
 tools refuse the new released record. This supplies neither
 distributed fencing nor generic runtime reuse.
 
-On S3 roots a server's held lock is version 3 and carries `lease_seconds`
-(`lease.rs`, `state_lock.rs`); a CLI writer or deployment holds an unleased
-lock, because nothing would stop its writes when a lease fenced. Its owner
-creates `__cluster/lease/<lock_id>/beat-<seq>.json` put-if-absent every third
-of a lease, first before it admits work. Before each beat it reads
-`__cluster/lease/<lock_id>/superseded.json` and `lock.json`, and sends the
-beat only when both reads answer, no claim exists and the record still holds
-its lock id; reads that get no answer are retried like an unanswered beat.
-The lease's
-requests go through the root outside the owner's storage scope, on a client
-with the backend's retries (`ClusterStore::lease_adapter`): a failed beat
-neither unsettles the scope nor stops when the scope closes for a release.
-A beat already present is the owner's own earlier request and counts from
-the start of that beat's first attempt, before its reads; an unanswered beat
-is sent again after a quarter of a beat interval. A timer of its own fences
-the owner two thirds of a lease after the start of its last acknowledged
-beat. The reads before its next beat, at most a third of a lease later,
-fence it on a claim or a record that no longer holds its lock id: a
-takeover, a release or an exact-ID unlock. The first beat races the same
-deadline counted from the send of the lock's own write, because a successor
-may count silence from the moment the record is visible; when it lapses, or
-the reads after beat 0 find a claim or a lost record, acquisition fails and
-the server does not serve. A fence fences the
-owner's storage scope (`StorageIoScope::fence`) before it is reported: every
-later request is refused, the parts and cleanup of an admitted multipart
-upload included, and every admitted request is cancelled, so the owner sends
-nothing after the fence however long its shutdown grace lasts. The scope
-also holds the owner's deadline (`StorageIoScope::fence_at`), moved forward
-with each acknowledged beat, and fences itself at it: after a pause of the
-whole process, admission, a multipart part and each poll of an admitted
-request check it before sending, whichever task resumes first, and no beat
-starts at or after it. The server
-then closes admission and exits 2 without releasing. A
-serving acquisition that finds a version-3 lock watches the beat listing on
-its own monotonic clock, and counts silence only up to the send of a listing
-that found no newer beat: storage reads a listing no earlier than its send,
-so an answer that stalls, or that a paused successor reads late, proves no
-silence after that send. A new beat refuses it. An empty listing starts the
-silence and the first beat that appears restarts it, because the owner
-writes its lock before its first beat lands; an empty listing after a beat
-was seen refuses, like a new beat. A lease and a half of silence
-lets it make sure the claim exists (a claim already there, from any
-successor, only fences an owner that is somehow still running), then
-replace `lock.json` by if-match on the version it first read. That if-match
-alone decides the next owner: of two successors, or of a successor and the
-owner's clean release (if-match on the version it read), exactly one
-applies. A successor that stops between its claim and its if-match leaves
-`lock.json` unchanged, so the next start takes it over the same way. The
-takeover leaves the old lease directory, claim included: an owner whose
-clock stopped, as in a suspended VM, resumes with its timer still ahead, and
-the claim, or the replaced record, stops it at its next beat. A clean release stops
-beating, deletes the lease directory, then releases as above. The lease
-coordinates liveness only: a request a dead owner sent before it fenced can
-still land after a takeover. A fresh key stays unreachable until a manifest
-names it, and a conditional publication cannot replace one its successor
-made; a request to a mutable key (a ref, the version hint, a control object,
-a delete) has no such guard, and the owner's storage scope only records its
-outcome as unknown, in that process. Local roots
-have no conditional update, so a successor could not replace `lock.json`
-without racing an exact-owner delete the old owner already sent; local
-locks, Azure locks and version-1 locks from older binaries carry no lease and
-keep exact-ID unlock.
+On S3 roots a server's held lock is version 3 and carries `lease_seconds`;
+the heartbeat, self-fence, watch, claim and if-match takeover protocol is the
+doc comment of `crates/omnigraph-cluster/src/lease.rs`. A CLI writer or
+deployment holds an unleased lock, because nothing would stop its writes when
+a lease fenced. The lease's requests use `ClusterStore`'s `lease_adapter`, so
+a failed beat neither unsettles the scope nor stops when the scope closes for
+a release. An unanswered beat is sent again after a quarter of a beat
+interval. When the first beat's deadline lapses, or the reads after beat 0
+find a claim or a lost record, acquisition fails and the server does not
+serve. A fence fences the owner's storage scope (`StorageIoScope::fence`,
+`StorageIoScope::fence_at`) before it is reported; the server then closes
+admission and exits 2 without releasing. A watching successor's empty listing
+starts the silence and the first beat that appears restarts it, because the
+owner writes its lock before its first beat lands; an empty listing after a
+beat was seen refuses, like a new beat. A clean release stops beating,
+deletes the lease directory, then releases as above. A request a dead owner
+sent to a mutable key (a ref, the version hint, a control object, a delete)
+before it fenced can still land after a takeover; the owner's storage scope
+only records its outcome as unknown, in that process. Local locks, Azure
+locks and version-1 locks from older binaries carry no lease and keep
+exact-ID unlock.
 
 Do not bypass the cluster API with direct filesystem writes, edit `state.json`, or derive a second mutable inventory. Content digests and live observations are recomputed from the declared and durable authorities.
 
-The distributed support boundary remains one mutation-capable writer process.
-V2 admission adds cooperative exclusion on all backends without claiming native
+One mutation-capable writer process per cluster is the supported topology
+(`G2`). V2 admission adds cooperative exclusion on all backends without claiming native
 I/O settlement. Azure writers also acquire the external admission lease through
 `omnigraph-azure-admission`.
 
 ## Serving projection
 
-`omnigraph-server` has one boot mode:
-
-```text
---cluster <config-directory | file://root | s3://root | az://root>
-```
-
-A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or independent graph add/remove API; inventory additions and destructive removals use deployment.
+`omnigraph-server` boots only from `--cluster`, a configuration directory or a
+storage-root URI ([server cluster boot](../decisions/0005-server-cluster-boot.md)).
+There is no independent graph add/remove API; inventory additions and
+destructive removals use deployment.
 
 Serving captures ledger/resource digests, graph identity, expected contracts and validated policies before binding the listener. The captured registry initially contains loading or preflight-blocked entries, with the same captured policy later installed on the engine. One process-owned startup batch opens at most four graphs concurrently, checks accepted contracts, projects external-Blob policy, and validates stored queries. Each completed graph becomes ready or blocked through the process/registry admission boundary; shutdown prevents late activation and drains entered opens. Default startup admits healthy graphs individually. `--require-all-graphs` installs successful handles atomically only when every graph succeeds; any failure stops startup. A nonempty inventory with zero healthy graphs fails after the batch finishes. There is no attempt timeout, startup retry, reopen or native-settlement proof.
 
@@ -532,29 +445,17 @@ authentication and before graph resolution. CLI discovery and response validatio
 are specified by [wire compatibility](versioning.md#wire-compatibility); the
 managed control-plane API and standard MCP/OAuth protocols are separate surfaces.
 
+Authentication and policy enforcement are `E6`. Cluster policy application
+publishes the bundles and bindings; it does not replace either enforcement
+layer.
 
-Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
-
-The optional [offline signed-token trust](../decisions/0053-offline-data-token-verification.md)
-uses immutable public trust loaded before graph open. The Core's opt-in
-root-bound serving snapshot supplies the canonical storage root from the same
-resolution as the applied revision; the server checks that root against trust
-without reading a managed identity marker. The verifier resolves
-`principal:<sub>` and retains a private, verified version-2 identity. Permission
-fields and unsupported token versions are refused. The common authorization
-gate requires applied Cedar policy for protected operations, with no token-derived
-graph/action ceiling. Static credential authority remains unchanged. Issuer
-reachability is outside the serving request path. The profile boundary and
-applied-policy ownership are described in
-[Identity credentials and applied policy authorization](../decisions/2026-09-09-identity-credentials-and-applied-policy.md).
-
-`GET /graphs/discovery` accepts only the verified identity profile and returns IDs and display names for every graph in the current
-serving registry (loading, ready, transitioning or blocked), as last installed
-by boot or a deployment activation. It neither scans storage nor discloses availability, paths, policy,
-schema, or query definitions. It needs no policy membership. The separate
-`GET /graphs` uses the same registry with a `graph_list` gate and returns one
-list containing runtime availability, sanitized failure and action. Neither inventory synthesizes graph
-entries from the boot witness. Discovery still discloses no availability.
+Signed data tokens are verified offline against public trust loaded before
+graph open ([offline data-token verification](../decisions/0053-offline-data-token-verification.md),
+[identity credentials and applied policy](../decisions/2026-09-09-identity-credentials-and-applied-policy.md)).
+The Core's opt-in root-bound serving snapshot supplies the canonical storage
+root from the same resolution as the applied revision. `GET /graphs/discovery`
+and `GET /graphs` read the same serving registry, as last installed by boot or
+a deployment activation; neither scans storage.
 
 HTTP and MCP graph resolution atomically capture a serving view with its graph-epoch lease. A loading, blocked or
 transitioning graph yields 503 only after graph `read` authorization on `main` or
@@ -570,22 +471,11 @@ Both managed and standalone targets request the
 ordinary graph catalog unless `graphs list --discovery` is requested; the CLI never
 infers routing from an arbitrary bearer token's unverified shape.
 
-A replica reports what it booted from on `GET /readyz` (RFC 0049): the
-applied `config_digest` as `booted_serving_digest`, the ledger revision and
-CAS, and registry, ready, loading and blocked graph counts. `served_graph_count`
-counts every registry entry; closed transitions contribute to the blocked count.
-Status is `loading`, `serving`, `degraded`, `blocked` or `draining`;
-readiness requires completed startup, a ready graph or valid empty inventory,
-and open admission. Healthy graphs can serve directly while siblings load,
-but an aggregate readiness probe remains 503 until loading finishes.
-Graph IDs stay on the authenticated catalog routes under their respective
-disclosure contracts. Status reads registry snapshots without graph/storage I/O;
-shutdown makes every entry `stopping` and both availability flags false, retaining
-any startup failure category.
-Graceful shutdown is bounded by one deadline (`--shutdown-grace-seconds`,
-default 25), kept by a thread and armed
-by a listener installed before graphs open, after which the process exits 2
-without claiming success.
+`GET /readyz` and the shutdown deadline are specified in
+[control-plane seams](../decisions/0049-control-plane-seams.md) and
+[deployment](../user/deployment.md). Shutdown makes every registry entry
+`stopping` and both availability flags false, retaining any startup failure
+category.
 
 Admitted HTTP writes run as registered server-owned operations. Their immutable
 inputs, trusted actor, Session and capacity reservations survive a lost response
@@ -724,9 +614,7 @@ snapshot and trust binding together.
 ## Azure boundary
 
 `az://container/prefix` uses the same control-object and graph-root model as
-local and S3 storage. Code paths, Azurite integration, and a managed-identity
-smoke deployment are qualified; the adversarial live-Azure matrix is still
-pending. Treat Azure as a qualification preview.
+local and S3 storage. Azure writes are a preview (`G4`).
 
 Every mutation-capable Azure server, apply job, direct writer, and maintenance process must run through `omnigraph-azure-admission`. The admission crate may depend downward on shared storage; storage, engine, cluster, server, and CLI must not depend upward on it.
 
@@ -760,7 +648,8 @@ Every mutation-capable Azure server, apply job, direct writer, and maintenance p
 
 - Configuration, diffing, deployment, recovery, and serving projection: `crates/omnigraph-cluster/src/`.
 - Shared local/S3/Azure control-object storage: `crates/omnigraph-storage/`.
-- Cluster-only boot and graph quarantine: `crates/omnigraph-server/src/settings.rs`.
+- Cluster-only boot: `crates/omnigraph-server/src/settings.rs`; serving-snapshot
+  graph quarantine: `crates/omnigraph-cluster/src/serve.rs`.
 - Operator commands and addressing: `crates/omnigraph-cli/`.
 - Azure lease wrapper: `crates/omnigraph-azure-admission/`.
 

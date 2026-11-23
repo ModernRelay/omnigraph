@@ -1,6 +1,6 @@
 # Governance
 
-How change enters OmniGraph: who decides, what each change needs before code
+How change enters Omnigraph: who decides, what each change needs before code
 lands, and what reviewers and CI enforce. It exists so an outside contributor
 can answer, without asking: *where does my report or idea go, who decides, and
 what has to happen before code lands?* The practical how-to lives in
@@ -8,7 +8,7 @@ what has to happen before code lands?* The practical how-to lives in
 
 ## Roles
 
-OmniGraph is maintained by EQTR, Inc.
+Omnigraph is maintained by EQTR, Inc.
 
 - **Maintainers** — triage issues, accept or decline proposals and RFCs,
   review and merge PRs, and set direction. Final decision authority.
@@ -130,9 +130,8 @@ reviewable. Reclassified changes restart on the correct path rather than
 being renegotiated in the thread. Low-effort PRs with no evident mental model
 and no testing beyond the happy path may be closed without detailed review.
 
-Review enforces issue linkage. CI also validates decision records, page budgets,
-metadata, lifecycle values, registry entries, and documentation links with
-`scripts/check-docs.py`.
+Review enforces issue linkage. CI also validates the format of decision records, page budgets and
+documentation links with `scripts/check-docs.py`.
 
 ## Code of conduct & security
 

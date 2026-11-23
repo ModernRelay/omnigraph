@@ -45,11 +45,6 @@ in [lance.md](lance.md).
 | What an operation reads or writes in storage | The DST golden and the engine `integration/*_cost.rs` curve tests | [DST storage-cost golden](#dst-storage-cost-golden) |
 | Wall time or memory | `omnigraph-bench`; evidence, never a pass/fail assertion | [Benchmark harness](test-ownership.md#benchmark-harness) |
 
-Loose integration suites of a crate are modules of one
-`tests/integration/main.rs`. A file stays a separate binary under `tests/`
-only when its tests need their own process: failpoints armed for the whole
-process, a re-executed binary, a mutated process environment.
-
 Server and CLI suites start processes through their `tests/support` modules,
 which own hermetic configuration, binary startup and temporary roots. Do not
 copy that setup into a new suite.
@@ -79,15 +74,6 @@ full procedure is in
 
 ## Commands
 
-```bash
-cargo test -p omnigraph-engine --test integration traversal_indexed::   # one suite
-cargo test -p omnigraph-engine --test writes concurrent                  # a separate binary
-cargo test -p omnigraph-server --test integration data_routes::
-cargo test -p omnigraph-cli --test integration cli_data::
-cargo test -p omnigraph-cluster --test failpoints --features failpoints
-cargo test -p omnigraph-gqt --test gq_logic_tests issue_563             # matching case names
-```
-
 Run one test with `--test integration <name>::<test> -- --exact`. The
 canonical workspace graph, formatting and Clippy commands are in
 [AGENTS.md](../../AGENTS.md#build-and-test); [ci.md](ci.md) lists the exact
@@ -96,10 +82,7 @@ gates. GQT, DST, plan replay and OpenAPI commands are in
 
 ## Cost tests and benchmarks
 
-A correctness test may assert a deterministic logical or object-store
-operation count when the count is part of the design contract. Wall time and
-peak RSS depend on the host and belong in the `omnigraph-bench` harness, whose
-results are evidence, not assertions. Workload definitions live in
+Workload definitions live in
 [`benchmarks/`](../../benchmarks/README.md); the cost owners and the harness
 are in [test ownership](test-ownership.md#cost-tests-and-benchmarks).
 

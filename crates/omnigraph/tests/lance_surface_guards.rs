@@ -2800,12 +2800,11 @@ async fn force_delete_branch_semantics() {
     );
 }
 
-// --- Guard 9b: RFC-025 tag targets and sparse cleanup protection -----------
+// --- Guard 9b: tag targets and sparse cleanup protection --------------------
 //
-// This is deliberately a substrate-only activation gate: it writes no
-// OmniGraph checkpoint rows and changes no graph format. It pins the Lance
-// facts RFC-025 would consume:
-//   * the proposed deterministic `ogcp_v1_...` spellings are valid tag names;
+// A substrate-only guard: it writes no Omnigraph rows and changes no graph
+// format. It pins the Lance facts a reserved-tag pin relies on:
+//   * deterministic prefixed spellings with a ULID are valid tag names;
 //   * exact main and named-branch targets remain distinct even at overlapping
 //     numeric versions;
 //   * a sparse tagged old version survives cleanup while adjacent eligible

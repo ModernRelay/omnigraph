@@ -28,9 +28,9 @@
 //! shared/exclusive slot ([`SchemaGateSlot`]): a pass that only READS the
 //! accepted contract/catalog view takes a shared permit, and only a pass
 //! that can CHANGE which view is accepted (schema apply, the system-column
-//! upgrade, and the contract install/discard/reload passes) takes the
+//! upgrade, and the passes that reload the accepted view) takes the
 //! exclusive side — the classification rule and its safety argument are
-//! RFC 2026-09-18-shared-schema-gate. Under the old protocol every writer
+//! `docs/decisions/2026-09-18-shared-schema-gate.md`. Under the old protocol every writer
 //! took this gate exclusively because a mutation could advance a Lance
 //! HEAD before discovering an in-flight apply; detached staging abolished
 //! that failure, leaving the gate as pure serialization.
@@ -334,8 +334,8 @@ pub(crate) type TableQueueKey = (String, Option<String>);
 /// The graph-global schema gate: the one shared/exclusive slot.
 ///
 /// It serializes every graph-global schema writer (schema apply and the
-/// system-column upgrade), every pass that installs, discards, or
-/// republishes the accepted schema-contract view, and every pass that
+/// system-column upgrade), every pass that reloads the accepted
+/// schema-contract view (open, refresh, branch sync), and every pass that
 /// changes the live branch-ref set without a CAS over it (branch create
 /// and create-from, whose namespace inventory precedes the native create)
 /// against each other — exclusively — while readers of the accepted view
@@ -393,7 +393,7 @@ pub(crate) struct SchemaSharedPermit {
 
 /// An exclusive schema permit: sole ownership of the accepted-view
 /// transition. Held by schema apply, the system-column upgrade, the
-/// contract install/discard/reload passes, and branch create.
+/// passes that reload the accepted view, and branch create.
 #[must_use = "dropping the permit releases the exclusive schema gate"]
 pub(crate) struct SchemaExclusivePermit {
     inner: Option<OwnedRwLockWriteGuard<()>>,

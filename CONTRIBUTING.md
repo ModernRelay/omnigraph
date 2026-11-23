@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in OmniGraph. This page is the practical how-to; the
+Thanks for your interest in Omnigraph. This page is the practical how-to; the
 rules and decision authority behind it live in [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Start in the right place

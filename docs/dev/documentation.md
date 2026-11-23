@@ -30,18 +30,17 @@ Each has one home below. A fact has one owner; every other page cites it.
 |---|---|---|---|---|
 | Contract | [contract.md](contract.md) | What each operation promises its caller: the target, the gaps and the open decisions | Every session | 53,000 bytes |
 | Work | [workload.md](workload.md) | What the system is optimized for, and the evidence | On demand | 36,000 bytes |
-| Rules | [invariants.md](invariants.md) | What an implementation must never do, each with its reason | Every session | 12,500 bytes |
-| Map | [`AGENTS.md`](../../AGENTS.md) | Which crate owns what, which page to read, the commands and the change discipline | Every session | 14,500 bytes |
+| Rules | [invariants.md](invariants.md) | What an implementation must never do, each with its reason | Every session | 11,500 bytes |
+| Map | [`AGENTS.md`](../../AGENTS.md) | Which crate owns what, which page to read, the commands and the change discipline | Every session | 14,000 bytes |
 | Decision | [`docs/decisions/`](../decisions/README.md) | Why one design was chosen and what was rejected | On demand | 5,000 bytes each |
-| Testing rules | [testing.md](testing.md) | Where a test goes and the rules for adding one | Every session | 8,500 bytes |
+| Testing rules | [testing.md](testing.md) | Where a test goes and the rules for adding one | Every session | 7,500 bytes |
 | Guide | the rest of `docs/dev/` | What spans more than one module and so has no single doc comment to live in | On demand | 60,000 bytes each |
 | User guide | `docs/user/` | Supported behavior, for someone who uses the CLI, the HTTP API or a deployment | By users | 350 lines each |
 | Release note | `changelog.d/`, `docs/releases/` | What changed for a user, written with the change | By users | see [Release notes](#release-notes) |
 
 `scripts/check-docs.py` holds the budgets and fails a page that passes its
-own. Three guides are over the guide budget today (`execution.md`,
-`test-ownership.md`, `writes.md`); each has a ceiling there that only goes
-down. A page over budget is split by owner or cut; a budget is raised only in
+own. A guide over the guide budget has its own ceiling there, which only
+goes down. A page over budget is split by owner or cut; a budget is raised only in
 a pull request whose description says what the page could not lose.
 
 Nothing else is kept:
@@ -111,9 +110,11 @@ format is in [`docs/decisions/README.md`](../decisions/README.md).
 - **A record follows the code.** A change that makes a record's statement
   false changes the record in the same pull request. A record whose design
   is fully removed is deleted.
-- **Code cites a record by its file name** or, for the records that code
-  already names by number, by `RFC NNNN`: the record's **Cited as** line
-  carries that label.
+- **Code cites a record by its file name.** A comment that cites `RFC NNNN`
+  names the record whose **Cited as** line carries that label. Many older
+  comments cite a number that has no record, in a dashed three-digit form,
+  because the design was replaced: when you change such code, replace the citation
+  with the reason in words.
 
 The design files that came before this system, under `docs/rfcs/`, are in
 git history. The last commit that holds them is `65e38056c`:
@@ -143,8 +144,7 @@ contributor reading the implementation.
   compatibility section.
 - Do not link to a decision record. A user page states the behavior itself.
 
-Most authored user pages should fit in 80–220 lines. Longer reference material
-must earn its size and should be generated from the defining schema when
+Reference material should be generated from the defining schema when
 practical.
 
 ## Where a fact goes
@@ -205,10 +205,8 @@ There is no separate release-note approver.
 | `deprecated` | Deprecations |
 | `removed` | Removals |
 
-Start the file with a Markdown bullet and end it with a newline. Code spans
-stay intact; nested lists, fenced examples and second paragraphs are refused
-in new notes. Local links use reference definitions
-at column zero, with a relative destination and optional heading anchor:
+Local links use reference definitions; `scripts/release_notes.py` refuses
+every other note shape with a message that names the fix:
 
 ```markdown
 - Queries accept the new predicate. See the [query guide][predicate-guide].
@@ -216,33 +214,26 @@ at column zero, with a relative destination and optional heading anchor:
 [predicate-guide]: ../docs/user/queries/index.md
 ```
 
-Give reference labels names unique to the note; CommonMark normalizes their case
-and whitespace.
-Definitions occupy one line and have no optional title. Local inline links,
-fragment-only links and URL query parameters on local links are refused; name
-the destination document explicitly. Raw HTML outside code is unsupported; use
-Markdown. Inline external URLs are allowed. Code spans follow CommonMark,
-including literal unmatched backticks and backslashes. Close fenced code blocks
-so they cannot consume the following note. The composer only rewrites link
-definitions outside code, preserving the rest of each fragment apart from
-normalizing CRLF line endings to LF. Do not add release headings to fragments.
+Inline external URLs are allowed. Code spans stay intact and follow
+CommonMark, including literal unmatched backticks and backslashes. The
+composer only rewrites link definitions outside code, preserving the rest of
+each fragment apart from normalizing CRLF line endings to LF.
 
 ### The release file
 
 The release-prep pull request adds `changelog.d/<version>.md`, named for the
-`version` in `release.json`. It opens with an intro of at most 100 words that
+`version` in `release.json`. `scripts/release_notes.py` refuses a release
+file whose headings, word counts or highlight count are out of shape, and its
+message names the limit. It opens with an intro that
 says what users get from the release and, when it breaks something, what
 they must do before they upgrade. Write the intro in
 [ASD-STE100](https://www.asd-ste100.org/) Simplified Technical English: short
 sentences (at most 25 words), active voice, simple present, one statement per
 sentence and no slogans. When the release has any breaking note, a
-`## Why these changes` section of at most 80 words says why the release asks
-users to act; it is printed at the top of the upgrade actions, and a release
-with no breaking note refuses it.
+`## Why these changes` section says why the release asks
+users to act; it is printed at the top of the upgrade actions.
 
-A `## Highlights` section holds three to five `### ` highlights for a minor or
-major release, and up to five for a patch release, each at most 150 words.
-The heading names the change and what it gives users in a few words, with a
+A `## Highlights` section holds `### ` highlights. The heading names the change and what it gives users in a few words, with a
 measured number when there is one (`CSV import: 630 million rows in under
 five minutes`, not `CSV loads go through the planner`). The body opens with
 what changes for the reader: what was slow, refused, wrong or impossible
@@ -277,15 +268,14 @@ format), keep one that states the final value and delete the others, and say
 each fact once.
 
 Notes print as one list per section, in file-name order. To put the most
-important ones first, add a `## Note order` section listing note file names,
-one per `- ` line (`- storage-format-14.breaking.md`); listed notes lead their
+important ones first, add a `## Note order` section listing note file names
+(`- storage-format-14.breaking.md`); listed notes lead their
 sections in that order, the rest follow by file name, and the section itself
 is not printed. A `## Contributors` section lists the GitHub handles to thank,
-one per `- @handle` line; the snapshot refuses a release file without it, and
-the page prints them as one thank-you line. List the pull request authors
+and the page prints them as one thank-you line. List the pull request authors
 since the previous release with
 `gh api repos/ModernRelay/omnigraph/compare/<previous>...<target> --paginate --jq '.commits[].author.login' | sort -u`,
-drop bots, and add anyone else worth thanking. No other headings are allowed.
+drop bots, and add anyone else worth thanking.
 Links follow the note rules. The file is immutable once its release is tagged.
 
 Wrap notes and the release file as you like: the page joins each paragraph
@@ -295,12 +285,14 @@ break. Code blocks and hard line breaks keep their lines.
 ### Pull request titles
 
 The `PR Title` check holds the title to `type(scope)!: description`
-([CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests) and also reads its
-type: a `feat`, `fix` or `perf` pull request adds a note, and a `!` title adds
-a `.breaking.md` note. A maintainer
+([CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests);
+`scripts/check-release-note.py` refuses a typed change without the note its
+type needs, and says which. A maintainer
 adds the `skip-changelog` label when a typed change has nothing users can see.
 The squash commit keeps the title and its `(#NNN)`, which is where the release
 page's pull request links come from.
+
+### Preview, snapshot and publication
 
 Preview local edits and untracked notes from the repository root after
 [activating the documentation environment](#documentation-tools):
@@ -320,15 +312,12 @@ checked in and no bot comment is needed.
 `changelog.d/release.json` names the next `version`, the previous release `base`
 for that maintenance line, an optional `legacy` baseline SHA and the cycle's
 release `format` (`2`, or `1` when the field is absent). These are
-explicit inputs, not inferred from the newest tag. Set `base` to `null` only for
-an initial release without a predecessor. The base and optional legacy source
-must be available with enough history to prove ancestry. The selected notes are paths
+explicit inputs, not inferred from the newest tag. The selected notes are paths
 present in the target tree and absent from the base tree. Content comes from
 the target; category and filename ordering are deterministic.
 
 An unreleased note can be edited or removed with a reverted change. Once a
-release includes it, retain its path and content: a correction or reversal gets
-a new note. A backport carries the same path and uses that branch's previous
+release includes it, a correction or reversal gets a new note. A backport carries the same path and uses that branch's previous
 release. CRLF and LF checkouts have the same identity; other content changes do
 not. The checker validates selected notes' links against the selected tree;
 historical raw notes are not checked against today's moving documentation.
@@ -344,9 +333,7 @@ python3 scripts/release_notes.py snapshot --target HEAD --date 2026-10-01
 Replace the example date with the intended release date. `--replace` regenerates an existing
 generated snapshot before its tag exists. Nothing moves, deletes or stages
 fragments. Preview accepts `--base REF`, `--version vX.Y.Z` and
-`--initial-release` for comparison runs. A snapshot must agree with the version
-and base in `release.json`, including `base: null` for an initial release.
-`legacy` stays `null`. Configuration itself remains part of the recorded inputs.
+`--initial-release` for comparison runs. Configuration itself remains part of the recorded inputs.
 
 The snapshot records the selected target SHA, base SHA and note digests. The
 target SHA documents where generation ran; squash merging may remove that

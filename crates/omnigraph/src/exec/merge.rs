@@ -31,7 +31,7 @@ const MERGE_VALIDATION_MAX_BYTES: u64 = KEYED_WRITE_MAX_BYTES;
 const MERGE_VALIDATION_RESOURCE: &str = "branch-merge retained validation key bytes";
 /// Maximum detached chunk commits one table may chain in a single merge. The
 /// writer rejects a larger plan before its first effect, which bounds the
-/// chain `walk_chain` follows.
+/// chain the collector's `discover_published` follows.
 const MAX_BRANCH_MERGE_DATA_TRANSACTIONS: u64 = 1024;
 /// Bound transaction-history metadata work independently of the chunk-chain
 /// ceiling. This is an optimization budget, never a correctness limit.

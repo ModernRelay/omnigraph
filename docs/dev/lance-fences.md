@@ -26,9 +26,9 @@ graph capabilities.
 
 ### Graph keys
 
-Schema-v9 node/edge tables carry the exact non-null `__id` unenforced primary
-key (edges also `__src`/`__dst`); v8 tables keep the `id`/`src`/`dst` spellings
-introduced in v6, and the explicit system-column upgrade (RFC 0040) renames them
+Node/edge tables carry the exact non-null `__id` unenforced primary key (edges
+also `__src`/`__dst`), or `id`/`src`/`dst` in the legacy system-column vintage;
+the schema IR, not the storage stamp, selects the vintage. The explicit system-column upgrade (RFC 0040) renames them
 with one rename-only `Operation::Project` commit per table
 (`TableStore::renamed_schema`), staged detached and published as a pin (RFC
 0067, detached-only), which must keep every fragment, field id, the primary-key
@@ -125,8 +125,7 @@ flat kNN), ranked exactly; one counter alone does not.
 
 Lance scores fragments no full-text segment covers flat, counting documents and
 tokens over the rows its prefilter admits (`plan_flat_match_query`), so a
-prefilter changes those rows' BM25 scores; `prefilter(false)` scores the whole
-corpus and refines afterwards. A bm25 scan therefore filters before scoring only
+prefilter changes those rows' BM25 scores. A bm25 scan therefore filters before scoring only
 under the plan's recorded full coverage (`Eligibility::BeforeScoring`) and runs
 the postfilter otherwise. Coverage is the union of the column's inverted
 segments' fragment bitmaps, so an untrained segment (the analyzer declaration,
@@ -154,10 +153,6 @@ builds postings where no segment covers a fragment.
 (the untrained segment carries its analyzer)
 
 ### Full-text compatibility
-
-Certified Lance 11 full-text indexes retain their analyzer compatibility under
-Lance 13. Uncertified or incompatible indexes still require an explicit rebuild
-before search.
 
 Every full-text segment used by a query must carry Omnigraph's artifact-scoped
 analyzer certificate. The certificate is bound to the immutable UUID, index
@@ -318,7 +313,7 @@ merge-insert matches a source to the full table schema only in the same field
 order (otherwise it takes its subschema path), so the evolved schema keeps the
 catalog order. A dropped column's values stay in the data files until optimize
 rewrites the fragment (dropped-column erasure, next row). Making a nullable
-column required (#721) commits a `Project` with `preserves_nullability: false`,
+column required commits a `Project` with `preserves_nullability: false`,
 the flag Lance's own `alter_columns` uses, after the engine has checked the
 rows. A deleted row keeps its value in the data file, and lance#10557 (after
 13.0.0) makes `alter_columns` count deleted rows for the same reason, so the
@@ -331,16 +326,12 @@ planning-only option that `optimize` leaves at its 10% default.
 **Owners:**
 `lance_surface_guards.rs::metadata_only_schema_evolution_keeps_blob_files_ids_and_index_coverage`,
 `lance_surface_guards.rs::include_deleted_rows_returns_a_deleted_rows_stored_null_issue_721`,
-`schema_apply.rs` (`issue_721_*`), the deferred
-`benchmarks/deferred/crates/omnigraph/tests/compaction_memory.rs.disabled`
-schema-apply instrument (not an active test)
+`schema_apply.rs` (`issue_721_*`)
 
 ### Dropped-column erasure
 
 A drop's `Operation::Project` keeps every data file that also holds a surviving
-column, and that file's `DataFile::fields` still lists the dropped field id. A
-Blob-v2 column is listed by its own id, never by its descriptor children's, so
-on a table without drops every listed id is a schema field id. Lance 13's
+column, and that file's `DataFile::fields` still lists the dropped field id. Lance 13's
 planner also selects a fragment when a file contains only dropped user columns
 but remains necessary for row lineage. It does not select a lone fragment solely
 because a file mixes kept and dropped columns, so those bytes still need the
@@ -363,10 +354,7 @@ the old files with their sidecars once no retained version names them.
 **Owners:**
 `lance_surface_guards.rs::compacting_a_chosen_fragment_drops_the_bytes_of_dropped_columns`,
 `integration/maintenance.rs::optimize_then_cleanup_erases_dropped_property_values`,
-`staged_tests.rs::table_compaction_planning_refuses_source_budgets`, the
-deferred
-`benchmarks/deferred/crates/omnigraph/tests/compaction_memory.rs.disabled`
-erasure instrument (not an active test)
+`staged_tests.rs::table_compaction_planning_refuses_source_budgets`
 
 ### Compaction of Blob tables
 
@@ -393,9 +381,7 @@ its scanner and ignores the batch size when planning. A set batch size beats
 `LANCE_DEFAULT_BATCH_SIZE` on the V2.x read path, where the variable is only the
 fallback. The fence is the scanner shape: a scanner built as compaction builds
 it honors an explicit batch size over the variable. No CI-run test observes
-Lance passing `CompactionOptions::batch_size` into that scanner; the historical
-`compaction_memory.rs` instrument was the only observer and is now deferred
-under `benchmarks/deferred/` pending GQ optimization support. This bounds
+Lance passing `CompactionOptions::batch_size` into that scanner. This bounds
 managed payload bytes per scanner batch, not total peak memory: decoder, I/O and
 copy buffers are additional, and one oversized value may exceed the target. Drop
 the derivation at the bump whose compaction streams Blob payloads.
@@ -409,9 +395,7 @@ variable),
 `integration/maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`,
 `integration/maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`,
 `integration/maintenance.rs::optimize_compacts_blob_fragments_with_deleted_rows`,
-`staged_tests.rs::compaction_blob_batch_rows_bounds_one_batch`, the deferred
-`benchmarks/deferred/crates/omnigraph/tests/compaction_memory.rs.disabled`
-instrument (not an active test)
+`staged_tests.rs::compaction_blob_batch_rows_bounds_one_batch`
 
 ## Indexes and column patches
 
@@ -435,17 +419,14 @@ after it and its index-rows ceiling measures the lag the plan shows.
 ### Index segments
 
 Lance masks a logical index's results by the union of its segments' fragment
-coverage. On a stable-row-ID table an update keeps the row ID and moves the row
-to a new fragment; once a delta segment covers that fragment, the older
-segment's entry for the row passes the mask, so full-text search returns the row
-for a term it no longer holds (twice for a term both versions hold) and a BTREE
-equality returns it for its old value. Lance applies per-segment ownership to
+coverage, so after an update on a stable-row-ID table a delta segment lets the
+older segment's stale entry for the row through. Lance applies per-segment ownership to
 vector search only (lance#7371, lance#8351); the full-text and scalar paths are
 reported as lance#9817. Omnigraph never adds a delta segment: `stage_index_fold`
 rebuilds a lagging index whole and the full-text rebuild replaces every segment.
 An untrained full-text segment (an empty fragment bitmap) carries its analyzer
-to every row it does not cover, with rows and scores equal to a full build; with
-no segment, Lance's flat path tokenizes with a bare `SimpleTokenizer`. Drop the
+to every row it does not cover, with rows and scores equal to a full build
+([full-text analyzer](#full-text-analyzer)). Drop the
 whole-rebuild rule at the bump whose scalar and full-text search apply segment
 ownership.
 
@@ -459,13 +440,9 @@ ownership.
 A fold rebuilds a lagging vector index whole under its partition count
 (`TableStore::stage_index_fold`, and the same rebuild inside
 `stage_index_reconciliation`). It skips the column, as pending index work, only
-when the uncommitted build fails with `lance::Error::Unprocessable`, and treats
-every other failure as an error, so a storage fault during a rebuild is never
-reported as a column that cannot train. Lance 13 raises `Unprocessable` only
-from vector training (`train_kmeans`, the PQ trainers), when the finite,
-non-null vectors are fewer than the centroids to train: a column whose vectors
-are all null or all non-finite has none, and a column with at least one builds
-even with fewer vectors than partitions. The declared-index planner asks the
+when the uncommitted build fails with `lance::Error::Unprocessable`, which
+Lance 13 raises only from vector training, when the finite, non-null vectors
+are fewer than the centroids to train. The declared-index planner asks the
 same question before it builds, by counting non-null vectors
 (`vector_column_trainable`). Re-derive the skip at the bump that moves the
 variant or the training rule.
@@ -589,8 +566,8 @@ or a raced delete (`NotFound`), at most three reads in all, around the listed
 reads that still go through Lance (`list_branches`) and the exact reads above.
 Resolving a logical branch name (`branch_control::resolve_live_native_branch`)
 lists `_refs/branches/` once and reads only that branch's own incarnations, so
-another branch's retirement rewrite, or its malformed retirement record, no
-longer fails a branch open or a held-ref re-resolve; fresh creation narrows content reads to its source and the target's equal,
+another branch's retirement rewrite, or its malformed retirement record, does
+not fail a branch open or a held-ref re-resolve; fresh creation narrows content reads to its source and the target's equal,
 ancestor and descendant names.
 Below format 18, operations that require a complete inventory, including
 logical enumeration and cleanup, still read every active ref; maintenance and
@@ -609,11 +586,7 @@ bump whose `from_path` reads a ref in one `get`.
 Stock `cleanup_old_versions` is never called on a graph table. Lance 13 does not
 trace detached manifests, and since lance#8944 it lists `data/` through
 `max(retained-manifest floor, now − 7 days)`, making old files referenced only
-by detached versions eligible for deletion while their manifests remain. The
-native guard puts the attached v1 manifest before the detached file, and the
-file before the seven-day cutoff, so only the seven-day rule can sweep the file.
-Files shared with retained attached versions stay protected; a recent detached
-snapshot can still lose an old file it inherits. An external Lance cleanup of
+by detached versions eligible for deletion while their manifests remain. An external Lance cleanup of
 graph tables or `__manifest`, whose proposals and unattached snapshots are
 detached versions, can therefore make retained snapshots, including the current
 graph, unreadable. The engine collector discovers canonical registrations,
@@ -869,10 +842,3 @@ chunks (`ordered_cursor.rs`).
 **Owners:** `integration/changes.rs`, `integration/export.rs` and
 `integration/merge_fast_forward.rs` wide-row tests
 (`tests/helpers/wide_rows.rs`)
-
-### MemWAL
-
-Upstream MemWAL has no Omnigraph consumer: no stream profile, token ledger,
-hidden stream column, or `_mem_wal` path exists.
-
-**Owners:** `integration/lifecycle.rs`, cluster removed-field diagnostics

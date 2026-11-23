@@ -1,5 +1,12 @@
 # Branch protection on `main`
 
+**Audience:** anyone who changes CI, the required contexts or how pull
+requests land on `main`
+**Authority:** the merge policy on `main` and how to change or relax it;
+`.github/branch-protection.json` holds the exact settings, the `ci_gate` job in
+`ci.yml` and `scripts/ci_gate.py` hold which jobs block `main`, and
+[ci.md](ci.md) describes the jobs
+
 `.github/branch-protection.json` is the reviewed policy. An administrator
 applies it with `scripts/apply-branch-protection.sh`; CI does not mutate branch
 protection.
@@ -24,40 +31,14 @@ branch first.
 `CI Gate` is the `ci_gate` job at the end of `ci.yml`. It needs every `ci.yml`
 job that blocks `main`, runs under `if: always()` so it reports whatever those
 jobs did, and hands their results to `scripts/ci_gate.py`, whose verdict is
-the context. The jobs it needs, and so the jobs that block `main`:
-
-- `classify_changes` (`Classify Changes`)
-- `check_agents_md` (`Check AGENTS.md Links`)
-- `workflow_action_pins` (`Check Workflow Action Pins`)
-- `cargo_deny` (`Dependency Guard (cargo deny)`)
-- `graph_vocabulary_guard` (`Graph Vocabulary Guard`)
-- `fmt` (`Format (rustfmt)`)
-- `lint` (`Lint (clippy)`)
-- `test` (`Test Workspace`)
-- `storage_upgrade_compatibility` (`Storage Upgrade Compatibility`)
-- `test_aws_feature` (`Test omnigraph-server --features aws`)
-
-The verdict: `success` passes; `failure` and `cancelled` fail, whether or not
-the job could have skipped; `skipped` passes exactly when the job's own `if:`
-in `ci.yml` was false on this event, as the script's table restates it
-(`fmt` on a pull request or queue entry with `run_full_ci` true, `lint` there
-or on a push to `main` with `run_full_ci` true, `test` with `run_full_ci`
-true, `graph_vocabulary_guard` off pull requests and queue entries; the other
-six never skip); a result set that is not exactly the table's jobs, an
-unsupported event, or a classifier output other than `true`/`false` fails.
-GitHub counts a skipped job as a passed required check, so a rule that listed
-the ten jobs by name admitted a job that never ran; the gate does not.
+the context; its docstring states the verdict.
 
 Which jobs block `main` is therefore the gate's `needs:` list and the
 script's table, changed together in a pull request. Adding a blocking job,
 renaming one or retiring one is one reviewed diff; the rule page is not
 touched. `scripts/check-merge-group-triggers.py`, a step of `Check Workflow
-Action Pins`, holds the two lists equal and pins the gate's wiring: `if:
-always()`, no `continue-on-error` on the gate or on any job it needs, exactly
-a SHA-pinned checkout and an unconditional `python3 scripts/ci_gate.py` step
-with explicit `shell: bash` and the four expected `env:` values, and a
-validator job with no condition, no dependencies and no error suppression that runs the validator
-and the gate's self-test. The gate, its dependencies and the validator use
+Action Pins`, holds the two lists equal and pins the gate's wiring (its
+docstring lists what it checks). The gate, its dependencies and the validator use
 block-form job mappings so every guarded key can be inspected. The `needs:`
 list accepts block and flow form, including multi-line flow lists.
 
@@ -181,7 +162,7 @@ A title edited after queueing does not change that captured subject: the
 edit re-runs only the pull-request check, and whether a red result there
 removes the entry is undocumented, as for the regression gate above. That
 the landed commit's subject is the captured one is inferred from the
-payload, not documented; one observed queue run confirms it.
+payload, not documented.
 This merge-group run executes the queued commit's copy of the checker, like
 every merge-group run; the policy copy ran on the pull request.
 
@@ -256,8 +237,7 @@ after every apply.
 
 `.github/CODEOWNERS` names the reviewers GitHub requests for workspace
 members: one anchored line per member directory (under `crates/`, `tools/`
-and `skills/`) except `omnigraph-gqt-core`, `omnigraph-gqt-served` and
-`omnigraph-mcp`, plus one for `/deny.toml`, the dependency allowlist. A member
+and `skills/`), plus one for `/deny.toml`, the dependency allowlist. A member
 without a line, like every other path, requests nobody. GitHub reads the copy on `main`,
 requests the listed people when a pull request is opened ready for review,
 marked ready, or gains a matching path in a later push, and never requests the

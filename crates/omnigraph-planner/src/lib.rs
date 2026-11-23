@@ -1,4 +1,4 @@
-//! Planner and optimizer for Omnigraph operations (RFC 0068).
+//! Planner and optimizer for Omnigraph operations.
 //!
 //! The crate owns four things: the logical plan an operation resolves to, the
 //! physical plan the optimizer selects, the fixed pass sequence between them,

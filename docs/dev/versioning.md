@@ -39,18 +39,10 @@ from stamp 13. The same command stamps a v14 to v17 graph to v18 in
 place, rewriting no row: main's stamp commit carries the branch rows and the
 branch ref files are unlinked after it.
 
-- v4 was the last released pre-identity format, used by Omnigraph 0.8.x.
-- v5 was an unreleased development format that introduced SchemaIR v2,
-  stable table/incarnation identity, identity-keyed manifest rows, and
-  identity-derived paths.
-- v6 preserves v5 and adds exact non-null physical `id` fencing through
-  Lance's unenforced primary-key metadata. It is the 0.9.x/0.10.x format.
-- v7 preserves v6's columns and re-keys `__manifest` registration and
-  tombstone rows ([RFC 0062](../decisions/0062-manifest-version-clock.md)): the
-  trailing segment of a `table_version:` / `table_tombstone:` `object_id` is
-  the `__manifest` version that wrote the row, and a table's current
-  registration is the one with the greatest manifest version, not the greatest
-  per-native-ref Lance version.
+The per-stamp history of the formats this binary neither serves nor converts
+(v1 to v7, v10 and v11) is the `INTERNAL_MANIFEST_SCHEMA_VERSION` doc comment in
+`crates/omnigraph-catalog/src/migrations.rs`.
+
 - v8 preserves v7's registration clock and adds logical retirement metadata
   on native graph refs.
   Branch deletion retains exact native parent history while removing logical
@@ -63,17 +55,6 @@ branch ref files are unlinked after it.
   no separate stamp: `omnigraph schema upgrade-system-columns` stages detached
   renames like schema apply (RFC 0067) and publishes the renamed table
   references and replacement contract row together.
-- v10 preserves v9's layout and lets a table registration carry
-  `omnigraph.staged_version` and `omnigraph.transaction_uuid` (RFC 0067): the
-  detached Lance version a pin was staged as and the transaction promotion
-  replays at its linear target. Existing registrations without the keys are
-  linear pins. Both system column vintages are stamped v10; the system-column upgrade does not advance the stamp.
-- v11 preserves v10's layout and stops promoting pins (RFC "Detached-only
-  tables"): `published_dataset_version` names no Lance version, a table's
-  history is its chain of detached commits, and a registration carries
-  `omnigraph.last_linear_version`, the highest linear version a v10 pin
-  reached; rows at or below it resolve through their linear twin, rows above
-  it open their detached version directly.
 - v12 kept the ten logical fields present at v11 (the unused `base_objects`
   list was removed) and stored them as three columns: `object_id`,
   `object_type` and `record`, a Lance packed struct (`lance-encoding:packed`)
@@ -84,9 +65,7 @@ branch ref files are unlinked after it.
   whole. Lance 13's default filtered-scan materialization can split packed
   children between early and late reads; the contract-row scan uses
   `MaterializationStyle::AllEarly` to keep the projected record together.
-  Isolated packed-child projection remains unsupported. The original v12
-  transition converted a v11 branch on its next publish, so predecessor roots
-  can mix v11 and v12. Neither is a served format.
+  Isolated packed-child projection remains unsupported.
 - v13 preserves the packed record and adds nullable `LargeUtf8` columns
   `schema_source` and `schema_ir`. Only the `schema_contract` row carries
   these texts; its `metadata` records `schema_ir_hash`,
@@ -177,7 +156,7 @@ branch ref files are unlinked after it.
   write a control fact into a version stamped below 17. Only the stamp-only
   route of `omnigraph upgrade` stamps a served graph's live branches 17 or
   above, with every process on the graph stopped; a cluster-managed graph,
-  which `upgrade` refuses, has no route past 16 yet.
+  which `upgrade` refuses, has no route past 16.
 - v18 moves a branch's existence from Lance's ref file under `_refs/branches/`
   into `main`'s catalog (RFC 2026-11-19, "Branch existence in the catalog"):
   a `branch` row per live branch in the config map of `main`'s version file
@@ -194,11 +173,6 @@ branch ref files are unlinked after it.
   and a retired row per retired ref, each other live ref takes its own
   metadata commit, and every ref file is unlinked as the route's follow-up.
   A fresh graph is born at 18.
-- the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
-  and are not supported migration inputs. Reuse of a numeric stamp by another
-  design (RFC 0062, RFC 0042 or RFC 0040) does not make an experimental graph
-  compatible. Such graphs require export with the build that wrote them and
-  rebuild at a fresh root.
 
 Normal open refuses lower and higher stamps before recovery or table decoding;
 it never migrates a graph. `omnigraph upgrade` is the one conversion, on a
@@ -314,7 +288,7 @@ publish rewrites every row, so the census reads about 1.5 N² cells for N
 commits on one lineage and refuses above about 75,000 commits. A stamp-8 or
 stamp-9 `__manifest` never loses a row or a version: its head holds one
 registration row per table and publish, the census reads every version since
-`init`, and the commit count at which it refuses has not been derived.
+`init`.
 `MAX_CENSUS_SNAPSHOT_BYTES` (1 GiB) bounds the `TableRow` values the census
 retains, one per table for every commit record and head, and the
 `TableRegistration` values it keeps for the first version of every ref and
@@ -335,37 +309,19 @@ with the requested version; a version of main below its genesis commit is
 `manifest_not_found`. Retired refs are never converted: their heads resolve
 through the writer shards.
 
-What a converted 0.11.x root (stamp 8 or 9) does not carry over:
+What a converted 0.11.x root (stamp 8 or 9) does not carry over (the old
+commits' schemas, table versions above a pin, table versions a 0.11.x
+`cleanup` removed, `_graph_commit_recoveries.lance/`) is in
+[the upgrade guide](../user/operations/upgrade.md#storage-upgrade). Every
+legacy `HistoryRecord` names the contract live at the upgrade
+(`UpgradeWork.schema_contents` is 1). `cleanup` deletes no version of main's
+or a live branch's `__manifest` (`would_prune` is only reported; retired trees
+are reclaimed separately), so a cleanup policy that retains a pre-upgrade
+`__manifest` version pinning a removed table version reports that table `is
+absent from the listing` and sweeps nothing for it. The route writes no `last_linear_version` fill commit: `commit list` after the
+upgrade equals `commit list` before it.
 
-- One schema contract for every pre-upgrade commit. 0.11.x overwrote the root
-  objects at each schema apply, so every legacy `HistoryRecord` names the
-  contract live at the upgrade (`UpgradeWork.schema_contents` is 1). The
-  table set and pins of an old commit are exact. A read at an old commit id
-  is planned against the live contract, as 0.11.x did.
-- Lance table versions above a pin, left by an interrupted 0.11.x write, are
-  not detected: the upgrade opens each table of main's head at its pinned
-  version only, for the column comparison. `cleanup` lists them under
-  `foreign_versions`.
-- 0.11.x `cleanup`, and 0.11.x `schema apply --allow-data-loss` (which ran
-  the same version removal on the tables it changed), removed table versions
-  and no `__manifest` version, so a retained pre-upgrade `__manifest` version
-  can pin a table version that is gone. The collector then reports `is absent
-  from the listing` and sweeps nothing for that table. `cleanup` deletes no
-  version of main's or a live branch's `__manifest` (`would_prune` is only
-  reported; retired trees are reclaimed separately), so the refusal lasts
-  while a policy retains such a version. Any narrower earlier `cleanup`
-  leaves such versions too: it sweeps the table versions only its
-  `would_prune` versions pin, and a wider policy retains those again.
-  `cleanup --keep 1` retains only each live branch's head, each non-main
-  branch's base, merge bases and tags, and passes unless one of those is
-  such a version; `--older-than` and a wider `--keep` refuse until no
-  version they retain pins a removed table version.
-- `_graph_commit_recoveries.lance/` stays as an unreferenced dataset.
-- The route writes no `last_linear_version` fill commit: `commit list` after
-  the upgrade equals `commit list` before it.
-
-Stamps 10 to 13 were written by main development builds only, 13 from
-2026-10-01 to 2026-10-04. Stamps 10 to 12 and every stamp below 8 stay
+Stamps 10 to 13 were written by main development builds only. Stamps 10 to 12 and every stamp below 8 stay
 rebuild-only. Stamps that exist only between releases get no
 conversion unless a route is written for them, as for 13; each layout change
 still takes a new stamp, so a graph written in between is refused and never
@@ -374,11 +330,8 @@ offline protocol.
 
 ## Recovery sidecars
 
-There is no recovery sidecar protocol to version. Builds up to the 0.11 line
-wrote recovery sidecar schema v9 under `__recovery/`; since RFC 0067 no writer
-arms one and no build interprets one. A read-write open refuses a graph that
-still carries a sidecar until the build that wrote it has resolved it. See
-[recovery.md](recovery.md).
+There is no recovery sidecar protocol to version. See
+[recovery.md](recovery.md#sidecars-from-older-builds).
 
 ## Lance contract
 
@@ -387,8 +340,7 @@ The workspace resolves the unmodified crates.io Lance package family to
 Engine adapters and compatibility boundaries are documented in
 [Lance compatibility fences](lance-fences.md). A dependency bump alone
 does not change the Omnigraph manifest format. Adopting a new Lance file format
-or a behavior that changes persisted graph meaning does. The Lance 13 bump moved no graph stamp: a format-16
-graph written under Lance 11 is served as it is.
+or a behavior that changes persisted graph meaning does.
 Experimental V2_3, spilled row lineage and stable-row-ID fragment-reuse indexes
 remain outside the graph contract. Retaining V2_2 alone is not a general rollback
 guarantee: qualify old readers against actual new writes using the predecessor
@@ -450,7 +402,8 @@ MCP and OAuth metadata retain their separate standard protocols.
 The CLI checks the configured server's `HEAD /healthz` before each data request,
 without credentials and with a five-second discovery bound, then validates the
 actual response header before consuming its body. Discovery failure means that
-request was not sent; a response mismatch after dispatch leaves effects unknown.
+request was not sent; a response mismatch after dispatch leaves effects unknown
+([`E4`](contract.md#rules-for-every-operation)).
 Graph HTTP requests follow no redirects and retry nothing automatically. See the
 [HTTP admission decision](../decisions/2026-09-30-v012-http-admission.md) and
 [operator guidance](../user/operations/server.md).
@@ -476,7 +429,7 @@ rebuild before search; see the
 
 ## Registry publication status
 
-crates.io publication is paused as of 2026-08 because access to the account
+crates.io publication is paused because access to the account
 owning the historical `omnigraph-*` names is unavailable. Those registry
 packages remain frozen at 0.8.0; `omnigraph-db` is reserved at 0.0.1 as a
 fallback. Current binaries ship through the installer, Homebrew, Docker, and
@@ -498,9 +451,6 @@ GitHub Releases, and the TypeScript SDK ships through npm. Do not document
    plus refusal and rebuild fallback evidence.
 5. Update the upgrade guide and release notes.
 
-No publication raises a branch's stamp above 16, so an existing branch reaches a
-stamp above 16 only by an explicit `omnigraph upgrade` route.
-
 ### Pins and schema contracts
 
 1. A change to what a pin or a schema-contract row records is a manifest
@@ -511,14 +461,7 @@ stamp above 16 only by an explicit `omnigraph upgrade` route.
 
 ### Lance
 
-1. Read every full page in the relevant domains from [lance.md](lance.md).
-2. Review the complete upstream release/source delta.
-3. Run `lance_surface_guards.rs` first, then the focused engine suites and
-   canonical workspace test.
-4. Update only the affected entries in
-   [Lance compatibility fences](lance-fences.md).
-5. Put bump evidence and historical findings in the release note or RFC that
-   consumed them, not an accumulating live-doc audit ledger.
+Follow the [dependency bump checklist](lance.md#dependency-bump-checklist).
 
 ### Wire and release
 
