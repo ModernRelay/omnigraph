@@ -674,6 +674,9 @@ worker declares itself ready, before the measured step begins, to witness that
 the preparation wrote nothing there (the worker holds no store credentials;
 the product's children receive the run's `AWS_*` variables). The clone is deleted
 after a verified repetition and kept for inspection after a failed one. A
+deletion removes the current objects and a listing witnesses it; on a
+versioned bucket the noncurrent versions stay until the bucket's lifecycle
+rule expires them, and the same holds for a server's cluster root. A
 `--- restart` is never the measured step on this route and is a no-op
 elsewhere in the program; `--- schema` and seeds, `--- csv` sections, seams,
 pins, settings and concurrent steps have no command-line form and are refused
@@ -716,7 +719,9 @@ its `omnigraph` taken from the store's `builds/<sha>/<triple>/omnigraph` or,
 on a miss, built from `git archive <sha>` in a scratch directory under the
 dataset cache with `cargo build --release --locked -p omnigraph-cli --bin
 omnigraph` and put there (a clean tree by construction); `<ref>=<path>` names
-the binary instead and puts nothing. Every ref is resolved, then every ref's
+the binary instead and puts nothing, and a full lowercase 40-character commit
+sha in that form is the commit as written, so it needs neither `git` nor a
+repository. Every ref is resolved, then every ref's
 binary is inspected, before any run: a product writing another storage format
 refuses the whole command as `not_comparable`, and a binary whose `version
 --json` names another commit than its ref is refused as
@@ -837,14 +842,17 @@ both count past the block's declared warmup and duration.
 
 ### A server per repetition
 
-`run --store <directory> --server-product[=<path>]` plans every selected
-scenario in the served environment of the host's local backend at
-`ResetMode::Rebuild`, spelled `rebuild`. A server point at that level is
+`run --store <directory | s3://bucket/prefix> --server-product[=<path>]`
+plans every selected scenario in the served environment of the store's
+backend, the host's probed local one or the one `--backend` declares for an
+`s3://` store, at `ResetMode::Rebuild`, spelled `rebuild`. A server point at that level is
 `ProcessLifecycle::FreshPerRepetition`, admits a workload step that loads or
 moves a head (the graph is the repetition's own), and admits the measured
 block with at most `SERVED_BLOCK_SESSIONS` (64) sessions. `--server` keeps
-`reset: none` and its refusals. `validate_run_options` requires a local store
-and the direct route, and refuses the flag on an engine point.
+`reset: none` and its refusals. `validate_run_options` requires a store of
+the declared backend's kind (an `s3://` store declares an S3 backend, a local
+store a local one) and the direct route, and refuses the flag on an engine
+point.
 
 `ProductBinary.server` is the server binary's canonical path and file digest:
 the path the flag gives, or `omnigraph-server` beside the product. The record
@@ -860,15 +868,20 @@ acquires the point's base from the store for two things only, the logical
 digest the point binds and the row count of every node and edge table, and
 never reads it again. Per repetition it:
 
-1. creates `<store>/servers/<run>-<repetition>` and writes a cluster source
+1. takes `<store>/servers/<run>-<repetition>` from the store, a directory or
+   a prefix of the bucket that a listing shows empty
+   (`FixtureStore::empty_server_root`), and writes a cluster source
    beside the run's scratch: the fixture's schema, and a policy that lets
    `act-bench-steps` and one `act-bench-s<n>` per block session read, write,
    and create, delete, merge, publish and drop on any branch;
 2. runs the product's `omnigraph cluster apply` onto the root, under the
    run's child environment plus an `OMNIGRAPH_HOME` created empty for the
    repetition, and refuses a receipt that is not complete and converged, or
-   an admission lock left behind;
-3. starts the server with `--cluster file://<root> --bind 127.0.0.1:0` under
+   an admission lock left behind: the lock file under a local root, and
+   under a bucket, where a release keeps the lock's key, a `lock_id` in the
+   product's `cluster status --json`;
+3. starts the server with `--cluster file://<root> --bind 127.0.0.1:0` (a
+   root under a bucket as its `s3://` URI) under
    the same environment, a `TMPDIR` of its own under the run's scratch and
    the token map, reads the bound address from its stdout, polls `/readyz`
    and reads the commit the server names at `/healthz`
@@ -879,7 +892,8 @@ never reads it again. Per repetition it:
    the private stdin frame, and redacted from every error;
 5. stops the server (SIGTERM, 40 seconds, then a kill), takes its peak
    resident set from the reaped process as the sample's `peak_rss_bytes`,
-   and deletes the root.
+   and deletes the root through the store, which lists it empty afterwards
+   (`FixtureStore::delete_server_root`).
 
 The worker (`execute_owned_server_rep_signaled`) calls
 `omnigraph_gqt_core::provision_served`, which executes the dataset file
@@ -912,7 +926,9 @@ sample carries `server_executable_sha256` and no receipt, base digest,
 physical digest, store calls or merge evidence; the worker leaves
 `peak_rss_bytes` absent and the owner sets it. The record's SUT is the
 product identity with `server_executable_sha256`, beside the machine, the
-probed backend and the base; a product record names a server binary exactly
+backend (probed for a local store, the run's declaration with
+`probe: "declared"` for a bucket) and the base; a product record names a
+server binary exactly
 when its target is the server. Validation requires the server's peak on
 every sample, and the projection leaves the logical-call columns absent.
 `report` names such a row `product-server`.

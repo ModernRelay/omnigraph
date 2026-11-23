@@ -659,9 +659,14 @@ fn validate_run(
         );
     }
     if matches!(environment.backend, Backend::S3 { .. })
-        && (environment.target != Target::Engine || protocol.reset != ResetMode::Clone)
+        && !matches!(
+            (environment.target, protocol.reset),
+            (Target::Engine, ResetMode::Clone) | (Target::Server, ResetMode::Rebuild)
+        )
     {
-        return Err("gqt-v1 reaches an S3 store embedded and under reset: clone only".into());
+        return Err(
+            "gqt-v1 reaches an S3 store embedded under reset: clone, or through a server started per repetition under reset: rebuild".into(),
+        );
     }
     match environment.target {
         Target::Engine => {

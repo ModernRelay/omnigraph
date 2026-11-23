@@ -987,6 +987,67 @@ fn a_block_plans_against_a_server_only_under_rebuild_and_within_its_session_boun
     );
 }
 
+/// A declared S3 backend, as a run over a bucket names it with `--backend`.
+fn declared_s3_backend() -> crate::case::Backend {
+    crate::case::Backend::S3 {
+        implementation: crate::case::S3Implementation::Rustfs,
+        implementation_version: "1.0.0-beta.12".into(),
+        region: "us-east-1".into(),
+        storage_class: "STANDARD".into(),
+        versioning: crate::case::S3Versioning::Disabled,
+        image_digest: Some(format!("sha256:{}", "e".repeat(64))),
+    }
+}
+
+#[test]
+fn a_rebuild_point_over_an_s3_store_plans_with_the_declared_backend() {
+    let directory = tempfile::tempdir().unwrap();
+    let environment =
+        crate::catalog::served_environment(declared_s3_backend(), NetworkPosition::SameHost);
+    let plan = catalog_of(directory.path(), SERVED_WORKLOAD)
+        .plan_with("writers", &environment, Some(ResetMode::Rebuild))
+        .unwrap_or_else(|diagnostics| {
+            panic!(
+                "a declared S3 backend plans a server point under reset: rebuild: {diagnostics:?}"
+            )
+        });
+    assert_eq!(
+        plan.definition.environment.target,
+        crate::gqt_case::Target::Server
+    );
+    assert_eq!(plan.definition.protocol.reset, ResetMode::Rebuild);
+    assert_eq!(plan.definition.environment.backend, declared_s3_backend());
+    let accepted = RunOptions {
+        store: Some("s3://bucket/prefix".into()),
+        backend: Some(declared_s3_backend()),
+        server_product: Some(ServerProduct::Beside),
+        ..RunOptions::default()
+    };
+    validate_run_options(&plan, &accepted).unwrap();
+    let local_store = RunOptions {
+        store: Some("/tmp/bench-store".into()),
+        ..accepted.clone()
+    };
+    let refusal = validate_run_options(&plan, &local_store)
+        .unwrap_err()
+        .message;
+    assert!(
+        refusal.contains("an s3:// store declares an S3 backend"),
+        "a point planned over S3 with a local store: {refusal}"
+    );
+    let s3_store = RunOptions {
+        backend: None,
+        ..accepted
+    };
+    let refusal = validate_run_options(&rebuild_point(), &s3_store)
+        .unwrap_err()
+        .message;
+    assert!(
+        refusal.contains("an s3:// store declares an S3 backend"),
+        "a point planned over a local backend with an s3:// store: {refusal}"
+    );
+}
+
 #[test]
 fn a_rebuild_point_runs_with_a_local_store_and_a_server_binary_and_nothing_else() {
     let plan = rebuild_point();
@@ -1011,7 +1072,7 @@ fn a_rebuild_point_runs_with_a_local_store_and_a_server_binary_and_nothing_else(
         (
             "an s3 store",
             |o| o.store = Some("s3://bucket/prefix".into()),
-            "an s3:// store and --backend do not apply",
+            "an s3:// store declares an S3 backend",
         ),
         (
             "a local route",
@@ -1238,6 +1299,7 @@ mod process {
     use crate::gqt_server_process::{
         LISTEN_ADDR_PREFIX, ServerDeadlines, ServerProcess, apply_cluster, write_cluster_config,
     };
+    use crate::store::{FixtureStore, ServerRoot};
     use crate::supervisor::tests::worker_script;
 
     /// A stand-in for the server binary: it records how it was started, prints
@@ -1275,10 +1337,26 @@ mod process {
         ready: &GraphServer,
         deadline: Duration,
     ) -> Started {
+        start_over(None, product, body, ready, deadline)
+    }
+
+    /// [`start_beside`] over `root`; with none, over a directory `root` of
+    /// the stand-in's own.
+    fn start_over(
+        root: Option<ServerRoot>,
+        product: Option<&str>,
+        body: &str,
+        ready: &GraphServer,
+        deadline: Duration,
+    ) -> Started {
         let (guard, directory, script) = worker_script(body);
-        let (root, logs) = (directory.path().join("root"), directory.path().join("logs"));
-        std::fs::create_dir(&root).unwrap();
+        let logs = directory.path().join("logs");
         std::fs::create_dir(&logs).unwrap();
+        let root = root.unwrap_or_else(|| {
+            let root = directory.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            ServerRoot::Local(root)
+        });
         let environment = [("STAND_IN_ADDRESS".to_string(), ready.address().to_string())];
         let tokens = [("act-bench-steps".to_string(), "started-token".to_string())];
         let started = ServerProcess::start(
@@ -1325,6 +1403,113 @@ mod process {
         );
         let stopped = server.stop(Duration::from_secs(20)).unwrap();
         assert!(stopped.peak_rss_bytes > 0);
+    }
+
+    /// A cluster root under a bucket, one segment of its prefix carrying a
+    /// colon as an EC2 role's store does.
+    const BUCKET_ROOT: &str = "s3://bucket/AROA:i-0/servers/01JRUN-00000001";
+
+    #[test]
+    fn a_server_over_a_bucket_is_started_with_the_prefix_as_its_cluster() {
+        let ready = GraphServer::start(&[]);
+        let (_guard, _directory, script, started) = start_over(
+            Some(ServerRoot::S3(BUCKET_ROOT.into())),
+            None,
+            &listening("'exit 0'"),
+            &ready,
+            Duration::from_secs(20),
+        );
+        let server = started.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            sidecar(&script, "args"),
+            format!("--cluster\n{BUCKET_ROOT}\n--bind\n127.0.0.1:0\n"),
+            "a root under a bucket reaches the server as the URI the store names"
+        );
+        server.stop(Duration::from_secs(20)).unwrap();
+    }
+
+    /// A stand-in for `omnigraph`: it appends each invocation's arguments to
+    /// `<script>.calls`, answers `cluster apply` with a converged receipt and
+    /// `cluster status` with the document in `STAND_IN_STATUS`.
+    const PRODUCT: &str = "printf '%s\\n' \"$*\" >> \"$0.calls\"\ncase \"$*\" in\n*'cluster apply'*) printf '%s' '{\"status\":\"complete\",\"result\":{\"converged\":true}}' ;;\n*'cluster status'*) printf '%s' \"$STAND_IN_STATUS\" ;;\nesac\n";
+
+    /// `apply_cluster` of the stand-in product onto `root`, its status read
+    /// answered with `status`: the outcome and the invocations it saw.
+    fn applied(root: &ServerRoot, status: &str) -> (RunnerResult<()>, Vec<String>) {
+        let (_guard, directory, script) = worker_script(PRODUCT);
+        let environment = [("STAND_IN_STATUS".to_string(), status.to_string())];
+        let outcome = apply_cluster(
+            &script,
+            &directory.path().join("config"),
+            root,
+            "act-bench-steps",
+            &environment,
+            Duration::from_secs(20),
+        );
+        let calls = sidecar(&script, "calls");
+        (outcome, calls.lines().map(str::to_owned).collect())
+    }
+
+    #[test]
+    fn an_apply_onto_a_bucket_reads_its_lock_from_the_products_status() {
+        let root = ServerRoot::S3(BUCKET_ROOT.into());
+        let (released, calls) = applied(&root, r#"{"lock_id":null}"#);
+        released.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls[0].starts_with(&format!(
+                "--as act-bench-steps --target {BUCKET_ROOT} cluster apply --config "
+            )) && calls[0].ends_with(" --json"),
+            "the apply targets the prefix: {calls:?}"
+        );
+        assert_eq!(
+            calls[1],
+            format!("--target {BUCKET_ROOT} cluster status --json"),
+            "the status read targets the prefix too"
+        );
+
+        let (held, _) = applied(&root, r#"{"lock_id":"01LOCK"}"#);
+        let held = held.unwrap_err();
+        assert_eq!(held.code, "server_cluster_apply_failed", "{held}");
+        assert!(
+            held.message.contains(&format!(
+                "left its admission at {BUCKET_ROOT} as lock 01LOCK"
+            )),
+            "{held}"
+        );
+
+        for unread in ["{}", "not json", r#"{"lock_id":7}"#] {
+            let (refused, _) = applied(&root, unread);
+            let refused = refused.unwrap_err();
+            assert!(
+                refused.message.contains("without a lock reading"),
+                "`{unread}`: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_apply_onto_a_local_root_reads_the_lock_file_and_asks_for_no_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = ServerRoot::Local(directory.path().join("root"));
+        std::fs::create_dir_all(directory.path().join("root/__cluster")).unwrap();
+        let (released, calls) = applied(&root, r#"{"lock_id":"01LOCK"}"#);
+        released.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            calls.len(),
+            1,
+            "a local root is asked for no status: {calls:?}"
+        );
+
+        let lock = directory.path().join("root/__cluster/lock.json");
+        std::fs::write(&lock, "{}").unwrap();
+        let (held, _) = applied(&root, r#"{"lock_id":null}"#);
+        let held = held.unwrap_err();
+        assert!(
+            held.message
+                .contains(&format!("left its admission at {}", lock.display())),
+            "{held}"
+        );
     }
 
     #[test]
@@ -1550,10 +1735,24 @@ mod process {
         (product, server)
     }
 
-    /// One repetition of `plan` against the product itself: the cluster the
-    /// bench writes applied by `omnigraph`, `omnigraph-server` started over it
-    /// with one actor per session, the worker's run, and the stop.
+    /// [`against_the_product_over`] a local root of its own.
     async fn against_the_product(
+        plan: &PlannedGqt,
+        sessions: usize,
+        branches: Vec<SeededTable>,
+        edges: Vec<SeededTable>,
+    ) -> GqtRepObservation {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        against_the_product_over(&ServerRoot::Local(root), plan, sessions, branches, edges).await
+    }
+
+    /// One repetition of `plan` against the product over the empty `root`:
+    /// the bench's cluster applied by `omnigraph`, `omnigraph-server` started
+    /// over it with one actor per session, the worker's run, and the stop.
+    async fn against_the_product_over(
+        root: &ServerRoot,
         plan: &PlannedGqt,
         sessions: usize,
         branches: Vec<SeededTable>,
@@ -1565,9 +1764,9 @@ mod process {
         };
         let schema = source.parse().unwrap().fixture.unwrap().schema;
         let directory = tempfile::tempdir().unwrap();
-        let [config, root, logs, home] =
-            ["config", "root", "logs", "home"].map(|name| directory.path().join(name));
-        for created in [&config, &root, &logs, &home] {
+        let [config, logs, home] =
+            ["config", "logs", "home"].map(|name| directory.path().join(name));
+        for created in [&config, &logs, &home] {
             std::fs::create_dir(created).unwrap();
         }
         let actors: Vec<String> = std::iter::once("steps".to_string())
@@ -1582,7 +1781,7 @@ mod process {
         apply_cluster(
             &product,
             &config,
-            &root,
+            root,
             &actors[STEPS],
             &environment,
             deadlines.apply,
@@ -1595,7 +1794,7 @@ mod process {
         let process = ServerProcess::start(
             &server,
             built.source_commit.as_deref(),
-            &root,
+            root,
             &actor_tokens,
             &environment,
             &logs,
@@ -1642,6 +1841,42 @@ mod process {
     async fn a_rebuild_repetition_runs_against_the_builds_own_server() {
         let sample = against_the_product(&rebuild_point(), 3, Vec::new(), Vec::new()).await;
         assert_block(&sample);
+    }
+
+    /// A rebuild repetition over a bucket: the cluster applied onto an empty
+    /// prefix by the build's `omnigraph`, its lock read from that binary's
+    /// status, and the build's server started on the prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rustfs_integration_a_rebuild_repetition_runs_against_the_builds_own_server_over_a_bucket()
+     {
+        let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
+            eprintln!("skipping s3 server root: OMNIGRAPH_S3_TEST_BUCKET is not set");
+            return;
+        };
+        let prefix = std::env::var("OMNIGRAPH_S3_TEST_PREFIX")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "omnigraph-itests".to_string());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let location = format!("s3://{bucket}/{prefix}/bench-servers/AROA:i-{unique}");
+        let store = FixtureStore::open(&location).unwrap();
+        let root = store.empty_server_root("01JRUN", 1).await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let environment =
+            crate::catalog::served_environment(declared_s3_backend(), NetworkPosition::SameHost);
+        let plan = catalog_of(directory.path(), SERVED_WORKLOAD)
+            .plan_with("writers", &environment, Some(ResetMode::Rebuild))
+            .unwrap_or_else(|diagnostics| panic!("{diagnostics:?}"));
+        let sample = against_the_product_over(&root, &plan, 3, Vec::new(), Vec::new()).await;
+        assert_block(&sample);
+        store.delete_server_root(&root).await.unwrap();
+        assert!(
+            store.witness(&location).await.unwrap().is_empty(),
+            "the repetition's root is the one thing the run wrote under the store"
+        );
     }
 
     /// Three `Next` edges for the sixteen-row fixture, two of them over one
