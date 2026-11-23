@@ -1,0 +1,1 @@
+- The MCP `query` and `mutate` tool descriptions name GQ as the Omnigraph query language and link its guide, as MCP directory review requires for tools that take caller-written queries.
