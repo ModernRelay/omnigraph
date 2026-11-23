@@ -127,6 +127,9 @@ section decides.
 - **Orthogonality and composability.** Primitives vary independently and close
   under composition (a composition composes again); extend or compose one
   before adding one.
+- **Information hiding** (Parnas). A module owns one decision and hides more
+  than it shows (a deep module, Ousterhout); code outside it never works on
+  its representation.
 - **Intrinsic naming.** Name a thing by what it is or selects, never by the
   caller, scenario or change that prompted it. The `issue_N` in a regression
   test's name is a cross-reference the gate reads, and stays.
