@@ -108,23 +108,28 @@ views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
 
 Applied to the shape of a design, that lens is **conceptual integrity**
-(Brooks): few ideas, applied everywhere. Always weigh it.
+(Brooks): few ideas, applied everywhere. Always weigh it. The lenses are the
+default; where one conflicts with the counterweight, the test that closes this
+section decides.
 
 - **Correct by construction.** Make the illegal state unrepresentable; fix the
   class, not the reported instance.
 - **Generality.** The prompting case is an instance of the mechanism, with no
-  branch, flag or constant of its own (zero-one-infinity).
+  branch, flag or constant of its own (zero-one-infinity: none, one or any
+  number, never a fixed few).
 - **Orthogonality and composability.** Primitives vary independently and close
-  under composition; extend or compose one before adding one.
+  under composition (a composition composes again); extend or compose one
+  before adding one.
 - **Intrinsic naming.** Name a thing by what it is or selects, never by the
-  caller, scenario or change that prompted it.
+  caller, scenario or change that prompted it. The `issue_N` in a regression
+  test's name is a cross-reference the gate reads, and stays.
 - **Cases as data.** Real variation is a parameter or a table row, not new
   code.
 
-The counterweight is **speculative generality** (Fowler) and the wrong
-abstraction (Metz): YAGNI, the rule of three. For a design choice, state the
-specific form and the general form, argue for and against each, and name what
-the choice trades away. Decide by the same lens, on evidence: the general form
+The counterweight is **speculative generality** (Fowler) and **the wrong
+abstraction** (Metz): YAGNI. For a design choice, state the specific form and
+the general form, argue for and against each, and name what the choice trades
+away. Decide by the same lens, on evidence: the general form
 wins only when the tree has the cases it serves today and it leaves fewer
 concepts than the specific one (parsimony).
 
