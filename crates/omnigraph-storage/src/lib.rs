@@ -33,6 +33,9 @@ mod read_through;
 pub mod read_through_contract;
 pub use read_through::{FrozenDirectory, ReadThroughMount, ReadThroughStore};
 
+#[cfg(any(test, feature = "dst"))]
+pub mod simulated_s3;
+
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// The typed condition established at a storage-substrate boundary.
@@ -1384,7 +1387,7 @@ impl ObjectStorageAdapter {
         let (store, retrying) = s3_clients(&location.bucket, root_uri, scope.is_some())?;
 
         let adapter = Self {
-            store: Arc::new(store),
+            store,
             scope: None,
             codec: UriCodec::S3 {
                 bucket: location.bucket,
@@ -1397,9 +1400,7 @@ impl ObjectStorageAdapter {
             read_through: None,
         };
         Ok(match (scope, retrying) {
-            (Some(scope), Some(retrying)) => {
-                adapter.with_scope_and_retrying(scope, Arc::new(retrying))
-            }
+            (Some(scope), Some(retrying)) => adapter.with_scope_and_retrying(scope, retrying),
             _ => adapter,
         })
     }
@@ -1626,10 +1627,8 @@ impl ObjectStorageAdapter {
                 ),
             ));
         }
-        let base_store: Arc<DynObjectStore> =
-            Arc::new(build_s3_store(s3_bucket_builder(&base.bucket), base_uri)?);
+        let base_store = s3_store(&base.bucket, base_uri, |builder| builder)?;
         let (layer, retrying) = s3_clients(&root.bucket, root_uri, scope.is_some())?;
-        let layer: Arc<DynObjectStore> = Arc::new(layer);
         let mount = s3_clone_mount(
             base_store,
             base_uri,
@@ -1655,7 +1654,7 @@ impl ObjectStorageAdapter {
         };
         Ok(match (scope, retrying) {
             (Some(scope), Some(retrying)) => {
-                let retrying: Arc<dyn ObjectStore> = Arc::new(mount.store(Arc::new(retrying)));
+                let retrying: Arc<dyn ObjectStore> = Arc::new(mount.store(retrying));
                 adapter.with_scope_and_retrying(scope, retrying)
             }
             _ => adapter,
@@ -3104,14 +3103,25 @@ fn s3_bucket_builder(bucket: &str) -> AmazonS3Builder {
     builder
 }
 
-fn build_s3_store(builder: AmazonS3Builder, root_uri: &str) -> Result<object_store::aws::AmazonS3> {
-    builder.build().map_err(|err| {
-        let kind = classify_object_store_error(&err);
-        StorageError::backend(
-            kind,
+/// The client of `bucket`, built from the `AWS_*` environment as `configure`
+/// leaves it. In a test or a DST build a simulated bucket that answers to the
+/// name is the client, and nothing is built.
+fn s3_store(
+    bucket: &str,
+    root_uri: &str,
+    configure: impl FnOnce(AmazonS3Builder) -> AmazonS3Builder,
+) -> Result<Arc<DynObjectStore>> {
+    #[cfg(any(test, feature = "dst"))]
+    if let Some(simulated) = simulated_s3::bucket(bucket) {
+        return Ok(simulated);
+    }
+    match configure(s3_bucket_builder(bucket)).build() {
+        Ok(store) => Ok(Arc::new(store)),
+        Err(err) => Err(StorageError::backend(
+            classify_object_store_error(&err),
             format!("failed to initialize s3 storage for '{root_uri}': {err}"),
-        )
-    })
+        )),
+    }
 }
 
 /// The clients of one `s3://` root: the store its reads and writes go to and,
@@ -3121,22 +3131,18 @@ fn s3_clients(
     bucket: &str,
     root_uri: &str,
     scoped: bool,
-) -> Result<(
-    object_store::aws::AmazonS3,
-    Option<object_store::aws::AmazonS3>,
-)> {
-    let mut builder = s3_bucket_builder(bucket);
+) -> Result<(Arc<DynObjectStore>, Option<Arc<DynObjectStore>>)> {
     let retrying = match scoped {
-        true => Some(build_s3_store(
-            builder.clone().with_retry(scoped_read_retry_config()),
-            root_uri,
-        )?),
+        true => Some(s3_store(bucket, root_uri, |builder| {
+            builder.with_retry(scoped_read_retry_config())
+        })?),
         false => None,
     };
-    if scoped {
-        builder = builder.with_retry(single_attempt_retry_config());
-    }
-    Ok((build_s3_store(builder, root_uri)?, retrying))
+    let store = s3_store(bucket, root_uri, |builder| match scoped {
+        true => builder.with_retry(single_attempt_retry_config()),
+        false => builder,
+    })?;
+    Ok((store, retrying))
 }
 
 /// Whether two canonical key prefixes of one bucket (object-store paths: no
@@ -6820,11 +6826,13 @@ mod tests {
         }
     }
 
-    /// A `.gqt` case cannot name its store's root, nor give one bucket two names.
+    /// A `.gqt` case cannot name its store's root, give one bucket two names,
+    /// nor put a folder marker in it.
     #[tokio::test]
     async fn s3_roots_overlap_in_every_spelling_of_their_bucket() {
         struct Open {
             other: Option<&'static [(&'static str, &'static str)]>,
+            folder_marker: Option<&'static str>,
             base_key: &'static str,
             root_key: &'static str,
             base_objects: &'static [(&'static str, &'static str)],
@@ -6832,6 +6840,7 @@ mod tests {
         }
         let one = |base_key, root_key, base_objects, refused| Open {
             other: None,
+            folder_marker: None,
             base_key,
             root_key,
             base_objects,
@@ -6869,8 +6878,41 @@ mod tests {
                 other: Some(object),
                 ..one("graph", "graph/clone", object, Some("holds a copy"))
             },
+            Open {
+                folder_marker: Some("graph/"),
+                ..one("graph", "graph/clone", object, Some("address one bucket"))
+            },
+            Open {
+                folder_marker: Some("graph/a/"),
+                ..one("graph", "graph/clone", object, Some("address one bucket"))
+            },
+            Open {
+                folder_marker: Some("graph/"),
+                ..one("graph", "graph/clone", &[], Some("holds no object"))
+            },
+            Open {
+                folder_marker: Some("graph/a/"),
+                ..one(
+                    "graph",
+                    "graph/clone",
+                    &[("graph/a", "base")],
+                    Some("address one bucket"),
+                )
+            },
+            Open {
+                folder_marker: Some("graph/a/"),
+                ..one(
+                    "graph",
+                    "graph/clone",
+                    &[("graph/a", "base"), ("graph/object", "base")],
+                    Some("address one bucket"),
+                )
+            },
         ] {
-            let shape = format!("root '{}' over base '{}'", open.root_key, open.base_key);
+            let shape = format!(
+                "root '{}' over base '{}', folder marker {:?}",
+                open.root_key, open.base_key, open.folder_marker
+            );
             let put = |store: Arc<DynObjectStore>,
                        objects: &'static [(&'static str, &'static str)]| async move {
                 for (key, bytes) in objects {
@@ -6891,7 +6933,11 @@ mod tests {
                 keys.sort();
                 keys
             };
-            let base_store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+            let bucket = simulated_s3::SimulatedBucket::new();
+            if let Some(marker) = open.folder_marker {
+                bucket.put_empty(marker).await.unwrap();
+            }
+            let base_store: Arc<DynObjectStore> = bucket;
             put(Arc::clone(&base_store), open.base_objects).await;
             let layer: Arc<DynObjectStore> = match open.other {
                 None => Arc::clone(&base_store),
@@ -6957,6 +7003,101 @@ mod tests {
         .to_string();
         assert!(text.contains("could not tell"), "{text}");
         assert_eq!(failing.puts(), 0, "written before the refusal");
+    }
+
+    /// A base object beside a folder marker of its name keeps its own size and
+    /// entity tag in a clone. A `.gqt` case cannot put a folder marker in its bucket.
+    #[tokio::test]
+    async fn a_simulated_base_object_beside_a_folder_marker_keeps_its_size_in_a_clone() {
+        let base = simulated_s3::SimulatedBucket::new();
+        let object = ObjectPath::from("graph/a");
+        base.put(&object, PutPayload::from_static(b"base"))
+            .await
+            .unwrap();
+        base.put_empty("graph/a/").await.unwrap();
+        let own = base.head(&object).await.unwrap();
+        let layer: Arc<DynObjectStore> = simulated_s3::SimulatedBucket::new();
+        let mount = s3_clone_mount(
+            base,
+            "s3://prod/base",
+            ObjectPath::from("graph"),
+            layer.as_ref(),
+            "s3://scratch/root",
+            ObjectPath::from("clone"),
+        )
+        .await
+        .unwrap();
+        let seen = mount
+            .store(layer)
+            .head(&ObjectPath::from("clone/a"))
+            .await
+            .unwrap();
+        assert_eq!((seen.size, seen.e_tag), (own.size, own.e_tag));
+    }
+
+    /// The S3 open end to end on simulated buckets: the storage half of what a
+    /// `.gqt` case reaches through the DST environment.
+    #[tokio::test]
+    async fn read_through_storage_opens_an_s3_clone_on_simulated_buckets() {
+        let base = simulated_s3::SimulatedBucket::new();
+        let _base_names = base
+            .answer_to(&["simulated-open-base", "simulated-open-base-again"])
+            .unwrap();
+        let root = simulated_s3::SimulatedBucket::new();
+        let _root_names = root.answer_to(&["simulated-open-root"]).unwrap();
+        base.put(
+            &ObjectPath::from("graph/object"),
+            PutPayload::from_static(b"base"),
+        )
+        .await
+        .unwrap();
+        let held = |bucket: Arc<simulated_s3::SimulatedBucket>| async move {
+            let mut keys: Vec<String> = bucket
+                .list(None)
+                .map_ok(|meta| meta.location.to_string())
+                .try_collect()
+                .await
+                .unwrap();
+            keys.sort();
+            keys
+        };
+
+        let clone = ObjectStorageAdapter::durable_read_through(
+            "s3://simulated-open-base/graph",
+            "s3://simulated-open-root/clone",
+        )
+        .await
+        .unwrap();
+        let read = clone
+            .read_text("s3://simulated-open-root/clone/object")
+            .await
+            .unwrap();
+        assert_eq!(read, "base", "an object the root lacks is the base's");
+        clone
+            .write_text("s3://simulated-open-root/clone/own", "clone")
+            .await
+            .unwrap();
+        assert_eq!(held(Arc::clone(&base)).await, ["graph/object"]);
+        assert_eq!(
+            held(root).await,
+            ["clone/__clone/created", "clone/own"],
+            "the marker and the write are the root's"
+        );
+
+        let refused = ObjectStorageAdapter::durable_read_through(
+            "s3://simulated-open-base/graph",
+            "s3://simulated-open-base-again/graph/clone",
+        )
+        .await
+        .err()
+        .map(|error| error.to_string());
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|text| text.contains("address one bucket")),
+            "{refused:?}"
+        );
+        assert_eq!(held(base).await, ["graph/object"]);
     }
 
     #[tokio::test]

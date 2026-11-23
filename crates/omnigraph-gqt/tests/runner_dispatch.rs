@@ -1867,6 +1867,79 @@ fn clone_cases_run_against_a_bucket() {
     });
 }
 
+/// A clone in a simulated bucket reads its base and writes its own root through
+/// the control adapter and Lance: the S3 clone path with no bucket to run it on.
+/// A `.gqt` case cannot give its bucket a second name, nor put a folder marker in it.
+#[test]
+fn a_clone_runs_on_a_simulated_bucket() {
+    let bucket = omnigraph_storage::simulated_s3::SimulatedBucket::new();
+    let _names = bucket
+        .answer_to(&["gqt-simulated-clone", "gqt-simulated-clone-again"])
+        .unwrap();
+    let base = "s3://gqt-simulated-clone/base";
+    let clone = "s3://gqt-simulated-clone/clone";
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let load = |db: omnigraph::db::Omnigraph, name: &str, mode: omnigraph::loader::LoadMode| {
+        let row = format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"{name}\"}}}}");
+        async move {
+            omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
+                .load_jsonl(&row, mode)
+                .await
+                .unwrap();
+        }
+    };
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::init(base, "node Person { name: String @key }")
+            .await
+            .unwrap();
+        load(db, "alice", omnigraph::loader::LoadMode::Overwrite).await;
+    });
+    let before = listing(&runtime, base);
+    assert_eq!(person_names(&runtime, clone, Some(base), "main"), ["alice"]);
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::open_clone(base, clone)
+            .await
+            .unwrap();
+        load(db, "bob", omnigraph::loader::LoadMode::Append).await;
+    });
+    assert_eq!(
+        person_names(&runtime, clone, Some(base), "main"),
+        ["alice", "bob"]
+    );
+    assert_eq!(person_names(&runtime, base, None, "main"), ["alice"]);
+    assert_eq!(
+        listing(&runtime, base),
+        before,
+        "the base's listing and ETags are as they were"
+    );
+
+    runtime.block_on(async { bucket.put_empty("base/").await.unwrap() });
+    let marked = listing(&runtime, base);
+    assert_eq!(
+        person_names(&runtime, clone, Some(base), "main"),
+        ["alice", "bob"],
+        "a folder marker at the base's key changes nothing for a clone beside it"
+    );
+    let inside = "s3://gqt-simulated-clone-again/base/inner";
+    let refused = runtime.block_on(async {
+        omnigraph::db::Omnigraph::open_clone(base, inside)
+            .await
+            .err()
+            .map(|error| error.to_string())
+    });
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|text| text.contains("do not contain each other")),
+        "a clone root inside its base under the bucket's second name: {refused:?}"
+    );
+    assert_eq!(
+        listing(&runtime, base),
+        marked,
+        "a refused open writes nothing into the base"
+    );
+}
+
 /// A case cannot name the paths and file kinds `--check` is handed.
 #[test]
 fn check_reports_a_path_that_names_no_case_and_checks_the_rest() {

@@ -89,13 +89,28 @@ impl FrozenDirectory {
     }
 
     /// Index every object of `files`, which may be any store whose keys start
-    /// at the directory's root: a local directory, a bucket prefix.
+    /// at the directory's root: a local directory, a bucket prefix. A location
+    /// listed twice, an object and a folder marker of one name in a bucket,
+    /// keeps the entry the store reads there.
     pub async fn over(files: Arc<dyn ObjectStore>) -> Result<Self> {
-        let objects = files
-            .list(None)
-            .map_ok(|meta| (meta.location.clone(), meta))
-            .try_collect()
-            .await?;
+        let mut objects = BTreeMap::new();
+        let mut twice = BTreeSet::new();
+        let mut listed = files.list(None);
+        while let Some(meta) = listed.try_next().await? {
+            let key = meta.location.clone();
+            if objects.insert(key.clone(), meta).is_some() {
+                twice.insert(key);
+            }
+        }
+        for key in twice {
+            match files.head(&key).await {
+                Ok(read) => {
+                    objects.insert(key, read);
+                }
+                Err(Error::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(Self {
             files,
             objects,
@@ -137,23 +152,28 @@ impl FrozenDirectory {
             .insert(key);
     }
 
-    /// Whether `other`, a store whose keys start above the directory, holds
-    /// one of the directory's objects under `prefix`, by entity tag and size:
-    /// the two stores then read one place. `None` for a directory with no object.
+    /// Whether `other`, whose keys start above the directory, holds under `prefix`
+    /// the first object the directory's own store reads, by the entity tag and size
+    /// of that read. A listed key no request reaches is passed over; `None` for none.
     pub(crate) async fn shown_by(
         &self,
         other: &dyn ObjectStore,
         prefix: &Path,
     ) -> Result<Option<bool>> {
-        let Some((key, object)) = self.objects.iter().next() else {
-            return Ok(None);
-        };
-        let at: Path = prefix.parts().chain(key.parts()).collect();
-        match other.head(&at).await {
-            Ok(seen) => Ok(Some(seen.e_tag == object.e_tag && seen.size == object.size)),
-            Err(Error::NotFound { .. }) => Ok(Some(false)),
-            Err(error) => Err(error),
+        for key in self.objects.keys() {
+            let own = match self.files.head(key).await {
+                Ok(own) => own,
+                Err(Error::NotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            let at: Path = prefix.parts().chain(key.parts()).collect();
+            return match other.head(&at).await {
+                Ok(seen) => Ok(Some(seen.e_tag == own.e_tag && seen.size == own.size)),
+                Err(Error::NotFound { .. }) => Ok(Some(false)),
+                Err(error) => Err(error),
+            };
         }
+        Ok(None)
     }
 
     /// The directory's object at `key`, `None` once deleted or never there.
