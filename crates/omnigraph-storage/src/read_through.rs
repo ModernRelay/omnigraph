@@ -137,6 +137,25 @@ impl FrozenDirectory {
             .insert(key);
     }
 
+    /// Whether `other`, a store whose keys start above the directory, holds
+    /// one of the directory's objects under `prefix`, by entity tag and size:
+    /// the two stores then read one place. `None` for a directory with no object.
+    pub(crate) async fn shown_by(
+        &self,
+        other: &dyn ObjectStore,
+        prefix: &Path,
+    ) -> Result<Option<bool>> {
+        let Some((key, object)) = self.objects.iter().next() else {
+            return Ok(None);
+        };
+        let at: Path = prefix.parts().chain(key.parts()).collect();
+        match other.head(&at).await {
+            Ok(seen) => Ok(Some(seen.e_tag == object.e_tag && seen.size == object.size)),
+            Err(Error::NotFound { .. }) => Ok(Some(false)),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The directory's object at `key`, `None` once deleted or never there.
     fn head(&self, key: &Path) -> Option<&ObjectMeta> {
         if self.is_deleted(key) {
