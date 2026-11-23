@@ -51,8 +51,20 @@ impl McpSettings {
         max_result_bytes: Option<usize>,
         setup_url: Option<String>,
     ) -> color_eyre::eyre::Result<Self> {
+        Self::resolve_with(allowed_hosts, max_result_bytes, setup_url, |name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    /// [`Self::resolve`] with the environment read through `env`.
+    pub(crate) fn resolve_with(
+        allowed_hosts: Vec<String>,
+        max_result_bytes: Option<usize>,
+        setup_url: Option<String>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> color_eyre::eyre::Result<Self> {
         let mut hosts = allowed_hosts;
-        if let Ok(value) = std::env::var(MCP_ALLOWED_HOSTS_ENV) {
+        if let Some(value) = env(MCP_ALLOWED_HOSTS_ENV) {
             hosts.extend(
                 value
                     .split(',')
@@ -65,28 +77,32 @@ impl McpSettings {
             validate_allowed_host(host)?;
         }
         let result_bytes = match max_result_bytes {
-            Some(bytes) => bytes,
-            None => match std::env::var(MCP_MAX_RESULT_BYTES_ENV) {
-                Ok(value) if !value.trim().is_empty() => {
-                    value.trim().parse::<usize>().map_err(|_| {
+            Some(bytes) => {
+                validate_result_bytes(bytes, "--mcp-max-result-bytes")?;
+                bytes
+            }
+            None => match env(MCP_MAX_RESULT_BYTES_ENV) {
+                Some(value) if !value.trim().is_empty() => {
+                    let bytes = value.trim().parse::<usize>().map_err(|_| {
                         color_eyre::eyre::eyre!(
                             "{MCP_MAX_RESULT_BYTES_ENV} must be a whole number of bytes, got `{value}`"
                         )
-                    })?
+                    })?;
+                    validate_result_bytes(bytes, MCP_MAX_RESULT_BYTES_ENV)?;
+                    bytes
                 }
                 _ => RESULT_BYTES,
             },
         };
-        validate_result_bytes(result_bytes)?;
-        let setup_url = setup_url.or_else(|| {
-            std::env::var(MCP_SETUP_URL_ENV)
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-        });
-        if let Some(url) = &setup_url {
-            validate_setup_url(url)?;
-        }
+        let setup_url = match setup_url {
+            Some(url) => Some(validate_setup_url(url.trim(), "--mcp-setup-url")?),
+            None => match env(MCP_SETUP_URL_ENV) {
+                Some(value) if !value.trim().is_empty() => {
+                    Some(validate_setup_url(value.trim(), MCP_SETUP_URL_ENV)?)
+                }
+                _ => None,
+            },
+        };
         Ok(Self {
             allowed_hosts: hosts,
             result_bytes,
@@ -116,34 +132,43 @@ pub(crate) fn validate_allowed_host(host: &str) -> color_eyre::eyre::Result<()> 
     }
 }
 
-/// The result bound may only lower the built-in one.
-pub(crate) fn validate_result_bytes(bytes: usize) -> color_eyre::eyre::Result<()> {
+/// The result bound may only lower the built-in one. `source` names the
+/// flag or environment variable the value came from.
+pub(crate) fn validate_result_bytes(bytes: usize, source: &str) -> color_eyre::eyre::Result<()> {
     if (1..=RESULT_BYTES).contains(&bytes) {
         Ok(())
     } else {
         Err(color_eyre::eyre::eyre!(
-            "--mcp-max-result-bytes must be between 1 and {RESULT_BYTES}, got {bytes}"
+            "{source} must be between 1 and {RESULT_BYTES}, got {bytes}"
         ))
     }
 }
 
+/// The longest setup URL accepted, after encoding.
+pub(crate) const SETUP_URL_BYTES: usize = 2048;
+
 /// A setup URL is public guidance: `https`, with no userinfo, query or
-/// fragment, so it cannot carry a credential or per-request state.
-pub(crate) fn validate_setup_url(value: &str) -> color_eyre::eyre::Result<()> {
-    let valid = url::Url::parse(value).is_ok_and(|url| {
+/// fragment, so it cannot carry a credential or per-request state. Returns
+/// the URL as the parser serializes it, percent-encoded, so what clients
+/// receive is the URI that was validated.
+pub(crate) fn validate_setup_url(value: &str, source: &str) -> color_eyre::eyre::Result<String> {
+    let parsed = url::Url::parse(value).ok().filter(|url| {
         url.scheme() == "https"
+            // Only the `scheme://host` form; the parser also accepts
+            // `https:host`, which is not what an operator means.
+            && value.get(..8).is_some_and(|head| head.eq_ignore_ascii_case("https://"))
             && url.host_str().is_some_and(|host| !host.is_empty())
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
+            && !value.chars().any(char::is_control)
     });
-    if valid {
-        Ok(())
-    } else {
-        Err(color_eyre::eyre::eyre!(
-            "--mcp-setup-url must be an https URL without userinfo, query or fragment, got `{value}`"
-        ))
+    match parsed.map(String::from) {
+        Some(url) if url.len() <= SETUP_URL_BYTES => Ok(url),
+        _ => Err(color_eyre::eyre::eyre!(
+            "{source} must be an https URL of at most {SETUP_URL_BYTES} bytes, without userinfo, query or fragment, got `{value}`"
+        )),
     }
 }
 

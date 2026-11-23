@@ -253,7 +253,7 @@ const INSTRUCTIONS_HEAD: &str = concat!(
 pub(super) fn instructions(settings: &McpSettings) -> String {
     let mut text = String::from(INSTRUCTIONS_HEAD);
     text.push_str(&format!(
-        "Reads carry their `graph_commit_id`. A result is limited to {} and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
+        "Reads carry their `graph_commit_id`. A read's result is limited to {} and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
         format_bytes(settings.result_bytes.min(RESULT_BYTES)),
     ));
     if settings.setup_url.is_some() {

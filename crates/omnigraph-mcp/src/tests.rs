@@ -1,5 +1,7 @@
 use super::*;
-use crate::settings::{validate_allowed_host, validate_result_bytes, validate_setup_url};
+use crate::settings::{
+    SETUP_URL_BYTES, validate_allowed_host, validate_result_bytes, validate_setup_url,
+};
 use serde_json::json;
 
 #[test]
@@ -223,29 +225,74 @@ fn a_configured_result_bound_lowers_the_limit_and_names_it() {
     assert!(serde_json::to_vec(&result).unwrap().len() <= RESULT_BYTES);
 }
 
+/// A low bound applies only to successful reads: a refusal larger than the
+/// bound, on a read or a write, and a write receipt larger than the bound
+/// both arrive unchanged, so the caller still learns what the call did.
+#[test]
+fn a_low_result_bound_never_replaces_a_refusal_or_a_write_result() {
+    let limit = 256;
+    let service = test_service(limit);
+    let refusal = HostError::from_output(
+        Some(StatusCode::PRECONDITION_FAILED),
+        &json!({"code": "precondition_failed", "error": "x".repeat(limit)}),
+    )
+    .unwrap()
+    .into_tool_result();
+    assert!(serde_json::to_vec(&refusal).unwrap().len() > limit);
+    for write in [false, true] {
+        let result = service.fit_result(refusal.clone(), write);
+        assert_eq!(result, refusal, "write: {write}");
+    }
+    let receipt = CallToolResult::structured(json!({"receipt": "x".repeat(limit)}));
+    assert_eq!(service.fit_result(receipt.clone(), true), receipt);
+    let read = service.fit_result(receipt, false);
+    assert_eq!(read.is_error, Some(true));
+}
+
 #[test]
 fn result_bound_and_setup_url_settings_are_validated() {
     for bytes in [1, 128 * 1024, RESULT_BYTES] {
-        assert!(validate_result_bytes(bytes).is_ok(), "{bytes}");
+        assert!(validate_result_bytes(bytes, "--flag").is_ok(), "{bytes}");
     }
     for bytes in [0, RESULT_BYTES + 1] {
-        assert!(validate_result_bytes(bytes).is_err(), "{bytes}");
+        let error = validate_result_bytes(bytes, MCP_MAX_RESULT_BYTES_ENV).unwrap_err();
+        assert!(
+            error.to_string().starts_with(MCP_MAX_RESULT_BYTES_ENV),
+            "{error}"
+        );
     }
-    for url in [
-        "https://platform.example.com/setup",
-        "https://example.com/organizations/o/clusters/c/graphs/new",
+    for (url, sent) in [
+        (
+            "https://platform.example.com/setup",
+            "https://platform.example.com/setup",
+        ),
+        (
+            "https://example.com/organizations/o/clusters/c/graphs/new",
+            "https://example.com/organizations/o/clusters/c/graphs/new",
+        ),
+        // Clients receive the encoded URI the schema declares.
+        (
+            "https://example.com/créer",
+            "https://example.com/cr%C3%A9er",
+        ),
+        ("HTTPS://Example.COM", "https://example.com/"),
     ] {
-        assert!(validate_setup_url(url).is_ok(), "{url}");
+        assert_eq!(validate_setup_url(url, "--flag").unwrap(), sent, "{url}");
     }
+    let long = format!("https://example.com/{}", "a".repeat(SETUP_URL_BYTES));
     for url in [
         "http://example.com/setup",
         "https://user:secret@example.com/setup",
         "https://example.com/setup?token=x",
         "https://example.com/setup#frag",
+        "https:example.com/setup",
+        "https://example.com/se\ttup",
+        "https://example.com/se\ntup",
         "example.com/setup",
         "",
+        long.as_str(),
     ] {
-        assert!(validate_setup_url(url).is_err(), "{url}");
+        assert!(validate_setup_url(url, "--flag").is_err(), "{url}");
     }
     assert_eq!(format_bytes(RESULT_BYTES), "1 MiB");
     assert_eq!(format_bytes(128 * 1024), "128 KiB");
@@ -253,10 +300,62 @@ fn result_bound_and_setup_url_settings_are_validated() {
     assert_eq!(format_bytes(1), "1 byte");
 }
 
+/// Each flag wins over its environment variable, which wins over the
+/// default; allowed hosts come from both. An invalid value names its source.
+#[test]
+fn settings_resolve_flags_over_environment() {
+    let env = |name: &str| match name {
+        MCP_ALLOWED_HOSTS_ENV => Some("b.example, ,c.example:8080".to_owned()),
+        MCP_MAX_RESULT_BYTES_ENV => Some(" 65536 ".to_owned()),
+        MCP_SETUP_URL_ENV => Some(" https://env.example.com/setup ".to_owned()),
+        _ => None,
+    };
+    let from_env = McpSettings::resolve_with(vec!["a.example".into()], None, None, env).unwrap();
+    assert_eq!(
+        from_env.allowed_hosts,
+        ["a.example", "b.example", "c.example:8080"]
+    );
+    assert_eq!(from_env.result_bytes, 65536);
+    assert_eq!(
+        from_env.setup_url.as_deref(),
+        Some("https://env.example.com/setup")
+    );
+    let from_flags = McpSettings::resolve_with(
+        Vec::new(),
+        Some(4096),
+        Some(" https://flag.example.com/créer ".into()),
+        env,
+    )
+    .unwrap();
+    assert_eq!(from_flags.result_bytes, 4096);
+    assert_eq!(
+        from_flags.setup_url.as_deref(),
+        Some("https://flag.example.com/cr%C3%A9er")
+    );
+    let defaults = McpSettings::resolve_with(Vec::new(), None, None, |_| None).unwrap();
+    assert_eq!(defaults, McpSettings::default());
+    for (name, value) in [
+        (MCP_MAX_RESULT_BYTES_ENV, "lots"),
+        (MCP_MAX_RESULT_BYTES_ENV, "0"),
+        (MCP_SETUP_URL_ENV, "http://example.com"),
+    ] {
+        let error = McpSettings::resolve_with(Vec::new(), None, None, |asked| {
+            (asked == name).then(|| value.to_owned())
+        })
+        .unwrap_err();
+        assert!(error.to_string().starts_with(name), "{error}");
+    }
+    let error = McpSettings::resolve_with(Vec::new(), Some(0), None, |_| None).unwrap_err();
+    assert!(
+        error.to_string().starts_with("--mcp-max-result-bytes"),
+        "{error}"
+    );
+}
+
 #[test]
 fn instructions_name_the_configured_bound_and_the_setup_step_only_when_configured() {
     let defaults = instructions(&McpSettings::default());
-    assert!(defaults.contains("A result is limited to 1 MiB"));
+    assert!(defaults.contains("A read's result is limited to 1 MiB"));
     assert!(!defaults.contains("`setup`"));
     let settings = McpSettings {
         result_bytes: 128 * 1024,
@@ -264,7 +363,7 @@ fn instructions_name_the_configured_bound_and_the_setup_step_only_when_configure
         ..McpSettings::default()
     };
     let configured = instructions(&settings);
-    assert!(configured.contains("A result is limited to 128 KiB"));
+    assert!(configured.contains("A read's result is limited to 128 KiB"));
     assert!(configured.contains("returns a `setup` link"));
     // The URL itself is never in the session instructions.
     assert!(!configured.contains("https://example.com/setup"));

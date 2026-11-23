@@ -2279,3 +2279,140 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
         "a denied control leaves the proposal in place: {unpublished}"
     );
 }
+
+/// The configured bound and setup link, end to end: the bound applies to
+/// successful reads and graph-backed resources only, so a refusal and a write
+/// receipt larger than it still arrive; the setup link never appears on a
+/// listing that names a graph, on the tool or the resource.
+#[tokio::test]
+async fn mcp_result_bound_and_setup_link_settings_apply_end_to_end() {
+    const LIMIT: usize = 256;
+    let mut settings = omnigraph_server::McpSettings::default();
+    settings.result_bytes = LIMIT;
+    settings.setup_url = Some("https://example.com/setup".into());
+    let (_temp, app) = static_token_app(settings).await;
+    let size = |result: &Value| serde_json::to_vec(&result["result"]).unwrap().len();
+
+    let text = instructions(&app, "secret").await;
+    assert!(
+        text.contains("A read's result is limited to 256 bytes"),
+        "{text}"
+    );
+    assert!(text.contains("returns a `setup` link"), "{text}");
+    assert!(!text.contains("https://example.com/setup"), "{text}");
+
+    // A read refusal over the bound arrives unchanged: a static token has
+    // no `graph_list` permit here.
+    let graphs = call(&app, "secret", "graphs", json!({})).await;
+    assert!(size(&graphs) > LIMIT, "{graphs}");
+    assert_eq!(
+        graphs["result"]["structuredContent"]["status"], 403,
+        "{graphs}"
+    );
+    assert_eq!(
+        graphs["result"]["structuredContent"]["error"]["code"], "forbidden",
+        "{graphs}"
+    );
+
+    // A read over the bound is refused, naming the bound.
+    let read = call(
+        &app,
+        "secret",
+        "query",
+        json!({"graph":"default","query":"query n() { match { $p: Person } return { $p.name, $p.age } }"}),
+    )
+    .await;
+    assert_eq!(read["result"]["isError"], true, "{read}");
+    let refusal = &read["result"]["structuredContent"]["error"];
+    assert_eq!(refusal["code"], "result_too_large", "{read}");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("256 bytes"),
+        "{read}"
+    );
+    // So is a graph-backed resource; the compiled-in references are not.
+    let (_, schema) = json_response(
+        &app,
+        rpc(
+            Some("secret"),
+            "resources/read",
+            json!({"uri":"omnigraph://graphs/default/schema"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        schema["error"]["data"]["error"]["code"], "result_too_large",
+        "{schema}"
+    );
+    let (_, reference) = json_response(
+        &app,
+        rpc(
+            Some("secret"),
+            "resources/read",
+            json!({"uri":"omnigraph://best-practices/queries"}),
+        ),
+    )
+    .await;
+    assert!(size(&reference) > LIMIT, "{reference}");
+
+    // A write receipt over the bound still arrives.
+    let head = main_head(&app).await;
+    let insert = "query add($name: String) { insert Person { name: $name, age: 7 } }";
+    let written = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Eve"},"if_graph_commit":head}),
+    )
+    .await;
+    assert_eq!(written["result"]["isError"], false, "{written}");
+    assert!(size(&written) > LIMIT, "{written}");
+
+    // A refusal over the bound keeps its status and disposition: the stale
+    // conditional write says nothing was written.
+    let stale = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Frank"},"if_graph_commit":head}),
+    )
+    .await;
+    assert!(size(&stale) > LIMIT, "{stale}");
+    let refusal = &stale["result"]["structuredContent"];
+    assert_eq!(refusal["status"], 412, "{stale}");
+    assert_eq!(refusal["error"]["code"], "precondition_failed", "{stale}");
+    assert_eq!(
+        refusal["error"]["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
+        "{stale}"
+    );
+}
+
+/// The setup link never appears on a listing that names a graph, from the
+/// tool or the `omnigraph://graphs` resource.
+#[tokio::test]
+async fn mcp_setup_link_is_absent_from_a_listing_that_names_a_graph() {
+    let mut settings = omnigraph_server::McpSettings::default();
+    settings.setup_url = Some("https://example.com/setup".into());
+    let (_temp, app, _state) = fixture_app_with(settings).await;
+    let bob = token("bob", RESOURCE);
+    let graphs = call(&app, &bob, "graphs", json!({})).await;
+    assert_eq!(graphs["result"]["isError"], false, "{graphs}");
+    let listing = &graphs["result"]["structuredContent"];
+    assert!(
+        !listing["graphs"].as_array().unwrap().is_empty(),
+        "{graphs}"
+    );
+    assert!(listing.get("setup").is_none(), "{graphs}");
+    let (_, read) = json_response(
+        &app,
+        rpc(
+            Some(&bob),
+            "resources/read",
+            json!({"uri":"omnigraph://graphs"}),
+        ),
+    )
+    .await;
+    let text = read["result"]["contents"][0]["text"].as_str().unwrap();
+    let resource: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(&resource, listing, "{read}");
+}

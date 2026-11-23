@@ -29,7 +29,7 @@ use axum::Router;
 use axum::http::{StatusCode, request::Parts};
 use catalog::*;
 use resources::*;
-use result::check_result;
+use result::{check_result, encodes_within};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
@@ -162,8 +162,10 @@ struct GraphTools<H> {
     host: H,
     version: String,
     slots: Arc<Semaphore>,
-    /// [`McpSettings::result_bytes`], applied to every tool result and
-    /// resource read.
+    /// [`McpSettings::result_bytes`], applied to successful read results and
+    /// graph-backed resource reads. Refusals and write results keep
+    /// [`RESULT_BYTES`], so a low bound never hides what a call did; the
+    /// compiled-in references are fixed text and are not bounded.
     result_bytes: usize,
     /// Built once at boot from the settings.
     instructions: Arc<str>,
@@ -249,7 +251,12 @@ where
 
 impl<H: Host> GraphTools<H> {
     fn fit_result(&self, result: ToolResult, write: bool) -> ToolResult {
-        check_result(result, self.result_bytes)
+        let limit = if write || result.is_error == Some(true) {
+            RESULT_BYTES
+        } else {
+            self.result_bytes
+        };
+        check_result(result, limit)
             .unwrap_or_else(|error| self.host.error(error, write).into_tool_result())
     }
 
@@ -412,16 +419,16 @@ impl<H: Host> ServerHandler for GraphTools<H> {
         let result = observe(pending, context.ct.cancelled(), READ_DEADLINE).await;
         match result {
             Ok((mime_type, text)) => {
-                if text.len() > self.result_bytes {
+                let result = ReadResourceResult::new(vec![
+                    ResourceContents::text(text, uri).with_mime_type(mime_type),
+                ]);
+                if !encodes_within(&result, self.result_bytes) {
                     return Err(Refusal::Protocol(ProtocolError::ResultTooLarge {
-                        limit: self.result_bytes,
+                        limit: self.result_bytes.min(RESULT_BYTES),
                     })
                     .resource_error(&self.host));
                 }
-                Ok(ReadResourceResult::new(vec![
-                    ResourceContents::text(text, uri).with_mime_type(mime_type),
-                ])
-                .into())
+                Ok(result.into())
             }
             Err(refusal) => Err(refusal.resource_error(&self.host)),
         }

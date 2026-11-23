@@ -336,7 +336,7 @@ fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
                 ApiError::new(
                     ErrorCode::ResultTooLarge,
                     format!(
-                        "The result exceeds the server's {} limit; narrow it with `limit` or filters, or use a narrower stored query.",
+                        "The result exceeds the server's result limit of {}. A query result can be narrowed with `limit` or filters, or with a narrower stored query.",
                         omnigraph_mcp::format_bytes(limit)
                     ),
                 )
@@ -405,10 +405,24 @@ where
 }
 
 impl ServerHost {
-    /// Encode a handler DTO under the configured result bound.
-    fn bounded<T: Serialize>(&self, value: &T) -> Result<ToolResult, ApiError> {
-        omnigraph_mcp::bounded_result_within(value, self.state.mcp_settings().result_bytes)
+    /// Encode a handler DTO: a read under the configured result bound, a
+    /// write under the built-in one, so a low bound never hides a receipt.
+    fn bounded<T: Serialize>(&self, write: bool, value: &T) -> Result<ToolResult, ApiError> {
+        let limit = if write {
+            omnigraph_mcp::RESULT_BYTES
+        } else {
+            self.state.mcp_settings().result_bytes
+        };
+        omnigraph_mcp::bounded_result_within(value, limit)
             .map_err(|error| protocol_error(error, false))
+    }
+
+    /// The MCP `graphs` listing, for the tool and the `omnigraph://graphs`
+    /// resource alike: discovery plus the setup link on an empty list.
+    async fn graphs(&self, actor: AuthenticatedActor) -> Result<McpGraphsOutput, ApiError> {
+        let discovery = self.discover(actor).await?;
+        let setup_url = self.state.mcp_settings().setup_url.as_deref();
+        Ok(graphs_output(discovery, setup_url))
     }
 
     async fn execute(
@@ -418,9 +432,10 @@ impl ServerHost {
         input: IngressLease,
         graph: McpGraphRequest,
     ) -> Result<ToolResult, ApiError> {
+        let write = request.is_write();
         // Reserve write ingress before decoding arguments, matching HTTP
         // admission and preserving refusal precedence.
-        let ingress = if request.is_write() {
+        let ingress = if write {
             let bytes = request
                 .argument_bytes()
                 .map_err(|_| ApiError::bad_request("invalid MCP tool arguments"))?;
@@ -436,15 +451,13 @@ impl ServerHost {
         let state = || State(self.state.clone());
         match call {
             ToolCall::Health => {
-                boxed(move || async move { self.bounded(&handlers::server_health().await.0) }).await
+                boxed(
+                    move || async move { self.bounded(write, &handlers::server_health().await.0) },
+                )
+                .await
             }
             ToolCall::Graphs => {
-                boxed(move || async move {
-                    let discovery = self.discover(actor).await?;
-                    let setup_url = self.state.mcp_settings().setup_url.as_deref();
-                    self.bounded(&graphs_output(discovery, setup_url))
-                })
-                .await
+                boxed(move || async move { self.bounded(write, &self.graphs(actor).await?) }).await
             }
             ToolCall::Schema(args) => {
                 boxed(move || async move {
@@ -452,7 +465,7 @@ impl ServerHost {
                     let output =
                         handlers::server_schema_get(Extension(handle), Some(Extension(actor)))
                             .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -462,7 +475,7 @@ impl ServerHost {
                     let output =
                         handlers::server_list_queries(Extension(handle), Some(Extension(actor)))
                             .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -493,7 +506,7 @@ impl ServerHost {
                             Bytes::from(body),
                         )
                         .await?;
-                        return self.bounded(&output.0);
+                        return self.bounded(write, &output.0);
                     };
                     let request = request_body(json!({
                         "query": query,
@@ -509,7 +522,7 @@ impl ServerHost {
                         ApiJson(request),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -524,7 +537,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -539,7 +552,7 @@ impl ServerHost {
                             target_branch: args.target_branch,
                         },
                     )?;
-                    self.bounded(&output)
+                    self.bounded(write, &output)
                 })
                 .await
             }
@@ -554,7 +567,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -576,7 +589,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -591,7 +604,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -609,7 +622,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -631,7 +644,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -652,7 +665,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -673,7 +686,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -693,7 +706,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -715,7 +728,7 @@ impl ServerHost {
                         ApiQuery(query.clone()),
                     )
                     .await?;
-                    self.bounded(&blob_stat_output(&query, &response)?)
+                    self.bounded(write, &blob_stat_output(&query, &response)?)
                 })
                 .await
             }
@@ -771,7 +784,7 @@ impl ServerHost {
                                 .await?
                             }
                         };
-                        return self.bounded(&output.0);
+                        return self.bounded(write, &output.0);
                     };
                     let request = ApiJson(request_body(json!({
                         "query": query,
@@ -803,7 +816,7 @@ impl ServerHost {
                             .await?
                         }
                     };
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -825,7 +838,7 @@ impl ServerHost {
                         ApiJson(request),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -859,7 +872,7 @@ impl ServerHost {
                         query,
                     )
                     .await?;
-                    self.bounded(&output)
+                    self.bounded(write, &output)
                 })
                 .await
             }
@@ -879,7 +892,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -897,7 +910,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -917,7 +930,7 @@ impl ServerHost {
                         ApiJson(request),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -935,7 +948,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    self.bounded(&output.0)
+                    self.bounded(write, &output.0)
                 })
                 .await
             }
@@ -954,7 +967,7 @@ impl ServerHost {
                     )
                     .await?;
                     // The route answers 204; structured content must be an object.
-                    self.bounded(&json!({}))
+                    self.bounded(write, &json!({}))
                 })
                 .await
             }
@@ -971,7 +984,7 @@ impl ServerHost {
     ) -> Result<(&'static str, String), ApiError> {
         match resource {
             ResourceRequest::Graphs => {
-                Ok(("application/json", pretty(&self.discover(actor).await?)?))
+                Ok(("application/json", pretty(&self.graphs(actor).await?)?))
             }
             ResourceRequest::Schema(name) => {
                 let (handle, actor) = self.graph(&name, actor, &graph)?;

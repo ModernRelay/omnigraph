@@ -60,15 +60,23 @@ pub(super) fn check_result(
     limit: usize,
 ) -> Result<CallToolResult, ProtocolError> {
     let limit = limit.min(RESULT_BYTES);
+    if encodes_within(&result, limit) {
+        Ok(result)
+    } else {
+        Err(ProtocolError::ResultTooLarge { limit })
+    }
+}
+
+/// Whether `value` encodes within `limit` bytes, never above [`RESULT_BYTES`].
+pub(super) fn encodes_within<T: Serialize>(value: &T, limit: usize) -> bool {
     serde_json::to_writer(
         &mut LimitedBytes {
             bytes: Vec::new(),
-            limit,
+            limit: limit.min(RESULT_BYTES),
         },
-        &result,
+        value,
     )
-    .map_err(|_| ProtocolError::ResultTooLarge { limit })?;
-    Ok(result)
+    .is_ok()
 }
 
 /// A bounded projection of the host's canonical error. The host judges codes,
