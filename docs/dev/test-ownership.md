@@ -820,7 +820,13 @@ tails and stop. Its two ignored tests,
 `every_statement_kind_runs_against_the_builds_own_server`, run a repetition
 against the built `omnigraph` and `omnigraph-server`, which they take from
 the test executable's profile directory; `tests-slow-nightly.yml` enrolls
-both, after the compile that leaves the binaries there. The release tests of
+both, after the compile that leaves the binaries there.
+`rustfs_integration_a_rebuild_repetition_runs_against_the_builds_own_server_over_a_bucket`
+runs one repetition with the same two binaries over a prefix of a bucket:
+the apply onto the prefix, the lock read from `cluster status`, the server
+started on the prefix, and the root's deletion. It returns early without
+`OMNIGRAPH_S3_TEST_BUCKET`, and the RustFS job of `ci.yml` enrolls it after
+the call that leaves the binaries in `target/debug`. The release tests of
 `tests/integration/cli.rs` named `the_rebuild_route_…` own the owner loop end
 to end. Each returns early unless the build is release and
 `OMNIGRAPH_BENCH_PRODUCT` and `OMNIGRAPH_BENCH_SERVER_PRODUCT` name the

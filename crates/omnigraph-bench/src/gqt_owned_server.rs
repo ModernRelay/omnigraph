@@ -6,15 +6,14 @@
 //! process, and the worker's side is `execute_owned_server_rep_signaled` in
 //! `gqt_runner`.
 
-use crate::case::Backend;
 use crate::gqt_case::PlannedGqt;
 use crate::gqt_evidence::{OwnedServerInput, RepetitionInputV2};
 use crate::gqt_runner::{
     RunExecution, RunOptions, binding, block_on_own_thread, child_environment, failure,
-    resolve_product, summarize_wall_clock, validate_sample,
+    resolve_product, store_evidence, summarize_wall_clock, validate_sample,
 };
 use crate::runner::{RunnerError, RunnerResult};
-use crate::store::{FixtureStore, StoreLocation};
+use crate::store::{FixtureStore, ServerRoot};
 use omnigraph_gqt_core::ServerTarget;
 use std::path::Path;
 use std::time::Duration;
@@ -58,21 +57,8 @@ pub(crate) fn execute_owned_server(
         workspace.path(),
     )?;
     let store = FixtureStore::open(store_text)?;
-    let (
-        Backend::LocalFs {
-            filesystem,
-            storage_class,
-        },
-        StoreLocation::Local { path: store_path },
-    ) = (&plan.definition.environment.backend, store.location())
-    else {
-        return Err(failure(
-            "a server the run starts serves a cluster root under a local store",
-        ));
-    };
-    let environment =
-        crate::environment::verify_local_environment(store_path, *filesystem, *storage_class)
-            .map_err(failure)?;
+    let (environment, observed_backend) =
+        store_evidence(&plan.definition.environment.backend, store.location())?;
     let inherited = child_environment();
     let with_home = |home: &Path| -> RunnerResult<Vec<(String, String)>> {
         std::fs::create_dir_all(home).map_err(failure)?;
@@ -126,9 +112,9 @@ pub(crate) fn execute_owned_server(
     let config = workspace.path().join("cluster-config");
     std::fs::create_dir(&config).map_err(failure)?;
     write_cluster_config(&config, OWNED_SERVER_GRAPH, &fixture.schema, &actors)?;
-    let roots = store_path.join("servers");
-    std::fs::create_dir_all(&roots).map_err(failure)?;
-    let roots = roots.canonicalize().map_err(failure)?;
+    let delete = |root: &ServerRoot| {
+        block_on_own_thread(store.delete_server_root(root)).and_then(|deleted| deleted)
+    };
     type Counts = Vec<crate::fixture_reference::GraphTableCountV1>;
     let seeded = |of: fn(&crate::dataset_identity::BranchLogicalV1) -> &Counts| {
         let branches = base.manifest.summary.branches.iter();
@@ -154,7 +140,6 @@ pub(crate) fn execute_owned_server(
     let mut left = None;
     let acquisition = (|| -> RunnerResult<()> {
         for repetition in 1..=run.repetitions {
-            let root = roots.join(format!("{run_id}-{repetition:08}"));
             let tokens: Vec<(String, String)> = actors
                 .iter()
                 .map(|actor| {
@@ -169,7 +154,9 @@ pub(crate) fn execute_owned_server(
                 error.with_repetition(repetition)
             };
             let unwritable = |error: std::io::Error| failed(failure(error));
-            std::fs::create_dir(&root).map_err(unwritable)?;
+            let root = block_on_own_thread(store.empty_server_root(&run_id, repetition))
+                .and_then(|root| root)
+                .map_err(failed)?;
             left = Some(root.clone());
             let logs = workspace.path().join(format!("server-{repetition:08}"));
             let environment = with_home(&logs.join("home")).map_err(failed)?;
@@ -243,9 +230,7 @@ pub(crate) fn execute_owned_server(
                     error
                         .message
                         .push_str(&format!("; server {}", server_logs.tails()));
-                    if crate::dataset_cache::contained(&error)
-                        && std::fs::remove_dir_all(&root).is_ok()
-                    {
+                    if crate::dataset_cache::contained(&error) && delete(&root).is_ok() {
                         left = None;
                     }
                     return Err(failed(error));
@@ -260,7 +245,7 @@ pub(crate) fn execute_owned_server(
             samples.push(sample);
             std::fs::remove_dir_all(&worker_scratch_root).map_err(unwritable)?;
             std::fs::remove_dir_all(&logs).map_err(unwritable)?;
-            std::fs::remove_dir_all(&root).map_err(unwritable)?;
+            delete(&root).map_err(failed)?;
             left = None;
         }
         Ok(())
@@ -275,8 +260,7 @@ pub(crate) fn execute_owned_server(
                     .push_str(&format!("; quarantine marker failed: {}", marker.message));
             }
             error.message.push_str(&format!(
-                "; cluster root {} and {} are left for inspection",
-                root.display(),
+                "; cluster root {root} and {} are left for inspection",
                 workspace.path().display()
             ));
         }
@@ -301,13 +285,13 @@ pub(crate) fn execute_owned_server(
         bound,
         build: crate::runner::build_evidence(build.as_ref())?,
         machine: machine.ok_or_else(|| failure("no worker identity"))?,
-        environment: Some(environment),
+        environment,
         fixture: None,
         dataset_cache_hit: Some(base.cache_hit),
         server_receipt: None,
         base: Some(base.manifest),
         product: Some(product),
-        observed_backend: None,
+        observed_backend,
         samples,
         wall_clock,
         durable_record: false,

@@ -1915,9 +1915,10 @@ pub fn validate_run_options(plan: &PlannedGqt, options: &RunOptions) -> RunnerRe
                     "reset: rebuild starts a server per repetition and requires --server-product",
                 ));
             }
-            if store.starts_with("s3://") || options.backend.is_some() {
+            let s3 = matches!(plan.definition.environment.backend, Backend::S3 { .. });
+            if store.starts_with("s3://") != s3 {
                 return Err(failure(
-                    "a server the run starts serves a cluster root under a local store; an s3:// store and --backend do not apply",
+                    "an s3:// store declares an S3 backend (--backend) and a local store a local one",
                 ));
             }
             if options.local_route != LocalRouteKind::Direct {
@@ -2252,6 +2253,58 @@ pub fn product_environment() -> Vec<(String, String)> {
     child_environment()
 }
 
+/// The backend evidence of a `--store` run: a local store is probed for the
+/// declared filesystem and storage class, an object store carries the run's
+/// declaration, marked `declared`.
+pub(crate) fn store_evidence(
+    backend: &Backend,
+    location: &StoreLocation,
+) -> RunnerResult<(
+    Option<crate::environment::LocalEnvironmentEvidence>,
+    Option<ObservedBackendV1>,
+)> {
+    match (backend, location) {
+        (
+            Backend::LocalFs {
+                filesystem,
+                storage_class,
+            },
+            StoreLocation::Local { path },
+        ) => Ok((
+            Some(
+                crate::environment::verify_local_environment(path, *filesystem, *storage_class)
+                    .map_err(failure)?,
+            ),
+            None,
+        )),
+        (
+            Backend::S3 {
+                implementation,
+                implementation_version,
+                region,
+                storage_class,
+                versioning,
+                image_digest,
+            },
+            StoreLocation::S3 { .. },
+        ) => Ok((
+            None,
+            Some(ObservedBackendV1::S3 {
+                implementation: *implementation,
+                implementation_version: implementation_version.clone(),
+                region: region.clone(),
+                storage_class: storage_class.clone(),
+                versioning: *versioning,
+                image_digest: image_digest.clone(),
+                probe: "declared".into(),
+            }),
+        )),
+        _ => Err(failure(
+            "the store's kind and the point's declared backend disagree",
+        )),
+    }
+}
+
 /// A `--store` run: the point's frozen base acquired from the store (built
 /// there when absent), then one empty clone per repetition handed to a worker
 /// that drives the product binary over it and deleted once its sample holds.
@@ -2286,48 +2339,7 @@ fn execute_clone_owned(
     )?;
     let store = FixtureStore::open(store_text)?;
     let (environment, observed_backend) =
-        match (&plan.definition.environment.backend, store.location()) {
-            (
-                Backend::LocalFs {
-                    filesystem,
-                    storage_class,
-                },
-                StoreLocation::Local { path },
-            ) => (
-                Some(
-                    crate::environment::verify_local_environment(path, *filesystem, *storage_class)
-                        .map_err(failure)?,
-                ),
-                None,
-            ),
-            (
-                Backend::S3 {
-                    implementation,
-                    implementation_version,
-                    region,
-                    storage_class,
-                    versioning,
-                    image_digest,
-                },
-                StoreLocation::S3 { .. },
-            ) => (
-                None,
-                Some(ObservedBackendV1::S3 {
-                    implementation: *implementation,
-                    implementation_version: implementation_version.clone(),
-                    region: region.clone(),
-                    storage_class: storage_class.clone(),
-                    versioning: *versioning,
-                    image_digest: image_digest.clone(),
-                    probe: "declared".into(),
-                }),
-            ),
-            _ => {
-                return Err(failure(
-                    "the store's kind and the point's declared backend disagree",
-                ));
-            }
-        };
+        store_evidence(&plan.definition.environment.backend, store.location())?;
     let child_environment = child_environment();
     let product = resolve_product(options, &child_environment)?;
     let binding = binding(&plan.dataset, &options.fixture_bindings)?;

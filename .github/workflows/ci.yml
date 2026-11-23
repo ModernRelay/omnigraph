@@ -1439,6 +1439,15 @@ jobs:
             store::tests::rustfs_integration_a_bucket_store_keeps_bases_clones_records_and_builds \
             -- --exact --nocapture 2>&1 | tee -a "$test_log"
 
+          # One `rebuild` repetition over a bucket, from the same build: the
+          # `omnigraph` and `omnigraph-server` the first call of this step
+          # left in `target/debug` apply a cluster onto a prefix and serve it.
+          cargo test --locked \
+            -p omnigraph-bench \
+            --lib \
+            gqt_tests::concurrent::owned_server::process::rustfs_integration_a_rebuild_repetition_runs_against_the_builds_own_server_over_a_bucket \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+
           if grep -Eiq \
             "SKIP public_physical_ref_token_rejects_s3_same_version_aba|skipping s3 " \
             "$test_log"
@@ -1469,6 +1478,7 @@ jobs:
             s3_storage::s3_open_clone_reads_the_base_and_writes_only_its_own_prefix \
             clone_cases_run_against_a_bucket \
             store::tests::rustfs_integration_a_bucket_store_keeps_bases_clones_records_and_builds \
+            gqt_tests::concurrent::owned_server::process::rustfs_integration_a_rebuild_repetition_runs_against_the_builds_own_server_over_a_bucket \
             public_physical_ref_token_rejects_s3_same_version_aba \
             s3::server_opens_s3_graph_directly_and_serves_snapshot_and_read \
             s3::server_boots_cluster_from_bare_storage_uri_and_serves_query \
