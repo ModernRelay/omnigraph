@@ -1,5 +1,5 @@
 use super::*;
-use crate::settings::validate_allowed_host;
+use crate::settings::{validate_allowed_host, validate_result_bytes, validate_setup_url};
 use serde_json::json;
 
 #[test]
@@ -15,7 +15,9 @@ fn refusals_delegate_write_context_and_preserve_resource_error_data() {
         ProtocolError::Capacity,
         ProtocolError::Cancelled,
         ProtocolError::Deadline,
-        ProtocolError::ResultTooLarge,
+        ProtocolError::ResultTooLarge {
+            limit: RESULT_BYTES,
+        },
         ProtocolError::InvalidResult,
     ] {
         for write in [false, true] {
@@ -142,11 +144,7 @@ fn complete_tool_result_including_legacy_text_has_one_byte_bound() {
     let result = bounded_result(&small).unwrap();
     assert_eq!(result.is_error, Some(false));
     assert_eq!(result.structured_content, Some(small));
-    let service = GraphTools {
-        host: HeldHost::default(),
-        version: "test".into(),
-        slots: Arc::new(Semaphore::new(1)),
-    };
+    let service = test_service(RESULT_BYTES);
     // The first source fits but its structured + legacy text envelope does
     // not. Both limits must return an error, not disguise a completed write
     // as an ordinary successful handler return.
@@ -156,23 +154,116 @@ fn complete_tool_result_including_legacy_text_has_one_byte_bound() {
     ] {
         assert_eq!(
             bounded_result(&value).unwrap_err(),
-            ProtocolError::ResultTooLarge
+            ProtocolError::ResultTooLarge {
+                limit: RESULT_BYTES
+            }
         );
         assert!(matches!(
             HostError::from_output(None, &value),
-            Err(ProtocolError::ResultTooLarge)
+            Err(ProtocolError::ResultTooLarge {
+                limit: RESULT_BYTES
+            })
         ));
         for write in [false, true] {
             let result = service.fit_result(CallToolResult::structured(value.clone()), write);
             assert_eq!(
                 result.structured_content,
                 Some(json!({
-                    "error": {"event": "ResultTooLarge", "write": write}
+                    "error": {
+                        "event": format!("ResultTooLarge {{ limit: {RESULT_BYTES} }}"),
+                        "write": write
+                    }
                 }))
             );
             assert!(serde_json::to_vec(&result).unwrap().len() <= RESULT_BYTES);
         }
     }
+}
+
+fn test_service(result_bytes: usize) -> GraphTools<HeldHost> {
+    let mut settings = McpSettings::default();
+    settings.result_bytes = result_bytes;
+    GraphTools {
+        host: HeldHost::default(),
+        version: "test".into(),
+        slots: Arc::new(Semaphore::new(1)),
+        result_bytes,
+        instructions: Arc::from(instructions(&settings)),
+    }
+}
+
+#[test]
+fn a_configured_result_bound_lowers_the_limit_and_names_it() {
+    let limit = 128 * 1024;
+    let value = json!({"text": "x".repeat(limit)});
+    assert!(bounded_result(&value).is_ok());
+    assert_eq!(
+        bounded_result_within(&value, limit).unwrap_err(),
+        ProtocolError::ResultTooLarge { limit }
+    );
+    // A bound above the built-in one never raises it.
+    let large = json!({"text": "x".repeat(RESULT_BYTES)});
+    assert_eq!(
+        bounded_result_within(&large, RESULT_BYTES * 2).unwrap_err(),
+        ProtocolError::ResultTooLarge {
+            limit: RESULT_BYTES
+        }
+    );
+    let service = test_service(limit);
+    let result = service.fit_result(CallToolResult::structured(value), false);
+    assert_eq!(
+        result.structured_content,
+        Some(json!({
+            "error": {"event": format!("ResultTooLarge {{ limit: {limit} }}"), "write": false}
+        }))
+    );
+    // A refusal keeps the built-in bound, so it is never itself refused.
+    assert!(serde_json::to_vec(&result).unwrap().len() <= RESULT_BYTES);
+}
+
+#[test]
+fn result_bound_and_setup_url_settings_are_validated() {
+    for bytes in [1, 128 * 1024, RESULT_BYTES] {
+        assert!(validate_result_bytes(bytes).is_ok(), "{bytes}");
+    }
+    for bytes in [0, RESULT_BYTES + 1] {
+        assert!(validate_result_bytes(bytes).is_err(), "{bytes}");
+    }
+    for url in [
+        "https://platform.example.com/setup",
+        "https://example.com/organizations/o/clusters/c/graphs/new",
+    ] {
+        assert!(validate_setup_url(url).is_ok(), "{url}");
+    }
+    for url in [
+        "http://example.com/setup",
+        "https://user:secret@example.com/setup",
+        "https://example.com/setup?token=x",
+        "https://example.com/setup#frag",
+        "example.com/setup",
+        "",
+    ] {
+        assert!(validate_setup_url(url).is_err(), "{url}");
+    }
+    assert_eq!(format_bytes(RESULT_BYTES), "1 MiB");
+    assert_eq!(format_bytes(128 * 1024), "128 KiB");
+    assert_eq!(format_bytes(1500), "1500 bytes");
+    assert_eq!(format_bytes(1), "1 byte");
+}
+
+#[test]
+fn instructions_name_the_configured_bound_and_the_setup_step_only_when_configured() {
+    let defaults = instructions(&McpSettings::default());
+    assert!(defaults.contains("A result is limited to 1 MiB"));
+    assert!(!defaults.contains("`setup`"));
+    let mut settings = McpSettings::default();
+    settings.result_bytes = 128 * 1024;
+    settings.setup_url = Some("https://example.com/setup".into());
+    let configured = instructions(&settings);
+    assert!(configured.contains("A result is limited to 128 KiB"));
+    assert!(configured.contains("returns a `setup` link"));
+    // The URL itself is never in the session instructions.
+    assert!(!configured.contains("https://example.com/setup"));
 }
 
 #[derive(Clone, Default)]
@@ -236,8 +327,7 @@ async fn cancellation_and_deadline_keep_the_host_owned_permit_until_completion()
             let host = HeldHost::default();
             let service = GraphTools {
                 host: host.clone(),
-                version: "test".into(),
-                slots: Arc::new(Semaphore::new(1)),
+                ..test_service(RESULT_BYTES)
             };
             let result = service
                 .run_tool(

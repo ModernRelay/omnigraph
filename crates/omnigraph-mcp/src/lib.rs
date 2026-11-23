@@ -19,9 +19,11 @@ pub use arguments::{
     MergeBaseArguments, MutateArguments, QueryArguments, ToolCall, ToolRequest, change_query,
 };
 pub use resources::{ResourceOutput, ResourceRequest};
-pub use result::{HostError, bounded_result};
+pub use result::{HostError, bounded_result, bounded_result_within};
 pub use rmcp::model::CallToolResult as ToolResult;
-pub use settings::{MCP_ALLOWED_HOSTS_ENV, McpSettings};
+pub use settings::{
+    MCP_ALLOWED_HOSTS_ENV, MCP_MAX_RESULT_BYTES_ENV, MCP_SETUP_URL_ENV, McpSettings, format_bytes,
+};
 
 use axum::Router;
 use axum::http::{StatusCode, request::Parts};
@@ -76,7 +78,10 @@ pub enum ProtocolError {
     Capacity,
     Cancelled,
     Deadline,
-    ResultTooLarge,
+    /// The encoded result exceeded `limit` bytes, the configured bound.
+    ResultTooLarge {
+        limit: usize,
+    },
     InvalidResult,
 }
 
@@ -141,6 +146,8 @@ where
         host,
         version,
         slots: Arc::new(Semaphore::new(16)),
+        result_bytes: settings.result_bytes.min(RESULT_BYTES),
+        instructions: Arc::from(instructions(&settings)),
     };
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
@@ -155,6 +162,11 @@ struct GraphTools<H> {
     host: H,
     version: String,
     slots: Arc<Semaphore>,
+    /// [`McpSettings::result_bytes`], applied to every tool result and
+    /// resource read.
+    result_bytes: usize,
+    /// Built once at boot from the settings.
+    instructions: Arc<str>,
 }
 
 /// Why a tool call or resource read produced no handler result.
@@ -193,7 +205,9 @@ impl Refusal {
             }
             Self::Protocol(ProtocolError::Cancelled) => "the read was cancelled",
             Self::Protocol(ProtocolError::Deadline) => "the read exceeded its 30 second deadline",
-            Self::Protocol(ProtocolError::ResultTooLarge) => "the resource exceeds 1 MiB",
+            Self::Protocol(ProtocolError::ResultTooLarge { .. }) => {
+                "the resource exceeds the result bound"
+            }
             Self::Protocol(ProtocolError::InvalidResult) => "could not encode MCP resource",
         };
         let data = self.tool_result(host, false).structured_content;
@@ -235,7 +249,7 @@ where
 
 impl<H: Host> GraphTools<H> {
     fn fit_result(&self, result: ToolResult, write: bool) -> ToolResult {
-        check_result(result)
+        check_result(result, self.result_bytes)
             .unwrap_or_else(|error| self.host.error(error, write).into_tool_result())
     }
 
@@ -270,7 +284,7 @@ impl<H: Host> ServerHandler for GraphTools<H> {
             "omnigraph-server",
             self.version.clone(),
         ))
-        .with_instructions(INSTRUCTIONS)
+        .with_instructions(self.instructions.to_string())
     }
 
     async fn list_tools(
@@ -398,11 +412,11 @@ impl<H: Host> ServerHandler for GraphTools<H> {
         let result = observe(pending, context.ct.cancelled(), READ_DEADLINE).await;
         match result {
             Ok((mime_type, text)) => {
-                if text.len() > RESULT_BYTES {
-                    return Err(ErrorData::internal_error(
-                        "the resource exceeds 1 MiB",
-                        None,
-                    ));
+                if text.len() > self.result_bytes {
+                    return Err(Refusal::Protocol(ProtocolError::ResultTooLarge {
+                        limit: self.result_bytes,
+                    })
+                    .resource_error(&self.host));
                 }
                 Ok(ReadResourceResult::new(vec![
                     ResourceContents::text(text, uri).with_mime_type(mime_type),

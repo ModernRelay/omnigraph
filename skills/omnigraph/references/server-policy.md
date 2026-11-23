@@ -134,7 +134,9 @@ route under the caller's actor and that route's Cedar action: narrow an
 agent's policy to keep it read-only. The `query` tool takes GQ source or a
 stored read's `name`. No server flag narrows the tool list; policy alone
 decides. List every non-loopback `Host` with `--mcp-allowed-host`. `/mcp`
-needs no `Omnigraph-Http-Api` header.
+needs no `Omnigraph-Http-Api` header. `--mcp-max-result-bytes` lowers the
+1 MiB tool-result bound for clients that accept less, and `--mcp-setup-url`
+returns a `setup` link with a successful, empty `graphs` list.
 
 `--oidc-identity-trust <file>` admits OIDC access tokens (for example an MCP
 client's OAuth sign-in) as `principal:<id>` actors and serves the

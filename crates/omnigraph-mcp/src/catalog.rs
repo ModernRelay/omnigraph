@@ -1,5 +1,6 @@
 //! MCP tool descriptions, annotations and JSON schemas.
 
+use crate::{McpSettings, RESULT_BYTES, format_bytes};
 use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -236,16 +237,30 @@ pub(super) fn spec(name: &str) -> Option<&'static ToolSpec> {
     TOOLS.iter().find(|spec| spec.name == name)
 }
 
-/// The instructions every MCP session receives.
-pub(super) const INSTRUCTIONS: &str = concat!(
+/// The fixed part of the instructions every MCP session receives.
+const INSTRUCTIONS_HEAD: &str = concat!(
     "Omnigraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n",
     "1. Call `graphs` for who you are and the ids of the graphs your credential holds any permission on; any other graph is not found. `access` says what you may do on one.\n",
     "2. Call `schema` for the graph (or read `omnigraph://graphs/{graph}/schema`) before writing a query: it declares the types, properties, keys and edges a query may name.\n",
     "3. Prefer a stored read: `queries` lists stored queries with typed parameters, and `query` runs one by `name`.\n",
     "4. Otherwise write a GQ read and pass it to `query` as `query`, with every value passed as a declared, typed parameter. `query` refuses mutations.\n",
     "Writes: `mutate`, `load`, `blobs_clear`, `branches_create`, `branches_delete`, `branches_merge`, `commits_publish` and `commits_drop` each publish at most one commit. `mutate` with `name` and no `query` runs a stored mutation from `queries`. For read-modify-write, pass your read's `graph_commit_id` to `mutate` as `if_graph_commit`; a 412 means nothing was written. The server never retries a write. A result with `outcome_unknown`, or no response at all (a client timeout, a cancellation or a dropped connection), means the write may or may not have happened: read the target or list its commits and reconcile before replaying, and replay a `mutate` with `if_graph_commit`. Schema and deployment changes are operator-owned and not available here.\n",
-    "Reads carry their `graph_commit_id`. A result is limited to 1 MiB and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
 );
+
+/// The instructions every MCP session receives, built once at boot from the
+/// settings: the configured result bound and, with a setup URL, what to do
+/// when `graphs` is empty.
+pub(super) fn instructions(settings: &McpSettings) -> String {
+    let mut text = String::from(INSTRUCTIONS_HEAD);
+    text.push_str(&format!(
+        "Reads carry their `graph_commit_id`. A result is limited to {} and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
+        format_bytes(settings.result_bytes.min(RESULT_BYTES)),
+    ));
+    if settings.setup_url.is_some() {
+        text.push_str("\nIf `graphs` succeeds with no graphs and returns a `setup` link, tell the user they have no graph yet and offer that link to create one. Creation happens on that page, not through these tools. Don't say a graph exists until `graphs` lists it; when the user says they created one, call `graphs` again.");
+    }
+    text
+}
 
 pub(super) fn tools() -> Vec<Tool> {
     TOOLS
@@ -585,6 +600,12 @@ pub(super) fn graphs_output_schema() -> Value {
                 "properties": {"graph_id": {"type": "string"}, "display_name": {"type": "string"}},
                 "required": ["graph_id", "display_name"],
             }},
+            "setup": {
+                "type": "object",
+                "description": "Present only on a successful empty list when the operator configured a setup page.",
+                "properties": {"message": {"type": "string"}, "url": {"type": "string", "format": "uri"}},
+                "required": ["message", "url"],
+            },
         },
         "required": ["graphs"],
     })

@@ -176,6 +176,8 @@ including JSON-RPC tool errors, never expose a reflected resource credential.
 | Flag | Environment | Default | Effect |
 |---|---|---|---|
 | `--mcp-allowed-host <host[:port]>`, repeatable | `OMNIGRAPH_MCP_ALLOWED_HOSTS=a,b` | none | Adds allowed `Host` values |
+| `--mcp-max-result-bytes <bytes>` | `OMNIGRAPH_MCP_MAX_RESULT_BYTES` | `1048576` (1 MiB) | Lowers the tool-result bound (1 to 1048576; never raises it), so a broad read is refused with `result_too_large`, naming the limit, before a client that accepts less truncates it (Claude takes about 150,000 characters). Refusals keep the 1 MiB bound; the instructions state the limit |
+| `--mcp-setup-url <url>` | `OMNIGRAPH_MCP_SETUP_URL` | none | An `https` page (no userinfo, query or fragment) returned as `setup` only with a successful, empty `graphs` list, never with a refusal; the instructions tell the client to offer it. It is public operator guidance, not graph data. HTTP discovery is unchanged |
 
 Settings are read once at boot. `/mcp` lists every tool below, and each call
 runs under the same policy action as its HTTP route, so a caller can do over
@@ -184,8 +186,7 @@ may do, narrow the policy for the agent's credential.
 
 The removed `--mcp-allow-adhoc` and `--mcp-allow-writes` flags make
 `omnigraph-server` refuse to start; leftover `OMNIGRAPH_MCP_ALLOW_*` variables
-are ignored, so such a deployment lists every tool. A token with no applied
-policy still only reads: `query` answers, and a write tool returns 403.
+are ignored, so such a deployment lists every tool. A token with no applied policy still only reads: `query` answers, and a write tool returns 403.
 
 ## Tools
 
@@ -331,7 +332,7 @@ passed its wait included, answers `outcome_unknown` with `effects: unknown`.
 | Limit | Value |
 |---|---|
 | Request body | 64 KiB |
-| Complete tool result, including the text copy | 1 MiB |
+| Complete tool result, including the text copy | 1 MiB, or lower with `--mcp-max-result-bytes` |
 | Wait for one read | 30 seconds |
 | Wait for one write | 30 seconds; the write continues past it |
 | Concurrent tool executions | 16 |

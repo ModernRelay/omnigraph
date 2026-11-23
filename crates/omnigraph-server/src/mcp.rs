@@ -331,11 +331,14 @@ fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
             ErrorCode::DeadlineExceeded,
             "The read exceeded its 30 second deadline.",
         ),
-        ProtocolError::ResultTooLarge | ProtocolError::InvalidResult => {
-            let error = if matches!(error, ProtocolError::ResultTooLarge) {
+        ProtocolError::ResultTooLarge { .. } | ProtocolError::InvalidResult => {
+            let error = if let ProtocolError::ResultTooLarge { limit } = error {
                 ApiError::new(
                     ErrorCode::ResultTooLarge,
-                    "The result exceeds 1 MiB; use a narrower stored query.",
+                    format!(
+                        "The result exceeds the server's {} limit; narrow it with `limit` or filters, or use a narrower stored query.",
+                        omnigraph_mcp::format_bytes(limit)
+                    ),
                 )
             } else {
                 ApiError::internal("could not encode MCP result")
@@ -349,8 +352,36 @@ fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
     }
 }
 
-fn bounded_result<T: Serialize>(value: &T) -> Result<ToolResult, ApiError> {
-    omnigraph_mcp::bounded_result(value).map_err(|error| protocol_error(error, false))
+/// A successful `graphs` result. `setup` appears only on a successful empty
+/// list and only when the operator configured `--mcp-setup-url`; the HTTP
+/// discovery output stays unchanged.
+#[derive(Serialize)]
+struct McpGraphsOutput {
+    #[serde(flatten)]
+    discovery: crate::api::GraphDiscoveryOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup: Option<McpSetupHint>,
+}
+
+#[derive(Serialize)]
+struct McpSetupHint {
+    message: &'static str,
+    url: String,
+}
+
+const SETUP_MESSAGE: &str = "No graph is visible to you yet. The user can create one on this page; creation happens there, not through these tools.";
+
+fn graphs_output(
+    discovery: crate::api::GraphDiscoveryOutput,
+    setup_url: Option<&str>,
+) -> McpGraphsOutput {
+    let setup = setup_url
+        .filter(|_| discovery.graphs.is_empty())
+        .map(|url| McpSetupHint {
+            message: SETUP_MESSAGE,
+            url: url.to_owned(),
+        });
+    McpGraphsOutput { discovery, setup }
 }
 
 /// One tool call's work, in its own allocation.
@@ -374,6 +405,12 @@ where
 }
 
 impl ServerHost {
+    /// Encode a handler DTO under the configured result bound.
+    fn bounded<T: Serialize>(&self, value: &T) -> Result<ToolResult, ApiError> {
+        omnigraph_mcp::bounded_result_within(value, self.state.mcp_settings().result_bytes)
+            .map_err(|error| protocol_error(error, false))
+    }
+
     async fn execute(
         &self,
         request: ToolRequest,
@@ -399,10 +436,15 @@ impl ServerHost {
         let state = || State(self.state.clone());
         match call {
             ToolCall::Health => {
-                boxed(|| async { bounded_result(&handlers::server_health().await.0) }).await
+                boxed(move || async move { self.bounded(&handlers::server_health().await.0) }).await
             }
             ToolCall::Graphs => {
-                boxed(move || async move { bounded_result(&self.discover(actor).await?) }).await
+                boxed(move || async move {
+                    let discovery = self.discover(actor).await?;
+                    let setup_url = self.state.mcp_settings().setup_url.as_deref();
+                    self.bounded(&graphs_output(discovery, setup_url))
+                })
+                .await
             }
             ToolCall::Schema(args) => {
                 boxed(move || async move {
@@ -410,7 +452,7 @@ impl ServerHost {
                     let output =
                         handlers::server_schema_get(Extension(handle), Some(Extension(actor)))
                             .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -420,7 +462,7 @@ impl ServerHost {
                     let output =
                         handlers::server_list_queries(Extension(handle), Some(Extension(actor)))
                             .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -451,7 +493,7 @@ impl ServerHost {
                             Bytes::from(body),
                         )
                         .await?;
-                        return bounded_result(&output.0);
+                        return self.bounded(&output.0);
                     };
                     let request = request_body(json!({
                         "query": query,
@@ -467,7 +509,7 @@ impl ServerHost {
                         ApiJson(request),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -482,7 +524,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -497,7 +539,7 @@ impl ServerHost {
                             target_branch: args.target_branch,
                         },
                     )?;
-                    bounded_result(&output)
+                    self.bounded(&output)
                 })
                 .await
             }
@@ -512,7 +554,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -534,7 +576,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -549,7 +591,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -567,7 +609,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -589,7 +631,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -610,7 +652,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -631,7 +673,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -651,7 +693,7 @@ impl ServerHost {
                         RawQuery(query),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -673,7 +715,7 @@ impl ServerHost {
                         ApiQuery(query.clone()),
                     )
                     .await?;
-                    bounded_result(&blob_stat_output(&query, &response)?)
+                    self.bounded(&blob_stat_output(&query, &response)?)
                 })
                 .await
             }
@@ -729,7 +771,7 @@ impl ServerHost {
                                 .await?
                             }
                         };
-                        return bounded_result(&output.0);
+                        return self.bounded(&output.0);
                     };
                     let request = ApiJson(request_body(json!({
                         "query": query,
@@ -761,7 +803,7 @@ impl ServerHost {
                             .await?
                         }
                     };
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -783,7 +825,7 @@ impl ServerHost {
                         ApiJson(request),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -817,7 +859,7 @@ impl ServerHost {
                         query,
                     )
                     .await?;
-                    bounded_result(&output)
+                    self.bounded(&output)
                 })
                 .await
             }
@@ -837,7 +879,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -855,7 +897,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -875,7 +917,7 @@ impl ServerHost {
                         ApiJson(request),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -893,7 +935,7 @@ impl ServerHost {
                         }),
                     )
                     .await?;
-                    bounded_result(&output.0)
+                    self.bounded(&output.0)
                 })
                 .await
             }
@@ -912,7 +954,7 @@ impl ServerHost {
                     )
                     .await?;
                     // The route answers 204; structured content must be an object.
-                    bounded_result(&json!({}))
+                    self.bounded(&json!({}))
                 })
                 .await
             }
@@ -1190,7 +1232,13 @@ mod tests {
         for (refusal, code, action) in [
             (ProtocolError::Cancelled, "cancelled", "retry"),
             (ProtocolError::Deadline, "deadline_exceeded", "retry"),
-            (ProtocolError::ResultTooLarge, "result_too_large", "fix"),
+            (
+                ProtocolError::ResultTooLarge {
+                    limit: omnigraph_mcp::RESULT_BYTES,
+                },
+                "result_too_large",
+                "fix",
+            ),
         ] {
             let body = error_body(project_error(protocol_error(refusal, false), false));
             assert!(body.get("status").is_none(), "{body}");
@@ -1201,6 +1249,36 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn graphs_adds_a_setup_link_only_to_a_successful_empty_list_when_configured() {
+        let empty = || crate::api::GraphDiscoveryOutput { graphs: Vec::new() };
+        let one = || crate::api::GraphDiscoveryOutput {
+            graphs: vec![crate::api::GraphDiscoveryEntry {
+                graph_id: "brain".into(),
+                display_name: "brain".into(),
+            }],
+        };
+        let url = "https://example.com/setup";
+        let with_setup = serde_json::to_value(graphs_output(empty(), Some(url))).unwrap();
+        assert_eq!(with_setup["graphs"], json!([]));
+        assert_eq!(with_setup["setup"]["url"], json!(url));
+        assert_eq!(with_setup["setup"]["message"], json!(SETUP_MESSAGE));
+        let listed = serde_json::to_value(graphs_output(one(), Some(url))).unwrap();
+        assert!(listed.get("setup").is_none());
+        let unconfigured = serde_json::to_value(graphs_output(empty(), None)).unwrap();
+        assert_eq!(unconfigured, json!({"graphs": []}));
+    }
+
+    #[test]
+    fn result_too_large_names_the_configured_limit_and_how_to_narrow() {
+        let error = protocol_error(ProtocolError::ResultTooLarge { limit: 128 * 1024 }, false);
+        assert_eq!(error.code, ErrorCode::ResultTooLarge);
+        let output = serde_json::to_value(error.into_output()).unwrap();
+        let message = output["error"].as_str().unwrap_or_default().to_owned();
+        assert!(message.contains("128 KiB"), "{message}");
+        assert!(message.contains("`limit`"), "{message}");
     }
 
     #[test]
@@ -1220,7 +1298,9 @@ mod tests {
                     json!({"effects": "none", "action": "fix"})
                 };
                 for error in [
-                    bounded_result(&value).unwrap_err(),
+                    omnigraph_mcp::bounded_result(&value)
+                        .map_err(|e| protocol_error(e, false))
+                        .unwrap_err(),
                     // The refusal itself has to fit the complete result too.
                     ApiError::bad_request("x".repeat(length)),
                 ] {
@@ -1232,7 +1312,12 @@ mod tests {
                 // The protocol's final response-size check uses the same
                 // server projection as a handler's bounded DTO conversion.
                 let body = error_body(project_error(
-                    protocol_error(ProtocolError::ResultTooLarge, write),
+                    protocol_error(
+                        ProtocolError::ResultTooLarge {
+                            limit: omnigraph_mcp::RESULT_BYTES,
+                        },
+                        write,
+                    ),
                     write,
                 ));
                 assert_eq!(body["error"]["code"], "result_too_large", "{body}");
@@ -1292,7 +1377,8 @@ mod tests {
                         assert!(execution_graph.set(request).is_ok());
                         entered.send(()).unwrap();
                         held.await.unwrap();
-                        bounded_result(&json!({"finished": true}))
+                        omnigraph_mcp::bounded_result(&json!({"finished": true}))
+                            .map_err(|e| protocol_error(e, false))
                     },
                 );
                 // The protocol crate owns cancellation/deadline replies. The

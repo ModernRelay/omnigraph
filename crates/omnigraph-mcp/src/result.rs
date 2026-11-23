@@ -6,13 +6,16 @@ use rmcp::model::CallToolResult;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-struct LimitedBytes(Vec<u8>);
+struct LimitedBytes {
+    bytes: Vec<u8>,
+    limit: usize,
+}
 impl std::io::Write for LimitedBytes {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > RESULT_BYTES - self.0.len() {
+        if bytes.len() > self.limit - self.bytes.len() {
             return Err(std::io::Error::other("MCP result exceeds byte limit"));
         }
-        self.0.write_all(bytes)?;
+        self.bytes.write_all(bytes)?;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -20,23 +23,51 @@ impl std::io::Write for LimitedBytes {
     }
 }
 
-fn bounded_value<T: Serialize>(value: &T) -> Result<Value, ProtocolError> {
-    let mut bytes = LimitedBytes(Vec::new());
-    serde_json::to_writer(&mut bytes, value).map_err(|_| ProtocolError::ResultTooLarge)?;
-    serde_json::from_slice(&bytes.0).map_err(|_| ProtocolError::InvalidResult)
+fn bounded_value<T: Serialize>(value: &T, limit: usize) -> Result<Value, ProtocolError> {
+    let mut bytes = LimitedBytes {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut bytes, value)
+        .map_err(|_| ProtocolError::ResultTooLarge { limit })?;
+    serde_json::from_slice(&bytes.bytes).map_err(|_| ProtocolError::InvalidResult)
 }
 
 /// Encode a handler DTO under both the value and complete SDK result bounds.
 /// An oversized response is an error, so the host can preserve the fact that
 /// a write ran before its receipt could be delivered.
 pub fn bounded_result<T: Serialize>(value: &T) -> Result<CallToolResult, ProtocolError> {
-    check_result(CallToolResult::structured(bounded_value(value)?))
+    bounded_result_within(value, RESULT_BYTES)
+}
+
+/// [`bounded_result`] under a configured bound, which the host takes from
+/// [`crate::McpSettings::result_bytes`] and which never exceeds
+/// [`RESULT_BYTES`].
+pub fn bounded_result_within<T: Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<CallToolResult, ProtocolError> {
+    let limit = limit.min(RESULT_BYTES);
+    check_result(
+        CallToolResult::structured(bounded_value(value, limit)?),
+        limit,
+    )
 }
 
 /// Include the text copy structured results carry for older clients.
-pub(super) fn check_result(result: CallToolResult) -> Result<CallToolResult, ProtocolError> {
-    serde_json::to_writer(&mut LimitedBytes(Vec::new()), &result)
-        .map_err(|_| ProtocolError::ResultTooLarge)?;
+pub(super) fn check_result(
+    result: CallToolResult,
+    limit: usize,
+) -> Result<CallToolResult, ProtocolError> {
+    let limit = limit.min(RESULT_BYTES);
+    serde_json::to_writer(
+        &mut LimitedBytes {
+            bytes: Vec::new(),
+            limit,
+        },
+        &result,
+    )
+    .map_err(|_| ProtocolError::ResultTooLarge { limit })?;
     Ok(result)
 }
 
@@ -57,11 +88,13 @@ impl HostError {
         status: Option<StatusCode>,
         output: &T,
     ) -> Result<Self, ProtocolError> {
-        let mut body = json!({"error": bounded_value(output)?});
+        // Refusals keep the built-in bound: a configured lower bound must
+        // never turn a refusal into a second, harder-to-read one.
+        let mut body = json!({"error": bounded_value(output, RESULT_BYTES)?});
         if let Some(status) = status {
             body["status"] = json!(status.as_u16());
         }
-        let result = check_result(CallToolResult::structured_error(body))?;
+        let result = check_result(CallToolResult::structured_error(body), RESULT_BYTES)?;
         Ok(Self {
             status,
             result: Box::new(result),
