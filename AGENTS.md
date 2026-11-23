@@ -114,6 +114,32 @@ more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
 
+Applied to the shape of a design, that lens is **conceptual integrity**
+(Brooks): few ideas, applied everywhere. Always weigh it. The lenses are the
+default; where one conflicts with the counterweight, the test that closes this
+section decides.
+
+- **Correct by construction.** Make the illegal state unrepresentable; fix the
+  class, not the reported instance.
+- **Generality.** The prompting case is an instance of the mechanism, with no
+  branch, flag or constant of its own (zero-one-infinity: none, one or any
+  number, never a fixed few).
+- **Orthogonality and composability.** Primitives vary independently and close
+  under composition (a composition composes again); extend or compose one
+  before adding one.
+- **Intrinsic naming.** Name a thing by what it is or selects, never by the
+  caller, scenario or change that prompted it. The `issue_N` in a regression
+  test's name is a cross-reference the gate reads, and stays.
+- **Cases as data.** Real variation is a parameter or a table row, not new
+  code.
+
+The counterweight is **speculative generality** (Fowler) and **the wrong
+abstraction** (Metz): YAGNI. For a design choice, state the specific form and
+the general form, argue for and against each, and name what the choice trades
+away. Decide by the same lens, on evidence: the general form
+wins only when the tree has the cases it serves today and it leaves fewer
+concepts than the specific one (parsimony).
+
 Validate every assumption. Do not assume how a function, module or symbol
 behaves: read it. For Lance internals, read the upstream implementation.
 
@@ -220,6 +246,9 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   workload revises [the work](docs/dev/workload.md) in the same pull request.
 - Preserve unrelated work in a dirty tree. Never discard user changes.
 - Make the smallest coherent change that closes the behavior and test surface.
+- Never weaken, skip or delete a check to make a change pass. A test, guard,
+  golden or pin changes only when what it guards changes, and the pull request
+  says so.
 - For a bug, reproduce the predicted failure at the tier the regression rule
   below names, then fix the root cause and prove the regression turns green.
 - Query-behavior tests default to `.gqt` logic tests under
@@ -277,4 +306,6 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   published release documents and the bytes they are verified against.
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
-- Keep this file a map. New deep content goes in its audience-owned guide.
+- Keep this file a map. New deep content goes in its audience-owned guide. A
+  rule belongs here only when a violation is hard to detect or hard to
+  reverse; where a check can catch it, add the check instead.
