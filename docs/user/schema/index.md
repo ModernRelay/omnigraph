@@ -119,6 +119,13 @@ property discards its stored values. A constraint that also names another
 property or `@src`/`@dst` cannot be removed in place: rebuild the graph
 without it.
 
+Earlier releases also admitted `@check` on a list property, and no write
+checked it. A graph that already declares one still opens, and its writes stay
+unchecked, but reapplying that source is refused at admission, as is every
+`cluster apply` of a deployment that contains the graph. To remove the
+constraint, drop the property in one schema change, then add it back without
+it; dropping a property discards its stored values.
+
 Current automatic property indexes are created for single-property node declarations:
 orderable scalars and enums receive a scalar index, free-text Strings receive a
 full-text index, and vectors receive a vector index. Composite declarations and
