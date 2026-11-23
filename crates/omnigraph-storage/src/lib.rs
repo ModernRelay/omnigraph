@@ -1616,7 +1616,7 @@ impl ObjectStorageAdapter {
         let base = parse_s3_uri(base_uri)?;
         let root_key = ObjectPath::from(root.key.as_str());
         let base_key = ObjectPath::from(base.key.as_str());
-        if root.bucket == base.bucket && s3_prefixes_overlap(root_key.as_ref(), base_key.as_ref()) {
+        if s3_roots_overlap(&root, &base) {
             return Err(StorageError::backend(
                 StorageFailureKind::Configuration,
                 format!(
@@ -3142,6 +3142,35 @@ fn s3_prefixes_overlap(a: &str, b: &str) -> bool {
         || b.is_empty()
         || a.starts_with(&format!("{b}/"))
         || b.starts_with(&format!("{a}/"))
+}
+
+/// Whether an `s3://` clone root and its base can name one object: no spelling
+/// of one may overlap a spelling of the other, since a write lands at each.
+fn s3_roots_overlap(root: &S3Location, base: &S3Location) -> bool {
+    let base_spellings = s3_prefix_spellings(&base.key);
+    root.bucket == base.bucket
+        && s3_prefix_spellings(&root.key).iter().any(|root| {
+            base_spellings
+                .iter()
+                .any(|base| s3_prefixes_overlap(root, base))
+        })
+}
+
+/// The prefixes the routes of a clone address the key `key` by: the adapter's
+/// key as written, the mount's encoding of it, and the percent-decoded path
+/// Lance opens (absent when Lance cannot address the key).
+fn s3_prefix_spellings(key: &str) -> Vec<String> {
+    let segments = || key.split('/').filter(|segment| !segment.is_empty());
+    let written = segments().collect::<Vec<_>>().join("/");
+    let mounted = ObjectPath::from(key).to_string();
+    let decoded = segments()
+        .map(|segment| ObjectPath::from_url_path(segment).map(|path| path.to_string()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(|parts| parts.join("/"));
+    [Some(written), Some(mounted), decoded.ok()]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn parse_s3_uri(uri: &str) -> Result<S3Location> {
@@ -6679,6 +6708,8 @@ mod tests {
             ("s3://bucket/graph//sub", "s3://bucket/graph/sub"),
             ("s3://bucket/graph/sub", "s3://bucket/graph//sub/"),
             ("s3://bucket//graph", "s3://bucket/graph/clone"),
+            ("s3://bucket/a^b", "s3://bucket/a%5Eb"),
+            ("s3://bucket/graph", "s3://bucket/gr%61ph/clone"),
         ] {
             let text = ObjectStorageAdapter::durable_read_through(base, root)
                 .await
@@ -6691,6 +6722,30 @@ mod tests {
         }
         assert!(!s3_prefixes_overlap("graph", "graphs"));
         assert!(!s3_prefixes_overlap("a/graph", "b/graph"));
+    }
+
+    /// GQT cannot name its store's root, and only an `s3://` clone has this check.
+    #[test]
+    fn s3_roots_overlap_in_every_spelling_a_route_addresses() {
+        let overlap = |base: &str, root: &str| {
+            s3_roots_overlap(&parse_s3_uri(root).unwrap(), &parse_s3_uri(base).unwrap())
+        };
+        for (base, root) in [
+            ("s3://bucket/a^b", "s3://bucket/a%5Eb"),
+            ("s3://bucket/a%5Eb", "s3://bucket/a^b"),
+            ("s3://bucket/graph", "s3://bucket/gr%61ph"),
+            ("s3://bucket/graph", "s3://bucket/gr%61ph/clone"),
+            ("s3://bucket/a%20b", "s3://bucket/a%2520b"),
+        ] {
+            assert!(overlap(base, root), "{base} and {root}");
+        }
+        for (base, root) in [
+            ("s3://bucket/graph", "s3://bucket/graphs"),
+            ("s3://bucket/a^b", "s3://bucket/a^c"),
+            ("s3://bucket/graph", "s3://other/graph"),
+        ] {
+            assert!(!overlap(base, root), "{base} and {root}");
+        }
     }
 
     #[tokio::test]
