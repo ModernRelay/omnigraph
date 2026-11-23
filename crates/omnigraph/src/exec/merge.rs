@@ -5209,7 +5209,31 @@ async fn publish_adopted_delta(
     Ok((update, chain))
 }
 
-fn ensure_merge_target_authority_unchanged(
+/// Refuses a merge whose input `captured` no longer reads as it did: its
+/// authority (branch incarnation, exact graph head, accepted schema) or its
+/// graph state (schema contract and every table's pin) differs from `live`.
+/// The manifest version is not compared: a publication that changed none of
+/// these, such as a branch row a create or delete adds to `main`'s catalog,
+/// leaves the merge's plan exact, and the publisher's CAS asserts the same
+/// head and the pins the plan read.
+fn ensure_merge_input_unchanged(
+    member: &str,
+    captured: &WriteTxn,
+    live_authority: &crate::db::WriteAuthorityToken,
+    live: &Snapshot,
+) -> Result<()> {
+    ensure_merge_authority_unchanged(captured, live_authority)?;
+    if !same_graph_state(&captured.base, live) {
+        return Err(OmniError::manifest_read_set_changed(
+            member.to_string(),
+            Some(captured.base.graph_manifest_version().to_string()),
+            Some(live.graph_manifest_version().to_string()),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_merge_authority_unchanged(
     captured: &WriteTxn,
     live: &crate::db::WriteAuthorityToken,
 ) -> Result<()> {
@@ -5564,14 +5588,28 @@ impl Omnigraph {
                 }
                 Snapshot::wrap(base.snapshot)
             };
+            // The tags must name inputs that are still what the merge reads.
+            // A publication that changed nothing the merge read (a branch row
+            // a create or delete adds to `main`'s catalog) moves the probed
+            // manifest version, so a stale probe re-reads both inputs.
             if !source_txn.manifest_probe.is_current().await?
                 || !target_txn.manifest_probe.is_current().await?
             {
-                return Err(OmniError::manifest_read_set_changed(
+                let (live_source_authority, live_source, live_target_authority, live_target) = self
+                    .revalidate_merge_inputs(&source_txn, &target_txn)
+                    .await?;
+                ensure_merge_input_unchanged(
                     "branch_merge_input_capture",
-                    None,
-                    None,
-                ));
+                    &source_txn,
+                    &live_source_authority,
+                    &live_source,
+                )?;
+                ensure_merge_input_unchanged(
+                    "branch_merge_input_capture",
+                    &target_txn,
+                    &live_target_authority,
+                    &live_target,
+                )?;
             }
             fail(&BRANCH_MERGE_POST_AUTHORITY_CAPTURE)?;
             Ok(base_snapshot)
@@ -6069,20 +6107,17 @@ impl Omnigraph {
             live_target_authority,
             fresh_target_snapshot,
         ) = self.revalidate_merge_inputs(source_txn, target_txn).await?;
-        ensure_merge_target_authority_unchanged(target_txn, &live_target_authority)?;
-        if target_snapshot.graph_manifest_version()
-            != fresh_target_snapshot.graph_manifest_version()
-        {
-            return Err(OmniError::manifest_read_set_changed(
-                format!("branch_merge_target:{}", target_branch.unwrap_or("main")),
-                Some(target_snapshot.graph_manifest_version().to_string()),
-                Some(fresh_target_snapshot.graph_manifest_version().to_string()),
-            ));
-        }
-        // The comparison above checked the complete target authority
-        // (branch incarnation, exact graph head, and schema identity), not only
-        // this numeric manifest version. This is the same coarse token
-        // mutation/load publish under.
+        // The target must be what the plan read: its authority (branch
+        // incarnation, exact graph head, schema identity), the same token
+        // mutation and load publish under, and every table's pin. Its
+        // manifest version may have moved by a publication that changed
+        // none of them, such as a branch row in `main`'s catalog.
+        ensure_merge_input_unchanged(
+            &format!("branch_merge_target:{}", target_branch.unwrap_or("main")),
+            target_txn,
+            &live_target_authority,
+            &fresh_target_snapshot,
+        )?;
 
         // Source is an immutable input, not part of the target CAS. A later
         // source-head advance is therefore harmless, but delete/recreate ABA is

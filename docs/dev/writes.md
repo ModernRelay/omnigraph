@@ -64,13 +64,17 @@ without reloading manifest history; the publish wraps the nonce into the
 addressable commit id `hb1.<block>.<slot>.<nonce>`. The schema and branch gates serialize
 conflicting control operations. A merge holds its target's branch gate and
 per-table queues through publication, and its source's branch gate only until
-the source snapshot is captured, tagged and proved still current; it takes no
+the source snapshot is captured, tagged and proved unchanged; it takes no
 per-table queue on the source. Both gates are taken in sorted branch order, so
 a merge whose source sorts first (`main` always does) holds the source gate
 while it waits for a target another merge holds. Once the source is captured,
 writes, index builds and deletes on the source do not wait for the merge, and
 the merge's final re-read still refuses a source whose incarnation or schema
-changed.
+changed. The target's re-read refuses a moved head, incarnation, schema or
+table pin, and nothing else: a publication that changed none of them, such as
+the branch row a create or delete adds to `main`'s catalog, moves `main`'s
+manifest version and does not refuse a merge into `main`
+(`ensure_merge_input_unchanged` in `exec/merge.rs`).
 
 Native branch creation uses an operation-local capture of the bound coordinator
 or that same one-entry cache after the control gates. Reuse

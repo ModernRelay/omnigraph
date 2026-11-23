@@ -8988,6 +8988,89 @@ async fn branch_merge_rejects_fresh_target_manifest_change_before_effects() {
     );
 }
 
+/// A branch delete publishes its retired row in `main`'s catalog and leaves
+/// `main`'s head, schema and table pins as they were. It takes the deleted
+/// branch's gate, not `main`'s, so on one handle, as in one server, it lands
+/// while a merge into `main` sits between its capture and its publication.
+/// The merge must then land too, as a mutation on `main` does: what it read
+/// of the target is the target's authority and tables, not `main`'s manifest
+/// version.
+// contract: merge+branch is not a refused pair (Concurrent operations)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_merge_into_main_lands_over_a_concurrent_branch_delete() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let main_rows = {
+        let db = init_and_load(&dir).await;
+        db.branch_create("source").await.unwrap();
+        db.branch_create("doomed").await.unwrap();
+        for (branch, name) in [("source", "source-only"), ("main", "main-only")] {
+            db.mutate(
+                branch,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", 40)]),
+            )
+            .await
+            .unwrap();
+        }
+        count_rows(&db, "node:Person").await
+    };
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let main_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let merge_rv =
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+
+    let merge_handle = Arc::clone(&db);
+    let merge_task = tokio::spawn(async move { merge_handle.branch_merge("source", "main").await });
+    merge_rv.wait_until_reached().await;
+
+    let before = version_main(&db).await.unwrap();
+    let delete = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        db.branch_delete("doomed"),
+    )
+    .await;
+    let after = version_main(&db).await;
+    // Release before asserting the fixture so a setup failure does not strand
+    // the parked merge.
+    merge_rv.release();
+    delete
+        .expect("the branch delete waited for the parked merge")
+        .unwrap();
+    assert!(
+        after.unwrap() > before,
+        "the branch delete must publish on main's catalog"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "main").await.unwrap(),
+        main_head,
+        "the branch delete must leave main's head where the merge captured it"
+    );
+
+    let merged = merge_task
+        .await
+        .unwrap()
+        .unwrap_or_else(|error| panic!("a branch delete refused a merge into main: {error}"));
+    assert_eq!(merged.outcome, omnigraph::db::MergeOutcome::Merged);
+    let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        count_rows(&reopened, "node:Person").await,
+        main_rows + 1,
+        "the source's row must be on main"
+    );
+    assert!(
+        !reopened
+            .branch_list()
+            .await
+            .unwrap()
+            .iter()
+            .any(|branch| branch == "doomed")
+    );
+}
+
 /// Source is a captured immutable input, not part of the target publisher's
 /// atomic read set. A later commit on the same source incarnation must not make
 /// the merge substitute the newer source head (or reject an otherwise-valid
