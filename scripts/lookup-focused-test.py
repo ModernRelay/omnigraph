@@ -228,16 +228,27 @@ def resolve_mapping(path_str: str, repo_root: Path | None = None) -> TestMapping
                 notes="Traversal source file: fastest coverage via traversal_indexed:: module",
             )
 
-        if stem.endswith("_tests"):
-            mod_filter = stem[:-6]
-        elif stem.endswith("_test"):
-            mod_filter = stem[:-5]
-        elif stem == "tests":
-            mod_filter = Path(sub_path).parent.name
+        mod_filter = stem
+        if stem == "tests":
+            parent_name = Path(sub_path).parent.name
+            mod_filter = "tests" if parent_name == "src" else parent_name
         else:
-            mod_filter = stem
+            # Check if this file is mounted under a sibling module via #[path]
+            # e.g. parser_tests.rs mounted in parser.rs via #[path = "parser_tests.rs"]
+            file_name = Path(sub_path).name
+            parent_dir = repo_root / matching_prefix / Path(sub_path).parent
+            candidate_base = stem[:-6] if stem.endswith("_tests") else (stem[:-5] if stem.endswith("_test") else None)
+            if candidate_base:
+                sibling_file = parent_dir / f"{candidate_base}.rs"
+                if sibling_file.is_file():
+                    try:
+                        content = sibling_file.read_text(encoding="utf-8", errors="ignore")
+                        if f'#[path = "{file_name}"]' in content or f'#[path="{file_name}"]' in content:
+                            mod_filter = candidate_base
+                    except OSError:
+                        pass
 
-        if mod_filter not in ("lib", "main", "mod", ""):
+        if mod_filter not in ("lib", "main", "mod", "src", ""):
             return TestMapping(
                 file_path=posix_path,
                 package=package,
@@ -281,6 +292,9 @@ def self_test() -> None:
         ("crates/omnigraph/src/exec/staging.rs", "omnigraph-engine", "--test writes"),
         ("crates/omnigraph-compiler/src/lexer.rs", "omnigraph-compiler", "--lib lexer::"),
         ("crates/omnigraph-compiler/src/query/parser_tests.rs", "omnigraph-compiler", "--lib parser::"),
+        ("crates/omnigraph-catalog/src/tests.rs", "omnigraph-catalog", "--lib tests::"),
+        ("crates/omnigraph-bench/src/gqt_tests.rs", "omnigraph-bench", "--lib gqt_tests::"),
+        ("crates/omnigraph-cli/src/operator_schema/schema_tests.rs", "omnigraph-cli", "--lib schema_tests::"),
         ("crates/omnigraph-gqt/cases/match_simple.gqt", "omnigraph-gqt", "gq_logic_tests -- match_simple"),
         ("crates/omnigraph-gqt/cases_slow/v2/issue_782_multi_hop_limit_stops_early.gqt", "omnigraph-gqt", "cargo run -p omnigraph-gqt --bin omnigraph-gqt --"),
         ("crates/omnigraph-dst/src/harness.rs", "omnigraph-dst", "(cd crates/omnigraph-dst && cargo test --locked)"),
