@@ -119,7 +119,7 @@ binary. Check `omnigraph version` and the [release notes](../releases/).
 
 ## Client compatibility
 
-Upgrade the CLI, server, and HTTP integrations together. OmniGraph 0.14 requires
+Upgrade the CLI, server, and HTTP integrations together. Omnigraph 0.14 requires
 HTTP contract `0.14`; the npm `0.13.0` clients are not compatible with it.
 Both `@modernrelay/omnigraph@0.14.0` and
 `@modernrelay/omnigraph-mcp@0.14.0` are published on npm. Install the 0.14.0
@@ -129,9 +129,15 @@ For an existing deployment, follow the
 [0.13 → 0.14 checklist](operations/upgrade-0.14.md), including configuration
 and command replacements.
 
+The Python client is [`omnigraph`](https://pypi.org/project/omnigraph/) on
+PyPI ([source](https://github.com/ModernRelay/omnigraph-python)). Its
+major.minor is the HTTP contract it speaks, and it refuses any other; its patch
+number is its own and does not track the server's. For the 0.14 server, install
+it with `pip install "omnigraph>=0.14,<0.15"`.
+
 You can use the released CLI, the [HTTP API](operations/server.md), or the
 server's built-in [MCP endpoint and CLI stdio bridge](operations/mcp.md)
-without either npm package. The MCP protocol has its own negotiation; refresh
+without any of these client packages. The MCP protocol has its own negotiation; refresh
 cached tool schemas when upgrading a client.
 
 ## Build from source
