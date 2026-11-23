@@ -738,18 +738,6 @@ async fn main() -> ExitCode {
                 Some(path) => omnigraph_bench::gqt_runner::ServerProduct::Path(path),
                 None => omnigraph_bench::gqt_runner::ServerProduct::Beside,
             });
-            if server_product.is_some()
-                && (backend.is_some() || store.as_deref().is_some_and(|s| s.starts_with("s3://")))
-            {
-                return bench_cli::failure(
-                    vec![Diagnostic::error(
-                        "invalid_run_input",
-                        "server-product",
-                        "--server-product starts the server over a cluster root under a local store; an s3:// store and --backend do not apply",
-                    )],
-                    json,
-                );
-            }
             let store_environment = match (&store, &backend) {
                 (Some(store), Some(backend)) if store.starts_with("s3://") => Some(
                     omnigraph_bench::gqt_case::GqtEnvironment::embedded(backend.clone()),
@@ -844,7 +832,9 @@ async fn main() -> ExitCode {
                     ),
                     (None, _) if server_product.is_some() => {
                         omnigraph_bench::catalog::served_environment(
-                            omnigraph_bench::catalog::local_environment().backend,
+                            backend.clone().unwrap_or_else(|| {
+                                omnigraph_bench::catalog::local_environment().backend
+                            }),
                             omnigraph_bench::case::NetworkPosition::SameHost,
                         )
                     }
