@@ -1,0 +1,1 @@
+- `omnigraph mcp --graph` answers `graphs` with its bound graph when the credential lacks `graph_list`, instead of returning the 403; other refusals stay errors.

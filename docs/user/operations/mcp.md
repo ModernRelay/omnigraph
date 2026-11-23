@@ -128,7 +128,7 @@ refusals stay the server's.
   command refuses before any request. A tool call that omits `graph` gets it, a
   call or resource URI naming another graph is refused with a JSON-RPC error, and
   `graphs` and `omnigraph://graphs` list only this graph. Run one bridge per
-  graph.
+  graph. When the credential lacks `graph_list`, the bridge answers `graphs` with this graph instead of the 403; other refusals stay errors.
 - **Writes need `--write`.** Without it, the bridge lists and admits only the
   tools the server annotates `readOnlyHint: true`, and refuses a call to any
   other before sending it. The applied policy still decides every call.

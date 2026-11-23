@@ -188,6 +188,14 @@ impl Binding {
                 tools.len() != listed
             }
             "tools/call" if tool_name(request) == Some(GRAPHS_TOOL) => {
+                if graph_list_refused(result) {
+                    // A credential without `graph_list` may not list the
+                    // server's graphs, but this connection is already bound
+                    // to one: answer with it. A listing is not permission;
+                    // every later call is still the server's to refuse.
+                    *result = bound_listing(&self.graph);
+                    return true;
+                }
                 let mut changed = false;
                 if let Some(structured) = result.get_mut("structuredContent") {
                     changed |= narrow_listing(structured, &self.graph);
@@ -278,6 +286,33 @@ fn resource_graph(uri: &str) -> Option<&str> {
 }
 
 /// Keep only `graph` in a `{"graphs": [...]}` listing.
+/// A `graphs` call the server refused with 403 `forbidden`: the credential
+/// lacks `graph_list`. Other refusals (401, `not_admitted`, transport
+/// failures) stay errors, so an authentication problem is never hidden behind
+/// a successful listing.
+fn graph_list_refused(result: &Value) -> bool {
+    result.get("isError").and_then(Value::as_bool) == Some(true)
+        && result
+            .pointer("/structuredContent/status")
+            .and_then(Value::as_u64)
+            == Some(403)
+        && result
+            .pointer("/structuredContent/error/code")
+            .and_then(Value::as_str)
+            == Some("forbidden")
+}
+
+/// The successful `graphs` result naming only the bound graph, in the
+/// server's layout: structured content plus its text copy.
+fn bound_listing(graph: &str) -> Value {
+    let listing = serde_json::json!({"graphs": [{"graph_id": graph, "display_name": graph}]});
+    serde_json::json!({
+        "content": [{"type": "text", "text": listing.to_string()}],
+        "structuredContent": listing,
+        "isError": false,
+    })
+}
+
 fn narrow_listing(listing: &mut Value, graph: &str) -> bool {
     let Some(graphs) = listing.get_mut("graphs").and_then(Value::as_array_mut) else {
         return false;
@@ -534,6 +569,25 @@ mod tests {
             resources["result"]["resources"].as_array().unwrap().len(),
             3
         );
+
+        // A credential without `graph_list` gets the bound graph instead of
+        // a 403; any other refusal stays as it is.
+        let forbidden = |code: &str, status: u64| {
+            json!({"id": 8, "result": {
+                "content": [{"type": "text", "text": "refused"}],
+                "structuredContent": {"error": {"code": code, "error": "refused"}, "status": status},
+                "isError": true,
+            }})
+        };
+        let mut refused_listing = forbidden("forbidden", 403);
+        assert!(binding.narrow("tools/call", &call("graphs", None), &mut refused_listing));
+        assert_eq!(refused_listing["result"]["structuredContent"], only);
+        assert_eq!(refused_listing["result"]["isError"], json!(false));
+        for (code, status) in [("not_admitted", 403), ("unauthorized", 401)] {
+            let mut kept = forbidden(code, status);
+            assert!(!binding.narrow("tools/call", &call("graphs", None), &mut kept));
+            assert_eq!(kept["result"]["isError"], json!(true));
+        }
 
         // An error answer, or another tool's result, is left as it is.
         let mut refused = json!({"id": 6, "error": {"code": -32602, "message": "no"}});
