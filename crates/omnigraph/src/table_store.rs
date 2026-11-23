@@ -9682,7 +9682,7 @@ mod tests {
         );
         // A segment that covers no fragment holds no rows and has no
         // statistics; an index of only such segments is rebuilt as the
-        // engine builds a new one. With 32 rows, target_vector_partitions(32) = 5.
+        // engine builds a new one (dynamically sized via target_vector_partitions(32) = 5).
         let mut emptied = indices[0].clone();
         emptied.fragment_bitmap.as_mut().unwrap().clear();
         assert_eq!(
