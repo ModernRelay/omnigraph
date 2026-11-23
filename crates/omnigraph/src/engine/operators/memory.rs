@@ -1,4 +1,14 @@
-//! Query-owned admission for graph work and shared Arrow allocations.
+//! Query-owned admission for graph work and shared Arrow allocations. Graph
+//! work admits frontier, index, mask, rank-map and string storage before it
+//! grows those structures, and Arrow take and concatenation outputs before
+//! they are built. Retained Arrow buffers are tracked by allocation identity:
+//! child arrays and null buffers take part, and shared views or slices reuse
+//! one charge while any operator lease retains the allocation, so an
+//! unchanged buffer is not charged again at every operator boundary. When a
+//! breaker finishes, its output leases replace its input and work leases, and
+//! stream teardown releases the leases it owns. This covers query-owned
+//! operator state, not a process-wide RSS cap or concurrent-query admission;
+//! shared graph indexes and storage caches have their own lifetimes.
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
@@ -41,7 +51,12 @@ pub(in crate::engine) struct QueryResources {
 }
 
 /// Monotonic statement-wide work admission. Child operators and repeated
-/// search passes share this counter; releasing memory never refunds work.
+/// search passes share this counter; releasing memory never refunds work,
+/// and neither does a fallback. It counts source rows as they enter a
+/// budgeted window, each edge scan's pinned physical rows (deleted positions
+/// included) before the scan runs, examined adjacency entries and
+/// bound-source replication: declared traversal row work, not source
+/// filtering, destination scans, bytes or elapsed time.
 #[derive(Debug)]
 struct TraversalWork {
     limit: Option<NonZeroU64>,

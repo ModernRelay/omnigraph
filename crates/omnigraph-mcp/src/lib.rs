@@ -1,6 +1,7 @@
-//! MCP protocol support mounted by the existing OmniGraph server.
+//! MCP protocol support mounted by the existing Omnigraph server.
 //!
-//! This crate owns SDK negotiation, tool/resource descriptions and bounded MCP
+//! This crate owns SDK negotiation, boot settings, tool/resource descriptions,
+//! argument decoding, result formatting, response deadlines and bounded MCP
 //! results. A [`Host`] supplies authenticated request context and starts work
 //! through its existing graph handlers and operation ownership. There is no
 //! listener, graph opener, authentication authority or separate serving runtime.

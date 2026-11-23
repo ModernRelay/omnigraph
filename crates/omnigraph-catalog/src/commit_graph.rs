@@ -179,7 +179,9 @@ impl HistoryCache {
     }
 
     /// The registry rows of the cold fragments of `dataset`'s version,
-    /// cached by data-file path while retained in this handle.
+    /// cached by data-file path while retained in this handle. A merge reads
+    /// the source's cold rows through this cache and imports only the rows
+    /// absent from the target.
     pub(crate) async fn cold_registry(&self, dataset: &Dataset) -> Result<LineageRegistry> {
         let fragments = crate::state::cold_fragments(dataset);
         let mut registry = LineageRegistry::default();
@@ -1609,6 +1611,15 @@ fn partial_merge_base_search<'a>(
 /// The lowest common ancestor with parked parents fetched in bounded batches
 /// and the registry runs of `index` crossed without a read; a parent `fetch`
 /// reports as `None` is a leaf, `fetch_slot` reads a candidate reached by slot.
+///
+/// The walk goes from both heads by generation. A registered run (one
+/// `history_block` row per released first-parent run of a block, with its
+/// slot range and the generation and parent of its first slot, and one
+/// `history_merge` row per merge commit inside it) is crossed from its last
+/// slot to its first without a read; blocks are read only for commits no row
+/// covers and for final candidates tied on distance and generation. A block
+/// the publisher gave no rows, because its commits were not the chain their
+/// ids claim, is walked from its records.
 async fn lazy_merge_base_search<'a, F, Fut, S, SFut>(
     get: &impl Fn(&str) -> Option<&'a GraphCommit>,
     source: &str,

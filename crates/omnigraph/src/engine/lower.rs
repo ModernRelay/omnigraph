@@ -994,7 +994,11 @@ impl Lower for Walk<'_, '_> {
     }
 
     /// Execute the declared aggregate arithmetic; `AggregateExec` emits groups
-    /// first and `run_plan` restores the return order.
+    /// first and `run_plan` restores the return order. The compiler stores
+    /// each `AggSignature` and the planner selects its `AggregateSpec`;
+    /// integer `sum` accumulates exactly in `Decimal128(38, 0)` and converts
+    /// the total once to `Float64`, `avg` and floating-point `sum` use
+    /// `Float64`, and `count($v)` counts the identity column.
     fn aggregate(&mut self, id: NodeId, fields: AggregateFields<'_>, input: Plan) -> Lowers<Plan> {
         if !self.outers.is_empty() {
             return Err(Self::not_a_pipeline_node("Aggregate"));

@@ -23,17 +23,13 @@ CONTRACT_PATH = DEV_DIR / "contract.md"
 
 # Byte budgets (docs/dev/documentation.md, Kinds of document). A page that
 # every agent session loads is listed by path; every other page of docs/dev/
-# takes GUIDE_BUDGET. A guide listed with a number above GUIDE_BUDGET is over
-# that budget: its number is a ceiling that only goes down, and the row is
-# deleted when the page fits.
+# takes GUIDE_BUDGET.
 PAGE_BUDGETS = {
     "AGENTS.md": 14_000,
     "docs/dev/contract.md": 53_000,
     "docs/dev/workload.md": 36_000,
-    "docs/dev/invariants.md": 11_500,
+    "docs/dev/invariants.md": 11_000,
     "docs/dev/testing.md": 7_500,
-    "docs/dev/execution.md": 88_500,
-    "docs/dev/writes.md": 70_500,
 }
 GUIDE_BUDGET = 60_000
 DECISION_BUDGET = 5_000

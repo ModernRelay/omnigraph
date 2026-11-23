@@ -1,4 +1,10 @@
 //! Local credential rotation coordination; the provider owns session authority.
+//!
+//! The rotating credential pair lives only in the OS keychain, apart from
+//! configuration directories and graph credentials. Profile-scoped
+//! coordination and a persisted pending marker prevent duplicate client
+//! exchanges. An exchange whose outcome is uncertain never authorizes a write
+//! replay.
 use super::*;
 use sha2::{Digest as _, Sha256};
 use std::fs::{File, OpenOptions};

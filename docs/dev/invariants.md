@@ -60,15 +60,13 @@ five more changes like this one?**
    snapshot addressability with `published: false` and never branch
    visibility, and both tags expire with the captured target authority
    (`branch:2`). Published table effects and the accepted schema contract
-   are complete in one manifest publication. The collector holds two properties
-   on every run: safety, that every pin of every retained `__manifest`
-   version on every live branch still opens and every path its manifest
-   lists still exists after the run; and progress, that a table version no
-   retained `__manifest` version names is gone after a run that retains
-   nothing else. Foreign movement fails closed: a linear commit above a
+   are complete in one manifest publication. The collector never
+   removes what a retained `__manifest` version on a live branch names, and
+   removes every table version that none names; its module doc
+   (`crates/omnigraph/src/db/omnigraph/collector.rs`) states both
+   properties. Foreign movement fails closed: a linear commit above a
    table's last linear version is reported by the collector (`cleanup`'s
-   `foreign_versions`), never deleted and never adopted.
-   The collector is in [writes](writes.md#mutation-and-load); each crash
+   `foreign_versions`), never deleted and never adopted. Each crash
    window's outcome is in [recovery](recovery.md).
 
 6. **Stable identity survives renames, not lifetimes.** Accepted SchemaIR owns

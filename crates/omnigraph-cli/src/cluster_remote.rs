@@ -1,4 +1,7 @@
 //! Live cluster deployment: submit once, then observe the original identity.
+//!
+//! Served apply writes and flushes its original ID before it sends the POST,
+//! and never replays work to recover output.
 
 use std::io::Write;
 use std::path::Path;

@@ -1,3 +1,7 @@
+//! The cluster control plane: desired configuration, the deployment ledger,
+//! plan and apply, exact recovery and the immutable serving snapshot a server
+//! boots from. It executes no row query or mutation.
+
 // The cluster state-machine tests compose several large async futures; rustc
 // needs the wider layout-query budget while building the lib-test harness
 // (with or without failpoints). Production builds keep the default.

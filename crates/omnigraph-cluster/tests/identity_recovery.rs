@@ -1,5 +1,7 @@
 //! An identity-authorized schema change cannot inherit an older data write's
 //! recovery effects. Fault injection lives in a separate integration process.
+//! It owns current-actor authorization and the adoption of a persisted
+//! settlement without replacing its author.
 
 #![cfg(feature = "failpoints")]
 // Match the cluster test harness budget for composed deployment/recovery futures.

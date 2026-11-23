@@ -505,7 +505,8 @@ Full rules: [writes](writes.md), [mutations](../user/mutations/index.md).
    "theirs" rule. A conflict is resolved by writing to a branch and merging
    again.
 6. `merge:6` The common ancestor is picked by a fixed rule, so the same merge
-   gives the same result. A merge over its declared size limits is refused.
+   gives the same result. A merge over its declared size limits is refused
+   `G16`.
 7. `merge:7` A merge checks what was written, not what was read `D20`. Two
    branches that each raised a counter from 3 to 4 merge to 4. To count
    across branches, record each increment as its own entity and count them
@@ -636,6 +637,7 @@ statement. "See" names the invariant or the design that bears on it.
 | `G12` | `read:9` | Types and properties carry descriptions, and nothing searches them | No design yet |
 | `G13` | Boundary, Processes | One server serves a cluster, and read-only CLI commands may read beside it. There is no read-only serving mode | [Graph access and cross-process writes](../decisions/2026-10-16-graph-access-serving-and-cross-process-writes.md) |
 | `G14` | `read:11`, `E7` | A `limit` without an `order` returns the first rows in physical order, which `optimize` can change. No test pins it | [GQ 3](https://github.com/ModernRelay/omnigraph/pull/1302), draft: one total order for every read |
+| `G16` | `merge:6` | A fast-forward merge whose changes are all node inserts, into types with no value, enum, uniqueness or minimum-cardinality rule, is not held to the size limit of validation. It publishes a change that the same merge refuses when the target has also moved. The limit on the number of chunks holds for both | No design yet |
 
 ## Decisions
 

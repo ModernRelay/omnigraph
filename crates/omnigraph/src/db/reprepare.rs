@@ -44,6 +44,14 @@
 //! acquisition refuses with an internal error; [`WriteAttempt::admit`]
 //! refuses an attempt outside one, and [`WriteAttempt::admitted_gates`], the
 //! commit point, ends it.
+//!
+//! The gated attempt costs other writers more than its own branch. Writers on
+//! the branch wait for its one preparation. The shared schema permit it holds
+//! makes every request for the exclusive side wait (a branch create, a schema
+//! apply, a system-column upgrade), and while such a request waits, new shared
+//! requests queue behind it, so writers on every branch wait too. Each wait
+//! lasts one preparation, as a branch merge's planning under the same permit
+//! does; for a large merge load on object storage that can be seconds.
 
 use super::omnigraph::{Omnigraph, WriteTxn};
 use super::write_queue::{self, BranchWriteGates};

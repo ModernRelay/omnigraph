@@ -1,5 +1,14 @@
 name: GQ Logic Tests
 
+# The required `GQ Logic Tests` context over the complete `.gqt` corpus: one
+# qualification matrix (`ordinary`, `dst`, `dst-clippy`, `served`), each cell
+# with its own 60-minute budget and cache key, and the `gq_logic_tests` job,
+# which fails unless classification and every cell succeeded, so a cancelled
+# or skipped cell is red. Matrix fail-fast cancels the remaining cells when one
+# fails; Cargo keeps its default fail-fast between test targets. Test cells
+# upload invocation reports, and every cell uploads its Cargo build timings,
+# failure included.
+
 on:
   # Code-bearing events only. The body and label events belong to
   # `fix-regression-gate.yml`, which builds nothing; listing them here

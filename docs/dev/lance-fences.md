@@ -58,13 +58,9 @@ plus one, assigned before the detached commit receives its random version, so
 two sibling first commits over one parent stamp a row they both update with the
 same value; a deletion-only commit restamps nothing; compaction carries every
 live row's id and stamp into the rewritten fragments. Change discovery across a
-window with no adjacent transaction
-(`changes::candidate_scan::row_identity_plan`, the `change_lineage` setting)
-pairs the live rows of two pinned versions by `_rowid` and reads only the pairs
-whose stamps differ, and only where the `from` side is on the `to` side's
-first-parent chain with no merge commit after it, since a merge can take the
-merged branch's pin, whose history never read the target's; a fragment whose
-sequences are absent, spilled or short takes the exact merge. Drop the ancestry
+window with no adjacent transaction pairs rows by `_rowid` and compares these
+stamps only where one side's lineage passed through the other
+(`row_identity_plan` in `crates/omnigraph/src/changes/row_identity.rs`). Drop the ancestry
 restriction at the bump whose stamp is the commit's own version.
 
 **Owners:**
@@ -490,15 +486,8 @@ the adapter's supported graph contract: native branch creation need not read or
 reject them before publication, and such a payload can fail only when an index
 is later read.
 
-The clone adapter is installed during normal dataset opens and initial dataset
-creation, preserving configured commit handlers without an additional reopen.
-It checks the exact source version at branch creation and delegates clone
-metadata to Lance. A task-local scope reuses the
-known main-source `ManifestLocation` only for the matching native V2 path and
-version, avoiding a listing; other locations retain native resolution. The
-adapter delegates manifest writing, transactions and commit-handler capabilities
-to the original handler. It neither captures an index inventory nor repairs
-index bases or reads external fragment-reuse payloads.
+The clone adapter that wraps every dataset's commit handler is
+`crates/omnigraph-core/src/lance_clone.rs`.
 
 **Owners:** `lance_clone` tests (exact source-version refusal, source-location
 reuse and fallback, local ETag normalization, configured-handler/session/failure
@@ -509,34 +498,20 @@ semantics);
 
 ### Branches/tags
 
-Each graph-branch lifetime is `{logical}.{ULID}`; bare names identify legacy
-lifetimes. Below storage format 18, unretired native
-`__manifest/_refs/branches/` entries define logical branches. Deletion writes identity-bound retirement metadata, archives the exact
-`BranchContents` inside its native tree, then unlinks the active ref. Needed
-native ancestry and historical merge-base providers remain readable through the
-archive. User `__manifest` tags block logical deletion; valid engine merge-input
-tags instead protect their exact snapshots until the target publication witness
-expires.
-
-Stock `Branches::get` and `list` include every physical ref. Below format 18,
-Omnigraph's logical manifest helpers validate and filter `omnigraph.retired_manifest_branch`, a
-version-1 JSON value binding the exact native name and identifier. An absent
-marker means live; malformed, unsupported, or mismatched metadata fails closed.
-The metadata update publishes retirement and preserves unrelated metadata.
-Before unlinking the active ref, retirement archives the exact `BranchContents`
-inside its native tree; retries validate the same identity in the ref or
-archive. Native branch controls retain Omnigraph's existing process-local
-serialization. Cold logical enumeration reads active refs; cached named-write
+Stock `Branches::get` and `list` include every physical ref. Below storage
+format 18 a native ref defines a logical branch, and retirement marks and
+archives a ref before unlinking it (`crates/omnigraph-core/src/branch_control.rs`,
+`retire_branch_recoverably`); user `__manifest` tags block logical deletion,
+and valid engine merge-input tags instead protect their exact snapshots until
+the target publication witness expires. Cold logical enumeration reads active refs; cached named-write
 admission checks the existing ref lookup without an added request. Cleanup and
 historical resolution read archives. Cleanup retains required native ancestors
 and exact merge-base providers, then reclaims unneeded trees with their
 archives. Delayed staging is judged from the complete post-list identity cut and
 final capture validation, so its retirement history need not remain forever.
 
-At or above format 18 the branch set is `main`'s catalog: one config entry of
-`main`'s `__manifest` per branch, keyed `omnigraph.branch.<native name>` and
-decoded by `BranchRows`; a retired branch keeps its key with the value `-`.
-Logical enumeration (`live_named_branches`) reads `main`'s live entries with no
+At or above format 18 the branch set is `main`'s catalog, the config-map rows
+of `crates/omnigraph-catalog/src/branch_rows.rs`. Logical enumeration (`live_named_branches`) reads `main`'s live entries with no
 ref listing. Deletion publishes an `omnigraph.tombstone` entry on the branch's
 own `__manifest`, whose readers `refuse_tombstoned` then refuses with
 `branch_deleted`, then rewrites the branch's entry on `main` as retired;
@@ -561,14 +536,8 @@ version. The engine reads an exact ref (`branch_control::get_branch_contents`,
 instead of Lance's `exists`, `head` and `get_range`, so that read cannot be torn
 and costs one request instead of three; a ref written before identifiers existed
 still goes through Lance's reader, which derives its synthetic identifier.
-`branch_control::read_branch_refs` rereads a torn read (`Arrow`, `CorruptFile`)
-or a raced delete (`NotFound`), at most three reads in all, around the listed
-reads that still go through Lance (`list_branches`) and the exact reads above.
-Resolving a logical branch name (`branch_control::resolve_live_native_branch`)
-lists `_refs/branches/` once and reads only that branch's own incarnations, so
-another branch's retirement rewrite, or its malformed retirement record, does
-not fail a branch open or a held-ref re-resolve; fresh creation narrows content reads to its source and the target's equal,
-ancestor and descendant names.
+The retry and the per-name resolution are `read_branch_refs` and
+`resolve_live_native_branch` in the same file.
 Below format 18, operations that require a complete inventory, including
 logical enumeration and cleanup, still read every active ref; maintenance and
 historical resolution also read retirement archives. At or above format 18 no
@@ -717,29 +686,11 @@ manifest put it reads the version back (`verify_commit_outcome`), and because
 that handler calls a missing version definitive
 (`is_version_not_found_definitive`), an absent version ends the attempt at once,
 although an abandoned put can still land afterwards. The handler Omnigraph
-installs on every dataset (`lance_clone`) therefore re-issues an ambiguous
-manifest put with the same manifest and precondition, by the storage crate's
-shared conditional-request policy (`omnigraph_storage::conditional`, up to
-`CONDITIONAL_REQUEST_REISSUES` times), before Lance reads back, and records per
-commit whether a request was sent and how it ended (`manifest_request`). A held
-version goes back as `CommitConflict` to Lance's read-back, which compares the
-complete transaction at that version. A re-issue that meets a held version is
-recorded unresolved, not held: S3 answers 409, which `object_store` reports as
-"already exists", while the earlier copy is still in flight, so a missing
-version on read-back proves nothing. The first copy's conflict stays held; a
-direct writer's retrying Lance client can repeat that copy itself, which this
-handler cannot see. Lance deletes the attempt's transaction file only when the
-handler calls a missing version definitive (`is_version_not_found_definitive`,
-read nowhere else), so only the commit's own request record answers it: the
-catalog's per-commit handler answers from its probe and keeps the inner answer
-unless the request may still land, and a dataset's shared handler, which holds
-no record of the attempt Lance reads back, never calls a missing version
-definitive. Lance then returns `CommitStatusUnknown` and keeps the file a late
-manifest would name; a table's orphaned transaction file goes to the collector's
-orphan sweep. The catalog publisher reads the record: no request sent, or one
+installs on every dataset therefore re-issues an ambiguous manifest put and
+records per commit whether a request was sent and how it ended
+(`crates/omnigraph-core/src/manifest_request.rs`, `lance_clone.rs`). The catalog publisher reads the record: no request sent, or one
 the store refused outright, is `Unpublished`; a request that may have applied is
-read back. A generic local-filesystem error is ambiguous too: the Windows rename
-handler can create the destination before temporary-file cleanup fails. Drop the
+read back. Drop the
 re-issue at the bump whose commit path settles an ambiguous manifest put itself,
 and keep the record while Lance's errors do not say whether the manifest was
 sent.

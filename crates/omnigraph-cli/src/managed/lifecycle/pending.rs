@@ -1,5 +1,12 @@
 //! Bounded operator-home custody for exact lifecycle retry identities.
 //! These records never authorize a service operation or select a destination.
+//!
+//! Pending and accepted lifecycle evidence is kept apart from configuration
+//! and credential custody, and survives target removal, logout and upgrade. A
+//! grammar change never authorizes discarding unresolved work or replaying it
+//! under a new identity. `config recover-operations --source DIR --profile
+//! NAME` copies matching folder evidence into custody (`import`) without
+//! accepting the old configuration or submitting a remote operation.
 use super::*;
 use sha2::{Digest as _, Sha256};
 use std::fs::File;

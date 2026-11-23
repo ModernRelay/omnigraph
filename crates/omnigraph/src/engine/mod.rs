@@ -1,7 +1,7 @@
 //! The read engine selected by the session setting `engine = v2`. The
 //! planner's physical plan lowers to a DataFusion plan executed under the
-//! query's context and memory pool. Relational nodes use DataFusion
-//! operators; scans and graph nodes use this module's operators.
+//! query's context and memory pool. Every read operator is this module's
+//! own except the aggregate, which is DataFusion's `AggregateExec`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

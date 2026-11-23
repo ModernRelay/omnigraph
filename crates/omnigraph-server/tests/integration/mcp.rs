@@ -1,4 +1,8 @@
 //! MCP is another authenticated read transport over the native policy handlers.
+//!
+//! The real HTTP fixture for authentication, policy, tool/route and
+//! error-disposition parity, limits and response lifetimes; protocol, catalog
+//! and formatting tests live in `omnigraph-mcp`.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;

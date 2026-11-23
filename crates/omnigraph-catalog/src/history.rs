@@ -22,13 +22,14 @@
 //! `SchemaContractHead` JSON, the source text and the IR text. A commit
 //! record names it in `schema_content_hash`.
 //!
-//! The commits a root held before the offline storage upgrade to stamp 14
+//! The commits a root held before the offline storage upgrade
 //! live under `legacy/`, written once by that upgrade and never again: the
 //! records of one writer's consecutive own commits in `legacy/data/<n>.lance`,
 //! extents like any other, and under `legacy/locator/` the flat objects that
 //! find them, id shards (`OGLI0001`, commit id to file and row), writer
 //! shards (`OGLW0001`, one entry per writer with own commits) and the
 //! directory (`OGLD0001`) that lists every file and shard with its digest.
+//! A root born at stamp 14 or later has no `legacy/`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;

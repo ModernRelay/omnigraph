@@ -6,6 +6,11 @@ name: Build release archives
 # calling workflow's single publisher attaches them to a release. Each archive
 # is stamped with its commit and channel, run on its own platform before
 # upload, and checked as an exact set before the call completes.
+#
+# The macOS job signs and notarizes the executables with the six `APPLE_*`
+# secrets. A rejection, a missing submission ID or missing credentials refuses
+# the macOS archive; there is no ad hoc fallback. A submission Apple has not
+# finished by the deadline is published signed, with a warning naming it.
 
 on:
   workflow_call:

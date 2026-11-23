@@ -1,5 +1,6 @@
-//! Data-plane routes: read/query/mutate/load/branches/snapshot/export.
-//! Moved verbatim from tests/server.rs in the modularization.
+//! Data-plane routes: read/query/mutate/load/branches/snapshot/export, with
+//! Blob GET/HEAD, conditions, ranges, redirects and backpressure, writes kept
+//! after a caller disconnects, and stream bytes.
 
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::convert::Infallible;

@@ -1,9 +1,24 @@
-//! The tracing collector of the detached-only tables RFC (§Garbage
-//! collection). `plan_collection` computes what a run deletes and deletes
-//! nothing; `sweep_table` performs one location's plan. `cleanup` runs both
-//! under its gates on the detached-only path and copies the counts onto its
-//! rows; `Omnigraph::cleanup_plan` runs the plan alone for tests and the DST
-//! oracle.
+//! The tracing collector `cleanup` runs over graph tables in place of Lance's
+//! `cleanup_old_versions`. `plan_collection` computes what a run deletes and
+//! deletes nothing; `sweep_table` performs one location's plan. `cleanup` runs
+//! both under its gates on the detached-only path and copies the counts onto
+//! its rows; `Omnigraph::cleanup_plan` runs the plan alone for tests and the
+//! DST oracle.
+//!
+//! The roots are the pins of every `__manifest` version the run's `--keep`
+//! and `--older-than` policy retains on every live branch. A detached manifest
+//! is swept when a `__manifest` version once named it and no retained version
+//! still does, or when no `__manifest` version ever named it and the
+//! publication authority its transaction properties record is provably gone;
+//! age does not prove abandonment. Nothing defers a table's collection.
+//!
+//! Every run holds two properties. Safety: after the run, every pin of every
+//! retained `__manifest` version on every live branch still opens, and every
+//! path its manifest lists still exists. Progress: a table version no
+//! retained `__manifest` version names is gone after a run that retains
+//! nothing else. A linear commit above a table's
+//! `omnigraph.last_linear_version` is foreign: the collector lists it under
+//! `foreign_versions` and deletes neither its manifest nor its files.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 

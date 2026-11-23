@@ -1,7 +1,12 @@
 //! `ProjectionExec`: the return expressions of a `Projection` node over the
 //! wide batch, each output batch charged to the query pool before it leaves.
 //! When a `Sort` consumes the projection, the lowering adds the sort's
-//! columns under the hidden prefix; the sort drops them.
+//! columns under the hidden prefix; the sort drops them. Above an aggregate it
+//! evaluates Boolean expressions over aggregate leaves and group keys,
+//! resolving each `AliasRef` by its input column name, and emits the public
+//! return columns in written order. Under a `HydrateColumns` it skips the
+//! deferred return items and carries each deferred binding's `_rowaddr` as
+//! `^binding`.
 
 use std::fmt;
 use std::sync::Arc;

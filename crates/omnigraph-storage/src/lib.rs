@@ -1,3 +1,9 @@
+//! Shared local, S3 and Azure storage for cluster control objects: state,
+//! locks, immutable resources and legacy conversion evidence. It also holds
+//! the typed storage failure (`StorageFailureKind`), the per-owner storage
+//! scope (`scoped`) and the one policy for conditional requests whose answer
+//! can be lost (`conditional`).
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::{self, Debug};

@@ -39,7 +39,7 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-gqt-core` | In-source format, expectation and ordinary execution tests | Shared parser and executor used by the GQT runner and benchmark harness |
 | `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus runner self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
 
-Test helpers that live in `omnigraph-core` or `omnigraph-catalog` and are reached by another crate's tests are gated `#[cfg(any(test, feature = "test-util"))]`. A plain `#[cfg(test)]` is not enough: `cfg(test)` is set per crate, so a dependent crate's test build compiles the base crate without it and cannot see the helper. The engine enables `test-util` on both crates through its dev-dependencies in `crates/omnigraph/Cargo.toml`, so the helpers exist only in test builds and never in a release artifact. `omnigraph-cluster` follows the same pattern: the server enables its `test-util` feature through its dev-dependencies to read a local cluster's serving snapshot with the storage root spelled as an `s3://` prefix, which is how the server's strict-boot test reaches the external Blob base overlap quarantine without an object store. `forbidden_apis.rs::split_crate_test_util_is_enabled_only_by_dev_dependencies` refuses a production enable of any of the three crates' `test-util` (`SPLIT_CRATE_PACKAGES` plus `TEST_UTIL_SEAM_PACKAGES`).
+Test helpers that another crate's tests reach are gated `#[cfg(any(test, feature = "test-util"))]`; `forbidden_apis.rs::split_crate_test_util_is_enabled_only_by_dev_dependencies` says why and refuses a production enable.
 
 `tests/forbidden_apis.rs` walks the engine, `omnigraph-core` and `omnigraph-catalog` sources; a line that carries the sentinel comment `// forbidden-api-allow: <reason>`, on the line itself or the line above, is exempt from the lexical deny-list only (the structural graph-write guard still counts it), so every exemption shows up in review.
 
@@ -84,25 +84,9 @@ Crash tests must cover the writer and the user-visible reopening behavior:
 - `tests/lance_surface_guards.rs` owns the Lance detached-commit facts the pin and the collector depend on;
 - the writer's normal integration owner proves pre-effect failures leave no residue.
 
-To add a seam: declare it beside the site it guards, above the item that
-crosses it, with
-`decide_seam! { pub static NAME = ("area.place", Op, [Effect, ..]); }`
-(imported from `crate::seams`; the compiler records the file and line as
-the seam's `site()`, and a hand-written `Seam::decide` is refused); add its
-path to the `catalog!` list in `crates/omnigraph/src/seams/catalog.rs`; call
-`fail`, `skip` or `contention` (imported from `crate::seams`) with it at a
-site between two steps (one declared effect), or `guarded` around the one
-operation it wraps (every outcome that operation can have; a further action
-there is then a case, not an edit). A private module on the path from the
-crate root to the declaring file becomes `pub(crate)` for the re-export.
-`crates/omnigraph-seams/tests/failpoint_names_guard.rs` checks the index, that no static is left
-in the catalog, under a test module or without `pub`, that a single-effect
-helper takes a seam declaring exactly its effect, that production code under
-`src/` crosses it, and that test code (an integration target, a `tests.rs` /
-`…_tests.rs` file, or any item gated on `cfg(test)`), the DST crate or a
-`.gqt` case (the `at` of a `--- seam` body, decoded as the runner decodes
-it) arms it; a crossing never counts as arming. `scripts/seam_corpus.py`
-lists every seam with where it is declared and which cases cover it.
+To add a seam, follow the module doc of `crates/omnigraph-seams/src/lib.rs`
+(Adding a decision seam); `crates/omnigraph-seams/tests/failpoint_names_guard.rs`
+checks every seam is catalogued, crossed and armed.
 
 The collector retry owners in `failpoints.rs` exercise each sweep window
 on file, RustFS/S3 and Azurite. The between-manifests fixture also reopens
@@ -171,9 +155,9 @@ maintenance, and the decoy must see no request. The in-source
 
 ### Plan replay
 
-Query behavior has two test tiers. A `.gqt` case owns what is visible in rows, counts, result column types, or errors. A Rust test owns what the format cannot express: mechanism, scale, process environment, concurrency. The claim that a v2 run is a function of its bound plan and the snapshot is of the second kind: no case reaches the replay door. On every successful rows step, the GQT runner checks the report shape, `schema_drift`, `check_pin`, and the plan root's complete declared result schema against both the compiler's retained declarations and the executed columns. Result-schema inference reads the checked query's stored types; it checks propagation and execution, not an independent inference algorithm. Inference compares nullability flags; execution compares names in order, full Arrow types (including node Struct members), and null cells in declared non-null results. It also serializes and deserializes the executed `BoundPlan`, requires equal physical explain documents, and directly compares stored schemas, return declarations, named node-object types and complete block predicates/specs. This checks that the plan's stored decisions survive the mirror without executing another query. The mapping from plan nodes to operators needs no check here: its rule is in [execution.md](execution.md#v2-plan-lowering-one-node-one-operator).
+Query behavior has two test tiers. A `.gqt` case owns what is visible in rows, counts, result column types, or errors. A Rust test owns what the format cannot express: mechanism, scale, process environment, concurrency. The claim that a v2 run is a function of its bound plan and the snapshot is of the second kind: no case reaches the replay door. On every successful rows step the GQT runner also checks the report, the pins, the result schema and the bound plan's serialization round trip (`check_bound_plan_round_trip` and its neighbours in `crates/omnigraph-gqt-core/src/lib.rs`). The mapping from plan nodes to operators needs no check here: its rule is in [execution.md](execution.md#v2-plan-lowering-one-node-one-operator).
 
-`crates/omnigraph/tests/integration/engine_v2_plan_replay.rs` owns the replay, including refusal of altered result schemas and missing, duplicate, unused or altered node-object declarations. Each test gathers one query through `Session::query_inspected`, serializes the run's replay envelope (`Executed::replay_envelope`: the query's source and name, the accepted scope, the schema digest, the `BoundPlan` through the planner's mirrors and an exact-fragment member's derivation), reads it back (the plan must read back equal), and executes it twice through `Session::replay_bound_plan`, a door that recompiles the named query against the target's catalog, binds it to the plan's own values, accepts the plan again and takes no session setting.
+`crates/omnigraph/tests/integration/engine_v2_plan_replay.rs` owns the replay; its module doc says how each test replays.
 
 GQT also owns the public ANN diagnostics contract; see the
 [GQT plan assertions](../../crates/omnigraph-gqt/README.md#plan-expectations).
@@ -181,179 +165,96 @@ Rust retains controlled partition layouts and independent native-counter oracles
 in `search.rs`, plus synthetic missing/zero/unknown/maximum metric inputs and
 replay separation in `engine/search.rs` and `engine/report/tests.rs`.
 
-The `--- expect plan` of an inspected step reads the explain document of that same `Executed`, never a second planning run; its `ran` lines read the report of that run (`crates/omnigraph-gqt-core/src/report.rs` reads the rows). A parameter refusal, a settings error and a query that failed produce no `Executed` and keep their ordinary checks.
+What `--- expect plan` and its `ran` lines read is on `Inspection` in `crates/omnigraph-gqt-core/src/lib.rs`; `crates/omnigraph-gqt-core/src/report.rs` reads the report rows.
 
 ## Server and CLI ownership
 
-CLI `system_remote` runs the actual CLI, server and fault proxy in the ordinary
-workspace gate; its required-cell checks reject removed or ignored cases. The
-lost-delivery matrix covers disconnect, truncated response, proxy 504 and caller
-timeout without replaying a committed merge or commit publication/drop (a drop's
-empty response has no body to truncate). Output unit tests inject write and flush
-failures; application tests check baseline file-lock custody through cursor flush,
-transfer receipt failures after a single dispatched write, and raw stream failures
-without mixed diagnostics. `blob_cli` unit tests own bounded stdin capture and
-interrupted reads. Extend `cli_data` for load consent and source-read ordering,
-Blob preconditions and output-file lifecycle; reuse its HTTP fixture and the
-existing parity matrix. Query semantics remain in GQT, not duplicated in these
-CLI boundary tests.
-Schema-family application tests verify that failed result delivery preserves an
-applied schema and its actor with one publication, and that an undeliverable
-target line precedes writable open. The same application owner injects write and
-flush failures into mutation-scope diagnostics; `cli_data` checks ordinary and GQ
-branch scopes while keeping JSON stdout parseable. Init output failure leaves a readable graph;
-lint report failures and subsequent invocations remain reusable. Extend the
-existing `cli_schema_config`, `cli_cluster` and `cli_data` owners for addressing,
-cluster ownership and offline source-read ordering.
+Each suite's module doc says what it owns. CLI suites are modules of the CLI's
+`integration` binary, by plane:
 
-Maintenance delivery tests use the existing output and application owners.
-They cover partial writes and flush failures, full-text rebuild publication and
-actor retention, and target-output failure before writable admission. Extend
-`cli_data` and `cli_cluster` for cleanup preview/consent and maintenance addressing;
-`crossversion_upgrade` retains ownership of storage-upgrade compatibility.
+| Plane | Suite |
+|---|---|
+| Data commands, Blob commands, `studio` | `cli_data` |
+| Cluster lifecycle, admission, managed deployment, organizations | `cli_cluster` |
+| Deployment journeys over the spawned binary | `cli_cluster_e2e` |
+| Stored queries | `cli_queries` |
+| Schema, config, the agent skill, exit statuses | `cli_schema_config` |
+| Cross-version rebuild and storage upgrade | `crossversion_upgrade` |
+| Embedded and remote parity | `parity_matrix` |
+| Local and remote system journeys, lost delivery | `system_local`, `system_remote` |
+| The stdio MCP bridge | `cli_mcp` |
 
-Cluster delivery tests extend the application and output owners. Direct apply
-tests fail supplied stdout/stderr writes and flushes, then inspect the original
-receipt, the released lock of the converged apply, single deployment result and
-stable graph history. The
-served adapter's tests verify identity delivery before POST and receipt/timeout output failures without
-resubmission. `cli_cluster` and `cli_queries` own exact unlock refusals, graph
-filtering and wrong-plane refusal before configuration or HTTP access. The existing
-`system_remote` deployment matrix owns real server completion after delivery loss.
+Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
+Query semantics remain in GQT, not duplicated in these CLI boundary tests.
 
-Operator schema/routing owners cover whole-document validity, independent
-profile/target defaults, single-identity managed profiles, standalone auth
-selection and immutable target-to-profile bindings.
-Credential-source owners cover bounded stdin/env/file/exec acquisition, absence
-of fallback, helper failures and secret redaction. Target/application tests own
-static set/remove, no-network/no-helper/noninteractive status and pipe-only export
-before secret acquisition. Managed authentication tests own independent profile
-sessions, principal/session collision refusal, refresh coordination and logout
-cache clearing; lifecycle fixtures retain original-identity recovery checks.
-They also own zero, one and multiple active organizations at login, refresh
-when the access token expires during selection, and revocation after an
-abandoned choice. Application tests own interactive and machine-mode dispatch
-and the JSON refusal on stdout. Authentication tests cover each credential
-check: a provider response that
-does not fit the published sign-in configuration is never reported as a saved
-credential's fault. `cli_cluster` owns `organization list` beside the member
-and invitation lists, including the 1,000-membership bound.
-Transport owners cover prefix boundaries, no redirects, explicit proxy selection,
-CA capture and unsupported trust combinations. Extend the shared served-client
-fixtures across managed and standalone graph commands instead of adding an
-allowlist-specific test setup.
+Server suites are organized by public route: `auth_policy`, `catalogue_routes`, `data_routes`, `mcp`, `schema_routes`, `stored_queries`, object-store coverage in `s3` and the generated contract in `openapi` in the `integration` binary, and `multi_graph`, `boot_settings` and `operation_routes` as their own binaries. Cluster integration binaries are `tests/failpoints.rs`, `tests/identity_recovery.rs` and `tests/s3_cluster.rs`. Extend these owners instead of adding a second server fixture to the MCP crate.
 
-`commands/local` retains version, skill and embedding output ownership.
-`skill.rs` owns exact file delivery and its broken-pipe exception; extend
-`cli_schema_config` for process behavior. Credential replacement during discovery
-must not change the token used by an already captured invocation.
+In-source owners in the CLI:
 
-Application and
-managed-output tests own completion, partial-write and flush failures; managed
-authentication/lifecycle fixtures own the pre-dispatch diagnostic gates and
-accepted-identity recovery output when stderr fails. Application tests keep
-single-result stdout intact and preserve delivered refusal statuses; served
-cluster tests retain typed refusals through failed hints. The binary's channel
-barrier test proves reported failures do not wait for blocked runtime work;
-`cli_schema_config` owns help/version/refusal statuses with closed streams.
+- output and application tests: write and flush failures, baseline file-lock
+  custody through cursor flush, transfer receipt failures after a single
+  dispatched write, raw stream failures without mixed diagnostics, failed
+  result delivery preserving an applied schema and its actor with one
+  publication, an undeliverable target line before writable open,
+  mutation-scope and maintenance diagnostics, full-text rebuild publication
+  and actor retention, init and lint output failures, direct cluster apply
+  output failures (the original receipt, the released lock, one deployment
+  result, stable graph history), completion and partial-write failures,
+  single-result stdout, delivered refusal statuses, and interactive and
+  machine-mode dispatch with the JSON refusal on stdout; the binary's channel
+  barrier test proves reported failures do not wait for blocked runtime work;
+- `blob_cli`: bounded stdin capture and interrupted reads;
+- the served adapter: identity delivery before POST and receipt and timeout
+  output failures without resubmission; served cluster tests keep typed
+  refusals through failed hints;
+- operator schema and routing: whole-document validity, independent
+  profile and target defaults, single-identity managed profiles, standalone
+  auth selection, immutable target-to-profile bindings, read-only YAML and
+  parent directories with writable private credential state, relocation of
+  legacy state, and explicit profile creation versus default-profile login;
+- credential sources: bounded stdin/env/file/exec acquisition, no fallback,
+  helper failures and secret redaction; target tests own static set/remove,
+  no-network/no-helper/noninteractive status and pipe-only export before
+  secret acquisition;
+- managed authentication and lifecycle: independent profile sessions,
+  principal and session collision refusal, refresh coordination, logout cache
+  clearing, original-identity recovery, zero, one and multiple active
+  organizations at login, refresh when the access token expires during
+  selection, revocation after an abandoned choice, the pre-dispatch diagnostic
+  gates, and accepted-identity recovery output when stderr fails; a provider
+  response that does not fit the published sign-in configuration is never
+  reported as a saved credential's fault; the client and managed-auth fixtures
+  delay discovery or a later request past credential expiry and assert that
+  no authenticated operation is dispatched; standalone flat-auth fixtures keep
+  distinct-target identity isolation, including two targets sharing an
+  endpoint;
+- transport: prefix boundaries, no redirects, explicit proxy selection, CA
+  capture and unsupported trust combinations; extend the shared served-client
+  fixtures across managed and standalone graph commands;
+- `commands/local`: version, skill and embedding output; `skill.rs` exact
+  file delivery and its broken-pipe exception; credential replacement during
+  discovery never changes the token of an already captured invocation;
+- `commands/mcp`: framing, binding and narrowing rules, and that the bridge
+  names no server or MCP implementation crate; `commands/studio`: the link
+  format, each platform's opener behind an injected command runner, desktop
+  entry lookup and `Exec` expansion; `target_identity`: the `home` and
+  `binding` digests.
 
-The operator-config owners also cover read-only YAML and parent directories with
-writable private credential state, preservation/conflict checks when relocating
-legacy state, and explicit profile creation versus default-profile login.
-The existing client and managed-auth fixtures delay discovery or a later request
-past credential expiry and assert that no authenticated operation is dispatched.
-Standalone flat-auth fixtures retain distinct-target identity isolation, including
-two targets sharing an endpoint.
-
-The `system_remote` deployment matrix holds a real
-admitted request through drain, disconnects or times out the caller before
-durable acceptance, and loses replies after acceptance. Exact-ID observation
-must finish with one ledger result, one schema publication and the same server
-PID; neither apply nor recovery polling may resubmit. The old Unix-gateway
-fixture does not qualify a version-1 operator transport: Unix socket targets are
-unsupported. Keep lower-level transport coverage distinct from public resolver
-capability/refusal tests.
-
-Server suites are organized by public route: `auth_policy`, `catalogue_routes`, `data_routes`, `mcp`, `schema_routes`, `stored_queries`, object-store coverage in `s3` and the generated contract in `openapi` in the `integration` binary, and `multi_graph`, `boot_settings` and `operation_routes` as their own binaries.
-
-The OpenAPI owner checks the [HTTP conventions](http-api.md), their named
-exceptions, and required error responses. Its negative cases remove a required
-response or code from a spec copy and require rejection; a regenerated snapshot
-alone is not proof of complete response coverage.
-
-`omnigraph-mcp` owns protocol, catalog and formatting tests. Server
-`integration/mcp.rs` keeps the real HTTP fixture for authentication, policy,
-tool/route and error-disposition parity, limits and response lifetimes. The
-server adapter's in-source tests own canonical protocol-refusal projection,
-including lost and oversized write results; `boot_settings` covers MCP across
-shutdown and restart. Extend these owners instead of adding a second server
-fixture to the MCP crate.
-
-Per-graph serving transitions extend these owners: in-source `registry` tests
-own capture/close ordering, drain-only deployment deadlines, affected activation
-scope, schema identity and candidate bounds;
-`operations`, `ingress` and the server's MCP adapter own detached execution and
-output lifetimes.
-`stored_queries` parks a request before engine capture, `data_routes` retains
-disconnected writes and stream bytes, and `boot_settings`/`mcp` check authorized
-availability. The same owners cover coherent schema/query batch activation; these assertions
-are not generic native settlement. Server `boot_settings` exercises authenticated
-submission, parked requests, caller disconnect, pre-effect refusal, durable
-acceptance before completion, activation-in-progress observation and exact receipt
-access after management handoff. It also holds a merge across served schema
-planning to prove preview does not wait for the graph gate, and its
-`owned_shutdown` journeys own process containment: a panic or an uncertain
-owned write exits 2 and retains the lock, while a proven unpublished staging
-failure with settled storage I/O is a 500 the server keeps serving through,
-with a clean SIGTERM still releasing the lock. In-source
-`deployment` tests suspend observer read futures across owner start, finish and complete
-turnover, exercising bounded re-observation for aggregate and exact status.
-CLI `cli_cluster` owns submit-once polling, transient 429/503 and truncated-body
-retries, malformed-receipt refusal, terminal outcomes and caller timeout without
-replay. Its managed fixtures cover status/history scope and filters, explicit
-managed target selection, and unsupported target-kind refusals before credentials
-or external access. Default target selection refuses applicable retired folder
-routing; explicit direct targets never route through it. Legacy lifecycle custody
-remains guarded even with explicit selection.
-Managed deployment fixtures also exercise immutable preview/delivery bodies,
-original-ID recovery, current authorization refusals, bounded waiting through
-uncertain delivery/archival, and queued-only cancellation. They do not replace
-native server execution tests or establish deployed service compatibility.
-CLI `cli_cluster_e2e` proves one PID/listener survives schema/query
-replacement, graph addition, policy grant/revocation and management handoff;
-the original submitter retains only its exact receipt access after restart.
-Extend that same journey for graph deletion, proving target storage/history
-removal, peer preservation and unchanged PID/listener, including a served deletion
-preview followed by `--no-wait` submission and exact-ID `status --wait`. It checks
-the achieved configuration again after restart. The local journey also exercises
-counted embedding-provider replacement, external-Blob admission changes, catalog
-integrity reporting, schema-drift refusal and missing-root refusal. S3/Azure wrappers
-share the transport-independent phases; local success does not qualify their
-storage-fault paths. CI requires the local journey to execute successfully.
-
-CLI suites own their named planes: cluster lifecycle, data commands, stored queries, schema/config, cross-version rebuild, embedded/remote parity, and local/remote system journeys. Keep `OMNIGRAPH_HOME` hermetic by using `tests/support::cli()` or `cli_process()`.
-
-CLI `integration/cli_mcp.rs` owns the stdio MCP bridge against a real served cluster and a stand-in endpoint: refusals before any I/O, tool listing with and without the bridge's `--write`, graph binding, reads equal to the server's own `/mcp` answers, a Unix-socket endpoint refused before it connects, `--as`, credential re-reading from the target's `auth` source after a 401 without resending, the server's `WWW-Authenticate` challenge relayed with a 401, managed resource identity renewal without replay or control-token forwarding, wrong-incarnation and actor-override refusals, cancellation, and unreachable servers or lost answers that start nothing and resend nothing. In-source `commands/mcp` tests own framing, binding and narrowing rules, and that the bridge names no server or MCP implementation crate.
-
-CLI `integration/cli_data.rs` owns `studio` through stand-in platform openers on `PATH` and a stand-in desktop entry: the `--json` link and its digests equal to `target inspect --json`, the registered handler's own program receiving the link, no credential read, `studio_unavailable` that runs neither `xdg-open` nor a browser on `PATH`, and direct, managed and inline targets refused before any I/O. In-source `commands/studio` tests own the link format, each platform's opener behind an injected command runner, so no test opens anything, and desktop-entry lookup and `Exec` expansion; `target_identity` tests own the `home` and `binding` digests.
-
-Deployment tests extend these owners: cluster `tests.rs` pins no-reset
+In-source owners in the server and below: the MCP adapter owns canonical
+protocol-refusal projection, including lost and oversized write results;
+`registry` owns capture and close ordering, drain-only deployment deadlines,
+affected activation scope, schema identity and candidate bounds; `operations`,
+`ingress` and the MCP adapter own detached execution and output lifetimes; the
+same owners cover coherent schema and query batch activation, which is not
+generic native settlement; `deployment` suspends observer read futures across
+owner start, finish and complete turnover. Cluster `tests.rs` pins no-reset
 ledger conversion, captured source bytes, exact-ID lookup, bounded results and
-exact applied schema identity after receipt eviction; `admission.rs` pins lifetime
-exclusion and exact reconciliation admission. Cluster `tests/failpoints.rs` owns
-interruption windows, killed-process recovery and corrective successors, including
-deletion before start, during partial removal, after root absence and before
-terminal ledger acknowledgement, same-lifetime older manifest survivors,
-replacement refusal and corrective creation in empty local settlement residue;
-`tests/identity_recovery.rs` owns current-actor authorization and adoption of a
-persisted settlement without replacing its author. CLI
-`tests/integration/cli_cluster_e2e.rs` owns the root-only deployment round trip, and
-`tests/integration/cli_cluster.rs` owns CLI admission. Engine `tests/schema_apply.rs` owns
-strict prepared publication and settlement proofs, with actor checks in
-`tests/policy_engine_chassis.rs`; catalog tests own numeric CAS. The storage
-in-source contract owns bounded same-GET bytes/tokens, and cluster
-`tests/s3_cluster.rs` owns the shared S3/Azure backend journey. Passing Azurite is
-not qualification of live Azure lease-loss or delayed accepted writes.
+exact applied schema identity after receipt eviction; `admission.rs` pins
+lifetime exclusion and exact reconciliation admission. Engine
+`tests/schema_apply.rs` owns strict prepared publication and settlement
+proofs, with actor checks in `tests/policy_engine_chassis.rs`; catalog tests
+own numeric CAS; the storage in-source contract owns bounded same-GET bytes
+and tokens.
 
 The system tests start workspace binaries on ephemeral localhost ports. Set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` only in constrained local sandboxes; CI's configured owners must not skip.
 

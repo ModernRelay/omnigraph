@@ -1,6 +1,8 @@
 //! `CrossJoinExec`: every pair of a `CrossJoin` node's two inputs that its
 //! `filters` hold for, the left collected, each right batch paired through one
 //! `PairBuffer`. It knows no text predicate and fills no scan's runtime filter.
+//! The left is collected under the query pool and the output charged as
+//! `cross join output`; an empty left executes nothing on the right.
 
 use std::fmt;
 use std::sync::Arc;

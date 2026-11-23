@@ -1,8 +1,15 @@
 //! Crash classification for Lance's public native branch controls.
 //!
-//! Graph retirement archives exact native authority before unlinking its active
-//! ref. Native trees remain available until dependency-aware cleanup. Controls remain serialized by
-//! OmniGraph's single-writer-process schema, branch, and table gates.
+//! Below storage format 18 an unretired native ref under
+//! `__manifest/_refs/branches/` defines a logical branch. Stock Lance lists
+//! every physical ref, so the logical helpers here filter by the retirement
+//! marker ([`manifest_branch_is_live`]). Graph retirement archives exact native
+//! authority before unlinking its active ref, so needed native ancestry and
+//! historical merge-base providers stay readable through the archive. Native
+//! trees remain available until dependency-aware cleanup. Controls remain
+//! serialized by Omnigraph's single-writer-process schema, branch, and table
+//! gates. At or above format 18 the branch set is main's `branch` rows, and no
+//! branch resolution or enumeration reads a ref.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -143,7 +150,8 @@ pub async fn dataset_branch_identifier(dataset: &Dataset) -> lance::Result<Branc
 
 /// Resolve a logical branch to its single live native ref by reading only that
 /// branch's own incarnations: one listing of `_refs/branches/`, then Lance's own
-/// listing read per candidate; a sibling's rewrite or a reclaimed candidate cannot fail it.
+/// listing read per candidate; a sibling's rewrite, a sibling's malformed
+/// retirement record or a reclaimed candidate cannot fail it.
 pub async fn resolve_live_native_branch(
     dataset: &Dataset,
     logical: &str,
@@ -296,6 +304,8 @@ pub async fn list_all_branch_contents(
     list_branch_contents(dataset).await
 }
 
+/// The ref metadata key that retires a native ref: a version-1 JSON value
+/// binding the exact native name and lifetime identifier.
 const RETIRED_MANIFEST_BRANCH_KEY: &str = "omnigraph.retired_manifest_branch";
 pub const RETIRED_BRANCH_ARCHIVE: &str = "_omnigraph_retired_branch.json";
 
@@ -307,6 +317,8 @@ struct RetiredManifestBranch {
     identifier: BranchIdentifier,
 }
 
+/// Whether the ref `branch` is live: no retirement marker means live, and a
+/// malformed, unsupported or mismatched marker fails closed.
 pub fn manifest_branch_is_live(branch: &str, contents: &BranchContents) -> Result<bool> {
     let Some(value) = contents.metadata.get(RETIRED_MANIFEST_BRANCH_KEY) else {
         return Ok(true);
@@ -588,7 +600,11 @@ decide_seam! {
 
 /// Revoke logical authority, archive its exact history, then unlink only the ref.
 /// Callers hold schema, branch, and table gates in one writer process.
-/// The metadata replacement is one-object publication, without a native CAS.
+/// The metadata replacement is one-object publication, without a native CAS;
+/// it adds the retirement marker and keeps every other metadata entry. A user
+/// tag on the branch refuses retirement; an engine merge-input, unpublished or
+/// unattached tag does not. A retry validates the same identity in the ref or,
+/// once the ref is gone, in its archive.
 pub async fn retire_branch_recoverably(
     dataset: &Dataset,
     branch: &str,

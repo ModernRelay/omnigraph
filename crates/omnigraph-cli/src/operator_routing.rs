@@ -1,3 +1,6 @@
+//! Resolve each owner's own auth and transport into the invocation. Source
+//! files never route execution.
+
 use crate::credential_sources::{
     self as credentials, CredentialRequest, OwnerBinding, OwnerKind, Purpose,
 };

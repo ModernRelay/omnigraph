@@ -3,6 +3,15 @@
 //! Graph publication remains engine authority. This module stores immutable
 //! input and the engine's exact outcomes; it never reconstructs a receipt from
 //! schema-text equality or replays an interrupted schema invocation.
+//!
+//! Fresh apply bootstraps ledger v2 directly. The applied revision and every
+//! achieved base keep each graph's exact source and IR digests and its schema
+//! identity domain and version, captured coherently during conversion and
+//! advanced only by successful schema outcomes. Serving and preparation of an
+//! affected graph compare that identity even after its receipt is evicted, so
+//! a recreated graph with identical schema text is refused; an unaffected
+//! graph is not opened. Ordinary apply never adopts a foreign schema identity
+//! as an implicit correction.
 
 use super::*;
 use omnigraph::db::{
@@ -46,6 +55,14 @@ pub(crate) fn pristine_bootstrap_state(state: &ClusterState) -> bool {
 
 /// The caller still owns authentication. Stored authority never grants effect
 /// permission; an authenticated initiating actor may read its exact receipt.
+///
+/// `StorageOwner` keeps the storage-owner trust boundary with an optional
+/// actor label. An `AuthenticatedIdentity` rechecks current cluster
+/// `ConfigManage`; schema effects and their recovery also need `Read` and
+/// `SchemaApply` on each affected graph. Deployment status and results expose
+/// management metadata under `ConfigManage` without data access to unrelated
+/// graphs. The original authority stays immutable: recovery records the
+/// current executor and keeps the authored engine receipt.
 #[derive(Debug, Clone)]
 pub enum DeploymentCaller {
     StorageOwner { actor: Option<String> },

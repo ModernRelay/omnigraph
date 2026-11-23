@@ -72,38 +72,12 @@ writes, index builds and deletes on the source do not wait for the merge, and
 the merge's final re-read still refuses a source whose incarnation or schema
 changed.
 
-Native branch creation uses an operation-local capture of the bound coordinator
-or that same one-entry cache after the control gates. Reuse
-requires a fresh match of the complete manifest incarnation, including the
-native branch lifetime; a stale or missing view takes the existing refresh/open
-path. Captures share immutable lineage and the Lance session, copy current
-table state, and leave the handle's active branch unchanged.
-
-A start at a graph commit (`from_commit`, `branch create … from commit "<id>"`) captures the
-branch whose incarnation wrote the commit and clones that branch's
-`__manifest` at the version that published it: Lance `create_branch` takes any
-retained version, so the new branch's first manifest holds the commit's table
-pins, head, buffer and schema contract, exactly as a create while the commit
-was the head. No second publication follows. Under the gates the engine
-captures the branch by name and reads the commit's record from the capture.
-The incarnation that wrote the commit must be the one the name resolves to:
-a name that resolves to nothing and a name created again since are one fact,
-refused as `BranchDeleted` in that one place, on every door. It then refuses,
-before any effect, a version above the captured head, a schema contract
-other than the accepted one, a version only the legacy history serves, a
-version whose head row is another commit, and any pinned table version that
-no longer opens (cleanup reclaimed it) or misses an object its manifest
-references. The collector's sweep deletes a version's files before its
-manifest, so a manifest that opens proves nothing after an interrupted run:
-every object of every pin the captured head does not also hold (the head's
-pins are roots, whose files the collector never deletes) is probed, as the
-collector oracle probes retained roots. The probe runs under the exclusive
-schema permit every write waits on, so it opens the pins and probes their
-objects with bounded concurrency and stops at the first missing object; it
-still sends one request per object of those pins. Collection keeps the new branch's base version, and with
-it the commit's pins, while the branch lives.
-An unpublished commit and an unattached snapshot are detached `__manifest`
-versions that no branch history holds, and are refused.
+Native branch creation captures its source after the control gates
+(`capture_branch_control_source` in `crates/omnigraph/src/db/omnigraph.rs`).
+A start at a graph commit (`branch create … from commit "<id>"`) clones the
+`__manifest` version that published it; its capture and the proof it runs
+before any effect are `capture_commit_start_source` and `prove_commit_start`
+there, and `create_branch_at` in `crates/omnigraph-catalog/src/lib.rs`.
 
 At or above format 18 create admission reads `main`'s branch rows, held with
 no request: a live row whose logical name is the target, or an ancestor or
@@ -142,29 +116,11 @@ Registration replacement, rename, tombstone, and same-version physical-owner
 handoff use the existing complete fold. This is disposable process memory;
 `__manifest` remains the only durable graph authority.
 
-`GraphNamespacePublisher` retains at most one complete stored row batch from
-its last acknowledged publication. Every attempt opens the target branch's
-latest `__manifest` again. Reuse requires matching native manifest location,
-version, naming scheme, complete Lance manifest and schema metadata; known
-ETag or size mismatches reject reuse. Dictionary-bearing schemas bypass this
-cache. Cached rows pass through the same decoder and collision, expected-version,
-lineage and exact-head checks as scanned rows. The cache changes neither the zero-retry
-version CAS nor the lost-acknowledgement readback. Foreign movement, missing rows
-or an image above the 8 MiB accounted Arrow-buffer/key budget use a full scan.
-This budget bounds retained cache accounting, not total process memory. The
-copy-on-write publication still rewrites the complete live row set.
-
-The capture (`open_write_txn`) obtains the accepted contract identity from
-the selected manifest snapshot. It validates that snapshot's complete contract
-row before reusing a catalog with the same identity. An unchanged captured
-manifest image reuses its validation; newly observed images carry the contract
-from their state scan, and acknowledged publications reuse their retained rows.
-The cache is disposable; a missing or invalid row
-cannot be repaired from root files. Captures and finalization hold the
-process-local schema gate and run the complete-authority checks; each capture
+`GraphNamespacePublisher` keeps the rows of its last acknowledged publication
+(`PublishedRows` in `crates/omnigraph-catalog/src/publisher.rs`). The capture
 validates the contract row of the manifest version it selected
-(`open_write_txn`, or `ensure_schema_state_valid` for control and maintenance
-entry points).
+(`open_write_txn` in `crates/omnigraph/src/db/omnigraph.rs`, or
+`ensure_schema_state_valid` for control and maintenance entry points).
 
 Finalization acquires the root-shared gate order:
 
@@ -257,23 +213,11 @@ once the retirement has landed, so its handles probe.
 
 `Omnigraph::claim_branch_writer_as` claims under `branch_claim` on the branch
 it names, the shared schema permit and the branch gate, through a
-coordinator it opens under those gates. The catalog's `claim_writer_epoch`
-writes the loaded rows with the row at `E + 1` and a fresh attempt id as the
-next `__manifest` version, under `PublishPrecondition::ExactBranchIdentity`:
-the branch's name and Lance-native identifier, with no head compare. A moved
-head does not refuse a claim and a branch recreated under its name does. The
-version records no graph commit and moves no head; it is a
-control-fact publication, and a publication that changes `table`
-rows or the schema contract still requires lineage. The process that already
-holds the rows' epoch gets it back and writes nothing. A claim that loses its
-version to another publication loads again and asserts the epoch its first
-load read, so of two racing claims one holds `E + 1` and the other is refused
-with `read: E`. A put with no answer is settled from the version it
-attempted: the row carrying this claim's attempt id is the claim landed, and
-another publication there before any acknowledgement is the claim lost.
-When that version cannot be read, or holds another publication after an
-acknowledgement, the claim is in doubt, keyed by the attempt id, and holds
-nothing; the next claim settles it by landing above it.
+coordinator it opens under those gates. The version a claim writes is a
+control-fact publication; a publication that changes `table` rows or the
+schema contract still requires lineage. How a claim lands, races and settles
+an unanswered put is the doc of `claim_writer_epoch` in
+`crates/omnigraph-catalog/src/publisher.rs`.
 
 Detached candidate versions (an unpublished commit or an unattached snapshot
 before publication) carry the row and assert nothing. Writes outside the
@@ -391,14 +335,10 @@ above `omnigraph.last_linear_version` under `foreign_versions`
 inspect an unregistered deterministic path's HEAD only to prove it remains
 its qualified original empty version 1; it never adopts an advanced HEAD.
 
-Detached manifests are reclaimed by the tracing collector `cleanup` runs
-(`db/omnigraph/collector.rs`; `optimize.rs`, `cleanup_detached_only`). Its
-roots are the pins of every `__manifest` version the run's `--keep` and
-`--older-than` policy retains on every live branch; a detached manifest is
-swept when a `__manifest` version once named it and no retained version
-still does, or when no `__manifest` version ever named it and the authority
-its transaction properties record is provably gone. Nothing defers a table's
-collection; see [Maintenance](../user/operations/maintenance.md#cleanup).
+Detached manifests are reclaimed by the tracing collector `cleanup` runs;
+its roots, sweep rule and the two properties every run holds are the module
+doc of `crates/omnigraph/src/db/omnigraph/collector.rs` (see also
+[Maintenance](../user/operations/maintenance.md#cleanup)).
 
 Optimize plans each table's compaction once, from its pin
 (`TableStore::plan_table_compaction`, whose doc comment says how the plan
@@ -452,156 +392,49 @@ A write sent back before its effects prepares again from its request; the
 rule, its bound and its preparation scope are the module doc of
 `crates/omnigraph/src/db/reprepare.rs`. The next attempt holds the shared
 schema permit and the branch gate, `commit_all` adds the table gates, and no
-maintenance run waits for writers.
+maintenance run waits for writers; what the gated attempt costs other
+writers is in that module doc too.
 
-The gated attempt costs other writers more than its own branch. Writers on the
-branch wait for its one preparation. The shared schema permit it holds also
-makes every request for the exclusive side wait (a branch create, a schema
-apply and a system-column upgrade among them), and the schema gate is fair: while such a
-request waits, new shared requests wait behind it, so writers on every branch
-wait too. Each wait lasts one preparation, as a branch merge's planning under
-the same permit already does. For a large merge load on object storage that
-can be seconds.
-
-Optimize captures its write authority before it takes the shared schema,
-main-branch and table gates, and rechecks it under them. On the direct path
-(`AuthorityCapture::BeforeGates`, the default) a head that moved while the
-run waited refuses the run: outside a serving process no gate fences the
-writer that moved it. A served run (`AuthorityCapture::UnderGates`) captures
-its complete authority again under the held gates instead, because writers in
-the same process move main while a run waits and none can move it while the
-gates are held, so that capture is the attempt's one authority and never a
-mix of the two. Every refusal before the first table's staging, this one
-included, carries `CompletionEvidence::BeforeEffect`; a policy denial keeps
-its typed shape, as at every `_as` door.
-
-A run with `max_gate_hold` defers every table whose turn comes after the
-deadline, measured from gate acquisition, and publishes the tables it finished
-(`run_table_pipeline`). A table whose own planning or staging fails with
-definite evidence is reported `failed` and the others still publish; a
-failure whose evidence stays uncertain fails the run. A cancellation
-(`OptimizeRequest::with_cancellation`) is checked before every table's plan
-and rewrite and before the publication: it drops the tables in progress,
-reports them, every table not yet started and every table holding a staged
-effect as `cancelled`, and publishes nothing (a table already reported
-without an effect keeps its outcome); one that arrives
-after the last check lets the run finish, and the artifact refresh stops
-before its write, or, if the write had already started, completes.
-Per-table ceilings (`TableCeilings`) are measured from the table's compaction
-plan before its first write, fragments first, and only when set: rows from
-fragment metadata, bytes from recorded data-file sizes or a HEAD resolved by
-the collector's base rule (`collector::data_file_location`,
-`deletion_file_location`; Lance 13 records no deletion-file size), managed Blob
-bytes from the descriptor scan compaction sizing uses, and the table's rows
-when an index would be rebuilt or built. A table over one, or one whose plan
-records no size to measure (a fragment without a row count, a Blob field that
-cannot be sized), is `deferred(resource_limit)` with nothing written; a size
-read that fails reports the table `failed`. The run
-byte budget (`run_source_bytes`, also the default table byte ceiling) defers
-the first table that would pass it, and every later one, as `byte_budget`.
-With `artifact_bytes`, the adjacency artifact is bounded twice: before the
-edge scan by a lower bound (`persist::fixed_bytes` at the shortest header plus
-8 bytes per live edge row), and during it by `GraphIndex::build_counted`, which
-reads one batch at a time, adds each batch's growth of the object to
-`persist::ArtifactCount` (from the widest header), and stops before keeping
-another batch or allocating the adjacency arrays. Either stop is
-`skipped(size_limit)` and writes nothing. The artifact write runs in a spawned
-task the run awaits, so a dropped run cannot drop an issued write on the
-mutable key. A caller's before-publish hook
-(`OptimizeRequest::with_before_publish`) belongs to the shared publication
-helper, `table_ops::commit_updates_on_branch_with_expected`: it runs once,
-after the updates are prepared and before the coordinator lock and the
-publisher's first attempt, with the lineage intent's nonce and the captured
-head. Its failure publishes nothing and is `Unpublished`. The helper's other
-callers pass no hook. The hook runs under every writer gate and has no bound
-of its own, so it is part of the publication in the writer wait a bounded run
-promises: `max_gate_hold`, plus the tables already started (their full-text
-and vector builds run one at a time), plus the publication with its hook, plus
-the configuration clear.
+Optimize's authority capture, run bounds, cancellation and before-publish hook
+are the docs of `AuthorityCapture`, `OptimizeLimits`, `TableCeilings` and
+`OptimizeRequest` in `crates/omnigraph/src/db/omnigraph/optimize.rs`.
 
 The index writer (`ensure_indices`, which `omnigraph index build` runs on any
 branch, and the explicit full-text rebuild) follows the same protocol: it
 opens each productive table at its pin, stages the complete BTREE/FTS/vector
 batch before the gates, commits every batch as a detached version of the pin
-and publishes the pins once. For `ensure_indices` one table's batch holds the
-declared indexes the table lacks and a whole rebuild of each BTREE or vector
-index whose coverage lags (`TableStore::stage_index_reconciliation`), the two
-index links optimize chains after its compaction; full-text coverage stays
-with the explicit rebuild. The tables stage concurrently and share one
-budget (`MaintenanceBudget`): a BTREE build holds `ceil(width / 4)` permits,
-so at most `INDEX_BUILD_CONCURRENCY` (4) run at once, and exactly 4 only when
-the width is a multiple of 4 (2 at width 5, 3 at 6, 7 or 9); a full-text or
-vector build holds all of them and runs alone; and the batches join in table
-and specification order, so the publication is the one a serial pass makes.
-The pass owns the budget: one `ensure_indices` or full-text rebuild pass
-(width 4), or one optimize run across the tables it stages at once (width
-its rewrite concurrency, shared with every compaction task, which holds one
-permit), never one budget per table. In optimize, a full-text or vector build
-therefore runs one at a time across the whole run, and no compaction task or
-other build runs beside it; a table waiting for its permit keeps its rewrite
-slot, so later tables wait too. No step waits for a permit while it holds
-one, so the budget cannot deadlock. The first build error observed in index
-order ends that batch and drops outstanding builds. A vector fold with too
-few finite, non-null values stays pending on Lance's typed training refusal.
-An index-build pass publishes nothing on a build error. Optimize applies its
-per-table failure rules: if a rewrite or fold already committed detached, its
-pin remains eligible for the single graph publication with `index_failed`.
-A fresh run plans the remaining work from the published pin.
-Each spilling BTREE training gets its own Lance memory pool of 150 MiB per
-core (`available_parallelism()`; `LANCE_MEM_POOL_SIZE` sets the pool size
-instead), so a pass can hold up to four such pools before Lance spills. A
-failure before publication leaves no graph-visible residue; after publication reads,
+and publishes the pins once (`maintain_indices_for_branch` in
+`crates/omnigraph/src/db/omnigraph/table_ops.rs`). For `ensure_indices` one
+table's batch holds the declared indexes the table lacks and a whole rebuild
+of each BTREE or vector index whose coverage lags
+(`TableStore::stage_index_reconciliation`), the two index links optimize
+chains after its compaction; full-text coverage stays with the explicit
+rebuild. Heavy steps share one budget per pass (`MaintenanceBudget` in
+`crates/omnigraph/src/table_store.rs`). Optimize applies its per-table failure
+rules: if a rewrite or fold already committed detached, its pin remains
+eligible for the single graph publication with `index_failed`. A failure
+before publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.
 
 Every writer commits a table effect through
 `TableStore::commit_staged_detached`, which takes the table's declared
-full-text columns. Lance applies a full-text analyzer only through a segment
-of the index, so a version holding rows and no segment for a declared column
-would match with a bare tokenizer (no lowercasing, no stemming). A table's
-first rows and an overwrite load (an overwrite drops every index) produce such
-a version, as does a schema evolution that adds a full-text column; when the
-committed version holds no segment for a declared column, the gateway chains
-an untrained, certified segment (an empty fragment bitmap, no postings) in a
-second detached commit under the same witness and returns that version to
-pin. The gateway decides this before the commit from the base version's index
-metadata and the effect's operation, as Lance's manifest build decides (an
-overwrite keeps no index, an index commit swaps the segments it removes for
-the ones it adds, and any other operation keeps a segment of every index whose
-column remains), resolving each column by field id in the schema the version
-will have, so a renamed column keeps its index; Lance's commit loads the same
-metadata, so the check adds no storage request. Schema apply declares a
-full-text `@index` it adds to a table it does not evolve the same way, beside
-the contract. The index writer builds postings where no segment covers a
-fragment, and the branch-merge insertion proof steps over a declaration link,
-which moves no row. The system-column upgrade keeps every index and declares
-none.
+full-text columns and chains an untrained full-text segment where the
+committed version would hold none; its doc comment and
+`full_text_columns_without_segment` in `crates/omnigraph/src/table_store.rs`
+give the rule. Schema apply declares a full-text `@index` it adds to a table
+it does not evolve the same way, beside the contract
+(`TableStore::commit_full_text_declarations`).
 
 Schema apply changes an existing table's columns by metadata-only Lance
-commits (`TableStore::stage_schema_evolution`). Renamed and dropped columns
-commit as one detached `Operation::Project` of the table's pin, the surviving
-columns keeping their field ids, metadata and indexes; added nullable columns
-commit as a detached `Operation::Merge` over the unchanged fragments, with
-field ids above every id the data files reference, which fragments that lack
-them read as null. Lance refuses a Merge that renames a field, so a table with
-both kinds chains the Merge on the Project, and the pin names the tip; either
-way the table publishes one logical version past its published version. No
-data file is written and no row or Blob payload is read, so the apply's memory
-and I/O do not grow with the rows or payload bytes the table stores; they
-still grow with its fragment, schema and index metadata, because planning
-walks the fragment inventory, the Merge carries it and each detached commit
-serializes it. Every surviving index keeps its coverage, and a stored external
-Blob descriptor, ranged or not, is never rebuilt. A dropped column's values
+commits, planned once before the first effect
+(`TableStore::plan_schema_evolution` and `TableStore::stage_schema_evolution`
+in `crates/omnigraph/src/table_store.rs`). A dropped column's values
 stay in the data files until the next optimize rewrites every fragment holding
 them (above); `cleanup` then deletes the old files once no retained version
 references them. The collector retains every live branch's head and creation
 point and every tagged version, so a branch created before that optimize keeps
-the old files, merged or not, until it is deleted. Every evolved table's
-commits are planned once, from its manifest, before the first effect, and the
-effects stage exactly that plan, each step checking that its base has the
-columns the previous step left. A column whose type or nullability would change refuses at
-planning; the schema planner emits no such step. The physical column order
-follows the catalog.
+the old files, merged or not, until it is deleted.
 
 An added type uses its identity-derived path, which a retry derives
 again from the accepted allocator. Retry preserves that path and every
@@ -621,26 +454,9 @@ both are complete and only the disposable in-memory view may need refresh.
 The system-column upgrade uses the same publication
 boundary. See [Schema contract in the manifest](../decisions/2026-09-30-schema-contract-in-manifest.md).
 
-`prepare_schema_apply_as` binds the canonical root and schema identity domain,
-exact main-branch authority, numeric manifest base, desired contract, actor and
-a preallocated intent nonce before table effects; the published commit id
-`hb1.<block>.<slot>.<nonce>` wraps that nonce, so a lookup by the intent names
-the commit through `commit_id_answers`, never by equality. Preparation supports a
-read-only handle: it captures authority and plans, without issuing native writes.
-`apply_prepared_schema_as` rechecks that authority and the current policy under
-the existing gates. Intent version 2 uses `ExactGraphVersion`: a base at `M` can
-publish only at `M + 1`, and metadata-only contention that preserves graph HEAD
-still refuses rather than rebasing. Version-1 intents are rejected. An effectful success
-returns the operation's own `GraphCommit` and contract identity, not a later head
-observation. The prepared
-value is execution input, not an authorization grant or a distributed writer
-fence.
-
-A schema no-op requires the exact source and accepted contract. Changed comments
-or formatting publish a replacement contract and lineage once while preserving
-every table pin. An empty migration plan alone cannot certify the desired
-source. The ordinary apply API uses the same preparation, execution and
-exact-version rule, including refusal on head-preserving metadata contention.
+A prepared schema apply (`prepare_schema_apply_as`, `apply_prepared_schema_as`
+in `crates/omnigraph/src/db/omnigraph.rs`) publishes only at the version after
+its captured base; those docs give the intent's contents and the no-op rule.
 
 Reconciling and settling a prepared schema invocation are in
 [recovery](recovery.md#schema-contract-publication).
@@ -792,40 +608,11 @@ Rows keep their fragment and stable row id; Lance restamps the patched rows'
 rewrite does. An omitted legacy (non-v2) Blob, or a vector of non-primitive
 items, sends the update back to whole rows.
 
-`TableStore::scan_update_matches` decides per update, from one scan of the
-carried columns (every column but the unassigned Blob and vector columns) with
-`_rowid` and `_rowaddr`. A patch writes the touched fragments' rows times the
-source row's bytes; a row rewrite reads and writes the matched rows whole,
-their carried columns, vectors and managed Blob payloads (`UpdateWriteCost`).
-An index on an assigned column adds one read of that column over the touched
-rows to the patch's cost, since the patch withdraws every touched fragment
-from that index until the next reconciliation. The cheaper one wins, taking
-the omitted columns' descriptors and vectors by `_rowid` only when the carried
-columns and vectors alone do not settle it. A stored external reference in an
-omitted Blob selects the patch, which keeps it without reading or refusing it.
-On a table whose omitted columns are all vectors, the scan reads the vectors
-too, so a row rewrite reads exactly what it always did. The pending batch
-keeps the carried columns, which validation reads (key and `@unique` groups,
-value constraints); staging cuts the source from it.
-
-The choice is a physical plan decision and never decides the outcome. The scan
-charges the carried columns, which both modes hold, and a row rewrite that
-would exceed the write budget (its carried Blob payload, or its whole rows at
-`append_batch`, the one check over the batch with its assignments applied)
-takes the patch, which then fits. Payload lengths come from the descriptors,
-so that overrun is found before a payload is read. A mutation that writes
-another table shares one write budget with the update, and a row rewrite's
-charge would decide that table's admission, so there the update always
-patches. A filtered scan returns matched rows as slices of a batch decoded
-from their fragment, and a slice pins its parent's buffers, so the scan copies
-each batch of matched rows into buffers of its own before charging or keeping
-it: the charge is the matched rows' own bytes, not those of the rows stored
-beside them. What remains is Arrow's fixed bookkeeping for each scan batch,
-about a hundred bytes per carried column. The number of batches follows the
-remaining budget and Lance's batching, not the rows stored beside the match.
-An index on the assigned column or the fragment a row shares therefore changes
-cost, never whether the write is admitted
-(`write_max_bytes_update_carried_blob.gqt`).
+`TableStore::scan_update_matches` decides per update between the patch and
+a row rewrite; the cost it compares and the admission rule are the docs of
+`scan_update_matches`, `UpdateMatchRequest` and `UpdateWriteCost` in
+`crates/omnigraph/src/table_store.rs`. The choice is a physical plan decision
+and never decides the outcome (`write_max_bytes_update_carried_blob.gqt`).
 
 A patch may withdraw touched fragments from an index on an assigned column
 while they stay in the manifest, and the index keeps its old entries for them.
@@ -884,19 +671,9 @@ and otherwise a probe of `main`'s head and a read of its latest version when
 the head moved; below the stamp it reads active refs. Creation does not scan retired
 histories.
 
-A detailed listing (`list_graph_branches_detailed` in `omnigraph-catalog`)
-derives every field from the same authority and writes nothing: each live
-row (`parent`, `parent_version`, `created_at`; below the stamp the ref's
-`BranchContents`), the head row of the branch's latest `__manifest` version
-and, once the branch has written a commit, the head row of its clone at
-`parent_version`, the commit it started at (a start at a past commit clones
-that commit's version, so the same read answers it). A row whose tree is
-absent lists its branch as not ready, with no head; a tree whose head carries
-a tombstone lists its branch as retirement pending. It reads no lineage, so
-its cost per branch is flat in history (`branch_control_cost.rs`). The
-collector keeps each live branch's
-oldest own `__manifest` version (`retained_versions` with `keep_base`), which
-is that clone; a reclamation that dropped it would lose the start.
+A detailed branch listing derives every field from the branch rows (or refs)
+and each branch's `__manifest`, and writes nothing
+(`list_graph_branches_detailed` in `crates/omnigraph-catalog/src/branch_detail.rs`).
 
 Stable table/incarnation identity, not `table_key`, determines whether a
 registration, rename, tombstone, or pointer belongs to the same lifetime.

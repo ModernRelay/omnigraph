@@ -1,5 +1,14 @@
 //! Server settings loading and mode inference (single vs multi).
-//! Moved verbatim from tests/server.rs in the modularization.
+//!
+//! Also the served lifecycle: authenticated submission, parked requests,
+//! caller disconnect, pre-effect refusal, durable acceptance before completion,
+//! activation-in-progress observation, exact receipt access after management
+//! handoff, authorized availability and MCP across shutdown and restart. A
+//! merge held across served schema planning shows preview does not wait for
+//! the graph gate. The `owned_shutdown` journeys own process containment: a
+//! panic or an uncertain owned write exits 2 and keeps the lock, a proven
+//! unpublished staging failure with settled storage I/O is a 500 the server
+//! keeps serving through, and a clean SIGTERM releases the lock.
 
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::fs;

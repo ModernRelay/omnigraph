@@ -5219,6 +5219,14 @@ fn gate_primitive_scan_reads_production_code_and_honors_the_sentinel() {
 
 /// `cfg(any(test, feature = "test-util"))` reads as test-only in both source guards,
 /// which holds only while no production build enables a split crate's `test-util`.
+///
+/// A helper in `omnigraph-core`, `omnigraph-catalog` or `omnigraph-cluster` that
+/// another crate's tests reach carries that gate, because `cfg(test)` is set per
+/// crate: a dependent crate's test build compiles the base crate without it.
+/// The engine enables the feature on core and catalog, and the server on the
+/// cluster, through their dev-dependencies, so the helpers exist in test builds
+/// only. This test refuses any other enable of the three crates' `test-util`
+/// (`SPLIT_CRATE_PACKAGES` plus `TEST_UTIL_SEAM_PACKAGES`).
 #[test]
 fn split_crate_test_util_is_enabled_only_by_dev_dependencies() {
     let manifests = workspace_manifests();

@@ -1,5 +1,16 @@
 //! Expand aligns source rows with destinations in bounded output batches.
 //! Budgeted traversals stream source windows; legacy multi-hop uses a breaker.
+//!
+//! A bound edge runs per input batch: the batch is held, its matched pairs
+//! come through a two-batch queue whose batches each own a memory lease,
+//! DataFusion sorts them under the query's memory and scratch budgets (a
+//! blocking stage per batch that may spill), and destination hydration sends
+//! batches through a second bounded queue. Its batches hold at most
+//! `EXPAND_OUTPUT_ROWS` rows and target a thirty-second of the query memory
+//! budget, at most 1 MiB; a wider indivisible row stays subject to the pool.
+//! Producer-held chunks, queued buffers and consumer handoffs are all
+//! charged, so queue length is not the memory bound. The expanded result is
+//! never collected here.
 
 use std::fmt;
 use std::sync::Arc;

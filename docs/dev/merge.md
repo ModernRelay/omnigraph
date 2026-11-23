@@ -15,22 +15,11 @@ ancestry walk below, which reads only the history blocks it addresses. A success
 history: missing, malformed, or conflicting settled records outside the proof
 may remain undetected until a history read reaches them.
 
-The inconclusive case walks the commit graph from both heads by generation
-(`commit_graph.rs`, `lazy_merge_base_search`), reading a commit it does not
-hold from its `__history` block. Each branch's `__manifest` also carries a
-block registry (`history_block` and `history_merge` rows, storage format 15):
-one row per released first-parent run of a block, with its slot range, the
-generation and parent of its first slot, and one row per merge commit inside
-the run. The walk crosses a registered block from its last slot to its first
-without a read and reads blocks for commits no row covers and for final
-candidates tied on distance and generation. The publisher writes the rows when it releases
-a run and refuses a run whose commits are not the chain their ids claim, so a
-block without rows is walked from its records. Registry rows past
-`REGISTRY_HOT_ROWS` live in cold fragments of `__manifest` that a publish
-reuses by reference. A registry push repacks smaller cold fragments; a merge
-caches them by data-file path and imports only rows absent from the target.
-`optimize` preserves this fragment layout; only the catalog publisher repacks it.
-See the [block registry RFC](../decisions/2026-10-10-merge-base-block-registry.md).
+The inconclusive case walks the commit graph from both heads by generation,
+crossing the block registry each branch's `__manifest` carries
+(`lazy_merge_base_search` in `crates/omnigraph-catalog/src/commit_graph.rs`;
+the registry's fragment layout is the module doc of
+`crates/omnigraph-catalog/src/commit.rs`). See the [block registry RFC](../decisions/2026-10-10-merge-base-block-registry.md).
 
 ## Per-table decision
 
@@ -96,20 +85,10 @@ a `FastForward` can publish a delta whose keys a `Merged` merge would refuse.
 
 The internal `omnigraph.insert_absence = "v1"` transaction property says that
 the filtered physical IDs were proven absent from that transaction's effective
-parent. Merge accepts it only when every version in the complete source
-interval is present and structurally proves:
-
-- one exact previous-version link and transaction UUID;
-- an insertion-only filtered Update over exactly physical `id`, or an
-  index-only commit, which moves no row and is crossed as a link;
-- no removed/updated fragments or unrelated maintenance effect;
-- complete nested schema/index-coverage metadata;
-- physical-row totals matching the manifest delta;
-- exact source and target native branch incarnations under the final gates.
-
-History proof follows the source's chain one `read_version` link at a time,
-reading each version's transaction record and opening its parent version,
-within a 1,024-version limit. Missing or unprovable history falls back.
+parent. Merge accepts it only across a complete source interval whose every
+version proves an insertion-only or index-only commit
+(`try_proven_pure_insert_history` in `crates/omnigraph/src/exec/merge.rs`
+lists the conditions). Missing or unprovable history falls back.
 
 The route stages bounded immutable fragments, then commits the same certified
 filter-bearing Update shape. It performs no target MergeInsert join or target
@@ -202,36 +181,12 @@ the merge's own captured allowance, and a pointer adoption writes no row. The
 proven-insert route keeps its 8,192-row bound per batch, and a source that
 yields other than its declared rows fails the merge.
 
-What the sweep keeps is what the cross-row checks judge across the whole
-delta at once: the facts keyed by the ids, each uniqueness group's values,
-an edge's source under `@card`, the id and endpoint columns of an edge table
-whose endpoint checks probe after the sweep, and the removed ids
-(`Sweep::fact_columns`). A streamed sweep copies each kept column out of its
-batch (`copy_batch_range`), so a kept column never pins a decode buffer
-another batch shares. `MergeValidationBudget` charges those columns' bytes as
-each batch is swept (`Sweep::fact_bytes`), and every removed id as it is
-copied out of the delete plan, against `MERGE_VALIDATION_MAX_BYTES` (32 MiB);
-crossing it refuses the merge as `branch-merge retained validation key bytes`
-before the first effect. Each fact copies its key into an owned string and hash entries of its
-own, so a short id costs about ten times its bytes; the other staged routes
-leave the same facts unaccounted.
-
-The charge counts values, not buffers, because Arrow lets a null string own
-bytes and a Lance 13 scan returns such nulls: two rows of one fragment, a
-wide value and a null, can come back as two one-row batches over one decode
-buffer, the null's offsets spanning the wide value, so its slice size and
-its allocation both count the wide value again. `table_store` owns the two
-answers: `column_logical_bytes` (with `batch_logical_bytes`) counts what a
-batch's rows hold, every non-null value plus offsets or views and validity,
-and `copy_batch_range` copies rows with `take`, which copies valid values
-alone. `batch_slice_memory_size` counts every slot's offset range, which is
-what a `concat` copies. Publication rebuilds a planned chunk the scan returned
-as several batches by copying each with `copy_batch_range` before
-concatenating them (`next_exact_staged_chunk`), and copies a single slice
-whose buffers hold more than its logical bytes. The proven-insert
-publication still plans its prefixes by `batch_slice_memory_size`, which
-subtracts each Blob payload's offset range: a null's span there can only
-shrink a chunk, never refuse one.
+What the sweep keeps for the cross-row checks is charged against a fixed
+32 MiB budget and refused before the first effect when it would pass it
+(`MergeValidationBudget` in `crates/omnigraph/src/exec/merge.rs`). The charge
+counts values, not buffers (`column_logical_bytes` and `copy_batch_range` in
+`crates/omnigraph/src/table_store.rs`), and publication rebuilds a planned
+chunk from copies (`next_exact_staged_chunk`).
 
 Why the budget is fixed and covers the whole delta is the
 `MergeValidationBudget` doc comment. The supported route past it is a merge
@@ -287,17 +242,8 @@ defer index construction to reconciliation.
 
 A `FastForward` whose target head
 is not the merge base, such as a second merge from the same source, opens the
-base like a diverged merge and compares the two states in memory. Every publish rewrites the hot `__manifest` rows into exactly one new
-fragment and names the cold registry fragments again, so a scan pays no
-per-fragment or per-deletion-file requests for them. Pages within a file are
-still read separately. The rows hold the
-`table` rows, the head `graph_commit` row and the buffered `settled_commit`
-and `replaced_table` rows, which `HISTORY_RELEASE_BYTES` (or the lower
-`history_release_bytes` a session set) bounds, so the bytes decoded per scan do not grow with retained history; older commits live in
-`__history` and are read only when a history read needs them. Read-only scans
-reduce one Arrow batch at a time; the publish scan retains every batch,
-because the copy-on-write publish rewrites them. Each `__manifest` version
-keeps its own copy of the rows and no path prunes `__manifest` versions.
+base like a diverged merge and compares the two states in memory. What a `__manifest` scan and publish cost is the module doc of
+`crates/omnigraph-catalog/src/commit.rs`.
 
 Successful local publication preserves the existing coherent projection after
 lineage adoption, avoiding a full reconstruction on the next unchanged refresh.
@@ -310,53 +256,10 @@ rules, and the small cache/layout controls in the
 
 ## Diagnosing a slow merge
 
-`MergeWriteProbes` is a task-local test and benchmark seam; production leaves
-it unset, so timing does not read the clock. Its top-level timing flow is:
-
-`OuterPrepare` -> ((`ProvenInsertHistory` -> `ProvenInsertPlanScan`) | `TableWalk`)
--> `CandidateValidation` -> `FinalRevalidation` -> `PhysicalPublish` ->
-`ManifestPublish` -> `OuterRestoreRefresh`.
-
-The parenthesized classification routes are chosen per table, so a mixed-table
-operation can record both route families. `TableWalk` covers one general
-classifier (lineage candidates or ordered fallback) and delta staging; for Blob tables it begins after
-the operation-wide descriptor preflight. `KeyedStage` and `KeyedCommit` are
-sub-buckets of `PhysicalPublish`.
-`merge_timing_snapshot` reports total, maximum, and exact interval count for
-every phase; the count remains meaningful when a short duration rounds down to
-zero microseconds. Structural probes identify the chosen data path. The columns
-below correspond to
-`ordered_cursor_scan_calls`, `stage_fenced_insert_calls`,
-`stage_known_present_update_calls`, `stage_merge_insert_calls`, and
-`strict_insert_preflight_calls`:
-
-| Route | Ordered cursors | Fenced inserts | Known-present updates | MergeInsert upserts | Strict-insert preflights |
-|---|---:|---:|---:|---:|---:|
-| Proven insertion replay | `0` | `C` | `0` | `0` | `0` |
-| Adopt with delta | `0` for lineage candidates; at least `2` for ordered fallback | insert chunks | changed-row chunks | `0` | insert chunks |
-| General three-way | `0` for lineage candidates; at least `3` for ordered fallback | insert chunks | updated-row chunks | `0` | insert chunks |
-
-Blob descriptor selection can add cursor passes, so the fallback counts are
-lower bounds. Debug verification runs both classifiers; use the completed
-classifier counters to distinguish it from either single route. Candidate
-scan-row, exact-address-take, and provenance-read counters expose work that
-ordered-cursor counts do not measure. Other useful signals are:
-
-- high `ProvenInsertHistory` means the retained transaction walk dominates;
-- high `ProvenInsertPlanScan` means scanning or materializing the certified
-  source interval dominates;
-- ordered cursors on a named-target pointer adoption can be required for
-  validation; on a main-target insert replay they indicate a provenance miss;
-- high `KeyedStage` means target lookup/join or Blob materialization dominates;
-- high `ManifestPublish` with a tiny delta points to manifest history or CAS
-  retries;
-- validation projected-byte counters show what the validation sweep read,
-  of which only key columns count toward the 32 MiB validation budget, while
-  Blob payload and external-probe counters isolate object cost.
-
-The probe set also records requested cursor batch bounds, raw proven-insert
-batch sizes, and legacy whole-delta scans. `stage_vector_index_calls` and
-`scan_staged_combined_calls` should remain zero on current merge routes.
+`MergeWriteProbes` and `MergeTimingPhase` in
+`crates/omnigraph-core/src/instrumentation.rs` record which route a merge
+took and where its time went; their docs give the counter table per route and
+how to read each phase.
 
 ## Conflicts
 

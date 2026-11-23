@@ -1,5 +1,43 @@
 #!/usr/bin/env python3
-"""Compose permanent release-note fragments from explicit Git trees."""
+"""Compose permanent release-note fragments from explicit Git trees.
+
+Inputs: `changelog.d/release.json` names the next `version`, the previous
+release `base` (null only for an initial release), an optional `legacy`
+baseline SHA and the cycle's `format` (1 when absent). They are explicit
+inputs, never inferred from the newest tag. A release selects the
+`changelog.d/` paths present in the target tree and absent from the base tree,
+with content from the target; a base-tree note that the target changed,
+renamed or removed is refused, so a published note is frozen. CRLF and LF
+checkouts of a note have one identity. Every local link must resolve, heading
+anchor included, at the selected revision. Rendering rewrites only the
+reference definitions outside code and keeps the rest of each note as
+written, code spans included, apart from CRLF line endings. Notes print one section per
+`CATEGORIES` entry, by file name after those the release file's
+`## Note order` lists.
+
+Formats: a format-2 cycle also reads `changelog.d/<version>.md` and applies
+the note and release-file caps; format 1 has neither. A format-2 release body
+is the snapshot without its heading, status line and provenance comment.
+
+Commands: `preview` renders the selection. With `--working-tree` it includes
+tracked edits and untracked notes and writes local links relative to
+`docs/releases/`; with `--target` its links name the full selected commit, so
+the Markdown also works outside the checkout. `snapshot` writes
+`docs/releases/<version>.md` and the index from committed inputs and an
+explicit date. `verify` checks a committed snapshot against an audited
+revision. `index` prints or rewrites `docs/releases/README.md`. `body` prints
+the release body of a tagged snapshot. No command moves, deletes or stages a
+note.
+
+Snapshot record: a snapshot records the selected target, the base, the
+configuration digest and every note digest; format 2 also records the release
+file's digest, the previous release tag and each note's pull request number.
+The target only says where generation ran, because a squash merge can remove
+that commit. Verification reselects the inputs from the audited tree,
+requires ancestry only for the base and the legacy source, and compares the
+regenerated document byte for byte, so a later note or configuration change
+requires a new snapshot.
+"""
 
 from __future__ import annotations
 
@@ -900,10 +938,23 @@ def check_working_notes(root: Path, errors: list[str]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    index = sub.add_parser("index", help="print the release-document index")
+    index = sub.add_parser(
+        "index", help="print the release-document index",
+        description="Print docs/releases/README.md as the release documents imply it. With --write, "
+        "validate every version document, then atomically replace the index.")
     index.add_argument("--write", action="store_true", help="atomically update docs/releases/README.md")
     for command in ("preview", "snapshot"):
-        child = sub.add_parser(command)
+        child = sub.add_parser(command, **{
+            "preview": dict(
+                help="render the selected notes without writing anything",
+                description="Render the selected notes. --base, --version and --initial-release override "
+                "changelog.d/release.json for comparison runs."),
+            "snapshot": dict(
+                help="write docs/releases/<version>.md and the index from committed inputs",
+                description="Validate both outputs, then replace each file atomically. An interruption "
+                "between the two can leave a new snapshot with an old index: run snapshot again with "
+                "--replace, or index --write. A version that already has a tag is refused."),
+        }[command])
         target = child.add_mutually_exclusive_group(required=True)
         target.add_argument("--target", help="committed revision")
         if command == "preview":
@@ -912,15 +963,17 @@ def main(argv: list[str] | None = None) -> int:
         base.add_argument("--base", help="override the explicit previous release in changelog.d/release.json")
         base.add_argument("--initial-release", action="store_true", help="explicitly select all notes without a previous release")
         child.add_argument("--version", help="override the configured version")
-        child.add_argument("--date", required=command == "snapshot")
+        child.add_argument("--date", required=command == "snapshot", help="release date, YYYY-MM-DD")
         if command == "snapshot":
-            child.add_argument("--replace", action="store_true")
-            child.add_argument("--replace-legacy", action="store_true")
-    verify = sub.add_parser("verify")
-    verify.add_argument("--version", required=True)
+            child.add_argument("--replace", action="store_true",
+                               help="regenerate an existing generated snapshot whose tag does not exist")
+            child.add_argument("--replace-legacy", action="store_true",
+                               help="replace the pinned v0.12.0 migration baseline")
+    verify = sub.add_parser("verify", help="check a committed snapshot against an audited revision")
+    verify.add_argument("--version", required=True, help="release version, vMAJOR.MINOR.PATCH")
     verify.add_argument("--target", required=True, help="audited release revision")
-    body = sub.add_parser("body")
-    body.add_argument("--tag", required=True)
+    body = sub.add_parser("body", help="print the release body of a tagged snapshot")
+    body.add_argument("--tag", required=True, help="release tag; it must select --target")
     body.add_argument("--target", required=True, help="audited release revision")
     args = parser.parse_args(argv)
     try:

@@ -1,7 +1,9 @@
 //! `RankFuseExec` drains and ranks both arms by score, fused identity, and
 //! downstream row keys. `fuse_arms` sums reciprocal ranks per entity and
 //! emits every arm row with that sum in the fused score column; the `Sort`
-//! above orders and cuts (RFC 0047 §Total order).
+//! above orders and cuts (RFC 0047 §Total order). The fused score column is
+//! `<binding>._rrf` (`F64`), and a selected edge's keys place its concrete
+//! type before its id.
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;

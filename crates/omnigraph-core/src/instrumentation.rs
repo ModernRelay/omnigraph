@@ -1416,6 +1416,19 @@ pub fn record_change_image_materialized() {
 }
 
 /// One internal branch-merge timing bucket.
+///
+/// The top-level flow is `OuterPrepare`, then per table either
+/// `ProvenInsertHistory` and `ProvenInsertPlanScan` or `TableWalk`, then
+/// `CandidateValidation`, `FinalRevalidation`, `PhysicalPublish`,
+/// `ManifestPublish` and `OuterRestoreRefresh`. The route is chosen per
+/// table, so a mixed-table merge can record both route families. `TableWalk`
+/// covers one general classifier and its delta staging; for a Blob table it
+/// begins after the operation-wide descriptor preflight. `KeyedStage` and
+/// `KeyedCommit` are sub-buckets of `PhysicalPublish`. A high
+/// `ProvenInsertHistory` means the retained transaction walk dominates; a
+/// high `ProvenInsertPlanScan`, the scan of the certified source interval; a
+/// high `KeyedStage`, target lookup, join or Blob materialization; a high
+/// `ManifestPublish` with a tiny delta, manifest history or CAS retries.
 #[derive(Debug, Clone, Copy)]
 pub enum MergeTimingPhase {
     OuterPrepare,
@@ -1502,7 +1515,31 @@ struct MergeTimingCounters {
 ///
 /// Install a fresh instance with [`with_merge_write_probes`] for each measured
 /// repetition. Counters accumulate for the lifetime of this value; read a
-/// timing snapshot after the scoped future completes.
+/// timing snapshot after the scoped future completes. Production leaves the
+/// task-local unset, so timing never reads the clock.
+///
+/// The structural counters identify the data path a merge took:
+///
+/// | Route | Ordered cursors | Fenced inserts | Known-present updates | MergeInsert upserts | Strict-insert preflights |
+/// |---|---:|---:|---:|---:|---:|
+/// | Proven insertion replay | 0 | one per chunk | 0 | 0 | 0 |
+/// | Adopt with delta | 0 for lineage candidates; at least 2 for the ordered fallback | insert chunks | changed-row chunks | 0 | insert chunks |
+/// | General three-way | 0 for lineage candidates; at least 3 for the ordered fallback | insert chunks | updated-row chunks | 0 | insert chunks |
+///
+/// The columns are `ordered_cursor_scan_calls`, `stage_fenced_insert_calls`,
+/// `stage_known_present_update_calls`, `stage_merge_insert_calls` and
+/// `strict_insert_preflight_calls`. Blob descriptor selection can add cursor
+/// passes, so the fallback counts are lower bounds. A debug build's verify
+/// mode runs both classifiers; the completed-classifier counters tell it from
+/// either single route. Candidate scan-row, exact-address-take and
+/// provenance-read counters measure work the cursor counts do not. Ordered
+/// cursors on a named-target pointer adoption can be required for
+/// validation; on a main-target insert replay they mean a provenance miss.
+/// The validation projected-byte counters show what the validation sweep
+/// read, of which only key columns count toward its budget, and the Blob
+/// payload and external-probe counters isolate object cost.
+/// `stage_vector_index_calls` and `scan_staged_combined_calls` stay zero on
+/// every merge route.
 #[derive(Clone, Default)]
 pub struct MergeWriteProbes {
     pub stage_append_calls: Arc<AtomicU64>,
@@ -1790,7 +1827,10 @@ impl MergeWriteProbes {
         self.merge_timing_total_us(MergeTimingPhase::OuterRestoreRefresh)
     }
 
-    /// Snapshot all completed merge timing intervals in deterministic order.
+    /// Snapshot all completed merge timing intervals in deterministic order:
+    /// for every phase, the total, the maximum and the exact interval count,
+    /// which stays meaningful when a short interval rounds down to zero
+    /// microseconds.
     ///
     /// Take the snapshot after the [`with_merge_write_probes`] future completes.
     /// `phase` is the stable identifier: callers must match by name rather than

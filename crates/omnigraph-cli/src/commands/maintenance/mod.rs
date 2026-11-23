@@ -1,4 +1,11 @@
-//! Direct graph maintenance through the existing admission and engine owners.
+//! Graph maintenance through the existing admission and engine owners:
+//! `optimize` (direct, or served as a recorded operation), index build and
+//! rebuild, full-text included, `cleanup` and the storage upgrade.
+//!
+//! Output delivery failures stay in application completion. Cleanup keeps its
+//! preview and consent before write admission; rebuild keeps its actor and
+//! branch. These commands do not use the data-write outcome envelope and never
+//! replay an operation after a delivery failure.
 
 use std::io::Write;
 

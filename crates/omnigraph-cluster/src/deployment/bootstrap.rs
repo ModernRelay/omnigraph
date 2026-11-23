@@ -1,5 +1,22 @@
 //! A single initial policy deployment with no graph/native-I/O effects.
 //! The retained lock is transferred by CAS, never removed or reconstructed.
+//!
+//! This is the one exception to exact-ID unlock, for a fresh S3 cluster with
+//! zero graphs. `bootstrap_serving` runs only the initial cluster-scoped policy
+//! deployment under a private retained lock, opens no graph, and returns a
+//! receipt of at most `MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES` bound to the exact
+//! root, input, native ledger and result, state CAS and original lock
+//! version. Native authority, graph or recovery residue refuses
+//! initialization; unrelated opaque metadata grants no authority.
+//! `claim_bootstrap_serving` validates those bindings and replaces that same
+//! lock version, by CAS, with a new process-owned serving lock before it
+//! captures the empty serving snapshot. Errors, cancellation and lost
+//! responses keep exclusion. State updates already issued use spent CAS
+//! predecessors, so a retried immutable payload cannot change the achieved
+//! input. Later serving owners use clean release, never a replay of the
+//! bootstrap receipt, and the S3 lock key stays present across release and
+//! acquisition, so an old bootstrap create cannot recreate its owner. This is
+//! not native-I/O settlement or expiry-based takeover.
 
 use super::*;
 use crate::admission::ClusterAdmission;

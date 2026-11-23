@@ -1,5 +1,8 @@
 //! Parse one invocation without reading configuration, credentials or command inputs.
 //! Routing and execution remain with their existing owners.
+//!
+//! This module owns command construction, the provenance of explicitly given
+//! arguments and validation of arguments that span command levels.
 
 use std::ffi::OsString;
 use std::path::PathBuf;

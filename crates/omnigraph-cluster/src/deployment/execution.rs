@@ -1,3 +1,19 @@
+//! Deployment execution: acceptance, per-graph invocation, settlement and
+//! recovery of the v2 ledger.
+//!
+//! A graph-birth claim binds the canonical root, the exact source and IR
+//! contract and the genesis identity, and reconciliation accepts only that
+//! birth, never matching text. Under explicit prior-owner quiescence,
+//! settlement may abandon an exact owned, unpublished, empty birth and leave a
+//! successor free to create a new identity. Graph creation records its
+//! authenticated initiator in the deployment result; engine genesis stays
+//! actorless, and later schema commits record their actor in the engine
+//! receipt. Foreign, committed or advanced roots are kept and refused. The
+//! durable claim remains until cleanup completes, and interrupted cleanup
+//! resumes. A later creation may reuse a bounded empty local directory tree
+//! that cleanup left, with engine preparation still proving an empty target;
+//! files, symlinks and cloud markers refuse.
+
 use super::*;
 use crate::authorization::AppliedPolicies;
 use omnigraph_policy::PolicyAction;
@@ -368,6 +384,15 @@ async fn capture_applied_graph_contracts(
 
 /// Data-preserving ledger conversion, independent of mutable configuration.
 /// `writers_stopped` attests external exclusion and settled prior control I/O.
+///
+/// It converts a v1 cluster to v2 keeping its resources, identities and
+/// history, without resetting graphs or migrating their storage format. On a
+/// v2 ledger it removes obsolete runtime fields from completed receipts after
+/// validating their prior shape, keeping ledger identity, deployment sequence,
+/// exact outcomes and applied resources, in one conditional replacement.
+/// Ordinary decoding runs the same validation only to report
+/// `ledger_upgrade_required`; malformed or unknown state stays invalid, and
+/// outstanding work must finish under the build that accepted it.
 pub async fn upgrade_deployment_ledger(
     root: &str,
     writers_stopped: bool,

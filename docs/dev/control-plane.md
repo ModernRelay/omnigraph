@@ -12,15 +12,9 @@ The cluster control plane turns a local declarative bundle into a durable applie
 
 ## Authority model
 
-Server telemetry is separate from deployment authority. The optional OTLP
-subscriber exports an explicit span allowlist with W3C request context; it
-does not export arbitrary dependency spans or protocol payloads. Owned reads
-and writes carry child spans through their existing process-owned futures.
-Exporter loss or shutdown does not alter native admission, publication, recovery
-or clean-exit evidence. JSON logs use the same restricted dependency-target
-filter as text logs. Configuration is in the
-[observability guide](../user/operations/observability.md); telemetry and log-filter
-unit tests own context propagation, redaction and the actual OTLP transport.
+Server telemetry is separate from deployment authority; its export rules are
+the module doc of `crates/omnigraph-server/src/telemetry.rs`, and its
+configuration is in the [observability guide](../user/operations/observability.md).
 
 There are three distinct views:
 
@@ -42,48 +36,16 @@ existing configuration-owned root selection.
 
 ## Managed CLI sessions
 
-A profile owns API, organization and one auth provider for one identity. A managed
-target references it and pins cluster identity/incarnation plus an optional data
-endpoint. Whole-document structural validation precedes selected credential and
-runtime capability checks. Registration consumes authenticated endpoint attestation;
-refresh verifies unchanged incarnation and never synthesizes a route. This does
-not qualify BYOC private routing. See the [operator reference](../user/cli/targets.md)
-and [decision](../decisions/2026-10-20-operator-connections-and-credential-providers.md).
-
-Pending/accepted lifecycle evidence remains separate from configuration and
-credential custody. Preserve it across removal, logout and upgrade. Retiring the
-old grammar does not authorize discarding unresolved work or replaying it under
-a new identity. `config recover-operations --source DIR --profile NAME`
-preserves matching legacy folder evidence without accepting old configuration
-or submitting remote operations; `managed::lifecycle::pending` (in `omnigraph-cli`) owns that copy/retire
-protocol.
-
-The CLI's managed HTTP adapter obtains current access before each new request,
-including status polls. A rotating credential pair lives only in the OS
-keychain, independently of configuration directories and graph credentials.
-Profile-scoped coordination and a persisted pending marker prevent duplicate
-client exchanges; the provider owns credential rotation and session authority.
-The API verifies provider access and maps it to a stable principal. An uncertain
-exchange never authorizes a write replay.
-The protocol and cache compatibility boundaries are specified in
-[the identity and applied-policy RFC](../decisions/2026-09-09-identity-credentials-and-applied-policy.md); user behavior and limits
-are in the [CLI reference](../user/cli/reference.md#managed-cluster-commands).
-
-Ordinary managed deployment uses immutable `/plans` previews and scoped
-`/deployments` delivery, separate from cloud lifecycle operations. The adapter
-freezes a resolved source head before preview and sends a preview ID exactly
-once for delivery. Polling observes the original product/native IDs and never
-resubmits a write. Native execution, runtime activation and result archival
-remain distinct facts; a saved result alone cannot prove an active runtime.
-Cancellation targets only the initiating caller's unattempted queued delivery.
-
-Read-only cluster member discovery uses the same selected organization and
-authenticated adapter. It requires cluster `status` permission and validates the
-response's cluster identity and bounded member records before rendering. The
-directory reports explicit enrollment and cluster-specific control grants;
-provider profile metadata is optional and applied Cedar remains the authority
-for graph operations. The `cli_cluster` transport fixture owns the command's
-scope, response validation and refusal tests.
+Managed profiles, targets, lifecycle custody, credential rotation, managed
+deployment delivery and member discovery are the module docs of
+`crates/omnigraph-cli/src/managed.rs` and its `managed/` submodules
+(`lifecycle/pending.rs`, `auth/coordination.rs`, `deployment.rs`,
+`members.rs`). User behavior and limits are in the
+[CLI reference](../user/cli/reference.md#managed-cluster-commands) and the
+[operator reference](../user/cli/targets.md); the reasons in the
+[operator connections](../decisions/2026-10-20-operator-connections-and-credential-providers.md)
+and [identity](../decisions/2026-09-09-identity-credentials-and-applied-policy.md)
+records.
 
 ## Durable layout
 
@@ -105,51 +67,21 @@ in one outstanding record.
 
 ## Operation record
 
-`__cluster/operations.json` (`omnigraph_cluster::OperationRecord`) is
-described by the doc comments of `crates/omnigraph-cluster/src/operations.rs`
-and `crates/omnigraph-server/src/recorded_operations.rs`. It names the
-cluster's ledger id; a record naming another ledger is refused with
-`operation_record_foreign` and never merged. The record gate is
-`ClusterAdmission::lock_operations` and `update_operations` (read, apply, one
-conditional put). The optimize run's before-publish write (`publishing`)
-carries the intent nonce, the input head and the per-table outcomes. A write
-with no definite answer (`OperationWrite::InDoubt`) stops the run's writes;
-the server's next admission or lookup reads the record back and re-applies a
-run's final change, kept per operation id until a write applies it or the record settled the run another way, to the record as it then stands. A write the store or the process's storage scope refuses is a definite `Refused` outcome (503, nothing accepted), distinct from one with no answer (`InDoubt`, 500 `outcome_unknown`): a scope keeps refusing a key whose earlier request is unsettled until the server is replaced. An `accepted` or `running` operation no live run holds becomes
-`interrupted`, and a `publishing` one joins at most four unresolved
-operations, settled by `Omnigraph::resolve_publication` once the settlement
-branch's graph head moves: one page of the branch's first-parent chain per
-attempt (`OMNIGRAPH_OPERATION_RESOLUTION_WALK_LIMIT`), the page's unvisited
-parent kept as the record's cursor, until the input head's child answers the
-nonce or proves the run did not commit. A lost terminal write is re-issued
-first. Terminal records are bounded by the deployment receipts' values; the
-newest evicted id's ULID time is the eviction mark, and an id at or before it
-is refused; an id dated more than `MAX_OPERATION_ID_LEAD_MS` ahead of the
-server's clock is refused too, since once evicted it would set the mark for
-everyone. A retained id answers before either check. A graph deletion settles the lifetime's non-terminal records in
-`complete_graph_deletion`: by the history rule while the root answers, and as
-`unsettled` (`graph_deleted`) once its absence is verified. The server side
-is `crates/omnigraph-server/src/recorded_operations.rs`: one admission gate
-per scope, taken by the handler and held by the owned operation that writes
-the acceptance as its first step, and cancellation on shutdown and before a
-deployment's drain of the graph.
+`__cluster/operations.json` (`omnigraph_cluster::OperationRecord`) holds
+recorded operations such as served `optimize`. Its states, admission order,
+bounds, eviction mark and settlement by history are the doc comments of
+`crates/omnigraph-cluster/src/operations.rs`, and the server's single writer,
+gates and cancellation those of `crates/omnigraph-server/src/recorded_operations.rs`.
+A graph deletion settles the lifetime's non-terminal records in
+`complete_graph_deletion` (`OperationRecord::settle_graph_deleted`).
 
 ## Deployment ledger
 
-`deployment.rs` and `deployment/execution.rs` own the sole v2 protocol. Fresh
-apply bootstraps v2 directly; explicit stopped-writer conversion preserves an
-existing v1 cluster's resources, identities and history. Conversion neither
-resets graphs nor migrates their storage format. Unknown versions and
-`state.lock: false` refuse. There is no offline/online mode field and no legacy
-apply, import, refresh or approval executor.
-
-The same explicit `cluster upgrade-ledger --writers-stopped` path removes
-obsolete runtime fields from completed v2 receipts after validating their prior
-shape and consistency. It preserves ledger identity, deployment sequence, exact
-outcomes and applied resources with one conditional replacement. Normal decoding
-uses that same validation to report `ledger_upgrade_required` for a recognized
-prior receipt, never to accept converted state. Malformed or unknown state stays
-invalid; outstanding work must finish under its originating build.
+`deployment.rs` and `deployment/execution.rs` own the sole v2 protocol.
+Unknown versions and `state.lock: false` refuse. There is no offline/online
+mode field and no legacy apply, import, refresh or approval executor. Ledger
+conversion and `cluster upgrade-ledger --writers-stopped` are documented on
+`upgrade_deployment_ledger` in `crates/omnigraph-cluster/src/deployment/execution.rs`.
 
 Apply manages graphs, schemas, queries, policies and provider/Blob bindings.
 Runtime changes are validated before effects and activated with the achieved
@@ -160,12 +92,8 @@ references or delete peer roots. Adoption, missing-root recreation and catalog
 repair refuse. Supported storage formats and the HTTP contract version are in
 [versioning](versioning.md).
 
-The applied revision and every achieved base retain each graph's exact source/IR
-digests and identity domain/version, captured coherently during conversion and
-advanced by successful schema outcomes. Serving and preparation of every affected graph compare
-this identity even after receipt eviction, rejecting a recreated graph with
-identical schema text. Unaffected graph opens are skipped. Ordinary apply never
-adopts foreign schema identity as an implicit correction.
+Schema identity retention across receipts is the module doc of
+`crates/omnigraph-cluster/src/deployment.rs`.
 
 Config capture reads each source once, preserving exact bytes by digest.
 Immutable bundles and prepared engine intents are bounded before acceptance,
@@ -204,18 +132,8 @@ Completion requires verified root absence before a `Deleted` outcome removes
 the graph's applied resources and contract. A lost completion acknowledgement is
 reconciled by original ID. There is no deletion queue, side record or retained-owner pool, and matching source text never authorizes a replacement root.
 
-A graph-birth token binds canonical root, exact source/IR contract and genesis
-identity. Reconciliation accepts only that birth, not matching text. Under
-explicit prior-owner quiescence, settlement may abandon an exact owned,
-unpublished empty birth and leave a successor free to create a new identity.
-Graph creation records its authenticated initiator in the deployment result;
-engine genesis retains its existing actorless initialization contract. Later
-schema commits record the actor in their engine receipt.
-Foreign, committed or advanced roots are preserved and refused. The durable
-claim remains until cleanup completes; interrupted cleanup is resumable.
-A later creation may reuse a bounded empty local directory tree left by cleanup,
-with engine preparation still proving an empty target. Files, symlinks and cloud
-markers refuse; this does not adopt existing graph contents.
+The graph-birth claim and its cleanup are the module doc of
+`crates/omnigraph-cluster/src/deployment/execution.rs`.
 
 Terminal results advance only the achieved resources. Partial convergence is a
 valid base for a corrective successor under the same owner or after a qualified
@@ -225,14 +143,9 @@ single-live-branch restriction. Older completed receipts may expire, but consume
 sequences never execute again; after eviction even acceptance of a requested
 nonce is unknown. Applied result revision is distinct from server activation.
 
-`DeploymentCaller` preserves the storage-owner trust boundary and an optional
-actor label. Authenticated identity callers recheck current cluster
-`ConfigManage`; schema effects/recovery additionally require affected graph
-`Read` and `SchemaApply`. Deployment status and results expose management metadata
-under `ConfigManage`, without requiring data access on unrelated graphs.
-Original authority stays immutable; recovery records the current executor while
-preserving the authored engine receipt. The accepted
-[server runtime RFC](../decisions/2026-09-29-server-runtime-and-online-deployment.md)
+Caller authority is documented on `DeploymentCaller` in
+`crates/omnigraph-cluster/src/deployment.rs`. The
+[server runtime decision](../decisions/2026-09-29-server-runtime-and-online-deployment.md)
 owns the protocol rationale and qualification limits.
 
 ## Concurrency
@@ -268,22 +181,9 @@ doors remain operator-excluded across outstanding work and recovery. No tags or
 additional retention store protect deployment evidence, and the executor never
 runs cleanup.
 
-Fresh S3 initialization has one narrower exception to exact-ID unlock:
-`bootstrap_serving` executes only the initial cluster-scoped policy deployment
-under a private retained bootstrap lock. It opens no graphs and returns a strict
-16 KiB maximum receipt bound to the exact root, input, native ledger/result,
-state CAS and original lock version. Native authority, graph or recovery
-residue refuses initialization; unrelated opaque metadata grants no authority.
-`claim_bootstrap_serving` validates those bindings and conditionally replaces
-that same lock version with a new process-owned serving lock before capturing
-the empty serving snapshot. It never deletes the lock or adopts an earlier
-claim after an uncertain acknowledgement. Errors, cancellation and lost
-responses retain exclusion. Already-issued bootstrap state updates use spent
-CAS predecessors; immutable payload retries cannot alter achieved input. This
-is only fresh zero-graph bootstrap, not native-I/O settlement or expiry-based
-takeover. Later serving owners use clean release rather than replaying the
-bootstrap receipt. The S3 lock key remains continuously present across normal
-release and acquisition, so an older bootstrap create cannot recreate its owner.
+Fresh S3 initialization is the one exception to exact-ID unlock; the
+bootstrap receipt and its claim are the module doc of
+`crates/omnigraph-cluster/src/deployment/bootstrap.rs`.
 
 Clean native shutdown closes logical admission, drains its existing operation
 owners, then closes and drains an explicit `StorageIoScope` shared by control
@@ -330,16 +230,10 @@ direct file writes cannot bypass the scope. Embedded defaults and Azure
 serving clients are not scoped; the automatic scoped shutdown path applies
 only to local and S3 roots.
 
-Only unique admission, successful startup and no unsettled key permit final
-release. Original adapters remain permanently closed; a private single-attempt
-client performs only exact-owner lock release under the same shutdown deadline.
-S3 release CAS writes a unique version-2 released marker at the existing key;
-ordinary acquisition CAS replaces it with a fresh held owner. Lost release
-acknowledgement is an error, while its delayed CAS cannot affect a successor.
-Local release uses awaited exact-owner deletion; automatic Azure release remains
-unqualified, and Azure shutdown retains the lock. Older
-tools refuse the new released record. This supplies neither
-distributed fencing nor generic runtime reuse.
+Final lock release is documented on `ClusterAdmission::release_after_settlement`
+(`admission.rs`) and `release_settled_lock` (`state_lock.rs`) in
+`crates/omnigraph-cluster/src/`. Automatic Azure release remains unqualified,
+and Azure shutdown retains the lock.
 
 On S3 roots a server's held lock is version 3 and carries `lease_seconds`;
 the heartbeat, self-fence, watch, claim and if-match takeover protocol is the
@@ -514,47 +408,16 @@ consume only read observers. Once HTTP connections and the remaining known
 logical owners finish, uncertain completion exits 2 immediately, with the original
 watchdog as the upper bound. This does not establish native-I/O settlement.
 
-Served export and baseline transport divide each existing process reservation
-into three outstanding frame credits and one sequential producer slot. The
-`Bytes` owner holds its payload, frame credit and process lease through the last
-clone or slice. Both routes share this sender; the baseline terminal record is
-encoded into one bounded pending chunk only after snapshot production succeeds.
-Only initial process-capacity admission has a short timeout. An admitted
-producer waits for a frame credit or response closure, including the terminal
-baseline cursor. Slow readers retain their bounded reservation until delivery
-or disconnect; no short per-frame deadline truncates a valid stream. A producer
-hands its failure to the sender, which ends the body with a constant error and
-logs the failure's class, never its message: the HTTP trace layer logs a body
-error's text, and an engine message can hold object URIs or credentials.
+Served export and baseline bodies use the bounded transport of
+`crates/omnigraph-server/src/export_transport.rs`.
 [Deployment limits](../user/deployment.md#admission-limits) distinguish this
 transport allowance from engine encoding and native memory.
 
 A same-view transition can close one graph while other graphs keep serving.
-Preparation reserves bounded transition capacity before closing admission.
-Its graph lease follows body collection, owned execution, producers, retained
-results and yielded transport bytes; disconnect or MCP response expiry cannot
-release surviving owners. After those logical owners finish, the transition
-can resume only the exact existing engine, schema, queries and fixed bindings
-under a fresh epoch. Close, resume and shutdown share a synchronous ordering
-boundary. Expiry or an abandoned closed transition leaves that graph unavailable;
-there is no automatic reopen or retry. Only its scheduling record is retired,
-so other ready graphs can transition. The closed registry entry and descendants
-retain the engine and resource charges; no native disposal or lock release is
-implied. Bounded inventory limits retained closed views, and obsolete tickets
-cannot affect a subsequent candidate. Status reports `transitioning` with
-`wait_for_transition`, without a finite `Retry-After` promise.
-
-The embedding entry point is `AppState::prepare_same_view`. It binds the actual
-process runtime; callers cannot substitute a new runtime to bypass stopping.
-It grants no schema/query replacement or deployment authority. The internal
-batch capability used by `deployment.rs` validates exact achieved schema/query
-bindings, graph additions and completed graph deletions under the same
-shutdown/attempt fence. Inventory removal requires an exact durable `Deleted`
-result for a graph closed by this transition; it is installed atomically with
-surviving bindings and management policy. There is no retired-owner cache,
-readoption path, root-recreation shortcut or public arbitrary-view replacement
-endpoint. Interrupted deletion keeps affected admissions closed; it never
-restores a partially deleted predecessor.
+Its leases, resume and expiry rules are the module doc of
+`crates/omnigraph-server/src/registry.rs`; the embedding entry point is
+`AppState::prepare_same_view`, and deployment inventory removal is
+`GraphRegistry::activate_deployment`.
 
 These registrations account for server lifetimes, not universal storage-I/O
 settlement. A joined future or zero operation counter cannot authorize runtime
@@ -569,35 +432,15 @@ owns admission limits.
 
 ### Public embedding APIs
 
-Ordinary callers use `read_serving_snapshot` or
-`read_serving_snapshot_from_storage`, `load_server_settings`, and `serve`.
-`ServingSnapshot` and `ServerConfig` contain their ordinary public fields;
-trust-disabled boot does not add root canonicalization solely for signed
-credentials.
-
-V2 serving acquires lifetime admission before reading its boot snapshot and
-opening graphs. Settings retain that opaque ownership in `ServerConfig`; a
-hand-built configuration cannot use a deployment/reconciliation capability as
-serving authority. Read-only snapshot APIs alone do not grant serving admission.
-
-Managed callers use `read_root_bound_serving_snapshot` or its `_from_storage`
-counterpart to obtain an opaque `RootBoundServingSnapshot`. Its snapshot and
-canonical-root accessors refer to the same opened store. Do not reconstruct
-that binding by reopening a caller-supplied path. Server embedders use
-`load_server_settings_with_data_token_trust` and
-`serve_with_data_token_trust`; `ManagedServerConfig` keeps the configuration
-and validated trust together. `with_shutdown_grace` changes only the shutdown
-bound. A failed managed load must not be retried through ordinary `serve`.
-The binary's `--data-token-trust FILE` selects this managed path.
-
-`ResolvedActor` is a public identity projection, not proof of authentication.
-Middleware and protected handlers retain `AuthenticatedActor`, whose private
-state carries verified claims. `DataTokenTrust::verify_at`
-returns the identity projection for existing callers;
-`verify_authenticated_at` returns the opaque authenticated result used by the
-server. Public actor construction cannot grant signed-token permissions.
-`IdentityTokenClaims` is the strict signed identity type; its read-only accessor
-on `AuthenticatedActor` exposes only verified claims.
+The embedding entry points are documented on the items themselves:
+`read_serving_snapshot`, `read_root_bound_serving_snapshot` and
+`RootBoundServingSnapshot` in `crates/omnigraph-cluster/src/serve.rs`;
+`load_server_settings` and `load_server_settings_with_data_token_trust` in
+`crates/omnigraph-server/src/settings.rs`; `ServerConfig`,
+`ManagedServerConfig`, `serve_with_data_token_trust` and
+`AppState::with_data_token_trust` in `crates/omnigraph-server/src/lib.rs`;
+`DataTokenTrust::verify_at` and `verify_authenticated_at` in `data_tokens.rs`;
+`ResolvedActor` and `AuthenticatedActor` in `identity.rs`.
 
 Policy embedders must handle `PolicyAction::ConfigManage`,
 `PolicyAction::Maintain`, `PolicyAction::Reclaim`,
@@ -606,17 +449,13 @@ enums are exhaustive, so an external exhaustive match must add the relevant
 arm when upgrading. Preserving existing constructors and direct storage-holder
 behavior does not remove that source compatibility requirement.
 
-In-process hosts that assemble `AppState` and call its existing
-`with_data_token_trust` method continue to own their graph/root binding. Use
-the managed settings loader when the library should validate the applied
-snapshot and trust binding together.
-
 ## Azure boundary
 
 `az://container/prefix` uses the same control-object and graph-root model as
 local and S3 storage. Azure writes are a preview (`G4`).
 
-Every mutation-capable Azure server, apply job, direct writer, and maintenance process must run through `omnigraph-azure-admission`. The admission crate may depend downward on shared storage; storage, engine, cluster, server, and CLI must not depend upward on it.
+Every mutation-capable Azure process runs through `omnigraph-azure-admission`;
+its dependency rule is the crate doc of `crates/omnigraph-azure-admission/src/lib.rs`.
 
 ## Support boundaries
 

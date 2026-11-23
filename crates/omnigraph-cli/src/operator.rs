@@ -1,4 +1,9 @@
 //! One captured operator configuration per invocation.
+//!
+//! `InvocationConfig` captures the operator home once and reads the strict
+//! versioned configuration lazily, at its first consumer. Every consumer of
+//! the invocation shares that one result, a failed load included. Repository
+//! or folder state never selects the configuration.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -85,6 +90,7 @@ pub(crate) fn operator_dir() -> Option<PathBuf> {
     env::home_dir().map(|home| home.join(OPERATOR_DIR))
 }
 
+/// The operator home and its configuration, captured once per invocation.
 #[derive(Debug)]
 pub(crate) struct InvocationConfig {
     directory: Option<PathBuf>,

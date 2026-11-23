@@ -30,7 +30,7 @@ Each has one home below. A fact has one owner; every other page cites it.
 |---|---|---|---|---|
 | Contract | [contract.md](contract.md) | What each operation promises its caller: the target, the gaps and the open decisions | Every session | 53,000 bytes |
 | Work | [workload.md](workload.md) | What the system is optimized for, and the evidence | On demand | 36,000 bytes |
-| Rules | [invariants.md](invariants.md) | What an implementation must never do, each with its reason | Every session | 11,500 bytes |
+| Rules | [invariants.md](invariants.md) | What an implementation must never do, each with its reason | Every session | 11,000 bytes |
 | Map | [`AGENTS.md`](../../AGENTS.md) | Which crate owns what, which page to read, the commands and the change discipline | Every session | 14,000 bytes |
 | Decision | [`docs/decisions/`](../decisions/README.md) | Why one design was chosen and what was rejected | On demand | 5,000 bytes each |
 | Testing rules | [testing.md](testing.md) | Where a test goes and the rules for adding one | Every session | 7,500 bytes |
@@ -39,8 +39,7 @@ Each has one home below. A fact has one owner; every other page cites it.
 | Release note | `changelog.d/`, `docs/releases/` | What changed for a user, written with the change | By users | see [Release notes](#release-notes) |
 
 `scripts/check-docs.py` holds the budgets and fails a page that passes its
-own. A guide over the guide budget has its own ceiling there, which only
-goes down. A page over budget is split by owner or cut; a budget is raised only in
+own. A page over budget is split by owner or cut; a budget is raised only in
 a pull request whose description says what the page could not lose.
 
 Nothing else is kept:
@@ -195,15 +194,8 @@ and links the guide that holds the steps, usually the
 [upgrade guide](../user/operations/upgrade.md). Review the note with its code.
 There is no separate release-note approver.
 
-| Suffix | Section |
-|---|---|
-| `breaking` | Upgrade actions: who is affected and what to do |
-| `added` | Features |
-| `changed` | Behavior changes |
-| `fixed` | Fixes |
-| `performance` | Performance |
-| `deprecated` | Deprecations |
-| `removed` | Removals |
+The suffix names the release-page section, as `CATEGORIES` in
+`scripts/release_notes.py` maps it (`breaking` prints as Upgrade actions).
 
 Local links use reference definitions; `scripts/release_notes.py` refuses
 every other note shape with a message that names the fix:
@@ -214,10 +206,7 @@ every other note shape with a message that names the fix:
 [predicate-guide]: ../docs/user/queries/index.md
 ```
 
-Inline external URLs are allowed. Code spans stay intact and follow
-CommonMark, including literal unmatched backticks and backslashes. The
-composer only rewrites link definitions outside code, preserving the rest of
-each fragment apart from normalizing CRLF line endings to LF.
+Inline external URLs are allowed.
 
 ### The release file
 
@@ -294,7 +283,9 @@ page's pull request links come from.
 
 ### Preview, snapshot and publication
 
-Preview local edits and untracked notes from the repository root after
+`python3 scripts/release_notes.py --help`, and each command's `--help`, say
+what the script selects, checks and records. Preview local edits and
+untracked notes from the repository root after
 [activating the documentation environment](#documentation-tools):
 
 ```bash
@@ -302,66 +293,29 @@ python3 scripts/release_notes.py preview --working-tree
 python3 scripts/check-docs.py
 ```
 
-Working previews have local links relative to `docs/releases/`; save them there
-temporarily if viewing in a Markdown reader. For a committed preview, use
-`preview --target HEAD`. Its links point to the full selected Git SHA, so the
-downloaded Markdown also works outside the checkout. The existing documentation
-CI job uploads this output as `release-notes-preview`; no generated preview is
-checked in and no bot comment is needed.
-
-`changelog.d/release.json` names the next `version`, the previous release `base`
-for that maintenance line, an optional `legacy` baseline SHA and the cycle's
-release `format` (`2`, or `1` when the field is absent). These are
-explicit inputs, not inferred from the newest tag. The selected notes are paths
-present in the target tree and absent from the base tree. Content comes from
-the target; category and filename ordering are deterministic.
+For a committed preview, use `preview --target HEAD`. The existing
+documentation CI job uploads this output as `release-notes-preview`; no
+generated preview is checked in and no bot comment is needed.
 
 An unreleased note can be edited or removed with a reverted change. Once a
-release includes it, a correction or reversal gets a new note. A backport carries the same path and uses that branch's previous
-release. CRLF and LF checkouts have the same identity; other content changes do
-not. The checker validates selected notes' links against the selected tree;
-historical raw notes are not checked against today's moving documentation.
+release includes it, a correction or reversal gets a new note. A backport
+carries the same path and uses that branch's previous release.
 
-With the documentation environment active and `changelog.d/<version>.md`
-written, release preparation creates a versioned snapshot and updates `docs/releases/README.md` from committed inputs
-and an explicit date:
+With `changelog.d/<version>.md` written, release preparation creates the
+versioned snapshot and updates `docs/releases/README.md`. Replace the example
+date with the intended release date:
 
 ```bash
 python3 scripts/release_notes.py snapshot --target HEAD --date 2026-10-01
 ```
 
-Replace the example date with the intended release date. `--replace` regenerates an existing
-generated snapshot before its tag exists. Nothing moves, deletes or stages
-fragments. Preview accepts `--base REF`, `--version vX.Y.Z` and
-`--initial-release` for comparison runs. Configuration itself remains part of the recorded inputs.
-
-The snapshot records the selected target SHA, base SHA and note digests. The
-target SHA documents where generation ran; squash merging may remove that
-commit. Validation compares the complete selected note set and digests,
-configuration, and regenerated document against the audited release tree. It
-requires ancestry only for the durable release base and legacy source. Any later
-note or configuration change requires regeneration. Format-2 snapshots also
-record the release file's digest, the previous release tag and
-the pull request link of each note; a recorded link must still match history
-when the release is verified. Verify a prepared committed
-snapshot with the documentation environment active:
+Verify a prepared committed snapshot, and repair only the index (also after a
+version is tagged):
 
 ```bash
 python3 scripts/release_notes.py verify --version v0.12.0 --target HEAD
-```
-
-Snapshot creation validates both outputs before writing and replaces each file
-atomically. An interruption between replacements can leave a current snapshot
-with an old index; retry with `--replace`. The checker detects a stale index.
-To repair only the index, including after a version is tagged, activate the
-documentation environment and run:
-
-```bash
 python3 scripts/release_notes.py index --write
 ```
-
-Without `--write`, the index command only prints its result. With `--write`, it
-validates the version documents before atomically replacing the existing index.
 
 The stable publisher validates the snapshot from its audited checkout and renders
 its local links at the release tag. Versions before v0.12.0 retain asset-only
@@ -373,13 +327,6 @@ to the release just published, advance the version, set `legacy` to `null` and
 keep `"format": 2`.
 Advance the workspace package version too: edge builds are refused while it is
 not above the latest stable release ([release workflows](ci.md#release-workflows)).
-
-Each snapshot records its format. The snapshots of v0.12.0 through v0.14.0 are
-format 1 and keep that shape; every later cycle is format 2. A format-2 GitHub
-release body is the snapshot without its heading, status line and provenance
-comment. The length caps and
-the release file apply only to a format-2 cycle. Generated snapshots require
-exact verification, and existing published documents and URLs stay unchanged.
 
 ### Release overviews
 

@@ -976,6 +976,18 @@ fn sanitize_table_key(table_key: &str) -> String {
 
 /// Try to prove that `(base, source]` contains only exact-id fenced inserts.
 ///
+/// The walk follows the source's chain one `read_version` link at a time,
+/// reading each version's transaction record and opening its parent, within
+/// `PURE_INSERT_HISTORY_MAX_VERSIONS`. Every version must be present and
+/// prove one exact previous-version link and transaction UUID; an
+/// insertion-only filtered `Update` over exactly the physical id carrying the
+/// `insert_absence` certificate, or an index-only commit, which moves no row
+/// and is crossed as a link; no removed or updated fragment and no unrelated
+/// maintenance effect; complete nested schema and index-coverage metadata;
+/// and physical-row totals matching the manifest delta. The source and
+/// target native branch incarnations are checked again under the final
+/// gates.
+///
 /// Missing/cleaned transaction files and every unfamiliar operation are a
 /// normal miss: the caller falls back to the general ordered row diff.  Once a
 /// proof is returned, however, later scan/count mismatches fail closed rather
@@ -3400,6 +3412,14 @@ fn classify_merge_conflict(
 /// meet) does not move it. It applies to the whole delta since the merge
 /// base, however the source's commits were chunked; a larger delta merges in
 /// stages, through a branch at an intermediate source commit merged first.
+///
+/// The kept columns are `Sweep::fact_columns`, each copied out of its batch
+/// (`copy_batch_range`), so a kept column never pins a decode buffer another
+/// batch shares. Crossing `MERGE_VALIDATION_MAX_BYTES` refuses the merge as
+/// the resource `MERGE_VALIDATION_RESOURCE`. Each fact copies its key into
+/// an owned string and hash entries of its own, so a short id costs about
+/// ten times its bytes; the other staged routes leave the same facts
+/// unaccounted.
 #[derive(Debug)]
 struct MergeValidationBudget {
     retained_bytes: u64,

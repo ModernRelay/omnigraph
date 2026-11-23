@@ -1,5 +1,5 @@
-//! Phase-5 serving snapshot: the read-only loader a `--cluster` server
-//! boots from (moved verbatim from lib.rs in the modularization).
+//! The serving snapshot: the read-only loader a `--cluster` server boots
+//! from.
 
 use super::*;
 use crate::config::storage_root_conflict_code;
@@ -89,6 +89,7 @@ impl ServingSnapshot {
 }
 
 /// A serving snapshot paired with the canonical root of the same opened store.
+/// Do not reconstruct the pair by reopening a caller-supplied path.
 ///
 /// The binding is read-only metadata for managed boot trust, not a writer fence
 /// or a guarantee that the ledger has not changed since this snapshot was read.

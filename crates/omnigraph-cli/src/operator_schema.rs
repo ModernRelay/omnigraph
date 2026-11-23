@@ -1,3 +1,8 @@
+//! The operator file's strict `version: 1` grammar and whole-document
+//! validation, cross-references included. The published JSON Schema
+//! (`docs/user/cli/operator-config.schema.json`) is a related contract, not a
+//! substitute for that cross-reference validation.
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};

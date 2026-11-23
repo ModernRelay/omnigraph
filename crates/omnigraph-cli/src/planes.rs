@@ -1,5 +1,10 @@
 //! Operation applicability for the single target resolver.
 //! This exhaustive command match owns backend availability before credentials or I/O.
+//!
+//! It refuses unsupported command and backend combinations. A graph is
+//! selected explicitly or by the target's `default_graph`; discovery never
+//! selects one. Local tooling ignores defaults and refuses routing flags that
+//! do not apply to it. Diagnostics go to stderr.
 
 use crate::cli::*;
 use crate::targets::{ResolvedTarget, TargetBinding};
@@ -183,7 +188,7 @@ pub(crate) fn root_input(command: &Command) -> bool {
 
 /// The commands that may name an `s3://` cluster root inline: stopped-writer
 /// deployment and recovery, and the direct maintenance commands. A cluster
-/// whose server is down has no served route for any of them (#1163, #1082).
+/// whose server is down has no served route for any of them.
 /// Every other command reaches cloud storage through a server.
 pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
     matches!(

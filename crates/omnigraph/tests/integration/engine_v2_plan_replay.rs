@@ -3,6 +3,15 @@
 //! report's `drained` mark, which no query result shows. One plan per
 //! switch-bearing node kind, one overfetch ladder, the skip shapes, a bound
 //! `now()`, the pins, and the row-count rule.
+//!
+//! Each test gathers one query through `Session::query_inspected`, writes the
+//! run's replay envelope (`Executed::replay_envelope`), reads it back (the plan
+//! must read back equal), and executes it twice through
+//! `Session::replay_bound_plan`. That door recompiles the named query against
+//! the target's catalog, binds it to the plan's own values, accepts the plan
+//! again and takes no session setting. The file also owns the refusal of an
+//! altered result schema and of a missing, duplicate, unused or altered
+//! node-object declaration.
 
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};

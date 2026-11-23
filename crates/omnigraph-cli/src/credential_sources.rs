@@ -1,3 +1,15 @@
+//! Bounded token sources (at most `MAX_CREDENTIAL_BYTES`) and the exec
+//! protocol.
+//!
+//! A provider acquires a credential for a destination already frozen by the
+//! resolver; it cannot return routing authority. Managed acquisition exchanges
+//! control access for a verified cluster-bound data credential before the
+//! common served `GraphClient` is built, so no control credential reaches a
+//! graph endpoint. An acquired credential keeps its typed binding and expiry
+//! through client construction; HTTP dispatch checks the expiry after public
+//! discovery and before it records a submission. Managed control credentials
+//! and issued data credentials have independent lifetimes. An expiry refusal
+//! never authorizes replaying a mutation.
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::OpenOptions;

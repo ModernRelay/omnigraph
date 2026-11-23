@@ -1,4 +1,9 @@
-//! Local credentials and bundled utilities.
+//! Commands that need no target: `version`, the bundled skill (`skill export`,
+//! `skill show`) and `embed`.
+//!
+//! Skill export and embedding generation finish their file work before they
+//! report, so an output failure neither undoes nor repeats it. `skill show`
+//! keeps a narrow `BrokenPipe` exception.
 
 use crate::embed::EmbedArgs;
 use color_eyre::eyre::Result;

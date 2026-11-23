@@ -1,4 +1,11 @@
 //! `ExpandExec` owns the validated traversal step executed by `expand_stream`.
+//! An unbudgeted named unbound single hop walks each input batch
+//! (`single_hop`); unbudgeted named multi-hop drains its input into the BFS
+//! breaker; budgeted expansions read fixed source windows; bound edges use the
+//! bounded pair producer, spillable pair ordering and incremental hydration
+//! within each input batch or window. Output chunks hold at most
+//! `EXPAND_OUTPUT_ROWS` rows (`expand_pairs` counts the pairs handed on), and
+//! dropping the stream at a downstream `Limit` cancels the producer.
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;

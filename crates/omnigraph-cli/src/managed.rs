@@ -1,5 +1,21 @@
-//! Managed control routing (RFC 0052) and offline data credentials (RFC 0053).
+//! Managed control routing and offline data credentials.
 //! One resolved target supplies all managed authority for an invocation.
+//!
+//! A profile owns the API, the organization and one authentication provider
+//! for one identity. A managed target references a profile and pins the
+//! cluster identity and incarnation, plus an optional data endpoint.
+//! Structural validation of the whole operator document precedes the selected
+//! credential and runtime capability checks. Registration consumes an
+//! authenticated endpoint attestation; refresh verifies that the incarnation
+//! is unchanged and never synthesizes a route. This does not qualify private
+//! routing for a customer-hosted cluster. The managed HTTP adapter obtains
+//! current access before each new request, status polls included.
+//!
+//! The module owns platform onboarding, verified principal replacement, the
+//! session lifecycle and authenticated resource registration. Configuration,
+//! secret custody, the derived data-credential cache and unresolved operation
+//! journals have separate lifecycles. Managed handlers write through the
+//! supplied output boundary, identity diagnostics before dispatch included.
 
 use crate::cli::{Cli, ClusterCommand, ClusterMembersCommand, ClusterRunArgs, Command};
 use reqwest::{Client, Method, StatusCode};
