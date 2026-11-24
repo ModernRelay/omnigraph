@@ -2787,7 +2787,15 @@ impl Ctx<'_> {
         aggs: &[(String, Agg)],
         keys: &[(String, SExpr)],
     ) -> R<SExpr> {
-        let same_item = body.projections.iter().position(|p| p.expr == o.expr);
+        // The typed column of the return item the key repeats, found by the
+        // item's column name: `names` and `out_cols` hold the typed items
+        // only, so a refused item before it shifts every position after it.
+        let same_item = body
+            .projections
+            .iter()
+            .find(|p| p.expr == o.expr)
+            .map(|p| item_name(&p.expr, p.alias.as_deref()))
+            .and_then(|n| names.iter().position(|x| *x == n));
         Ok(match &o.expr {
             Expr::Ident(alias) if names.contains(alias) => {
                 let i = names.iter().position(|n| n == alias).unwrap();

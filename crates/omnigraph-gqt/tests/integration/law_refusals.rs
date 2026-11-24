@@ -821,6 +821,58 @@ fn printed_fixes_reach_one_fixed_point_in_every_block_context() {
     );
 }
 
+/// A refused return item is no column of the read: an order key, grouped or
+/// not, is checked against the typed items alone. Every arrangement of three
+/// typed items, grouped or not, with a name nothing binds written at each
+/// position, under every order key that repeats an item by its expression or
+/// names its alias, is refused with the unbound name's code, never a panic.
+#[test]
+fn a_read_with_a_refused_return_item_is_refused_with_its_code() {
+    let cat = catalog(rows::CHECKED);
+    let groupings: [&[(&str, Option<&str>)]; 2] = [
+        &[
+            ("$p.name", None),
+            ("count($p)", Some("n")),
+            ("$p.age", None),
+        ],
+        &[
+            ("$p.name", None),
+            ("$p.handle", Some("h")),
+            ("$p.age", None),
+        ],
+    ];
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for typed in groupings {
+        for at in 0..=typed.len() {
+            let mut items: Vec<(&str, Option<&str>)> = typed.to_vec();
+            items.insert(at, ("$unbound", None));
+            let written: Vec<String> = items
+                .iter()
+                .map(|(e, a)| a.map_or(e.to_string(), |a| format!("{e} as {a}")))
+                .collect();
+            let mut keys: Vec<String> = typed.iter().map(|(e, _)| e.to_string()).collect();
+            keys.extend(typed.iter().filter_map(|(_, a)| a.map(str::to_string)));
+            for key in keys {
+                let source = format!(
+                    "query q() {{ match {{ $p: Person }} return {{ {} }} order {{ {key} desc }} }}",
+                    written.join(", ")
+                );
+                checked += 1;
+                match std::panic::catch_unwind(|| check_source_all(&cat, &source)) {
+                    Err(_) => failures.push(format!("the checker panicked on\n{source}")),
+                    Ok(refusals) if refusals.first().map(|d| d.code.as_str()) != Some("T6") => {
+                        failures.push(format!("{source}\n  refused with {}", render(&refusals)))
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+    }
+    assert!(checked > 0);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A fix does not reveal a refusal the pass did not report: `T84` (`$q`
 /// bound nowhere in the inline read) leaves the inline read typed as its fix
 /// would, so the same pass also reports `T68` (the inline read returns `$p`

@@ -2372,6 +2372,29 @@ fn t65_suggests_an_applicable_edit() {
     }
 }
 
+/// An order key over grouped rows that repeats a return item reads that
+/// item's column by name. A refused item before it is no column, so the key
+/// is checked against the typed items alone and the read is refused with
+/// the item's own code, never a panic.
+#[test]
+fn a_grouped_order_key_after_a_refused_item_is_refused_with_its_code() {
+    for src in [
+        "query q() { match { $p: Person } return { $zz, $p.name, count($zz) as a0 } order { $p.name desc } }",
+        "query q() { match { $p: Person } return { $zz, $p.name, count($p) as a0 } order { $p.name desc } }",
+        "query q() { match { $p: Person } return { $zz, $p.name, count($p) as a0 } order { a0 desc, $p.name } }",
+    ] {
+        let refusals = crate::query::check::check_source_all(&catalog(), src);
+        assert_eq!(
+            refusals.first().map(|d| d.code.as_str()),
+            Some("T6"),
+            "{src}: {refusals:?}"
+        );
+    }
+    ok(
+        "query q() { match { $p: Person } return { $p.name, count($p) as a0 } order { $p.name desc } }",
+    );
+}
+
 /// A literal compared with a property is checked against the property's
 /// type in every scope that compares, either operand order, and in an `in`
 /// list: `T3`, its edit writing the nearest allowed value where the literal
