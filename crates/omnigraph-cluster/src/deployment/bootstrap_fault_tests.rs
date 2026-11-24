@@ -848,11 +848,10 @@ fn lock_json(text: &str) -> serde_json::Value {
 }
 
 /// Leave this identity's lock retained, as the 2026-11-23 failure did: the
-/// freshness probe after the lock keeps failing until the attempt's one probe
-/// budget ends.
+/// freshness probe after the lock fails. Retrying that read is the storage
+/// adapter's; bootstrap asks once.
 async fn fail_after_lock(store: &ClusterStore, bundle: &CapturedDeployment, adapter: &Controlled) {
     adapter.arm_exists(true, usize::MAX);
-    let start = tokio::time::Instant::now();
     let failure = bootstrap_in_store(
         store,
         bundle,
@@ -861,8 +860,6 @@ async fn fail_after_lock(store: &ClusterStore, bundle: &CapturedDeployment, adap
     )
     .await
     .unwrap_err();
-    // One budget per attempt, not one per check.
-    assert_eq!(start.elapsed(), crate::store::BOOTSTRAP_PROBE_BUDGET);
     adapter.disarm_exists();
     assert_eq!(
         failure.outcome(),
@@ -1055,25 +1052,10 @@ async fn a_retained_lock_of_another_identity_or_a_legacy_lock_is_never_re_entere
 }
 
 #[tokio::test(start_paused = true)]
-async fn transient_freshness_probe_errors_are_retried_within_the_deadline() {
-    let (_directory, bundle, store, adapter) = fixture();
-    adapter.arm_exists(true, 3);
-    let start = tokio::time::Instant::now();
-    let receipt = first_attempt(&store, &bundle).await.unwrap();
-    assert_eq!(adapter.exists_fault.lock().unwrap().unwrap().1, 0);
-    assert!(start.elapsed() < crate::store::BOOTSTRAP_PROBE_BUDGET);
-    claim_in_store(&store, &receipt).await.unwrap();
-    assert_no_bootstrap_records(&adapter).await;
-    adapter.assert_no_forbidden_calls().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_persistent_probe_error_before_the_lock_fails_at_the_deadline_with_no_effects() {
+async fn a_probe_error_before_the_lock_fails_with_no_effects() {
     let (_directory, bundle, store, adapter) = fixture();
     adapter.arm_exists(false, usize::MAX);
-    let start = tokio::time::Instant::now();
     let failure = first_attempt(&store, &bundle).await.unwrap_err();
-    assert_eq!(start.elapsed(), crate::store::BOOTSTRAP_PROBE_BUDGET);
     assert_eq!(
         failure.outcome(),
         outcome(

@@ -129,29 +129,6 @@ fn bootstrap_lock_error(error: StateLockError) -> Diagnostic {
     }
 }
 
-/// Every effect-free `exists()` probe of one bootstrap attempt shares one
-/// deadline, this long after the attempt starts (`BootstrapProbeDeadline`). A
-/// probe whose error is transient or unclassified is retried after a pause of
-/// `BOOTSTRAP_PROBE_FIRST_PAUSE`, doubling to `BOOTSTRAP_PROBE_MAX_PAUSE`, and
-/// each probe is cut off at the deadline. So an attempt's probes end within 240
-/// seconds of its start, inside a managed operator's 600-second attempt bound,
-/// however many checks the attempt runs.
-pub(crate) const BOOTSTRAP_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(240);
-
-/// The one probe deadline of a bootstrap attempt, or of a claim. It is made
-/// only by `start`, and every freshness and graph-or-recovery probe takes it,
-/// so no check starts a budget of its own.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BootstrapProbeDeadline(tokio::time::Instant);
-
-impl BootstrapProbeDeadline {
-    pub(crate) fn start() -> Self {
-        Self(tokio::time::Instant::now() + BOOTSTRAP_PROBE_BUDGET)
-    }
-}
-const BOOTSTRAP_PROBE_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
-const BOOTSTRAP_PROBE_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(8);
-
 /// Only explicit stopped-ledger conversion may remove obsolete runtime fields.
 /// The remaining ledger is decoded by the ordinary strict types and validator.
 fn decode_ledger(text: &str, upgrade: bool) -> Result<(ClusterState, bool), Diagnostic> {
@@ -411,68 +388,22 @@ impl ClusterStore {
         self
     }
 
-    /// Whether `path` exists, by effect-free probes retried inside the
-    /// attempt's `deadline`. An error is never taken for absence.
-    async fn probe_exists(
-        &self,
-        path: &str,
-        deadline: BootstrapProbeDeadline,
-    ) -> Result<bool, Diagnostic> {
-        use omnigraph_storage::StorageFailureKind;
-        let deadline = deadline.0;
-        let uri = self.uri(path);
-        let mut pause = BOOTSTRAP_PROBE_FIRST_PAUSE;
-        let mut attempts = 0u32;
-        loop {
-            attempts += 1;
-            let error = match tokio::time::timeout_at(deadline, self.adapter.exists(&uri)).await {
-                Ok(Ok(found)) => return Ok(found),
-                Ok(Err(error)) => error,
-                Err(_) => {
-                    let mut diagnostic = Diagnostic::error(
-                        "bootstrap_freshness_unknown",
-                        path,
-                        format!(
-                            "the existence probe did not answer within the attempt's {}-second probe budget (attempt {attempts})",
-                            BOOTSTRAP_PROBE_BUDGET.as_secs()
-                        ),
-                    );
-                    diagnostic.storage_failure = Some(StorageFailureKind::Transient);
-                    return Err(diagnostic);
-                }
-            };
-            let kind = error.failure_kind();
-            let now = tokio::time::Instant::now();
-            if !matches!(
-                kind,
-                StorageFailureKind::Transient | StorageFailureKind::Unknown
-            ) || now >= deadline
-            {
-                return Err(read_failure(
-                    "bootstrap_freshness_unknown",
-                    path,
-                    format_args!("existence probe failed after {attempts} attempts"),
-                    &error,
-                ));
-            }
-            tracing::warn!(
+    /// Whether `path` exists. The storage adapter retries the read; an error
+    /// is never taken for absence.
+    async fn probe_exists(&self, path: &str) -> Result<bool, Diagnostic> {
+        self.adapter.exists(&self.uri(path)).await.map_err(|error| {
+            read_failure(
+                "bootstrap_freshness_unknown",
                 path,
-                attempts,
-                ?kind,
-                "retrying an effect-free bootstrap freshness probe"
-            );
-            tokio::time::sleep(pause.min(deadline - now)).await;
-            pause = (pause * 2).min(BOOTSTRAP_PROBE_MAX_PAUSE);
-        }
+                "existence probe failed",
+                &error,
+            )
+        })
     }
 
-    async fn require_absent_native_paths(
-        &self,
-        paths: &[&str],
-        deadline: BootstrapProbeDeadline,
-    ) -> Result<(), Diagnostic> {
+    async fn require_absent_native_paths(&self, paths: &[&str]) -> Result<(), Diagnostic> {
         for path in paths {
-            if self.probe_exists(path, deadline).await? {
+            if self.probe_exists(path).await? {
                 return Err(Diagnostic::error(
                     "bootstrap_root_not_fresh",
                     *path,
@@ -485,36 +416,25 @@ impl ClusterStore {
 
     /// One freshness check: no native authority, graph data or recovery, and
     /// no lock unless this bootstrap holds it.
-    pub(crate) async fn require_fresh_bootstrap(
-        &self,
-        own_lock: bool,
-        deadline: BootstrapProbeDeadline,
-    ) -> Result<(), Diagnostic> {
-        self.require_no_bootstrap_graphs_or_recovery(deadline)
-            .await?;
-        self.require_absent_native_paths(&[CLUSTER_STATE_FILE, CLUSTER_RESOURCES_DIR], deadline)
+    pub(crate) async fn require_fresh_bootstrap(&self, own_lock: bool) -> Result<(), Diagnostic> {
+        self.require_no_bootstrap_graphs_or_recovery().await?;
+        self.require_absent_native_paths(&[CLUSTER_STATE_FILE, CLUSTER_RESOURCES_DIR])
             .await?;
         if !own_lock {
-            self.require_absent_native_paths(&[CLUSTER_LOCK_FILE], deadline)
+            self.require_absent_native_paths(&[CLUSTER_LOCK_FILE])
                 .await?;
         }
         Ok(())
     }
 
-    pub(crate) async fn require_no_bootstrap_graphs_or_recovery(
-        &self,
-        deadline: BootstrapProbeDeadline,
-    ) -> Result<(), Diagnostic> {
-        self.require_absent_native_paths(
-            &[
-                crate::CLUSTER_GRAPHS_DIR,
-                "__manifest",
-                "__history",
-                CLUSTER_RECOVERIES_DIR,
-                "__cluster/approvals",
-            ],
-            deadline,
-        )
+    pub(crate) async fn require_no_bootstrap_graphs_or_recovery(&self) -> Result<(), Diagnostic> {
+        self.require_absent_native_paths(&[
+            crate::CLUSTER_GRAPHS_DIR,
+            "__manifest",
+            "__history",
+            CLUSTER_RECOVERIES_DIR,
+            "__cluster/approvals",
+        ])
         .await
     }
 

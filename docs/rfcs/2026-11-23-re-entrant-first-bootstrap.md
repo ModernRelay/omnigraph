@@ -44,9 +44,9 @@ bootstrap resumable by the process that started it, and by no one else.
 - Every failure carries a fixed-vocabulary outcome `{code, step, effects,
   retryable}`, where `effects` is `none`, `confirmed` or `unconfirmed`,
   derived from the storage requests the attempt actually sent.
-- The effect-free freshness probes retry transient and unclassified read
-  errors with backoff. Every probe of one attempt shares one 240-second
-  deadline. An error is never read as absence.
+- The effect-free freshness probes ask storage once. Retrying a read is the
+  storage adapter's, as for every other scoped read (#1533); an error is never
+  read as absence.
 
 The graph format, the serving receipt, `claim_bootstrap_serving`, the ledger
 protocol and the lease are unchanged. Containment still rests on conditional
@@ -129,7 +129,7 @@ pub struct BootstrapRequest {
   - `retryable` is true only when `effects` is not `unconfirmed`, the attempt
     left no accepted initial deployment incomplete (a rerun refuses that
     state), and the failure is a storage request whose class is transient or
-    unclassified: a read, a probe (including the probe deadline), or a write
+    unclassified: a read, a probe, or a write
     the store refused without applying it. It says a rerun of the same
     request, with `PriorAttempts::Excluded` once the failed process is gone,
     can make progress. It is advice: the rerun's own checks decide.
@@ -307,26 +307,19 @@ cannot say for the operation around it. First bootstrap stops at its first
 write error, and the recording adapter keeps the class of a write the store
 refused without applying it; `retryable` uses that.
 
-### Freshness probes retry inside one deadline
+### Freshness probes rely on storage's read retry
 
-Every effect-free `exists()` probe of one attempt shares one deadline, 240
-seconds after the attempt starts. The attempt creates it once and passes it to
-each freshness check and each graph-and-recovery check it runs; no check
-starts a budget of its own. A probe whose error is transient or unclassified
-is retried after a pause of 250 milliseconds, doubling to at most 8 seconds,
-and each probe is itself cut off at the deadline. Errors of every other class
-(configuration, permission, precondition, permanent) fail at once. At the
-deadline the probe fails with `bootstrap_freshness_unknown`. Each retry is
-logged with its path and the error class. A probe that answers is never
-second-guessed, and an error is never taken for absence.
-
-So an attempt's probes end within 240 seconds of its start, however many
-checks it runs, leaving at least 360 seconds of a managed operator's
-600-second attempt bound for the conditional writes, whose re-issue policy is
-bounded on its own (four re-issues within about 3 seconds per request), and
-the policy deployment. The other reads, of the lock and the ledger, fail at
-once; the rerun that follows them resumes. A claim of the serving receipt is
-not an attempt and has its own deadline of the same length.
+Each effect-free `exists()` probe asks storage once. Bootstrap has no retry
+policy of its own: a scoped storage adapter retries its reads (3 retries within
+180 seconds for a timeout or a 5xx on a safe request), whatever path built it.
+On 2026-11-23 a captured S3 binding did not, so one stalled probe failed the
+attempt; #1533 builds every `s3://` adapter through one construction, so this
+RFC stacks on it. A probe that answers is never second-guessed, and an error
+is never taken for absence: it fails with `bootstrap_freshness_unknown`,
+classified by the store boundary, and a transient class makes the failure
+`retryable`. The reads of the lock and the ledger fail the same way; the
+rerun that follows them resumes. A managed operator's 600-second attempt bound
+still bounds the whole attempt.
 
 ### Containment
 
@@ -350,11 +343,9 @@ lock key stays present from the first create to the server's claim.
 
 ## Invariants
 
-- **Invariant 11, bounded and observable failures.** The probe retry is
-  bounded by one deadline per attempt and a backoff cap, applies to
-  effect-free reads only, and is logged per retry; the outcome makes every
-  failure's effects explicit. The deny-list's "silent retries" hide outcomes;
-  this retry hides none.
+- **Invariant 11, bounded and observable failures.** Bootstrap adds no
+  retry: its reads use the storage adapter's bounded read retry, and the
+  outcome makes every failure's effects explicit.
 - **Invariant 12, one source of truth.** Bootstrap progress is `lock.json`
   and `state.json`. No second record copies what the ledger records, so none
   can drift from it, and a new step adds no record of its own.
@@ -438,13 +429,11 @@ not settle it.
 
 - A same-identity rerun after a lock-then-freshness failure resumes and
   completes, with one lock lineage: one create, one if-match from the exact
-  created version, no delete. The failed attempt's probes end exactly at the
-  attempt's one deadline.
+  created version, no delete.
 - A foreign incarnation, a foreign request id, a version 1 bootstrap lock and a
   serving lock refuse re-entry with the same code and leave the lock
   unchanged; a rerun without `Excluded` refuses and changes nothing.
-- Transient probe errors are retried to success; a persistent probe error
-  before the lock fails at the deadline with `effects: none` and
+- A probe error before the lock fails with `effects: none` and
   `retryable: true` and writes nothing.
 - A lost answer on, or a process killed right after, the lock create, the
   ledger create and the terminal ledger revision: an excluded rerun completes
@@ -491,6 +480,6 @@ None.
   each was a second copy of a ledger fact, and the gap between an effect and
   its receipt left the root terminal. An outstanding initial deployment
   refuses with `bootstrap_deployment_outstanding`. The attempt cap is removed;
-  a legacy lock refuses as an identity mismatch; every probe of an attempt
-  shares one 240-second deadline; failed reads are classified once, at the
+  a legacy lock refuses as an identity mismatch; probes ask storage once and
+  rely on its read retry (#1533); failed reads are classified once, at the
   store boundary, and refused writes by the recording adapter.

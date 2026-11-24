@@ -12,7 +12,6 @@
 use super::*;
 use crate::admission::ClusterAdmission;
 use crate::state_lock::{BootstrapLockState, StateLockGuard};
-use crate::store::BootstrapProbeDeadline;
 use omnigraph_storage::{StorageFailureKind, StorageKind};
 use std::sync::Arc;
 
@@ -528,9 +527,6 @@ async fn bootstrap_attempt(
     step: &mut BootstrapStep,
     deployment_outstanding: &mut bool,
 ) -> Result<BootstrapServingReceipt, Diagnostic> {
-    // The one probe budget of this attempt: every freshness and
-    // graph-or-recovery probe below shares it.
-    let deadline = BootstrapProbeDeadline::start();
     *step = BootstrapStep::Input;
     let identity = &request.identity;
     identity.validate()?;
@@ -544,7 +540,7 @@ async fn bootstrap_attempt(
     let (guard, lock_version) = match observed {
         BootstrapLockState::Absent => {
             *step = BootstrapStep::Freshness;
-            store.require_fresh_bootstrap(false, deadline).await?;
+            store.require_fresh_bootstrap(false).await?;
             *step = BootstrapStep::Lock;
             store
                 .acquire_bootstrap_lock(identity.incarnation(), identity.request_id())
@@ -585,7 +581,7 @@ async fn bootstrap_attempt(
         progress = match progress {
             Progress::Freshness => {
                 *step = BootstrapStep::Freshness;
-                store.require_fresh_bootstrap(true, deadline).await?;
+                store.require_fresh_bootstrap(true).await?;
                 *step = BootstrapStep::Ledger;
                 store
                     .write_state(&execution::empty_ledger(), None, &mut store.observations())
@@ -594,9 +590,7 @@ async fn bootstrap_attempt(
             }
             Progress::Deployment => {
                 *step = BootstrapStep::Deployment;
-                store
-                    .require_no_bootstrap_graphs_or_recovery(deadline)
-                    .await?;
+                store.require_no_bootstrap_graphs_or_recovery().await?;
                 let mut effects_started = false;
                 let result = execution::execute_captured_deployment_in_store(
                     store,
@@ -647,7 +641,7 @@ async fn bootstrap_attempt(
         result_revision: deployed.result_revision,
     };
     receipt.validate()?;
-    validate_terminal(store, &receipt, deadline).await?;
+    validate_terminal(store, &receipt).await?;
     store
         .verify_bootstrap_lock(&receipt.bootstrap_lock_id, &receipt.bootstrap_lock_version)
         .await?;
@@ -687,14 +681,13 @@ async fn claim_in_store(
 ) -> Result<AdmittedServingSnapshot, Diagnostic> {
     receipt.validate()?;
     // A claim is not an attempt; its own probes share one budget.
-    let deadline = BootstrapProbeDeadline::start();
-    let result = validate_terminal(store, receipt, deadline).await?;
+    let result = validate_terminal(store, receipt).await?;
     let guard: StateLockGuard = store
         .claim_bootstrap_lock(&receipt.bootstrap_lock_id, &receipt.bootstrap_lock_version)
         .await?;
     // There is intentionally no read/adopt fallback after an uncertain CAS.
     let admission = ClusterAdmission::from_bootstrap_lock(store.clone(), guard, Some(result));
-    validate_terminal(store, receipt, deadline).await?;
+    validate_terminal(store, receipt).await?;
     let snapshot = serve::read_snapshot_with_store(store)
         .await
         .map_err(|mut errors| errors.remove(0))?;
@@ -735,7 +728,6 @@ async fn require_settled_io(store: &ClusterStore) -> Result<(), Diagnostic> {
 async fn validate_terminal(
     store: &ClusterStore,
     receipt: &BootstrapServingReceipt,
-    deadline: BootstrapProbeDeadline,
 ) -> Result<DeploymentResult, Diagnostic> {
     if store.canonical_root()? != receipt.canonical_root {
         return Err(refusal("bootstrap_root_mismatch", "bootstrap root changed"));
@@ -799,9 +791,7 @@ async fn validate_terminal(
         ));
     }
     authorization::AppliedPolicies::load(store, &state).await?;
-    store
-        .require_no_bootstrap_graphs_or_recovery(deadline)
-        .await?;
+    store.require_no_bootstrap_graphs_or_recovery().await?;
     Ok(result.clone())
 }
 

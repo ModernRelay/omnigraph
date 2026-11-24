@@ -301,7 +301,8 @@ revision 2 refuses `bootstrap_deployment_outstanding`; any other ledger
 refuses `bootstrap_state_mismatch`. The attempt's control requests pass
 through a recording adapter that refuses unconditional mutations, so a
 failure's `effects` (`none`, `confirmed`, `unconfirmed`) is derived from what
-was sent. Every effect-free probe of one attempt shares one 240-second deadline.
+was sent. Each effect-free probe asks storage once; retrying it is the storage
+adapter's bounded read retry.
 `force_unlock_storage_root` with the exact lock id remains the emergency path
 that can remove a held bootstrap lock. See
 [re-entrant first bootstrap](../rfcs/2026-11-23-re-entrant-first-bootstrap.md).
