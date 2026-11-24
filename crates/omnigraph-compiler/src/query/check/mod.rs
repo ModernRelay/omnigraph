@@ -3769,9 +3769,11 @@ impl Ctx<'_> {
 
     /// `T68` for a block whose only element binds a name the scope where the
     /// block is written holds, with the same type: a re-mention, which once
-    /// correlated the block on the outer row and so filtered it. An `exists` block of that shape is the
-    /// test that its `where` is true, so the fix writes the predicate in the
-    /// block's place (`not exists { $p: Person where $p.name = "bob" }` is
+    /// correlated the block on the outer row and so filtered it. Such a block
+    /// reads that one row where its `where` is true, so the fix writes the
+    /// scalar its function folds to in the block's place
+    /// ([`crate::query::syntax::print::outer_row_block`]): an `exists` block
+    /// is the predicate, a `count` block `if(…, 1, 0)` (`not exists { $p: Person where $p.name = "bob" }` is
     /// `not ($p.name = "bob")`). Where the predicate can be null the block's
     /// test was false and the conjunct would be null, so `not exists` kept a
     /// row that `not ( … )` drops; the fix writes `coalesce(…, false)` there,
@@ -3810,11 +3812,24 @@ impl Ctx<'_> {
         );
         d.position = at;
         d.end = at_end;
-        if block.func != BlockFunc::Exists {
-            return Err(E::D(d.with_fix(format!(
+        let unfoldable = || {
+            format!(
                 "read the outer `${variable}` without binding it inside the block, or write the filter as a conjunct of the `where`"
-            ))));
-        }
+            )
+        };
+        // The block reads the one outer row where its predicate holds, so
+        // its function folds to a scalar (`exists` to the predicate,
+        // `count` to `if(…, 1, 0)`); `MARK` stands where the predicate's
+        // text stays as written.
+        const MARK: &str = "\u{0}";
+        let arg = block.arg.as_deref().map(crate::query::syntax::print::expr);
+        let Some(fold) = crate::query::syntax::print::outer_row_block(
+            block.func,
+            arg.as_deref(),
+            pattern.predicate.as_ref().map(|_| MARK),
+        ) else {
+            return Err(E::D(d.with_fix(unfoldable())));
+        };
         let mut probe = self.inner_scope(sc, outer.to_vec())?;
         probe.recover = false;
         probe.inner = false;
@@ -3833,27 +3848,31 @@ impl Ctx<'_> {
             ("(", ")")
         };
         let (fix, edits) = match (&pattern.predicate, &pattern.spans.predicate) {
-            (Some(p), Some(pspan)) if span.end > span.start => (
-                format!("`{open}{}{close}`", crate::query::syntax::print::expr(p)),
-                vec![
-                    TextEdit {
-                        start: span.start,
-                        end: pspan.start,
-                        replacement: open.to_string(),
-                    },
-                    TextEdit {
-                        start: pspan.end,
-                        end: span.end,
-                        replacement: close.to_string(),
-                    },
-                ],
-            ),
+            (Some(p), Some(pspan)) if span.end > span.start => {
+                let (before, after) = fold.split_once(MARK).expect("the fold holds the predicate");
+                let (before, after) = (format!("{before}{open}"), format!("{close}{after}"));
+                (
+                    format!("`{before}{}{after}`", crate::query::syntax::print::expr(p)),
+                    vec![
+                        TextEdit {
+                            start: span.start,
+                            end: pspan.start,
+                            replacement: before,
+                        },
+                        TextEdit {
+                            start: pspan.end,
+                            end: span.end,
+                            replacement: after,
+                        },
+                    ],
+                )
+            }
             (None, _) if span.end > span.start => (
-                "`true`, since the outer row always exists".to_string(),
+                format!("`{fold}`, since the outer row always exists"),
                 vec![TextEdit {
                     start: span.start,
                     end: span.end,
-                    replacement: "true".to_string(),
+                    replacement: fold.clone(),
                 }],
             ),
             _ => return Err(E::D(d.with_fix("write the block's `where` in its place"))),

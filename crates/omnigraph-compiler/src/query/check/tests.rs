@@ -296,6 +296,23 @@ fn an_inner_scope_binds_a_name_new_to_it_and_reads_an_outer_one() {
         "T68",
         "query q() { match { $p: Person } where not coalesce($p.age > 30, false) return { $p } }",
     );
+    // Every block function folds over the one row it reads: `count` to
+    // `if(…, 1, 0)`, `max` to the value; with no predicate the row is read.
+    repaired(
+        "query q() { match { $p: Person } where count { $p: Person where $p.age > 30 } > 0 return { $p } }",
+        "T68",
+        "query q() { match { $p: Person } where if(coalesce($p.age > 30, false), 1, 0) > 0 return { $p } }",
+    );
+    repaired(
+        "query q() { match { $p: Person } where max($p.age) { $p: Person where $p.name = \"a\" } > 3 return { $p } }",
+        "T68",
+        "query q() { match { $p: Person } where if(($p.name = \"a\"), $p.age, null) > 3 return { $p } }",
+    );
+    repaired(
+        "query q() { match { $p: Person } where count { $p: Person } > 0 return { $p } }",
+        "T68",
+        "query q() { match { $p: Person } where 1 > 0 return { $p } }",
+    );
     // Another type meant a name of the block's own: no edit is certain.
     let d = refused_with(
         "query q() { match { $p: Person } where not exists { $p: Company } return { $p } }",

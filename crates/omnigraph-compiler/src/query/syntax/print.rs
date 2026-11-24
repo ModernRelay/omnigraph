@@ -297,6 +297,55 @@ pub(crate) fn block(b: &Block) -> String {
     format!("{head} {}", braced(&b.pattern))
 }
 
+/// The scalar a block equals when its pattern binds nothing of its own and
+/// only tests the row it is written on (a block of filters alone, or one
+/// re-mentioning an outer binding): the block reads that one row where
+/// `cond` holds and no row elsewhere, so its function folds to a scalar of
+/// the same value and type. `cond` is never null (a nullable predicate is
+/// passed as `coalesce(φ, false)`, which is what the block tested); `None`
+/// is a pattern with no predicate, which always holds. `arg` is the
+/// aggregate's argument as written.
+///
+/// `None` for `collect`, `stddev` and `percentile`, and for an aggregate
+/// missing its argument: no fold of those is the same value and type.
+pub(crate) fn outer_row_block(
+    func: BlockFunc,
+    arg: Option<&str>,
+    cond: Option<&str>,
+) -> Option<String> {
+    let when = |then: &str, otherwise: &str| match cond {
+        Some(c) => format!("if({c}, {then}, {otherwise})"),
+        None => then.to_string(),
+    };
+    Some(match (func, arg) {
+        (BlockFunc::Exists, _) => cond.unwrap_or("true").to_string(),
+        // `count` is `I64`, as the literals are.
+        (BlockFunc::Agg(AggFunc::Count), None) => when("1", "0"),
+        // `count(e)` counts the rows where `e` is not null.
+        (BlockFunc::Agg(AggFunc::Count), Some(a)) => {
+            let path = a
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '$' | '_' | '.' | '@'));
+            let test = if path {
+                format!("{a} is not null")
+            } else {
+                format!("({a}) is not null")
+            };
+            match cond {
+                Some(c) => format!("if({c} and {test}, 1, 0)"),
+                None => format!("if({test}, 1, 0)"),
+            }
+        }
+        // `min` and `max` of one value are that value, of its type.
+        (BlockFunc::Agg(AggFunc::Min | AggFunc::Max), Some(a)) => when(a, "null"),
+        // `sum` and `avg` are `F64` over a numeric argument.
+        (BlockFunc::Agg(AggFunc::Sum | AggFunc::Avg), Some(a)) => {
+            when(&format!("cast({a}, F64)"), "null")
+        }
+        _ => return None,
+    })
+}
+
 pub(crate) fn agg(f: AggFunc) -> &'static str {
     match f {
         AggFunc::Count => "count",

@@ -719,6 +719,108 @@ fn every_refusal_reaches_a_fixed_point_within_three_passes() {
     );
 }
 
+/// The block contexts a pattern can be written in: each `⟨⟩` is the
+/// block's content. A `where` operand (`exists`, `count` and every
+/// aggregate's block, negated or compared), or an element of the `match`
+/// written the way edition 2 wrote one (a block compared among the elements,
+/// `not { }`, `optional { }`).
+const BLOCK_CONTEXTS: &[&str] = &[
+    "match { $p: Person } where exists { ⟨⟩ }",
+    "match { $p: Person } where not exists { ⟨⟩ }",
+    "match { $p: Person } where count { ⟨⟩ } != 0",
+    "match { $p: Person } where count($p.age) { ⟨⟩ } > 0",
+    "match { $p: Person } where sum($p.age) { ⟨⟩ } > 1",
+    "match { $p: Person } where avg($p.age) { ⟨⟩ } > 1",
+    "match { $p: Person } where min($p.age) { ⟨⟩ } > 1",
+    "match { $p: Person } where max($p.age) { ⟨⟩ } > 1",
+    "match { $p: Person } where collect($p.age) { ⟨⟩ } = [1]",
+    "match { $p: Person, exists { ⟨⟩ } }",
+    "match { $p: Person  count { ⟨⟩ } != 0 }",
+    "match { $p: Person, not { ⟨⟩ } }",
+    "match { $p: Person, optional { ⟨⟩ } }",
+    "match { $p: Person, exists { ⟨⟩ }, $q: Company }",
+];
+
+/// The contents a block holds in edition-2 text and in edition 3, refused
+/// or not: filters alone, a re-mention of the outer binding, triples that
+/// introduce a name, a block's own `where`, nested blocks.
+const BLOCK_CONTENTS: &[&str] = &[
+    "$p.age > 3",
+    "$p.age > 3  $p.name = \"a\"",
+    "where $p.age > 3",
+    "$p.age > 3 where $p.name = \"a\"",
+    "$p: Person { name: \"a\" }",
+    "$p: Person where $p.age > 3",
+    "$p: Person",
+    "$p knows $q",
+    "$p knows $q  $q.age > 3",
+    "$q: Person, $p knows $q where $q.age > 3",
+    "$p worksAt $q",
+    "not { $p knows $q }",
+    "exists { $p.age > 3 }",
+    "count { $p.age > 3 } > 0",
+];
+
+/// The printed fixes reach one fixed point however two refusals of a block
+/// meet: every block context of [`BLOCK_CONTEXTS`] holding every content of
+/// [`BLOCK_CONTENTS`], alone or followed by another, either compiles, stops
+/// at a refusal with no fix, or converges, with or without the fixes for
+/// review; and `lint --fix` on what it wrote changes nothing. Two rules whose
+/// fixes undo each other, one moving a filter into a block's `where` and the
+/// other deleting a `where` that has no element before it, fail here. The
+/// rows' stricter rule, that every pass leaves fewer refusals
+/// ([`converge`]), does not hold of a compound: the pass that repairs an
+/// element list can reveal a refusal of a block inside it, in the same
+/// stage.
+#[test]
+fn printed_fixes_reach_one_fixed_point_in_every_block_context() {
+    use omnigraph_compiler::{FixOptions, FixStatus, fix_source};
+    let cat = catalog(rows::CHECKED);
+    let mut contents: Vec<String> = BLOCK_CONTENTS.iter().map(|c| c.to_string()).collect();
+    for a in BLOCK_CONTENTS {
+        for b in BLOCK_CONTENTS {
+            contents.push(format!("{a}  {b}"));
+        }
+    }
+    let mut violations = Vec::new();
+    let mut fixed = 0;
+    for context in BLOCK_CONTEXTS {
+        for content in &contents {
+            let source = format!(
+                "query q() {{ {} return {{ $p.name }} }}",
+                context.replace("⟨⟩", content)
+            );
+            for review in [false, true] {
+                let out = fix_source(&cat, &source, FixOptions { review });
+                match out.report.status {
+                    FixStatus::DoesNotConverge => {
+                        violations.push(format!("{source}\n  does not converge: {:?}", out.report))
+                    }
+                    FixStatus::Fixed => {
+                        fixed += 1;
+                        let text = out.fixed.unwrap();
+                        let again = fix_source(&cat, &text, FixOptions { review });
+                        if again.report.status != FixStatus::Unchanged {
+                            violations.push(format!(
+                                "{source}\n  fixed to\n{text}\n  which the fixes change again: {:?}",
+                                again.report
+                            ));
+                        }
+                    }
+                    FixStatus::Unchanged | FixStatus::Unfixed => {}
+                }
+            }
+        }
+    }
+    assert!(fixed > 0, "no source was fixed");
+    assert!(
+        violations.is_empty(),
+        "{} sources break the fixed-point rule:\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
 /// A fix does not reveal a refusal the pass did not report: `T84` (`$q`
 /// bound nowhere in the inline read) leaves the inline read typed as its fix
 /// would, so the same pass also reports `T68` (the inline read returns `$p`

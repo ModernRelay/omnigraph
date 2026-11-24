@@ -2627,6 +2627,18 @@ fn pred_text(e: &Pair<Rule>) -> String {
     }
 }
 
+/// A predicate written among a pattern's elements, as the conjunct the fix
+/// moves to the `where`: [`pred_text`], each block in it that holds only
+/// filters written as the scalar it folds to ([`folded_text`]).
+fn moved_pred_text(e: &Pair<Rule>) -> String {
+    let text = folded_text(e);
+    if top_level_or(e) {
+        format!("({text})")
+    } else {
+        text
+    }
+}
+
 /// The expression of a `where` (`where_clause` or `inner_where_rec`), as a
 /// conjunct.
 fn where_expr_text(w: &Pair<Rule>) -> String {
@@ -2634,13 +2646,12 @@ fn where_expr_text(w: &Pair<Rule>) -> String {
     pred_text(&e)
 }
 
-/// The predicates of a `not { … }` block whose every element is a filter
-/// and which has no `where`, in written order; `None` for any other block.
-fn only_filters(negation: &Pair<Rule>) -> Option<Vec<String>> {
-    let body = child(negation, Rule::block_body)?;
-    if child(&body, Rule::where_clause).is_some() {
-        return None;
-    }
+/// The predicates of a block (`not { … }`, `exists { … }`, an aggregate's)
+/// whose every element is a filter, in written order, its own `where` last;
+/// `None` for any other block. Such a block binds nothing: it tests the row
+/// it is written on.
+fn only_filters(block: &Pair<Rule>) -> Option<Vec<String>> {
+    let body = child(block, Rule::block_body)?;
     let elements = child(&body, Rule::elements)?;
     let mut preds = Vec::new();
     for e in elements
@@ -2652,10 +2663,122 @@ fn only_filters(negation: &Pair<Rule>) -> Option<Vec<String>> {
             return None;
         }
         let x = k.clone().into_inner().next()?;
-        expr(x.clone()).ok()?;
-        preds.push(pred_text(&x));
+        if !expression_but_for_folds(&x) {
+            return None;
+        }
+        preds.push(moved_pred_text(&x));
+    }
+    if let Some(w) = child(&body, Rule::where_clause) {
+        preds.push(where_expr_text(&w));
     }
     (!preds.is_empty()).then_some(preds)
+}
+
+/// The written text of `e`, each block in it that holds only filters
+/// written as the scalar it folds to ([`block_fold`]), so that one edit
+/// moving a predicate also repairs the blocks inside it.
+fn folded_text(e: &Pair<Rule>) -> String {
+    fn folds(p: &Pair<Rule>, out: &mut Vec<((usize, usize), String)>) {
+        crate::stack::deep(|| {
+            for c in p.clone().into_inner() {
+                if c.as_rule() == Rule::block_value
+                    && let Some(fold) = block_fold(&c)
+                {
+                    out.push((span_of(&c), fold));
+                    continue;
+                }
+                folds(&c, out);
+            }
+        })
+    }
+    let input = input_of(e);
+    let (start, end) = span_of(e);
+    let mut found = Vec::new();
+    folds(e, &mut found);
+    let mut text = String::new();
+    let mut at = start;
+    for ((s, f), fold) in found {
+        text.push_str(&input[at..s]);
+        text.push_str(&fold);
+        at = f;
+    }
+    text.push_str(&input[at..end]);
+    text
+}
+
+/// Whether `x` builds as an expression once each block in it that holds
+/// only filters is folded: it builds, or its first refusal is such a
+/// block's, which [`moved_pred_text`] repairs in the text it writes.
+fn expression_but_for_folds(x: &Pair<Rule>) -> bool {
+    fn starts(p: &Pair<Rule>, out: &mut Vec<usize>) {
+        crate::stack::deep(|| {
+            for c in p.clone().into_inner() {
+                if c.as_rule() == Rule::block_value && filter_only_block(&c).is_some() {
+                    out.push(c.as_span().start());
+                }
+                starts(&c, out);
+            }
+        })
+    }
+    match expr(x.clone()) {
+        Ok(_) => true,
+        Err(r) => {
+            let mut folded = Vec::new();
+            starts(x, &mut folded);
+            r.diagnostic.code == Q017 && r.span.is_some_and(|(s, _)| folded.contains(&s))
+        }
+    }
+}
+
+/// The block value `block` (`exists`, `count` or an aggregate's) and the
+/// predicates it holds when its every element is a filter: it binds
+/// nothing, so it reads the row it is written on where those predicates
+/// hold, a null one excluded. `None` for any other block.
+fn filter_only_block(block: &Pair<Rule>) -> Option<(BlockFunc, Option<String>, Vec<String>)> {
+    let preds = only_filters(block)?;
+    let func = match child(block, Rule::agg_name) {
+        Some(name) => BlockFunc::Agg(agg_func(&name.as_str().to_ascii_lowercase())),
+        None => BlockFunc::Exists,
+    };
+    let arg = child(block, Rule::expr).map(|a| pred_text(&a));
+    Some((func, arg, preds))
+}
+
+/// The scalar a block value of filters alone folds to
+/// ([`print::outer_row_block`]): `exists { φ }` is `coalesce(φ, false)`,
+/// `count { φ }` is `if(coalesce(φ, false), 1, 0)`. `None` for any other
+/// block, and for an aggregate no fold equals.
+fn block_fold(block: &Pair<Rule>) -> Option<String> {
+    let (func, arg, preds) = filter_only_block(block)?;
+    let cond = format!("coalesce({}, false)", preds.join(" and "));
+    print::outer_row_block(func, arg.as_deref(), Some(&cond))
+}
+
+/// `Q017` for a block value (`exists`, `count` or an aggregate) whose every
+/// element is a filter: the fix writes the scalar the block folds to over
+/// the one row it tests ([`print::outer_row_block`]), `exists { φ }` as
+/// `coalesce(φ, false)` and `count { φ }` as `if(coalesce(φ, false), 1, 0)`.
+/// An aggregate no fold equals (`collect`, `stddev`, `percentile`) gets the
+/// refusal and no edit.
+fn filter_only_refusal(input: &str, block: &Pair<Rule>, span: (usize, usize)) -> Refusal {
+    let message = "a block holding only filters binds nothing and tests the row it is written on: the block is the scalar it folds to over that row";
+    match block_fold(block) {
+        Some(fold) => refusal(
+            input,
+            Q017,
+            message,
+            span,
+            vec![edit(span.0, span.1, fold)],
+            MACHINE,
+        ),
+        None => refusal_note(
+            input,
+            Q017,
+            message,
+            span,
+            "bind a name of the block's own, or write the filter in the `where`",
+        ),
+    }
 }
 
 /// A `not { … }` block's content rewritten as a block's braces hold it
@@ -2764,10 +2887,10 @@ impl Pieces {
         match k.as_rule() {
             Rule::filter_rec
                 if keyword_filter(&k).is_none()
-                    && expr(k.clone().into_inner().next().unwrap()).is_ok() =>
+                    && expression_but_for_folds(&k.clone().into_inner().next().unwrap()) =>
             {
                 let x = k.clone().into_inner().next().unwrap();
-                self.preds.push(pred_text(&x));
+                self.preds.push(moved_pred_text(&x));
                 note_problem(
                     &mut self.problem,
                     Q017,
@@ -2960,14 +3083,28 @@ fn build_elements(
     }
     if let Some((code, message, at)) = problem {
         let end = input[..region.1].trim_end().len();
-        let mut refused = refusal(
-            input,
-            code,
-            message,
-            (region.0, end),
-            vec![edit(region.0, end, rebuild(&pieces))],
-            MACHINE,
-        );
+        // A list whose every element is a predicate keeps no element once
+        // they move to the `where`, and a pattern holds at least one: no
+        // text of the grammar is the rewrite, so the refusal prints none
+        // (`optional { $p.age > 3 }` keeps every row either way).
+        let mut refused = if pieces.elements.is_empty() {
+            refusal_note(
+                input,
+                code,
+                message,
+                (region.0, end),
+                "a pattern holds at least one element: bind a name in it, or write the test as a predicate of the enclosing `where`",
+            )
+        } else {
+            refusal(
+                input,
+                code,
+                message,
+                (region.0, end),
+                vec![edit(region.0, end, rebuild(&pieces))],
+                MACHINE,
+            )
+        };
         refused.diagnostic.position = Some(Position::at(input, at));
         return Err(refused);
     }
@@ -4344,26 +4481,14 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
         match inner.as_rule() {
             Rule::expr => expr(inner),
             Rule::block_value => {
-                // A block holding only filters of outer names binds nothing
-                // to test: `exists { φ }` held on the rows its filter held
-                // on, a null one excluded, as `not { φ }` is
+                // A block holding only filters of outer names binds nothing:
+                // it reads the row it is written on where its filter holds,
+                // a null one excluded, as `not { φ }` is
                 // `not coalesce(φ, false)`. Moving the filter to the block's
-                // own `where` would leave a block of no element.
-                if child(&inner, Rule::kw_exists).is_some()
-                    && let Some(preds) = only_filters(&inner)
-                {
-                    return Err(refusal(
-                        input,
-                        Q017,
-                        "a block holding only filters tests no pattern: `exists { φ }` is `coalesce(φ, false)`",
-                        span,
-                        vec![edit(
-                            span.0,
-                            span.1,
-                            format!("coalesce({}, false)", preds.join(" and ")),
-                        )],
-                        MACHINE,
-                    ));
+                // own `where` would leave a block of no element, which does
+                // not parse; the fix writes the scalar the block folds to.
+                if filter_only_block(&inner).is_some() {
+                    return Err(filter_only_refusal(input, &inner, span));
                 }
                 let at = source_span(&inner);
                 let mut func = None;

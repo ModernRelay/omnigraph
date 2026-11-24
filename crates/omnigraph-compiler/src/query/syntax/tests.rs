@@ -266,6 +266,44 @@ fn a_predicate_inside_match_prints_the_where_after_the_braces() {
             "Q017",
             "query q() { match { $p: Person } where coalesce($p.age > 20, false) return { $p } }",
         ),
+        // Every block function folds the same way over the one row a block
+        // of filters tests, its own `where` included: `count` to
+        // `if(…, 1, 0)`, `count(e)` to the rows where `e` is not null, `min`
+        // and `max` to the value, `sum` and `avg` to it as `F64`. Moving the
+        // filter to the block's `where` would leave no element, which does
+        // not parse.
+        (
+            "query q() { match { $p: Person } where count { $p.age > 2 } != 0 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false), 1, 0) != 0 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where count { $p.age > 2 where $p.age < 9 } > 0 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2 and $p.age < 9, false), 1, 0) > 0 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where count($p.age) { $p.age > 2 } > 0 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false) and $p.age is not null, 1, 0) > 0 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where max($p.age) { $p.age > 2 } > 1 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false), $p.age, null) > 1 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where sum($p.age) { $p.age > 2 } > 1 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false), cast($p.age, F64), null) > 1 return { $p } }",
+        ),
+        // Written among the elements, one edit moves the comparison and
+        // folds the block in it.
+        (
+            "query q() { match { $p: Person, count { $p.age > 2 } != 0 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false), 1, 0) != 0 return { $p } }",
+        ),
         (
             "query q() { match { $p: Person $p knows $q } return { $q } }",
             "Q016",
@@ -285,6 +323,23 @@ fn a_predicate_inside_match_prints_the_where_after_the_braces() {
             parsed(intended),
             "{src}\n{fixed}"
         );
+    }
+}
+
+/// A pattern holds at least one element. A list whose every element is a
+/// predicate keeps none once they move to the `where`, so its refusal prints
+/// no edit rather than a text that does not parse, which another rule's fix
+/// would undo: `optional { $p.age > 3 }` keeps every row either way.
+#[test]
+fn a_pattern_left_with_no_element_prints_no_edit() {
+    for src in [
+        "query q() { match { $p: Person, optional { $p.age > 3 } } return { $p } }",
+        "query q() { match { $p: Person, optional { $p.age > 3  $p.name = \"a\" } } return { $p } }",
+        "query q() { match { 1 = 1 } return { 1 as one } }",
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q017", "{src}: {e:?}");
+        assert!(e.suggestion.is_none(), "{src}: {e:?}");
     }
 }
 
