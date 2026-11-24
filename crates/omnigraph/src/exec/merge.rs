@@ -5313,9 +5313,10 @@ decide_seam! {
 }
 
 decide_seam! {
-    /// The merge's input `__manifest` versions are tagged, before the probe
-    /// that proves them current, so a publication parked here makes the
-    /// input-capture check take its stale path.
+    /// The merge's input `__manifest` versions are tagged (unless this is a
+    /// dry run, which tags nothing), before the probe that proves them
+    /// current, so a publication parked here makes the input-capture check
+    /// take its stale path.
     pub static BRANCH_MERGE_POST_INPUT_TAGS_PRE_PROBE = ("branch_merge.post_input_tags_pre_probe", BranchMerge, [Fail]);
 }
 

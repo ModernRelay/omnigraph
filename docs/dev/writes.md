@@ -65,14 +65,7 @@ addressable commit id `hb1.<block>.<slot>.<nonce>`. The schema and branch gates 
 conflicting control operations. A merge holds its target's branch gate and
 per-table queues through publication, and its source's branch gate only until
 the source snapshot is captured, tagged and proved unchanged; it takes no
-per-table queue on the source. The proof is a probe after the tags exist: a
-current probe shows each tagged `__manifest` version is still the head. A stale
-probe re-reads both inputs and requires the same head, schema and table pins
-(`ensure_merge_input_unchanged`), so the tag can name a version that is no
-longer the head. A `cleanup` that runs in another process at that moment
-(`G2`) can remove that version. A later cleanup then fails on the tag until
-the merge releases it, and a merge `as commit` whose held source version was
-removed cannot be published. Both fail closed. Both gates are taken in sorted branch order, so
+per-table queue on the source. Both gates are taken in sorted branch order, so
 a merge whose source sorts first (`main` always does) holds the source gate
 while it waits for a target another merge holds. Once the source is captured,
 writes, index builds and deletes on the source do not wait for the merge, and
@@ -82,6 +75,15 @@ table pin, and nothing else: a publication that changed none of them, such as
 the branch row a create or delete adds to `main`'s catalog, moves `main`'s
 manifest version and does not refuse a merge into `main`
 (`ensure_merge_input_unchanged` in `exec/merge.rs`).
+
+The input proof is a probe taken after the merge-input tags exist: a current
+probe shows that each tagged `__manifest` version is still the head. A stale
+probe re-reads both inputs and requires the same head, schema and table pins
+(`ensure_merge_input_unchanged`), so a tag can name a version that is no longer
+the head. A `cleanup` that runs in another process at that moment (`G2`) can
+remove that version. A later cleanup then fails on the tag until the merge
+releases it, and a merge `as commit` whose held source version was removed
+cannot be published. Both results fail closed.
 
 Native branch creation uses an operation-local capture of the bound coordinator
 or that same one-entry cache after the control gates. Reuse
