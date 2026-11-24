@@ -875,3 +875,258 @@ pub async fn assert_branch_claim_adds_no_request_to_a_write(
         "a held bound branch is not probed: {owned:?}"
     );
 }
+
+// ── Delete-request counter (what a sweep sends to the store) ──
+
+/// The store requests a sweep issues, by kind. object_store 0.14 has no
+/// single-object delete in the trait: `ObjectStoreExt::delete` is a
+/// `delete_stream` of one path. `stream_sizes` holds the paths each
+/// `delete_stream` call named; S3 receives one `DeleteObjects` request per
+/// 1,000 of them (`aws::AmazonS3::delete_stream`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeleteRequests {
+    pub stream_sizes: Vec<u64>,
+    pub heads: u64,
+    pub gets: u64,
+    pub lists: u64,
+    pub writes: u64,
+}
+
+impl DeleteRequests {
+    /// Objects named for deletion.
+    pub fn objects_deleted(&self) -> u64 {
+        self.stream_sizes.iter().sum()
+    }
+
+    /// Delete calls that named one object each.
+    pub fn single_deletes(&self) -> u64 {
+        self.stream_sizes.iter().filter(|n| **n == 1).count() as u64
+    }
+
+    /// The delete requests an S3 store receives: one per 1,000 paths of each
+    /// stream.
+    pub fn s3_delete_requests(&self) -> u64 {
+        self.stream_sizes.iter().map(|n| n.div_ceil(1000)).sum()
+    }
+}
+
+/// A `WrappingObjectStore` that tells single deletes from delete streams and
+/// counts the paths each stream names. Install it as a probe's table and
+/// manifest wrapper around the operation under test.
+#[derive(Debug, Default, Clone)]
+pub struct DeleteRequestCounter(Arc<Mutex<DeleteRequests>>);
+
+impl DeleteRequestCounter {
+    pub fn snapshot(&self) -> DeleteRequests {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub fn reset(&self) {
+        *self.0.lock().unwrap() = DeleteRequests::default();
+    }
+}
+
+impl WrappingObjectStore for DeleteRequestCounter {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
+    }
+
+    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(DeleteCountingStore {
+            target,
+            counter: self.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct DeleteCountingStore {
+    target: Arc<dyn ObjectStore>,
+    counter: DeleteRequestCounter,
+}
+
+impl fmt::Display for DeleteCountingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DeleteCountingStore({})", self.target)
+    }
+}
+
+impl DeleteCountingStore {
+    fn tally(&self, record: impl FnOnce(&mut DeleteRequests)) {
+        record(&mut self.counter.0.lock().unwrap());
+    }
+}
+
+#[async_trait]
+impl ObjectStore for DeleteCountingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.tally(|c| c.writes += 1);
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.tally(|c| c.writes += 1);
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        if options.head {
+            self.tally(|c| c.heads += 1);
+        } else {
+            self.tally(|c| c.gets += 1);
+        }
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> OSResult<Vec<bytes::Bytes>> {
+        self.tally(|c| c.gets += 1);
+        self.target.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        use futures::StreamExt;
+        let counter = self.counter.clone();
+        let index = {
+            let mut c = counter.0.lock().unwrap();
+            c.stream_sizes.push(0);
+            c.stream_sizes.len() - 1
+        };
+        let counted = locations
+            .inspect(move |location| {
+                if location.is_ok() {
+                    counter.0.lock().unwrap().stream_sizes[index] += 1;
+                }
+            })
+            .boxed();
+        self.target.delete_stream(counted)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.tally(|c| c.lists += 1);
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.tally(|c| c.lists += 1);
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.tally(|c| c.lists += 1);
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OSResult<()> {
+        self.tally(|c| c.writes += 1);
+        self.target.copy_opts(from, to, options).await
+    }
+}
+
+/// One `cleanup --keep 1` measurement: the inserts before it, the manifests
+/// it removed and the store requests it issued.
+#[derive(Debug, Clone)]
+pub struct CleanupSweepCost {
+    pub commits: usize,
+    pub manifests_removed: u64,
+    pub requests: DeleteRequests,
+}
+
+/// Commit `commits` one-row inserts on `main`, then run `cleanup --keep 1`
+/// with every table and `__manifest` store it opens counted.
+pub async fn measure_cleanup_after_inserts(
+    db: &omnigraph::Session,
+    commits: usize,
+) -> CleanupSweepCost {
+    for index in 0..commits {
+        super::collector::insert_person(db, "main", &format!("sweep-{index}")).await;
+    }
+    let counter = DeleteRequestCounter::default();
+    let probes = QueryIoProbes {
+        table_wrapper: Some(Arc::new(counter.clone()) as Arc<dyn WrappingObjectStore>),
+        manifest_wrapper: Some(Arc::new(counter.clone()) as Arc<dyn WrappingObjectStore>),
+        ..Default::default()
+    };
+    let window_start = std::time::SystemTime::now();
+    let started = std::time::Instant::now();
+    let stats = with_query_io_probes(
+        probes,
+        Box::pin(db.cleanup_as(super::collector::keep_one(), None)),
+    )
+    .await
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    let cost = CleanupSweepCost {
+        commits,
+        manifests_removed: stats.iter().map(|row| row.manifests_removed).sum(),
+        requests: counter.snapshot(),
+    };
+    eprintln!(
+        "cleanup after {commits} commits: manifests removed {}, objects deleted {}, delete calls {}, \
+         single deletes {}, S3 delete requests {}, heads {}, gets {}, lists {}, wall {} ms \
+         from unix ms {}",
+        cost.manifests_removed,
+        cost.requests.objects_deleted(),
+        cost.requests.stream_sizes.len(),
+        cost.requests.single_deletes(),
+        cost.requests.s3_delete_requests(),
+        cost.requests.heads,
+        cost.requests.gets,
+        cost.requests.lists,
+        elapsed.as_millis(),
+        window_start
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    );
+    cost
+}
+
+/// The sweep's delete requests beyond one per removed manifest are flat in
+/// the files it removes: each table's freed files share one delete stream,
+/// while the manifests stay single deletes, oldest first.
+pub fn assert_sweep_delete_requests_flat_in_files(curve: &[CleanupSweepCost]) {
+    let (small, large) = (&curve[0], &curve[curve.len() - 1]);
+    let files = |cost: &CleanupSweepCost| cost.requests.objects_deleted() - cost.manifests_removed;
+    let file_requests =
+        |cost: &CleanupSweepCost| cost.requests.s3_delete_requests() - cost.manifests_removed;
+    assert!(
+        files(large) > files(small),
+        "the fixture must free more files after {} commits than after {}: {curve:?}",
+        large.commits,
+        small.commits
+    );
+    assert_eq!(
+        file_requests(large),
+        file_requests(small),
+        "the delete requests for freed files grew with the files: {curve:?}"
+    );
+    assert!(
+        file_requests(large) < files(large),
+        "freed files must share delete requests: {curve:?}"
+    );
+}

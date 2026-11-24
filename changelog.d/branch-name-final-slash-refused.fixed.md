@@ -1,0 +1,1 @@
+- `branch create` refuses a name that ends in `/`. It used to create a branch that `branch list` shows as `a/.<ULID>` and that `a/` does not name; delete such a branch by its listed name.
