@@ -6610,7 +6610,7 @@ async fn cold_csr_reader(dir: &tempfile::TempDir) -> Session {
 /// edge tables and built its own copy, and all but one were dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[serial]
-async fn concurrent_cold_traversals_build_the_adjacency_once() {
+async fn concurrent_cold_traversals_build_the_adjacency_once_issue_1539() {
     const READERS: usize = 8;
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
