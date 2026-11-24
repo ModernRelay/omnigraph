@@ -370,6 +370,28 @@ impl QueryDiagnostic {
 
     /// Every refusal of the pass: this one, then [`Self::further`], each
     /// without its further list.
+    /// This diagnostic, and each further one, with its suggestion's edits
+    /// of `source` rewritten to keep every comment they replace
+    /// ([`crate::query::syntax::trivia::keep_comments`]).
+    pub fn keep_comments(&mut self, source: &str) {
+        if let Some(suggestion) = self.suggestion.as_deref_mut()
+            && suggestion.edits.iter().all(|e| {
+                e.start <= e.end
+                    && e.end <= source.len()
+                    && source.is_char_boundary(e.start)
+                    && source.is_char_boundary(e.end)
+            })
+        {
+            suggestion.edits =
+                crate::query::syntax::trivia::keep_comments(source, &suggestion.edits);
+        }
+        if let Some(extra) = self.extra.as_deref_mut() {
+            for further in &mut extra.further {
+                further.keep_comments(source);
+            }
+        }
+    }
+
     pub fn all(&self) -> Vec<QueryDiagnostic> {
         let mut first = self.clone();
         let further = first

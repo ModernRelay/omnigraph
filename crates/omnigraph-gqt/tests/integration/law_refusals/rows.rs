@@ -1433,7 +1433,8 @@ query q() { match { $p: Person } return { $p.name } }"#,
   return { $p.name }
 }"#,
         message: "",
-        fix: Some("match { $p: Person, $q: Person }"),
+        // The comment stays after the element it followed.
+        fix: Some("match { $p: Person, // the person\n    $q: Person }"),
         intended: Some("query q() { match { $p: Person, $q: Person } return { $p.name } }"),
     },
     Row {
@@ -1562,7 +1563,10 @@ query q() { match { $p: Person } return { $p.name } }"#,
   return { $r.name }
 }"#,
         message: "",
-        fix: Some("match { $p: Person, $p knows $q, $q knows $r }"),
+        // Each comment stays after the element it followed.
+        fix: Some(
+            "match { $p: Person, // the person\n    $p knows $q, /* their friend */ $q knows $r }",
+        ),
         intended: Some(
             "query q() { match { $p: Person, $p knows $q, $q knows $r } return { $r.name } }",
         ),

@@ -114,9 +114,15 @@ pub(crate) fn source_canonical_forms(source: &str) -> Vec<(String, CanonicalForm
     decls
         .into_iter()
         .flat_map(|decl| {
-            canonical_forms(decl)
-                .into_iter()
-                .map(|form| (decl.name.clone(), form))
+            canonical_forms(decl).into_iter().map(|mut form| {
+                // The canonical form keeps every comment it replaces.
+                if let Some(edit) = form.edit.take() {
+                    form.edit = crate::query::syntax::trivia::keep_comments(source, &[edit])
+                        .into_iter()
+                        .next();
+                }
+                (decl.name.clone(), form)
+            })
         })
         .collect()
 }

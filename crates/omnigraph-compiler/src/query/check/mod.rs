@@ -99,7 +99,13 @@ pub fn check_file(
     let unit = source_unit(&decls);
     decls
         .iter()
-        .map(|d| (d.name.clone(), check_decl(catalog, &unit, d)))
+        .map(|d| {
+            let checked = check_decl(catalog, &unit, d).map_err(|mut refused| {
+                refused.keep_comments(file.source.as_str());
+                refused
+            });
+            (d.name.clone(), checked)
+        })
         .collect()
 }
 
@@ -116,7 +122,12 @@ pub fn check_syntax_decl(
         Body::Statement(_) => Vec::new(),
     };
     let unit = source_unit(&decls);
-    check_decl(catalog, &unit, syntax.decl()).map(|checked| checked.core)
+    check_decl(catalog, &unit, syntax.decl())
+        .map(|checked| checked.core)
+        .map_err(|mut refused| {
+            refused.keep_comments(file.source.as_str());
+            refused
+        })
 }
 
 /// [`check_syntax_decl`] over a declaration's header, its refusal as a

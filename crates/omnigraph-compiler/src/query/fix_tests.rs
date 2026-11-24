@@ -285,3 +285,62 @@ fn edition_2_shapes_converge_to_a_fixed_point() {
         assert_eq!(again.report.status, FixStatus::Unchanged, "{text}");
     }
 }
+
+/// A comment is trivia: the printed fixes keep every comment where it was
+/// written, never drop one, and never write code after a `//` on its line.
+/// A comment on the lines before a statement or an element moves with it,
+/// and one after a statement on its last line stays after it; the fixed
+/// text means what the same source without its comments fixes to.
+#[test]
+fn printed_fixes_keep_comments_where_they_were_written() {
+    let schema = "node Doc { name: String @key\n n: I32? }\nnode Note { text: String }\nedge Cites: Doc -> Note\n";
+    let catalog = build_catalog(&parse_schema(schema).unwrap()).unwrap();
+    for (source, fixed) in [
+        (
+            "query m() {\n  update Doc set { n: 5 } where n = 1\n  // keep me\n  insert Note { text: \"once\" }\n}\n",
+            "query m() {\n  // keep me\n  insert Note { text: \"once\" }\n  match { $x: Doc } where $x.n = 1  update $x set { n: 5 }\n}\n",
+        ),
+        (
+            "query m() {\n  update Doc set { n: 5 } where n = 1 // after update\n  insert Note { text: \"once\" }\n}\n",
+            "query m() {\n  insert Note { text: \"once\" }\n  match { $x: Doc } where $x.n = 1  update $x set { n: 5 } // after update\n}\n",
+        ),
+        (
+            "query m() {\n  update Doc set { n: 5 } where n = 1\n  // keep me\n  update Note set { text: \"b\" } where text = \"a\"\n}\n",
+            "query m() {\n  match { $x: Doc } where $x.n = 1  update $x set { n: 5 }\n  // keep me\n  match { $n: Note } where $n.text = \"a\"  update $n set { text: \"b\" }\n}\n",
+        ),
+        (
+            "query m() {\n  // first\n  update Doc set { n: 5 } where n = 1\n  insert Note { text: \"once\" }\n  // last\n}\n",
+            "query m() {\n  // first\n  insert Note { text: \"once\" }\n  match { $x: Doc } where $x.n = 1  update $x set { n: 5 }\n  // last\n}\n",
+        ),
+        (
+            "query q() {\n  match {\n    $d: Doc // the doc\n    $d.n > 2 /* small */\n  }\n  return { $d.name }\n}\n",
+            "query q() {\n  match { $d: Doc } where // the doc\n    $d.n > 2 /* small */ \n  return { $d.name }\n}\n",
+        ),
+    ] {
+        let out = fix_source(&catalog, source, FixOptions::default());
+        assert_eq!(
+            out.report.status,
+            FixStatus::Fixed,
+            "{source}\n{:?}",
+            out.report
+        );
+        let text = out.fixed.unwrap();
+        assert_eq!(text, fixed);
+        let plain = fix_source(
+            &catalog,
+            &crate::query::syntax::trivia::without_comments(source),
+            FixOptions::default(),
+        );
+        assert_eq!(
+            crate::query::syntax::parse::parse_source(&text).unwrap(),
+            crate::query::syntax::parse::parse_source(&plain.fixed.unwrap()).unwrap(),
+            "{text}"
+        );
+        assert_eq!(
+            fix_source(&catalog, &text, FixOptions::default())
+                .report
+                .status,
+            FixStatus::Unchanged
+        );
+    }
+}

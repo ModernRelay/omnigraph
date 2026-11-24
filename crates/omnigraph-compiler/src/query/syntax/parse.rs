@@ -82,8 +82,9 @@ pub(crate) fn refusal(
     edits: Vec<TextEdit>,
     applicability: Applicability,
 ) -> Refusal {
-    // A printed fix never holds two edits of one range.
-    let mut edits = non_overlapping(input.len(), &edits);
+    // A printed fix never holds two edits of one range, and keeps every
+    // comment the edits replace.
+    let mut edits = super::trivia::keep_comments(input, &non_overlapping(input.len(), &edits));
     let mut d = QueryDiagnostic::parse(code, message, Some(Position::at(input, span.0)));
     // A pest span may end after implicit whitespace; the construct ends at
     // its last token, and covers every edit that touches it.
@@ -812,6 +813,13 @@ fn duplicate_declarations(input: &str, names: &[DeclName]) -> Vec<Refusal> {
     out
 }
 
+/// `r` with its suggestion's edits of `input` keeping every comment they
+/// replace ([`super::trivia::keep_comments`]).
+fn kept(input: &str, mut r: Refusal) -> Refusal {
+    r.diagnostic.keep_comments(input);
+    r
+}
+
 /// The file and each declaration's name span, in source order.
 fn structural(input: &str) -> std::result::Result<(SourceFile, Vec<DeclName>), Refused> {
     LineIndex::scope(input, || structural_scoped(input))
@@ -823,7 +831,7 @@ fn structural_scoped(input: &str) -> std::result::Result<(SourceFile, Vec<DeclNa
     let room = crate::query::depth::nesting(input)
         .saturating_mul(crate::query::depth::GRAMMAR_BYTES_PER_LEVEL);
     let pairs = crate::stack::with_room(room, || QueryParser::parse(Rule::query_file, input))
-        .map_err(|error| Refused::Grammar(grammar_error(input, error)))?;
+        .map_err(|error| Refused::Grammar(kept(input, grammar_error(input, error))))?;
     let file = pairs.into_iter().next().expect("grammar: one query_file");
     let outer_ends = TOKEN_ENDS.with(|ends| std::mem::take(&mut *ends.borrow_mut()));
     // The habit pass reparses inside a parse: each parse records its own.
@@ -833,12 +841,13 @@ fn structural_scoped(input: &str) -> std::result::Result<(SourceFile, Vec<DeclNa
     // its keywords lowercased and `<>` written `!=` parses to the same
     // pairs at the same offsets.
     let normalized = lexical_respellings(input, &file);
+    let keep = |r: Refusal| kept(input, r);
     let built = if normalized == input {
         build_file(input, file)
     } else {
         let pairs =
             crate::stack::with_room(room, || QueryParser::parse(Rule::query_file, &normalized))
-                .map_err(|error| Refused::Grammar(grammar_error(input, error)))?;
+                .map_err(|error| Refused::Grammar(kept(input, grammar_error(input, error))))?;
         let file = pairs.into_iter().next().expect("grammar: one query_file");
         LineIndex::scope(&normalized, || build_file(&normalized, file))
     };
@@ -846,11 +855,16 @@ fn structural_scoped(input: &str) -> std::result::Result<(SourceFile, Vec<DeclNa
     let mut refusals = RECOVERED.with(|r| std::mem::replace(&mut *r.borrow_mut(), outer));
     TOKEN_ENDS.with(|ends| *ends.borrow_mut() = outer_ends);
     match built {
-        Ok(file) if refusals.is_empty() => Ok(file),
+        Ok((mut file, names)) if refusals.is_empty() => {
+            // The tree's text is the source as written, which the
+            // refusals' edits apply to.
+            file.source = SourceText(input.into());
+            Ok((file, names))
+        }
         built => {
             refusals.extend(built.err());
             refusals.sort_by_key(|r| r.span.map_or(0, |(start, _)| start));
-            Err(Refused::Builder(refusals))
+            Err(Refused::Builder(refusals.into_iter().map(keep).collect()))
         }
     }
 }
@@ -965,6 +979,7 @@ fn build_file(input: &str, file: Pair<Rule>) -> R<(SourceFile, Vec<DeclName>)> {
     Ok((
         SourceFile {
             settings,
+            source: SourceText(input.into()),
             body: match statement {
                 // The declarations before `explain` are the source unit its
                 // read's calls resolve in.
@@ -1242,7 +1257,7 @@ fn decl(pair: Pair<Rule>) -> R<Decl> {
                     vec![edit(
                         rs,
                         me,
-                        format!("{}\n  {}", mat.as_str().trim(), ret.as_str().trim()),
+                        format!("{}\n  {}", token_text(&mat).trim(), token_text(&ret).trim()),
                     )],
                     MACHINE,
                 ));
@@ -1319,7 +1334,10 @@ fn param(pair: Pair<Rule>) -> R<Param> {
     let core = type_ref.into_inner().next().unwrap();
     let type_name = match core.as_rule() {
         Rule::base_type => core.as_str().to_string(),
-        Rule::list_type => format!("[{}]", core.into_inner().next().unwrap().as_str().trim()),
+        Rule::list_type => format!(
+            "[{}]",
+            token_text(&core.into_inner().next().unwrap()).trim()
+        ),
         Rule::vector_type => format!("Vector({})", core.into_inner().next().unwrap().as_str()),
         other => unreachable!("grammar: type_ref holds no {other:?}"),
     };
@@ -1719,7 +1737,7 @@ fn read_tail(input: &str, body: &mut ReadBody, tail: Vec<Pair<Rule>>) -> R<()> {
                     .clone()
                     .into_inner()
                     .filter(|p| p.as_rule() == Rule::ordering)
-                    .map(|p| p.as_str().trim())
+                    .map(|p| token_text(&p).trim())
                     .collect();
                 return Err(refusal(
                     input,
@@ -1794,7 +1812,7 @@ fn ordering(pair: Pair<Rule>) -> R<Ordering> {
             vec![edit(
                 span.0,
                 span.1,
-                format!("{} {}", key.as_str().trim(), dir.as_str()),
+                format!("{} {}", token_text(&key).trim(), dir.as_str()),
             )],
             MACHINE,
         ));
@@ -1847,7 +1865,7 @@ fn projection(pair: Pair<Rule>) -> R<Projection> {
                 vec![edit(
                     span.0,
                     span.1,
-                    format!("{} as {}", value.as_str().trim(), name.as_str()),
+                    format!("{} as {}", token_text(&value).trim(), name.as_str()),
                 )],
                 MACHINE,
             ));
@@ -2208,7 +2226,7 @@ fn assignments_list<'i>(p: &Pair<'i, Rule>) -> Option<Pair<'i, Rule>> {
 fn assignments_text(pairs: &[Pair<Rule>]) -> String {
     pairs
         .iter()
-        .map(|p| p.as_str().trim().trim_end_matches(',').trim())
+        .map(|p| token_text(p).trim().trim_end_matches(',').trim())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2285,7 +2303,7 @@ fn statement_inner(input: &str, s: Pair<Rule>) -> R<Stmt> {
                     for p in body.into_inner() {
                         match p.as_rule() {
                             Rule::cypher_name => ty = Some(p.as_str().to_string()),
-                            Rule::cypher_prop => props.push(p.as_str().trim().to_string()),
+                            Rule::cypher_prop => props.push(token_text(&p).trim().to_string()),
                             _ => {}
                         }
                     }
@@ -2349,7 +2367,7 @@ fn statement_inner(input: &str, s: Pair<Rule>) -> R<Stmt> {
                     ));
                 }
                 var = Some(v);
-                parts.push(format!("{prop}: {}", value.as_str().trim()));
+                parts.push(format!("{prop}: {}", token_text(&value).trim()));
             }
             Err(refusal(
                 input,
@@ -2593,22 +2611,85 @@ fn where_statement(
                 .any(|c| c.as_rule() == Rule::variable))
         .then_some(inner)
     }
-    let (staying, grouped): (Vec<&Pair<Rule>>, Vec<&Pair<Rule>>) =
-        tail.iter().partition(|q| typed_where(q).is_none());
+    // Each statement of the tail keeps the comments written before it,
+    // wherever the rewrite moves it; the first statement's stay before the
+    // edit.
+    // The comments between statement `k - 1` and `k`: those on the line
+    // statement `k - 1` ends on trail it, the rest lead statement `k`.
+    let between = |k: usize| -> (Vec<String>, Vec<String>) {
+        let from = tend(input, &tail[k - 1]);
+        let to = tail[k].as_span().start();
+        super::trivia::comment_spans(input)
+            .into_iter()
+            .filter(|(s, e)| *s >= from && *e <= to)
+            .map(|(s, e)| (input[from..s].contains('\n'), input[s..e].to_string()))
+            .fold(
+                (Vec::new(), Vec::new()),
+                |(mut same, mut next), (later, c)| {
+                    if later {
+                        next.push(c)
+                    } else {
+                        same.push(c)
+                    }
+                    (same, next)
+                },
+            )
+    };
+    // Each statement of the tail keeps the comments written with it,
+    // wherever the rewrite moves it: those on the lines before it, and those
+    // after it on its last line. The comments before the first statement,
+    // and after the last on its line, stay outside the edit.
+    let leading = |k: usize| -> String {
+        if k == 0 {
+            return String::new();
+        }
+        super::trivia::carried(
+            &between(k).1,
+            super::trivia::indent_at(input, tail[k].as_span().start()),
+        )
+    };
+    let trailing = |k: usize| -> String {
+        if k + 1 >= tail.len() {
+            return String::new();
+        }
+        let same = between(k + 1).0;
+        if same.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", same.join(" "))
+        }
+    };
+    type Indexed<'a, 'i> = Vec<(usize, &'a Pair<'i, Rule>)>;
+    let (staying, grouped): (Indexed, Indexed) = tail
+        .iter()
+        .enumerate()
+        .partition(|(_, q)| typed_where(q).is_none());
     let groups: Vec<String> = if tail.is_empty() {
         vec![type_where_group(&s)]
     } else {
         grouped
             .iter()
-            .map(|q| type_where_group(&typed_where(q).unwrap()))
+            .map(|(k, q)| {
+                format!(
+                    "{}{}{}",
+                    leading(*k),
+                    type_where_group(&typed_where(q).unwrap()),
+                    trailing(*k)
+                )
+            })
             .collect()
     };
-    let end = tail
-        .last()
-        .map_or(span.1, |q| input[..q.as_span().end()].trim_end().len());
+    let end = tail.last().map_or(span.1, |q| tend(input, q));
     let text: Vec<String> = staying
         .iter()
-        .map(|q| input[q.as_span().start()..tend(input, q)].to_string())
+        .map(|(k, q)| {
+            format!(
+                "{}{}{}",
+                leading(*k),
+                &input[q.as_span().start()..tend(input, q)],
+                trailing(*k)
+            )
+        })
         .chain(groups)
         .collect();
     refusal(
@@ -2667,7 +2748,8 @@ fn type_where_group(s: &Pair<Rule>) -> String {
 /// position written as a property of `$var`; the endpoint names `from` and
 /// `to` become `$var.@src` and `$var.@dst`.
 fn qualify_bare_names(pair: &Pair<Rule>, var: &str) -> String {
-    let source = pair.as_str();
+    // The construct's tokens, never the comment after its last one.
+    let source = token_text(pair);
     let base = pair.as_span().start();
     let mut edits: Vec<(usize, usize, String)> = pair
         .clone()
@@ -2973,6 +3055,11 @@ fn inner_text(p: &Pair<Rule>) -> String {
 struct Pieces {
     elements: Vec<String>,
     preds: Vec<String>,
+    /// The comments written before the element being read, which the
+    /// first piece it writes carries ([`super::trivia::carried`]).
+    leading: String,
+    /// Whether the last piece written is a conjunct of the `where`.
+    last_is_pred: bool,
     problem: Option<(QueryCode, String, usize)>,
     /// The names the elements before the one being read bind.
     bound_before: BTreeSet<String>,
@@ -2995,6 +3082,22 @@ fn note_problem(
 }
 
 impl Pieces {
+    /// An element of the rebuilt list, after the comments written before
+    /// the element it came from.
+    fn push_element(&mut self, text: String) {
+        let lead = std::mem::take(&mut self.leading);
+        self.elements.push(format!("{lead}{text}"));
+        self.last_is_pred = false;
+    }
+
+    /// A conjunct of the rebuilt `where`, after the comments written before
+    /// the element it came from.
+    fn push_pred(&mut self, text: String) {
+        let lead = std::mem::take(&mut self.leading);
+        self.preds.push(format!("{lead}{text}"));
+        self.last_is_pred = true;
+    }
+
     /// A predicate written among the elements, as `text`: a conjunct of the
     /// `where`. A block in it that names a name only a later element binds
     /// read that name as its own, since a block written among the elements
@@ -3009,12 +3112,12 @@ impl Pieces {
             self.bound_after.get(n).is_some_and(|c| *c > 0) && !self.bound_before.contains(n)
         };
         if !names.iter().any(later) {
-            self.preds.push(text);
+            self.push_pred(text);
             return;
         }
         let name = fresh_var("block");
-        self.elements.push(format!("let ${name} = {text}"));
-        self.preds.push(format!("${name}"));
+        self.push_element(format!("let ${name} = {text}"));
+        self.push_pred(format!("${name}"));
     }
 
     /// The elements of an `elements` pair, a missing comma among them a
@@ -3074,12 +3177,37 @@ impl Pieces {
                             at,
                         );
                     }
+                    let input = input_of(list);
+                    let from = last_end.unwrap_or(list.as_span().start());
+                    self.leading = super::trivia::carried(
+                        &super::trivia::comments_in(input, from, c.as_span().start()),
+                        super::trivia::indent_at(input, c.as_span().start()),
+                    );
                     last_end = Some(token_end(&c));
                     if self.item(&c) && own.is_none() {
                         own = Some(c);
                     }
+                    self.leading.clear();
                 }
                 _ => {}
+            }
+        }
+        // The comments after the last element, up to the list's end, stay
+        // after the last piece it wrote.
+        if let Some(from) = last_end {
+            let input = input_of(list);
+            let after = super::trivia::comments_after(input, from);
+            if !after.is_empty() {
+                let indent = super::trivia::indent_at(input, from).to_string();
+                let tail = format!(" {}", super::trivia::carried(&after, &indent));
+                let last = if self.last_is_pred {
+                    self.preds.last_mut()
+                } else {
+                    self.elements.last_mut()
+                };
+                if let Some(last) = last {
+                    last.push_str(&tail);
+                }
             }
         }
         own
@@ -3138,13 +3266,13 @@ impl Pieces {
                 let mut inner = k.clone().into_inner();
                 let var = inner.next().unwrap().as_str();
                 let ty = inner.next().unwrap().as_str();
-                self.elements.push(format!("{var}: {ty}"));
+                self.push_element(format!("{var}: {ty}"));
                 for pm in child(&k, Rule::prop_match_list).unwrap().into_inner() {
                     let mut kv = pm.into_inner();
                     let key = kv.next().unwrap().as_str();
                     let value = kv.next().unwrap();
                     self.preds
-                        .push(format!("{var}.{key} = {}", value.as_str().trim()));
+                        .push(format!("{var}.{key} = {}", token_text(&value).trim()));
                 }
                 note_problem(
                     &mut self.problem,
@@ -3157,20 +3285,20 @@ impl Pieces {
                 let mut inner = k.clone().into_inner();
                 let var = inner.next().unwrap().as_str();
                 let ty = inner.next().unwrap().as_str();
-                self.elements.push(format!("{var}: {ty}"));
+                self.push_element(format!("{var}: {ty}"));
                 for item in child(&k, Rule::brace_items_rec).unwrap().into_inner() {
                     let it = item.into_inner().next().unwrap();
                     let mut parts = it.clone().into_inner();
                     let key = parts.next().unwrap().as_str();
                     match it.as_rule() {
                         Rule::prop_match => {
-                            let value = parts.next().unwrap().as_str().trim();
-                            self.preds.push(format!("{var}.{key} = {value}"));
+                            let value = token_text(&parts.next().unwrap()).trim();
+                            self.push_pred(format!("{var}.{key} = {value}"));
                         }
                         _ => {
                             let op = parts.next().unwrap().as_str();
-                            let value = parts.next().unwrap().as_str().trim();
-                            self.preds.push(format!("{var}.{key} {op} {value}"));
+                            let value = token_text(&parts.next().unwrap()).trim();
+                            self.push_pred(format!("{var}.{key} {op} {value}"));
                         }
                     }
                 }
@@ -3186,13 +3314,13 @@ impl Pieces {
                 let var = inner.next().unwrap().as_str();
                 let head = inner.next().unwrap();
                 let ty = head.as_str().trim_end_matches('(').trim();
-                self.elements.push(format!("{var}: {ty}"));
+                self.push_element(format!("{var}: {ty}"));
                 for pm in child(&k, Rule::prop_match_list).unwrap().into_inner() {
                     let mut kv = pm.into_inner();
                     let key = kv.next().unwrap().as_str();
                     let value = kv.next().unwrap();
                     self.preds
-                        .push(format!("{var}.{key} = {}", value.as_str().trim()));
+                        .push(format!("{var}.{key} = {}", token_text(&value).trim()));
                 }
                 note_problem(
                     &mut self.problem,
@@ -3210,7 +3338,7 @@ impl Pieces {
                     "exists"
                 };
                 self.preds
-                    .push(format!("{w} {{ {} }}", pattern.as_str().trim()));
+                    .push(format!("{w} {{ {} }}", token_text(&pattern).trim()));
                 note_problem(
                     &mut self.problem,
                     Q014,
@@ -3225,7 +3353,7 @@ impl Pieces {
                     self.preds
                         .push(pred_text(&ik.clone().into_inner().next().unwrap()));
                 } else {
-                    self.elements.push(token_text(&inner).to_string());
+                    self.push_element(token_text(&inner).to_string());
                 }
                 note_problem(
                     &mut self.problem,
@@ -3238,9 +3366,9 @@ impl Pieces {
             | Rule::from_clause
             | Rule::optional_block
             | Rule::binding
-            | Rule::traversal => self.elements.push(token_text(e).to_string()),
+            | Rule::traversal => self.push_element(token_text(e).to_string()),
             _ => {
-                self.elements.push(token_text(e).to_string());
+                self.push_element(token_text(e).to_string());
                 return true;
             }
         }
@@ -3520,7 +3648,7 @@ fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal
         .clone()
         .into_inner()
         .filter(|p| p.as_rule() == Rule::with_item)
-        .map(|p| p.as_str().trim())
+        .map(|p| token_text(&p).trim())
         .collect();
     let message = "`with` is Cypher's; GQ draws an intermediate result with `from { match { … } return { … } }`";
     let Some(first) = before.first() else {
@@ -3617,7 +3745,7 @@ fn element(pair: Pair<Rule>, before: &[Pair<Rule>]) -> R<Element> {
                     vec![edit(
                         span.0,
                         span.1,
-                        format!("from {}", rel.as_str().trim()),
+                        format!("from {}", token_text(&rel).trim()),
                     )],
                     MACHINE,
                 ))
@@ -3663,7 +3791,7 @@ fn element(pair: Pair<Rule>, before: &[Pair<Rule>]) -> R<Element> {
                         span.1,
                         format!(
                             "from {name}({})",
-                            args.map(|a| a.as_str().trim().to_string())
+                            args.map(|a| token_text(&a).trim().to_string())
                                 .unwrap_or_default()
                         ),
                     )],
@@ -3930,7 +4058,7 @@ fn cypher_pattern(c: Pair<Rule>) -> Refusal {
                     match q.as_rule() {
                         Rule::ident => name = Some(q.as_str().to_string()),
                         Rule::cypher_name => ty = Some(q.as_str().to_string()),
-                        Rule::cypher_prop => props.push(q.as_str().trim().to_string()),
+                        Rule::cypher_prop => props.push(token_text(&q).trim().to_string()),
                         _ => {}
                     }
                 }
@@ -4027,7 +4155,7 @@ fn list_to_rows(c: Pair<Rule>) -> Refusal {
             vec![edit(
                 span.0,
                 span.1,
-                format!("from {}", rel.as_str().trim()),
+                format!("from {}", token_text(rel).trim()),
             )],
             REVIEW,
         );
@@ -4036,7 +4164,7 @@ fn list_to_rows(c: Pair<Rule>) -> Refusal {
     // relation from a list: both readings are printed.
     match parts.iter().find(|p| p.as_rule() == Rule::expr) {
         Some(l) => {
-            let l = l.as_str().trim();
+            let l = token_text(l).trim();
             refusal_note(
                 input,
                 Q012,
@@ -4225,7 +4353,7 @@ fn mixed_args(list: &Pair<Rule>, items: &[Pair<Rule>]) -> Refusal {
     let text: Vec<&str> = pos
         .iter()
         .chain(opts.iter())
-        .map(|p| p.as_str().trim())
+        .map(|p| token_text(p).trim())
         .collect();
     refusal(
         input,
@@ -4319,7 +4447,7 @@ fn expr(pair: Pair<Rule>) -> R<Expr> {
                             Q005,
                             format!(
                                 "invalid integer: `-{}` is below the smallest I64",
-                                operand.as_str().trim()
+                                token_text(&operand).trim()
                             ),
                             &operand,
                         )
@@ -4342,7 +4470,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
         let span = (pair.as_span().start(), tend(input, &pair));
         let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
         let left_pair = parts[0].clone();
-        let left_source = left_pair.as_str().trim().to_string();
+        let left_source = token_text(&left_pair).trim().to_string();
         let Some(op) = parts.get(1).cloned() else {
             return expr(left_pair);
         };
@@ -4363,12 +4491,12 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                     let mut terms = vec![format!(
                         "{left_source} {} {}",
                         op.as_str(),
-                        right_pair.as_str().trim()
+                        token_text(&right_pair).trim()
                     )];
-                    let mut prev = right_pair.as_str().trim().to_string();
+                    let mut prev = token_text(&right_pair).trim().to_string();
                     let items: Vec<Pair<Rule>> = chain.clone().into_inner().collect();
                     for pair in items.chunks(2) {
-                        let r = pair[1].as_str().trim().to_string();
+                        let r = token_text(&pair[1]).trim().to_string();
                         terms.push(format!("{prev} {} {r}", pair[0].as_str()));
                         prev = r;
                     }
@@ -4381,7 +4509,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                         MACHINE,
                     );
                 }
-                let right_source = right_pair.as_str().trim().to_string();
+                let right_source = token_text(&right_pair).trim().to_string();
                 let ranges = vec![written_range(&left_pair), written_range(&right_pair)];
                 Ok(Expr::Compare {
                     op: comp_op(op.as_str()),
@@ -4400,7 +4528,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                     let items: Vec<&str> = list
                         .clone()
                         .into_inner()
-                        .map(|p| p.as_str().trim())
+                        .map(|p| token_text(&p).trim())
                         .collect();
                     let (s, e) = span_of(&list);
                     return Err(refusal(
@@ -4412,7 +4540,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                         MACHINE,
                     ));
                 }
-                let list_source = list.as_str().trim().to_string();
+                let list_source = token_text(&list).trim().to_string();
                 let mut ranges = vec![written_range(&left_pair), written_range(&list)];
                 // A written list's elements, each a range of its own; the checker
                 // reads them only when the list operand is that literal.
@@ -4448,7 +4576,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
             Rule::not_in_rec => {
                 let right = op.clone().into_inner().nth(2).unwrap();
                 whole(
-                    format!("not {left_source} in {}", right.as_str().trim()),
+                    format!("not {left_source} in {}", token_text(&right).trim()),
                     "`not` comes before the comparison: `not x in list`",
                     Q014,
                     MACHINE,
@@ -4456,8 +4584,8 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
             }
             Rule::between_rec => {
                 let mut b = op.clone().into_inner();
-                let lo = b.nth(1).unwrap().as_str().trim().to_string();
-                let hi = b.nth(1).unwrap().as_str().trim().to_string();
+                let lo = token_text(&b.nth(1).unwrap()).trim().to_string();
+                let hi = token_text(&b.nth(1).unwrap()).trim().to_string();
                 // Parenthesized: the comparison may be the operand of a `not`.
                 whole(
                     format!("({left_source} >= {lo} and {left_source} <= {hi})"),
@@ -4468,7 +4596,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
             }
             Rule::like_rec => {
                 let pat = op.clone().into_inner().nth(1).unwrap();
-                let text = pat.as_str().trim();
+                let text = token_text(&pat).trim();
                 let inner = text
                     .strip_prefix('"')
                     .and_then(|t| t.strip_suffix('"'))
@@ -4504,7 +4632,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
             Rule::starts_with_words_rec => {
                 let mut w = op.clone().into_inner();
                 let word = w.next().unwrap().as_str().to_ascii_lowercase();
-                let right = w.nth(1).unwrap().as_str().trim().to_string();
+                let right = token_text(&w.nth(1).unwrap()).trim().to_string();
                 let func = if word == "ends" {
                     "ends_with"
                 } else {
@@ -4528,7 +4656,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                 at: SourceSpan {
                     operands: vec![
                         left_source.to_string(),
-                        parts[2].as_str().trim().to_string(),
+                        token_text(&parts[2]).trim().to_string(),
                     ],
                     ..SourceSpan::of(
                         input,
@@ -4865,7 +4993,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
                         vec![edit(
                             span.0,
                             span.1,
-                            format!("{} is not null", args[0].as_str().trim()),
+                            format!("{} is not null", token_text(&args[0]).trim()),
                         )],
                         MACHINE,
                     ));
@@ -4873,7 +5001,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
                 let positional: Vec<&str> = args
                     .iter()
                     .filter(|a| a.as_rule() == Rule::positional)
-                    .map(|a| a.as_str().trim())
+                    .map(|a| token_text(a).trim())
                     .collect();
                 // An infix operator written as a call: the fix writes it infix.
                 if matches!(word, "and" | "or" | "in")
@@ -4919,7 +5047,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
                     )
                     .map(|w| w.as_str().to_string())
                     .or_else(|| {
-                        let t = one.as_str().trim();
+                        let t = token_text(one).trim();
                         (t.starts_with('"') && t.ends_with('"') && t.len() > 2)
                             .then(|| gq_edge_name(&t[1..t.len() - 1]))
                     }),

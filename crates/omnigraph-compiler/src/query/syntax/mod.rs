@@ -18,6 +18,7 @@ pub mod parse;
 pub mod print;
 pub mod recover;
 pub mod statement;
+pub mod trivia;
 
 #[cfg(test)]
 mod tests;
@@ -27,11 +28,32 @@ mod tests;
 #[grammar = "query/syntax/grammar.pest"]
 pub(crate) struct QueryParser;
 
-/// A parsed source: its settings lines and its body.
+/// A parsed source: its settings lines and its body, and the text it was
+/// parsed from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceFile {
     pub settings: Vec<SettingStmt>,
     pub body: Body,
+    pub source: SourceText,
+}
+
+/// The text a [`SourceFile`] was parsed from: what a refusal's byte-range
+/// edits apply to, and whose comments they keep
+/// ([`trivia::keep_comments`]). No part of tree equality: two spellings of
+/// one tree are equal trees.
+#[derive(Debug, Clone, Default)]
+pub struct SourceText(pub std::sync::Arc<str>);
+
+impl PartialEq for SourceText {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl SourceText {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

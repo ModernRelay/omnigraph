@@ -133,6 +133,73 @@ fn ran_steps(sections: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
+/// `None` when `step`, with a comment written at three gaps between its
+/// tokens (on a line of its own, at the end of a line, and as a block
+/// comment), fixes as `plain`, its fix without them, does: the same status,
+/// each declaration's typed IR, and every comment kept unchanged.
+fn commented_fix_holds(
+    catalog: &Catalog,
+    step: &str,
+    plain: &omnigraph_compiler::FixOutcome,
+    n: usize,
+) -> Option<String> {
+    use crate::law_refusals::{comment_gaps, with_comment};
+    use omnigraph_compiler::query::syntax::trivia::comment_spans;
+    let gaps = comment_gaps(step);
+    if gaps.len() < 3 {
+        return None;
+    }
+    let mut written = step.to_string();
+    // From the last gap down, so the earlier offsets hold.
+    for (style, at) in [gaps.len() * 3 / 4, gaps.len() / 2, gaps.len() / 4]
+        .into_iter()
+        .enumerate()
+    {
+        written = with_comment(&written, gaps[at], style, n * 3 + style);
+    }
+    let out = fix_source(catalog, &written, FixOptions { review: true });
+    if out.report.status != plain.report.status {
+        return Some(format!(
+            "status {:?}, without the comments {:?}\n{written}",
+            out.report.status, plain.report.status
+        ));
+    }
+    let text = out.fixed.clone().unwrap_or_else(|| written.clone());
+    // Kept, not reordered: a comment inside a construct a fix rebuilds is
+    // written at the construct's start, before one the fix copies.
+    let comments = |t: &str| -> Vec<String> {
+        let mut c: Vec<String> = comment_spans(t)
+            .into_iter()
+            .map(|(s, e)| t[s..e].to_string())
+            .collect();
+        c.sort();
+        c
+    };
+    if comments(&text) != comments(&written) {
+        return Some(format!(
+            "comments {:?} became {:?}\n{text}",
+            comments(&written),
+            comments(&text)
+        ));
+    }
+    if let Some(want) = &plain.fixed {
+        let got: Vec<_> = typed(catalog, &text)
+            .into_iter()
+            .map(|(n, r)| (n, r.map_err(|_| ())))
+            .collect();
+        let want: Vec<_> = typed(catalog, want)
+            .into_iter()
+            .map(|(n, r)| (n, r.map_err(|_| ())))
+            .collect();
+        if got != want {
+            return Some(format!(
+                "another typed IR than without the comments\n{text}"
+            ));
+        }
+    }
+    None
+}
+
 /// One file of text: its path relative to its tree, its schema and the
 /// sources of the steps it ran.
 struct Unit {
@@ -445,6 +512,7 @@ struct Counts {
     ir_equal: usize,
     keyed_insert: usize,
     listed: usize,
+    commented: usize,
 }
 
 #[test]
@@ -488,6 +556,7 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
     let mut warnings: Vec<String> = Vec::new();
     let mut counts = Counts::default();
     let mut paired_in_tree = 0;
+    let mut comment_violations: Vec<String> = Vec::new();
     for unit in edition_2 {
         let catalog = unit.schema.as_deref().and_then(catalog_of);
         let Some(catalog) = catalog else {
@@ -508,6 +577,14 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
                 _ => {}
             }
             let out = fix_source(&catalog, step, FixOptions { review: true });
+            // Every fourth text, with three comments written between its
+            // tokens, fixes as it does without them.
+            if counts.texts % 4 == 0
+                && let Some(violation) = commented_fix_holds(&catalog, step, &out, counts.texts)
+            {
+                comment_violations.push(format!("{}: {violation}", unit.path));
+            }
+            counts.commented += usize::from(counts.texts % 4 == 0);
             match out.report.status {
                 FixStatus::Unchanged => {
                     counts.compiled_as_written += 1;
@@ -656,6 +733,15 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
     for warning in &warnings {
         println!("warning: a difference no RFC rule sanctions: {warning}");
     }
+    println!(
+        "texts fixed again with comments written between their tokens: {}",
+        counts.commented
+    );
+    assert!(
+        comment_violations.is_empty(),
+        "texts whose fix changes with comments written between their tokens:\n{}",
+        comment_violations.join("\n")
+    );
     assert!(
         counts.does_not_converge.is_empty(),
         "printed fixes that do not converge:\n{}",

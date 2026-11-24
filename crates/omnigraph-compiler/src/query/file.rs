@@ -481,6 +481,7 @@ impl QueryDecl {
         use super::syntax::{Body, Decl, DeclBody, ReadBody, SourceFile};
         let file = SourceFile {
             settings: Vec::new(),
+            source: Default::default(),
             body: Body::Decls(vec![Decl {
                 name: String::new(),
                 at: Default::default(),

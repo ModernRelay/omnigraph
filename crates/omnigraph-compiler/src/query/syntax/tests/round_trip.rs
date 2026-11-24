@@ -741,6 +741,7 @@ fn file() -> impl Strategy<Value = (SourceFile, u64)> {
                 SourceFile {
                     settings: Vec::new(),
                     body,
+                    source: Default::default(),
                 },
                 seed,
             )

@@ -85,6 +85,13 @@ usually joins them through an edge.
 A file whose fixes write a text seen before, or still change after 16 passes,
 does not converge and is left as it was.
 
+A comment, `// …` or `/* … */`, survives every fix. A comment on the lines
+before a statement or an element moves with it when a fix reorders them, and
+one after a statement on its last line stays after it; one inside a
+construct a fix rebuilds is written where the construct starts, on a line of
+its own if it stood on one; and a `// …` comment always ends its line, so no
+code a fix writes is read as part of it.
+
 `--json` prints lint's report of the fixed text with a `fix` object:
 `status` (`fixed`, `unchanged`, `unfixed` or `does_not_converge`), `written`,
 `passes`, `applied` (each code with its count), `applied_for_review`,

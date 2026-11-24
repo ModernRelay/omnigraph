@@ -728,6 +728,7 @@ const BLOCK_CONTEXTS: &[&str] = &[
     "match { $p: Person } where exists { ⟨⟩ }",
     "match { $p: Person } where not exists { ⟨⟩ }",
     "match { $p: Person } where count { ⟨⟩ } != 0",
+    "match { $p: Person } where count { ⟨⟩ } > 0",
     "match { $p: Person } where count($p.age) { ⟨⟩ } > 0",
     "match { $p: Person } where sum($p.age) { ⟨⟩ } > 1",
     "match { $p: Person } where avg($p.age) { ⟨⟩ } > 1",
@@ -761,54 +762,94 @@ const BLOCK_CONTENTS: &[&str] = &[
     "count { $p.age > 3 } > 0",
 ];
 
+/// Write bodies the respelling map rewrites, alone and beside statements
+/// that select nothing and groups that already open with `match`: each a
+/// write's body, under [`rows::CHECKED`].
+const STATEMENT_BODIES: &[&str] = &[
+    "update Person set { age: 1 } where age > 3  insert Company { slug: \"s\", name: \"n\" }",
+    "update Person set { age: 1 } where age > 3  update Company set { name: \"m\" } where slug = \"s\"",
+    "delete Person where age > 3",
+    "insert Company { slug: \"s\", name: \"n\" }  update Person set { age: 1 } where age > 3  insert Company { slug: \"t\", name: \"n\" }",
+    "match { $p: Person } where $p.age > 3  update $p set { age: 1 }  update Company set { name: \"m\" } where slug = \"s\"",
+    "match { $p: Person  $p.age > 3 }  update $p set { city: \"x\" }",
+];
+
+/// Reads whose ranking `T65` draws with `from`, under [`rows::CHECKED`].
+const RANKED_READS: &[&str] = &[
+    "query q($v: Vector(3)) { match { $d: Doc  $d.year > 2000 } return { $d.title, nearest($d.embedding, $v) } order { nearest($d.embedding, $v) } limit 3 }",
+    "query q($s: String) { match { $p: Person, $p authored $d } where $d.year > 1 return { $d.title } order { bm25($d.body, $s) } limit 3 }",
+    "query q($s: String, $v: Vector(3)) { match { $p: Person  $p authored $d } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s), 60) } limit 3 }",
+];
+
+/// The sources the fixed-point and comment laws run over: every block
+/// context holding every content of [`BLOCK_CONTENTS`], alone (`true`) or
+/// followed by another (`false`), every write body of [`STATEMENT_BODIES`]
+/// and every read of [`RANKED_READS`] (`true`).
+fn fix_law_sources() -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    for context in BLOCK_CONTEXTS {
+        for a in BLOCK_CONTENTS {
+            out.push((
+                format!(
+                    "query q() {{ {} return {{ $p.name }} }}",
+                    context.replace("⟨⟩", a)
+                ),
+                true,
+            ));
+            for b in BLOCK_CONTENTS {
+                out.push((
+                    format!(
+                        "query q() {{ {} return {{ $p.name }} }}",
+                        context.replace("⟨⟩", &format!("{a}  {b}"))
+                    ),
+                    false,
+                ));
+            }
+        }
+    }
+    for body in STATEMENT_BODIES {
+        out.push((format!("query w() {{ {body} }}"), true));
+    }
+    for read in RANKED_READS {
+        out.push((read.to_string(), true));
+    }
+    out
+}
+
 /// The printed fixes reach one fixed point however two refusals of a block
-/// meet: every block context of [`BLOCK_CONTEXTS`] holding every content of
-/// [`BLOCK_CONTENTS`], alone or followed by another, either compiles, stops
-/// at a refusal with no fix, or converges, with or without the fixes for
-/// review; and `lint --fix` on what it wrote changes nothing. Two rules whose
-/// fixes undo each other, one moving a filter into a block's `where` and the
-/// other deleting a `where` that has no element before it, fail here. The
-/// rows' stricter rule, that every pass leaves fewer refusals
-/// ([`converge`]), does not hold of a compound: the pass that repairs an
-/// element list can reveal a refusal of a block inside it, in the same
-/// stage.
+/// meet: every source of [`fix_law_sources`] either compiles, stops at a
+/// refusal with no fix, or converges, with or without the fixes for review;
+/// and `lint --fix` on what it wrote changes nothing. Two rules whose fixes
+/// undo each other, one moving a filter into a block's `where` and the other
+/// deleting a `where` that has no element before it, fail here. The rows'
+/// stricter rule, that every pass leaves fewer refusals ([`converge`]), does
+/// not hold of a compound: the pass that repairs an element list can reveal
+/// a refusal of a block inside it, in the same stage.
 #[test]
 fn printed_fixes_reach_one_fixed_point_in_every_block_context() {
     use omnigraph_compiler::{FixOptions, FixStatus, fix_source};
     let cat = catalog(rows::CHECKED);
-    let mut contents: Vec<String> = BLOCK_CONTENTS.iter().map(|c| c.to_string()).collect();
-    for a in BLOCK_CONTENTS {
-        for b in BLOCK_CONTENTS {
-            contents.push(format!("{a}  {b}"));
-        }
-    }
     let mut violations = Vec::new();
     let mut fixed = 0;
-    for context in BLOCK_CONTEXTS {
-        for content in &contents {
-            let source = format!(
-                "query q() {{ {} return {{ $p.name }} }}",
-                context.replace("⟨⟩", content)
-            );
-            for review in [false, true] {
-                let out = fix_source(&cat, &source, FixOptions { review });
-                match out.report.status {
-                    FixStatus::DoesNotConverge => {
-                        violations.push(format!("{source}\n  does not converge: {:?}", out.report))
-                    }
-                    FixStatus::Fixed => {
-                        fixed += 1;
-                        let text = out.fixed.unwrap();
-                        let again = fix_source(&cat, &text, FixOptions { review });
-                        if again.report.status != FixStatus::Unchanged {
-                            violations.push(format!(
-                                "{source}\n  fixed to\n{text}\n  which the fixes change again: {:?}",
-                                again.report
-                            ));
-                        }
-                    }
-                    FixStatus::Unchanged | FixStatus::Unfixed => {}
+    for (source, _) in fix_law_sources() {
+        for review in [false, true] {
+            let out = fix_source(&cat, &source, FixOptions { review });
+            match out.report.status {
+                FixStatus::DoesNotConverge => {
+                    violations.push(format!("{source}\n  does not converge: {:?}", out.report))
                 }
+                FixStatus::Fixed => {
+                    fixed += 1;
+                    let text = out.fixed.unwrap();
+                    let again = fix_source(&cat, &text, FixOptions { review });
+                    if again.report.status != FixStatus::Unchanged {
+                        violations.push(format!(
+                            "{source}\n  fixed to\n{text}\n  which the fixes change again: {:?}",
+                            again.report
+                        ));
+                    }
+                }
+                FixStatus::Unchanged | FixStatus::Unfixed => {}
             }
         }
     }
@@ -818,6 +859,160 @@ fn printed_fixes_reach_one_fixed_point_in_every_block_context() {
         "{} sources break the fixed-point rule:\n{}",
         violations.len(),
         violations.join("\n")
+    );
+}
+
+/// Where a comment can be written in `source`: the start of every run of
+/// whitespace after the declaration's first `{`, outside strings and
+/// comments.
+pub(crate) fn comment_gaps(source: &str) -> Vec<usize> {
+    let open = source.find('{').unwrap_or(0);
+    let inside: Vec<(usize, usize)> =
+        omnigraph_compiler::query::syntax::trivia::comment_spans(source);
+    let mut out = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut previous_space = false;
+    for (i, c) in source.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            previous_space = false;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+            previous_space = false;
+            continue;
+        }
+        let space = c.is_whitespace();
+        if space && !previous_space && i > open && !inside.iter().any(|(s, e)| *s <= i && i < *e) {
+            out.push(i);
+        }
+        previous_space = space;
+    }
+    out
+}
+
+/// `source` with comment `n` written at `gap`: on a line of its own, at the
+/// end of the line before (`// …` with code after it moved to the next
+/// line), or a block comment between two tokens.
+pub(crate) fn with_comment(source: &str, gap: usize, style: usize, n: usize) -> String {
+    let comment = match style % 3 {
+        0 => format!("\n// c{n}\n"),
+        1 => format!(" // c{n}\n"),
+        _ => format!(" /* c{n} */ "),
+    };
+    format!("{}{comment}{}", &source[..gap], &source[gap..])
+}
+
+/// Whether the comment `text` holds at `span` stands on a line of its own.
+fn own_line(text: &str, span: (usize, usize)) -> bool {
+    let line = text[..span.0].rfind('\n').map_or(0, |n| n + 1);
+    text[line..span.0].trim().is_empty()
+}
+
+/// A comment is trivia, and the printed fixes keep it where it was written.
+/// Every source of [`fix_law_sources`] with one comment written at a gap
+/// between its tokens, on a line of its own, at the end of a line with code
+/// after it, or as a block comment (every gap and style for a source alone,
+/// one for a compound), fixes as the same source without it does: the same
+/// status, the fixed text parsing to the same tree, every comment kept
+/// unchanged (never dropped, and never extended over code after it on its
+/// line; a comment inside a construct a fix rebuilds is written at its
+/// start, so the order of comments may change), and a comment written on
+/// its own line still on its own line.
+#[test]
+fn printed_fixes_keep_every_comment_where_it_was_written() {
+    use omnigraph_compiler::query::syntax::trivia::comment_spans;
+    use omnigraph_compiler::{FixOptions, FixStatus, fix_source};
+    let cat = catalog(rows::CHECKED);
+    let mut violations = Vec::new();
+    let mut checked = 0;
+    for (k, (source, alone)) in fix_law_sources().into_iter().enumerate() {
+        let gaps = comment_gaps(&source);
+        if gaps.is_empty() {
+            continue;
+        }
+        let base = fix_source(&cat, &source, FixOptions { review: true });
+        let variants: Vec<(usize, usize)> = if alone {
+            gaps.iter()
+                .flat_map(|g| (0..3).map(move |s| (*g, s)))
+                .collect()
+        } else {
+            vec![(gaps[k % gaps.len()], k)]
+        };
+        for (gap, style) in variants {
+            checked += 1;
+            let written = with_comment(&source, gap, style, k);
+            let out = fix_source(&cat, &written, FixOptions { review: true });
+            let mut fail = |why: String| violations.push(format!("{written}\n  {why}"));
+            if out.report.status != base.report.status {
+                fail(format!(
+                    "status {:?} where the source without the comment is {:?}",
+                    out.report.status, base.report.status
+                ));
+                continue;
+            }
+            let text = out.fixed.clone().unwrap_or_else(|| written.clone());
+            if let (FixStatus::Fixed, Some(want)) = (out.report.status, &base.fixed)
+                && let Err(e) = same_tree(&text, want)
+            {
+                fail(format!("fixed to another tree: {e}"));
+                continue;
+            }
+            // Kept, not reordered: a comment inside a construct a fix
+            // rebuilds is written at the construct's start, before one the
+            // fix copies.
+            let comments = |t: &str| -> Vec<String> {
+                let mut c: Vec<String> = comment_spans(t)
+                    .into_iter()
+                    .map(|(s, e)| t[s..e].to_string())
+                    .collect();
+                c.sort();
+                c
+            };
+            if comments(&text) != comments(&written) {
+                fail(format!(
+                    "comments {:?} became {:?} in\n{text}",
+                    comments(&written),
+                    comments(&text)
+                ));
+                continue;
+            }
+            for before in comment_spans(&written) {
+                let comment = &written[before.0..before.1];
+                let Some(after) = comment_spans(&text)
+                    .into_iter()
+                    .find(|(s, e)| &text[*s..*e] == comment)
+                else {
+                    continue;
+                };
+                if own_line(&written, before) && !own_line(&text, after) {
+                    fail(format!(
+                        "`{}` left its own line in\n{text}",
+                        &written[before.0..before.1]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(checked > 1000, "{checked} variants");
+    assert!(
+        violations.is_empty(),
+        "{} of {checked} commented sources break the comment rule:\n{}",
+        violations.len(),
+        violations
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
