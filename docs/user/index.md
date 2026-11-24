@@ -39,6 +39,7 @@ deployment.
 - [Managed organization members and invitations](cli/managed-team.md)
 - [HTTP server](operations/server.md)
 - [MCP](operations/mcp.md)
+- [Connect Claude to Omnigraph Cloud](operations/claude.md)
 - [Troubleshooting](operations/troubleshooting.md)
 
 ## Operate a deployment
