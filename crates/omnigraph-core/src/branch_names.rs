@@ -100,6 +100,48 @@ pub fn ensure_logical_branch_name(logical: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse, by the name as written, a new logical branch name that no native
+/// ref can carry. A create mints the native ref `{logical}.{ULID}`, and
+/// Lance's `check_valid_branch` admits a ref only when every `/`-separated
+/// segment is non-empty and holds letters, digits (of any script), `.`, `-`
+/// and `_`, and the ref holds no `..`; the suffix appends `.` to the last
+/// segment, so a name ending in `.` would hold `..`. The rule is Lance's,
+/// read through the suffix, and one stricter: a name ending in `/` is
+/// refused although Lance admits `{name}.{ULID}`, because
+/// [`split_native_branch_name`] cannot split that ref back to the name, so
+/// the branch would list under its native ref and resolve by no name. Lance's
+/// other checks cannot fire on a minted ref and so are not repeated here: it
+/// always ends in the 26-character ULID, so it never ends in `.lock` and is
+/// never `main`, and `\` is already refused as a character. Only a create
+/// applies the rule: reads keep resolving every live name, legacy refs
+/// (native == logical) included.
+pub fn ensure_new_branch_name(logical: &str) -> Result<()> {
+    ensure_logical_branch_name(logical)?;
+    let refuse = |rule: String| {
+        Err(OmniError::manifest(format!(
+            "branch name '{logical}' {rule}"
+        )))
+    };
+    if let Some(refused) = logical
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/')))
+    {
+        return refuse(format!(
+            "contains {refused:?}; only letters, digits, '.', '-', '_' and '/' are allowed"
+        ));
+    }
+    if logical.split('/').any(str::is_empty) {
+        return refuse("has an empty segment; '/' must separate non-empty segments".to_string());
+    }
+    if logical.contains("..") {
+        return refuse("contains '..'".to_string());
+    }
+    if logical.ends_with('.') {
+        return refuse("ends in '.'".to_string());
+    }
+    Ok(())
+}
+
 pub const MERGE_INPUT_PREFIX: &str = "__omnigraph_merge_input_v1_";
 
 /// Ownership encoded before the tag's single create-if-absent publication.
@@ -486,6 +528,49 @@ mod tests {
         ensure_logical_branch_name("feature").unwrap();
         ensure_logical_branch_name("release.1.2").unwrap();
         let err = ensure_logical_branch_name("feature.01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap_err();
+        assert!(err.to_string().contains("incarnation-shaped"), "{err}");
+    }
+
+    /// The create rule is Lance's ref rule read through the incarnation
+    /// suffix: over every short name from an alphabet of legal and refused
+    /// characters, a name passes exactly when Lance admits its native ref and
+    /// that ref splits back to the name. Only a trailing `/` separates the two.
+    #[test]
+    fn new_branch_names_pass_exactly_when_lance_admits_their_native_ref() {
+        let alphabet = ['a', 'é', '1', '.', '-', '_', '/', ' ', '~', '\\', '^'];
+        let mut names = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            frontier = frontier
+                .iter()
+                .flat_map(|prefix| alphabet.iter().map(move |c| format!("{prefix}{c}")))
+                .collect();
+            names.extend(frontier.iter().cloned());
+        }
+        let incarnation = mint_incarnation();
+        for name in names.iter().skip(1) {
+            let native = native_branch_name(name, &incarnation);
+            let lance = lance::dataset::refs::check_valid_branch(&native);
+            let splits_back = split_native_branch_name(&native).0 == name;
+            assert_eq!(splits_back, !name.ends_with('/'), "'{name}'");
+            let ours = ensure_new_branch_name(name);
+            assert_eq!(
+                ours.is_ok(),
+                lance.is_ok() && splits_back,
+                "'{name}': ours {ours:?}, Lance {lance:?}"
+            );
+            if let Err(error) = ours {
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("branch name '{name}' ")),
+                    "{error}"
+                );
+            }
+        }
+        ensure_new_branch_name("é/ü").unwrap();
+        ensure_new_branch_name("release.1.2").unwrap();
+        let err = ensure_new_branch_name("feature.01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap_err();
         assert!(err.to_string().contains("incarnation-shaped"), "{err}");
     }
 
