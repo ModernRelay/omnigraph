@@ -712,7 +712,13 @@ edition 2 did" a check: for every `.gqt` case present at the pinned edition-2
 commit (`EDITION_2_SOURCE_COMMIT` in `ci.yml`, the merge base with `main`) and
 in this tree, under the same path or one git's rename detection pairs, it runs
 the commit's text of the case with that commit's `omnigraph-gqt` and this
-tree's text with this tree's runner. Both texts get one rewrite, the same on
+tree's text with this tree's runner. Edition-2 text found after that commit,
+such as a repro of a respelling defect, lives in this tree under
+`crates/omnigraph-gqt/edition-2/`: each case there is the edition-2 side of the
+case of the same path under `cases/`, its hand rewrite, and a case there with
+no hand rewrite fails the script. Write the hand rewrite as the text `lint
+--fix --review-fixes` writes for each step, with the edition-2 case's
+expectations, which the edition-2 runner blesses (`OMNIGRAPH_GQ_BLESS=1`). Both texts get one rewrite, the same on
 both sides: the `--- runner` section becomes a single deterministic-simulation
 environment (in-memory store, seed 0), because only that environment's trace
 (`--trace`) records each step's result: a read's Arrow schema and rows, a
@@ -756,15 +762,17 @@ earlier run left under `--work`.
 in `omnigraph-gqt`'s `integration` binary is the gate for `omnigraph lint
 --fix`: it gives every query step edition 2 ran in the commit's tree
 (`OMNIGRAPH_EDITION_2_TREE`; the GQT and benchmark corpora and the `.gq`
-files beside a `.pg`) to the fix loop with review fixes applied, requires
+files beside a `.pg`), and every case under `crates/omnigraph-gqt/edition-2/`,
+to the fix loop with review fixes applied, requires
 every one whose refusals print fixes to converge, and compares each
 declaration's typed IR with the hand rewrite of the same case and name in
 this tree. A difference passes as a row of
 `crates/omnigraph-gqt/lint-fix-edition-2.tsv` naming a reason (`REASONS` in
 the test; an `open:` reason prints a warning), and a row that matches nothing
 fails; a keyed `insert` the fix leaves, where the hand rewrite wrote the
-respelling map's `replace`, is recognized by applying that row. Without the
-tree it skips; `OMNIGRAPH_REQUIRE_EDITION_2=1` fails instead.
+respelling map's `replace`, is recognized by applying that row. The in-tree
+cases run on every run; without the pinned tree it skips that corpus and says
+so, and `OMNIGRAPH_REQUIRE_EDITION_2=1` fails instead.
 
 Fix coverage over edition-2 text is an instrument beside it,
 `fix_coverage::fix_coverage_over_edition_2_text` in `omnigraph-gqt`'s
