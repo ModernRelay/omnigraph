@@ -656,18 +656,33 @@ policy.
 
 ### Bound branch create
 
-Lance 13 `Dataset::create_branch` hands its `CommitBuilder` the dataset's object
-store and store parameters but not its session. The commit writes through that
-store, but its existence probe of the new branch location
-(`DatasetBuilder::load`, a `_versions/` listing) opens on a default session,
-whose registry builds a client from the store parameters alone. A bound handle's
+A Lance 13 `CommitBuilder` handed no session runs on `Session::default()`, a
+fresh registry of Lance's own providers: for a URI destination, the existence
+probe of the new location (`DatasetBuilder::load`, a `_versions/` listing) and
+the dataset the commit returns build their clients there. That registry knows
+nothing of the graph's captured binding, its storage IO scope or, in a test or
+DST build, a simulated S3 bucket, whose name it would build a real client for
+(issue 1541). Every commit the engine makes therefore starts from
+`lance_commit::commit_builder`, whose `CommitDestination` carries the session:
+an opened dataset's own, or one named beside a URI. A branch's tree at or above
+format 18 (`lance_clone::create_branch_tree`) commits on its source's session.
+
+Lance 13 `Dataset::create_branch`, which the ref protocol below format 18 still
+calls (`lance_clone::create_branch`), hands its `CommitBuilder` the dataset's
+object store and store parameters but not its session, and the ref it writes
+next (`Branches::create`) is not public. Its commit writes through the
+dataset's store, but its probe opens on the default session. A bound handle's
 datasets carry no provider options (its registry supplies them), so
 `lance_clone::create_branch` passes the captured binding's options as those
 parameters; without them the probe reaches the ambient provider configuration.
-Drop the parameters at the bump whose `create_branch` passes the dataset's
-session.
+The probe still runs outside the storage IO scope, and a graph below format 18
+on a simulated bucket cannot create a branch. Drop the parameters, and close
+both gaps, at the bump whose `create_branch` passes the dataset's session.
 
-**Owners:** `bound_storage.rs` (S3-configured decoy)
+**Owners:**
+`lance_surface_guards.rs::create_branch_commits_its_tree_on_a_default_session_lance_13`
+(goes red at that bump), `bound_storage.rs` (S3-configured decoy),
+`issue_1541_branch_operations_on_a_simulated_bucket.gqt`
 
 ### Table forks
 
