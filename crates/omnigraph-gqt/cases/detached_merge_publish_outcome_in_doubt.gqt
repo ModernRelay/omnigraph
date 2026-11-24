@@ -7,6 +7,12 @@ environments:
   - target: omnigraph-engine-dst
     storage: in-memory-object-store
     seeds: [0, 42]
+  - target: omnigraph-engine-dst
+    storage: s3-compatible
+    seeds: [0]
+  - target: omnigraph-engine-dst
+    storage: google-cloud-storage
+    seeds: [0]
 
 --- schema
 node Person {
