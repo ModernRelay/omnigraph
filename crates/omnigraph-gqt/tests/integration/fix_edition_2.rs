@@ -23,9 +23,12 @@
 //! must be a row of `lint-fix-edition-2.tsv` naming one of [`REASONS`]; a
 //! row that matches no difference fails too.
 //!
-//! Without the tree the test prints a skip line; with
-//! `OMNIGRAPH_REQUIRE_EDITION_2=1`, as the `Cross-Edition Comparison` job
-//! sets, it fails instead.
+//! Edition-2 text written after the pinned commit lives in this tree under
+//! [`EDITION_2_DIR`] (a repro of a respelling defect), each case paired with
+//! the case of the same path under `cases/`, its hand rewrite. Those cases
+//! run on every run. Without the pinned tree the test skips the pinned
+//! corpus and says so; with `OMNIGRAPH_REQUIRE_EDITION_2=1`, as the
+//! `Cross-Edition Comparison` job sets, it fails instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -55,12 +58,24 @@ const REASONS: &[(&str, &str)] = &[
         "The hand rewrite of a body of several statements reused one variable name in each group, where the group rule's fix binds a fresh one per group; the typed IR differs in the names only.",
     ),
     (
+        "map.statement-ahead-of-the-group",
+        "The fix of a statement `where` keeps each later statement's own rows: a statement that selects nothing stays ahead of the group the fix opens. The hand rewrite wrote it inside that group, where it runs once per selected row; a key equality selects one row there, so the rows are the same.",
+    ),
+    (
+        "hand.block-kept-as-a-let",
+        "A block among the elements naming a name only a later element binds stays in place as a `let` in both texts; the fix names it `$block` and keeps a `not` inside it, the hand rewrite named it for what it tests and renamed the block's own names. The case's expectations hold for both.",
+    ),
+    (
         "open:fix-conjunct-order",
         "Applied pass by pass, the printed fixes of a property brace and of filters among nested blocks write the `where` conjuncts in another order than section 6's map (the brace's conjuncts leading, the rest in written order); the hand rewrite follows the map.",
     ),
 ];
 
 const TABLE: &str = "lint-fix-edition-2.tsv";
+
+/// Edition-2 text kept in this tree, each case the edition-2 side of the
+/// case of the same path under `cases/`.
+const EDITION_2_DIR: &str = "crates/omnigraph-gqt/edition-2";
 
 fn files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -327,9 +342,37 @@ fn declarations(catalog: &Catalog, steps: &[(String, String)]) -> Declarations {
     out
 }
 
-/// The counterpart in this tree of an edition-2 path: the same path, else
-/// the one file of the same name (preferring the path less a `v2/` part).
+/// The cases under [`EDITION_2_DIR`] of the tree at `root`.
+fn in_tree_edition_2(root: &Path) -> Vec<Unit> {
+    let mut cases = Vec::new();
+    files(&root.join(EDITION_2_DIR), "gqt", &mut cases);
+    cases.sort();
+    cases
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let sections = sections(&text);
+            Unit {
+                path: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned(),
+                schema: schema_of(&sections),
+                steps: ran_steps(&sections),
+            }
+        })
+        .collect()
+}
+
+/// The counterpart in this tree of an edition-2 path: for a case under
+/// [`EDITION_2_DIR`], the case of the same path under `cases/`; else the same
+/// path, else the one file of the same name (preferring the path less a
+/// `v2/` part).
 fn counterpart<'a>(path: &str, current: &'a BTreeMap<String, Unit>) -> Option<&'a Unit> {
+    if let Some(rest) = path.strip_prefix(EDITION_2_DIR) {
+        return current.get(&format!("crates/omnigraph-gqt/cases{rest}"));
+    }
     if let Some(unit) = current.get(path) {
         return Some(unit);
     }
@@ -406,31 +449,45 @@ struct Counts {
 
 #[test]
 fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
-    let Some(tree) = std::env::var_os("OMNIGRAPH_EDITION_2_TREE").map(PathBuf::from) else {
-        assert!(
-            std::env::var("OMNIGRAPH_REQUIRE_EDITION_2").as_deref() != Ok("1"),
-            "OMNIGRAPH_REQUIRE_EDITION_2=1 needs OMNIGRAPH_EDITION_2_TREE, the edition-2 checkout"
-        );
-        println!("skipped: OMNIGRAPH_EDITION_2_TREE names no edition-2 tree");
-        return;
-    };
     let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let current: BTreeMap<String, Unit> = units(&here)
         .into_iter()
         .map(|u| (u.path.clone(), u))
         .collect();
+    let mut edition_2 = in_tree_edition_2(&here);
+    assert!(
+        !edition_2.is_empty(),
+        "{EDITION_2_DIR} holds no edition-2 case"
+    );
+    let pinned = std::env::var_os("OMNIGRAPH_EDITION_2_TREE").map(PathBuf::from);
+    match &pinned {
+        Some(tree) => {
+            let pinned = units(tree);
+            assert!(
+                pinned.len() > 100,
+                "{} holds {} units: not the edition-2 tree",
+                tree.display(),
+                pinned.len()
+            );
+            edition_2.extend(pinned);
+        }
+        None => {
+            assert!(
+                std::env::var("OMNIGRAPH_REQUIRE_EDITION_2").as_deref() != Ok("1"),
+                "OMNIGRAPH_REQUIRE_EDITION_2=1 needs OMNIGRAPH_EDITION_2_TREE, the edition-2 checkout"
+            );
+            println!(
+                "skipped the pinned corpus: OMNIGRAPH_EDITION_2_TREE names no edition-2 tree; {} in-tree cases run",
+                edition_2.len()
+            );
+        }
+    }
     let rows = table();
     let mut matched: BTreeSet<Key> = BTreeSet::new();
     let mut unlisted: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut counts = Counts::default();
-    let edition_2 = units(&tree);
-    assert!(
-        edition_2.len() > 100,
-        "{} holds {} units: not the edition-2 tree",
-        tree.display(),
-        edition_2.len()
-    );
+    let mut paired_in_tree = 0;
     for unit in edition_2 {
         let catalog = unit.schema.as_deref().and_then(catalog_of);
         let Some(catalog) = catalog else {
@@ -486,10 +543,13 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
                 }
             }
         }
+        let in_tree = unit.path.starts_with(EDITION_2_DIR);
         let Some(other) = counterpart(&unit.path, &current) else {
+            assert!(!in_tree, "{}: no hand rewrite under cases/", unit.path);
             counts.no_counterpart += respelled.iter().filter(|s| !s.is_empty()).count();
             continue;
         };
+        paired_in_tree += usize::from(in_tree);
         let Some(other_catalog) = other.schema.as_deref().and_then(catalog_of) else {
             continue;
         };
@@ -564,7 +624,13 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
             }
         }
     }
-    let stale: Vec<&Key> = rows.keys().filter(|k| !matched.contains(k)).collect();
+    // Without the pinned tree, its rows match nothing and are not stale.
+    let stale: Vec<&Key> = rows
+        .keys()
+        .filter(|k| !matched.contains(k))
+        .filter(|k| pinned.is_some() || k.case.starts_with(EDITION_2_DIR))
+        .collect();
+    println!("in-tree edition-2 cases paired with their hand rewrite: {paired_in_tree}");
     let stuck: usize = counts.stuck.values().sum();
     let stuck_without_review: usize = counts.stuck_without_review.values().sum();
     println!(

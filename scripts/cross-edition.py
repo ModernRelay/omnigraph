@@ -6,7 +6,11 @@ base with main (`EDITION_2_SOURCE_COMMIT` in `.github/workflows/ci.yml`); it
 links that commit's engine, so it answers every case exactly as main did. The
 current side is this tree's runner. For each case path present at both
 commits, each side runs its own text of the case: the merge base's case with
-the edition-2 runner, this tree's case with the current one.
+the edition-2 runner, this tree's case with the current one. Edition-2 text
+written after the merge base lives in this tree under `EDITION_2_DIR`, each
+case paired with the case of the same path under `CASES_DIR`, its hand
+rewrite; the edition-2 runner runs the first and the current runner the
+second, as for a case of the merge base.
 
 Both texts get one rewrite before they run: their `--- runner` section is
 replaced by a single deterministic-simulation environment (in-memory store,
@@ -49,6 +53,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES_DIR = "crates/omnigraph-gqt/cases"
+# Edition-2 text kept in this tree (a repro of a respelling defect found
+# after the merge base), each case the edition-2 side of the case of the same
+# path under CASES_DIR.
+EDITION_2_DIR = "crates/omnigraph-gqt/edition-2"
 TABLE = ROOT / "crates/omnigraph-gqt/cross-edition.tsv"
 ASPECTS = ("columns", "types", "rows", "affected", "error", "steps", "requests")
 
@@ -416,7 +424,33 @@ def paired_cases(base_ref: str) -> list[tuple[str, str]]:
         parts = line.split("\t")
         if parts[0].startswith("R") and len(parts) == 3 and parts[2] in current:
             pairs[parts[1]] = parts[2]
+    pairs.update(in_tree_pairs(ROOT))
     return sorted(pairs.items(), key=lambda pair: pair[1])
+
+
+def in_tree_pairs(root: Path) -> dict[str, str]:
+    """(edition-2 path, current path) of every case under `EDITION_2_DIR`:
+    the case of the same path under `CASES_DIR` is its hand rewrite, which
+    must exist."""
+    pairs = {}
+    for path in sorted((root / EDITION_2_DIR).rglob("*.gqt")):
+        relative = path.relative_to(root / EDITION_2_DIR)
+        current = Path(CASES_DIR) / relative
+        if not (root / current).is_file():
+            raise SystemExit(
+                f"{path.relative_to(root)} has no hand rewrite at {current}: "
+                "an in-tree edition-2 case pairs with the case of the same path under the corpus"
+            )
+        pairs[str(path.relative_to(root))] = str(current)
+    return pairs
+
+
+def edition_2_text(base_ref: str, path: str) -> str:
+    """A pair's edition-2 text: this tree's file under `EDITION_2_DIR`, else
+    the merge base's case."""
+    if path.startswith(EDITION_2_DIR + "/"):
+        return (ROOT / path).read_text()
+    return base_text(base_ref, path)
 
 
 def base_text(base_ref: str, path: str) -> str:
@@ -568,7 +602,7 @@ def run(args: argparse.Namespace) -> int:
         old_path, relative = pair
         old = run_side(
             edition_2_runner,
-            base_text(args.base_ref, old_path),
+            edition_2_text(args.base_ref, old_path),
             work / "edition-2",
             relative,
             args.timeout,
@@ -783,6 +817,23 @@ class SelfTest(unittest.TestCase):
         self.assertEqual(align(old, new), {(1, ""): (1, ""), (3, ""): (2, ""), (4, ""): (3, "")})
         renamed = [((1, ""), "Query:a"), ((2, ""), "Query:b2"), ((3, ""), "Mutate:c")]
         self.assertEqual(align(old, renamed)[(2, "")], (2, ""))
+
+    def test_an_in_tree_edition_2_case_pairs_with_its_hand_rewrite(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / EDITION_2_DIR).mkdir(parents=True)
+            (root / CASES_DIR).mkdir(parents=True)
+            (root / EDITION_2_DIR / "a.gqt").write_text(self.CASE)
+            (root / CASES_DIR / "a.gqt").write_text(self.CASE)
+            self.assertEqual(
+                in_tree_pairs(root), {f"{EDITION_2_DIR}/a.gqt": f"{CASES_DIR}/a.gqt"}
+            )
+            (root / EDITION_2_DIR / "b.gqt").write_text(self.CASE)
+            with self.assertRaises(SystemExit):
+                in_tree_pairs(root)
+
+    def test_every_in_tree_edition_2_case_has_its_hand_rewrite(self):
+        in_tree_pairs(ROOT)
 
     def test_signature_names_the_declaration(self):
         text = 'operation: ordinal=4 line=Some(9) binding=None generation=0 expected=Query(QueryStep { ordinal: 4, source: "q", name: "rows" })'

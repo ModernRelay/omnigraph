@@ -17,6 +17,7 @@ expression_type_errors.gqt	7	error	language.diagnostic	Both refuse a bare proper
 expression_type_errors.gqt	8	error	results.mutation-where-lexical	Edition 2 refused a search predicate in a write's `where` (T44); edition 3 accepts the lexical predicate there and the write succeeds.
 expression_type_errors.gqt	9	error	language.diagnostic	Both refuse `count` in an assignment value; edition 3 names the aggregate rule (T8) where edition 2 raised T44.
 expression_type_errors.gqt	13	error	language.accepted-item-beside-aggregates	A Boolean return item beside an aggregate, refused by edition 2 (T9), is accepted.
+fix_draws_rrf_with_its_fusion_constant.gqt	2	requests	open:index-probe-where-edition-2-scanned	The rewrite ranks the whole `Doc` type and joins the `About` triple after the fused score, probing indexes the edition-2 plan did not read: three index reads and the exact lexical scan's one data read exceed edition 2's 11 requests.
 inline_list_match_by_membership.gqt	3	error	language.diagnostic	Both refuse list equality; the property brace becomes the equality `$x.tags = [...]`, refused by the comparison code T7 where edition 2's brace raised T3.
 issue_566_order_key_binds_to_return_item.gqt	6	error	language.accepted-order-key-not-returned	An order key that is not a return item, refused by edition 2 (T42), is accepted.
 issue_613_self_loop_pinned_hop_distance.gqt	2	rows	results.hop-range-self-loop	`knows{1,2}` from bob no longer returns bob through bob's self-loop.
