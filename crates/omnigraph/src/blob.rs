@@ -2119,6 +2119,7 @@ mod tests {
         for scheme in EXTERNAL_BASE_SCHEMES {
             for root in [
                 "az://container/c",
+                "gs://bucket/graph",
                 "memory://graph",
                 "shared-memory://universe/g",
             ] {
@@ -2129,7 +2130,7 @@ mod tests {
                     "{root}"
                 );
             }
-            for root in ["gs://bucket/graph", "og://graph", "S3://bucket/graph"] {
+            for root in ["og://graph", "S3://bucket/graph"] {
                 assert!(
                     matches!(
                         NormalizedExternalUri::storage_root_forms(root, scheme),
