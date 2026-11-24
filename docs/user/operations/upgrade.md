@@ -14,7 +14,7 @@ CLI configuration, HTTP/MCP, and client compatibility changes.
 
 ## Storage upgrade
 
-`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v18 in place, and stamps a v14 to v17 graph to v18 in place by the route `stamp-v14-to-v18`: one metadata-only commit per live branch still below v18, main first, then the branch ref files removed, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again. From v18 a branch exists as an entry of `main`'s catalog, which `main`'s commit records for every branch the graph holds, with one retired row for each retired branch, so `work.rows_written` counts both and can be larger than the branch count, and the ref files under `_refs/branches/` are gone once the run completes (`work.refs_unlinked`); see [branching](../branching/index.md).
+`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v18 in place, and stamps a v14 to v17 graph to v18 in place by the route `stamp-v14-to-v18`: one metadata-only commit per live branch still below v18, main first, then the branch ref files removed, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again. From v18 a branch exists as an entry of `main`'s catalog, which `main`'s commit records for every branch the graph holds, with one retired row for each retired ref (a deleted branch whose commits are kept, or a 0.11.x schema-apply lock that a finished apply or the upgrade retired), so `work.rows_written` counts both and can be larger than the branch count, and the ref files under `_refs/branches/` are gone once the run completes (`work.refs_unlinked`); see [branching](../branching/index.md).
 Branches, commit ids, commit history and table data are kept; no table row is
 rewritten. Only main builds from 2026-10-01 to 2026-10-04 wrote v13.
 
@@ -67,7 +67,8 @@ anything under `__history/`.
 | `recovery_required` | the graph is pending or holds leftover recovery files; follow `recovery.action` | 1 |
 
 The report's `work` object counts what the run read and writes: `live_refs`,
-`retired_refs` (deleted branches whose commits are kept), `orphan_writers`,
+`retired_refs` (deleted branches whose commits are kept, and 0.11.x
+schema-apply locks that a finished apply or the upgrade retired), `orphan_writers`,
 `legacy_commits`, `bookkeeping_versions`, `absent_parents`, `data_files`,
 `id_shards`, `writer_shards`, `schema_contents`, `census_reads`,
 `census_cells`, `legacy_bytes` and `table_opens` (the tables of a v8 or v9
