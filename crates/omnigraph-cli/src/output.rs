@@ -2541,7 +2541,7 @@ mod tests {
             line: 1,
             column: 30,
         };
-        let one_way = "one-way: Doc.emb (line 1, column 30): an explicit `distance` on a Vector, `l2` included\nbinaries before this release refuse the whole graph after this apply, and only a backup taken before the upgrade restores it\n";
+        let one_way = "one-way: Doc.emb (line 1, column 30): an explicit `distance` on a Vector, `l2` included\nbinaries before this release refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored\n";
         for (plan, expected) in [
             (
                 SchemaMigrationPlan {

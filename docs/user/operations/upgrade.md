@@ -17,7 +17,7 @@ This release parses GQ 3 only: a stored query or `.gq` file written for an
 earlier release fails to compile, and [Upgrading queries to GQ
 3](../queries/upgrading-to-gq3.md) maps each older form to its GQ 3 form. Validate stored queries with the new binary first (`omnigraph queries validate`), rewrite the failing ones from their printed fixes (`omnigraph lint --fix` applies them), and apply the rewritten registry in the same step as the binary switch, since an older server cannot load the new syntax ([procedure](../queries/upgrading-to-gq3.md#stored-queries-at-upgrade)). Each declaration of a stored file is available on its own: one that fails is unavailable with its own diagnostic, one that calls it is unavailable naming it, and the rest of the file serves. `omnigraph version` and `/healthz` report the GQ language version (`gq_language`, `3.0`); a binary that reports none is a GQ language 2 build.
 
-A schema apply that stores a [one-way construct](../queries/upgrading-to-gq3.md#schemas), which `schema plan` and `cluster plan` name first, makes an earlier binary refuse the whole graph until the backup is restored. After `index rebuild --kind full-text` it refuses full-text reads, and its own `index rebuild --kind full-text` restores them; `index build` and `optimize` never recommend it.
+A schema apply that stores a [one-way construct](../queries/upgrading-to-gq3.md#schemas), which `schema plan` and `cluster plan` name first, makes an earlier binary refuse the whole graph until a later apply stores none of those constructs, where the schema allows the change, or the backup is restored. After `index rebuild --kind full-text` it refuses full-text reads, and its own `index rebuild --kind full-text` restores them; `index build` and `optimize` never recommend it.
 
 ## Storage upgrade
 
@@ -154,9 +154,8 @@ Once this release has built or rebuilt an index (`index build`, `index rebuild`,
 schema apply, or a write declaring a column's first full-text index), rollback in place is not
 supported. An earlier binary refuses full-text search on that index, whose certificate records
 the field's [analyzer profile](../search/analyzers.md), and returns no rows. It reads the BITMAP,
-LABEL_LIST and NGRAM indexes [`@index` builds](../schema/index.md#what-index-builds), but rebuilds
-a lagging one as a BTREE or fails. To roll back, restore the backup taken before the upgrade, or
-rebuild the indexes with the earlier binary on each live branch; a stored one-way construct has no such repair.
+LABEL_LIST and NGRAM indexes [`@index` builds](../schema/index.md#what-index-builds), but rebuilds a lagging one as a BTREE under its name or fails; back on this release, `index build` replaces such a BTREE with the declared index.
+To roll back, restore the backup taken before the upgrade, or rebuild the indexes with the earlier binary on each live branch. A stored one-way construct is repaired only by a later apply of this release that stores none, which the [list of constructs](../queries/upgrading-to-gq3.md#schemas) says when the schema allows, or by the backup.
 
 ## Full-text index upgrade
 

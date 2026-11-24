@@ -119,13 +119,18 @@ graph's schema file with no graph commit: `cluster plan` marks it
 `text_only`, and `omnigraph schema show` still shows the stored source.
 
 **One-way constructs.** A binary before GQ 3 re-parses the stored schema on
-every open, so once an apply stores one of these it refuses the whole graph,
-and only a backup taken before the upgrade restores it: an explicit
-`distance` on a Vector (`l2` included), `@index` on a List property,
+every open, so once an apply stores one of these it refuses the whole graph
+until a later apply stores none of them or a backup taken before the upgrade
+is restored: an explicit `distance` on a Vector (`l2` included), `@index` on a
+List property,
 `@index(fulltext)` with or without options, an `analyzer` or a `scorer` in it.
-`schema plan`, `schema apply` and `cluster plan` name each one under
-`one_way_constructs` (`construct`, `type_name`, `property`, `line`, `column`)
-with a `one_way_note`; nothing gates the apply.
+A plan with a step (`schema plan`, `schema apply`, `cluster plan`) names each
+one under `one_way_constructs` (`construct`, `type_name`, `property`, `line`,
+`column`) with a `one_way_note`; a plan with no step names none. Nothing gates
+the apply. A later apply takes one back where the schema allows it:
+`@index(fulltext, …)` respelled as a plain `@index`, a non-`l2` `distance`
+omitted again, or the property dropped; `@index` on a List only by dropping the
+property, and an explicit `l2` never by omitting it.
 
 Plan/apply diagnostics may carry stable codes of the form **`OG-XXX-NNN`**. When
 a code is present, match it rather than the free-form message text.

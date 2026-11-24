@@ -3,7 +3,8 @@
 //! A graph stores its accepted `.pg` source beside the IR, and a binary
 //! before GQ 3 re-parses that source on every open. Once an apply stores a
 //! construct its parser or feature set refuses, that binary refuses the whole
-//! graph, and only a backup taken before the upgrade restores it.
+//! graph until a later apply stores none of them (where the schema allows
+//! the change) or the backup taken before the upgrade is restored.
 //! [`ONE_WAY_CONSTRUCTS`] is the one table of those constructs: `schema plan`,
 //! `schema apply` and `cluster plan` report each match of a candidate source
 //! through [`one_way_constructs`], and the cross-version owner proves every
@@ -17,7 +18,7 @@ use super::parser::{Rule, SchemaParser};
 use crate::error::{CompilerError, Result};
 
 /// The line every report of one-way constructs carries.
-pub const ONE_WAY_NOTE: &str = "binaries before this release refuse the whole graph after this apply, and only a backup taken before the upgrade restores it";
+pub const ONE_WAY_NOTE: &str = "binaries before this release refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored";
 
 /// One property declaration as the one-way rows read it: its syntax, before
 /// any desugaring that would forget how it was written (an explicit `l2`

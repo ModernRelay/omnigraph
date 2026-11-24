@@ -227,7 +227,8 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
 - A graph stores its schema text, and an earlier binary parses it again on
   every open. A schema apply that stores one of these constructs makes every
   earlier binary refuse the whole graph, every read, write, export and index
-  pass, and only the backup taken before the upgrade restores it:
+  pass, until a later apply stores none of them or the backup taken before
+  the upgrade is restored:
 
   | Construct | `construct` |
   |---|---|
@@ -237,10 +238,25 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
   | an `analyzer` in `@index(fulltext, …)` | `full_text_analyzer` |
   | a `scorer` in `@index(fulltext, …)` | `full_text_scorer` |
 
-  `schema plan`, `schema apply` and `cluster plan` name each one the schema
-  holds, under `one_way_constructs`, with the line `binaries before this
-  release refuse the whole graph after this apply, and only a backup taken
-  before the upgrade restores it`. They report only; nothing gates the apply.
+  A plan with a step (`schema plan`, `schema apply`, `cluster plan`) names
+  each one the schema it applies holds, under `one_way_constructs`, with the
+  line `binaries before this release refuse the whole graph after this apply,
+  until an apply stores none of these constructs or the backup taken before
+  the upgrade is restored`. A plan with no step applies nothing, so it names
+  none, whatever the stored schema holds. They report only; nothing gates the
+  apply.
+
+  Where the schema allows the change, a later apply by this release takes a
+  construct back, and an earlier binary opens the graph once none is stored:
+  `@index(fulltext, …)` respelled as a plain `@index`, a `distance` other than
+  `l2` omitted again (the field's distance becomes `l2`, and the next `index
+  build` replaces its index), or the property dropped. Removing an `analyzer` or a `scorer` alone
+  leaves `@index(fulltext)`, which is one-way too. Removing an `@index` is
+  refused, so `@index` on a List is taken back only by dropping the property,
+  and an explicit `distance = "l2"` is never taken back by omitting it, since
+  that apply has no step. An earlier binary's full-text reads over an index
+  this release built stay refused until its own
+  `index rebuild --kind full-text`.
   Upgrade every binary that opens the graph before applying such a schema
   ([analyzers](../search/analyzers.md)). A body-level `@index(tags)` over a
   list, a plain `@index` on a String and an added property or type are not
