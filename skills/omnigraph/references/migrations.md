@@ -74,10 +74,11 @@ The current binary serves storage formats 14 to 18 and refuses a v8 or v9
 graph on open, naming `omnigraph upgrade`. Its `upgrade` converts a
 standalone v8, v9 or v13 graph straight to 18 in place and keeps branches,
 commit ids and commit history; no table row is rewritten. Each branch moves
-from its ref file into `main`'s catalog: `main`'s commit records every branch
-(`work.rows_written`), and the run then removes the files under
-`_refs/branches/` (`work.refs_unlinked`), so an empty `_refs/branches/` after
-the run is expected and no branch is lost. `--to-format`
+from its ref file into `main`'s catalog: `main`'s commit records a row for
+every branch and one for each retired branch (a deleted branch whose commits
+are kept), so `work.rows_written` can be larger than the branch count. The
+run then removes the files under `_refs/branches/` (`work.refs_unlinked`), so
+an empty `_refs/branches/` after the run is expected and no branch is lost. `--to-format`
 accepts 18 only. The same command is the only way a v14 to v17 graph
 reaches 18: no publication stamps a branch 17 or 18, and a graph the current
 binary creates is born at 18. The upgrade is offline and cannot verify that itself: stop
