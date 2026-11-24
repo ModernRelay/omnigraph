@@ -470,6 +470,92 @@ fn fresh_name(type_name: &str) -> String {
     })
 }
 
+/// `base`, or its first numbered variant, that no variable of the
+/// declaration uses; the name is taken, so the next call picks another.
+fn fresh_var(base: &str) -> String {
+    with_ctx(|c| {
+        let name = std::iter::once(base.to_string())
+            .chain((2..).map(|n| format!("{base}{n}")))
+            .find(|n| !c.vars.contains(n))
+            .unwrap();
+        c.vars.insert(name.clone());
+        name
+    })
+}
+
+/// The names an element of a `match` binds: a binding's variable, a
+/// triple's ends and edge binding, a `let`'s name, and those of an
+/// `optional`'s elements. A predicate binds none.
+fn element_binds(k: &Pair<Rule>, out: &mut BTreeSet<String>) {
+    crate::stack::deep(|| element_binds_at(k, out))
+}
+
+fn element_binds_at(k: &Pair<Rule>, out: &mut BTreeSet<String>) {
+    match k.as_rule() {
+        Rule::filter_rec
+        | Rule::negation_rec
+        | Rule::blockless_rec
+        | Rule::prefix_rec
+        | Rule::stray_braces_rec => {}
+        Rule::let_clause => {
+            if let Some(v) = child(k, Rule::variable) {
+                out.insert(v.as_str()[1..].to_string());
+            }
+        }
+        // The `optional`'s own elements, each once; a nested `optional` is
+        // one of them, and binds its own.
+        Rule::optional_block | Rule::optional_rec => {
+            let list = child(k, Rule::block_body)
+                .and_then(|body| child(&body, Rule::elements))
+                .or_else(|| child(k, Rule::elements));
+            let elements: Vec<Pair<Rule>> = match list {
+                Some(list) => list
+                    .into_inner()
+                    .filter(|e| e.as_rule() == Rule::element)
+                    .collect(),
+                None => k
+                    .clone()
+                    .into_inner()
+                    .filter(|e| e.as_rule() == Rule::element)
+                    .collect(),
+            };
+            for e in elements {
+                element_binds(&kind(&e), out);
+            }
+        }
+        _ => {
+            for v in k.clone().into_inner().flatten() {
+                if v.as_rule() == Rule::variable {
+                    out.insert(v.as_str()[1..].to_string());
+                }
+            }
+        }
+    }
+}
+
+/// The names written inside a block of `p` (`exists { … }`, an aggregate's
+/// block, `not { … }`), `p` itself counted when `inside`.
+fn block_names(p: &Pair<Rule>, inside: bool, out: &mut BTreeSet<String>) {
+    crate::stack::deep(|| block_names_at(p, inside, out))
+}
+
+fn block_names_at(p: &Pair<Rule>, inside: bool, out: &mut BTreeSet<String>) {
+    if p.as_rule() == Rule::variable {
+        if inside {
+            out.insert(p.as_str()[1..].to_string());
+        }
+        return;
+    }
+    let inside = inside
+        || matches!(
+            p.as_rule(),
+            Rule::block_value | Rule::not_block_rec | Rule::negation_rec | Rule::call_block_rec
+        );
+    for c in p.clone().into_inner() {
+        block_names(&c, inside, out);
+    }
+}
+
 /// The file as the front door hands it on: the settings, a statement body,
 /// or one [`QueryDecl`] per declaration carrying its tree, its name,
 /// metadata, parameters and write mode filled so every door can select and
@@ -2888,6 +2974,12 @@ struct Pieces {
     elements: Vec<String>,
     preds: Vec<String>,
     problem: Option<(QueryCode, String, usize)>,
+    /// The names the elements before the one being read bind.
+    bound_before: BTreeSet<String>,
+    /// How many elements after the one being read bind each name. A name
+    /// counted here and not bound before is one a block written here did
+    /// not correlate on.
+    bound_after: HashMap<String, usize>,
 }
 
 /// One problem of an element list.
@@ -2903,6 +2995,28 @@ fn note_problem(
 }
 
 impl Pieces {
+    /// A predicate written among the elements, as `text`: a conjunct of the
+    /// `where`. A block in it that names a name only a later element binds
+    /// read that name as its own, since a block written among the elements
+    /// correlated only on the names bound before it; in the `where` it
+    /// would correlate on the later binding. The predicate then stays where
+    /// it was written as `let $block = …`, which correlates on the names
+    /// bound before it alone, and the conjunct reads `$block`.
+    fn predicate(&mut self, written: &Pair<Rule>, text: String) {
+        let mut names = BTreeSet::new();
+        block_names(written, false, &mut names);
+        let later = |n: &String| {
+            self.bound_after.get(n).is_some_and(|c| *c > 0) && !self.bound_before.contains(n)
+        };
+        if !names.iter().any(later) {
+            self.preds.push(text);
+            return;
+        }
+        let name = fresh_var("block");
+        self.elements.push(format!("let ${name} = {text}"));
+        self.preds.push(format!("${name}"));
+    }
+
     /// The elements of an `elements` pair, a missing comma among them a
     /// problem; returns the first element refused on its own (a foreign
     /// form, say).
@@ -2912,12 +3026,37 @@ impl Pieces {
         // Where the last element's last token ends: a missing comma goes
         // there, before any comment or line break after it.
         let mut last_end: Option<usize> = None;
+        let binds: Vec<BTreeSet<String>> = list
+            .clone()
+            .into_inner()
+            .filter(|c| c.as_rule() == Rule::element)
+            .map(|c| {
+                let mut out = BTreeSet::new();
+                element_binds(&kind(&c), &mut out);
+                out
+            })
+            .collect();
+        self.bound_before.clear();
+        self.bound_after.clear();
+        for name in binds.iter().flatten() {
+            *self.bound_after.entry(name.clone()).or_default() += 1;
+        }
+        let mut index = 0;
         for c in list.clone().into_inner() {
             match c.as_rule() {
                 Rule::missing_comma_rec => {
                     gap = Some(last_end.unwrap_or(c.as_span().start()));
                 }
                 Rule::element => {
+                    for name in &binds[index] {
+                        if let Some(n) = self.bound_after.get_mut(name) {
+                            *n -= 1;
+                        }
+                    }
+                    if index > 0 {
+                        self.bound_before.extend(binds[index - 1].iter().cloned());
+                    }
+                    index += 1;
                     // A predicate written without a comma before it moves to
                     // the `where`, so its own refusal names it.
                     let predicate = matches!(
@@ -2964,7 +3103,7 @@ impl Pieces {
                     && expression_but_for_folds(&k.clone().into_inner().next().unwrap()) =>
             {
                 let x = k.clone().into_inner().next().unwrap();
-                self.preds.push(moved_pred_text(&x));
+                self.predicate(&k, moved_pred_text(&x));
                 note_problem(
                     &mut self.problem,
                     Q017,
@@ -2978,7 +3117,7 @@ impl Pieces {
                 // not hold on, a null one included: the respelling map's
                 // `not coalesce(φ, false)`. Any other block is `not exists`.
                 let filters = only_filters(&k);
-                self.preds.push(match filters {
+                let text = match filters {
                     Some(preds) => format!("not coalesce({}, false)", preds.join(" and ")),
                     // The block's own elements rewritten the same way, so
                     // one suggestion repairs every nested level at once.
@@ -2986,7 +3125,8 @@ impl Pieces {
                         "not exists {{ {} }}",
                         rendered_block(&k).unwrap_or_else(|| inner_text(&k))
                     ),
-                });
+                };
+                self.predicate(&k, text);
                 note_problem(
                     &mut self.problem,
                     Q012,

@@ -304,6 +304,24 @@ fn a_predicate_inside_match_prints_the_where_after_the_braces() {
             "Q017",
             "query q() { match { $p: Person } where if(coalesce($p.age > 2, false), 1, 0) != 0 return { $p } }",
         ),
+        // A block among the elements correlated only on the names bound
+        // before it; in the `where` it would read a later binding of the
+        // same name. It stays where it was written, as a `let`.
+        (
+            "query q() { match { $p: Person, exists { $p knows $x }, $x: Company } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person, let $block = exists { $p knows $x }, $x: Company } where $block return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, not { $p knows $x }, $x: Company } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person, let $block = not exists { $p knows $x }, $x: Company } where $block return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, $x: Company, exists { $p knows $x } } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person, $x: Company } where exists { $p knows $x } return { $p } }",
+        ),
         (
             "query q() { match { $p: Person $p knows $q } return { $q } }",
             "Q016",
