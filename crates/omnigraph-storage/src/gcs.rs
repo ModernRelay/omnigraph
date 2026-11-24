@@ -32,6 +32,14 @@ use crate::{Result, StorageError, StorageFailure, StorageFailureKind};
 
 /// The static bearer token Lance's provider reads outside `GoogleConfigKey`
 /// and prefers over every other credential.
+///
+/// `GOOGLE_BEARER_TOKEN` is captured as this option too. Lance applies a
+/// `google_bearer_token` option and then, for an external-account
+/// application-default credentials file, replaces it with its own
+/// workload-identity provider, while the control client keeps the token: the
+/// two clients would sign with different credentials. Lance's storage token
+/// is applied before that provider and wins over it, so one option makes
+/// both clients use the token.
 const STORAGE_TOKEN: &str = "google_storage_token";
 
 /// The variables Lance's `StorageOptions::new` copies into `allow_http`, in
@@ -121,12 +129,13 @@ pub(crate) fn capture_gcs_environment_values(
     let mut conflicting = Vec::new();
     for (key, value) in &environment {
         let lowercase = key.to_ascii_lowercase();
-        let option = if lowercase == STORAGE_TOKEN {
-            STORAGE_TOKEN.to_string()
-        } else if let Ok(config_key) = GoogleConfigKey::from_str(&lowercase) {
-            config_key.as_ref().to_string()
-        } else {
-            continue;
+        // A bearer token is the storage token under another name: one
+        // credential option, so both clients resolve it alike (below).
+        let option = match GoogleConfigKey::from_str(&lowercase) {
+            _ if lowercase == STORAGE_TOKEN => STORAGE_TOKEN.to_string(),
+            Ok(GoogleConfigKey::BearerToken) => STORAGE_TOKEN.to_string(),
+            Ok(config_key) => config_key.as_ref().to_string(),
+            Err(_) => continue,
         };
         if !key.starts_with("GOOGLE_") {
             // Lance would read it; the documented spelling is GOOGLE_*.
@@ -171,8 +180,8 @@ pub(crate) fn capture_gcs_environment_values(
 
 /// The control-object client builder for one bucket, from the captured
 /// options alone. `object_store` resolves them as Lance's provider does:
-/// the storage token first, then an explicit bearer token, a service
-/// account, the application-default credentials file, then the instance
+/// the storage token first (a bearer token is captured as it), then a
+/// service account, the application-default credentials file, then the instance
 /// metadata server.
 pub(crate) fn gcs_bucket_builder(
     bucket: &str,
@@ -254,6 +263,38 @@ mod tests {
             assert!(message.contains(name), "{name}: {message}");
             assert!(!message.contains("unrelated-ci-secret"), "{message}");
         }
+    }
+
+    /// A bearer token beside an external-account credentials file: Lance
+    /// would replace the token with its workload-identity provider unless
+    /// the token reaches it as the storage token, which it applies first.
+    #[test]
+    fn a_bearer_token_is_the_one_storage_token() {
+        let environment = capture(&[
+            ("GOOGLE_BEARER_TOKEN", "token"),
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "/run/external-account.json",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(environment.options[STORAGE_TOKEN], "token");
+        assert!(!environment.options.contains_key("google_bearer_token"));
+        assert!(
+            capture(&[
+                ("GOOGLE_BEARER_TOKEN", "token"),
+                ("GOOGLE_STORAGE_TOKEN", "token"),
+            ])
+            .is_ok()
+        );
+        let error = capture(&[
+            ("GOOGLE_BEARER_TOKEN", "one-token"),
+            ("GOOGLE_STORAGE_TOKEN", "other-token"),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(STORAGE_TOKEN), "{error}");
+        assert!(!error.contains("-token"), "{error}");
     }
 
     #[test]

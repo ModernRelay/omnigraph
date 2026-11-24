@@ -8,10 +8,13 @@
 //! The provider decides the conditional surface, the one way the two differ
 //! here. An S3 bucket conditions a write on the ETag. A Google Cloud Storage
 //! bucket conditions it on the object generation, reported in
-//! [`ObjectMeta::version`] and [`PutResult::version`], and refuses a write
-//! conditioned on the ETag, as `object_store`'s GCS client sends
-//! `x-goog-if-generation-match` from [`UpdateVersion::version`] alone; its
-//! ETag is unrelated to the generation.
+//! [`ObjectMeta::version`] and [`PutResult::version`] by every write, a
+//! completed multipart upload included. `object_store`'s GCS client sends
+//! `x-goog-if-generation-match` from [`UpdateVersion::version`] alone and
+//! ignores an ETag beside it, so a replace naming no generation is refused
+//! and one naming both compares the generation. Its ETag is unrelated to the
+//! generation, and a read conditioned on the ETag a GCS bucket reported
+//! (`If-Match`, `If-None-Match`) compares that ETag.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -166,25 +169,20 @@ impl SimulatedBucket {
     }
 
     /// The precondition `options` names, translated to the token the store
-    /// compares; a GCS write conditioned on the ETag, or naming no
-    /// generation, is refused as the GCS client refuses it.
+    /// compares; a GCS replace naming no generation is refused as the GCS
+    /// client refuses it, and an ETag beside a generation is ignored, as
+    /// that client ignores it.
     fn compared(&self, mut options: PutOptions) -> Result<PutOptions> {
         if self.provider != Provider::Gcs {
             return Ok(options);
         }
         if let PutMode::Update(version) = &options.mode {
-            let generation = match version {
-                UpdateVersion {
-                    e_tag: None,
-                    version: Some(generation),
-                } => generation.clone(),
-                _ => {
-                    return Err(object_store::Error::NotSupported {
-                        source: "Google Cloud Storage conditions a replace on the object \
-                                 generation (UpdateVersion::version) alone"
-                            .into(),
-                    });
-                }
+            let Some(generation) = version.version.clone() else {
+                return Err(object_store::Error::NotSupported {
+                    source: "Google Cloud Storage conditions a replace on the object \
+                             generation (UpdateVersion::version)"
+                        .into(),
+                });
             };
             options.mode = PutMode::Update(UpdateVersion {
                 e_tag: Some(generation),
@@ -205,10 +203,67 @@ fn reported_by(provider: Provider, mut meta: ObjectMeta) -> ObjectMeta {
     meta
 }
 
+/// A write's result as `provider` reports it, as [`reported_by`] reports
+/// metadata.
+fn reported_write(provider: Provider, mut result: PutResult) -> PutResult {
+    if provider == Provider::Gcs {
+        result.version = result.e_tag.take();
+        result.e_tag = result.version.as_deref().map(gcs_etag);
+    }
+    result
+}
+
+const GCS_ETAG_PREFIX: &str = "\"gcs-etag-";
+
 /// The ETag a simulated GCS bucket reports for the object at `generation`:
-/// a value of its own, so a client that conditions on it cannot pass.
+/// a value of its own, so a client that conditions a write on it cannot pass.
 fn gcs_etag(generation: &str) -> String {
-    format!("\"gcs-etag-{generation}\"")
+    format!("{GCS_ETAG_PREFIX}{}\"", generation.trim_matches('"'))
+}
+
+/// The generation a reported GCS ETag stands for; any other value is left
+/// as it is, and matches no object.
+fn generation_of(e_tag: &str) -> String {
+    match e_tag
+        .strip_prefix(GCS_ETAG_PREFIX)
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(generation) => format!("\"{generation}\""),
+        None => e_tag.to_owned(),
+    }
+}
+
+/// Every ETag a read precondition lists, translated to the token the store
+/// compares (`*` and unknown values unchanged).
+fn compared_etags(list: &str) -> String {
+    list.split(',')
+        .map(|e_tag| generation_of(e_tag.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A multipart upload to a GCS bucket, whose completion reports the
+/// generation and ETag a single-request write reports.
+#[derive(Debug)]
+struct ReportedUpload {
+    provider: Provider,
+    upload: Box<dyn MultipartUpload>,
+}
+
+#[async_trait]
+impl MultipartUpload for ReportedUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        self.upload.put_part(data)
+    }
+
+    async fn complete(&mut self) -> Result<PutResult> {
+        let result = self.upload.complete().await?;
+        Ok(reported_write(self.provider, result))
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.upload.abort().await
+    }
 }
 
 /// The key prefix the S3 client sends for a listing of `prefix`.
@@ -246,12 +301,8 @@ impl ObjectStore for SimulatedBucket {
         options: PutOptions,
     ) -> Result<PutResult> {
         let options = self.compared(options)?;
-        let mut result = self.objects.put_opts(location, payload, options).await?;
-        if self.provider == Provider::Gcs {
-            result.version = result.e_tag.take();
-            result.e_tag = result.version.as_deref().map(gcs_etag);
-        }
-        Ok(result)
+        let result = self.objects.put_opts(location, payload, options).await?;
+        Ok(reported_write(self.provider, result))
     }
 
     async fn put_multipart_opts(
@@ -259,10 +310,18 @@ impl ObjectStore for SimulatedBucket {
         location: &Path,
         options: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        self.objects.put_multipart_opts(location, options).await
+        let upload = self.objects.put_multipart_opts(location, options).await?;
+        Ok(Box::new(ReportedUpload {
+            provider: self.provider,
+            upload,
+        }))
     }
 
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+    async fn get_opts(&self, location: &Path, mut options: GetOptions) -> Result<GetResult> {
+        if self.provider == Provider::Gcs {
+            options.if_match = options.if_match.as_deref().map(compared_etags);
+            options.if_none_match = options.if_none_match.as_deref().map(compared_etags);
+        }
         let mut result = self.objects.get_opts(location, options).await?;
         result.meta = self.reported(result.meta);
         Ok(result)
@@ -404,7 +463,17 @@ mod tests {
         assert!(bucket(Provider::S3, "simulated-names-a").is_none());
     }
 
-    /// A GCS bucket conditions on the generation and refuses the ETag.
+    fn replace(e_tag: Option<&str>, version: Option<&str>) -> PutOptions {
+        PutMode::Update(UpdateVersion {
+            e_tag: e_tag.map(str::to_owned),
+            version: version.map(str::to_owned),
+        })
+        .into()
+    }
+
+    /// A GCS bucket conditions a replace on the generation alone: an ETag
+    /// beside it is ignored, and a replace naming no generation is refused,
+    /// as the GCS client sends only `x-goog-if-generation-match`.
     #[tokio::test]
     async fn a_gcs_bucket_conditions_a_replace_on_the_generation() {
         let bucket = SimulatedBucket::new(Provider::Gcs);
@@ -414,40 +483,113 @@ mod tests {
             .version
             .clone()
             .expect("a write reports its generation");
-        assert_ne!(first.e_tag.as_ref(), Some(&generation));
+        let e_tag = first.e_tag.clone().expect("a write reports its ETag");
+        assert_ne!(e_tag, generation);
 
         let head = bucket.head(&path).await.unwrap();
         assert_eq!(head.version.as_ref(), Some(&generation));
-        assert_eq!(head.e_tag, first.e_tag);
+        assert_eq!(head.e_tag.as_ref(), Some(&e_tag));
         let listed: Vec<ObjectMeta> = bucket.list(None).try_collect().await.unwrap();
         assert_eq!(listed[0].version.as_ref(), Some(&generation));
 
-        let by_etag = PutMode::Update(UpdateVersion {
-            e_tag: first.e_tag.clone(),
-            version: None,
-        });
-        let refused = bucket
-            .put_opts(&path, PutPayload::from("s2"), by_etag.into())
-            .await;
-        assert!(
-            matches!(refused, Err(object_store::Error::NotSupported { .. })),
-            "{refused:?}"
-        );
-        let by_generation = PutMode::Update(UpdateVersion {
-            e_tag: None,
-            version: Some(generation.clone()),
-        });
+        for absent in [replace(Some(&e_tag), None), replace(None, None)] {
+            let refused = bucket.put_opts(&path, PutPayload::from("s2"), absent).await;
+            assert!(
+                matches!(refused, Err(object_store::Error::NotSupported { .. })),
+                "{refused:?}"
+            );
+        }
         let second = bucket
-            .put_opts(&path, PutPayload::from("s2"), by_generation.clone().into())
+            .put_opts(
+                &path,
+                PutPayload::from("s2"),
+                replace(Some(&e_tag), Some(&generation)),
+            )
             .await
             .unwrap();
-        assert_ne!(second.version, Some(generation));
-        let stale = bucket
-            .put_opts(&path, PutPayload::from("s3"), by_generation.into())
-            .await;
+        assert_ne!(second.version, Some(generation.clone()));
+        let current = second.version.clone().unwrap();
+        for stale in [
+            replace(None, Some(&generation)),
+            replace(second.e_tag.as_deref(), Some(&generation)),
+        ] {
+            let refused = bucket.put_opts(&path, PutPayload::from("s3"), stale).await;
+            assert!(
+                matches!(refused, Err(object_store::Error::Precondition { .. })),
+                "{refused:?}"
+            );
+        }
+        bucket
+            .put_opts(
+                &path,
+                PutPayload::from("s3"),
+                replace(Some("\"unrelated\""), Some(&current)),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A read conditioned on the ETag a GCS bucket reported passes while the
+    /// object is unchanged and fails once it changes.
+    #[tokio::test]
+    async fn a_gcs_read_compares_the_reported_etag() {
+        let bucket = SimulatedBucket::new(Provider::Gcs);
+        let path = Path::from("graph/table.lance");
+        bucket.put(&path, PutPayload::from("abcdef")).await.unwrap();
+        let head = bucket.head(&path).await.unwrap();
+        let e_tag = head.e_tag.clone().unwrap();
+
+        let range = GetOptions {
+            if_match: Some(e_tag.clone()),
+            range: Some((1..3).into()),
+            ..Default::default()
+        };
+        let read = bucket.get_opts(&path, range.clone()).await.unwrap();
+        assert_eq!(read.meta.e_tag.as_ref(), Some(&e_tag));
+        assert_eq!(read.bytes().await.unwrap().as_ref(), b"bc");
+        let unchanged = GetOptions {
+            if_none_match: Some(format!("\"other\", {e_tag}")),
+            ..Default::default()
+        };
+        let not_modified = bucket.get_opts(&path, unchanged).await;
         assert!(
-            matches!(stale, Err(object_store::Error::Precondition { .. })),
-            "{stale:?}"
+            matches!(not_modified, Err(object_store::Error::NotModified { .. })),
+            "{not_modified:?}"
         );
+
+        bucket.put(&path, PutPayload::from("ghijkl")).await.unwrap();
+        let changed = bucket.get_opts(&path, range).await;
+        assert!(
+            matches!(changed, Err(object_store::Error::Precondition { .. })),
+            "{changed:?}"
+        );
+    }
+
+    /// A completed multipart upload reports what a single write reports: the
+    /// generation, and the ETag the next read of the object gives.
+    #[tokio::test]
+    async fn a_gcs_multipart_upload_reports_like_a_single_write() {
+        let bucket = SimulatedBucket::new(Provider::Gcs);
+        let path = Path::from("graph/data/part.lance");
+        let mut upload = bucket.put_multipart(&path).await.unwrap();
+        upload.put_part(PutPayload::from("ab")).await.unwrap();
+        upload.put_part(PutPayload::from("cd")).await.unwrap();
+        let completed = upload.complete().await.unwrap();
+        let generation = completed
+            .version
+            .clone()
+            .expect("a completed upload reports its generation");
+
+        let head = bucket.head(&path).await.unwrap();
+        assert_eq!(head.version.as_ref(), Some(&generation));
+        assert_eq!(head.e_tag, completed.e_tag);
+        bucket
+            .put_opts(
+                &path,
+                PutPayload::from("ef"),
+                replace(None, Some(&generation)),
+            )
+            .await
+            .unwrap();
     }
 }
