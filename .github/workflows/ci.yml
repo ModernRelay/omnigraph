@@ -234,6 +234,11 @@ jobs:
       - name: Check required storage upgrade coverage
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
 
+      # Includes the registry's own check: every row well formed and asked
+      # for by a test, every row a test or workflow names a registry row.
+      - name: Check the predecessor registry
+        run: python3 scripts/predecessors.py --self-test
+
       - name: Check required contexts report on the merge queue and the gate is wired
         run: python3 scripts/check-merge-group-triggers.py --self-test
 
@@ -721,30 +726,13 @@ jobs:
       - name: Verify catalogue inventories against the built CLI
         run: python3 scripts/check-catalogue-docs.py --binary target/debug/omnigraph
 
-      - name: Install genuine v0.9 release for upgrade regression
-        run: |
-          set -euo pipefail
-          v09_dir="$RUNNER_TEMP/omnigraph-v09"
-          # The installer downloads the official archive and verifies its
-          # SHA256 before extraction. An exact VERSION never falls back to edge.
-          REPO_SLUG=ModernRelay/omnigraph VERSION=v0.9.0 INSTALL_DIR="$v09_dir" \
-            bash scripts/install.sh
-          test -x "$v09_dir/omnigraph"
-          [[ "$("$v09_dir/omnigraph" --version)" == "omnigraph 0.9.0" ]] \
-            || { echo "::error::upgrade regression requires the genuine v0.9.0 CLI"; exit 1; }
-          echo "OMNIGRAPH_V09_BIN=$v09_dir/omnigraph" >> "$GITHUB_ENV"
-
-      - name: Install genuine v0.10 release for the v6 format fence
-        run: |
-          set -euo pipefail
-          v6_dir="$RUNNER_TEMP/omnigraph-v010"
-          # 0.10.0, the last release that writes internal schema v6
-          REPO_SLUG=ModernRelay/omnigraph VERSION=v0.10.0 INSTALL_DIR="$v6_dir" \
-            bash scripts/install.sh
-          test -x "$v6_dir/omnigraph"
-          [[ "$("$v6_dir/omnigraph" --version)" == "omnigraph 0.10.0" ]] \
-            || { echo "::error::the v6 format fence requires the genuine v0.10.0 CLI"; exit 1; }
-          echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
+      # The two journeys the owner check below requires run against these
+      # registry rows (.github/predecessors.toml); every other predecessor
+      # case of the workspace graph skips here and runs in its own job.
+      - name: Provision predecessors
+        uses: ./.github/actions/predecessors
+        with:
+          rows: release-0.9.0 release-0.10.0
 
       - name: Run workspace and failpoint tests once
         run: |
@@ -775,7 +763,7 @@ jobs:
           # The two upgrade journeys and these real CLI/server/proxy journeys
           # must execute in the ordinary workspace gate. A removed, filtered or
           # re-ignored owner is not green, and a journey that skipped its
-          # released binary is not green either. The live-apply journey
+          # predecessor is not green either. The live-apply journey
           # (`cluster_e2e_live_apply_changes_schema_queries_and_adds_graph_without_restart`)
           # waits on the CLI's real 500 ms poll interval for about 30 s, so it
           # is a `nightly:` owner of `tests-slow-nightly.yml` instead. The
@@ -808,9 +796,9 @@ jobs:
           done
           python3 scripts/check-workspace-test-owners.py target/nextest/ci/junit.xml \
             "${owners[@]}" \
-            --output-lacks "crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end=skipping v0.9 upgrade e2e:" \
+            --output-lacks "crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end=skipping: predecessor" \
             --output-has "crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end=v0.9 refusal and export/import rebuild completed" \
-            --output-lacks "crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10=skipping immediate-predecessor v6 upgrade test"
+            --output-lacks "crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v6_and_v6_refuses_v10=skipping: predecessor"
 
       # Kept on every run, red or green: per-test durations and the compile's
       # unit timings are what a change to this job's scheduling is sized from.
@@ -839,22 +827,15 @@ jobs:
   storage_upgrade_compatibility:
     name: Storage Upgrade Compatibility
     runs-on: ubuntu-latest
-    # Three builds use one target directory here: genuine stamp-13 and
-    # Lance 11 predecessor CLIs (one package, one bin, no test features),
-    # then the current tree's test targets. Their dependency feature sets differ (the
-    # test builds enable dev-dependency features such as lance-io's defaults
-    # and test-util), so the second build reuses only the dependency artifacts
-    # whose features match. The v5 fence measured a cold predecessor CLI at
-    # 25m40s.
+    # Two source predecessors (stamp-13, lance-11) build in their own target
+    # directories when the predecessor cache misses; the v5 fence measured a
+    # cold predecessor CLI at 25m40s. Then the current tree's test targets.
     timeout-minutes: 120
     permissions:
       contents: read
     env:
       CARGO_TERM_COLOR: always
       RUST_MIN_STACK: 16777216
-      # A missing predecessor binary fails the genuine journey instead of
-      # skipping it: this context is required on every change.
-      OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
@@ -888,98 +869,17 @@ jobs:
       - name: Check storage compatibility gate configuration
         run: python3 scripts/check-storage-upgrade-ci.py --self-test
 
-      # The genuine predecessors of the release route (`omnigraph upgrade`,
-      # storage format 8 or 9 to 14): v0.11.0 writes stamp 9 and converts a
-      # v0.10.0 graph to stamp 8. The release assets are trusted exactly as
-      # the `test` job's v0.9.0 and v0.10.0 installs trust them: `install.sh`
-      # verifies the archive against the `.sha256` published beside it, and
-      # no digest is pinned here.
-      - name: Install released v0.10.0 and v0.11.0 CLIs
-        run: |
-          set -euo pipefail
-          v6_dir="$RUNNER_TEMP/omnigraph-v010"
-          v011_dir="$RUNNER_TEMP/omnigraph-v011"
-          # The installer downloads the official archive and verifies its
-          # SHA256 before extraction. An exact VERSION never falls back to edge.
-          # A failed download leaves nothing behind, so each release gets three
-          # attempts before this blocking job fails.
-          install_release() {
-            for attempt in 1 2 3; do
-              REPO_SLUG=ModernRelay/omnigraph VERSION="$1" INSTALL_DIR="$2" \
-                bash scripts/install.sh && return 0
-              echo "install of $1 failed on attempt $attempt/3; retrying"
-              sleep 10
-            done
-            return 1
-          }
-          install_release v0.10.0 "$v6_dir"
-          test -x "$v6_dir/omnigraph"
-          [[ "$("$v6_dir/omnigraph" --version)" == "omnigraph 0.10.0" ]] \
-            || { echo "::error::the storage upgrades of a 0.10.0 graph require the genuine v0.10.0 CLI"; exit 1; }
-          install_release v0.11.0 "$v011_dir"
-          test -x "$v011_dir/omnigraph"
-          [[ "$("$v011_dir/omnigraph" --version)" == "omnigraph 0.11.0" ]] \
-            || { echo "::error::the release storage upgrade requires the genuine v0.11.0 CLI"; exit 1; }
-          echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
-          echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV"
-
-      # The genuine stamp-13 predecessor for the main-build in-place route
-      # (`omnigraph upgrade`, storage format 13 to 14). Keep this immutable:
-      # HEAD^ is not a stable format reference, and the last main commit that
-      # wrote stamp 13 is the source the journey converts.
-      - name: Build genuine stamp-13 CLI
-        env:
-          STAMP_13_SOURCE_COMMIT: c0a4519f38d65dc1356728981983da8b096cfbef
-        run: |
-          set -euo pipefail
-          v13_source="$RUNNER_TEMP/omnigraph-stamp-13"
-          v13_bin="$RUNNER_TEMP/omnigraph-stamp-13-bin"
-          git fetch --no-tags --depth=1 origin "$STAMP_13_SOURCE_COMMIT"
-          git worktree add --detach "$v13_source" "$STAMP_13_SOURCE_COMMIT"
-          cargo build --locked \
-            --manifest-path "$v13_source/Cargo.toml" \
-            --package omnigraph-cli \
-            --bin omnigraph \
-            --target-dir "$GITHUB_WORKSPACE/target"
-          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v13_bin"
-          test -x "$v13_bin"
-          # Clean path-package artifacts through both workspace manifests while
-          # retaining shared registry dependencies: the predecessor and current
-          # packages share names and versions, so either manifest alone can
-          # miss a stale path identity and link the wrong rlib.
-          cargo clean --workspace --locked \
-            --manifest-path "$v13_source/Cargo.toml" \
-            --target-dir "$GITHUB_WORKSPACE/target"
-          cargo clean --workspace --locked \
-            --target-dir "$GITHUB_WORKSPACE/target"
-          echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"
-
-      # Same graph format, genuinely older substrate. A version label alone
-      # cannot distinguish this writer from the candidate, so pin its source.
-      - name: Build genuine Lance 11 CLI
-        env:
-          LANCE11_SOURCE_COMMIT: 0a62bb7b2aa5b99b012f413807c216277f7f9596
-        run: |
-          set -euo pipefail
-          lance11_source="$RUNNER_TEMP/omnigraph-lance-11"
-          lance11_bin="$RUNNER_TEMP/omnigraph-lance-11-bin"
-          git fetch --no-tags --depth=1 origin "$LANCE11_SOURCE_COMMIT"
-          git worktree add --detach "$lance11_source" "$LANCE11_SOURCE_COMMIT"
-          test "$(git -C "$lance11_source" rev-parse HEAD)" = "$LANCE11_SOURCE_COMMIT"
-          # Run inside the predecessor checkout so its workspace configuration applies.
-          (cd "$lance11_source" && cargo build --locked \
-            --package omnigraph-cli \
-            --bin omnigraph \
-            --target-dir "$GITHUB_WORKSPACE/target")
-          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$lance11_bin"
-          test -x "$lance11_bin"
-          # Remove both path-package identities before linking the candidate tests.
-          cargo clean --workspace --locked \
-            --manifest-path "$lance11_source/Cargo.toml" \
-            --target-dir "$GITHUB_WORKSPACE/target"
-          cargo clean --workspace --locked \
-            --target-dir "$GITHUB_WORKSPACE/target"
-          echo "OMNIGRAPH_LANCE11_BIN=$lance11_bin" >> "$GITHUB_ENV"
+      # The genuine predecessors of the in-place route (`omnigraph upgrade`):
+      # release-0.11.0 writes stamp 9 and converts a release-0.10.0 graph to
+      # stamp 8; stamp-13 is the last main commit that wrote stamp 13;
+      # lance-11 is the same graph format on a genuinely older substrate.
+      # `require` fails a journey whose row is missing instead of skipping
+      # it: this context is required on every change.
+      - name: Provision predecessors
+        uses: ./.github/actions/predecessors
+        with:
+          rows: stamp-13 lance-11 release-0.10.0 release-0.11.0
+          require: true
 
       # The owner is the `crossversion_upgrade` module of the CLI's
       # `integration` binary. The exact case names come from the compiled
@@ -1033,10 +933,9 @@ jobs:
     # contexts alone, so a reporting run there would finish after the merge.
     if: github.event_name != 'merge_group' && needs.classify_changes.outputs.run_full_ci == 'true'
     runs-on: ubuntu-latest
-    # This job owns the immutable predecessor build in parallel with the
-    # current-tree workspace job. The 2026-07-28 cold measurement was 25m40s
-    # for the predecessor CLI; exact current-CLI fence compilation reuses the same locked
-    # dependency graph and retains bounded headroom here.
+    # This job owns the stamp-5 predecessor in parallel with the current-tree
+    # workspace job. The 2026-07-28 cold measurement was 25m40s for the
+    # predecessor CLI, built only when the predecessor cache misses.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -1074,37 +973,13 @@ jobs:
         with:
           version: "v0.16.0"
 
-      # CI pins only the immediate predecessor. Older seams remain env-gated
-      # and on-demand, per docs/dev/testing.md.
-      - name: Build genuine final-v5 CLI
-        env:
-          # Final v5-writing main commit immediately before RFC-023 activated
-          # the exact non-null `id` primary-key contract in v6. Keep this
-          # immutable: HEAD^ is not a stable format reference.
-          FINAL_INTERNAL_V5_COMMIT: 46b6d9084fb629b88d4ac9e8c546e0a30d213d19
-        run: |
-          set -euo pipefail
-          v5_source="$RUNNER_TEMP/omnigraph-final-v5"
-          v5_bin="$RUNNER_TEMP/omnigraph-final-v5-bin"
-          git fetch --no-tags --depth=1 origin "$FINAL_INTERNAL_V5_COMMIT"
-          git worktree add --detach "$v5_source" "$FINAL_INTERNAL_V5_COMMIT"
-          cargo build --locked \
-            --manifest-path "$v5_source/Cargo.toml" \
-            --package omnigraph-cli \
-            --bin omnigraph \
-            --target-dir "$GITHUB_WORKSPACE/target"
-          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v5_bin"
-          test -x "$v5_bin"
-          # Clean path-package artifacts through both workspace manifests while
-          # retaining shared registry dependencies. The predecessor and current
-          # packages have the same names+versions, so either manifest alone can
-          # miss a stale path identity and make the fence link the wrong rlib.
-          cargo clean --workspace --locked \
-            --manifest-path "$v5_source/Cargo.toml" \
-            --target-dir "$GITHUB_WORKSPACE/target"
-          cargo clean --workspace --locked \
-            --target-dir "$GITHUB_WORKSPACE/target"
-          echo "OMNIGRAPH_V5_BIN=$v5_bin" >> "$GITHUB_ENV"
+      # The final v5-writing main commit, immediately before RFC 0023
+      # activated the exact non-null `id` primary-key contract in v6.
+      - name: Provision predecessors
+        uses: ./.github/actions/predecessors
+        with:
+          rows: stamp-5
+          require: true
 
       - name: Run exact v5↔v10 refusal and rebuild fence
         run: |
@@ -1113,10 +988,6 @@ jobs:
           cargo test --locked -p omnigraph-cli --test integration \
             crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 \
             -- --exact --nocapture 2>&1 | tee "$test_log"
-          if grep -Fq "skipping immediate-predecessor v5 upgrade test" "$test_log"; then
-            echo "::error::v5↔v10 format fence skipped despite a configured predecessor binary"
-            exit 1
-          fi
           grep -Eq "test crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 \.\.\. ok" "$test_log" \
             || { echo "::error::exact v5↔v10 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
@@ -1439,6 +1310,15 @@ jobs:
             store::tests::rustfs_integration_a_bucket_store_keeps_bases_clones_records_and_builds \
             -- --exact --nocapture 2>&1 | tee -a "$test_log"
 
+          # One `rebuild` repetition over a bucket, from the same build: the
+          # `omnigraph` and `omnigraph-server` the first call of this step
+          # left in `target/debug` apply a cluster onto a prefix and serve it.
+          cargo test --locked \
+            -p omnigraph-bench \
+            --lib \
+            gqt_tests::concurrent::owned_server::process::rustfs_integration_a_rebuild_repetition_runs_against_the_builds_own_server_over_a_bucket \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+
           if grep -Eiq \
             "SKIP public_physical_ref_token_rejects_s3_same_version_aba|skipping s3 " \
             "$test_log"
@@ -1469,6 +1349,7 @@ jobs:
             s3_storage::s3_open_clone_reads_the_base_and_writes_only_its_own_prefix \
             clone_cases_run_against_a_bucket \
             store::tests::rustfs_integration_a_bucket_store_keeps_bases_clones_records_and_builds \
+            gqt_tests::concurrent::owned_server::process::rustfs_integration_a_rebuild_repetition_runs_against_the_builds_own_server_over_a_bucket \
             public_physical_ref_token_rejects_s3_same_version_aba \
             s3::server_opens_s3_graph_directly_and_serves_snapshot_and_read \
             s3::server_boots_cluster_from_bare_storage_uri_and_serves_query \

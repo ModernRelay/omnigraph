@@ -91,7 +91,7 @@ enum Command {
         #[command(subcommand)]
         command: ArchiveCommand,
     },
-    /// Rebuild and query the disposable OmniGraph telemetry projection.
+    /// Rebuild and query the disposable Omnigraph telemetry projection.
     Projection {
         #[command(subcommand)]
         command: ProjectionCommand,
@@ -738,18 +738,6 @@ async fn main() -> ExitCode {
                 Some(path) => omnigraph_bench::gqt_runner::ServerProduct::Path(path),
                 None => omnigraph_bench::gqt_runner::ServerProduct::Beside,
             });
-            if server_product.is_some()
-                && (backend.is_some() || store.as_deref().is_some_and(|s| s.starts_with("s3://")))
-            {
-                return bench_cli::failure(
-                    vec![Diagnostic::error(
-                        "invalid_run_input",
-                        "server-product",
-                        "--server-product starts the server over a cluster root under a local store; an s3:// store and --backend do not apply",
-                    )],
-                    json,
-                );
-            }
             let store_environment = match (&store, &backend) {
                 (Some(store), Some(backend)) if store.starts_with("s3://") => Some(
                     omnigraph_bench::gqt_case::GqtEnvironment::embedded(backend.clone()),
@@ -844,7 +832,9 @@ async fn main() -> ExitCode {
                     ),
                     (None, _) if server_product.is_some() => {
                         omnigraph_bench::catalog::served_environment(
-                            omnigraph_bench::catalog::local_environment().backend,
+                            backend.clone().unwrap_or_else(|| {
+                                omnigraph_bench::catalog::local_environment().backend
+                            }),
                             omnigraph_bench::case::NetworkPosition::SameHost,
                         )
                     }
@@ -2283,10 +2273,15 @@ async fn run_at(
             Some((reference, path)) => (reference, Some(PathBuf::from(path))),
             None => (spec.as_str(), None),
         };
-        match git_commit(reference) {
-            Ok(commit) => references.push((reference, commit, path)),
-            Err(diagnostic) => return print_cli_failure(diagnostic, json),
-        }
+        let commit = if path.is_some() && full_commit_sha(reference) {
+            reference.to_string()
+        } else {
+            match git_commit(reference) {
+                Ok(commit) => commit,
+                Err(diagnostic) => return print_cli_failure(diagnostic, json),
+            }
+        };
+        references.push((reference, commit, path));
     }
     let mut targets = Vec::new();
     for (reference, commit, path) in references {
@@ -2501,14 +2496,17 @@ fn git_commit(reference: &str) -> Result<String, Diagnostic> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--verify", &format!("{reference}^{{commit}}")])
         .output()
-        .map_err(|e| Diagnostic::error("invalid_run_input", "at", format!("git: {e}")))?;
+        .map_err(|e| {
+            Diagnostic::error(
+                "invalid_run_input",
+                "at",
+                format!(
+                    "`git` could not be run to resolve `{reference}`: {e}; only a full lowercase commit sha given as `<sha>=<path>` needs no repository"
+                ),
+            )
+        })?;
     let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success()
-        || commit.len() != 40
-        || !commit
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
+    if !output.status.success() || !full_commit_sha(&commit) {
         return Err(Diagnostic::error(
             "invalid_run_input",
             "at",
@@ -2519,6 +2517,14 @@ fn git_commit(reference: &str) -> Result<String, Diagnostic> {
         ));
     }
     Ok(commit)
+}
+
+/// Forty lowercase hexadecimal digits, the form `git rev-parse` prints.
+fn full_commit_sha(text: &str) -> bool {
+    text.len() == 40
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// The commit's `omnigraph`: the store's cached build, else built from an

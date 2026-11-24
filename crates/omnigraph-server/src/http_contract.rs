@@ -241,7 +241,7 @@ pub(crate) fn describe_contract(doc: &mut utoipa::openapi::OpenApi) {
             for response in operation.responses.responses.values_mut() {
                 if let RefOr::T(response) = response {
                     let mut header = Header::new(schema.clone());
-                    header.description = Some("Supported OmniGraph HTTP API contract.".into());
+                    header.description = Some("Supported Omnigraph HTTP API contract.".into());
                     response.headers.insert(contract_header.clone(), header);
                     if path == "/healthz" {
                         let mut cache_schema = Object::with_type(Type::String);

@@ -39,7 +39,7 @@ use omnigraph::storage::StorageAdapter;
 use omnigraph_compiler::settings::Engine;
 use omnigraph_gqt_core::runner_config::SeamDirective;
 use omnigraph_gqt_core::{
-    Case, ConcurrentStep, ExecutionHost, PlainHost, Readback, ServedSession, ServerTarget, Step,
+    Case, ConcurrentStep, ExecutionHost, Observer, Readback, ServedSession, ServerTarget, Step,
     StepFail, StepKind, case_session, execute_steps, readback_acked_rows, run_block_once,
 };
 use serde::{Deserialize, Serialize};
@@ -613,7 +613,7 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
             .await
             .map_err(|error| format!("the readback's handle failed to open: {error}"))?;
         let reader = case_session(db, case, Engine::V2)?;
-        let readback = readback_acked_rows(&PlainHost, &reader, step, &driven.acked_runs).await?;
+        let readback = readback_acked_rows(&(), &reader, step, &driven.acked_runs).await?;
         self.observe_block(run, driven, readback);
         Ok(())
     }
@@ -640,7 +640,7 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
         self.operation_started(step.ordinal)?;
         let driven = crate::driver::drive(runners, step, run, || Ok(())).await?;
         self.operation_finished(step.ordinal)?;
-        let readback = readback_acked_rows(&PlainHost, &reader, step, &driven.acked_runs).await?;
+        let readback = readback_acked_rows(&(), &reader, step, &driven.acked_runs).await?;
         self.observe_block(run, driven, readback);
         Ok(())
     }
@@ -670,8 +670,9 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
     }
     /// The selected measured block loops for its run; any other block is
     /// run once, as on a host that measures none.
-    fn concurrent_step<'a>(
+    fn concurrent_step<'a, O: Observer>(
         &'a self,
+        observer: &'a O,
         session: &'a omnigraph::Session,
         case: &'a Case,
         step: &'a ConcurrentStep,
@@ -685,7 +686,7 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
             }
             .boxed();
         }
-        run_block_once(self, session, step)
+        run_block_once(observer, session, step)
     }
     fn served_block<'a>(
         &'a self,
@@ -711,6 +712,31 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
     fn finish_seams(&self, _: ()) -> Result<(), String> {
         Ok(())
     }
+    fn reopen<'a>(
+        &'a self,
+        uri: &'a str,
+        _: Option<Arc<dyn StorageAdapter>>,
+    ) -> BoxFuture<'a, Result<Omnigraph, OmniError>> {
+        let storage = self
+            .state
+            .lock()
+            .unwrap()
+            .local
+            .as_ref()
+            .map(|l| l.generation.storage.clone());
+        async move {
+            let storage = storage.ok_or_else(|| {
+                OmniError::Io(std::io::Error::other("served restart is unsupported"))
+            })?;
+            Omnigraph::open_with_storage(uri, storage).await
+        }
+        .boxed()
+    }
+}
+/// The bench's observer: the two moments around the selected operation are
+/// its clock and its integrity checks; the records it keeps are the passed
+/// assertions, the commit evidence and the measured step's process stats.
+impl<S: MeasurementSignals + Send> Observer for BenchHost<'_, S> {
     fn operation_started(&self, ordinal: usize) -> Result<(), String> {
         self.callback(self.start(ordinal))
     }
@@ -767,26 +793,6 @@ impl<S: MeasurementSignals + Send> ExecutionHost for BenchHost<'_, S> {
             }
             _ => {}
         }
-    }
-    fn reopen<'a>(
-        &'a self,
-        uri: &'a str,
-        _: Option<Arc<dyn StorageAdapter>>,
-    ) -> BoxFuture<'a, Result<Omnigraph, OmniError>> {
-        let storage = self
-            .state
-            .lock()
-            .unwrap()
-            .local
-            .as_ref()
-            .map(|l| l.generation.storage.clone());
-        async move {
-            let storage = storage.ok_or_else(|| {
-                OmniError::Io(std::io::Error::other("served restart is unsupported"))
-            })?;
-            Omnigraph::open_with_storage(uri, storage).await
-        }
-        .boxed()
     }
 }
 pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
@@ -855,6 +861,7 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
             uri,
             None,
             &host,
+            &host,
         );
         let executed = if host.kinds[&host.selected] == StepKind::BranchMerge
             && host.attribution == crate::case::Attribution::PerPhase
@@ -919,6 +926,7 @@ pub(crate) async fn execute_served_rep_signaled<S: MeasurementSignals + Send>(
         omnigraph_gqt_core::execute_measured_served(
             &case,
             &input.target,
+            &host,
             &host,
             bound.plan.definition.workload.measured_step.ordinal,
         ),
@@ -996,7 +1004,7 @@ pub(crate) async fn execute_owned_server_rep_signaled<S: MeasurementSignals + Se
         bound
             .plan
             .past_declared_run(Duration::from_millis(case.runner.timeout_ms)),
-        omnigraph_gqt_core::execute_measured_served(&case, &input.target, &host, selected),
+        omnigraph_gqt_core::execute_measured_served(&case, &input.target, &host, &host, selected),
     )
     .await
     .unwrap_or_else(|_| Err("queries whole-file timeout exceeded".into()))
@@ -1068,7 +1076,7 @@ fn process_stats(
 /// The names a `--store` run's child processes inherit from the run: what
 /// the object-store client, Lance and the locale read; everything else is
 /// cleared so the product sees one declared environment.
-pub const CHILD_ENVIRONMENT: [&str; 24] = [
+pub const CHILD_ENVIRONMENT: [&str; 25] = [
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
@@ -1080,6 +1088,7 @@ pub const CHILD_ENVIRONMENT: [&str; 24] = [
     "AWS_ROLE_SESSION_NAME",
     "AWS_REGION",
     "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT",
     "AWS_ENDPOINT_URL",
     "AWS_ENDPOINT_URL_S3",
     "AWS_ALLOW_HTTP",
@@ -1171,6 +1180,7 @@ pub(crate) async fn execute_clone_rep_signaled<S: MeasurementSignals + Send>(
         omnigraph_gqt_core::execute_measured_process(
             &case,
             &target,
+            &host,
             &host,
             bound.plan.definition.workload.measured_step.ordinal,
         ),
@@ -1906,9 +1916,10 @@ pub fn validate_run_options(plan: &PlannedGqt, options: &RunOptions) -> RunnerRe
                     "reset: rebuild starts a server per repetition and requires --server-product",
                 ));
             }
-            if store.starts_with("s3://") || options.backend.is_some() {
+            let s3 = matches!(plan.definition.environment.backend, Backend::S3 { .. });
+            if store.starts_with("s3://") != s3 {
                 return Err(failure(
-                    "a server the run starts serves a cluster root under a local store; an s3:// store and --backend do not apply",
+                    "an s3:// store declares an S3 backend (--backend) and a local store a local one",
                 ));
             }
             if options.local_route != LocalRouteKind::Direct {
@@ -2243,6 +2254,58 @@ pub fn product_environment() -> Vec<(String, String)> {
     child_environment()
 }
 
+/// The backend evidence of a `--store` run: a local store is probed for the
+/// declared filesystem and storage class, an object store carries the run's
+/// declaration, marked `declared`.
+pub(crate) fn store_evidence(
+    backend: &Backend,
+    location: &StoreLocation,
+) -> RunnerResult<(
+    Option<crate::environment::LocalEnvironmentEvidence>,
+    Option<ObservedBackendV1>,
+)> {
+    match (backend, location) {
+        (
+            Backend::LocalFs {
+                filesystem,
+                storage_class,
+            },
+            StoreLocation::Local { path },
+        ) => Ok((
+            Some(
+                crate::environment::verify_local_environment(path, *filesystem, *storage_class)
+                    .map_err(failure)?,
+            ),
+            None,
+        )),
+        (
+            Backend::S3 {
+                implementation,
+                implementation_version,
+                region,
+                storage_class,
+                versioning,
+                image_digest,
+            },
+            StoreLocation::S3 { .. },
+        ) => Ok((
+            None,
+            Some(ObservedBackendV1::S3 {
+                implementation: *implementation,
+                implementation_version: implementation_version.clone(),
+                region: region.clone(),
+                storage_class: storage_class.clone(),
+                versioning: *versioning,
+                image_digest: image_digest.clone(),
+                probe: "declared".into(),
+            }),
+        )),
+        _ => Err(failure(
+            "the store's kind and the point's declared backend disagree",
+        )),
+    }
+}
+
 /// A `--store` run: the point's frozen base acquired from the store (built
 /// there when absent), then one empty clone per repetition handed to a worker
 /// that drives the product binary over it and deleted once its sample holds.
@@ -2277,48 +2340,7 @@ fn execute_clone_owned(
     )?;
     let store = FixtureStore::open(store_text)?;
     let (environment, observed_backend) =
-        match (&plan.definition.environment.backend, store.location()) {
-            (
-                Backend::LocalFs {
-                    filesystem,
-                    storage_class,
-                },
-                StoreLocation::Local { path },
-            ) => (
-                Some(
-                    crate::environment::verify_local_environment(path, *filesystem, *storage_class)
-                        .map_err(failure)?,
-                ),
-                None,
-            ),
-            (
-                Backend::S3 {
-                    implementation,
-                    implementation_version,
-                    region,
-                    storage_class,
-                    versioning,
-                    image_digest,
-                },
-                StoreLocation::S3 { .. },
-            ) => (
-                None,
-                Some(ObservedBackendV1::S3 {
-                    implementation: *implementation,
-                    implementation_version: implementation_version.clone(),
-                    region: region.clone(),
-                    storage_class: storage_class.clone(),
-                    versioning: *versioning,
-                    image_digest: image_digest.clone(),
-                    probe: "declared".into(),
-                }),
-            ),
-            _ => {
-                return Err(failure(
-                    "the store's kind and the point's declared backend disagree",
-                ));
-            }
-        };
+        store_evidence(&plan.definition.environment.backend, store.location())?;
     let child_environment = child_environment();
     let product = resolve_product(options, &child_environment)?;
     let binding = binding(&plan.dataset, &options.fixture_bindings)?;

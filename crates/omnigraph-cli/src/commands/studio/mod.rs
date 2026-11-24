@@ -164,7 +164,7 @@ fn deliver(
                 writeln!(stdout, "{}", link.link)?;
                 writeln!(
                     stderr,
-                    "opened OmniGraph Studio on target '{}'",
+                    "opened Omnigraph Studio on target '{}'",
                     link.target
                 )?;
             }
@@ -173,7 +173,7 @@ fn deliver(
         Opening::Unavailable(reason) => reason,
     };
     let error = format!(
-        "studio_unavailable: OmniGraph Studio did not open: {reason}; install it from \
+        "studio_unavailable: Omnigraph Studio did not open: {reason}; install it from \
          {INSTALL_URL}, then open the link"
     );
     if json {
@@ -324,7 +324,7 @@ mod tests {
             stdout,
             format!("omnigraph-studio://open?target=staging&binding={binding}&home={home}\n")
         );
-        assert!(stderr.contains("opened OmniGraph Studio"), "{stderr}");
+        assert!(stderr.contains("opened Omnigraph Studio"), "{stderr}");
     }
 
     #[test]

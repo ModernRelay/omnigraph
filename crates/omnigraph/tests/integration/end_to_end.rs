@@ -2510,7 +2510,7 @@ async fn assert_graph_root_refuses_overlapping_bases(
             .with_external_blob_policy(policy)
         {
             Err(OmniError::ExternalBlobPolicy { reason, .. }) => assert!(
-                reason.contains("overlaps an OmniGraph storage root"),
+                reason.contains("overlaps an Omnigraph storage root"),
                 "{base}: {reason}"
             ),
             Err(other) => panic!("{base}: expected a policy refusal, got {other}"),

@@ -361,7 +361,7 @@ pub fn object_store_path_from_uri(uri: &str) -> Result<String> {
                     uri, e
                 ))
             })?;
-            Ok(url.path().trim_start_matches('/').to_string())
+            Ok(omnigraph_storage::s3_object_key(uri, &url))
         }
         StorageKind::Azure | StorageKind::Gcs => {
             let url = url::Url::parse(uri).map_err(|e| {
@@ -650,5 +650,14 @@ mod tests {
             value["table_fork_owner"] = owner;
             assert!(TableVersionMetadata::from_json_str(&value.to_string()).is_err());
         }
+    }
+
+    /// GQT cannot name its store's root, and only an `s3://` path has this key.
+    #[test]
+    fn s3_object_store_path_keeps_a_caret_as_written() {
+        assert_eq!(
+            object_store_path_from_uri("s3://bucket/a^b/nodes/t/_versions/1.manifest").unwrap(),
+            "a^b/nodes/t/_versions/1.manifest"
+        );
     }
 }

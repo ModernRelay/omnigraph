@@ -94,9 +94,10 @@ identity selection.
 Google Cloud Storage support is a preview. A `gs://` root works for a graph
 opened by URI through the embedded Rust API (`Omnigraph::open`,
 `Omnigraph::init`). Cluster storage roots, CLI targets and servers do not
-accept `gs://` yet. No CI job runs against Google Cloud Storage: the bucket
-tests run only when an operator points them at a bucket, and Lance's multipart
-uploads of large files have not been exercised there.
+accept `gs://` yet. CI runs `gs://` graphs against a simulated bucket that
+checks writes the way Google Cloud Storage does, not against Google's service:
+the real-bucket tests run only when an operator points them at a bucket, and
+Lance's multipart uploads of large files have not been exercised there.
 
 Roots use the strict form `gs://<bucket>/<prefix>`. Credentials never belong
 in the URI. OmniGraph reads its Google configuration once per process from
