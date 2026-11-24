@@ -17,6 +17,8 @@ failpoints = ["omnigraph/failpoints"]
 test-util = []
 
 [dependencies]
+# The first-bootstrap recording adapter implements the storage adapter trait.
+async-trait = { workspace = true }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.16.1" }
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.16.1" }
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.16.1" }
@@ -37,7 +39,6 @@ tracing = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 serial_test = "3"
 tempfile = { workspace = true }
 # Paused time for the lease tests, so the crate's own test build runs them.

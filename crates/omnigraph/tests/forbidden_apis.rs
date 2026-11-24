@@ -2753,8 +2753,8 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
     (
         "omnigraph-cluster/deployment/bootstrap_fault_tests.rs",
         ".write_text(",
-        1,
-        "test module compiled under its parent's cfg(test); writes fixtures",
+        2,
+        "test module compiled under its parent's cfg(test); writes fixtures, and rewrites the retained lock's attempt counter before any attempt runs",
     ),
     (
         "omnigraph-cluster/lease.rs",

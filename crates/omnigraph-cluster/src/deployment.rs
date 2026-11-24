@@ -13,10 +13,13 @@ use omnigraph::db::{
 mod execution;
 pub use execution::*;
 mod bootstrap;
+mod write_effects;
 pub use bootstrap::{
-    BootstrapServingReceipt, MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES, bootstrap_serving,
-    claim_bootstrap_serving,
+    BootstrapFailure, BootstrapIdentity, BootstrapOutcome, BootstrapRequest,
+    BootstrapServingReceipt, BootstrapStep, MAX_BOOTSTRAP_SERVING_RECEIPT_BYTES, PriorAttempts,
+    bootstrap_serving, claim_bootstrap_serving,
 };
+pub use write_effects::WriteEffects;
 
 pub(crate) const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;

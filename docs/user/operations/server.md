@@ -41,6 +41,8 @@ For first boot of a fresh, empty S3 cluster initialized by the library, use
 `--bootstrap-handoff FILE` with its exact receipt. This is a one-time ownership
 claim, not a restart or recovery path; see
 [first boot from a bootstrap receipt](../clusters/index.md#first-boot-from-a-bootstrap-receipt).
+A failed library bootstrap resumes only by its own identity, earlier process gone:
+[re-entrant first bootstrap](../../rfcs/2026-11-23-re-entrant-first-bootstrap.md).
 
 ### Logs
 

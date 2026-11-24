@@ -827,9 +827,17 @@ mod tests {
         fs::write(temp.path().join("management.yaml"), "version: 1\ngroups:\n  operators: [operator]\nrules:\n  - id: manage\n    allow:\n      actors: {group: operators}\n      actions: [config_manage]\n  - id: discover\n    allow:\n      actors: {group: operators}\n      actions: [graph_list]\n").unwrap();
         fs::write(temp.path().join("cluster.yaml"), &source).unwrap();
         let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
-        let receipt = omnigraph_cluster::bootstrap_serving(temp.path(), &caller)
-            .await
-            .unwrap();
+        let receipt = omnigraph_cluster::bootstrap_serving(
+            temp.path(),
+            &caller,
+            &omnigraph_cluster::BootstrapRequest {
+                identity: omnigraph_cluster::BootstrapIdentity::new("inc-server-test", None)
+                    .unwrap(),
+                prior_attempts: omnigraph_cluster::PriorAttempts::NotExcluded,
+            },
+        )
+        .await
+        .unwrap();
         let receipt_path = temp.path().join("receipt.json");
         fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
         let root_path = PathBuf::from(&root);
@@ -1000,9 +1008,17 @@ mod tests {
             source.replace(&root, &refused_root),
         )
         .unwrap();
-        let receipt = omnigraph_cluster::bootstrap_serving(temp.path(), &caller)
-            .await
-            .unwrap();
+        let receipt = omnigraph_cluster::bootstrap_serving(
+            temp.path(),
+            &caller,
+            &omnigraph_cluster::BootstrapRequest {
+                identity: omnigraph_cluster::BootstrapIdentity::new("inc-server-test", None)
+                    .unwrap(),
+                prior_attempts: omnigraph_cluster::PriorAttempts::NotExcluded,
+            },
+        )
+        .await
+        .unwrap();
         fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
         let trust = temp.path().join("bad-trust.json");
         fs::write(&trust, b"{}").unwrap();

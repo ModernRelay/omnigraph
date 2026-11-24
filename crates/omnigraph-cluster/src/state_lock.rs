@@ -20,6 +20,14 @@ const RELEASED_LOCK_VERSION: u32 = 2;
 /// its heartbeats stop. Older binaries refuse this version, so they neither
 /// take it over nor release it.
 const LEASED_LOCK_VERSION: u32 = 3;
+/// A held first-bootstrap lock naming its bootstrap identity (the caller's
+/// cluster incarnation and optional request id) and its attempt number. Only
+/// a rerun of that identity re-enters it, by exact-version CAS. Older binaries
+/// refuse this version, so they neither claim nor re-enter it. The attempt is
+/// an unbounded counter from 1: the caller's admission window bounds reruns,
+/// and only its `u32` overflow refuses (`reenter_bootstrap_lock`).
+const BOOTSTRAP_LOCK_VERSION: u32 = 4;
+const MAX_BOOTSTRAP_IDENTITY_FIELD_BYTES: usize = 128;
 const CLUSTER_LOCK_FILE: &str = "__cluster/lock.json";
 /// The bound on every read of `lock.json`. An owner that reads with a
 /// smaller one gets a limit error and stops at its deadline.
@@ -37,6 +45,8 @@ pub(crate) enum StateLockError {
     LockVersion(u32),
     #[error("invalid cluster state lock binding: {0}")]
     InvalidBinding(String),
+    #[error("the bootstrap lock's attempt counter is at its maximum {0}")]
+    BootstrapAttemptsExhausted(u32),
     #[error(
         "the cluster lock's lease fenced before its first heartbeat was acknowledged ({0:?}); \
          this process must not serve, and a restart takes the lock over"
@@ -57,6 +67,22 @@ pub(crate) struct StateLockFile {
     release_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lease_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incarnation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt: Option<u32>,
+}
+
+/// A bootstrap incarnation or request id: 1 to 128 bytes of ASCII letters,
+/// digits, `.`, `_`, `:` and `-`.
+pub(crate) fn valid_bootstrap_identity_field(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_BOOTSTRAP_IDENTITY_FIELD_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 impl StateLockFile {
@@ -71,7 +97,26 @@ impl StateLockFile {
             pid: process::id(),
             release_id: None,
             lease_seconds: None,
+            incarnation: None,
+            request_id: None,
+            attempt: None,
         }
+    }
+
+    /// The held bootstrap lock of `attempt` for one bootstrap identity.
+    fn bootstrap(incarnation: &str, request_id: Option<&str>, attempt: u32) -> Self {
+        let mut lock = Self::new(BOOTSTRAP_OPERATION);
+        lock.version = BOOTSTRAP_LOCK_VERSION;
+        lock.incarnation = Some(incarnation.to_owned());
+        lock.request_id = request_id.map(str::to_owned);
+        lock.attempt = Some(attempt);
+        lock
+    }
+
+    /// The attempt number of a version 4 bootstrap lock; 0 for every other.
+    #[cfg(test)]
+    fn bootstrap_attempt(&self) -> u32 {
+        self.attempt.unwrap_or(0)
     }
 
     /// A held lock of `kind`. A server's lock on S3 is leased: S3's if-match
@@ -95,6 +140,34 @@ impl StateLockFile {
 
     pub(crate) fn parse(text: &str) -> Result<Self, StateLockError> {
         let lock: Self = serde_json::from_str(text).map_err(StateLockError::LockParse)?;
+        let names_bootstrap =
+            lock.incarnation.is_some() || lock.request_id.is_some() || lock.attempt.is_some();
+        if lock.version == BOOTSTRAP_LOCK_VERSION {
+            let valid = lock.release_id.is_none()
+                && lock.lease_seconds.is_none()
+                && lock.operation == BOOTSTRAP_OPERATION
+                && lock
+                    .incarnation
+                    .as_deref()
+                    .is_some_and(valid_bootstrap_identity_field)
+                && lock
+                    .request_id
+                    .as_deref()
+                    .is_none_or(valid_bootstrap_identity_field)
+                && lock.attempt.is_some_and(|attempt| attempt >= 1);
+            if !valid {
+                return Err(StateLockError::InvalidBinding(
+                    "a version 4 lock is a held bootstrap lock naming its identity and attempt"
+                        .into(),
+                ));
+            }
+            return Ok(lock);
+        }
+        if names_bootstrap {
+            return Err(StateLockError::InvalidBinding(
+                "only a version 4 bootstrap lock names a bootstrap identity".into(),
+            ));
+        }
         match (lock.version, lock.release_id.as_deref(), lock.lease_seconds) {
             (LOCK_VERSION, None, None) => {}
             (RELEASED_LOCK_VERSION, Some(id), None) if Ulid::from_string(id).is_ok() => {}
@@ -119,6 +192,9 @@ impl StateLockFile {
         self.version = RELEASED_LOCK_VERSION;
         self.release_id = Some(Ulid::new().to_string());
         self.lease_seconds = None;
+        self.incarnation = None;
+        self.request_id = None;
+        self.attempt = None;
         self
     }
 
@@ -165,7 +241,8 @@ pub(crate) struct StateLockGuard {
     adapter: Arc<dyn StorageAdapter>,
     uri: String,
     kind: StorageKind,
-    lock: StateLockFile,
+    /// Boxed with the lease: a guard is moved through every acquisition result.
+    lock: Box<StateLockFile>,
     release_on_drop: bool,
     /// Renews a leased lock while this guard lives.
     /// Boxed: a guard is moved through every acquisition result.
@@ -383,7 +460,7 @@ async fn acquire_state_lock_leased(
             adapter,
             uri: lock_uri.to_string(),
             kind,
-            lock,
+            lock: Box::new(lock),
             release_on_drop: kind != StorageKind::S3,
             lease: None,
         };
@@ -491,26 +568,127 @@ pub(crate) async fn release_settled_lock(
 
 const BOOTSTRAP_OPERATION: &str = "bootstrap_serving";
 
-/// No release path exists in initial bootstrap, including a lost write
-/// acknowledgement before a guard could be constructed.
+/// What `lock.json` says about one bootstrap identity's retained lock.
+#[derive(Debug)]
+pub(crate) enum BootstrapLockState {
+    Absent,
+    /// This identity's version 4 lock, with the exact version read.
+    Own {
+        lock: Box<StateLockFile>,
+        version: String,
+    },
+    /// Anything else, which a first bootstrap never takes over.
+    Other(&'static str),
+}
+
+pub(crate) async fn read_bootstrap_lock_state(
+    adapter: &Arc<dyn StorageAdapter>,
+    uri: &str,
+    incarnation: &str,
+    request_id: Option<&str>,
+) -> Result<BootstrapLockState, StateLockError> {
+    let Some((text, version)) = adapter
+        .read_text_versioned_if_exists_bounded(uri, LOCK_RECORD_MAX_BYTES)
+        .await?
+    else {
+        return Ok(BootstrapLockState::Absent);
+    };
+    let Ok(lock) = StateLockFile::parse(&text) else {
+        return Ok(BootstrapLockState::Other(
+            "the existing lock record does not decode",
+        ));
+    };
+    Ok(if lock.is_released() {
+        BootstrapLockState::Other("a released lock shows an earlier owner")
+    } else if lock.operation != BOOTSTRAP_OPERATION {
+        BootstrapLockState::Other("a lock other than a bootstrap lock is held")
+    } else if lock.incarnation.as_deref() != Some(incarnation)
+        || lock.request_id.as_deref() != request_id
+    {
+        // Parsing admits identity fields on version 4 only, so a legacy
+        // bootstrap lock, which names none, is an identity mismatch here.
+        BootstrapLockState::Other(
+            "the lock names another bootstrap identity, or none; it is never re-entered",
+        )
+    } else if !valid_version_token(&version) {
+        BootstrapLockState::Other("the lock's version token is not usable for an exact CAS")
+    } else {
+        BootstrapLockState::Own {
+            lock: Box::new(lock),
+            version,
+        }
+    })
+}
+
+fn valid_version_token(version: &str) -> bool {
+    !version.is_empty() && version.len() <= 1024 && !version.chars().any(char::is_control)
+}
+
+/// Create this identity's first attempt lock if absent. `None` when a lock
+/// already exists. No release path exists in initial bootstrap, including a
+/// lost write acknowledgement before a guard could be constructed.
 pub(crate) async fn acquire_bootstrap_lock(
     adapter: Arc<dyn StorageAdapter>,
     kind: StorageKind,
     uri: &str,
-) -> Result<(StateLockGuard, String), StateLockError> {
+    incarnation: &str,
+    request_id: Option<&str>,
+) -> Result<Option<(StateLockGuard, String)>, StateLockError> {
     require_conditional_bootstrap(kind, uri)?;
-    let lock = StateLockFile::new(BOOTSTRAP_OPERATION);
+    let lock = StateLockFile::bootstrap(incarnation, request_id, 1);
     let payload = serde_json::to_string_pretty(&lock).map_err(StateLockError::LockEncode)?;
     if !adapter.write_text_if_absent(uri, &payload).await? {
-        return Err(StateLockError::InvalidBinding(
-            "bootstrap lock is already held".into(),
-        ));
+        return Ok(None);
     }
+    bootstrap_guard(adapter, kind, uri, lock).await.map(Some)
+}
+
+/// Re-enter this identity's retained lock: replace the exact record and
+/// version read with the next attempt, under a new lock id, by if-match.
+/// `None` when the version no longer holds. The lock is never deleted or
+/// released; its key stays present throughout.
+pub(crate) async fn reenter_bootstrap_lock(
+    adapter: Arc<dyn StorageAdapter>,
+    kind: StorageKind,
+    uri: &str,
+    previous: &StateLockFile,
+    version: &str,
+) -> Result<Option<(StateLockGuard, String)>, StateLockError> {
+    require_conditional_bootstrap(kind, uri)?;
+    let (Some(incarnation), Some(attempt)) = (previous.incarnation.as_deref(), previous.attempt)
+    else {
+        return Err(StateLockError::InvalidBinding(
+            "only a version 4 bootstrap lock is re-entered".into(),
+        ));
+    };
+    // The one attempt bound: the counter's own range.
+    let next = attempt
+        .checked_add(1)
+        .ok_or(StateLockError::BootstrapAttemptsExhausted(attempt))?;
+    let lock = StateLockFile::bootstrap(incarnation, previous.request_id.as_deref(), next);
+    let payload = serde_json::to_string_pretty(&lock).map_err(StateLockError::LockEncode)?;
+    if adapter
+        .write_text_if_match(uri, &payload, version)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    bootstrap_guard(adapter, kind, uri, lock).await.map(Some)
+}
+
+/// The guard of a bootstrap lock this call wrote, with the version read back.
+async fn bootstrap_guard(
+    adapter: Arc<dyn StorageAdapter>,
+    kind: StorageKind,
+    uri: &str,
+    lock: StateLockFile,
+) -> Result<(StateLockGuard, String), StateLockError> {
     let guard = StateLockGuard {
         adapter: adapter.clone(),
         uri: uri.into(),
         kind,
-        lock,
+        lock: Box::new(lock),
         release_on_drop: false,
         lease: None,
     };
@@ -542,11 +720,7 @@ async fn read_bootstrap_lock(
         .await?
         .ok_or_else(|| StateLockError::InvalidBinding("bootstrap lock is absent".into()))?;
     let lock = StateLockFile::parse(&text)?;
-    if lock.is_released()
-        || lock.operation != BOOTSTRAP_OPERATION
-        || version.is_empty()
-        || version.len() > 1024
-        || version.chars().any(char::is_control)
+    if lock.is_released() || lock.operation != BOOTSTRAP_OPERATION || !valid_version_token(&version)
     {
         return Err(StateLockError::InvalidBinding(
             "not a retained bootstrap lock and version".into(),
@@ -601,7 +775,7 @@ pub(crate) async fn claim_bootstrap_lock(
         adapter,
         uri: uri.into(),
         kind,
-        lock,
+        lock: Box::new(lock),
         release_on_drop: false,
         lease: None,
     }
@@ -638,11 +812,60 @@ mod tests {
         assert_eq!(parsed.operation(), "apply");
         assert_eq!(parsed.pid(), 42);
 
-        let future = valid.replace("\"version\": 1", "\"version\": 4");
+        let future = valid.replace("\"version\": 1", "\"version\": 5");
         assert!(matches!(
             StateLockFile::parse(&future),
-            Err(StateLockError::LockVersion(4))
+            Err(StateLockError::LockVersion(5))
         ));
+        // A bootstrap lock is version 4 and names its identity and attempt.
+        let bootstrap =
+            serde_json::to_string(&StateLockFile::bootstrap("inc-1", Some("req-1"), 1)).unwrap();
+        let parsed_bootstrap = StateLockFile::parse(&bootstrap).unwrap();
+        assert_eq!(parsed_bootstrap.bootstrap_attempt(), 1);
+        assert_eq!(parsed_bootstrap.operation(), BOOTSTRAP_OPERATION);
+        let anonymous = serde_json::to_string(&StateLockFile::bootstrap("inc-1", None, 2)).unwrap();
+        assert!(!anonymous.contains("request_id"));
+        assert_eq!(
+            StateLockFile::parse(&anonymous)
+                .unwrap()
+                .bootstrap_attempt(),
+            2
+        );
+        // The attempt is an unbounded counter from 1.
+        for attempt in [17, 1000, u32::MAX] {
+            let later = bootstrap.replace("\"attempt\":1", &format!("\"attempt\":{attempt}"));
+            assert_eq!(
+                StateLockFile::parse(&later).unwrap().bootstrap_attempt(),
+                attempt
+            );
+        }
+        for refused in [
+            bootstrap.replace("\"attempt\":1", "\"attempt\":0"),
+            bootstrap.replace("\"incarnation\":\"inc-1\"", "\"incarnation\":\"\""),
+            bootstrap.replace("\"incarnation\":\"inc-1\"", "\"incarnation\":\"inc/1\""),
+            bootstrap.replace(
+                "\"operation\":\"bootstrap_serving\"",
+                "\"operation\":\"serve\"",
+            ),
+            bootstrap.replace(",\"attempt\":1", ""),
+            bootstrap.replace("\"version\":4", "\"version\":1"),
+            valid.replace("\"pid\": 42", "\"pid\": 42, \"incarnation\": \"inc-1\""),
+        ] {
+            assert!(
+                matches!(
+                    StateLockFile::parse(&refused),
+                    Err(StateLockError::InvalidBinding(_))
+                ),
+                "{refused}"
+            );
+        }
+        let released_bootstrap = parsed_bootstrap.mark_released();
+        assert!(
+            StateLockFile::parse(&serde_json::to_string(&released_bootstrap).unwrap())
+                .unwrap()
+                .is_released(),
+            "a release drops the bootstrap identity"
+        );
         // A leased lock is version 3 and records a lease within the bounds.
         let leased = valid
             .replace("\"version\": 1", "\"version\": 3")
