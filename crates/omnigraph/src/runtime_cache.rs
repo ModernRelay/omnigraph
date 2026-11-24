@@ -11,9 +11,11 @@ use omnigraph_core::handle_cache::LruMap;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use crate::db::{ResolvedTarget, SchemaContractIdentity, Snapshot};
+use crate::db::write_queue::observed;
+use crate::db::{SchemaContractIdentity, Snapshot};
 use crate::error::Result;
 use crate::graph_index::{GraphIndex, persist};
+use crate::seams::{decide_seam, fail};
 
 pub(crate) use omnigraph_core::handle_cache::TableHandleCache;
 
@@ -56,18 +58,36 @@ struct GraphIndexTableState {
     endpoints: (String, String),
 }
 
+decide_seam! {
+    /// A caller missed the cache and is about to take the build gate;
+    /// crossed once per such caller, before the gate. An observation site:
+    /// a test arms `observe` here to count the callers a held build keeps
+    /// waiting.
+    pub static GRAPH_INDEX_BUILD_QUEUED = ("runtime_cache.graph_index_build_queued", Unreachable, [Fail]);
+}
+
+decide_seam! {
+    /// The gate holder found no cached index and no usable artifact and is
+    /// about to scan the edge tables.
+    pub static GRAPH_INDEX_SCAN_BUILD = ("runtime_cache.graph_index_scan_build", Unreachable, [Fail]);
+}
+
 #[derive(Debug, Default)]
 pub struct RuntimeCache {
     graph_indices: Mutex<GraphIndexCache>,
-    /// Single-flight gate for the persisted-artifact decode: simultaneous
-    /// misses serialize here, so on the fresh-artifact path the full-catalog
-    /// GET + decode runs once and waiters are served from the shared decode
-    /// by the post-acquisition re-check. A FAILED attempt records its scope
-    /// key in `artifact_negative`, so a stale/absent artifact costs one gated
-    /// GET per distinct key — never a repeated queue of doomed downloads —
-    /// and later misses for that key go straight to the scan build. Scan
-    /// builds themselves run outside this gate.
-    artifact_admission: Mutex<()>,
+    /// One load or build at a time per handle. Simultaneous misses serialize
+    /// here and re-check the cache once they hold the gate, so the artifact
+    /// GET + decode, or the scan of the edge tables, runs once and the
+    /// waiters are served the shared `Arc`. A scan build holds every id and
+    /// edge of its scope in memory, so N concurrent misses building N copies
+    /// is what the gate exists to prevent; the cost is that a miss on one
+    /// scope waits for a build of another. A FAILED artifact attempt records
+    /// its scope key in `artifact_negative`, so a stale/absent artifact costs
+    /// one GET per distinct key and later misses for that key go straight to
+    /// the scan build. A failed build caches nothing: the gate passes to the
+    /// next waiter, which builds. Taken before `graph_indices`, never while
+    /// holding it.
+    build_gate: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -104,7 +124,7 @@ impl RuntimeCache {
     }
 
     /// Note on in-flight loaders: an artifact decode already running under
-    /// `artifact_admission` can repopulate the shelf and one entry AFTER this
+    /// `build_gate` can repopulate the shelf and one entry AFTER this
     /// returns. That is safe, not racy: every serve re-verifies stamps
     /// against the caller's CURRENT snapshot, and entry keys embed stamps —
     /// stale state parked by a straggler is simply never served.
@@ -148,78 +168,58 @@ impl RuntimeCache {
     /// distinct entries and never serve each other.
     pub async fn graph_index(
         &self,
-        resolved: &ResolvedTarget,
+        snapshot: &Snapshot,
         edge_types: &HashMap<String, (String, String)>,
         adapter: &dyn crate::storage::StorageAdapter,
         system_columns: SystemColumns,
     ) -> Result<Arc<GraphIndex>> {
-        let key = graph_index_cache_key(resolved, edge_types);
+        let key = graph_index_cache_key(snapshot, edge_types);
         {
             let mut cache = self.graph_indices.lock().await;
-            if let Some(index) = cache.entries.get(&key).cloned() {
-                return Ok(index);
-            }
-            if let Some(index) = cache.shelf_serve(&resolved.snapshot, edge_types) {
-                cache.insert(key, Arc::clone(&index));
+            if let Some(index) = cache.serve(&key, snapshot, edge_types) {
                 return Ok(index);
             }
         }
 
-        // Miss for both the scope entry and the shelf: try the persisted
-        // artifact once, single-flight, so concurrent misses never duplicate
-        // the full-catalog decode. A key whose attempt already failed skips
-        // the gate entirely (the key embeds the stamps, so the failure
-        // verdict holds until the stamps move or a fresh decode lands).
+        // Miss for both the scope entry and the shelf: one caller at a time
+        // loads or builds. A waiter re-checks once it holds the gate, so it
+        // is served what the caller before it produced.
+        observed(&GRAPH_INDEX_BUILD_QUEUED);
+        let _gate = self.build_gate.lock().await;
         let known_doomed = {
             let mut cache = self.graph_indices.lock().await;
+            if let Some(index) = cache.serve(&key, snapshot, edge_types) {
+                return Ok(index);
+            }
+            // The key embeds the stamps, so a failed artifact attempt holds
+            // until the stamps move or a fresh decode lands; a waiter whose
+            // predecessor just failed shares that verdict.
             cache.artifact_negative.get(&key).is_some()
         };
         if !known_doomed {
-            let _admission = self.artifact_admission.lock().await;
-            let doomed_while_waiting = {
-                let mut cache = self.graph_indices.lock().await;
-                if let Some(index) = cache.entries.get(&key).cloned() {
+            match GraphIndex::load_persisted(snapshot, edge_types, adapter).await {
+                Some((index, stamps)) => {
+                    let index = Arc::new(index);
+                    let mut cache = self.graph_indices.lock().await;
+                    cache.shelf = Some((stamps, Arc::clone(&index)));
+                    cache.artifact_negative.invalidate_all();
+                    cache.insert(key, Arc::clone(&index));
                     return Ok(index);
                 }
-                if let Some(index) = cache.shelf_serve(&resolved.snapshot, edge_types) {
-                    cache.insert(key.clone(), Arc::clone(&index));
-                    return Ok(index);
-                }
-                // A same-key waiter whose winner just FAILED shares that
-                // verdict instead of repeating the doomed GET.
-                cache.artifact_negative.get(&key).is_some()
-            };
-            if doomed_while_waiting {
-                // fall through to the scan build below
-            } else {
-                match GraphIndex::load_persisted(&resolved.snapshot, edge_types, adapter).await {
-                    Some((index, stamps)) => {
-                        let index = Arc::new(index);
-                        let mut cache = self.graph_indices.lock().await;
-                        cache.shelf = Some((stamps, Arc::clone(&index)));
-                        cache.artifact_negative.invalidate_all();
-                        cache.insert(key, Arc::clone(&index));
-                        return Ok(index);
-                    }
-                    None => {
-                        let mut cache = self.graph_indices.lock().await;
-                        cache.artifact_negative.insert(key.clone(), ());
-                    }
+                None => {
+                    let mut cache = self.graph_indices.lock().await;
+                    cache.artifact_negative.insert(key.clone(), ());
                 }
             }
         }
 
-        // No usable artifact: scan-build the SCOPED index (small, never
-        // shelved), outside the admission gate so unrelated scopes still
-        // build concurrently. The graph-build probe fires inside
+        // No usable artifact: scan-build the SCOPED index (never shelved),
+        // still under the gate. The graph-build probe fires inside
         // `GraphIndex::build` itself, so a persisted-artifact load is never
         // counted as a build.
-        let index =
-            Arc::new(GraphIndex::build(&resolved.snapshot, edge_types, system_columns).await?);
+        fail(&GRAPH_INDEX_SCAN_BUILD)?;
+        let index = Arc::new(GraphIndex::build(snapshot, edge_types, system_columns).await?);
         let mut cache = self.graph_indices.lock().await;
-        if let Some(existing) = cache.entries.get(&key).cloned() {
-            return Ok(existing);
-        }
         cache.insert(key, Arc::clone(&index));
         Ok(index)
     }
@@ -228,6 +228,22 @@ impl RuntimeCache {
 impl GraphIndexCache {
     fn insert(&mut self, key: GraphIndexCacheKey, value: Arc<GraphIndex>) {
         self.entries.insert(key, value);
+    }
+
+    /// The index for `key` from its scope entry, else from the shelf (which
+    /// then gains the scope entry).
+    fn serve(
+        &mut self,
+        key: &GraphIndexCacheKey,
+        snapshot: &Snapshot,
+        edge_types: &HashMap<String, (String, String)>,
+    ) -> Option<Arc<GraphIndex>> {
+        if let Some(index) = self.entries.get(key).cloned() {
+            return Some(index);
+        }
+        let index = self.shelf_serve(snapshot, edge_types)?;
+        self.insert(key.clone(), Arc::clone(&index));
+        Some(index)
     }
 
     /// Serve a scope from the shelved full-catalog decode when every
@@ -266,15 +282,14 @@ impl Default for GraphIndexCache {
 }
 
 fn graph_index_cache_key(
-    resolved: &ResolvedTarget,
+    snapshot: &Snapshot,
     edge_types: &HashMap<String, (String, String)>,
 ) -> GraphIndexCacheKey {
     let mut edge_tables: Vec<GraphIndexTableState> = edge_types
         .iter()
         .filter_map(|(edge_name, endpoints)| {
             let table_key = format!("edge:{}", edge_name);
-            resolved
-                .snapshot
+            snapshot
                 .dataset(&table_key)
                 .map(|entry| GraphIndexTableState {
                     identity: entry.identity,
@@ -865,11 +880,11 @@ edge Likes: Person -> Person {}
             HashMap::from([(edge.to_string(), (et.from_type.clone(), et.to_type.clone()))])
         };
         let knows = db
-            .graph_index_for_resolved(&resolved, &scope("Knows"), catalog.system_columns)
+            .graph_index_for_snapshot(&resolved.snapshot, &scope("Knows"), catalog.system_columns)
             .await
             .unwrap();
         let likes = db
-            .graph_index_for_resolved(&resolved, &scope("Likes"), catalog.system_columns)
+            .graph_index_for_snapshot(&resolved.snapshot, &scope("Likes"), catalog.system_columns)
             .await
             .unwrap();
         assert!(

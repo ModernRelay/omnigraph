@@ -97,6 +97,14 @@ requested table's stamp on every serve, so it stops serving a written edge
 table, but on a handle that writes edges after one artifact load it keeps that
 stale full-catalog topology for the handle's life (at most one).
 
+One artifact load or scan build runs at a time per handle
+(`RuntimeCache::build_gate`). Queries that miss the cache together wait for
+the gate and are then served the index its holder produced, so a scope's edge
+tables are scanned once and not once per query; a miss on one scope also
+waits for a build of another. A build that fails caches nothing and the next
+waiter builds. A historical read (`run_query_at`) takes its index from the
+same cache as a live read, under the key of its snapshot's edge tables.
+
 An explicitly bound edge must scan its edge table because topology alone does
 not contain edge properties. Every edge probe (`graph.rs::scan_edges_stream`:
 the bound-edge producer, an indexed hop) pushes its `key IN (keys)` list into
