@@ -112,7 +112,10 @@ the same HTTP contract.
 
 Install a specific stable tag with `VERSION=v0.14.0` on macOS/Linux or
 `-Version v0.14.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
-different destination.
+different destination. On macOS/Linux, `ARCHIVE_SHA256=<digest>` also
+requires the downloaded archive to have that SHA256, in addition to the
+`.sha256` published beside it, so a pinned install refuses an asset replaced
+under its tag.
 
 Documentation on `main` may describe behavior newer than the latest stable
 binary. Check `omnigraph version` and the [release notes](../releases/).
