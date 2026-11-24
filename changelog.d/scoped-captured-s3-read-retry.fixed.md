@@ -1,0 +1,1 @@
+- A scoped adapter built from a captured S3 binding, which a managed first bootstrap reads through, now retries its reads (3 within 180 seconds), so one stalled existence check no longer fails it.
