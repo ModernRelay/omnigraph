@@ -790,8 +790,11 @@ in `return` (`T35`) runs as a Boolean; `T32`/`T33`/`T54` are `T65`; `T58` is `T9
 carry their own `Q…` code instead of `Q000`. A read named after a function
 (`lower`, `length`, `round`, …) or an element keyword is `T74`; over grouped rows every order key must be returned
 (`T42`). With no fix: a later `update`/`delete … where` reading a type an
-earlier statement of the write changed (`T91`: split the write), and
-`fuzzy(…, n)` with `n` above 2 (`T71`). Two keyed inserts of one key in one
+earlier statement of the write changed (`T91`: split the write), including
+`update Doc … where …` then `insert Doc { … }`, whose `Q008` fix writes the
+`insert` first; `fuzzy(…, n)` with `n` above 2 (`T71`); and a list holding
+predicates only, `optional { $p.age > 3 }` (`Q017`). Every fix keeps the
+comments it touches. Two keyed inserts of one key in one
 write fail with `key_conflict`. The full map is the user guide's "Upgrading
 queries to GQ 3" page.
 

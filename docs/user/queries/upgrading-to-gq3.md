@@ -91,7 +91,7 @@ fix.
 | `fuzzy($x.t, $q)`, `fuzzy($x.t, $q, n)` | `match_terms($x.t, terms($q, mode: any, max_edits: 2))`, or `max_edits: n` for the third argument (none for `0`); every removed lexical call's fix is a machine edit | `T6` |
 | `delete T where φ` | `match { $x: T } where φ′  delete $x`: each bare property is written `$x.p`, and an edge's `from` and `to` are `$x.@src` and `$x.@dst` | `Q008` |
 | `update T set { … } where φ` | `match { $x: T } where φ′  update $x set { … }`, a bare property in an assignment written `$x.p` | `Q008` |
-| a body of several statements | one group per `update … where` and `delete … where`, in order, each opening with its `match`; a statement that selects nothing of its own (an `insert`) stays in the group it was written in, ahead of the groups the fix opens, so it runs once rather than once per selected row. A later group that selects a type an earlier statement changes is refused (`T91`, below) | `Q008` |
+| a body of several statements | one group per `update … where` and `delete … where`, in order, each opening with its `match`; a statement that selects nothing of its own (an `insert`) stays in the group it was written in, ahead of the groups the fix opens, so it runs once rather than once per selected row. A later group that selects a type an earlier statement changes is refused (`T91`, below), and so is the fix's own move where the moved statement changes the type the group selects: `update Doc … where …` then `insert Doc { … }` writes the `insert` first, and the `update`'s group then selects `Doc`, which it changed. Write the two statements as two writes | `Q008` |
 | `insert T { … }` over a type with `@key` | `replace T { … }`, which means what that `insert` meant; narrow it to `insert` where only creation is meant, or `upsert` where only the named properties should change | none: it compiles, and on an existing key, or on a key an earlier statement of the same write inserted (where the older release kept the last row), fails at run time with `key_conflict`, naming `upsert` and `replace`, changing no data |
 | `from:` and `to:` in an edge insert | `@src:` and `@dst:` | `T11` |
 | `omnigraph load --mode append`, `load csv … mode append` | `insert` | the CLI's and HTTP's mode refusal, `Q004` |
@@ -219,7 +219,15 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
   the older release ran its statements in order. A write whose `update … where`
   or `delete … where` reads a type an earlier statement of the same write
   changes is refused (`T91`), with no edit: no single write means the same.
-  Split it into two writes, or write the final row in one keyed statement.
+  The `Q008` fix can lead there itself: it writes a statement that selects
+  nothing ahead of the group it opens, so `update Doc … where …` followed by
+  `insert Doc { … }` becomes an `insert Doc` and then a group selecting `Doc`.
+  Split it into two writes, the `update` first, or write the final row in one
+  keyed statement.
+- A list of elements that holds predicates only, with no binding, is refused
+  with no edit (`Q017`): `match { $p.age > 3 }`, and `optional { $p.age > 3 }`,
+  which binds nothing and keeps every row whether its test holds or not. Move
+  the test to the `where` if it should filter, or delete the `optional`.
 - `fuzzy(f, q, n)` with `n` above 2 is refused (`T71`: `max_edits` is 0 to 2)
   with no edit. The older release searched with any budget, and no GQ 3 form
   matches more than two edits; choose a budget of 2 or less by hand, which

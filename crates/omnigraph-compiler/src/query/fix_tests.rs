@@ -344,3 +344,22 @@ fn printed_fixes_keep_comments_where_they_were_written() {
         );
     }
 }
+
+/// The group rule writes a statement that selects nothing ahead of the
+/// group a `T … where` opens. Where that statement changes the type the
+/// group selects (`update Doc … where …` then `insert Doc { … }`), the
+/// rewrite is refused (`T91`, no fix): every group selects on the write's
+/// one snapshot. Two writes keep the order.
+#[test]
+fn a_moved_insert_of_the_selected_type_stops_at_t91() {
+    let schema = "node Doc { name: String @key\n n: I32? }\nnode Note { text: String }\n";
+    let catalog = build_catalog(&parse_schema(schema).unwrap()).unwrap();
+    let out = fix_source(
+        &catalog,
+        "query m() { update Doc set { n: 5 } where n = 1  insert Doc { name: \"c\", n: 1 } }",
+        FixOptions { review: true },
+    );
+    assert_eq!(out.report.status, FixStatus::Unfixed, "{:?}", out.report);
+    assert_eq!(out.report.unfixed[0].code.as_str(), "T91");
+    assert_eq!(codes(&out.report), [("Q008", 1)]);
+}
