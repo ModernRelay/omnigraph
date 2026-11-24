@@ -1924,10 +1924,17 @@ fn write_body(pair: Pair<Rule>) -> R<WriteBody> {
                             ));
                         }
                         Rule::where_stmt => {
+                            let tail: Vec<Pair<Rule>> = parts
+                                .iter()
+                                .filter(|q| q.as_rule() == Rule::mutation_stmt)
+                                .skip_while(|q| q.as_span() != p.as_span())
+                                .cloned()
+                                .collect();
                             return Err(where_statement(
                                 s,
                                 selection.as_ref(),
                                 where_pair.as_ref(),
+                                &tail,
                             ));
                         }
                         _ => {
@@ -2172,7 +2179,7 @@ fn statement_inner(input: &str, s: Pair<Rule>) -> R<Stmt> {
                 variable: var.as_str()[1..].to_string(),
             })
         }
-        Rule::where_stmt => Err(where_statement(s, None, None)),
+        Rule::where_stmt => Err(where_statement(s, None, None, &[])),
         Rule::create_rec => {
             let word = s
                 .clone()
@@ -2400,10 +2407,20 @@ fn assignment_list(input: &str, pairs: &[Pair<Rule>]) -> R<Vec<Assignment>> {
 /// respelling map, section 6).
 /// Over a bound variable, `delete $x where φ`, the predicate joins the
 /// group's `where`.
+///
+/// A statement runs once per row its group selects, and a statement after
+/// a group's `match` belongs to that group. So the fix of the first such
+/// statement rewrites the rest of its group, `tail`, at once: every
+/// statement of the tail that selects no rows of its own (`insert`, a
+/// statement over the group's bound variables) stays in the group it was
+/// written in, in written order, and each `T … where` statement follows as
+/// its own group. A statement written after `update T … where φ` keeps the
+/// one run it had, rather than running once per updated row.
 fn where_statement(
     s: Pair<Rule>,
     selection: Option<&Pair<Rule>>,
     where_pair: Option<&Pair<Rule>>,
+    tail: &[Pair<Rule>],
 ) -> Refusal {
     let input = input_of(&s);
     let span = span_of(&s);
@@ -2478,28 +2495,85 @@ fn where_statement(
         }
         return refusal(input, Q008, message, span, edits, MACHINE);
     }
-    let v = fresh_name(type_name);
-    let filter = qualify_bare_names(&predicate, &v);
-    let statement = match kind {
-        "update" => format!("update ${v} set {{ {} }}", qualified_set(&v)),
-        _ => format!("delete ${v}"),
+    let message = format!(
+        "`{kind} {type_name} … where …` is not a statement: a statement names a bound variable, and the group's `match` and `where` select its rows"
+    );
+    fn typed_where<'i>(q: &Pair<'i, Rule>) -> Option<Pair<'i, Rule>> {
+        let inner = q.clone().into_inner().next().unwrap();
+        (inner.as_rule() == Rule::where_stmt
+            && !inner
+                .clone()
+                .into_inner()
+                .any(|c| c.as_rule() == Rule::variable))
+        .then_some(inner)
+    }
+    let (staying, grouped): (Vec<&Pair<Rule>>, Vec<&Pair<Rule>>) =
+        tail.iter().partition(|q| typed_where(q).is_none());
+    let groups: Vec<String> = if tail.is_empty() {
+        vec![type_where_group(&s)]
+    } else {
+        grouped
+            .iter()
+            .map(|q| type_where_group(&typed_where(q).unwrap()))
+            .collect()
     };
+    let end = tail
+        .last()
+        .map_or(span.1, |q| input[..q.as_span().end()].trim_end().len());
+    let text: Vec<String> = staying
+        .iter()
+        .map(|q| input[q.as_span().start()..tend(input, q)].to_string())
+        .chain(groups)
+        .collect();
     refusal(
         input,
         Q008,
-        format!(
-            "`{kind} {type_name} … where …` is not a statement: a statement names a bound variable, and the group's `match` and `where` select its rows"
-        ),
+        message,
         span,
-        vec![edit(
-            span.0,
-            span.1,
-            format!(
-                "match {{ ${v}: {type_name} }} where {}  {statement}",
-                filter.trim()
-            ),
-        )],
+        vec![edit(span.0, end, text.join("\n  "))],
         MACHINE,
+    )
+}
+
+/// `T … where φ` as its own group, `match { $x: T } where φ′  <statement>`,
+/// `$x` a name the declaration does not use yet; the name is taken, so the
+/// next group binds another.
+fn type_where_group(s: &Pair<Rule>) -> String {
+    let mut kind = "";
+    let mut type_name = "";
+    let mut set: Vec<Pair<Rule>> = Vec::new();
+    let mut predicate = None;
+    for part in s.clone().into_inner() {
+        match part.as_rule() {
+            Rule::kw_update => kind = "update",
+            Rule::kw_delete => kind = "delete",
+            Rule::type_name => type_name = part.as_str(),
+            Rule::assignments => set.extend(
+                part.into_inner()
+                    .filter(|a| a.as_rule() == Rule::assignment),
+            ),
+            Rule::expr => predicate = Some(part),
+            _ => {}
+        }
+    }
+    let predicate = predicate.expect("grammar: where_stmt holds its predicate");
+    let v = fresh_name(type_name);
+    with_ctx(|c| c.vars.insert(v.clone()));
+    let filter = qualify_bare_names(&predicate, &v);
+    let statement = match kind {
+        "update" => format!(
+            "update ${v} set {{ {} }}",
+            set.iter()
+                .map(|a| qualify_bare_names(a, &v))
+                .map(|t| t.trim().trim_end_matches(',').trim().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        _ => format!("delete ${v}"),
+    };
+    format!(
+        "match {{ ${v}: {type_name} }} where {}  {statement}",
+        filter.trim()
     )
 }
 

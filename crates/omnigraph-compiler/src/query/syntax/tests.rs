@@ -974,6 +974,43 @@ fn delete_and_update_with_where_print_the_group() {
     }
 }
 
+/// A statement runs once per row its group selects. The fix of
+/// `T … where` opens a group, so a statement written after it that selects
+/// nothing of its own stays in the group it was written in, before the new
+/// one, rather than running once per selected row; each later `T … where`
+/// opens its own group, binding a name of its own.
+#[test]
+fn a_where_statements_group_keeps_each_later_statements_own_rows() {
+    for (src, intended) in [
+        (
+            "query m() { update Doc set { n: 5 } where n = 1  insert Note { text: \"once\" } }",
+            "query m() { insert Note { text: \"once\" }  match { $x: Doc } where $x.n = 1  update $x set { n: 5 } }",
+        ),
+        (
+            "query m() { insert Note { text: \"a\" }  delete Doc where n = 1  insert Note { text: \"b\" } }",
+            "query m() { insert Note { text: \"a\" }  insert Note { text: \"b\" }  match { $x: Doc } where $x.n = 1  delete $x }",
+        ),
+        (
+            "query m() { update Doc set { n: 5 } where n = 1  insert Note { text: \"once\" }  update Note set { text: \"b\" } where text = \"a\" }",
+            "query m() { insert Note { text: \"once\" }  match { $x: Doc } where $x.n = 1  update $x set { n: 5 }  match { $n: Note } where $n.text = \"a\"  update $n set { text: \"b\" } }",
+        ),
+        // A statement written in a group with a `match` stays in it.
+        (
+            "query m() { match { $p: Person } update $p set { a: 1 }  update Doc set { n: 5 } where n = 1  insert Note { text: \"each\" } }",
+            "query m() { match { $p: Person } update $p set { a: 1 }  insert Note { text: \"each\" }  match { $x: Doc } where $x.n = 1  update $x set { n: 5 } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q008", "{src}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(
+            parse_source(&fixed).unwrap_or_else(|e| panic!("{src}\n{fixed}\n{e:?}")),
+            parsed(intended),
+            "{fixed}"
+        );
+    }
+}
+
 #[test]
 fn the_mutation_keyword_is_refused_with_query_as_the_fix() {
     let e = refusal_of("mutation hire($h: String) { insert Person { handle: $h } }");

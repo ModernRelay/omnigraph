@@ -249,3 +249,39 @@ fn a_suggestion_without_edits_is_no_fix() {
     assert_eq!(out.report.status, FixStatus::Unfixed);
     assert_eq!(out.report.unfixed.len(), 1);
 }
+
+/// Edition-2 texts whose printed fixes once looped, multiplied a statement
+/// or stopped: each converges to a compiling text, and the fixed text is a
+/// fixed point (`lint --fix` on its own output changes nothing).
+#[test]
+fn edition_2_shapes_converge_to_a_fixed_point() {
+    let schema = "node Doc { name: String @key\n n: I32? }\nnode Note { text: String }\nedge Cites: Doc -> Note\n";
+    let catalog = build_catalog(&parse_schema(schema).unwrap()).unwrap();
+    for (source, fixed) in [
+        // A block of filters alone: one edit moves the comparison to the
+        // `where` and folds the block, which no rule moves back.
+        (
+            "query q() {\n  match {\n    $d: Doc\n    count { $d.n > 2 } != 0\n  }\n  return { max($d.n) as a0 }\n}\n",
+            "query q() {\n  match { $d: Doc } where if(coalesce($d.n > 2, false), 1, 0) != 0\n  return { max($d.n) as a0 }\n}\n",
+        ),
+        // The `insert` after `update … where` runs once, not once per
+        // updated row.
+        (
+            "mutation m() {\n  update Doc set { n: 5 } where n = 1\n  insert Note { text: \"once\" }\n}\n",
+            "query m() {\n  insert Note { text: \"once\" }\n  match { $x: Doc } where $x.n = 1  update $x set { n: 5 }\n}\n",
+        ),
+    ] {
+        let out = fix_source(&catalog, source, FixOptions::default());
+        assert_eq!(
+            out.report.status,
+            FixStatus::Fixed,
+            "{source}\n{:?}",
+            out.report
+        );
+        let text = out.fixed.unwrap();
+        assert_eq!(text, fixed);
+        assert!(check_source_all(&catalog, &text).is_empty(), "{text}");
+        let again = fix_source(&catalog, &text, FixOptions::default());
+        assert_eq!(again.report.status, FixStatus::Unchanged, "{text}");
+    }
+}
