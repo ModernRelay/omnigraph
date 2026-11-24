@@ -2339,6 +2339,21 @@ fn t65_suggests_an_applicable_edit() {
             "query q($s: String, $v: Vector(3)) { match { $d: Doc } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s)) } limit 3 }",
             "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score, $d: Doc } return { $d.title } order { $score desc } limit 3 }",
         ),
+        // Edition 2's third positional argument is the fusion constant.
+        (
+            "query q($s: String, $v: Vector(3)) { match { $d: Doc } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s), 60) } limit 3 }",
+            "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score, $d: Doc } return { $d.title } order { $score desc } limit 3 }",
+        ),
+        (
+            "query q($s: String, $v: Vector(3), $c: I64) { match { $d: Doc } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s), $c) } limit 3 }",
+            "query q($s: String, $v: Vector(3), $c: I64) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: $c) as $score, $d: Doc } return { $d.title } order { $score desc } limit 3 }",
+        ),
+        // The ranked binding introduced by a triple alone has the type the
+        // edge declares for that end.
+        (
+            "query q($s: String, $v: Vector(3)) { match { $p: Person, $p authored $d } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s)) } limit 3 }",
+            "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score, $p: Person, $p authored $d } return { $d.title } order { $score desc } limit 3 }",
+        ),
     ] {
         let d = refused_with(written, "T65");
         let suggestion = d.suggestion.expect("an edit");

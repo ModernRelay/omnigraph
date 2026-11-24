@@ -1,0 +1,1 @@
+- `T65` prints its edit for an `rrf` with a third argument, `rrf(a, b, 60)`, and for one ranking a binding only a triple introduces.

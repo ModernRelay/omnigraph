@@ -1008,9 +1008,21 @@ fn ranking_edits(
             let all = fresh("all");
             let mut arms = Vec::new();
             let mut ranked: Option<String> = None;
-            for a in &call.args {
-                let Arg::Expr(Expr::Call(arm)) = a else {
-                    return None;
+            // Edition 2 wrote the fusion constant as a third positional
+            // argument, `rrf(a, b, 60)`; it is the `k` option.
+            let mut positional_k = None;
+            for (i, a) in call.args.iter().enumerate() {
+                let arm = match a {
+                    Arg::Expr(Expr::Call(arm))
+                        if matches!(arm.name.as_str(), "nearest" | "bm25") =>
+                    {
+                        arm
+                    }
+                    Arg::Expr(k) if i == 2 && i + 1 == call.args.len() => {
+                        positional_k = Some(print::expr(k));
+                        continue;
+                    }
+                    _ => return None,
                 };
                 let [
                     Arg::Expr(field @ Expr::Prop { variable, .. }),
@@ -1035,18 +1047,32 @@ fn ranking_edits(
                 ));
             }
             let ranked = ranked?;
-            let type_name = body.pattern.elements.iter().find_map(|c| match c {
-                Element::Binding {
-                    variable,
-                    type_name,
-                } if *variable == ranked => Some(type_name.clone()),
-                _ => None,
-            })?;
-            let k = call
-                .options
+            // The ranked binding's type: its binding element, or the type the
+            // edge declares for the end of the triple that introduces it.
+            let type_name = body
+                .pattern
+                .elements
                 .iter()
-                .find(|(o, _)| o == "k")
+                .find_map(|c| match c {
+                    Element::Binding {
+                        variable,
+                        type_name,
+                    } if *variable == ranked => Some(type_name.clone()),
+                    _ => None,
+                })
+                .or_else(|| {
+                    end_bindings(catalog, &body.pattern.elements, &HashMap::new())
+                        .into_iter()
+                        .flat_map(|(_, binds)| binds)
+                        .find_map(|(n, t)| (n == ranked).then_some(t))
+                })?;
+            let named_k = call.options.iter().find(|(o, _)| o == "k");
+            if positional_k.is_some() && named_k.is_some() {
+                return None;
+            }
+            let k = named_k
                 .map(|(_, v)| print::expr(v))
+                .or(positional_k)
                 .unwrap_or_else(|| "60".into());
             let score = fresh("score");
             (
