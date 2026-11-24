@@ -113,6 +113,35 @@ more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
 
+Applied to the shape of a design, that lens is **conceptual integrity**
+(Brooks): few ideas, applied everywhere. Always weigh it. The lenses are the
+default; where one conflicts with the counterweight, the test that closes this
+section decides.
+
+- **Correct by construction.** Make the illegal state unrepresentable; fix the
+  class, not the reported instance.
+- **Generality.** The prompting case is an instance of the mechanism, with no
+  branch, flag or constant of its own (zero-one-infinity: none, one or any
+  number, never a fixed few).
+- **Orthogonality and composability.** Primitives vary independently and close
+  under composition (a composition composes again); extend or compose one
+  before adding one.
+- **Information hiding** (Parnas). A module owns one decision and hides more
+  than it shows (a deep module, Ousterhout); code outside it never works on
+  its representation.
+- **Intrinsic naming.** Name a thing by what it is or selects, never by the
+  caller, scenario or change that prompted it. The `issue_N` in a regression
+  test's name is a cross-reference the gate reads, and stays.
+- **Cases as data.** Real variation is a parameter or a table row, not new
+  code.
+
+The counterweight is **speculative generality** (Fowler) and **the wrong
+abstraction** (Metz): YAGNI. For a design choice, state the specific form and
+the general form, argue for and against each, and name what the choice trades
+away. Decide by the same lens, on evidence: the general form
+wins only when the tree has the cases it serves today and it leaves fewer
+concepts than the specific one (parsimony).
+
 Validate every assumption. Do not assume how a function, module or symbol
 behaves: read it. For Lance internals, read the upstream implementation.
 
@@ -146,9 +175,8 @@ cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
-# Focused examples. A crate's loose integration tests are modules of one `tests/integration/main.rs`
-# binary (one link per crate, not one per file); a file stays a separate binary only when its tests
-# need their own process. CI selects a module's test as `--test integration <module>::<name>`.
+# Focused examples. A crate's integration tests are modules of one `tests/integration/main.rs`
+# binary: select one as `--test integration <module>::<name>`.
 cargo test -p omnigraph-engine --test integration traversal_indexed::
 cargo test -p omnigraph-engine --features failpoints --test failpoints
 cargo test -p omnigraph-server --features aws
@@ -170,18 +198,13 @@ every one and when to run it.
 The separate `GQ Logic Tests` context owns the complete GQT corpus. Also run
 `cargo test -p omnigraph-gqt --locked` and
 `cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro`
-from any directory inside the checkout: the workspace `.cargo/config.toml`
-enables DST by default there. `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS` (empty
-included) or a `target.*.rustflags` config entry replaces that list, and a
-cargo run outside the checkout (`--manifest-path`) never reads it; such a
-build must refuse requested DST execution, not skip those cases. The DST suite itself runs from
-`crates/omnigraph-dst` (`cargo test`): its `[env]`-only Cargo configuration
-supplies the pool trio the suite asserts at process start.
+from inside the checkout: the workspace `.cargo/config.toml` enables DST there
+and states what overrides it. A build that cannot run DST must refuse the
+requested cases, not skip them. The DST suite runs from `crates/omnigraph-dst`
+(`cargo test`; see its README).
 
-S3 suites require `OMNIGRAPH_S3_TEST_BUCKET` and the documented `AWS_*`
-environment. Azure suites require `OMNIGRAPH_AZURE_TEST_CONTAINER` and the
-documented Azure/Azurite environment. See [testing](docs/dev/testing.md) and
-[deployment](docs/user/deployment.md).
+Cloud suites skip unless their environment is set; see
+[testing](docs/dev/testing.md).
 
 API changes regenerate `openapi.json` ([CONTRIBUTING.md](CONTRIBUTING.md#openapi-spec)).
 
@@ -195,6 +218,9 @@ API changes regenerate `openapi.json` ([CONTRIBUTING.md](CONTRIBUTING.md#openapi
   workload revises [the work](docs/dev/workload.md) in the same pull request.
 - Preserve unrelated work in a dirty tree. Never discard user changes.
 - Make the smallest coherent change that closes the behavior and test surface.
+- Never weaken, skip or delete a check to make a change pass. A test, guard,
+  golden or pin changes only when what it guards changes, and the pull request
+  says so.
 - For a bug, reproduce the predicted failure at the tier the regression rule
   below names, then fix the root cause and prove the regression turns green.
 - Every issue fix lands a regression test at the cheapest tier that catches
@@ -244,4 +270,6 @@ API changes regenerate `openapi.json` ([CONTRIBUTING.md](CONTRIBUTING.md#openapi
   messages and generated text, never `OmniGraph`. Code identifiers keep their
   spelling (`Omnigraph::open`, `omnigraph-engine`, `omnigraph://`), and so do
   published release documents and the bytes they are verified against.
-- Keep this file a map. New deep content goes in its audience-owned guide.
+- Keep this file a map. New deep content goes in its audience-owned guide. A
+  rule belongs here only when a violation is hard to detect or hard to
+  reverse; where a check can catch it, add the check instead.

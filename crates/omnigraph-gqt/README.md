@@ -51,7 +51,12 @@ environments:
 ```
 
 With schema and seed, the complete scenario executes against a fresh graph
-for each environment. These two target/storage combinations are implemented.
+for each environment. These two target/storage combinations are implemented,
+and a third: `omnigraph-engine-dst` with `storage: s3-compatible` runs the
+case on a simulated bucket, an in-memory store the engine reaches at an
+`s3://` root through the paths a real bucket takes (the control adapter's S3
+client and Lance's `s3` store), with no endpoint and no network; `--store` is
+refused there, since the bucket starts empty.
 With `--store`, direct engine execution opens an existing `file://`, `s3://`
 or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
 `azure-blob-storage` backend. It skips initialization, seed loading and

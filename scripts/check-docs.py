@@ -25,7 +25,7 @@ CONTRACT_PATH = DEV_DIR / "contract.md"
 # every agent session loads is listed by path; every other page of docs/dev/
 # takes GUIDE_BUDGET.
 PAGE_BUDGETS = {
-    "AGENTS.md": 14_000,
+    "AGENTS.md": 15_000,
     "docs/dev/contract.md": 53_000,
     "docs/dev/workload.md": 36_000,
     "docs/dev/invariants.md": 11_000,

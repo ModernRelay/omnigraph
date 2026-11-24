@@ -53,6 +53,12 @@ impl Environment {
         };
         let storage = match self.execution {
             Execution::Engine { storage } => storage,
+            Execution::Dst {
+                storage: Storage::S3Compatible,
+                ..
+            } => {
+                return Err("unsupported_environment: under omnigraph-engine-dst --store is read through below in-memory-object-store; s3-compatible is a simulated bucket that starts empty".into());
+            }
             Execution::Dst { .. } => {
                 let root = uri.strip_prefix("file://").ok_or(
                     "invalid_case: under omnigraph-engine-dst --store takes a file:// root, read through below the in-memory environment",
@@ -154,7 +160,7 @@ impl Environment {
                 storage: Storage::LocalFilesystem,
             } if !needs_dst => Ok(()),
             Execution::Dst {
-                storage: Storage::InMemoryObjectStore,
+                storage: Storage::InMemoryObjectStore | Storage::S3Compatible,
                 ..
             } => {
                 if cfg!(tokio_unstable) {
@@ -164,7 +170,7 @@ impl Environment {
                 }
             }
             _ => Err(format!(
-                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams or scripted concurrent blocks and omnigraph-engine-dst/in-memory-object-store",
+                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams or scripted concurrent blocks, omnigraph-engine-dst/in-memory-object-store and omnigraph-engine-dst/s3-compatible (a simulated bucket)",
                 self
             )),
         }

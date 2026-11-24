@@ -31,7 +31,7 @@ Each has one home below. A fact has one owner; every other page cites it.
 | Contract | [contract.md](contract.md) | What each operation promises its caller: the target, the gaps and the open decisions | Every session | 53,000 bytes |
 | Work | [workload.md](workload.md) | What the system is optimized for, and the evidence | On demand | 36,000 bytes |
 | Rules | [invariants.md](invariants.md) | What an implementation must never do, each with its reason | Every session | 11,000 bytes |
-| Map | [`AGENTS.md`](../../AGENTS.md) | Which crate owns what, which page to read, the commands and the change discipline | Every session | 14,000 bytes |
+| Map | [`AGENTS.md`](../../AGENTS.md) | Which crate owns what, which page to read, the commands and the change discipline | Every session | 15,000 bytes |
 | Decision | [`docs/decisions/`](../decisions/README.md) | Why one design was chosen and what was rejected | On demand | 5,000 bytes each |
 | Testing rules | [testing.md](testing.md) | Where a test goes and the rules for adding one | Every session | 7,500 bytes |
 | Guide | the rest of `docs/dev/` | What spans more than one module and so has no single doc comment to live in | On demand | 60,000 bytes each |
