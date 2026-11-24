@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Reject mutable third-party GitHub Action and reusable-workflow refs."""
+"""Reject mutable third-party GitHub Action and reusable-workflow refs, in workflows and in
+the repository's own composite actions."""
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_ROOT = REPO_ROOT / ".github" / "workflows"
+ACTION_ROOT = REPO_ROOT / ".github" / "actions"
 USES_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)")
 FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
@@ -18,7 +20,12 @@ def main() -> int:
     failures: list[str] = []
     checked = 0
 
-    workflows = (*WORKFLOW_ROOT.glob("*.yml"), *WORKFLOW_ROOT.glob("*.yaml"))
+    workflows = (
+        *WORKFLOW_ROOT.glob("*.yml"),
+        *WORKFLOW_ROOT.glob("*.yaml"),
+        *ACTION_ROOT.glob("*/action.yml"),
+        *ACTION_ROOT.glob("*/action.yaml"),
+    )
     for workflow in sorted(workflows):
         for line_number, line in enumerate(workflow.read_text().splitlines(), start=1):
             match = USES_RE.match(line)

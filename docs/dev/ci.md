@@ -82,8 +82,9 @@ The required contexts, the jobs `CI Gate` needs and the recovery routes:
 
 `Storage Upgrade Compatibility` (`storage_upgrade_compatibility` in `ci.yml`)
 runs on every change and in the merge queue. Its steps and their comments in
-`ci.yml`, and `scripts/check-storage-upgrade-ci.py`, hold its predecessor
-builds, release installs, required cases and four scopes; the cases are in
+`ci.yml`, and `scripts/check-storage-upgrade-ci.py`, hold the rows it takes
+from the [predecessor registry](test-ownership.md#predecessor-binaries), its
+required cases and four scopes; the cases are in
 [test ownership](test-ownership.md#cross-version-rebuild-and-storage-upgrade).
 
 The released 0.12 cluster-ledger journey is separate
@@ -339,7 +340,7 @@ The remaining jobs own contracts that need special infrastructure. They run afte
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps disabled; see
   [branch-protection.md](branch-protection.md), CI Gate).
-- **V5 ↔ V10 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every pull request that changes engine input, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
+- **V5 ↔ V10 format fence** provisions the `stamp-5` predecessor (the final v5-writing commit, built from source) and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every pull request that changes engine input, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every pull request that changes engine input, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards before clicking Merge when ready. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
 - **Azurite Azure integration** exercises configured storage, admission-lease,
   recovery, cluster, server, and CLI owners against a digest-pinned Azurite
@@ -449,6 +450,7 @@ python3 scripts/check-workflow-action-pins.py
 python3 scripts/check-classify-copy.py --self-test && python3 scripts/check-classify-copy.py       # after a workflow edit: the classifier copies match
 python3 scripts/check-change-classes.py --self-test && python3 scripts/check-change-classes.py     # after a classifier or path-filter edit
 python3 scripts/check-storage-upgrade-ci.py --self-test
+python3 scripts/predecessors.py --self-test   # after a predecessor row, a `predecessor("…")` request or a workflow `rows:` edit
 python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit; also pins the CI Gate wiring
 python3 scripts/ci_gate.py --self-test   # after a ci.yml job `if:` change or an edit to the gate's needs/table
 python3 scripts/check-pr-title.py --self-test

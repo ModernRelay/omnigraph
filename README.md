@@ -213,13 +213,14 @@ See the [policy guide](docs/user/operations/policy.md).
 | Client | Use it for | Where |
 |---|---|---|
 | **TypeScript SDK** | typed access from Node / TS | [`@modernrelay/omnigraph`](https://www.npmjs.com/package/@modernrelay/omnigraph) · [source](https://github.com/ModernRelay/omnigraph-ts) |
+| **Python SDK** | async typed access from Python | [`omnigraph`](https://pypi.org/project/omnigraph/) · [source](https://github.com/ModernRelay/omnigraph-python) |
 | **Built-in MCP** | connect an agent to the server's `/mcp`, directly or through `omnigraph mcp --target NAME` | [MCP guide](docs/user/operations/mcp.md) |
 | **Omnigraph Studio** | browse, query and review a graph in a desktop app | [download](https://www.omnigraph.dev/studio?utm_source=github&utm_medium=readme&utm_campaign=studio) · [source](https://github.com/ModernRelay/omnigraph-studio) |
 | **HTTP / OpenAPI** | use the wire contract from any language | [HTTP guide](docs/user/operations/server.md) · [OpenAPI](openapi.json) |
 
 Match the client's HTTP contract to the server's. The 0.14 server requires
 contract `0.14`; see [client availability](docs/user/install.md#client-compatibility)
-before selecting an npm package.
+before selecting an npm or PyPI package.
 
 ## Docs
 

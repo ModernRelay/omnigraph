@@ -258,15 +258,59 @@ and tokens.
 
 The system tests start workspace binaries on ephemeral localhost ports. Set `OMNIGRAPH_SKIP_SYSTEM_E2E=1` only in constrained local sandboxes; CI's configured owners must not skip.
 
-### Cross-version rebuild and storage upgrade
+### Predecessor binaries
 
-The cross-version rebuild owner, `integration/crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test integration crossversion_upgrade::` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
+A cross-version test runs an older Omnigraph beside the current tree. Each
+older binary is one row of
+[`.github/predecessors.toml`](../../.github/predecessors.toml), named by what
+it is (`stamp-13`, `lance-11`, `release-0.11.0`): its source, either a release
+tag that `scripts/install.sh` installs against a pinned SHA256 or a commit
+built in its own checkout with a pinned toolchain; the binaries it provides;
+the version its `omnigraph --version` must report; and the condition under
+which it is retired. The file's header lists the fields.
+
+A test asks for a row with `support::predecessors::predecessor("<row>")`
+(`crates/omnigraph-cli/tests/support/predecessors.rs`). It reads the manifest
+that `OMNIGRAPH_PREDECESSORS` names, else `target/predecessors/manifest.json`,
+and applies one rule: a provisioned row is returned once its binaries exist
+and report the row's version; a row the manifest lacks prints
+`skipping: predecessor <row> is not provisioned` and returns `None`, or fails
+the test when the manifest was provisioned with `--require`.
+
+`scripts/predecessors.py provision` installs or builds rows into
+`target/predecessors/` and writes that manifest, naming every row stored
+there; a stored row is reused while its registry entry and version still
+match. To run every cross-version case locally, provision once:
 
 ```bash
-OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test integration crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 -- --exact --nocapture
+python3 scripts/predecessors.py provision --all
 ```
 
-The v6↔v10 fence works the same way with a released binary: `OMNIGRAPH_V6_BIN` (the 0.10.0 release). The stamps between them are described in [versioning](versioning.md#current-storage-contract). The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request that changes engine input, with the releases it installs.
+Then run the cases as usual, for example
+`cargo dev-test --test integration crossversion_upgrade::`. Name rows instead
+of `--all` to provision fewer: a source row builds a debug CLI from scratch
+(about 25 minutes cold) in a temporary directory outside the repository, so
+only the predecessor's own Cargo configuration applies, and removes it
+afterwards.
+
+In CI a job names the rows it needs with the `./.github/actions/predecessors`
+action (`rows:`, and `require: true` where a skipped journey must fail), which
+caches them by what they are made from. A new predecessor is a row and a
+`rows:` entry, never a build step. `scripts/predecessors.py --self-test`, run
+by `Check Workflow Action Pins`, requires every row to be asked for by a test
+and every row a test or workflow names to exist: a row no test asks for is
+retired.
+
+### Cross-version rebuild and storage upgrade
+
+The cross-version rebuild owner, `integration/crossversion_upgrade.rs`, runs each predecessor case against a row of the [predecessor registry](#predecessor-binaries) and skips it when the row is not provisioned, so a local `cargo test -p omnigraph-cli --test integration crossversion_upgrade::` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, provision its row and run the exact case:
+
+```bash
+python3 scripts/predecessors.py provision stamp-5
+cargo test --locked -p omnigraph-cli --test integration crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 -- --exact --nocapture
+```
+
+The v6↔v10 fence works the same way with the `release-0.10.0` row. The stamps between them are described in [versioning](versioning.md#current-storage-contract). The v0.9 journey (`release-0.9.0`) is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` provisions both rows and runs both journeys on every pull request that changes engine input. The v3 (`release-0.7.2`) and v4 (`release-0.8.1`) cases run only where a row is provisioned.
 
 The separate `Storage Upgrade Compatibility` CI job requires the
 `storage_upgrade` cases of `integration/crossversion_upgrade.rs` (the report on a fresh
@@ -280,12 +324,19 @@ graph, the cluster-path refusal and the six genuine journeys:
 `db::upgrade::tests`, `lance_version_columns` and `forbidden_apis`. Missing
 cases, empty runs and skipped required cases fail the job.
 
-To run the
-crossversion scope locally, build the pinned Lance 11 and stamp-13 predecessors
-as for the v5 fence above, install the two releases with `scripts/install.sh` (`VERSION=v0.11.0`
-and `VERSION=v0.10.0`, each with its `INSTALL_DIR`), place the four binaries
-under `target/storage-upgrade-binaries/` (`lance-11/`, `stamp-13/`, `v0.11.0/`,
-`v0.10.0/`) and run the job's sequence, the `Run required storage upgrade crossversion tests` step of `ci.yml`.
+The job provisions its four rows with `require: true`, so a journey whose row
+is missing fails instead of skipping. To run the crossversion scope locally,
+provision the same rows and run its cases:
+
+```bash
+python3 scripts/predecessors.py provision stamp-13 lance-11 release-0.10.0 release-0.11.0
+cargo dev-test --test integration crossversion_upgrade:: -- --test-threads=1
+```
+
+The job itself runs the exact `storage_upgrade` names
+`check-storage-upgrade-ci.py --list-cases crossversion --compiled` takes from a
+`-- --list` of the same feature graph, and checks the log against them
+([ci.md](ci.md)).
 
 `db/upgrade/tests.rs` owns the `upgrade_storage` protocol over
 `legacy::write::LegacyHistory`, the test-only writer of
@@ -319,21 +370,19 @@ Ordinary CI keeps current-version live-deployment coverage; it does
 not download 0.12 or run this journey.
 
 Run explicitly from the repository root when qualifying that upgrade path,
-using a native build with Cargo's default `target/` directory.
-Both predecessor variables are required; missing binaries fail. The installer
-verifies the official archive checksum. Copy the freshly built candidate server
-so another build cannot replace it during qualification:
+using a native build with Cargo's default `target/` directory. The test
+requires the `release-0.12.0` row, CLI and server, and fails without it.
+Copy the freshly built candidate server so another build cannot replace it
+during qualification:
 
 ```bash
 set -euo pipefail
 qualification_dir=$(mktemp -d)
-REPO_SLUG=ModernRelay/omnigraph VERSION=v0.12.0 INSTALL_DIR="$qualification_dir/v012" bash scripts/install.sh
+python3 scripts/predecessors.py provision release-0.12.0
 qualification_features=omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo build --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster --features "$qualification_features"
 cp target/debug/omnigraph-server "$qualification_dir/omnigraph-server"
 env RUST_MIN_STACK=16777216 \
-  OMNIGRAPH_V012_BIN="$qualification_dir/v012/omnigraph" \
-  OMNIGRAPH_V012_SERVER_BIN="$qualification_dir/v012/omnigraph-server" \
   "CARGO_BIN_EXE_omnigraph-server=$qualification_dir/omnigraph-server" \
   cargo test --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster \
     --features "$qualification_features" --test integration \

@@ -40,7 +40,7 @@ in [lance.md](lance.md).
 | A Lance behavior Omnigraph depends on | `lance_surface_guards.rs` and its fence | [Lance compatibility](#lance-compatibility) |
 | An HTTP route, authentication, MCP or OpenAPI | `crates/omnigraph-server/tests/`, by public route. Never test a server promise only through the engine facade | [Server and CLI ownership](test-ownership.md#server-and-cli-ownership) |
 | A CLI command, its output or its delivery | `crates/omnigraph-cli/tests/`, by plane | [Server and CLI ownership](test-ownership.md#server-and-cli-ownership) |
-| A storage stamp, an upgrade or a predecessor binary | CLI `integration/crossversion_upgrade.rs`, engine `db/upgrade/tests.rs` | [Cross-version tests](test-ownership.md#cross-version-rebuild-and-storage-upgrade), [support matrix](versioning.md#storage-upgrade-support-matrix) |
+| A storage stamp, an upgrade or a predecessor binary | CLI `integration/crossversion_upgrade.rs`, engine `db/upgrade/tests.rs` | [Predecessor binaries](test-ownership.md#predecessor-binaries), [cross-version tests](test-ownership.md#cross-version-rebuild-and-storage-upgrade), [support matrix](versioning.md#storage-upgrade-support-matrix) |
 | A bound plan reproducing its run | `integration/engine_v2_plan_replay.rs`, `engine_v2_scrubbed_replay.rs` | [Plan replay](test-ownership.md#plan-replay) |
 | What an operation reads or writes in storage | The DST golden and the engine `integration/*_cost.rs` curve tests | [DST storage-cost golden](#dst-storage-cost-golden) |
 | Wall time or memory | `omnigraph-bench`; evidence, never a pass/fail assertion | [Benchmark harness](test-ownership.md#benchmark-harness) |

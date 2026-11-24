@@ -91,7 +91,7 @@ def self_test() -> None:
 </system-err>
     </testcase>
     <testcase name="journey_skipped" classname="omnigraph-cli::crossversion_upgrade">
-      <system-err>skipping v0.9 upgrade e2e: OMNIGRAPH_V09_BIN is unset
+      <system-err>skipping: predecessor release-0.9.0 is not provisioned
 </system-err>
     </testcase>
     <testcase name="journey_red" classname="omnigraph-cli::crossversion_upgrade">
@@ -112,7 +112,7 @@ def self_test() -> None:
         cases,
         ["journey_ok"],
         ["journey_ok=v0.9 refusal and export/import rebuild completed", "journey_ok=stdout line"],
-        ["journey_ok=skipping v0.9 upgrade e2e:"],
+        ["journey_ok=skipping: predecessor"],
     ) == []
     assert check(cases, ["absent_owner"], [], []) == ["::error::required owner did not run: absent_owner"]
     assert check(cases, ["journey_red"], [], []) == [
@@ -124,17 +124,17 @@ def self_test() -> None:
     assert check(cases, [], ["journey_ok=never printed"], []) == [
         "::error::journey_ok did not report 'never printed'"
     ]
-    assert check(cases, [], [], ["journey_skipped=skipping v0.9 upgrade e2e:"]) == [
-        "::error::journey_skipped skipped its real work: 'skipping v0.9 upgrade e2e:'"
+    assert check(cases, [], [], ["journey_skipped=skipping: predecessor"]) == [
+        "::error::journey_skipped skipped its real work: 'skipping: predecessor'"
     ]
     assert check(cases, [], ["journey_red=panicked"], []) == [
         "::error::required owner did not pass: journey_red (omnigraph-cli::crossversion_upgrade failed)",
         "::error::journey_red did not report 'panicked'",
     ]
-    assert check(cases, [], [], ["absent_owner=skipping v0.9 upgrade e2e:"]) == [
+    assert check(cases, [], [], ["absent_owner=skipping: predecessor"]) == [
         "::error::required owner did not run: absent_owner"
     ]
-    assert check(cases, [], [], ["ignored_owner=skipping v0.9 upgrade e2e:"]) == [
+    assert check(cases, [], [], ["ignored_owner=skipping: predecessor"]) == [
         "::error::required owner did not pass: ignored_owner (omnigraph-server::remote skipped)"
     ]
     try:
