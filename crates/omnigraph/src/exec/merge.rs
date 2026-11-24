@@ -5313,6 +5313,13 @@ decide_seam! {
 }
 
 decide_seam! {
+    /// The merge's input `__manifest` versions are tagged, before the probe
+    /// that proves them current, so a publication parked here makes the
+    /// input-capture check take its stale path.
+    pub static BRANCH_MERGE_POST_INPUT_TAGS_PRE_PROBE = ("branch_merge.post_input_tags_pre_probe", BranchMerge, [Fail]);
+}
+
+decide_seam! {
     /// Source/target heads and snapshots have been captured while the schema
     /// and both branch-incarnation gates are held, before merge planning or
     /// any durable table effect.
@@ -5588,10 +5595,18 @@ impl Omnigraph {
                 }
                 Snapshot::wrap(base.snapshot)
             };
+            fail(&BRANCH_MERGE_POST_INPUT_TAGS_PRE_PROBE)?;
             // The tags must name inputs that are still what the merge reads.
-            // A publication that changed nothing the merge read (a branch row
-            // a create or delete adds to `main`'s catalog) moves the probed
-            // manifest version, so a stale probe re-reads both inputs.
+            // A current probe proves that the tagged `__manifest` version is
+            // still the head after its tag exists. A publication that changed
+            // nothing the merge read (a branch row a create or delete adds to
+            // `main`'s catalog) moves the probed version, so a stale probe
+            // re-reads both inputs and proves only that their head, schema and
+            // table pins are unchanged: the tag then names a version that is
+            // no longer the head, which a concurrent `cleanup` in another
+            // process can remove (`G2`). A later cleanup then fails closed on
+            // the tag until the merge releases it, and an `as commit` proposal
+            // whose held source version was removed cannot be published.
             if !source_txn.manifest_probe.is_current().await?
                 || !target_txn.manifest_probe.is_current().await?
             {

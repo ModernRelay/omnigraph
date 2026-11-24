@@ -8994,12 +8994,25 @@ async fn branch_merge_rejects_fresh_target_manifest_change_before_effects() {
 /// while a merge into `main` sits between its capture and its publication.
 /// The merge must then land too, as a mutation on `main` does: what it read
 /// of the target is the target's authority and tables, not `main`'s manifest
-/// version.
+/// version. Both checks are covered: a delete parked before the input-capture
+/// probe makes that probe stale, and one parked after it reaches only the
+/// final re-read before effects.
 // contract: merge+branch is not a refused pair (Concurrent operations)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn branch_merge_into_main_lands_over_a_concurrent_branch_delete() {
     let _scenario = FailScenario::setup();
+    for seam in [
+        &catalog::BRANCH_MERGE_POST_INPUT_TAGS_PRE_PROBE,
+        &catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE,
+    ] {
+        assert_merge_into_main_lands_over_a_branch_delete_at(seam).await;
+    }
+}
+
+async fn assert_merge_into_main_lands_over_a_branch_delete_at(
+    seam: &'static omnigraph::seams::DecideSeam,
+) {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     let main_rows = {
@@ -9020,8 +9033,7 @@ async fn branch_merge_into_main_lands_over_a_concurrent_branch_delete() {
     };
     let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
     let main_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
-    let merge_rv =
-        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+    let merge_rv = helpers::failpoint::Rendezvous::park_first(seam);
 
     let merge_handle = Arc::clone(&db);
     let merge_task = tokio::spawn(async move { merge_handle.branch_merge("source", "main").await });
@@ -9050,10 +9062,12 @@ async fn branch_merge_into_main_lands_over_a_concurrent_branch_delete() {
         "the branch delete must leave main's head where the merge captured it"
     );
 
-    let merged = merge_task
-        .await
-        .unwrap()
-        .unwrap_or_else(|error| panic!("a branch delete refused a merge into main: {error}"));
+    let merged = merge_task.await.unwrap().unwrap_or_else(|error| {
+        panic!(
+            "a branch delete at {} refused a merge into main: {error}",
+            seam.name()
+        )
+    });
     assert_eq!(merged.outcome, omnigraph::db::MergeOutcome::Merged);
     let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
