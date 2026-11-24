@@ -2,15 +2,18 @@
 //! `object_type`, and `record`, a Lance packed struct holding every other field
 //! of [`manifest_schema`] row-major in one column, so a scan reads one column's
 //! pages for the record instead of one per field. Lance's packed struct has no
-//! per-child null bit (Lance 11 refuses a null value inside a packed struct
+//! per-child null bit (Lance refuses a null value inside a packed struct
 //! child), so every child is declared non-null and the last child, `present`,
 //! carries one bit per field that is null in the logical row; the child under
 //! a set bit holds the filler (`""` or `0`), which a reader checks and refuses
 //! anything else. [`compact_to_storage`] and [`expand_from_storage`] are the
 //! two manifest boundaries; everything above them keeps the logical [`manifest_schema`].
 //! History uses the same field codec for its commit-only packed record.
-//! A scan projects `record` whole: Lance 11 cannot project a fixed-width child
-//! of a packed struct on its own.
+//! A scan projects `record` whole: Lance cannot project a fixed-width child
+//! of a packed struct on its own. A filtered scan of `record` also sets
+//! `MaterializationStyle::AllEarly`, because Lance's default filtered-scan
+//! materialization can split the projected children between its early and
+//! late reads.
 //!
 //! A `table` row fills the fields from `location` to `dropped_at`, the one
 //! `graph_commit` row and every `settled_commit` row fill the fields from

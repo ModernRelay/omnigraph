@@ -51,8 +51,7 @@ decide_seam! {
 }
 
 /// Max source-row frontier for which Expand uses the BTREE-indexed path.
-/// Larger frontiers fall back to the in-memory CSR (dense / whole-graph). See
-/// `docs/dev/execution.md`.
+/// Larger frontiers fall back to the in-memory CSR (dense / whole-graph).
 const DEFAULT_EXPAND_INDEXED_MAX_FRONTIER: u64 = 1024;
 
 /// Max hop count for the indexed path (each hop is one indexed scan; very deep
@@ -61,7 +60,9 @@ const DEFAULT_EXPAND_INDEXED_MAX_HOPS: u32 = 6;
 
 /// The two indexed-path ceilings as the environment set them when the plan
 /// was gathered, read once here and carried on every `Expand`'s cost inputs
-/// and in the plan's assumptions.
+/// and in the plan's assumptions; the run reads the plan's values. A missing
+/// or nonnumeric value takes its default, and so does a zero hop cap. The
+/// frontier ceiling also binds execution through `should_switch_to_csr`.
 #[derive(Debug, Clone, Copy)]
 struct ExpandCaps {
     max_frontier: u64,

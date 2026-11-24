@@ -138,8 +138,7 @@ cluster id, and cluster incarnation. Invalid trust or a root mismatch refuses
 startup before graphs open. Trust alone requires bearer authentication. The
 server verifies tokens locally; it does not contact an identity or control
 service. The provisioning operator owns supplying the correct identity binding.
-The [trust and credential format](../../rfcs/0053-offline-data-token-verification.md#public-trust-and-root-binding)
-defines the machine-written file.
+The file is machine-written.
 
 Signed credentials use the actor `principal:<immutable-principal-id>`. A caller
 cannot change its actor through request headers or JSON. The server accepts
@@ -193,8 +192,7 @@ unqualified machine identities refuse. Every refresh must request the exact
 resource again and check the returned audience.
 
 Supply at most four RSA keys, 1,000 subject mappings and 256 KiB per public file.
-The [resource identity contract](../../rfcs/2026-09-09-identity-credentials-and-applied-policy.md#provider-native-access-and-standard-clients)
-defines the versioned format. Authority is held by whoever can publish this
+The file format is versioned. Authority is held by whoever can publish this
 file; it contains no provider secret or graph policy. Protect its filesystem
 permissions and publish complete updates atomically.
 

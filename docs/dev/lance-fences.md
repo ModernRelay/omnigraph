@@ -14,7 +14,11 @@ Rationale and bump evidence belong in the owning RFC or release note.
 
 ### File format
 
-Every production write explicitly selects stable V2_2. Experimental V2_3,
+Every production write writes stable V2_2. A write that creates a dataset
+selects `LanceFileVersion::V2_2` explicitly; the appends and the streamed
+overwrite in `table_store.rs` that leave `data_storage_version` unset write into
+an existing dataset, where Lance 13's insert path takes the format the
+dataset's manifest records, V2_2 (Lance 13's own default is V2_2 as well). Experimental V2_3,
 spilled row lineage and stable-row-ID fragment-reuse indexes are not enabled as
 graph capabilities.
 
@@ -22,9 +26,9 @@ graph capabilities.
 
 ### Graph keys
 
-Schema-v9 node/edge tables carry the exact non-null `__id` unenforced primary
-key (edges also `__src`/`__dst`); v8 tables keep the `id`/`src`/`dst` spellings
-introduced in v6, and the explicit system-column upgrade (RFC 0040) renames them
+Node/edge tables carry the exact non-null `__id` unenforced primary key (edges
+also `__src`/`__dst`), or `id`/`src`/`dst` in the legacy system-column vintage;
+the schema IR, not the storage stamp, selects the vintage. The explicit system-column upgrade (RFC 0040) renames them
 with one rename-only `Operation::Project` commit per table
 (`TableStore::renamed_schema`), staged detached and published as a pin (RFC
 0067, detached-only), which must keep every fragment, field id, the primary-key
@@ -54,13 +58,9 @@ plus one, assigned before the detached commit receives its random version, so
 two sibling first commits over one parent stamp a row they both update with the
 same value; a deletion-only commit restamps nothing; compaction carries every
 live row's id and stamp into the rewritten fragments. Change discovery across a
-window with no adjacent transaction
-(`changes::candidate_scan::row_identity_plan`, the `change_lineage` setting)
-pairs the live rows of two pinned versions by `_rowid` and reads only the pairs
-whose stamps differ, and only where the `from` side is on the `to` side's
-first-parent chain with no merge commit after it, since a merge can take the
-merged branch's pin, whose history never read the target's; a fragment whose
-sequences are absent, spilled or short takes the exact merge. Drop the ancestry
+window with no adjacent transaction pairs rows by `_rowid` and compares these
+stamps only where one side's lineage passed through the other
+(`row_identity_plan` in `crates/omnigraph/src/changes/row_identity.rs`). Drop the ancestry
 restriction at the bump whose stamp is the commit's own version.
 
 **Owners:**
@@ -121,8 +121,7 @@ flat kNN), ranked exactly; one counter alone does not.
 
 Lance scores fragments no full-text segment covers flat, counting documents and
 tokens over the rows its prefilter admits (`plan_flat_match_query`), so a
-prefilter changes those rows' BM25 scores; `prefilter(false)` scores the whole
-corpus and refines afterwards. A bm25 scan therefore filters before scoring only
+prefilter changes those rows' BM25 scores. A bm25 scan therefore filters before scoring only
 under the plan's recorded full coverage (`Eligibility::BeforeScoring`) and runs
 the postfilter otherwise. Coverage is the union of the column's inverted
 segments' fragment bitmaps, so an untrained segment (the analyzer declaration,
@@ -151,10 +150,6 @@ builds postings where no segment covers a fragment.
 
 ### Full-text compatibility
 
-Certified Lance 11 full-text indexes retain their analyzer compatibility under
-Lance 13. Uncertified or incompatible indexes still require an explicit rebuild
-before search.
-
 Every full-text segment used by a query must carry Omnigraph's artifact-scoped
 analyzer certificate. The certificate is bound to the immutable UUID, index
 details, and file inventory, not the current dataset writer or graph head.
@@ -181,7 +176,7 @@ unchanged.
 The audited analyzer dependency set has exact pins and a resolved-lockfile
 guard. Any change needs a compatibility audit before keeping or changing the
 certificate generation. See
-[RFC 0043](../rfcs/0043-full-text-index-compatibility.md) for the decision and
+[RFC 0043](../decisions/0043-full-text-index-compatibility.md) for the decision and
 [the operator procedure](../user/operations/upgrade.md#full-text-index-upgrade).
 
 ### Pushed filter simplification
@@ -314,7 +309,7 @@ merge-insert matches a source to the full table schema only in the same field
 order (otherwise it takes its subschema path), so the evolved schema keeps the
 catalog order. A dropped column's values stay in the data files until optimize
 rewrites the fragment (dropped-column erasure, next row). Making a nullable
-column required (#721) commits a `Project` with `preserves_nullability: false`,
+column required commits a `Project` with `preserves_nullability: false`,
 the flag Lance's own `alter_columns` uses, after the engine has checked the
 rows. A deleted row keeps its value in the data file, and lance#10557 (after
 13.0.0) makes `alter_columns` count deleted rows for the same reason, so the
@@ -327,16 +322,12 @@ planning-only option that `optimize` leaves at its 10% default.
 **Owners:**
 `lance_surface_guards.rs::metadata_only_schema_evolution_keeps_blob_files_ids_and_index_coverage`,
 `lance_surface_guards.rs::include_deleted_rows_returns_a_deleted_rows_stored_null_issue_721`,
-`schema_apply.rs` (`issue_721_*`), the deferred
-`benchmarks/deferred/crates/omnigraph/tests/compaction_memory.rs.disabled`
-schema-apply instrument (not an active test)
+`schema_apply.rs` (`issue_721_*`)
 
 ### Dropped-column erasure
 
 A drop's `Operation::Project` keeps every data file that also holds a surviving
-column, and that file's `DataFile::fields` still lists the dropped field id. A
-Blob-v2 column is listed by its own id, never by its descriptor children's, so
-on a table without drops every listed id is a schema field id. Lance 13's
+column, and that file's `DataFile::fields` still lists the dropped field id. Lance 13's
 planner also selects a fragment when a file contains only dropped user columns
 but remains necessary for row lineage. It does not select a lone fragment solely
 because a file mixes kept and dropped columns, so those bytes still need the
@@ -359,10 +350,7 @@ the old files with their sidecars once no retained version names them.
 **Owners:**
 `lance_surface_guards.rs::compacting_a_chosen_fragment_drops_the_bytes_of_dropped_columns`,
 `integration/maintenance.rs::optimize_then_cleanup_erases_dropped_property_values`,
-`staged_tests.rs::table_compaction_planning_refuses_source_budgets`, the
-deferred
-`benchmarks/deferred/crates/omnigraph/tests/compaction_memory.rs.disabled`
-erasure instrument (not an active test)
+`staged_tests.rs::table_compaction_planning_refuses_source_budgets`
 
 ### Compaction of Blob tables
 
@@ -389,9 +377,7 @@ its scanner and ignores the batch size when planning. A set batch size beats
 `LANCE_DEFAULT_BATCH_SIZE` on the V2.x read path, where the variable is only the
 fallback. The fence is the scanner shape: a scanner built as compaction builds
 it honors an explicit batch size over the variable. No CI-run test observes
-Lance passing `CompactionOptions::batch_size` into that scanner; the historical
-`compaction_memory.rs` instrument was the only observer and is now deferred
-under `benchmarks/deferred/` pending GQ optimization support. This bounds
+Lance passing `CompactionOptions::batch_size` into that scanner. This bounds
 managed payload bytes per scanner batch, not total peak memory: decoder, I/O and
 copy buffers are additional, and one oversized value may exceed the target. Drop
 the derivation at the bump whose compaction streams Blob payloads.
@@ -405,9 +391,7 @@ variable),
 `integration/maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`,
 `integration/maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`,
 `integration/maintenance.rs::optimize_compacts_blob_fragments_with_deleted_rows`,
-`staged_tests.rs::compaction_blob_batch_rows_bounds_one_batch`, the deferred
-`benchmarks/deferred/crates/omnigraph/tests/compaction_memory.rs.disabled`
-instrument (not an active test)
+`staged_tests.rs::compaction_blob_batch_rows_bounds_one_batch`
 
 ## Indexes and column patches
 
@@ -431,17 +415,14 @@ after it and its index-rows ceiling measures the lag the plan shows.
 ### Index segments
 
 Lance masks a logical index's results by the union of its segments' fragment
-coverage. On a stable-row-ID table an update keeps the row ID and moves the row
-to a new fragment; once a delta segment covers that fragment, the older
-segment's entry for the row passes the mask, so full-text search returns the row
-for a term it no longer holds (twice for a term both versions hold) and a BTREE
-equality returns it for its old value. Lance applies per-segment ownership to
+coverage, so after an update on a stable-row-ID table a delta segment lets the
+older segment's stale entry for the row through. Lance applies per-segment ownership to
 vector search only (lance#7371, lance#8351); the full-text and scalar paths are
 reported as lance#9817. Omnigraph never adds a delta segment: `stage_index_fold`
 rebuilds a lagging index whole and the full-text rebuild replaces every segment.
 An untrained full-text segment (an empty fragment bitmap) carries its analyzer
-to every row it does not cover, with rows and scores equal to a full build; with
-no segment, Lance's flat path tokenizes with a bare `SimpleTokenizer`. Drop the
+to every row it does not cover, with rows and scores equal to a full build
+([full-text analyzer](#full-text-analyzer)). Drop the
 whole-rebuild rule at the bump whose scalar and full-text search apply segment
 ownership.
 
@@ -455,13 +436,9 @@ ownership.
 A fold rebuilds a lagging vector index whole under its partition count
 (`TableStore::stage_index_fold`, and the same rebuild inside
 `stage_index_reconciliation`). It skips the column, as pending index work, only
-when the uncommitted build fails with `lance::Error::Unprocessable`, and treats
-every other failure as an error, so a storage fault during a rebuild is never
-reported as a column that cannot train. Lance 13 raises `Unprocessable` only
-from vector training (`train_kmeans`, the PQ trainers), when the finite,
-non-null vectors are fewer than the centroids to train: a column whose vectors
-are all null or all non-finite has none, and a column with at least one builds
-even with fewer vectors than partitions. The declared-index planner asks the
+when the uncommitted build fails with `lance::Error::Unprocessable`, which
+Lance 13 raises only from vector training, when the finite, non-null vectors
+are fewer than the centroids to train. The declared-index planner asks the
 same question before it builds, by counting non-null vectors
 (`vector_column_trainable`). Re-derive the skip at the bump that moves the
 variant or the training rule.
@@ -509,15 +486,8 @@ the adapter's supported graph contract: native branch creation need not read or
 reject them before publication, and such a payload can fail only when an index
 is later read.
 
-The clone adapter is installed during normal dataset opens and initial dataset
-creation, preserving configured commit handlers without an additional reopen.
-It checks the exact source version at branch creation and delegates clone
-metadata to Lance. A task-local scope reuses the
-known main-source `ManifestLocation` only for the matching native V2 path and
-version, avoiding a listing; other locations retain native resolution. The
-adapter delegates manifest writing, transactions and commit-handler capabilities
-to the original handler. It neither captures an index inventory nor repairs
-index bases or reads external fragment-reuse payloads.
+The clone adapter that wraps every dataset's commit handler is
+`crates/omnigraph-core/src/lance_clone.rs`.
 
 **Owners:** `lance_clone` tests (exact source-version refusal, source-location
 reuse and fallback, local ETag normalization, configured-handler/session/failure
@@ -528,34 +498,20 @@ semantics);
 
 ### Branches/tags
 
-Each graph-branch lifetime is `{logical}.{ULID}`; bare names identify legacy
-lifetimes. Below storage format 18, unretired native
-`__manifest/_refs/branches/` entries define logical branches. Deletion writes identity-bound retirement metadata, archives the exact
-`BranchContents` inside its native tree, then unlinks the active ref. Needed
-native ancestry and historical merge-base providers remain readable through the
-archive. User `__manifest` tags block logical deletion; valid engine merge-input
-tags instead protect their exact snapshots until the target publication witness
-expires.
-
-Stock `Branches::get` and `list` include every physical ref. Below format 18,
-Omnigraph's logical manifest helpers validate and filter `omnigraph.retired_manifest_branch`, a
-version-1 JSON value binding the exact native name and identifier. An absent
-marker means live; malformed, unsupported, or mismatched metadata fails closed.
-The metadata update publishes retirement and preserves unrelated metadata.
-Before unlinking the active ref, retirement archives the exact `BranchContents`
-inside its native tree; retries validate the same identity in the ref or
-archive. Native branch controls retain Omnigraph's existing process-local
-serialization. Cold logical enumeration reads active refs; cached named-write
+Stock `Branches::get` and `list` include every physical ref. Below storage
+format 18 a native ref defines a logical branch, and retirement marks and
+archives a ref before unlinking it (`crates/omnigraph-core/src/branch_control.rs`,
+`retire_branch_recoverably`); user `__manifest` tags block logical deletion,
+and valid engine merge-input tags instead protect their exact snapshots until
+the target publication witness expires. Cold logical enumeration reads active refs; cached named-write
 admission checks the existing ref lookup without an added request. Cleanup and
 historical resolution read archives. Cleanup retains required native ancestors
 and exact merge-base providers, then reclaims unneeded trees with their
 archives. Delayed staging is judged from the complete post-list identity cut and
 final capture validation, so its retirement history need not remain forever.
 
-At or above format 18 the branch set is `main`'s catalog: one config entry of
-`main`'s `__manifest` per branch, keyed `omnigraph.branch.<native name>` and
-decoded by `BranchRows`; a retired branch keeps its key with the value `-`.
-Logical enumeration (`live_named_branches`) reads `main`'s live entries with no
+At or above format 18 the branch set is `main`'s catalog, the config-map rows
+of `crates/omnigraph-catalog/src/branch_rows.rs`. Logical enumeration (`live_named_branches`) reads `main`'s live entries with no
 ref listing. Deletion publishes an `omnigraph.tombstone` entry on the branch's
 own `__manifest`, whose readers `refuse_tombstoned` then refuses with
 `branch_deleted`, then rewrites the branch's entry on `main` as retired;
@@ -580,14 +536,8 @@ version. The engine reads an exact ref (`branch_control::get_branch_contents`,
 instead of Lance's `exists`, `head` and `get_range`, so that read cannot be torn
 and costs one request instead of three; a ref written before identifiers existed
 still goes through Lance's reader, which derives its synthetic identifier.
-`branch_control::read_branch_refs` rereads a torn read (`Arrow`, `CorruptFile`)
-or a raced delete (`NotFound`), at most three reads in all, around the listed
-reads that still go through Lance (`list_branches`) and the exact reads above.
-Resolving a logical branch name (`branch_control::resolve_live_native_branch`)
-lists `_refs/branches/` once and reads only that branch's own incarnations, so
-another branch's retirement rewrite, or its malformed retirement record, no
-longer fails a branch open or a held-ref re-resolve; fresh creation narrows content reads to its source and the target's equal,
-ancestor and descendant names.
+The retry and the per-name resolution are `read_branch_refs` and
+`resolve_live_native_branch` in the same file.
 Below format 18, operations that require a complete inventory, including
 logical enumeration and cleanup, still read every active ref; maintenance and
 historical resolution also read retirement archives. At or above format 18 no
@@ -605,11 +555,7 @@ bump whose `from_path` reads a ref in one `get`.
 Stock `cleanup_old_versions` is never called on a graph table. Lance 13 does not
 trace detached manifests, and since lance#8944 it lists `data/` through
 `max(retained-manifest floor, now − 7 days)`, making old files referenced only
-by detached versions eligible for deletion while their manifests remain. The
-native guard puts the attached v1 manifest before the detached file, and the
-file before the seven-day cutoff, so only the seven-day rule can sweep the file.
-Files shared with retained attached versions stay protected; a recent detached
-snapshot can still lose an old file it inherits. An external Lance cleanup of
+by detached versions eligible for deletion while their manifests remain. An external Lance cleanup of
 graph tables or `__manifest`, whose proposals and unattached snapshots are
 detached versions, can therefore make retained snapshots, including the current
 graph, unreadable. The engine collector discovers canonical registrations,
@@ -699,7 +645,7 @@ create, and the registration's `omnigraph.last_linear_version` records where the
 linear history stopped. Every manifest names its transaction file
 `{read_version}-{uuid}.txn`, which is how the engine matches a pin's
 `transaction_uuid` and follows a chain of detached commits by `read_version`
-links without a second request (the collector, `walk_chain`); the pure-insert
+links without a second request (the collector, `discover_published`); the pure-insert
 merge proof follows the same links and also reads each link's transaction file
 to certify it, crossing a `CreateIndex` link as moving no row because Lance
 applies it with every fragment of the version it read. A detached commit never
@@ -712,14 +658,18 @@ triggers Lance auto-cleanup: `auto_cleanup_hook` runs only from
 
 ### Catalog publication
 
-Every `__manifest` publish is an `Operation::Overwrite` committed through
-`CommitBuilder::with_max_retries(0)`. Lance 13 treats that as a strict
+Every `__manifest` publish that moves a branch is an `Operation::Overwrite`
+committed through `CommitBuilder::with_max_retries(0)`. Lance 13 treats that as a strict
 overwrite: it skips conflict resolution and writes
 `_versions/{read_version + 1}.manifest` only if absent, so a concurrent commit
 fails the publish with `CommitConflict` instead of being rebased over; the
 publisher maps that to `RowLevelCasContention` and retries from a fresh load. A
 Lance release that rebased overwrites under zero retries would break this
-version CAS.
+version CAS. A detached `__manifest` version (an unpublished commit or an
+unattached snapshot) commits with `DETACHED_VERSION_RETRIES` (20), and a
+graph-table detached commit takes Lance's default of 20: a detached commit
+retries only to pick an unused random version id, and zero retries would
+never commit one.
 
 **Owners:** `omnigraph-catalog`
 `stale_overwrite_loses_the_version_cas_without_replacing_the_winner` (the stale
@@ -736,29 +686,11 @@ manifest put it reads the version back (`verify_commit_outcome`), and because
 that handler calls a missing version definitive
 (`is_version_not_found_definitive`), an absent version ends the attempt at once,
 although an abandoned put can still land afterwards. The handler Omnigraph
-installs on every dataset (`lance_clone`) therefore re-issues an ambiguous
-manifest put with the same manifest and precondition, by the storage crate's
-shared conditional-request policy (`omnigraph_storage::conditional`, up to
-`CONDITIONAL_REQUEST_REISSUES` times), before Lance reads back, and records per
-commit whether a request was sent and how it ended (`manifest_request`). A held
-version goes back as `CommitConflict` to Lance's read-back, which compares the
-complete transaction at that version. A re-issue that meets a held version is
-recorded unresolved, not held: S3 answers 409, which `object_store` reports as
-"already exists", while the earlier copy is still in flight, so a missing
-version on read-back proves nothing. The first copy's conflict stays held; a
-direct writer's retrying Lance client can repeat that copy itself, which this
-handler cannot see. Lance deletes the attempt's transaction file only when the
-handler calls a missing version definitive (`is_version_not_found_definitive`,
-read nowhere else), so only the commit's own request record answers it: the
-catalog's per-commit handler answers from its probe and keeps the inner answer
-unless the request may still land, and a dataset's shared handler, which holds
-no record of the attempt Lance reads back, never calls a missing version
-definitive. Lance then returns `CommitStatusUnknown` and keeps the file a late
-manifest would name; a table's orphaned transaction file goes to the collector's
-orphan sweep. The catalog publisher reads the record: no request sent, or one
+installs on every dataset therefore re-issues an ambiguous manifest put and
+records per commit whether a request was sent and how it ended
+(`crates/omnigraph-core/src/manifest_request.rs`, `lance_clone.rs`). The catalog publisher reads the record: no request sent, or one
 the store refused outright, is `Unpublished`; a request that may have applied is
-read back. A generic local-filesystem error is ambiguous too: the Windows rename
-handler can create the destination before temporary-file cleanup fails. Drop the
+read back. Drop the
 re-issue at the bump whose commit path settles an ambiguous manifest put itself,
 and keep the record while Lance's errors do not say whether the manifest was
 sent.
@@ -861,10 +793,3 @@ chunks (`ordered_cursor.rs`).
 **Owners:** `integration/changes.rs`, `integration/export.rs` and
 `integration/merge_fast_forward.rs` wide-row tests
 (`tests/helpers/wide_rows.rs`)
-
-### MemWAL
-
-Upstream MemWAL has no Omnigraph consumer: no stream profile, token ledger,
-hidden stream column, or `_mem_wal` path exists.
-
-**Owners:** `integration/lifecycle.rs`, cluster removed-field diagnostics

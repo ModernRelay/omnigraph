@@ -622,6 +622,17 @@ fn sum_counts(left: &[usize], right: &[usize]) -> Vec<usize> {
 /// Declares the operator catalog once: the payload-bearing [`PhysicalNode`],
 /// its fieldless [`PhysicalNodeKind`] with `ALL`, each kind's explain name,
 /// and the child visitation and admitted child counts, all from one declaration.
+///
+/// A variant is one line: its fields, explain name, child fields and four
+/// tokens, `shape:` (its `PipelineShape` over the streamed input), `sides:`
+/// (the inputs its operator drains whole), `cut:` (the most rows it keeps)
+/// and `order:` (the order its output leaves in, `order_of(input)` for an
+/// order-preserving operator). The generated `shape`, `collected_sides`,
+/// `row_cut` and `order` are matches with one arm per kind, so a line without
+/// a token does not compile at that line. The matches that read fields stay
+/// hand-written and are named in `tests/physical_node_matches.rs`, which
+/// refuses a default arm beside named kinds and a match over kinds at any
+/// other site.
 macro_rules! physical_nodes {
     (
         $order_of:ident ;

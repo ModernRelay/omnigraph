@@ -1,4 +1,4 @@
-//! The read-path plan (RFC 0068 milestone 3): a GQ query resolves to a tree
+//! The read-path plan: a GQ query resolves to a tree
 //! and `rewrite` writes each bound scan's projection from what the whole
 //! tree reads through its binding. Synthetic sources expose planner states
 //! and JSON structure that the GQT plan assertions cannot observe.

@@ -2,6 +2,13 @@
 //!
 //! Input loading preserves the CLI's existing validation order. Preparation
 //! classifies captured source; GraphClient remains the execution owner.
+//!
+//! Preparation (`prepare`) enforces the statement restrictions it recognizes
+//! and forwards unrecognized source unchanged, so syntax a newer server
+//! accepts still reaches it. Read presentation (`crate::presentation`) is
+//! captured once and rendering never reloads configuration; the captured read
+//! format also selects structured execution-error output, while mutation
+//! error formatting follows explicit `--json` only.
 
 mod args;
 mod prepare;

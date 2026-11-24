@@ -1,17 +1,16 @@
 # Omnigraph agent guide
 
 This file is the always-on map for coding agents. Keep it short: current detail
-belongs in `docs/`, exact behavior in code and tests, decisions in RFCs, and
-open work in issues.
+belongs in `docs/`, exact behavior in code and tests, the reason for a design
+in its [decision record](docs/decisions/README.md), and open work in issues.
 
 ## Required reading
 
 Before every task and every change:
 
 1. Read [the contract](docs/dev/contract.md): what each kind of operation
-   promises its caller, where the engine differs today, and the direction the
-   work asks for. For a non-trivial change, name the statements it keeps,
-   closes, decides or changes.
+   promises its caller, and where the engine differs today. For a non-trivial
+   change, name the statements it keeps, closes, decides or changes.
 2. Read [architectural invariants](docs/dev/invariants.md). Apply the hard
    invariants and deny-list to implementation and review work.
 3. Consult the domain map in [Lance alignment](docs/dev/lance.md). Fetch and
@@ -28,7 +27,6 @@ Tools that support `@` imports include these automatically:
 
 @docs/dev/contract.md
 @docs/dev/invariants.md
-@docs/dev/lance.md
 @docs/dev/testing.md
 
 `CLAUDE.md` is a symlink to this file. Edit `AGENTS.md` only.
@@ -102,7 +100,8 @@ authority model.
 | Understand atomic writes and crashes | [Write path](docs/dev/writes.md) and [recovery](docs/dev/recovery.md) |
 | Understand query execution | [Execution](docs/dev/execution.md) |
 | Understand clusters and serving | [Control plane](docs/dev/control-plane.md) |
-| Propose or inspect a decision | [RFC registry](docs/rfcs/README.md) |
+| See why a design was chosen, and what was rejected | [Decision records](docs/decisions/README.md) |
+| Propose a design | [RFCs](GOVERNANCE.md#rfcs): a pull request, not a file |
 | Write documentation | [Documentation guide](docs/dev/documentation.md) |
 | Review shipped history | [Release notes](docs/releases/) |
 | Cut a release | [Release checklist](docs/dev/documentation.md#release-checklist) |
@@ -154,32 +153,9 @@ which distribution of work a change serves, and what it trades away. Read
 [the contract](docs/dev/contract.md) for what each operation promises, and
 [the work](docs/dev/workload.md) for the workload hypothesis.
 
-The full rules live in [invariants](docs/dev/invariants.md). Keep these in
-working memory:
-
-1. A graph change has one publication door; never expose per-table partial
-   commits.
-2. A query or write attempt uses one coherent accepted snapshot. A retry starts
-   fresh rather than mixing old and new authority.
-3. A mutation, load, schema apply, merge, or maintenance batch publishes once.
-4. Pre-publication durable effects stay unreachable (detached commits, staged
-   files). Table pins and the accepted schema contract are complete in one
-   manifest publication; ambiguity fails closed.
-5. Stable schema identity survives supported renames, not drop/re-add. Never
-   infer identity from names, paths, versions, field IDs, or branch refs.
-6. Indexes, caches, topology, fragment layout, and compaction are derived
-   performance state. Missing coverage must not change logical correctness.
-7. Bearer tokens resolve actors at the server boundary; clients cannot supply a
-   trusted actor. Every mutating engine entry point enforces policy when one is
-   installed.
-8. Failures, retries, memory, I/O, and backpressure are bounded and observable.
-   Never acknowledge before durable graph visibility or return silent partial
-   results.
-
-Do not add a queue for manifest-derived work, inline vector/FTS rebuilds, raw
-public Lance writers, string-built query semantics, process-local locks
-advertised as distributed fencing, cloud-only correctness paths, or a shadow
-source of truth without an accepted RFC that changes the invariant.
+The rules an implementation must never break are the hard invariants and the
+deny-list in [invariants](docs/dev/invariants.md). A change that needs an
+exception lands a [decision record](docs/decisions/README.md) that argues it.
 
 ## Build and test
 
@@ -199,9 +175,8 @@ cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 
-# Focused examples. A crate's loose integration tests are modules of one `tests/integration/main.rs`
-# binary (one link per crate, not one per file); a file stays a separate binary only when its tests
-# need their own process. CI selects a module's test as `--test integration <module>::<name>`.
+# Focused examples. A crate's integration tests are modules of one `tests/integration/main.rs`
+# binary: select one as `--test integration <module>::<name>`.
 cargo test -p omnigraph-engine --test integration traversal_indexed::
 cargo test -p omnigraph-engine --features failpoints --test failpoints
 cargo test -p omnigraph-server --features aws
@@ -223,25 +198,19 @@ every one and when to run it.
 The separate `GQ Logic Tests` context owns the complete GQT corpus. Also run
 `cargo test -p omnigraph-gqt --locked` and
 `cargo clippy -p omnigraph-gqt --all-targets --locked -- -D warnings -W clippy::dbg_macro`
-from any directory inside the checkout: the workspace `.cargo/config.toml`
-enables DST by default there. `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS` (empty
-included) or a `target.*.rustflags` config entry replaces that list, and a
-cargo run outside the checkout (`--manifest-path`) never reads it; such a
-build must refuse requested DST execution, not skip those cases. The DST suite itself runs from
-`crates/omnigraph-dst` (`cargo test`): its `[env]`-only Cargo configuration
-supplies the pool trio the suite asserts at process start.
+from inside the checkout: the workspace `.cargo/config.toml` enables DST there
+and states what overrides it. A build that cannot run DST must refuse the
+requested cases, not skip them. The DST suite runs from `crates/omnigraph-dst`
+(`cargo test`; see its README).
 
-S3 suites require `OMNIGRAPH_S3_TEST_BUCKET` and the documented `AWS_*`
-environment. Azure suites require `OMNIGRAPH_AZURE_TEST_CONTAINER` and the
-documented Azure/Azurite environment. See [testing](docs/dev/testing.md) and
-[deployment](docs/user/deployment.md).
+Cloud suites skip unless their environment is set; see
+[testing](docs/dev/testing.md).
 
-API changes must regenerate `openapi.json` through the server OpenAPI test.
-Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
+API changes regenerate `openapi.json` ([CONTRIBUTING.md](CONTRIBUTING.md#openapi-spec)).
 
 ## Change discipline
 
-- Give every design, RFC and non-trivial change its
+- Give every design, decision record and non-trivial change its
   [contract line](docs/dev/contract.md#citing): the statements it keeps, the
   gaps it closes, the decisions it settles and the statements it changes. The
   contract is the target and the code is today's behavior: to change what
@@ -254,10 +223,6 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   says so.
 - For a bug, reproduce the predicted failure at the tier the regression rule
   below names, then fix the root cause and prove the regression turns green.
-- Query-behavior tests default to `.gqt` logic tests under
-  `crates/omnigraph-gqt/cases/`; a Rust test needs a reason the
-  logic test format cannot express (mechanism assertions, scale symptoms,
-  process environment, concurrency).
 - Every issue fix lands a regression test at the cheapest tier that catches
   the defect: a `.gqt` logic test when the defect is visible in rows, counts,
   result column types, or errors, a `_issue_NNN` Rust test when it needs mechanism or scale
@@ -281,18 +246,16 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   rows with v1's. A defect seen on v1 is fixed on v2
   (`crates/omnigraph/src/engine/`); a v1 edit needs the pin updated in the
   same PR and a reviewer's eyes.
-- A change to what an operation reads or writes in storage adds or updates
-  its row in the DST storage-cost golden,
-  `crates/omnigraph-dst/cost_table.txt`, and the pull request explains every
-  changed line ([testing](docs/dev/testing.md#dst-storage-cost-golden)).
 - Update user-visible docs in the same change as a flag, endpoint, format,
   schema construct, behavior, or limit.
 - Reconcile the agent skill in that same change: every statement in
   `skills/omnigraph` (`SKILL.md` and `references/`) about what the change
   adds, alters or removes. `omnigraph skill export` ships it with the binary,
   so a stale skill instruction is a user-facing bug.
-- Update current developer guides when architecture or support boundaries
-  change. Put rationale/history in one RFC, not a copied design note.
+- When a change makes a guide or a decision record false, change it in the
+  same pull request. A design that is costly to reverse lands its
+  [decision record](docs/dev/documentation.md#decisions): what was chosen,
+  why, and what was rejected. No plans, status or history in `docs/`.
 - Add a permanent `changelog.d/<slug>.<category>.md` note for user-visible changes;
   follow [release-note authoring](docs/dev/documentation.md#release-notes).
   Keep private tickets and planning shorthand out of public history.
@@ -307,8 +270,6 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   messages and generated text, never `OmniGraph`. Code identifiers keep their
   spelling (`Omnigraph::open`, `omnigraph-engine`, `omnigraph://`), and so do
   published release documents and the bytes they are verified against.
-- Recheck exact flags, environment variables, routes, and constants in source
-  before documenting them.
 - Keep this file a map. New deep content goes in its audience-owned guide. A
   rule belongs here only when a violation is hard to detect or hard to
   reverse; where a check can catch it, add the check instead.

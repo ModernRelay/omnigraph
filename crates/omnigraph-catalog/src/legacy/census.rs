@@ -32,10 +32,20 @@ use crate::{MAIN_BRANCH_HEAD_KEY, TableRegistration};
 
 /// The cells of the `object_type` column one census may read. Every source
 /// version rewrites every row, so the sum over the versions of a lineage
-/// grows with the square of its commit count.
+/// grows with the square of its commit count: a stamp-13 lineage of N commits
+/// reads about 1.5 N² cells, so the bound refuses one above about 75,000
+/// commits. A stamp-8 or stamp-9 head holds one registration row per table and
+/// publish and never loses a row, and the census reads every version since
+/// `init`.
 pub const MAX_CENSUS_CELLS: u64 = 1 << 33;
 /// The inline bytes of the table snapshots one census may retain: the record
 /// of every graph commit holds one [`TableRow`] per table of its version.
+/// The bound is checked from the head scans alone, before any version is read,
+/// counting each ref's own commits plus its head times the tables of its head
+/// (so a graph whose tables were added late is over-counted), and again as
+/// each value is retained. It counts `size_of` of each value only: the strings
+/// a value owns are not counted and the plan holds a second copy of the
+/// records, so the process needs several times the bound.
 pub const MAX_CENSUS_SNAPSHOT_BYTES: u64 = 1 << 30;
 /// Version reads in flight at once.
 const READS_IN_FLIGHT: usize = 16;

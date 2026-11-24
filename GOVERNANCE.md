@@ -1,6 +1,6 @@
 # Governance
 
-How change enters OmniGraph: who decides, what each change needs before code
+How change enters Omnigraph: who decides, what each change needs before code
 lands, and what reviewers and CI enforce. It exists so an outside contributor
 can answer, without asking: *where does my report or idea go, who decides, and
 what has to happen before code lands?* The practical how-to lives in
@@ -8,7 +8,7 @@ what has to happen before code lands?* The practical how-to lives in
 
 ## Roles
 
-OmniGraph is maintained by EQTR, Inc.
+Omnigraph is maintained by EQTR, Inc.
 
 - **Maintainers** — triage issues, accept or decline proposals and RFCs,
   review and merge PRs, and set direction. Final decision authority.
@@ -41,8 +41,10 @@ The lane is set by **blast radius and design impact**, not line count.
   design. Path: **issue → `accepted` → PR**.
 - **L — design.** Creates or changes a design: new user-facing surface
   (query/schema/CLI/HTTP), on-disk or wire formats, a new substrate
-  dependency, anything irreversible, or anything touching an accepted RFC.
-  Path: **issue → `accepted` → draft RFC → RFC `accepted` → code PRs**.
+  dependency, anything irreversible, or anything that changes a
+  [decision record](docs/decisions/README.md) or a statement of
+  [the contract](docs/dev/contract.md).
+  Path: **issue → `accepted` → RFC pull request merged → code PRs**.
 
 If you cannot tell S from M, it is M. A reviewer who reclassifies a change
 upward closes the PR and restarts it on the correct path — that is about
@@ -54,10 +56,10 @@ Labels are the state machine; an issue has exactly one status label.
 
 - `needs-triage` — default on arrival. No work should start.
 - `accepted` — a maintainer agreed the change should exist; a code PR may
-  follow for size M. Size L still requires an accepted RFC.
+  follow for size M. Size L still requires a merged RFC.
 - `needs-rfc` — size L, accepted with the design outstanding. It replaces
-  `accepted` while the RFC is drafted and reviewed; the issue returns to
-  `accepted` only when the RFC's lifecycle becomes `accepted`.
+  `accepted` while the RFC is written and reviewed; the issue returns to
+  `accepted` only when the RFC merges.
 - `blocked` — accepted, but waiting on something named in the thread.
 - `declined` — closed, with a reason.
 
@@ -67,21 +69,35 @@ change should exist. An accepted issue with no assignee is open to anyone.
 
 ## RFCs
 
-An RFC lives in two vessels: its **issue** (discussion, then implementation
-tracking) and its **document** (`docs/rfcs/NNNN-title.md`). Numbering,
-statuses, and the template live in
-[docs/rfcs/README.md](docs/rfcs/README.md).
+An RFC is a pull request, not a file. It proposes a design before the code
+exists, and its title has the type `rfc`. Its description carries the
+problem, the alternatives and the argument; its thread carries the review.
+The description opens with a short summary a person can read in a minute;
+the exact statements for agents follow it.
 
-- **RFC lifecycle is explicit.** A draft may merge so review and evidence have
-  one durable home; merge alone is not acceptance. Code starts only after a
-  maintainer changes the RFC's frontmatter to `status: accepted`.
-- **An accepted RFC sanctions its implementation PRs directly**: code PRs
-  reference the RFC, and the RFC's issue is the umbrella that tracks them.
-- **Amending an accepted RFC is itself a size-L change**: issue → `accepted`
-  → amendment PR → accepted amendment → code. Discovering mid-implementation that the
-  design is wrong is normal and welcome — stop, amend, then continue. A code
-  PR that rewrites an accepted RFC on the way through is rejected regardless
-  of the code's quality.
+What it merges is small:
+
+- the statements of [the contract](docs/dev/contract.md) that the design
+  adds or changes, each with a row under Gaps until the code follows;
+- one [decision record](docs/decisions/README.md) of one page: what was
+  chosen, why, and what was rejected;
+- an entry of the [deny-list](docs/dev/invariants.md#deny-list), when the
+  design rules a shape out.
+
+[The documentation guide](docs/dev/documentation.md#decisions) owns the
+rules for records.
+
+- **Merge is acceptance.** Nothing on `main` is a draft. An RFC that is not
+  accepted stays an open pull request or is closed.
+- **A merged RFC sanctions its implementation PRs directly**: code PRs
+  reference the decision record, and the RFC's issue is the umbrella that
+  tracks them.
+- **Changing a decision is itself a size-L change**: issue → `accepted` →
+  RFC pull request → code. Discovering mid-implementation that the design is
+  wrong is normal and welcome: stop, change the record and the contract in
+  their own pull request, then continue.
+- **A record follows the code.** The pull request that completes or removes
+  a design updates or deletes its record in the same change.
 
 ## Pull requests
 
@@ -96,9 +112,10 @@ draft means unfinished, not unreviewed.
 
 ### A ready PR must
 
-- reference its `accepted` issue or an accepted RFC — or be size S;
-- keep to one kind of content: an RFC PR touches only `docs/rfcs/`; a
-  contributor code PR does not modify RFC documents (amend first, then code);
+- reference its `accepted` issue or a decision record — or be size S;
+- keep to one kind of content: an RFC PR touches only the contract, a
+  decision record and the deny-list; a contributor code PR does not change
+  what a decision record chose (change the decision first, then the code);
 - be green on CI (build, `fmt`, `clippy`, tests, and the repo's drift
   checks);
 - describe its blast radius and what was tested beyond the happy path.
@@ -113,9 +130,8 @@ reviewable. Reclassified changes restart on the correct path rather than
 being renegotiated in the thread. Low-effort PRs with no evident mental model
 and no testing beyond the happy path may be closed without detailed review.
 
-Review enforces issue linkage. CI also validates RFC location, numbering,
-metadata, lifecycle values, registry entries, and documentation links with
-`scripts/check-docs.py`.
+Review enforces issue linkage. CI also validates the format of decision records, page budgets and
+documentation links with `scripts/check-docs.py`.
 
 ## Code of conduct & security
 

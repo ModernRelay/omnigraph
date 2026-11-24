@@ -2,7 +2,12 @@
 //!
 //! This crate is deliberately not a storage backend. It can address exactly
 //! one reserved admission Blob derived by `omnigraph-storage`, and exposes only
-//! the lease operations needed to admit and retire an OmniGraph process.
+//! the lease operations needed to admit and retire an Omnigraph process: one
+//! mutation-capable process, a server or a job. Every mutation-capable Azure
+//! server, apply job, direct writer and maintenance process runs through it.
+//!
+//! This crate may depend on `omnigraph-storage`; storage, engine, cluster,
+//! server and CLI must not depend on it.
 
 use std::collections::BTreeMap;
 use std::fmt;

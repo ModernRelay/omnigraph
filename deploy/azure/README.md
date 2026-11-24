@@ -1,7 +1,7 @@
 # Azure Container Apps reference deployment
 
 This directory is the OSS reference topology for one Azure Blob-backed
-OmniGraph cluster. It provisions a private Blob container, ACR, one
+Omnigraph cluster. It provisions a private Blob container, ACR, one
 user-assigned managed identity, Log Analytics, a Container Apps environment,
 one manual bootstrap Job, and one HTTPS Container App.
 
@@ -70,7 +70,7 @@ and an unlocked lease, then activate.
 On a first deployment, Azure RBAC grants may take time to reach the data plane.
 The script first runs the same Job resource in a read-only `readiness` mode. It
 may retry that phase up to three times because it only pulls the image and
-inspects the admission object; it does not acquire a lease or start OmniGraph.
+inspects the admission object; it does not acquire a lease or start Omnigraph.
 It then switches the Job to `apply` and runs that lease-capable phase exactly
 once. A failed or timed-out apply is never retried automatically: inspect the
 lease and use the recovery runbook below.

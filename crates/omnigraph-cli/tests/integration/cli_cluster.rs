@@ -1,4 +1,18 @@
 //! Direct, served, and explicitly selected managed cluster command workflows.
+//!
+//! Owns CLI admission, cluster ownership and addressing, exact unlock
+//! refusals, graph filtering and wrong-plane refusal before configuration or
+//! HTTP access. Served apply polls a submission once: transient 429/503 and
+//! truncated-body retries, malformed-receipt refusal, terminal outcomes and a
+//! caller timeout without replay. Managed fixtures cover status and history
+//! scope and filters, explicit managed target selection, unsupported
+//! target-kind refusals before credentials or external access, immutable
+//! preview and delivery bodies, original-ID recovery, authorization refusals,
+//! bounded waiting through uncertain delivery and archival, and queued-only
+//! cancellation; they do not replace native server execution tests. Default
+//! target selection refuses retired folder routing, and an explicit direct
+//! target never routes through it. `organization list` sits beside the member
+//! and invitation lists, with the 1,000-membership bound.
 
 use serde_json::Value;
 use std::fs;

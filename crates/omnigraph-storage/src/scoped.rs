@@ -4,7 +4,7 @@
 //! wrapped remote client must disable retries before construction: a successful
 //! retry cannot establish what happened to an earlier, unacknowledged request.
 //!
-//! Settlement depends on the request's operation and the Lance 11 key it names:
+//! Settlement depends on the request's operation and the Lance key it names:
 //!
 //! - Lance writes fresh table files (`data/*.lance`, their Blob sidecars,
 //!   `_transactions/*.txn`, `_deletions/*.arrow|*.bin`, flat files in
@@ -549,7 +549,7 @@ pub(crate) fn key_class(path: &Path, conditional: bool) -> KeyClass {
         if *grandparent == "data" && name.ends_with(".blob") {
             return KeyClass::Immutable;
         }
-        // Lance 11 writes each index's files directly in its UUID directory.
+        // Lance writes each index's files directly in its UUID directory.
         // Unknown nested paths stay mutable: a root prefix can itself contain
         // `_indices/<uuid>/` before an unrelated control object.
         if *grandparent == "_indices" && is_uuid(parent) {

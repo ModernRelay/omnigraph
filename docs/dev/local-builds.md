@@ -37,48 +37,25 @@ only that crate is built in this `target/`.
 
 ## Warm worktrees
 
-A cold `target/` costs a full dependency build and about 10 GB for the engine's
-test binaries alone. sccache removes only part of that cost across worktrees.
-Its Rust cache key includes the compile's working directory
-(`src/compiler/rust.rs`, step 9, unchanged on sccache's main branch as of
-0.19). Cargo runs a registry crate's rustc from that crate's own directory, so
+A cold `target/` costs a full dependency build. sccache removes only part of that cost across worktrees.
+Its Rust cache key includes the compile's working directory. Cargo runs a registry crate's rustc from that crate's own directory, so
 those compiles can hit, but runs every workspace crate from the workspace root,
 so the workspace crates, and everything they feed, miss in every new worktree.
 `SCCACHE_BASEDIRS` normalizes C and C++ only. sccache also never caches a
 proc-macro, a link or a build-script run, and those repeat in full.
 
-`scripts/seed-target.sh`, which Claude Code runs at session start through the
-checked-in `.claude/settings.json` hook and any other agent runs once in a new
-worktree before its first build, instead seeds its `target/` as an APFS
-copy-on-write clone (`cp -c -R -p`) of a warm checkout's `target/`. The clone
-shares disk blocks with its source until either side rewrites a file. The
-script does nothing when `target/` already exists, when no source qualifies,
-off macOS, or when the source is on another or a non-APFS volume, where `cp -c`
-would fall back to a full copy:
+`scripts/seed-target.sh` seeds a new worktree's `target/` as an APFS copy-on-write clone of a warm checkout's `target/`; its header comment says how it picks the source and when it does nothing:
 
 ```bash
 sh scripts/seed-target.sh
 OMNIGRAPH_WARM_TARGET=/path/to/warm/target sh scripts/seed-target.sh
 ```
 
-Without `$OMNIGRAPH_WARM_TARGET` the source is the most recently built
-`target/` among the repository's other worktrees whose ancestor Cargo configs
-are identical. Cargo joins array values such as `build.rustflags` from every
-`.cargo/config.toml` above a checkout, so a worktree nested inside another
-checkout, as `.claude/worktrees/*` is inside the main checkout, builds with
-`--cfg tokio_unstable` twice. Its artifact hashes then differ from the main
-checkout's, and a clone of the main checkout's `target/` rebuilds everything;
-a sibling nested worktree's `target/` matches. Spelling the flags as a string,
-which Cargo does not join, would break every checkout still holding the array
-form, because Cargo refuses to merge a string with an array.
-
-The clone keeps the source's mtimes. Cargo decides freshness by comparing an
-artifact's recorded time with its sources' mtimes; the new worktree's sources
-were just checked out, so every workspace crate rebuilds once and every
-registry dependency stays fresh. Cargo rewrites the build-script output paths
-recorded under the old `target/` itself. A source built with other features or
-another toolchain seeds less, so keep one worktree warm with
-`cargo dev-build-tests`.
+Spelling `build.rustflags` as a string, which Cargo does not join, would break every
+checkout still holding the array form, because Cargo refuses to merge a
+string with an array. Cargo rewrites the build-script output paths recorded
+under the old `target/` itself. A source built with other features or another
+toolchain seeds less.
 
 ## Shared sccache backend (optional)
 
@@ -112,7 +89,4 @@ link locally. CI uses the GitHub Actions backend instead
 On Linux, `.cargo/config.toml` links through `scripts/cargo-linker.sh`, which
 adds `-fuse-ld=mold` when `mold` is on `PATH` (GCC 12.1 or later, or clang)
 and otherwise runs `cc` unchanged. Install it with the system package manager
-(`apt-get install mold`). The linker is not part of a compile fingerprint, so
-installing or removing mold relinks without recompiling. CI's test and lint jobs
-install it; release builds do not, and link with the default `cc`. macOS uses
-the system linker.
+(`apt-get install mold`).

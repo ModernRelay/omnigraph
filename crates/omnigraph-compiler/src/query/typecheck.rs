@@ -71,6 +71,12 @@ impl TypeContext {
 /// once and retained with its type, the match scope completed, the
 /// parameters parsed. Only [`typecheck_query`] and [`typecheck_query_decl`]
 /// construct one; lowering and result-schema inference read it.
+///
+/// An occurrence is one source location: a literal list's null members are
+/// resolved too, and equal expressions at two locations are two occurrences.
+/// Checking, lowering and inference use one accepted catalog; lowering still
+/// inserts comparison casts, folds constants and substitutes search scores,
+/// so validation of the lowered IR stays fallible.
 #[derive(Debug, Clone)]
 pub struct CheckedReadQuery {
     pub(crate) name: String,

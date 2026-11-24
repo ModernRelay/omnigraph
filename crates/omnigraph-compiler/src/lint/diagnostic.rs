@@ -70,8 +70,7 @@ pub enum SafetyTier {
 }
 
 /// Severity for a diagnostic at the user-facing surface. Defaults are set
-/// per code in [`super::codes`]; operators override via `omnigraph.yaml`
-/// (planned for a follow-up PR).
+/// per code in [`super::codes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Severity {
     /// Blocks apply.

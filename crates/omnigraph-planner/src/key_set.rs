@@ -94,7 +94,10 @@ impl PatternEdge {
 /// column read), and one binding's scan is bounded by its own filter (a key
 /// or unique equality or a list membership) below its table's row count. The
 /// root is the binding with the fewest estimated rows, the first in the
-/// correlated tree on a tie. `None` when the block does not qualify.
+/// correlated tree on a tie. `None` when the block does not qualify, and
+/// under a `traversal_work_limit`. The shapes the bulk CSR degree check
+/// answers need a filter-free destination, so they have no bounded binding
+/// and stay correlated.
 pub(crate) fn key_set_tree(
     plan: &LogicalPlan,
     inner: LogicalId,

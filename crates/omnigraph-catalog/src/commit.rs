@@ -28,9 +28,17 @@
 //!
 //! Costs. Without a cold push, the bytes written and decoded per publish do
 //! not depend on released history; a push also reads and writes the cold
-//! fragments it repacks. Each version keeps its own hot copy and nothing
-//! prunes `__manifest` versions today, so retained bytes grow with the
-//! publication count until version retention exists.
+//! fragments it repacks. The hot fragment is one file, so a scan pays no
+//! per-fragment or per-deletion-file requests for it, though pages within it
+//! are read separately; its buffered commits are bounded by
+//! `HISTORY_RELEASE_BYTES`, so the bytes decoded per scan do not grow with
+//! retained history, and older commits are read from `__history` only when a
+//! history read needs them. A read-only scan reduces one Arrow batch at a
+//! time; the publish scan keeps every batch, because the copy-on-write
+//! publish rewrites them. Each version keeps its own hot copy and nothing
+//! prunes `__manifest` versions, so retained bytes grow with the publication
+//! count. `optimize` preserves this fragment layout; only this publish
+//! repacks it.
 //!
 //! Lance's auto-cleanup hook is skipped: `__manifest` versions are the snapshot
 //! and time-travel authority.

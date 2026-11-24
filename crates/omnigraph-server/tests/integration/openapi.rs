@@ -1,3 +1,9 @@
+//! The generated contract: `openapi.json` against the specification built in
+//! memory, and in `conventions` the HTTP conventions, their named exceptions
+//! and the required error responses. Negative cases remove a required response
+//! or code from a copy of the spec and require rejection, so a regenerated
+//! snapshot alone never proves response coverage.
+
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use std::collections::HashSet;
 use std::env;

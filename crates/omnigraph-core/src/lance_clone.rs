@@ -1,4 +1,16 @@
 //! Scoped clone-source location reuse and local manifest identity normalization.
+//!
+//! Every dataset open and every initial dataset creation installs the handler
+//! here, wrapping the configured commit handler without an extra reopen.
+//! Branch creation checks the exact source version and leaves the clone's
+//! metadata to Lance; inside that call a task-local scope reuses the known
+//! main-source `ManifestLocation`, only for the matching native V2 path and
+//! version, so Lance need not list for it, and every other location keeps
+//! Lance's own resolution. Manifest writing, transactions and the commit
+//! handler's capabilities go to the wrapped handler. The adapter captures no
+//! index inventory, repairs no index base and reads no external
+//! fragment-reuse payload. Every commit's manifest request is resolved here
+//! too (`manifest_request`).
 
 use std::sync::Arc;
 
@@ -71,7 +83,7 @@ impl CloneContext {
     }
 }
 
-/// The handler every OmniGraph dataset commits through. It reuses a clone
+/// The handler every Omnigraph dataset commits through. It reuses a clone
 /// source's location, normalizes local discovery tags, and resolves the
 /// manifest request of every commit (`manifest_request`).
 #[derive(Debug)]

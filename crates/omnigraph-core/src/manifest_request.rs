@@ -5,7 +5,7 @@
 //! error whether or not that request was ever sent: a transaction file put
 //! that fails before it and a manifest put that times out after the store
 //! applied it come back as the same opaque storage error. The handler
-//! OmniGraph installs on every dataset (`lance_clone`) sits on that request.
+//! Omnigraph installs on every dataset (`lance_clone`) sits on that request.
 //! It re-issues a request whose answer was ambiguous, unchanged, until the
 //! store answers it definitively, and it records what it established in a
 //! [`ManifestRequestProbe`] the committer may pass for one commit. The

@@ -1,5 +1,5 @@
 //! The `--- expect plan` section: assertions over the plan a query step runs
-//! under, checked against the engine's explain document (RFC 0068) without
+//! under, checked against the engine's explain document without
 //! executing the query. Each line names one fact of one node; nothing is
 //! compared as rendered text.
 //!

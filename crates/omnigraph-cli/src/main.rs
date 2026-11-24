@@ -1,3 +1,5 @@
+//! The `omnigraph` binary: runtime startup, diagnostic hooks, process
+//! arguments and the final exit status around `omnigraph_cli::app`.
 #![recursion_limit = "256"]
 
 use std::io::Write;

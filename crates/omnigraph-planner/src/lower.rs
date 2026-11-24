@@ -3,6 +3,17 @@
 //! variant without a method does not compile. A ranked scan is one `scan`
 //! call with its [`RankedAccess`]; the two arms of a `RankFuse` are two
 //! subtrees, each lowered once.
+//!
+//! The walk visits the tree from its root, inputs before their consumer, and
+//! calls one `Lower` method per node with its `NodeId`, fields and lowered
+//! inputs. The trait has no default bodies and the walk's match no catch-all
+//! arm, so a new variant compiles only once the walk and every `impl Lower`
+//! handle it. Two calls are not one per node: `anti_join_outer` runs between
+//! an `AntiJoin`'s outer and inner trees, and `finish` once with the lowered
+//! root. `hash_join` receives the build scan's `ScanSpec`, so the fallback
+//! lookup reads the same filters and projection, and `contains_join` the
+//! node's `haystack`, `needle` and `residual`. `Lower::Op` is an associated
+//! type, so this crate does not depend on DataFusion.
 
 use std::collections::HashSet;
 

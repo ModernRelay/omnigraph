@@ -304,6 +304,13 @@ enum StagedTarget {
     Rebuilt(crate::storage_layer::StagedHandle),
 }
 
+/// The index writer behind `ensure_indices` and the explicit full-text
+/// rebuild: open each productive table at its pin, stage its complete batch
+/// before the gates, commit every batch as a detached version of its pin and
+/// publish the pins once. The first build error observed in index order ends
+/// that table's batch and drops its outstanding builds, and the pass then
+/// publishes nothing; a vector fold with too few finite, non-null values
+/// stays pending on Lance's typed training refusal.
 async fn maintain_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,

@@ -2,6 +2,17 @@
 //! omnigraph 0.11.x wrote in place of a `schema_contract` row: `_schema.pg`,
 //! `_schema.ir.json` and `__schema_state.json`. The upgrade reads the contract
 //! of such a root from them and leaves them in place; nothing served reads them.
+//!
+//! A `.staging` copy of one of them is `source_recovery_required`, as a
+//! recovery sidecar is, whether or not a live `__schema_apply_lock__` ref is
+//! beside it; that lock on an otherwise clean root is `schema_apply_lock_retired`,
+//! and the upgrade retires it once main is fenced. A missing, inconsistent or
+//! over-bound object is `unsupported_source`, and a failure of the store
+//! ([`store_did_not_answer`]) is `preflight_failed`, which a rerun of the check
+//! can clear. Once main is fenced the upgrade reads the contract from the
+//! schema archive under `__history/schemas/` that its intent binds, never from
+//! these objects again, so a root object changed or removed after the fence
+//! does not stop the rerun.
 
 use omnigraph_compiler::{
     SYSTEM_COLUMNS_V3, SchemaIR, schema_ir_hash, schema_shape_hash_from_ir, validate_schema_ir,

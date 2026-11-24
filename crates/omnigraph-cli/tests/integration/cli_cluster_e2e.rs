@@ -1,5 +1,16 @@
 //! Cluster lifecycle compositions over the spawned binary (recovery, drift, convergence).
-//! Moved verbatim from tests/cli.rs in the modularization.
+//!
+//! The root-only deployment round trip, and the live journey: one server PID
+//! and listener survive schema and query replacement, graph addition, policy
+//! grant and revocation, management handoff and graph deletion (target storage
+//! and history removed, peers kept, a served deletion preview followed by
+//! `--no-wait` submission and exact-ID `status --wait`). The original
+//! submitter keeps only its exact receipt access after restart, and the
+//! achieved configuration is checked again after it. The local journey also
+//! exercises counted embedding-provider replacement, external-Blob admission
+//! changes, catalog integrity reporting, schema-drift refusal and missing-root
+//! refusal. The S3 and Azure wrappers share the transport-independent phases;
+//! local success does not qualify their storage-fault paths.
 
 use std::fs;
 

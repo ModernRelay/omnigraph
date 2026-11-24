@@ -1,4 +1,11 @@
 //! Schema creation, inspection, evolution, and query linting.
+//!
+//! Handlers receive the captured target. Cluster ownership refusals precede
+//! the source reads of `init` and `schema apply`, and offline lint resolves no
+//! target. Schema apply keeps the client's write evidence; initialization and
+//! the system-column upgrade have their own execution paths and do not claim
+//! the data-write outcome envelope. The upgrade adapter has separate read-only
+//! check and execution modes.
 
 use color_eyre::eyre::{Result, bail, eyre};
 use std::{fs, io::Write, path::Path};

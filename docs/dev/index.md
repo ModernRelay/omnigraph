@@ -1,18 +1,13 @@
 # Developer guide
 
-These pages describe the system that exists now: its architecture, invariants,
-change boundaries, and test ownership. Design history and proposals belong in
-[RFCs](../rfcs/); user behavior belongs in the [user guide](../user/).
+**Audience:** anyone changing Omnigraph, an agent included
+**Authority:** the index of developer guides; what to read before every change
+is in [`AGENTS.md`](../../AGENTS.md#required-reading)
 
-## Before every change
-
-1. Read [Architectural invariants](invariants.md).
-2. Use the domain map in [Lance alignment](lance.md), read the complete
-   upstream pages relevant to the task, then read the matching
-   [compatibility fences](lance-fences.md).
-3. Use [Testing](testing.md) and [test ownership](test-ownership.md) to find
-   existing coverage and establish a focused baseline before adding or
-   changing tests.
+These pages describe the system: its architecture, invariants, change
+boundaries, and test ownership. Why a design was chosen is in a
+[decision record](../decisions/README.md); user behavior belongs in the
+[user guide](../user/).
 
 ## Understand the system
 
@@ -44,17 +39,16 @@ change boundaries, and test ownership. Design history and proposals belong in
 | Understand PR and release workflows | [CI and releases](ci.md) |
 | Change required checks, repository policy, or who is requested to review | [Branch protection](branch-protection.md) |
 | Write or reorganize documentation | [Documentation guide](documentation.md) |
-| Review a parser boundary regression example | [Camel-case filtering case study](case-studies/camel-case-filtering.md) |
 
 The workflow YAML, code, and tests are authoritative for exact command lines,
 serialized fields, constants, and assertions. Developer docs explain ownership
 and invariants rather than duplicating those details.
 
-## History and decisions
+## Decisions and history
 
-- [RFC process and registry](../rfcs/README.md)
+- [Decision records](../decisions/README.md): one page for each design chosen
+  on purpose, with what was rejected
 - [Release notes](../releases/)
-- Git history for superseded implementation plans and handoff notes
+- Git history for everything else
 
-An implemented RFC records why a decision was made; it does not replace the
-current guides above. A roadmap belongs in an issue, not in `docs/dev/`.
+A roadmap belongs in an issue, not in `docs/dev/`.

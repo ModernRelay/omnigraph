@@ -1,4 +1,10 @@
 //! Capture exactly one destination. Command inputs never participate in routing.
+//!
+//! By command class, the resolver selects one profile for an account
+//! operation or one target for a resource operation. Explicit selectors
+//! override their declarative defaults, and applicability is checked before
+//! credentials or backend access. The resolved destination is kept through
+//! storage and HTTP execution.
 use crate::cli::{
     BlobCommand, BranchCommand, Cli, Command, CommitCommand, IndexCommand, SchemaCommand,
 };

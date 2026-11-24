@@ -1,5 +1,10 @@
 # `Test Workspace` runs the workspace graph with `cargo nextest run --profile ci`
 # (ci.yml): one scheduler over every test of every binary, a process per test.
+# `cargo test` runs the test binaries one after another, so a binary whose
+# remaining tests are few and process-bound (the CLI, server and upgrade
+# journeys) holds the machine while they finish; one queue lets another
+# binary's tests fill that time. nextest runs no doctest, so the job keeps a
+# `cargo test --doc` step on the same graph.
 # The JUnit report is what `scripts/check-workspace-test-owners.py` reads for
 # each required owner's verdict and for the captured output of the upgrade
 # journeys, in place of grepping a `--nocapture` log.

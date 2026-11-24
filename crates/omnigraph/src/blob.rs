@@ -1,7 +1,7 @@
 //! Engine-owned interpretation of Lance Blob-v2 descriptors.
 //!
 //! Lance remains responsible for resolving physical files and reading bytes.
-//! This module owns the logical boundary that every OmniGraph carrier needs:
+//! This module owns the logical boundary that every Omnigraph carrier needs:
 //! parent validity is the sole null witness, a valid zero-length descriptor is
 //! a managed value, and malformed persisted descriptors fail before a caller
 //! can silently reinterpret them.
@@ -1369,6 +1369,23 @@ impl Omnigraph {
     ///
     /// External references are returned descriptor-only, without policy
     /// evaluation, object-store setup, metadata probes, or payload reads.
+    ///
+    /// The selector is resolved through one coherently captured catalog and
+    /// snapshot and then carried by stable table, incarnation and property
+    /// identity. A managed read returns a [`BlobReader`] pinned to the selected
+    /// immutable dataset version, with a strong ETag bound to that cell and
+    /// version; null has no payload and no ETag. There is no unbounded read and
+    /// no raw Lance `BlobFile`.
+    ///
+    /// Historical reads fail closed rather than select another lifetime. The
+    /// current catalog resolves the selector, so a renamed type reaches older
+    /// history through its stable table identity; the old type name is not
+    /// kept. A target before a property rename is refused rather than reading
+    /// a similarly placed field, and so is an older version of an upgraded
+    /// table whose schema lacks the stable-property marker. A named branch is
+    /// readable at its exact current head; an older snapshot of it without a
+    /// persisted native-branch incarnation witness is refused, so a deleted and
+    /// recreated branch cannot be read in its predecessor's place.
     pub async fn read_blob_at(
         &self,
         target: impl Into<ReadTarget>,

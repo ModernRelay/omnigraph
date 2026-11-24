@@ -3,6 +3,15 @@
 //! bridge only connects: a target it cannot relay to refuses before any
 //! request, and an unreachable server fails each request without anything
 //! being started.
+//!
+//! Against a real served cluster and a stand-in endpoint: tool listing with
+//! and without the bridge's `--write`, graph binding, reads equal to the
+//! server's own `/mcp` answers, a Unix-socket endpoint refused before it
+//! connects, `--as`, credentials re-read from the target's `auth` source after
+//! a 401 without resending, the server's `WWW-Authenticate` challenge relayed
+//! with a 401, managed resource identity renewal without replay or
+//! control-token forwarding, wrong-incarnation and actor-override refusals,
+//! cancellation, and lost answers that resend nothing.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

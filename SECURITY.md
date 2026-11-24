@@ -1,6 +1,6 @@
 # Security Policy
 
-OmniGraph is maintained by EQTR, Inc. Do not report security issues through
+Omnigraph is maintained by EQTR, Inc. Do not report security issues through
 public GitHub issues, pull requests or the Slack community.
 
 ## Reporting a vulnerability
@@ -34,7 +34,7 @@ The advisory credits the reporter unless they ask not to be named.
 
 ## Supported versions
 
-OmniGraph is pre-1.0. Security fixes land on `main`, ship in the next edge
+Omnigraph is pre-1.0. Security fixes land on `main`, ship in the next edge
 build, and are included in the next stable release. Only the latest stable
 release and the newest edge build receive fixes. Reports against older
 releases are welcome, but the fix ships in a new release, not a backport.
@@ -49,5 +49,5 @@ the install script.
 Out of scope: the configuration of the services a deployment relies on, such
 as storage bucket policies and encryption, the identity provider, the
 embedding provider and the TLS-terminating proxy. The
-[deployment guide](docs/user/deployment.md) describes what OmniGraph expects
+[deployment guide](docs/user/deployment.md) describes what Omnigraph expects
 from each.

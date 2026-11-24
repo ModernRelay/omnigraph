@@ -1,6 +1,7 @@
 //! init/config scaffolding, schema plan/apply, graphs listing, version,
-//! and the built-in agent skill.
-//! Moved verbatim from tests/cli.rs in the modularization.
+//! and the built-in agent skill: `skill export` and `skill show` byte for byte
+//! with `skills/omnigraph`. Also target addressing, and help, version and
+//! refusal exit statuses with closed output streams.
 
 use std::collections::BTreeMap;
 use std::fs;

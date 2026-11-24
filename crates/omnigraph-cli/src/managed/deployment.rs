@@ -1,4 +1,12 @@
 //! Native managed previews and delivery: submit once, observe the original IDs.
+//!
+//! Deployment uses an immutable `/plans` preview and scoped `/deployments`
+//! delivery, separate from cloud lifecycle operations. The source head is
+//! frozen before the preview, and the preview ID is sent once for delivery.
+//! Polling observes the original product and native IDs and never resubmits.
+//! Native execution, runtime activation and result archival are distinct
+//! facts: a saved result alone does not prove an active runtime. Cancellation
+//! targets only the caller's own queued delivery that has not been attempted.
 use super::*;
 
 mod preview;

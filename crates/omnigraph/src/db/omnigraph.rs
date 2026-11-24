@@ -822,7 +822,7 @@ impl Omnigraph {
     }
 
     /// Open a shallow clone of the graph at `base_uri`, rooted at `root_uri`
-    /// (`docs/rfcs/2026-11-10-graph-shallow-clone.md`): the clone starts with
+    /// (`docs/decisions/2026-11-10-graph-shallow-clone.md`): the clone starts with
     /// every branch, version, commit and index of the base, every write lands
     /// under `root_uri`, and the base is never written. Both are local
     /// directories or `s3://` prefixes of one endpoint, and `root_uri` is an
@@ -1391,6 +1391,16 @@ impl Omnigraph {
     /// Capture a serializable, exact-base schema intent without graph effects.
     /// The caller must durably retain it before invoking effects if interrupted
     /// outcomes must be reconciled. This does not reserve or fence the graph.
+    ///
+    /// The intent binds the canonical root and schema identity domain, the
+    /// exact main-branch authority, the numeric manifest base, the desired
+    /// contract, the actor and a preallocated intent nonce. The published
+    /// commit id `hb1.<block>.<slot>.<nonce>` wraps that nonce, so a lookup by
+    /// the intent names the commit through `commit_id_answers`, never by
+    /// equality. Preparation works on a read-only handle: it captures
+    /// authority and plans without issuing native writes. The intent is
+    /// execution input, not an authorization grant or a distributed writer
+    /// fence.
     pub async fn prepare_schema_apply_as(
         &self,
         desired_schema_source: &str,
@@ -1413,6 +1423,18 @@ impl Omnigraph {
 
     /// Execute an engine-issued intent against its exact captured authority.
     /// A stale intent refuses before effects; it is never silently rebased.
+    ///
+    /// The authority and the current policy are checked again under the
+    /// existing gates. A version-2 intent publishes by `ExactGraphVersion`: a
+    /// base at `M` can publish only at `M + 1`, so metadata-only contention
+    /// that preserves the graph head still refuses. Version-1 intents are
+    /// rejected. An effectful success returns the operation's own
+    /// `GraphCommit` and contract identity, not a later head observation. A
+    /// no-op requires the exact source and accepted contract: changed comments
+    /// or formatting publish a replacement contract and lineage once while
+    /// keeping every table pin, since an empty migration plan alone cannot
+    /// certify the desired source. `apply_schema_as` runs the same
+    /// preparation, execution and exact-version rule.
     pub async fn apply_prepared_schema_as(
         &self,
         prepared: &PreparedSchemaApply,
@@ -1631,27 +1653,27 @@ impl Omnigraph {
             .capture_for_branch_control())
     }
 
-    /// Open a capture-once write transaction (RFC-013 step 3b): pin the base
-    /// snapshot and take the contract of that one manifest version (its
-    /// `schema_contract` identity; the catalog from the memo or one row read).
-    /// The per-table opens take `Option<&WriteTxn>` and, on the bound branch
-    /// for the non-strict (Insert/Merge) path, source the pinned base entry —
-    /// instead of re-resolving per table. Strict ops, the fork path, and the
-    /// commit-time revalidation keep their own reads: `revalidate_write_txn`
-    /// probes the manifest and reopens the branch only on a mismatch
-    /// (correctness machinery — see the handoff doc).
+    /// Open a capture-once write transaction: pin the base snapshot and take
+    /// the contract of that one manifest version (its `schema_contract`
+    /// identity; the catalog from the memo or one row read). Every planning
+    /// and validation step of the attempt uses this view.
     ///
-    /// "Once" covers the table-touch hot path captured here (the cost gate
-    /// permits no contract file read at all); it does
-    /// NOT yet
-    /// cover edge endpoint
-    /// / cardinality RI validation (`ensure_node_id_exists`, the loader's RI/cardinality),
-    /// which still resolve through `snapshot_for_branch` and re-validate. Those reads must
-    /// observe LIVE committed state, so unifying them (validate-once + pinned + re-checked
-    /// read-set) is step 4's §7.1 work — threading `txn.base` there would re-introduce the
-    /// stale-read class the #298 cardinality fix removed. Write-side opens now attach the shared
-    /// per-graph `Session` (the dataset-opener unification); the S3 cost gate
-    /// for that term is still owed (handoff §1d).
+    /// The snapshot's complete contract row is validated before a catalog
+    /// with the same identity is reused (`accepted_catalog_for_snapshot`):
+    /// an unchanged manifest image reuses its validation, a newly observed
+    /// image carries the contract from its state scan, and an acknowledged
+    /// publication reuses its retained rows. That memo is disposable; a
+    /// missing or invalid row cannot be repaired from root files.
+    ///
+    /// The per-table opens take `Option<&WriteTxn>` and, on the bound branch
+    /// for the non-strict (Insert/Merge) path, source the pinned base entry
+    /// instead of re-resolving per table. Strict operations, the fork path and
+    /// the commit-time revalidation keep their own reads:
+    /// `revalidate_write_txn` probes the manifest and reopens the branch only
+    /// on a mismatch. Edge endpoint and cardinality validation
+    /// (`ensure_node_id_exists`, the loader's checks) read live committed
+    /// state through `snapshot_for_branch`, not this base. Write-side opens
+    /// attach the shared per-graph `Session`.
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 

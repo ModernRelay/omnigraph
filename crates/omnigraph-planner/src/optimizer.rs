@@ -1157,6 +1157,8 @@ fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
 /// The metadata columns a sort appends after `keys` so its order is total;
 /// none for group rows, when every returned expression is a key (equal rows
 /// are indistinguishable), or for an individual column already used as a key.
+/// Identity columns come in binding-name order, a selected bound edge's type
+/// before its id.
 fn sort_tiebreak(
     candidates: &[(ColumnRef, &'static str)],
     keys: &[IROrdering],
@@ -2136,6 +2138,11 @@ fn search_filter_field(filter: &IRExpr) -> Option<&IRExpr> {
     }
 }
 
+/// Replace a direct unfiltered `count($var)` over one scan with a
+/// `MetadataCount` leaf, when every item of the `Aggregate` counts that same
+/// binding; a Boolean `Projection` above it stays. Property counts, grouping,
+/// filters, traversal, joins and search keep the ordinary aggregate. Runs on
+/// every query plan; no `PlanSource` method or setting disables it.
 fn aggregate_pushdown(plan: &mut LogicalPlan) -> Result<bool, PlanError> {
     let candidates: Vec<_> = plan
         .live()
@@ -2189,6 +2196,14 @@ fn metadata_count_schema(return_exprs: &[IRProjection]) -> Result<SchemaRef, Pla
 /// Project independent and dependent query scans from binding demand; the id
 /// column is a demand like any other (`@id`, a whole entity, `identity_reads`).
 /// A diff or merge plan holds no `Projection` node and never reaches this pass.
+///
+/// A bare `$var`, or a binding nothing references, demands the node object's
+/// members, never a `Blob` or `Vector` column; an expression or a pushed
+/// filter demands every property it names, a `Vector` included;
+/// `count($var)` demands the identity alone. A key column is always read,
+/// so an unused expansion destination keeps only its identity and key
+/// columns. Hydration passes the projection to Lance before destination rows
+/// are repeated per edge.
 fn projection_pushdown(
     plan: &mut LogicalPlan,
     source: &dyn PlanSource,
@@ -2460,6 +2475,20 @@ fn predicate_reads(predicate: &Predicate, out: &mut Vec<ColumnRef>) {
 /// Pass 6: a return column only the output reads leaves its binding's scan
 /// (row address instead) for a `HydrateColumns` above the root `Limit` when
 /// the scan estimates over `HYDRATE_ROW_RATIO` rows per kept row; a fusion's two arms together.
+///
+/// A deferred column is a bare `$b.property` return: not a key, the identity,
+/// a `Blob`, a sort key, a column a filter, join, traversal or aggregate
+/// reads, or a return the sort orders by alias. The pass fires when the root
+/// is a `Limit` of more than zero rows and the plan has no `Aggregate`, on a
+/// binding whose scan is unique and unranked or is one of a `RankFuse`'s two
+/// arm scans (a lone ranked scan keeps its columns). The scan reads
+/// `_rowaddr` in the column's place and the return projection carries it as
+/// `^binding` (`ROW_ADDRESS_PREFIX`); the logical plan keeps the full
+/// projection. A scan below a limit reads more rows than the limit keeps
+/// whenever a sort, filter or traversal sits between them, and even a bare
+/// scan reads ahead to its I/O buffer before the first batch is consumed.
+/// The addresses are safe to fetch by because one query reads one pinned
+/// snapshot.
 fn materialize_returns_late(
     physical: &mut PhysicalPlan,
     logical: &LogicalPlan,
@@ -4044,7 +4073,12 @@ impl Lowering<'_> {
     /// Pass 10, the strategy of a correlated block with a key-set tree: the
     /// cost model over the rows each inner tree produces, the correlated one
     /// from the outer input's row-count estimate (`chain_rows`); `Correlated`
-    /// when an estimate is unknown.
+    /// when an estimate is unknown. Both estimates are recorded as
+    /// `anti_join_rows($x)`. Each hop is priced at its edge type's average
+    /// degree, so a hub root is under-priced: with a tiny outer side the key
+    /// set can read every edge of the hub, bounded by the root's
+    /// neighbourhood and never by the outer rows; the recorded estimates
+    /// make such a choice visible.
     fn anti_join_strategy(
         &mut self,
         input: LogicalId,

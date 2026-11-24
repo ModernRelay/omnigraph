@@ -21,6 +21,20 @@
 //! Filling a slot needs the `install` feature; without it the crate is
 //! read-only, so arming a seam in a build that never reads one is a compile
 //! error instead of a silent no-op.
+//!
+//! # Adding a decision seam
+//!
+//! Declare it with [`decide_seam!`] beside the site it guards, above the item
+//! that crosses it, so the compiler records its file and line as the seam's
+//! site; `crates/omnigraph-seams/tests/failpoint_names_guard.rs` refuses a
+//! hand-written `Seam::decide`. Add its path to the crate's [`catalog!`] list
+//! (the engine's is `crates/omnigraph/src/seams/catalog.rs`); a private module
+//! on the path from the crate root to the declaring file becomes `pub(crate)`
+//! for the re-export. Cross it between two steps with the site helper whose
+//! one effect it declares (`fail`, `skip` or `contention` in
+//! `omnigraph_core::seams`). The guard then requires a production crossing and
+//! an arming test or `.gqt` case; `scripts/seam_corpus.py` lists every seam
+//! with where it is declared and which cases cover it.
 
 use std::cell::RefCell;
 use std::fmt;

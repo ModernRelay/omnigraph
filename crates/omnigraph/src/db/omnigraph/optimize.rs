@@ -555,11 +555,16 @@ pub struct OptimizeLimits {
     pub table: TableCeilings,
     /// Total source bytes across the tables the run starts. It is also the
     /// table byte ceiling when that is unset, and refuses a larger one, so a
-    /// first table within its ceilings always fits.
+    /// first table within its ceilings always fits. The first table that
+    /// would pass it, and every later one, is deferred as `byte_budget`.
     pub run_source_bytes: Option<u64>,
     /// The largest adjacency artifact the run writes, in bytes of the whole
     /// object. Over it, the artifact is `skipped(size_limit)` and a load
-    /// rebuilds the adjacency in memory.
+    /// rebuilds the adjacency in memory. It is checked twice: before the edge
+    /// scan against a lower bound (`persist::fixed_bytes`: the shortest
+    /// header plus 8 bytes per live edge row), and during the scan by
+    /// `GraphIndex::build_counted`, which stops before it keeps another batch
+    /// or allocates the adjacency arrays.
     pub artifact_bytes: Option<u64>,
 }
 
@@ -592,6 +597,17 @@ impl OptimizeLimits {
 
 /// Ceilings on one table's plan; an absent one is not measured. A table over
 /// any of them is `deferred(resource_limit)` and nothing is written for it.
+///
+/// Each is measured from the table's compaction plan before its first write,
+/// fragments first: rows from fragment metadata; bytes from the recorded
+/// data-file sizes, or a HEAD of each file whose size is not recorded,
+/// resolved by the collector's base rule (`collector::data_file_location`,
+/// `collector::deletion_file_location`; Lance records no deletion-file
+/// size); managed Blob bytes from the descriptor scan compaction sizing
+/// uses; and the table's rows when an index would be rebuilt or built. A plan
+/// that records nothing to measure for a set ceiling (a fragment without a
+/// row count, a Blob field that cannot be sized) is deferred the same way; a
+/// size read that fails reports the table `failed`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TableCeilings {
@@ -738,11 +754,26 @@ impl OptimizeRequest {
         self
     }
 
+    /// Run `hook` once, after the run's updates are prepared and before the
+    /// coordinator lock and the publisher's first attempt, with the lineage
+    /// intent's nonce and the captured head; the shared publication helper
+    /// `table_ops::commit_updates_on_branch_with_expected` makes the call, and
+    /// its other callers pass no hook. The hook runs under every writer gate
+    /// with no bound of its own, so it is part of the publication in the
+    /// writer wait `OptimizeLimits::max_gate_hold` describes.
     pub fn with_before_publish(mut self, hook: OptimizeBeforePublish) -> Self {
         self.before_publish = Some(hook);
         self
     }
 
+    /// Cancel the run through `cancellation`, which is checked before every
+    /// table's plan and rewrite and before the publication. A cancelled run
+    /// drops the tables in progress, reports them, every table not yet
+    /// started and every table holding a staged effect as `cancelled`, and
+    /// publishes nothing; a table already reported without an effect keeps
+    /// its outcome. A cancellation after the last check lets the run finish,
+    /// and the adjacency refresh stops before its write or, once the write
+    /// has started, completes it.
     pub fn with_cancellation(mut self, cancellation: OptimizeCancellation) -> Self {
         self.cancellation = Some(cancellation);
         self

@@ -10,8 +10,10 @@
 //! data loss. Refs without a suffix are legacy incarnations (native ==
 //! logical) and keep resolving unchanged.
 //!
-//! The manifest dataset's ref list is the registry: a logical branch is live
-//! iff exactly one native ref splits back to it.
+//! Below storage format 18 the manifest dataset's ref list is the registry: a
+//! logical branch is live iff exactly one native ref splits back to it. At or
+//! above it the registry is the `branch` rows of main's `__manifest`
+//! (`omnigraph-catalog`'s `BranchRows`), and a branch writes no ref file.
 
 use crate::error::{OmniError, Result};
 use crate::graph_commit_id::{canonical_ulid, is_valid_graph_commit_id, parse_history_block_id};

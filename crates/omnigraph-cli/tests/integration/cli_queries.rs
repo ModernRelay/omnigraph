@@ -1,5 +1,6 @@
-//! Stored-query commands and alias resolution.
-//! Moved verbatim from tests/cli.rs in the modularization.
+//! Stored-query commands and alias resolution, with exact unlock refusals,
+//! graph filtering and wrong-plane refusal before configuration or HTTP
+//! access.
 
 use std::{
     fs,

@@ -456,7 +456,7 @@ edge counts, a canonical logical-content digest, logical payload bytes,
 engine-managed index observations, main history depth, branch inventory, and a
 relocation-self-contained witness. The command rechecks the copied physical
 tree after observation and removes it. It never opens the registered source as
-an OmniGraph database and does not mutate that source.
+an Omnigraph database and does not mutate that source.
 
 The declarative expectations for the frozen FinGraph fixture live in
 `benchmarks/fixtures/finbench/finbench-2026-08-21-sf10-v1.fixture-reference-v1.yaml`.
@@ -623,7 +623,7 @@ it through one immutable pointer per invocation. Check it independently with:
 target/release/omnigraph-bench archive verify .bench/archive
 ```
 
-The JSON archive is authority. Its team-facing OmniGraph database is a
+The JSON archive is authority. Its team-facing Omnigraph database is a
 disposable, inventory-verified projection:
 
 ```bash

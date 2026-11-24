@@ -135,6 +135,12 @@ pub struct GraphBranchDetail {
 /// checkout and scan of the version it was created from. A branch gone
 /// before its own reads keeps its name and has no details: it was deleted
 /// after the listing.
+///
+/// A branch started at a past commit is a clone of that commit's version, so
+/// the same read answers its start. No lineage is read, so the cost per
+/// branch is flat in history. The start survives because the collector keeps
+/// each live branch's oldest own `__manifest` version (`retained_versions`
+/// with `keep_base`), which is that clone.
 pub async fn list_graph_branches_detailed(
     root_uri: &str,
     control_session: &Arc<lance::session::Session>,

@@ -1,5 +1,17 @@
 //! Data commands: load/query/mutate/branch/commit/export/snapshot/policy/embed/maintenance.
-//! Moved verbatim from tests/cli.rs in the modularization.
+//!
+//! Owns load consent and source-read ordering (offline included), Blob
+//! preconditions and `blob get/stat/put/clear`, the output-file lifecycle,
+//! ordinary and GQ branch scopes with JSON stdout kept parseable, cleanup
+//! preview and consent, and maintenance addressing, over its HTTP fixture.
+//! Query semantics stay in GQT.
+//!
+//! `studio` runs through stand-in platform openers on `PATH` and a stand-in
+//! desktop entry: the `--json` link and its digests equal
+//! `target inspect --json`, the registered handler's own program receives the
+//! link, no credential is read, `studio_unavailable` runs neither `xdg-open`
+//! nor a browser on `PATH`, and direct, managed and inline targets are refused
+//! before any I/O.
 
 use std::fs;
 

@@ -1,4 +1,9 @@
-//! Exact live-row counts from a query's pinned Lance snapshot.
+//! Exact live-row counts from a query's pinned Lance snapshot: Lance's
+//! `count_rows(None)`, deletions excluded, one non-null `I64` per count alias
+//! (zero for an empty table), the one output row charged to the query pool.
+//! It reads no identity or property column, though older Lance metadata can
+//! need file metadata or deletion-vector reads. Planning and explain never
+//! read the count.
 
 use std::fmt;
 use std::sync::Arc;

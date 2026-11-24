@@ -1,3 +1,8 @@
+//! The cluster-only HTTP server: authentication, read authorization,
+//! admission control, routing, OpenAPI, multi-graph serving and live
+//! deployment activation. It mounts `omnigraph-mcp` at `/mcp` through the
+//! adapter in `mcp`.
+
 // MCP's typed futures include the same recursive query-plan types as HTTP.
 #![recursion_limit = "256"]
 
@@ -218,6 +223,9 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVER_INTERNAL_SCHEMA_VERSION: u32 =
     omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
 
+/// Applied serving settings. The cluster's lifetime admission they carry is
+/// opaque: a hand-built configuration cannot use a deployment or
+/// reconciliation capability as serving authority.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Server topology + the graphs to open at startup. RFC-011

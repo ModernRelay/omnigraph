@@ -28,7 +28,7 @@
 //! v18 is read as it is. A publish under this binary stamps a v14 or v15
 //! branch 16 in its CAS and writes back the stamp of any other branch
 //! ([`stamp_after_publish`]); only `omnigraph upgrade`'s stamp-only route
-//! raises a branch to 17. Normal open never converts: a v8, v9 or v13
+//! raises a branch above 16. Normal open never converts: a v8, v9 or v13
 //! standalone root is converted by the offline `omnigraph upgrade`, whose
 //! intent, receipts and fence live here; a graph at any other stamp below
 //! v14 is rebuilt by export and load, and normal open refuses a graph that
@@ -87,7 +87,10 @@ use crate::state::{SchemaContractHead, SchemaContractRow};
 /// - v9 — RFC-0040 spells the system columns `__id`/`__src`/`__dst`, freeing
 ///   `id`, `src`, `dst` for user properties. Stamped on every graph created
 ///   with the new spellings; a v8 graph keeps the legacy spellings and its
-///   stamp. RFC 0040 Rollout step 3 defines the v8 → v9 upgrade.
+///   stamp. `omnigraph schema upgrade-system-columns` renames the spellings
+///   without changing the stamp: it stages detached renames as schema apply
+///   does and publishes the renamed table references and the replacement
+///   contract row together.
 /// - v10 — RFC 0067 lets a table registration name a detached Lance version
 ///   (`omnigraph.staged_version`, `omnigraph.transaction_uuid`) whose linear
 ///   target is published before it exists. An older binary would open the
@@ -129,7 +132,7 @@ use crate::state::{SchemaContractHead, SchemaContractRow};
 ///   (`commit.rs`); the packed record gains `block_id`, `first_slot` and
 ///   `last_slot`. A v14 binary refuses the rows' type, so the stamp refuses
 ///   it before any open. A v14 graph is served as it is: each branch is
-///   stamped 15 by its first publish under this binary, in the CAS that
+///   stamped 16 by its first publish under this binary, in the CAS that
 ///   writes the first rows, and nothing is converted offline. The same stamp
 ///   fences the one other thing a v14 binary cannot interpret: the reserved
 ///   `unpublished_<commit id>` tags that name a detached `__manifest` version
@@ -137,8 +140,9 @@ use crate::state::{SchemaContractHead, SchemaContractRow};
 ///   whose head row carries the proposal's captured clock `M + 1` rather than
 ///   its physical version; a v14 binary would retain such a tag forever and
 ///   refuse to delete its branch. `as commit` is refused on a v14 ref and
-///   never advances a stamp; `omnigraph upgrade` stamps a v14 graph's live
-///   refs 15 without waiting for a publish.
+///   never advances a stamp, and so are `commit publish` and `commit drop`
+///   ([`require_unpublished_commits`]); `omnigraph upgrade`'s stamp-only
+///   route stamps a v14 graph's live refs without waiting for a publish.
 ///
 /// - v16 — a branch's `__manifest` may also be addressed by the reserved
 ///   `unattached_<root>_<commit id>` tags that name a detached version
@@ -157,13 +161,15 @@ use crate::state::{SchemaContractHead, SchemaContractRow};
 ///   (RFC "Graph access and cross-process writes"). The first kind is the
 ///   `writer_epoch` row, at most one per version, its payload in `metadata`
 ///   as the `schema_contract` row's is; only a claim of the branch's writer
-///   epoch writes or raises it. A v16 binary refuses the row's type, so the
-///   stamp refuses it before any open.
+///   epoch writes or raises it, and every other publish carries forward the
+///   row it read. A v16 binary refuses the row's type, so the stamp refuses
+///   it before any open.
 ///   This is the first stamp no publication raises a branch to: a publish
 ///   writes back the stamp it loaded, a v14 or v15 branch still taking 16 at
 ///   its first publish, and only `omnigraph upgrade`'s stamp-only route
-///   stamps a served graph's live refs 17, with every process on the graph
-///   stopped. A graph this binary creates is born at 17.
+///   raises a served graph's live refs above 16, with every process on the
+///   graph stopped. A cluster-managed graph, which `omnigraph upgrade`
+///   refuses, therefore stays at 16.
 ///
 /// - v18 — a branch's existence is a `branch` row in main's version file:
 ///   `omnigraph.branch.<native>` in the config map, holding the lifetime
@@ -531,7 +537,8 @@ pub const UPGRADE_PENDING_KEY: &str = "omnigraph:storage_upgrade_pending";
 #[doc(hidden)]
 pub const UPGRADE_RECEIPT_KEY: &str = "omnigraph:storage_upgrade_receipt";
 
-/// The most live refs, main included, one upgrade converts.
+/// The most live refs, main included, one upgrade converts; the census
+/// admits as many retired refs.
 #[doc(hidden)]
 pub const MAX_BRANCHES: usize = 1024;
 

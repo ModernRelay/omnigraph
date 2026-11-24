@@ -1,6 +1,14 @@
 //! Optional vendor-neutral tracing and safe HTTP request diagnostics.
 //!
 //! Export failure never changes request admission, execution, or ownership.
+//!
+//! Telemetry is separate from deployment authority. The optional OTLP layer
+//! exports only spans of this crate's own target, with W3C trace context; a
+//! dependency's span or a protocol payload is never exported. Owned reads and
+//! writes carry child spans through their process-owned futures. Losing or
+//! shutting down the exporter does not change admission, publication,
+//! recovery or clean-exit evidence. JSON logs use the same restricted
+//! dependency-target filter (`safe_log_metadata`) as text logs.
 
 use std::fmt;
 use std::time::{Duration, Instant};

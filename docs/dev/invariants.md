@@ -24,16 +24,13 @@ five more changes like this one?**
 
 2. **There is one graph-content publication door.** A graph change becomes
    authoritative through one `__manifest` publication containing every
-   visible table pointer, accepted schema contract and graph-lineage update.
+   visible table pointer, accepted schema contract and graph-lineage update
+   (`E2`).
    A write to an existing registered table never moves its linear HEAD: its effects are detached commits the `__manifest`
-   pin `(published_dataset_version, staged_version, transaction_uuid)`
-   names, every pin is a detached version that opens, and the pin is the
-   table's version for its whole life. A graph table's linear HEAD stays at
-   its creation version, recorded per registration as
-   `omnigraph.last_linear_version`; the collector reads it to list foreign
-   versions. Added-type
-   admission may also inspect an unregistered deterministic path, but accepts
-   only its qualified original empty version 1, never an advanced HEAD.
+   pin names, every pin is a detached version that opens, and the pin is the
+   table's version for its whole life. The pin's fields,
+   `omnigraph.last_linear_version` and added-type admission are in
+   [writes](writes.md#mutation-and-load).
    Per-table publication is never graph publication.
 
 3. **Every operation uses one coherent accepted view.** A read holds one
@@ -46,35 +43,31 @@ five more changes like this one?**
 
 4. **A mutation publishes once.** `mutate`, `load`, schema apply, merge, and
    equivalent multi-table operations stage all participants and publish once.
-   They do not acknowledge or publish per statement or per table. The D2
-   constructive-versus-destructive mutation split remains explicit.
+   They do not acknowledge or publish per statement or per table. A mutation
+   holds inserts and updates, or deletes, never both (`write:1`).
 
 5. **Crash convergence is part of the commit protocol.** An effect that is
    durable before publication must be unreachable: a detached version or a
-   staged file nothing references, which a retry ignores. `cleanup`'s
+   staged file nothing references, which a retry ignores (`E2`, `E4`). `cleanup`'s
    collector reclaims such a version only when the publication authority
    its transaction properties record is provably gone; age does not prove
    abandonment. The two explicitly requested exceptions are the publishable
-   proposal (`as commit`, [RFC](../rfcs/2026-10-10-unpublished-graph-commits.md))
+   proposal (`as commit`, [decision](../decisions/2026-10-10-unpublished-graph-commits.md))
    and the nonpublishable snapshot (`as unattached branch`,
-   [RFC](../rfcs/2026-10-11-unattached-graph-branches.md)): each writes a
+   [decision](../decisions/2026-10-11-unattached-graph-branches.md)): each writes a
    detached `__manifest` version reachable by its graph commit id through a
-   reserved tag, `unpublished_<id>` for the proposal and
-   `unattached_<root>_<C>` for the snapshot, which acknowledges durable
+   reserved tag ([writes](writes.md#writer-adapters)), which acknowledges durable
    snapshot addressability with `published: false` and never branch
-   visibility; the branch still changes only at the proposal's later ordinary
-   publication, the snapshot never publishes, and both tags expire with the
-   captured target authority. Published table effects and the accepted schema contract
-   are complete in one manifest publication; no contract-file installation
-   remains. There is no side record to classify. The collector holds two properties
-   on every run: safety, that every pin of every retained `__manifest`
-   version on every live branch still opens and every path its manifest
-   lists still exists after the run; and progress, that a table version no
-   retained `__manifest` version names is gone after a run that retains
-   nothing else. Foreign movement fails closed: a linear commit above a
+   visibility, and both tags expire with the captured target authority
+   (`branch:2`). Published table effects and the accepted schema contract
+   are complete in one manifest publication. The collector never
+   removes what a retained `__manifest` version on a live branch names, and
+   removes every table version that none names; its module doc
+   (`crates/omnigraph/src/db/omnigraph/collector.rs`) states both
+   properties. Foreign movement fails closed: a linear commit above a
    table's last linear version is reported by the collector (`cleanup`'s
-   `foreign_versions`), never deleted and never adopted.
-   See [recovery.md](recovery.md).
+   `foreign_versions`), never deleted and never adopted. Each crash
+   window's outcome is in [recovery](recovery.md).
 
 6. **Stable identity survives renames, not lifetimes.** Accepted SchemaIR owns
    non-zero type, property, and table-incarnation identities. A rename
@@ -90,8 +83,9 @@ five more changes like this one?**
 8. **Integrity failures are loud.** Type, required-field, uniqueness,
    endpoint, cardinality, schema-lifetime, recovery, and mutation-mode
    violations fail with typed outcomes. The engine does not invent
-   placeholders, silently weaken constraints, return plausible partial state,
-   or reinterpret an unknown persisted format.
+   placeholders, silently weaken constraints (`E3`), return plausible partial
+   state (`E5`), or reinterpret an unknown persisted format (contract
+   Boundary, Versions).
 
 9. **Query semantics are typed structures.** Traversal, search modes, ranking,
    mutations, polymorphism, policy predicates, and future planner capabilities
@@ -110,17 +104,14 @@ five more changes like this one?**
    operator fields may widen nullable flags, but values may not violate a
    declared non-null constraint.
 
-10. **Trust is established at the boundary and enforced at the engine.** HTTP
-    resolves bearer tokens to actors; a client never supplies its trusted actor
-    identity. Token plaintext is not retained. Server reads apply their policy,
-    and every mutating engine `_as` entry point applies the action/scope/actor
-    gate so embedded and CLI-direct writers do not bypass it.
+10. **Trust is established at the boundary and enforced at the engine.** The
+    server resolves the actor and checks every action (`E6`). Token plaintext
+    is not retained. Every mutating engine `_as` entry point applies the
+    action/scope/actor gate so embedded and CLI-direct writers do not bypass
+    it.
 
-11. **Failures and resource use are bounded and observable.** Conflict,
-    timeout, OOM, backpressure, partial-effect, external dependency, and
-    recovery paths have explicit outcomes. Retries are contract-defined and
-    bounded. Hot-path work must scale with the working set, not accumulated
-    history.
+11. **Failures and resource use are bounded and observable** (`E4`, `E5`).
+    Hot-path work must scale with the working set, not accumulated history.
 
 12. **One source of truth, cheaply derived.** Lance, `__manifest`, and the
     accepted schema are authoritative. `__manifest` is a table's only
@@ -131,15 +122,17 @@ five more changes like this one?**
     full history on every call.
 
 13. **Evidence matches the boundary.** Test the layer whose contract changed.
-    Irreversible storage, protocol, or substrate decisions require an RFC plus
-    compatibility, refusal, crash, and rebuild evidence. Cost claims require a
+    Irreversible storage, protocol, or substrate decisions require a
+    [decision record](documentation.md#decisions) plus compatibility, refusal,
+    crash, and rebuild evidence. Cost claims require a
     checked-in instrument. Extend the existing owner
     ([testing.md](testing.md), [test ownership](test-ownership.md)) before
     adding a parallel fixture.
 
 ## Deny-list
 
-Treat these shapes as rejected until an RFC demonstrates why the case is
+Treat these shapes as rejected until a
+[decision record](documentation.md#decisions) argues why the case is
 different:
 
 - a custom WAL, transaction manager, buffer pool, or storage primitive already
@@ -160,79 +153,39 @@ different:
 - process-local locks presented as distributed writer fencing;
 - silent retries, partial results, swallowed errors, or acknowledgement before
   durable graph visibility;
-- maintained parallel truth or cold full-history reconstruction per request.
+- maintained parallel truth or cold full-history reconstruction per request;
+- an ingest tier that acknowledges a write before the graph shows it, a
+  Lance MemWAL included: per-table durability still needs graph-level
+  validation, a fold and one cross-table publication, and that coordination
+  costs more than the commit it defers ([ingestion](ingestion.md));
+- a node or edge type the engine writes into a user's graph on its own, such
+  as an automatic actor node: it changes the schema format for every reader,
+  and an export then holds rows that a load refuses;
+- a file in a checkout that carries graphs, credentials or identity (the
+  retired `omnigraph.yaml`): one file with two owners can be neither
+  committed safely nor kept personal, and a checkout could redirect a token.
 
-Cases an RFC has argued: the flat locator objects and legacy data files under
+Cases a decision record has argued: the flat locator objects and legacy data files under
 `__history/legacy/`, written once by the storage upgrade (from stamp 8, 9 or 13), in the
-[RFC 0068 amendment](../rfcs/0068-graph-commit-record.md#why-this-is-not-a-deny-list-shape).
+[legacy commit files](../decisions/0068-graph-commit-record.md).
 
-## Current support boundaries
+## Support boundaries
 
-- The server is cluster-only and ledger v2 is the sole operational protocol.
-  Server-owned apply activates schemas, queries, policies, provider/Blob bindings
-  under existing writer admission.
-  Runtime views share engine authority and retain immutable request bindings.
-  Direct apply bootstraps or deploys while serving is stopped. Legacy ledger
-  conversion is explicit and preserves data; no v1 executor remains. Removing
-  a graph declaration authorizes deletion of its exact managed root and all
-  retained history, after affected admission closes and admitted work drains.
-  The existing ledger records deletion intent before effects and owns resumption
-  through verified root absence. Adoption and missing-root recreation remain
-  unsupported; unexpected roots and schema drift refuse rather than infer
-  identity from matching text.
-  One outstanding durable authority owns completion/recovery. Generic drain
-  does not prove native-I/O settlement. Clean server release additionally closes
-  its explicit storage scope, drains accepted backend mutations and refuses
-  sticky uncertainty; a converged direct apply releases by the same proof.
-  S3 release/reacquisition uses the same lock key by CAS.
-  Excluding raw and older writers remains an operator obligation.
-- Azure writes require the admission wrapper and remain a qualification preview
-  pending the adversarial live-Azure matrix. The narrower managed-identity
-  smoke proof is complete.
-- Schema apply retains its main-only, single-live-branch restriction and
-  process-local gate ordering. Its contract and table references publish
-  together; the removed file-installation protocol supplies no distributed
-  lock. Branch creation/deletion and cleanup retain their existing
-  single-writer-process control boundary.
-- The writer epoch fences publications that move a branch's head, on a branch
-  some process claimed ([writes](writes.md#writer-epoch)). Only the embedded
-  engine claims: no command or route does, so a claimed branch refuses the
-  server and the CLI. Branch create and delete are fenced through `main`'s
-  epoch at or above format 18: the branch row and the retired row are
-  publications on `main`, and the tombstone on the branch's chain asserts no
-  epoch. The collector's deletes and its removal of a retired row's entry,
-  `optimize`'s configuration commit, the stamp-only route of
-  `omnigraph upgrade`, and below format 18 the ref metadata and ref deletes
-  are not fenced. The process that holds
-  its handle's bound branch reads it, and opens and revalidates its writes on
-  it, with no head probe ([writes](writes.md#writer-epoch) lists the sites and
-  the captures that still probe), so the reads of an owner another process
-  replaced, or whose branch another process deleted, are stale until its next
-  publish on the branch. One mutation-capable writer process per cluster
-  remains the supported topology.
-- Physical index reconciliation is explicit; there is no background scheduler
-  whose queue is a second authority.
-
-These are constraints, not roadmap ledgers. Change one only with the owning
-code, tests, guide, and—when irreversible—RFC.
+What Omnigraph supports today is stated where a caller observes it, in
+[the contract](contract.md#gaps): one writing process per cluster (`G2`,
+`G13`), Azure writes as a preview (`G4`), schema apply on `main` with no
+other live branch (`D6`), and maintenance only when asked (`maintain:1`).
+The mechanism behind each boundary has one owner:
+[control plane](control-plane.md#support-boundaries) for serving, apply and
+graph removal, and [writer epoch](writes.md#writer-epoch) for what the fence
+covers. Change a boundary only with the owning code, tests, guide and, when
+it is costly to reverse, a [decision record](documentation.md#decisions).
 
 ## Review checklist
 
 - Which statements of [the contract](contract.md#citing) does it keep, close,
   decide or change?
-- Does one snapshot or authority token cover the whole operation?
-- Is graph visibility still one manifest publication?
-- Is every pre-publication durable effect unreachable until the manifest names
-  it, and are the table pins and accepted contract complete in that publication?
 - Does it read linear HEAD outside the collector's foreign-version listing or
   qualified original-version admission for an unregistered added-type path, or
   rebuild a row without carrying `omnigraph.last_linear_version` forward?
-- Does the collector's mark set still cover every retained pin, and does its
-  sweep still reach every unretained published version?
-- Are names kept separate from stable identity?
-- Does a missing physical optimization preserve logical correctness?
-- Are retries, memory, I/O, and failure outcomes bounded?
-- Does policy still cover non-HTTP writers?
 - Is current truth stated once and linked elsewhere?
-- Did the change extend the existing test owner and read the complete relevant
-  Lance domain?

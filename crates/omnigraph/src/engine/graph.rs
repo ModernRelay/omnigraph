@@ -1244,6 +1244,11 @@ pub(super) fn resolve_csr<'g>(
 /// Shared BFS keeps one visited set across member orientations and source kinds.
 /// Budgeted indexed hops admit full physical-table rows before endpoint scans.
 /// Only legacy Named can switch to CSR.
+///
+/// The walk emits each chunk of at most its reservation's batch rows as it
+/// fills, charged to its own `expand emissions` reservation and released once
+/// hydrated; the first chunk is what lets a `Limit` finish early, and the
+/// stream's drop cancels the producer at its next per-neighbor check.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_expand_bfs<F>(
     wide: &RecordBatch,
@@ -1845,6 +1850,11 @@ fn physical_scan_rows<E: std::fmt::Display>(
 /// pushed, a bound edge over a larger source set is sieved.
 const PUSHDOWN_KEYS_MAX: usize = 1024;
 
+/// One edge probe, for the bound-edge producer and an indexed hop: the
+/// `keys` rows of `ds` in one orientation, with `key IN (keys)` pushed into
+/// Lance when the key column has usable BTREE coverage or the list holds at
+/// most `PUSHDOWN_KEYS_MAX` keys, and otherwise read unfiltered and sieved
+/// through one set of the keys.
 async fn scan_edges_stream(
     ds: &Dataset,
     orientation: EndpointColumns,

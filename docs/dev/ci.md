@@ -1,5 +1,11 @@
 # CI and releases
 
+**Audience:** anyone who changes a workflow, a CI check or a release
+**Authority:** what each CI and release workflow is for and the rules across
+them; the workflow YAML under `.github/workflows/` and the scripts it runs hold
+each job's steps, and [branch-protection.md](branch-protection.md) owns the
+required contexts and the merge queue
+
 Workflow YAML under `.github/workflows/` is the source of truth. This page explains the boundaries; it does not duplicate every job or pinned version.
 
 ## Issue triage
@@ -7,20 +13,10 @@ Workflow YAML under `.github/workflows/` is the source of truth. This page expla
 Issue forms apply `needs-triage` plus `bug` or `feature` according to the selected
 form. `issue-triage.yml` provides an asynchronous fallback for newly opened
 issues submitted through other paths.
-It skips opening events already carrying `needs-triage`, then checks the current
-issue before writing. Closed issues and issues with any lifecycle status are
-left unchanged. It only adds `needs-triage`; it never replaces other labels or
-runs in response to later label edits.
-
-Failed API operations are retried up to three attempts, with a fresh status
-check before each write attempt. Runs for the same issue are serialized; issues
-with different numbers run independently. The workflow uses only `issues: write`
-and does not check out or execute repository or issue content.
 
 To repair missed intake, a maintainer with write access can select **Actions >
 Issue triage > Run workflow** on the default branch and enter one positive issue
-number. Manual runs use the same lifecycle checks and reject pull request
-numbers. They do not scan or relabel the backlog.
+number.
 
 Actions must be enabled and the run must succeed. Issues created using
 `GITHUB_TOKEN` do not trigger this workflow automatically; their creators must
@@ -78,77 +74,18 @@ read fails the check rather than dropping out of it. It runs in
 `Check Workflow Action Pins` (with its self-test) and in every `GQT`
 qualification job.
 
-Merge queue entries trigger `ci.yml`, `gq-logic-tests.yml`, and `dst.yml`
-through `merge_group` (`checks_requested`). These runs check out the combined
-queue commit; the classifier diffs the group's base and head, so a
-documentation-only entry skips the same work it skips on a pull request.
-Workspace tests fail fast as they do on pull requests. The PR metadata gates
-stay on `pull_request_target`; on the queue `Fix Regression Gate` reports a
-pass and `PR Title` checks the squash subject the entry is about to land; the
-vocabulary audit, Azurite, the format fence, the RustFS shards, the arm64
-benchmark harness tests and the deployment jobs keep their pull-request or
-post-merge schedule and never run on the queue; the DST pinned suite runs
-there as a reporting context. Queue
-runs never publish releases or save the main branch's caches. Details:
-[branch-protection.md](branch-protection.md), Merge queue.
+Queue runs never publish releases or save the main branch's caches. The
+merge queue: [branch-protection.md](branch-protection.md), Merge queue.
 
-Branch protection requires five contexts: `CI Gate`, `Check Workflow Action
-Pins`, `GQ Logic Tests`, `Fix Regression Gate` and `PR Title`. `CI Gate` is the `ci_gate`
-job of `ci.yml`: it needs `classify_changes`, `check_agents_md`,
-`workflow_action_pins`, `cargo_deny`, `graph_vocabulary_guard`, `fmt`,
-`lint`, `test`, `storage_upgrade_compatibility` and `test_aws_feature`, runs
-under `if: always()`, and `scripts/ci_gate.py` turns their results into the
-verdict: `failure` and `cancelled` are red, and `skipped` is accepted only
-where the job's own `if:` was false on that event, as the script's table
-restates it. Those ten jobs are what blocks `main`; a new blocking job joins
-`needs:` and the table in the same pull request, and
-`scripts/check-merge-group-triggers.py` holds the two equal and pins the
-gate's wiring. `Check Workflow Action Pins` is required on its own so a
-malformed gate cannot hide that validator's red. `GQ Logic Tests`, `Fix
-Regression Gate` and `PR Title` are their own workflows and keep their own
-names. Details and the recovery
-routes: [branch-protection.md](branch-protection.md), CI Gate.
+The required contexts, the jobs `CI Gate` needs and the recovery routes:
+[branch-protection.md](branch-protection.md), CI Gate.
 
 `Storage Upgrade Compatibility` (`storage_upgrade_compatibility` in `ci.yml`)
-runs on every change and in the merge queue. It provisions four rows of the
-[predecessor registry](testing.md#predecessor-binaries) with the
-`./.github/actions/predecessors` action and `require: true`: `stamp-13` and
-`lance-11`, each built from its pinned commit in its own checkout and target
-directory, and the releases `release-0.10.0` and `release-0.11.0`, installed by
-`scripts/install.sh` against their pinned archive digests, three attempts each.
-0.11.0 writes stamp 9, and 0.10.0 followed by the 0.11.0 `upgrade` gives the
-stamp-8 source (`--to-format 8`) and the stamp-9 source its default target
-leaves. The action caches the provisioned rows under a key of what they are
-made from, so a cold source build runs only when a row, the provisioner or
-the installer changes. With `require`, a missing row fails the six genuine
-journeys (`genuine_v13_storage_upgrade_preserves_history`,
-`genuine_lance11_storage_upgrade_round_trip`,
-`genuine_v0_11_0_storage_upgrade_preserves_history`,
-`genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
-`genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history`,
-`genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`)
-instead of skipping them; the `test` job provisions its rows without it. Four
-scopes then run, each checked against its log by
-`scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
-cases of `crossversion_upgrade.rs` (a module of the CLI's `integration`
-binary, run by the exact names `--list-cases crossversion --compiled` takes
-from a `-- --list` of the same feature graph, which must contain every
-source-derived name, generated to a file before the run so an empty inventory
-fails the step, and the run's log must equal that file), the
-engine `db::upgrade::tests`, `lance_version_columns` (a module of the
-engine's `integration` binary, selected as `lance_version_columns::`) and
-`forbidden_apis`. All four select the
-`Test Workspace` packages (`--workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude
-omnigraph-dst --features "$FAILPOINT_FEATURES"`), so the job resolves one
-graph, the one `Test Workspace` builds, and the engine scopes reuse the
-crossversion scope's build; a scope that selects `-p omnigraph-engine
---features failpoints` resolves a third graph, about 20 minutes warm. The
-script's `--self-test` pins
-the scopes, the predecessor step (with `require` and every row the
-`storage_upgrade` cases ask for) and the required case names, so removing or
-altering one fails `Check Workflow Action Pins` and this job. The 120-minute
-budget covers a cold predecessor cache, two source builds of about 25 minutes
-each, then the current tree's test targets.
+runs on every change and in the merge queue. Its steps and their comments in
+`ci.yml`, and `scripts/check-storage-upgrade-ci.py`, hold the rows it takes
+from the [predecessor registry](test-ownership.md#predecessor-binaries), its
+required cases and four scopes; the cases are in
+[test ownership](test-ownership.md#cross-version-rebuild-and-storage-upgrade).
 
 The released 0.12 cluster-ledger journey is separate
 [manual release qualification](test-ownership.md#manual-012-cluster-upgrade-qualification).
@@ -163,78 +100,38 @@ runs the seam guard (`crates/omnigraph-seams/tests/failpoint_names_guard.rs`)
 in the same flagless shape. Both of its engine invocations select those same
 three packages, so they resolve one feature graph and the engine builds once:
 each crate alone resolves a different graph (`omnigraph-gqt` enables the
-engine's `test-util` and depends on `omnigraph-dst`), and three selections
-cost three engine builds, about 20 minutes each warm. The guard is a source
-walk whose crate declares no workspace crate (its dev-dependencies are
-`yaml_serde`, `syn`, `tempfile` and `toml`), so it adds no second engine
-build. The benchmark units include the fixture parity test against the
+engine's `test-util` and depends on `omnigraph-dst`). The benchmark units include the fixture parity test against the
 generated branch-merge corpus case.
-The dispatch owner also checks external-store admission and persistence.
-Automatic corpus runs supply no `--store`, so schema-less query files are
-refused there; schema-and-seed datasets with zero steps are admitted.
-`--measure` refuses a selection with no DST environment.
 `GQT (dst)` runs the whole package, on engine v2, the one engine; a step's
 `--- expect same as v1` comparison runs inside it, so no job selects an
 engine. `GQT (dst-clippy)` checks all package targets with Clippy.
-`GQT (served)` runs `crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs`:
-every corpus case that declares the `omnigraph-server` target runs again
-through an in-process server, its in-process verdict must be green and its
-served verdict must equal it; `gqt_served_count.rs` in the same job totals
-the served and skipped cases and fails when no case is served.
+`GQT (served)` runs `crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs`
+and `gqt_served_count.rs`.
 The same cell builds `omnigraph`, `omnigraph-server` and `omnigraph-gqt`, then
 explicitly runs `omnigraph-cli/tests/integration/gqt_served_smoke.rs`. That test reuses the
 CLI's cluster/server process helpers and runs a corpus case through the GQT
 command with a bearer token. It requires one passing served attempt, token
 redaction in the retained report and replay refusal. It is ignored outside this
 cell because the GQT binary must be built first.
-All three steps select the same four packages under an empty `RUSTFLAGS`, and
-the binaries are built with `cargo test --no-run` so every step resolves the
-same dev-dependency feature world (`cargo build --bins` would compile
-`omnigraph-cluster` again without `failpoints` and `test-util`).
 This is the one job that builds the tests-only `omnigraph-gqt-served` crate,
 so `Test Workspace` excludes it beside `omnigraph-gqt`. All
 four run from the repository root. `dst` and `dst-clippy` build under the
 workspace Cargo configuration, which enables the seeded Tokio runtime; every
 `ordinary` and `served` step clears `RUSTFLAGS`.
-Each job has its own 60-minute budget and cache key. The budget is at least
-twice the observed 27-minute cold `ordinary` build. See the cache rule under
-[Full correctness graphs](#full-correctness-graphs) for the budget policy.
-Matrix fail-fast cancels the remaining jobs when one fails; Cargo retains
-its default fail-fast between test targets.
-The required context fails if classification or any qualification fails,
-is cancelled, or is skipped. A successful run still requires all four jobs
-to pass; fail-fast never turns incomplete qualification into success.
-Test jobs upload invocation reports, and all four jobs upload available
-Cargo build timings separately, including on failure.
+The workflow's header says how the four jobs aggregate into the context and
+what they upload; the budget policy is the cache rule under
+[Full correctness graphs](#full-correctness-graphs).
 Every corpus case is enrolled, including cases whose required graph
-behavior currently fails. `Test Workspace` excludes this separately tested
+behavior fails. `Test Workspace` excludes this separately tested
 package; it does not silently skip DST cases. `GQ Logic Tests` runs when its
 input changed (engine input or a `.gqt` case, the classifier's `run_gqt`) and
 otherwise reports success without building, the way the AWS job does; its
 workflow carries the `Classify Changes` copy under the name
 `Classify Changes (GQ Logic Tests)`. `Fix Regression Gate`
-(`fix-regression-gate.yml`) holds every issue the PR body closes by keyword
-(`Closes #N`, `Closes ModernRelay/omnigraph#N`, or the issue URL) to a
-regression in the diff: a `.gqt` case anywhere in the corpus or a `#[test]`-attributed
-`issue_N` function, added or strengthened, in a top-level test target
-(`tests/<name>.rs`), `tests/integration/main.rs` or its direct modules, or a
-`src/` module under `crates/*`, `tools/*` or `skills/` (an owner
-test not yet named for the issue is renamed to carry `issue_N` when
-extended). An integration module requires a bare, top-level `mod <name>;`
-declaration in that root at the range's head commit. Attributed declarations,
-path overrides and deeper modules are not resolved. A PR whose diff changes no path under `crates/`, `tools/` or `skills/`
-(Markdown files there aside) and neither root `Cargo.toml` nor `Cargo.lock`
-passes unexamined, with a notice annotation saying so: a fix in a workflow, a
-script, a document, or a deployment file has no logic or Rust test that could
-witness it. Owners the gate does not recognize inside those paths (helper and
-fixture modules, a script under a crate, a rustdoc-only change) go through
-the `no-repro` label, which a maintainer applies to waive the check per PR;
-`scripts/check-fix-regression.py` is the check. A failure names the code
-paths that made the gate look, the ways through, any near miss in the diff (a
-case whose header says `# issue: N` under another name, a
-test named with the bare number, moved, under a leading `_`, or in a helper
-module, an issue-named function with no test attribute), and a case skeleton,
-as a log line and as a GitHub error annotation. It is a policy check, so it runs on `pull_request_target`: the
+(`fix-regression-gate.yml`) holds every issue the PR body closes by keyword to a
+regression in the diff, a `.gqt` case named `issue_N_*` or an `issue_N` test,
+or to the `no-repro` label a maintainer applies; the docstring of
+`scripts/check-fix-regression.py` states the matching rules. It is a policy check, so it runs on `pull_request_target`: the
 workflow and the script come from `main`, and the pull request head is fetched
 only as data for the diff range, never checked out or executed. It runs on
 body edits and label changes as well as pushes, builds nothing, and runs for
@@ -248,41 +145,17 @@ also passes), carries no trailing period, and keeps the title within 100
 characters with no whitespace but the plain space; `docs(rfc):` is refused in favour of `rfc:`, and GitHub's
 `Revert "…"` title in favour of `revert: …` (the rule and its examples:
 [CONTRIBUTING.md](../../CONTRIBUTING.md), Pull Requests).
-`scripts/check-pr-title.py` is the check; it runs its `--self-test` first and
-prints each independently detectable problem with a stable diagnostic code
-and a repair instruction, both in the log and in a GitHub error annotation.
-Length failures include the actual length, the limit and how many characters
-must be removed. Text output uses red failures, yellow repairs and green
-successes on a terminal or in Actions. Use `--color never` or set `NO_COLOR`
-to a nonempty value to disable automatic color; `--color always` forces it.
-Agents can use `--format json` with either input option for one JSON object.
-Version 1 carries `schema_version`, `offset_unit`, `input_kind`, `valid`,
-`title`, `length`, `max_length`, `excess` and `errors`. Each error has a closed
-`code`, its `field`, a `span` with `start` and `end`, the exact `found` text,
-`expected`, `message` and `fix`. Ranges are zero-based, end-exclusive Unicode
-code-point offsets in the checked `title`; for a squash message, that means
-the extracted title. A zero-width range marks a missing token; an unclosed
-scope marks its unmatched opening parenthesis. The human report names the
-same range using one-based character positions, or an insertion offset.
-`--schema` prints the JSON Schema with the allowed codes, fields and record
-shapes. Enum types close the code, field, input, format and color sets;
-immutable records validate ranges and their original-title slices at runtime.
-Numeric facts and the validity flag are derived from the report.
-JSON contains no color or Actions annotations.
-Both formats exit 0 for an accepted title and 1 for a refused title;
-invalid command-line arguments exit 2. For example:
+`scripts/check-pr-title.py` is the check; it runs its `--self-test` first.
+`--help` and `--schema` give its options and its JSON report. For example:
 
 ```bash
 python3 scripts/check-pr-title.py --title "fix(merge): find the merge base over contracted lineage" --format json
 python3 scripts/check-pr-title.py --schema
 ```
 
-The check uses Python 3.11 or later and the standard library. Its `--self-test`
-entry point runs `scripts/test_check_pr_title.py`, including an exact range
-and field fixture for every error code, Unicode/length boundaries, parser
-refusals, runtime type invariants and each output/CLI mode. When editing the
+The check uses Python 3.11 or later and the standard library. When editing the
 checker, also run `python3 -m mypy --strict scripts/check-pr-title.py` in a
-development environment with mypy installed. The enum dispatches are exhaustive.
+development environment with mypy installed.
 
 On a pull request `PR Title` also checks its release notes with
 `scripts/check-release-note.py`, which reads the type and `!` from the title
@@ -302,8 +175,8 @@ title edit after queueing cannot change what lands unchecked
 checked on the pull request, so the merge-group run does not check them again.
 
 The `Check AGENTS.md Links` context also runs `scripts/check-docs.py`, which
-validates local documentation links, user/developer audience boundaries, RFC
-location and metadata, registry agreement, and the absence of committed
+validates local documentation links, user/developer audience boundaries, the
+format of decision records, the byte budget of each page, and the absence of committed
 merge-conflict markers in Markdown. Before the documentation checks run,
 the same context also rejects any pull request whose own diff adds a
 conflict-marker line in any file type (a pull-request-only step; the
@@ -313,29 +186,12 @@ line; markers already on the base branch never fail an unrelated pull
 request. There is no exemption; a document that must quote a conflict block
 indents the markers one space. After the documentation checks, the same
 context runs `typos` (`crate-ci/typos`, pinned by commit) over every tracked
-text file, hidden paths such as `.github/` included; the tool itself skips
-`Cargo.toml` manifests, lock files and binaries. It matches each word against
-a list of known misspellings, not a dictionary: an unknown word never fires,
-and an identifier fires only when one of the words it splits into is on the
-list (a CamelCase fragment or a short abbreviation can be one). A
-flagged token that is correct where it occurs gets one commented line in
-`.typos.toml`: under `[default.extend-words]` when it appears in prose and
-code alike, under `[type.rust.extend-words]` (or `extend-identifiers` for one
-exact identifier) when it exists only in Rust sources, so the same
-misspelling in Markdown still fires; a hyphenated prefix goes in
-`extend-ignore-re`; a generated text file gets an `extend-exclude` glob.
-Every exemption lives in that one file: the job refuses a sibling
-`typos.toml` or `_typos.toml`, and CI ignores a config file in a
-subdirectory (a local run inside that subdirectory would not).
+text file, hidden paths such as `.github/` included. Every exemption lives in
+`.typos.toml`, whose header says how typos matches and where an exemption
+goes.
 
-`Graph Vocabulary Guard` remains a dependency of `CI Gate`, but its
-substrate-sized audit steps are currently disabled everywhere (the job-level
-`VOCABULARY_AUDIT_ENABLED` variable in `ci.yml` is the single switch). The job still
-runs its unit tests and reports success so the exact-SHA release gates stay
-wired. When re-enabled it checks OpenAPI, Rust presentation strings, and public
-Rust against the reviewed terminology inventory after merge, on tags, and by manual
-dispatch. User documentation is intentionally outside this exact-occurrence
-audit and is owned by `scripts/check-docs.py`. The AWS job reports a successful
+`Graph Vocabulary Guard` and its `VOCABULARY_AUDIT_ENABLED` switch:
+[branch-protection.md](branch-protection.md), CI Gate. The AWS job reports a successful
 skip when no engine input changed; formatting and Clippy are also skipped by
 the classifier without leaving required contexts pending.
 
@@ -351,7 +207,7 @@ a pinnable, attested release. A run cancelled while pending because `main`
 moved on ends the edge run with a notice and no build; a failed check or the
 timeout fails it. A run builds only its own commit because its build provenance
 names that commit; the rolling `edge` tag never moves backward. A manual backfill must already have a successful non-PR vocabulary
-audit for the exact commit. The current manual workflows therefore fail closed
+audit for the exact commit. The manual workflows therefore fail closed
 for historical pre-guard tags rather than offering a force bypass.
 
 GitHub evaluates a tag-push workflow from the commit selected by that tag. A
@@ -379,16 +235,8 @@ Repository metadata gates also check:
   refusals name no remedy: a `path` dependency without `version` in
   a publishable crate is a wildcard (add `version`); a workspace member without
   a `license` field is unlicensed (add `license = "MIT"`); a crate whose license
-  text cargo-deny cannot read needs a `[[licenses.clarify]]` entry. A `path` copy of a
-  crate, bare or behind `[patch]`, and a `.cargo/config.toml` source replacement
-  keep no source for cargo-deny to check; `scripts/check-dependency-sources.py`,
-  run in the same job, refuses them: the source-less `Cargo.lock` packages are
-  exactly the workspace members by name and version, no manifest declares a
-  `[patch]` table, and neither `.cargo/config.toml` nor the deprecated
-  `.cargo/config` declares a source replacement or path override.
-  Build scripts are outside both checks. An exemption that no longer matches
-  anything fails the check, so the bump that clears an advisory or drops a
-  license's last holder also removes its `deny.toml` row. The job blocks `main`
+  text cargo-deny cannot read needs a `[[licenses.clarify]]` entry. `scripts/check-dependency-sources.py`, run in
+  the same job, refuses the source-less routes its docstring lists. The job blocks `main`
   through `CI Gate` (see [branch-protection.md](branch-protection.md)). The RustSec
   database is fetched at run time; `dependency-guard-nightly.yml` runs the same
   check on `main` daily, so an advisory published overnight shows there first
@@ -417,35 +265,16 @@ stop-the-line. The job compiles in one step (`cargo test --no-run`) and runs
 in the next, so compile and run wall clock read apart in the log.
 
 The run step uses `cargo-nextest` (binary version pinned in the job through
-the commit-pinned `taiki-e/install-action`) rather than `cargo test`: `cargo
-test` runs the workspace's test binaries one after another, so the run's wall
-clock is the sum of the binaries' durations, and a binary whose remaining
-tests are few and process-bound (the CLI, server and upgrade journeys) holds
-the machine while they finish. nextest schedules every test of every binary
-through one queue, a process per test, so another binary's tests fill that
-time. Which journeys form the tail is a matter for the suite's per-test
-timings, not asserted here. nextest runs no doctest, so the step keeps a
-`cargo test --doc` call on the same graph after it. The `ci` profile in
-`.config/nextest.toml` writes
-`target/nextest/ci/junit.xml` with captured output, and
-`scripts/check-workspace-test-owners.py` reads that report for the owners
-the job requires by name (the two upgrade journeys and the CLI/server/proxy
-journeys listed in the step) and for the upgrade journeys' captured notices.
-The same profile prints no line for
-a passing test (`status-level = "slow"`): the run's log holds the start line,
-the `SLOW` line of a test still running after a minute, each failure with its
-captured output as it happens and once more in the final summary, and the
-summary line, so a log of the workspace's tests opens in GitHub's viewer and
-reads as its failures. The local command in
+the commit-pinned `taiki-e/install-action`) rather than `cargo test`; the header of `.config/nextest.toml` says why, and
+why the step keeps a `cargo test --doc` call. The `ci` profile in
+`.config/nextest.toml` and its comments say what the report holds, who reads
+it and what the log prints. The local command in
 [test ownership](test-ownership.md#commands) stays `cargo test`; the two run the same binaries.
 
 Every run, red or green, uploads that report as `test-workspace-junit` and
 the compile step's `--timings` page as `test-workspace-build-timings`, both
 kept 14 days: per-test durations and per-crate compile and link times on the
-hosted runner, which any change to this job's scheduling is sized from. The
-`ci` profile terminates a test that runs ten minutes (`slow-timeout`), so a
-hang fails as a named test instead of holding the job to its 60-minute limit,
-and a test still running after one minute is reported as `SLOW` in the log.
+hosted runner, which any change to this job's scheduling is sized from.
 
 The `main` run also seeds the dependency cache that pull requests restore.
 Every `Swatinem/rust-cache` step in `ci.yml`, `gq-logic-tests.yml`, and
@@ -491,19 +320,13 @@ A cache is derived state, and no job may need one to fit its budget. The
 repository's caches exceed GitHub's cap, so every save evicts the least
 recently used entries: within one `main` run, the jobs that finish first are
 evicted first by the saves of the jobs that finish last. A run cancelled by
-its timeout does not save a `rust-cache` archive
-([issue #755](https://github.com/ModernRelay/omnigraph/issues/755): every run
-after the cancelled `main` run restored nothing). Completed `sccache`
+its timeout does not save a `rust-cache` archive. Completed `sccache`
 uploads can survive a later cancellation, but neither cache is guaranteed.
 Each `GQ Logic Tests` budget
 therefore covers a cold build with margin, and a second `cargo` invocation
 in a job must not change the dependency graph: it selects packages whose
 graph the first invocation already built, or it rebuilds every crate whose
-features differ (issue #755 was `GQT (ordinary)`
-running the seam guard as an engine integration test, whose
-dev-dependencies resolve a second graph, 49 minutes cold against 45; the
-Azurite job ran its owners under six per-crate selections, four of them
-with the Lance stack, 89 minutes on `main`). A job that runs several owners
+features differ. A job that runs several owners
 names one selection once and passes each owner only its target.
 
 Every Rust job in those three workflows installs the `rust-toolchain.toml`
@@ -515,8 +338,8 @@ action and save their caches from the tag ref; they are outside this rule.
 The remaining jobs own contracts that need special infrastructure. They run after merge, on tags, and by manual dispatch; five of them, the format fence, the RustFS S3 integration, the Azurite Azure integration, the AWS feature build, and the arm64 benchmark harness tests, also run on pull requests:
 
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
-  public Rust against the reviewed terminology inventory (audit steps currently
-  disabled; see above).
+  public Rust against the reviewed terminology inventory (audit steps disabled; see
+  [branch-protection.md](branch-protection.md), CI Gate).
 - **V5 ↔ V10 format fence** provisions the `stamp-5` predecessor (the final v5-writing commit, built from source) and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every pull request that changes engine input, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every pull request that changes engine input, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards before clicking Merge when ready. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
 - **Azurite Azure integration** exercises configured storage, admission-lease,
@@ -542,12 +365,8 @@ The remaining jobs own contracts that need special infrastructure. They run afte
 - **AWS feature** builds and tests `omnigraph-server` with `--features aws`; it also runs on every pull request and blocks `main` through `CI Gate`.
 - **Benchmark harness (arm64 Linux)** runs the unit tests of `omnigraph-bench` on the pinned `ubuntu-24.04-arm` runner. The harness captures the identity of the host it runs on from `/proc/cpuinfo`, the cgroup files and the memory total, the benchmark lab's machines are arm64 Linux, and every other test job is x86_64: a host read that differs between the two architectures fails here and nowhere else. It runs on every pull request that changes engine input, as a reporting context, and after merge, on tags, and by manual dispatch; wait for it before clicking Merge when ready on a pull request that touches `crates/omnigraph-bench`. The job prints the runner's CPU identification before the tests, so a red run shows the file the harness read.
 
-Azure remains a qualification preview. Emulator coverage and the completed
-managed-identity smoke proof do not replace the pending adversarial live-Azure
-matrix, and every mutation-capable Azure server must retain the
-admission-wrapper boundary.
-
-CI checks OpenAPI drift but never rewrites `openapi.json`. Regenerate an intentional API change locally as described in [test ownership](test-ownership.md#openapi).
+Azure writes are contract gap `G4` ([contract](contract.md#gaps)); every
+mutation-capable Azure server must retain the admission-wrapper boundary.
 
 ## DST tiers
 
@@ -678,15 +497,15 @@ release that reports it must agree with that source.
 
 | Workflow | Trigger and output |
 |---|---|
-| `build-release-archives.yml` | Called by the two release workflows only; builds the four platform archives with the server's `aws` feature, the feature set of the stable image (`publish-image.yml`), stamped with their commit and channel (`OMNIGRAPH_SOURCE_VERSION`, `OMNIGRAPH_RELEASE_CHANNEL`), runs each on its platform, and verifies the exact archive set and checksums. It uploads workflow artifacts and writes no release. |
-| `release-edge.yml` | Daily at 04:17 UTC, and by manual dispatch on `main`; builds the run's commit, the tip of `main`, once its whole CI run passes, unless `edge` already holds it. It refuses, before building, while the workspace package version is not above the latest stable release, since `X.Y.Z-edge+<commit>` sorts before `X.Y.Z`. After every archive is built, one job attests their provenance and publishes the build as its own prerelease, `edge-<commit date>-<short commit>`, which never changes once published, then copies that release's archives to the rolling `edge` release when `edge` holds an ancestor of the build and the build is still on `main`; it keeps the 30 newest edge builds plus the newest build of each storage format, recorded in a marker line of the release text (`scripts/edge_release.py prune`), and smoke-tests both through the installers on every platform. Its image job packages the published build's Linux x86_64 archive, after checking its checksum and its attestation for this workflow and commit, on `trixie-slim` (the archives need glibc 2.39 or newer; the root `Dockerfile` takes the base as `BASE_IMAGE`, bookworm by default for the stable image). Both image workflows pull their base, and the stable one its `rust:1-bookworm` builder, from Docker Hub logged in when the `DOCKERHUB_*` secrets exist, since anonymous ECR Public and Docker Hub pulls from GitHub-hosted runners are throttled; without the secrets the base comes from ECR Public. It checks the stamp inside the image, pushes `edge-<commit date>-<short commit>` to GHCR and, when configured, Docker Hub, attests both digests, and moves the `edge` image tag only when the `edge` release moved; it never touches `latest`, and a rerun reuses the image first pushed for the build. Edge images are not pruned. Runs never overlap, so a newer build cannot move `edge` under an older run's installer checks. GitHub refuses the workflow token a new tag on a commit whose workflow files differ from `main`'s current ones, so a run whose commit's workflows no longer match `main` (checked before building and again before tagging) publishes nothing, with a notice; the next run builds the newer tip. A day whose new commits change only documentation still gets a build. |
+| `build-release-archives.yml` | Called by the two release workflows only; builds the four platform archives with the server's `aws` feature, stamped with their commit and channel, and uploads workflow artifacts. It writes no release. |
+| `release-edge.yml` | Daily at 04:17 UTC, and by manual dispatch on `main`; builds the tip of `main` once its whole CI run passes and publishes it as its own prerelease `edge-<commit date>-<short commit>`, moves the rolling `edge` release and image forward, and smoke-tests the installers. It refuses while the workspace package version is not above the latest stable release. Its header and step comments hold the rest. |
 | `release.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds platform archives, attests their provenance, publishes the GitHub release, updates Homebrew when credentials are available, and smoke-tests the installers on every platform. The provenance names the run's commit, so a manual backfill is dispatched at the tag itself (`gh workflow run release.yml --ref <tag> -f tag=<tag>`); from v0.14.0 a backfill run at any other commit is refused. A backfill of a tag before v0.14.0 builds a source that predates the commit stamp, so its archives are run but their stamp is not checked, and it publishes without provenance when run at another commit. |
-| `publish-crates.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; publication remains paused until the registry-ownership policy changes. |
+| `publish-crates.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; its `Enforce registry publication pause` step refuses publication. |
 | `publish-image.yml` | Called by audited `v*` tag CI or manually for an already-audited tag; builds the bookworm-compatible public server image for GHCR and, when configured, Docker Hub. Its binaries carry the commit and `stable` channel stamp, checked in the image before it is pushed, and the pushed GHCR digest is attested. As in `release.yml`, a backfill from v0.14.0 is dispatched at the tag itself, and an older tag backfilled from elsewhere publishes without provenance. Manual backfills do not move `latest`. |
 | `package.yml` / `omnigraph-package.yml` | Manual AWS CodeBuild packaging for default and AWS-feature artifacts, with checksums, digests, and attestations. |
 | `refresh-docs-site.yml` | Documentation changes on `main` or manual dispatch; requests a docs-site redeploy. |
 | `nix.yml` | A change to `flake.nix`, `flake.lock`, `rust-toolchain.toml` or the workflow, weekly, and by manual dispatch; builds the flake on each of its three systems and checks the binaries run and report their commit. Nothing waits on it. The flake sets `RUSTFLAGS` and the release packages and features as `build-release-archives.yml` does, and reads the toolchain from `rust-toolchain.toml` with that channel manifest's hash, which a toolchain bump updates in `flake.nix`. |
-| `bench-binaries.yml` | A push to `main` or a `bench/**` branch, a `v*` tag, a pull request labelled `benchmark`, and manual dispatch; builds `omnigraph`, `omnigraph-bench` and `omnigraph-server` for arm64 Linux on the arm64 runner inside the Amazon Linux 2023 container the benchmark lab's machines run (glibc 2.34, where the release archives need 2.39), one package per build with `RUSTFLAGS` empty, and uploads them as the workflow artifact `bench-binaries-<commit>` with their checksums, the `benchmarks/` catalog and a `build.json` naming the toolchain and the image, kept 90 days. The commit is a pull request's head, never the merge commit. A second job, `harness_from_artifact`, downloads the artifact into the same image with no checkout, no `git` and no toolchain, as the lab's machine holds it, and runs `omnigraph-bench run` with `--at <commit>=<path>`, plain and with `--server-product`, then `report`. The harness measures only on a disk it has proved (on Linux, XFS on EC2 instance-store NVMe) and a GitHub runner has none, so the job accepts two ends of a run: the harness's refusal of the disk, or a completed run with its row in the report; a stop before the disk, such as a step that needs `git` or a repository, fails it. Nothing waits on the workflow: the lab shelves the artifact when the build job uploads it, whatever the second job reports, and its machines measure without compiling. |
+| `bench-binaries.yml` | A push to `main` or a `bench/**` branch, a `v*` tag, a pull request labelled `benchmark`, and manual dispatch; builds the benchmark lab's arm64 Linux binaries as the artifact `bench-binaries-<commit>` and runs the harness from that artifact (`harness_from_artifact`). Nothing waits on it. Its header holds the rest. |
 
 Release archives and containers include the CLI, server, and Azure admission wrapper where their packaging contract requires all three. Keep the reusable package workflow, Dockerfile, and binary-contract check aligned.
 
@@ -695,17 +514,8 @@ The shared archive builder requires six repository Actions secrets:
 `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGN_IDENTITY` (the exact certificate
 name), `APPLE_NOTARY_KEY_P8` (base64 App Store Connect team API key),
 `APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_ISSUER`. Both release callers pass
-only these six secrets to the builder. Its macOS job imports the identity
-into a temporary Keychain, signs all three executables with fixed
-`com.modernrelay.<binary>` identifiers, hardened runtime and a secure
-timestamp, and verifies the identifiers and signing team. It submits the
-same executables in a temporary ZIP to Apple and polls for up to 30 minutes
-before packaging them in the existing tarball and computing checksums.
-`Accepted` continues. A rejection, a missing submission ID or missing
-credentials refuses the macOS release; there is no ad hoc fallback. A
-submission Apple has not finished by the deadline is published signed, with a
-warning that names the submission ID to check. Temporary credentials and the
-signing Keychain are removed on exit.
+only these six secrets to the builder; its header says how the macOS job signs
+and notarizes.
 
 Every release build sets `RUSTFLAGS` itself (`build-release-archives.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, `flake.nix`, the documented source build): empty, except the macOS archive row's `-C code-model=large` and the flake's `--remap-path-prefix` flags. A set `RUSTFLAGS`, empty included, replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. A plain `cargo build --release` outside these paths still inherits the cfg. The cfg serves the DST suite and the GQT DST runner only.
 

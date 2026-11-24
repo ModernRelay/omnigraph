@@ -1,4 +1,14 @@
-//! Graph data transfer through the existing client and streaming boundaries.
+//! Graph data transfer through the existing client and streaming boundaries:
+//! `load`, `export` and the Blob commands.
+//!
+//! Blob input capture validates ranges and write preconditions before it
+//! acquires the graph client; stdin comes from a supplied reader, and file and
+//! stdin payloads keep their byte bound. `load` passes its source path on:
+//! `GraphClient` owns backend-specific input reads and managed limits,
+//! including the embedded writable open before the source read. Stream and
+//! receipt delivery failures return through application completion with any
+//! write evidence kept. Blob output files are opened late, and a transfer that
+//! fails after output began leaves the prefix written.
 use crate::client::GraphClient;
 use crate::helpers::resolve_branch;
 use color_eyre::eyre::Result;

@@ -10,6 +10,8 @@ name: Release Edge
 # `publish_edge_release` job writes both releases, after every archive is
 # built, run on its platform and verified as a set. The rolling release only
 # moves forward along `main`.
+# A day whose new commits change only documentation still gets a build. Edge
+# releases are pruned (`scripts/edge_release.py prune`); edge images are not.
 
 on:
   schedule:

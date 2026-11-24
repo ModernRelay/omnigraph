@@ -1,4 +1,12 @@
 //! Direct cluster control. The cluster crate retains deployment and recovery authority.
+//!
+//! Served deployment submission and observation are `crate::cluster_remote`.
+//! Direct apply reports its original ID through the core's identity callback,
+//! which cannot return an error: a delivery failure there is captured, the one
+//! core call finishes, and the failure is returned with the original ID and
+//! root. An output error can follow a confirmed lock release; an unconfirmed
+//! release carries the original deployment and admission IDs. No path replays
+//! work to recover output.
 
 mod args;
 pub(crate) use args::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};

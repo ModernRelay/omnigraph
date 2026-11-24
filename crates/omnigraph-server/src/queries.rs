@@ -1,8 +1,8 @@
 //! Stored-query registry.
 //!
 //! A server-side registry of named, parameter-typed `.gq` queries that
-//! operators declare in `omnigraph.yaml` (per-graph, or top-level in
-//! single mode) and the server loads at startup. Each entry is parsed
+//! operators declare per graph in the cluster configuration and the server
+//! loads from the applied revision. Each entry is parsed
 //! and its identity asserted here (`load`); type-checking against the
 //! live schema happens separately (a `check` pass) so the loader stays
 //! callable without an open engine (the CLI's offline `queries check`).
@@ -78,7 +78,7 @@ pub struct RegistrySpec {
 }
 
 /// A single registry load failure. Collected (not fail-fast) so a bad
-/// `omnigraph.yaml` surfaces every broken entry at once, matching the
+/// declaration surfaces every broken entry at once, matching the
 /// bad-policy-YAML posture.
 #[derive(Debug, Clone)]
 pub struct LoadError {

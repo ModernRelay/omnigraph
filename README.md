@@ -224,7 +224,7 @@ before selecting an npm or PyPI package.
 
 ## Docs
 
-- [0.14 highlights and upgrade actions](docs/releases/v0.14.0-overview.md) · [User guide](docs/user/index.md)
+- [0.16 highlights and upgrade actions](docs/releases/v0.16.0-overview.md) · [User guide](docs/user/index.md)
 - [Cluster guide](docs/user/clusters/index.md) · [Deployment guide](docs/user/deployment.md) · [CLI reference](docs/user/cli/reference.md)
 - [Schema](docs/user/schema/index.md) · [Queries](docs/user/queries/index.md) · [Search](docs/user/search/index.md) · [Policy](docs/user/operations/policy.md)
 

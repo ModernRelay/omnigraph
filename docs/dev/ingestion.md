@@ -1,10 +1,15 @@
 # Ingestion
 
+**Audience:** engine and server contributors who change a load surface
+**Authority:** the load surfaces (strict graph batch, compatibility loader) and
+how they reach the one load writer; the write protocol belongs to
+[writes.md](writes.md), keyed-write limits to
+[writes.md](writes.md#keyed-writes), setting values to
+[settings](../user/queries/settings.md)
+
 Omnigraph has one durable ingestion model: a bounded batch becomes visible through the ordinary `Load` writer and one graph commit. There is no separate streaming database, WAL, token ledger, lane lifecycle, or acknowledgement tier.
 
-The rejected designs are retained in [RFC 0018](../rfcs/0018-ingest-wal.md) and [RFC 0026](../rfcs/0026-memwal-streaming-ingest.md). They are history, not implementation guidance.
-
-## Current surfaces
+## Surfaces
 
 ### Strict graph batch
 
@@ -25,13 +30,13 @@ The optional top-level `id` supplies entity identity. `data` holds user properti
 
 The strict parser rejects duplicate members, unknown fields, reserved physical columns, malformed envelopes, and noncanonical supplied entity IDs. It accepts logical type and property names only; callers never select physical datasets, lanes, fragments, or bindings.
 
-The HTTP handler authorizes both change and any requested branch creation before polling the body. It verifies `Content-Type`, rejects an oversized `Content-Length` early, and otherwise collects at most 32 MiB. The parser also bounds individual lines and per-table retained rows/Arrow bytes before durable effects. Keyed modes bound parser estimates and retained row data across tables with the session's `write_max_bytes` (default 32 MiB). Logical Blob payloads have their own allowance of the same size.
+The HTTP handler authorizes both change and any requested branch creation before polling the body. It verifies `Content-Type`, rejects an oversized `Content-Length` early, and otherwise collects at most 32 MiB. The parser also bounds individual lines and per-table retained rows/Arrow bytes before durable effects. Keyed modes bound parser estimates and retained row data across tables with the session's `write_max_bytes`. Logical Blob payloads have their own allowance of the same size.
 
 ### Compatibility loader
 
 `POST /graphs/{graph_id}/load` accepts a JSON envelope whose `data` field is loader-compatible NDJSON; the engine `load_as` takes that NDJSON directly. This preserves historical coercions and shapes that the strict graph-batch boundary intentionally refuses: a nullable scalar or list item of the wrong JSON type becomes NULL (a non-nullable property then refuses the load), and a list that is not a JSON array is refused. `Date` and `DateTime` are the exception on both paths: their string form already goes through a fallible parser, so a NULL for a wrong-typed value would be a lost error rather than a coercion, and such a value is refused with the property named.
 
-The engine `ingest*` methods are deprecated parser/default shims over the same loader, with no separate fast path or durability contract. They retain the old default of forking a missing branch from `main` when no base is supplied. CLI and HTTP integrations use `load` or `/load/ndjson`, which require an explicit base to create a missing branch.
+The engine `ingest*` methods are deprecated parser/default shims over the same loader, with no separate fast path or durability contract. CLI and HTTP integrations use `load` or `/load/ndjson`, which require an explicit base to create a missing branch.
 
 ## Transaction contract
 
@@ -47,27 +52,23 @@ A third input, the `load csv` statement, reads an external object under the Blob
 
 For `load`, a missing target branch is created only when the caller explicitly supplies a base (`from` over HTTP/CLI). Without a base, a missing branch is an error; a typo never forks implicitly.
 
-Load modes are shared across the surfaces:
+Load modes are shared across the surfaces (`write:5`).
 
-- `merge` upserts by exact `id`;
-- `append` strictly inserts absent IDs;
-- `overwrite` replaces each named table's contents.
+One batch may touch several logical declarations; its publication is atomic (`E2`). A failure before the manifest request does not publish the batch's rows; detached table effects remain unreachable staging. The publisher distinguishes a definite refusal from an uncertain manifest outcome; callers must resolve the latter before repeating the load. No ordinary load arms a recovery record. See [writes.md](writes.md#the-protocol) and [recovery.md](recovery.md).
 
-One batch may touch several logical declarations. Cross-table visibility is atomic: readers see all published table versions or none. A failure before the manifest request does not publish the batch's rows; detached table effects remain unreachable staging. The publisher distinguishes a definite refusal from an uncertain manifest outcome; callers must resolve the latter before repeating the load. No ordinary load arms a recovery record. See [writes.md](writes.md#the-protocol) and [recovery.md](recovery.md).
-
-The write envelope is bounded before staging. Keyed work is limited to 8,192 retained rows per table. The session's `write_max_bytes` (default 32 MiB) independently bounds retained row data, logical Blob payloads and parsing estimates, preserving the existing table and operation scopes. An Overwrite load collects committed IDs absent from its replacement only when its plan's `removal` is `scan`, a populated node target an edge type references; an edge target, a node target no edge type references and an empty table collect none. Collected IDs are charged under a separate removed-ID allowance of the same size, each its UTF-8 length plus 24 bytes. Overwrite keeps its bulk-input behavior and is exempt from keyed aggregate row/batch limits. See [writes.md](writes.md#keyed-writes). The HTTP strict-batch body has its own fixed 32 MiB ceiling. Clients split larger incremental imports into explicit batches and accept one graph commit per batch.
+The write envelope is bounded before staging; the keyed-write limits are in [writes.md](writes.md#keyed-writes). The HTTP strict-batch body has its own fixed 32 MiB ceiling. Clients split larger incremental imports into explicit batches and accept one graph commit per batch.
 
 ## Blob and index behavior
 
 External Blob references pass the graph's deny-by-default source policy. Overwrite may retain an allowed reference; keyed modes materialize selected external bytes within the same bounded preflight. See [blob.md](blob.md).
 
-Load publishes logical data only. Declared physical indexes are derived and reconciled by `ensure_indices` or `optimize`; ingestion does not synchronously train ANN or FTS indexes.
+Load publishes logical data only. Declared physical indexes are derived and reconciled by `ensure_indices_on_as` or `optimize`; ingestion does not synchronously train ANN or FTS indexes.
 
 ## Why there is no MemWAL path
 
 The removed experiment could durably admit rows into per-dataset Lance MemWALs, but Omnigraph still needed graph-level validation, cross-table ordering, recovery, fold, and one manifest publication. That extra coordinator duplicated authority and paid the graph commit cost later rather than removing it.
 
-Current cluster configuration therefore rejects removed `streaming` declarations. A load leaves no stream profile, `_mem_wal`, `_stream_tokens`, lifecycle revision, receipt, or durable-but-not-visible acknowledgement state. A graph written by an unreleased experimental format must be exported with its matching binary and rebuilt.
+Cluster configuration rejects removed `streaming` declarations. A load leaves no stream profile, `_mem_wal`, `_stream_tokens`, lifecycle revision, receipt, or durable-but-not-visible acknowledgement state. A graph written by an unreleased experimental format must be exported with its matching binary and rebuilt.
 
 If an application needs durable acceptance before graph visibility, put an external log or queue in front of Omnigraph. Its consumer submits bounded idempotent batches and checkpoints the external offset only after Omnigraph acknowledges the graph commit. That keeps each system's durability promise explicit.
 

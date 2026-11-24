@@ -2,6 +2,22 @@
 //!
 //! Snapshot readers retain one immutable view. Request capture and transitions
 //! use the same synchronous registry boundary under process admission.
+//!
+//! A transition closes some graphs while the others keep serving. Preparation
+//! reserves bounded transition capacity before it closes admission. A graph's
+//! lease follows body collection, owned execution, producers, retained
+//! results and yielded transport bytes, so a disconnect or an MCP response
+//! expiry cannot release an owner that survives. After those owners finish, a
+//! same-view transition can resume only the exact existing engine, schema,
+//! queries and fixed bindings, under a fresh epoch. Close, resume and shutdown
+//! share one ordering boundary. An expired or abandoned closed transition
+//! leaves its graph unavailable, with no automatic reopen or retry; only its
+//! scheduling record is retired, so other ready graphs can transition. The
+//! closed entry and its descendants keep the engine and its resource charges;
+//! no native disposal or lock release is implied. Bounded inventory limits the
+//! closed views kept, and an obsolete ticket cannot affect a later candidate.
+//! Status reports `transitioning` with `wait_for_transition` and no finite
+//! `Retry-After`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -681,6 +697,12 @@ impl GraphRegistry {
             .collect()
     }
 
+    /// Install a deployment's achieved views, its completed deletions and the
+    /// management policy in one registry change. A graph leaves the inventory
+    /// only with an exact durable `Deleted` result for a graph this transition
+    /// closed. There is no retired-owner cache, readoption or root recreation,
+    /// and an interrupted deletion keeps its admissions closed rather than
+    /// restoring a partially deleted predecessor.
     pub(crate) fn activate_deployment(
         &self,
         record: &Arc<TransitionRecord>,

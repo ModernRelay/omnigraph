@@ -1100,6 +1100,12 @@ pub const INDEX_BUILD_CONCURRENCY: usize = 4;
 /// all of them, so it never overlaps another step. Permits are granted in
 /// request order, so a waiting full-text build is not starved by later steps.
 /// The pass never has more steps in flight than its width.
+///
+/// An index pass's width is `INDEX_BUILD_CONCURRENCY`. An optimize run's
+/// width is its rewrite concurrency, shared with every compaction task, so a
+/// full-text or vector build runs one at a time across the whole run with no
+/// compaction task or other build beside it, and a table waiting for its
+/// permit keeps its rewrite slot, so later tables wait too.
 #[derive(Debug, Clone)]
 pub struct MaintenanceBudget {
     permits: Arc<tokio::sync::Semaphore>,
@@ -4846,9 +4852,13 @@ impl TableStore {
     /// full-text segment for (a table whose first rows land here, an
     /// overwrite, which drops every index) gets an untrained one in a second
     /// detached commit chained on the first under the same witness, and the
-    /// returned version is that one. So no version a writer pins leaves a
-    /// declared full-text index without its analyzer; postings still come
-    /// from explicit reconciliation.
+    /// returned version is that one. A schema evolution that adds a
+    /// full-text column produces the same case. So no version a writer pins
+    /// leaves a declared full-text index without its analyzer; postings still
+    /// come from explicit reconciliation, which builds them where no segment
+    /// covers a fragment, and the branch-merge insertion proof steps over the
+    /// declaration commit, which moves no row. The system-column upgrade keeps
+    /// every index and declares none.
     pub async fn commit_staged_detached(
         &self,
         ds: Arc<Dataset>,
@@ -5786,7 +5796,12 @@ impl TableStore {
     /// step left (the planned base first), or the step refuses. Neither step
     /// writes or rewrites a data file or reads a row; every surviving index
     /// keeps its coverage, and an index on a dropped column leaves with it.
-    /// HEAD does NOT advance.
+    /// HEAD does NOT advance. Either way the table publishes one logical
+    /// version past its published version, the pin naming the tip. Memory and
+    /// I/O grow with the table's fragment, schema and index metadata (the plan
+    /// walks the fragment inventory, the Merge carries it and each detached
+    /// commit serializes it), never with its rows or payload bytes, and a
+    /// stored external Blob descriptor, ranged or not, is never rebuilt.
     pub async fn stage_schema_evolution(
         &self,
         ds: &Dataset,
@@ -6706,6 +6721,16 @@ impl TableStore {
     /// as [`Self::scan_with_pending_materialized_blobs`] does, and return the
     /// dataset's full logical schema. The caller holds no pending row of the
     /// table, so this scan has no merge-shadow side.
+    ///
+    /// A filtered scan returns matched rows as slices of a batch decoded from
+    /// their fragment, and a slice pins its parent's buffers, so each batch of
+    /// matched rows is copied into buffers of its own before it is charged or
+    /// kept: the charge is the matched rows' own bytes, not the rows stored
+    /// beside them. What remains is Arrow's fixed bookkeeping per scan batch,
+    /// about a hundred bytes per carried column, so an index on the assigned
+    /// column or the fragment a row shares changes cost, never admission.
+    /// Payload lengths come from the descriptors, so a row rewrite's Blob
+    /// overrun is found before a payload is read.
     pub async fn scan_update_matches(
         &self,
         ds: &Dataset,
@@ -9066,7 +9091,10 @@ fn largest_proven_insert_prefix(
 /// (`ArrayData::get_slice_memory_size`): every slot's offset range, a null's
 /// included. A Lance scan can return a null whose offsets span a neighbouring
 /// row's bytes in a shared decode buffer, so this counts what a `concat` of
-/// the rows would copy, not what they hold ([`column_logical_bytes`]).
+/// the rows would copy, not what they hold ([`column_logical_bytes`]). The
+/// proven-insert merge publication plans its chunk prefixes by this size, less
+/// each Blob payload's offset range, so a null's span there can only shrink a
+/// chunk, never refuse one.
 pub(crate) fn batch_slice_memory_size(
     batch: &RecordBatch,
     offset: usize,

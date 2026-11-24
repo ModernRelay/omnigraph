@@ -40,15 +40,10 @@ in [lance.md](lance.md).
 | A Lance behavior Omnigraph depends on | `lance_surface_guards.rs` and its fence | [Lance compatibility](#lance-compatibility) |
 | An HTTP route, authentication, MCP or OpenAPI | `crates/omnigraph-server/tests/`, by public route. Never test a server promise only through the engine facade | [Server and CLI ownership](test-ownership.md#server-and-cli-ownership) |
 | A CLI command, its output or its delivery | `crates/omnigraph-cli/tests/`, by plane | [Server and CLI ownership](test-ownership.md#server-and-cli-ownership) |
-| A storage stamp, an upgrade or a predecessor binary | CLI `integration/crossversion_upgrade.rs`, engine `db/upgrade/tests.rs` | [Predecessor binaries](#predecessor-binaries), [cross-version tests](test-ownership.md#cross-version-rebuild-and-storage-upgrade), [support matrix](versioning.md#storage-upgrade-support-matrix) |
+| A storage stamp, an upgrade or a predecessor binary | CLI `integration/crossversion_upgrade.rs`, engine `db/upgrade/tests.rs` | [Predecessor binaries](test-ownership.md#predecessor-binaries), [cross-version tests](test-ownership.md#cross-version-rebuild-and-storage-upgrade), [support matrix](versioning.md#storage-upgrade-support-matrix) |
 | A bound plan reproducing its run | `integration/engine_v2_plan_replay.rs`, `engine_v2_scrubbed_replay.rs` | [Plan replay](test-ownership.md#plan-replay) |
 | What an operation reads or writes in storage | The DST golden and the engine `integration/*_cost.rs` curve tests | [DST storage-cost golden](#dst-storage-cost-golden) |
 | Wall time or memory | `omnigraph-bench`; evidence, never a pass/fail assertion | [Benchmark harness](test-ownership.md#benchmark-harness) |
-
-Loose integration suites of a crate are modules of one
-`tests/integration/main.rs`. A file stays a separate binary under `tests/`
-only when its tests need their own process: failpoints armed for the whole
-process, a re-executed binary, a mutated process environment.
 
 Server and CLI suites start processes through their `tests/support` modules,
 which own hermetic configuration, binary startup and temporary roots. Do not
@@ -77,59 +72,7 @@ full procedure is in
 [test ownership](test-ownership.md#lance-compatibility); the fences are in
 [Lance compatibility fences](lance-fences.md).
 
-## Predecessor binaries
-
-A cross-version test runs an older Omnigraph beside the current tree. Each
-older binary is one row of
-[`.github/predecessors.toml`](../../.github/predecessors.toml), named by what
-it is (`stamp-13`, `lance-11`, `release-0.11.0`): its source, either a release
-tag that `scripts/install.sh` installs against a pinned SHA256 or a commit
-built in its own checkout with a pinned toolchain; the binaries it provides;
-the version its `omnigraph --version` must report; and the condition under
-which it is retired. The file's header lists the fields.
-
-A test asks for a row with `support::predecessors::predecessor("<row>")`
-(`crates/omnigraph-cli/tests/support/predecessors.rs`). It reads the manifest
-that `OMNIGRAPH_PREDECESSORS` names, else `target/predecessors/manifest.json`,
-and applies one rule: a provisioned row is returned once its binaries exist
-and report the row's version; a row the manifest lacks prints
-`skipping: predecessor <row> is not provisioned` and returns `None`, or fails
-the test when the manifest was provisioned with `--require`.
-
-`scripts/predecessors.py provision` installs or builds rows into
-`target/predecessors/` and writes that manifest, naming every row stored
-there; a stored row is reused while its registry entry and version still
-match. To run every cross-version case locally, provision once:
-
-```bash
-python3 scripts/predecessors.py provision --all
-```
-
-Then run the cases as usual, for example
-`cargo dev-test --test integration crossversion_upgrade::`. Name rows instead
-of `--all` to provision fewer: a source row builds a debug CLI from scratch
-(about 25 minutes cold) in a temporary directory outside the repository, so
-only the predecessor's own Cargo configuration applies, and removes it
-afterwards.
-
-In CI a job names the rows it needs with the `./.github/actions/predecessors`
-action (`rows:`, and `require: true` where a skipped journey must fail), which
-caches them by what they are made from. A new predecessor is a row and a
-`rows:` entry, never a build step. `scripts/predecessors.py --self-test`, run
-by `Check Workflow Action Pins`, requires every row to be asked for by a test
-and every row a test or workflow names to exist: a row no test asks for is
-retired.
-
 ## Commands
-
-```bash
-cargo test -p omnigraph-engine --test integration traversal_indexed::   # one suite
-cargo test -p omnigraph-engine --test writes concurrent                  # a separate binary
-cargo test -p omnigraph-server --test integration data_routes::
-cargo test -p omnigraph-cli --test integration cli_data::
-cargo test -p omnigraph-cluster --test failpoints --features failpoints
-cargo test -p omnigraph-gqt --test gq_logic_tests issue_563             # matching case names
-```
 
 Run one test with `--test integration <name>::<test> -- --exact`. The
 canonical workspace graph, formatting and Clippy commands are in
@@ -139,10 +82,7 @@ gates. GQT, DST, plan replay and OpenAPI commands are in
 
 ## Cost tests and benchmarks
 
-A correctness test may assert a deterministic logical or object-store
-operation count when the count is part of the design contract. Wall time and
-peak RSS depend on the host and belong in the `omnigraph-bench` harness, whose
-results are evidence, not assertions. Workload definitions live in
+Workload definitions live in
 [`benchmarks/`](../../benchmarks/README.md); the cost owners and the harness
 are in [test ownership](test-ownership.md#cost-tests-and-benchmarks).
 

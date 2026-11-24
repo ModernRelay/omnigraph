@@ -39,12 +39,23 @@ impl ExpandMode {
 /// hop against recorded coverage, the observed frontier and a warm
 /// CSR; between input batches and at every later hop with
 /// `should_switch_to_csr`).
+///
+/// Explain prints the policy's `alternatives`; the run's report row names
+/// the mode the traversal ended on (`ran`), which a GQT `expand … : mode … ran`
+/// line reads. Every input of a re-decision is on the node or is data of the
+/// run (the observed frontier, the CSR the run built).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "policy", rename_all = "snake_case")]
 pub enum ExpandPolicy {
     /// The session's traversal pin chose the mode; the run takes no other.
     Pinned,
     /// A query-wide work budget admits only indexed scans; no CSR fallback.
+    /// Every expansion of a statement with an edge selection, named and
+    /// nested ones included, declares it, with no topology prefilter or bulk
+    /// adjacency shortcut; a forced CSR is refused, since the shared
+    /// graph-index artifact can cover more than the selected types. Its
+    /// producer prepares the pinned member datasets once and reads source
+    /// windows of a fixed size, independent of upstream batch boundaries.
     Budgeted,
     /// No edge statistics: the mode is `Csr` and the run takes no other.
     Uncosted,
@@ -83,7 +94,12 @@ pub enum AccessPath {
     /// The per-batch id lookup: work scales with the frontier.
     IdLookup,
     /// The destination table read once, hashed on its id, probed by the
-    /// traversal pairs in their order: work scales with the table.
+    /// traversal pairs in their order: work scales with the table. The build
+    /// is a table `Scan` with the dependent scan's pushed filters (search
+    /// predicates included) and projection, and the output has the schema the
+    /// dependent scan declares: the probe's columns without the destination
+    /// id, then the destination's. The node may declare `IdLookup` as its
+    /// fallback (explain prints `fallback`).
     HashJoin,
 }
 
@@ -141,6 +157,9 @@ pub enum AntiJoinStrategy {
     /// The inner tree runs once from its most bounded binding, with no outer
     /// rows, and ends on the correlation binding; the outer rows are kept by
     /// the aggregate of their key's matches. Work scales with the block alone.
+    /// Explain and a GQT `anti join $x: key_set` line print it; acceptance
+    /// refuses a strategy whose inner tree the plan does not hold (check
+    /// `block strategy`), so an edited saved plan fails before it runs.
     KeySet,
 }
 
@@ -163,11 +182,16 @@ pub enum IndexCoverage {
     Degraded,
 }
 
+/// Where an `Expand`'s recorded `IndexCoverage` came from. Explain statistics
+/// never select it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageProvenance {
+    /// A saved plan that records no provenance: the run keeps the runtime
+    /// coverage correction.
     #[default]
     LegacyAssumed,
+    /// Derived from the pinned catalog's index facts; never probed again.
     PinnedIndexFacts,
 }
 

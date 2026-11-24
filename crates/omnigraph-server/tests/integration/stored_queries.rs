@@ -1,5 +1,5 @@
-//! Stored-query registry boot, /queries listing, and invocation routes.
-//! Moved verbatim from tests/server.rs in the modularization.
+//! Stored-query registry boot, /queries listing, and invocation routes,
+//! including a request parked before engine capture.
 
 use axum::body::Body;
 use axum::http::StatusCode;

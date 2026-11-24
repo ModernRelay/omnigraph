@@ -7,6 +7,16 @@
 //! `__history/legacy/`, converts every live ref to its head alone, validates
 //! what it wrote and activates main. A run that stops after the fence is
 //! resumed by running the command again.
+//!
+//! A main at a served stamp takes the stamp-only route instead
+//! ([`stamp_live_refs`]). The report names the route it took
+//! ([`handler`], [`stamp_handler`]). A `--to-format` other than the current
+//! stamp is `unsupported_target`, checked before the stamp; a stamp above it
+//! is `newer_than_binary`, and any other stamp no route converts is
+//! `unsupported_source` with the open guard's refusal. A root carrying the
+//! pending intent stays refused by normal open: `--check` reports it
+//! `recovery_required`, and a run without `--check` resumes the attempt its
+//! intent names.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -1963,9 +1973,23 @@ async fn fence_main_with_session(
     }
 }
 
-/// The stamp-only route (RFC "Unpublished graph commits"; RFC "Branch existence
-/// in the catalog" §Upgrade): a metadata commit per branch stamped below the
-/// binary's, main first with the rows of every ref, then every ref file unlinked.
+/// The stamp-only route, taken when main carries a served stamp: a
+/// metadata-only commit per live branch stamped below the binary's, main
+/// first with the rows of every ref, then every ref file under
+/// `_refs/branches/` unlinked.
+///
+/// The commits write no fence and no pending key, rewrite no table row, keep
+/// every fragment of the branch (cold block registry fragments included) and
+/// touch no retired ref. Main's commit carries a `branch` row per live ref and
+/// a retired row per retired ref, so `work.rows_written` counts both. Two live
+/// refs under one logical name are refused before any commit, and `SchemaApply`
+/// is checked per branch when a policy is installed. A graph with no branch
+/// behind and no ref file left is `already_current`; `--check` stops at
+/// `check_passed` with `work.live_refs`, `work.rows_written` and
+/// `work.refs_unlinked`. A rerun stamps what an interrupted run left and
+/// unlinks the refs it left; its boundaries are `stamped:main`,
+/// `stamped:ref '<native>'` and `unlinked:ref '<native>'`. This is the one way
+/// a served branch reaches a stamp above 16, since no publication raises one.
 async fn stamp_live_refs(
     root: &str,
     main: &Dataset,

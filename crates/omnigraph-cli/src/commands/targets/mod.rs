@@ -1,6 +1,13 @@
-//! The `target` and `credential` command groups and `access`: the operator
-//! configuration's named targets, a server target's static token for another
-//! program, and what the caller may do at a target.
+//! The `target`, `credentials` and `config` command groups and `access`: the
+//! operator configuration's named targets, a server target's static token for
+//! another program, and what the caller may do at a target.
+//!
+//! It owns offline configuration validation, target editing and the
+//! credential commands, including journaled owner and profile renames that
+//! keep binding IDs, and explicit rename recovery. A static token is installed
+//! by `credentials set` from stdin, never by login. `credentials status` stays
+//! free of network and helper calls and never prompts; `credentials export`
+//! checks that stdout is a pipe before it acquires any secret.
 
 mod access;
 mod args;

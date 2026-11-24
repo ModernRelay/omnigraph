@@ -451,6 +451,16 @@ async fn take_over(
 
 /// The caller must have settled every accepted effect and excluded competing
 /// administrative unlocks. Remote clean release never deletes the lock key.
+///
+/// On S3 it writes a unique version-2 released marker by if-match at the
+/// existing key, and an ordinary acquisition later replaces that marker with
+/// a fresh held owner, so a delayed release cannot affect a successor. A lost
+/// release acknowledgement is an error. A local root deletes the exact
+/// owner's record and awaits it. A clean server release reaches this only
+/// after unique admission, a successful startup and no unsettled storage key;
+/// its original adapters stay closed and a private single-attempt client
+/// sends only this request, under the same shutdown deadline. This is neither
+/// distributed fencing nor permission to reuse a runtime.
 pub(crate) async fn release_settled_lock(
     adapter: &Arc<dyn StorageAdapter>,
     kind: StorageKind,

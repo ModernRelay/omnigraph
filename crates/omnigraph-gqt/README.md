@@ -10,7 +10,7 @@ These directories organize the corpus. Every case runs on engine v2, the one
 engine; a case's `set engine = v2;` line changes nothing, and discovery never
 selects an engine.
 The format contract and future extensions live in
-[RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
+[RFC 0045](../../docs/decisions/0045-gq-logic-tests.md).
 
 ## Slow cases
 
@@ -139,7 +139,7 @@ store argument and refuses a file without schema and seed.
 
 One engine instance survives ordinary steps and expected errors. Only
 `--- restart` drops the engine and reopens the same storage. A case owns one
-session ([Session settings](../../docs/rfcs/2026-09-16-session-settings.md)) for
+session ([Session settings](../../docs/decisions/2026-09-16-session-settings.md)) for
 its lifetime: a `--- mutate` step of only `set` and
 `reset` lines expects `ok` and changes that session for the steps that follow,
 across a restart; a `set` prefix before any other body applies to that step

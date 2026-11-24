@@ -39,11 +39,11 @@ pub use catalog::{CatalogIdentity, build_catalog, build_catalog_from_ir};
 pub use ir::ParamMap;
 
 /// The GQ grammar's version, major when it accepts less or a produced shape
-/// changes, minor when it only accepts more (`docs/rfcs/2026-09-14-compatibility-surfaces.md`);
+/// changes, minor when it only accepts more;
 /// `(2, 0)` introduced the shared expression model;
-/// `(2, 1)` adds typed edge selections (`docs/rfcs/2026-09-30-typed-edge-alternation.md`);
+/// `(2, 1)` adds typed edge selections (`docs/decisions/2026-09-30-typed-edge-alternation.md`);
 /// `(2, 2)` adds the `as commit` clause and the `commit publish` / `commit drop`
-/// statements (`docs/rfcs/2026-10-10-unpublished-graph-commits.md`);
+/// statements (`docs/decisions/2026-10-10-unpublished-graph-commits.md`);
 /// `(2, 3)` adds `branch create <name> from commit "<id>"`.
 pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 3);
 pub use ir::lower::{lower_mutation_query, lower_query};

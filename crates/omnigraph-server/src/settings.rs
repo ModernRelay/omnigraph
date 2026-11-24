@@ -1,6 +1,5 @@
 //! Server settings: cluster/CLI/env resolution, bearer-token sources, and
-//! runtime-state classification (moved verbatim from lib.rs in the
-//! modularization).
+//! runtime-state classification.
 
 use super::*;
 use std::io::Read;
@@ -284,10 +283,11 @@ fn settings_from_snapshot_inner(
     })
 }
 
-/// RFC-011 cluster-only boot: the server serves exclusively from a
-/// cluster's applied revision (`--cluster <dir | s3://… | az://…>`). The legacy
-/// omnigraph.yaml / `--target` / positional-URI single-graph boot paths
-/// were removed — a deployment serves from exactly one source.
+/// Cluster-only boot: the server serves exclusively from a cluster's applied
+/// revision (`--cluster <dir | s3://… | az://…>`), its one source. The
+/// settings acquire the cluster's lifetime admission before the boot snapshot
+/// is read and graphs open, and keep it in `ServerConfig`; the read-only
+/// snapshot readers alone grant no serving admission.
 pub async fn load_server_settings(
     cli_cluster: Option<&PathBuf>,
     cli_bind: Option<String>,
@@ -307,6 +307,8 @@ pub async fn load_server_settings(
 /// Load applied serving settings with explicitly enabled offline data-token
 /// trust. Root metadata and the snapshot come from the same opened Core store;
 /// trust is validated before any graph engine can be opened for recovery.
+/// The binary's `--data-token-trust FILE` selects this path, and a failed load
+/// must not be retried through ordinary `serve`.
 pub async fn load_server_settings_with_data_token_trust(
     cli_cluster: Option<&PathBuf>,
     cli_bind: Option<String>,

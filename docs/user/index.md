@@ -61,5 +61,4 @@ deployment.
 User-visible changes are recorded in the [release notes](../releases/).
 See [0.14 highlights and upgrade actions](../releases/v0.14.0-overview.md)
 for a short overview of the release.
-Contributors should start with the [developer guide](../dev/index.md). Design
-decisions and proposals live in [RFCs](../rfcs/).
+Contributors should start with the [developer guide](../dev/index.md).

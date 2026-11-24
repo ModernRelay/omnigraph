@@ -16,8 +16,7 @@ The `Check`, `Scope`, and `Value` columns are consumed by the test. They are
 fixed checks over the generated specification, not a general rules language.
 Response naming applies to the named response body, including a union's named
 alternatives; a nested field type can retain its domain name. Protocol-defined
-paths and the baseline record have permanent exceptions. The conditional
-commit-page default remains with the separate pagination design.
+paths and the baseline record have permanent exceptions.
 
 | Check | Scope | Value | Reason and owner |
 |---|---|---|---|
@@ -48,9 +47,9 @@ commit-page default remains with the separate pagination design.
 ## Operation inventory
 
 `omnigraph-api-types::operations` names each HTTP operation once, with its
-method, path, write capability and existing MCP and CLI bindings. An absent
-or restricted binding has a reason. Every CLI command with no HTTP operation has an exact named entry with
-its reason.
+method, path, write capability and existing MCP and CLI bindings (its doc
+comment states the rules). Every CLI command with no HTTP operation has an
+exact named entry with its reason.
 
 The server registers native routes through this inventory. Its route owner
 also records branch actions from the actual `BranchAction` dispatch and OAuth
@@ -73,17 +72,17 @@ response assertions hold the errors an operation can send: omitting a response
 or merely removing its code must fail. A POST is not necessarily a write;
 stored-query calls can write, whereas inline query and export calls read.
 
-The final returned `disposition.action` controls retries. Registry defaults
-cannot override unknown effects or a recovery intent. In particular, 503 does
-not by itself authorize retry, and an uncertain write requires reconciliation
-or recovery before another write. The server's error owner tests these runtime
-facts; the OpenAPI owner tests their published description.
+What a failure tells the caller about retry is `E4`; the returned
+`disposition.action` alone authorizes a retry
+([HTTP API conventions](../decisions/2026-10-19-http-api-conventions.md)). The
+server's error owner tests these runtime facts; the OpenAPI owner tests their
+published description.
 
 ## Compatibility and coverage
 
 Changing an operationId or schema name changes generated SDK source even when
 the wire is unchanged. The released 0.14 contract uses `actor_id` in access
-results and the `listing` enum for commit lists.  Retired `unpublished` and `unattached` query keys are refused
+results and the `listing` enum for commit lists. Retired `unpublished` and `unattached` query keys are refused
 even when false; they
 cannot silently select history. MCP has its own tool-schema migration and
 does not require the HTTP contract header. See the
@@ -96,8 +95,7 @@ described through `tools/list` and the [MCP guide](../user/operations/mcp.md).
 `og_catalog` is a reserved graph id documented on `graph_id`; it serves only
 inline query and schema requests and refuses other operations.
 
-New collections are paged from their first release. Existing unbounded graph,
-branch and query lists, and unpaged commit history, keep their behavior until
-the separate pagination design changes it. See the
-[HTTP conventions RFC](https://github.com/ModernRelay/omnigraph/pull/1089) for the rename
-batch and the [server guide](../user/operations/server.md) for clients.
+New collections are paged from their first release. Existing graph, branch and
+query lists, and commit history without paging inputs, are unbounded. See the
+[HTTP API conventions decision](../decisions/2026-10-19-http-api-conventions.md)
+and the [server guide](../user/operations/server.md) for clients.

@@ -1,15 +1,18 @@
 # Graph recovery
 
 **Audience:** engine and storage contributors
-**Authority:** current graph publication recovery
+**Authority:** what a crash leaves on storage and who finishes it: graph
+publication, reconciling and settling a prepared schema invocation, the
+storage upgrade, initialization and graph branch control; the write path is
+[writes.md](writes.md), merge publication [merge.md](merge.md), and cluster
+recovery [control-plane.md](control-plane.md)
 
 A graph write becomes visible at its branch's `__manifest` publication. The
 published table references and accepted schema contract are complete together;
-normal open never installs a contract from root files. No writer arms a
-recovery sidecar, classifier, roll-forward, rollback, `Restore` compensation or
-recovery audit ([RFC 0067](../rfcs/0067-detached-table-commits.md)). Table pins
+normal open never installs a contract from root files
+([RFC 0067](../decisions/0067-detached-table-commits.md)). Table pins
 are not promoted onto linear history
-([Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md)). Ordinary open neither starts nor resumes a storage
+([Detached-only tables](../decisions/2026-09-21-detached-only-tables.md)). Ordinary open neither starts nor resumes a storage
 conversion and refuses a graph that carries a pending one; the offline
 `omnigraph upgrade` owns it ([Pending storage conversion](#pending-storage-conversion)).
 
@@ -36,18 +39,14 @@ Each registration records that stopping point as
 leaves a table effect nothing to finish, so no writer, `cleanup` or open runs
 a reconciler over pins.
 
-A linear commit above `omnigraph.last_linear_version` is foreign: no read or
-write resolves it and nothing adopts it, and the collector deletes neither its
-manifest nor its files and lists it under `foreign_versions`
-(`collector.rs`, `foreign_versions`), which `cleanup` reports per table.
+A linear commit above `omnigraph.last_linear_version` is foreign; its outcome
+is in [writes](writes.md#failure-outcomes).
 
 ## Schema contract publication
 
 Schema apply and the system-column upgrade publish the replacement
-`schema_contract` row with their table references and graph-lineage change in
-one main-branch manifest commit. Open and refresh validate that row; neither
-uses root schema files or a schema-apply sentinel. A proven publication is
-complete even if a later error interrupts adoption of the in-memory view.
+`schema_contract` row in one main-branch manifest commit
+([writes](writes.md#mutation-and-load)). Open and refresh validate that row.
 Lost acknowledgement remains a distinct outcome checked against the exact
 attempted publication, not evidence that the write lost.
 
@@ -61,21 +60,38 @@ prove nonpublication from a verified occupant of `M + 1` or its own exact fence
 receipt. It adds no schema/data changes, never adopts foreign schema, and never
 rebases either contender. Missing evidence stays unresolved, while a stale
 no-op certificate can be refused without a fence. Version-1 prepared intents
-are rejected. See [writes.md](writes.md#mutation-and-load) for the two engine
-APIs and [control-plane.md](control-plane.md#deployment-ledger) for their
-durable cluster owner; neither result alone proves native-I/O settlement.
+are rejected. See [control-plane.md](control-plane.md#deployment-ledger) for
+their durable cluster owner; neither result alone proves native-I/O
+settlement.
+
+`reconcile_schema_apply_as` only reads retained, exact publication evidence and
+returns `Committed`, `NoOp` or `Unknown`. It checks the single candidate manifest
+version immediately after the prepared base, without walking history. Missing
+evidence, including metadata-only interposition, stays unknown; a no-op requires
+the exact captured base still to be current. Reconciliation neither applies the
+schema nor authorizes replay. Callers still own durable intent recording,
+evidence retention and fencing the previous owner before they can establish
+terminal non-publication.
+
+For a durably accepted invocation, `prepare_schema_settlement_as` issues a
+separate neutral lineage intent bound to that original and its one `M + 1`.
+The caller persists it before `settle_prepared_schema_as` can publish its fence.
+A verified occupied candidate or exact fence receipt proves `NotPublished`;
+missing evidence remains `Unknown`. A stale no-op certificate is `NoOpRefused`.
+Prior-owner quiescence, current policy, exclusive admission and protected
+evidence remain caller obligations. These engine boundaries do not enable
+online server activation; the deployment protocol remains in the
+[server runtime RFC](../decisions/2026-09-29-server-runtime-and-online-deployment.md).
 
 A prepared-create or prepared-schema token is settled by the build that wrote
-it. Format 14 added lineage fields: a prepared-create token from an older build
-decodes with `generation` 0 and no native branch and is refused by its stamp
-before anything is published, and a format-14 token read by an older build
-fails on the unknown fields before any stamp check. An operation interrupted
-across a binary swap is prepared again, never settled by the other build.
+it. A prepared-create token from a build before format 14 decodes with
+`generation` 0 and no native branch and is refused by its stamp before
+anything is published, and a format-14 token read by an older build fails on
+the unknown lineage fields before any stamp check. An operation interrupted across a binary swap is prepared again, never
+settled by the other build.
 
-Historical queries keep the accepted live contract and rebind its aliases by
-stable identity to the selected historical table image. Retained contract rows
-do not introduce historical schema-language semantics. See
-[Schema contract in the manifest](../rfcs/2026-09-30-schema-contract-in-manifest.md).
+Historical queries read through the accepted live contract (`read:3`); see
+[Schema contract in the manifest](../decisions/2026-09-30-schema-contract-in-manifest.md).
 
 ## Pending storage conversion
 
@@ -149,9 +165,8 @@ rule below still applies: a root with a sidecar reports
 
 ## Sidecars from older builds
 
-No build at or after RFC 0067 step 5 writes or reads a recovery sidecar. A
-file under `__recovery/` can only come from an earlier build that stopped
-mid-write. This build cannot interpret it, so a read-write open
+This build writes and reads no recovery sidecar. A file under `__recovery/`
+can only come from an earlier build that stopped mid-write. This build cannot interpret it, so a read-write open
 refuses the graph, naming the operation ids, until the build
 that wrote the sidecar has opened the graph read-write and finished its own
 recovery. A read-only open never looks at
@@ -179,8 +194,7 @@ Failure-window tests cover both unchanged graphs before publication and
 complete published graphs afterward. Their owners are the matrix's default
 same-handle actor, the `live_handle_*` tests in `failpoints.rs` and DST's
 `Scenario::keep_handle` mode
-(`dst_fault_storm_on_one_live_handle_keeps_writing`). No contract-file install
-or sentinel-release retry is part of write entry.
+(`dst_fault_storm_on_one_live_handle_keeps_writing`).
 
 ## Initialization ownership
 
@@ -207,8 +221,7 @@ the token's digest, and names the apply that wrote it with a fresh attempt id:
 the storage adapter reads a create's lost answer back by the stored bytes, so
 two applies of one token must not write the same claim. Settlement recognizes
 the token's claim by digest, graph commit id and root, whichever apply wrote
-it, and still accepts the exact version-2 claim, without an attempt id, that
-earlier releases wrote.
+it, and still accepts the exact version-2 claim without an attempt id.
 Read-only reconciliation recognizes that birth or returns `Absent`/`Unknown`;
 matching schema text is insufficient. After explicit prior-owner quiescence,
 `settle_prepared_graph_create_after_quiescence` may remove only that token's
@@ -220,10 +233,9 @@ for its admission and durable-result owner.
 
 Do not retry initialization or remove an indeterminate claim until every
 initializer for that root is quiescent and the root has been inspected. The
-claim coordinates competing initializers even though schema files are no
-longer installed. Read-write open of a local root still performs its temporary
-create-if-absent capability probe; removing contract installation does not
-make that entire entrypoint read-only.
+claim coordinates competing initializers. Read-write open of a local root
+performs a temporary create-if-absent capability probe, so that entrypoint is
+not read-only.
 
 ## Graph branch controls
 
@@ -280,11 +292,9 @@ logical branch list alone is not proof.
 
 ## Test ownership
 
-- `crates/omnigraph/tests/failpoints.rs` owns writer crash windows: no
-  graph-visible residue before publication, the pin complete after it, per
-  writer.
-- `crates/omnigraph/tests/detached_commit_matrix.rs` owns the writer × window
-  × fault × recovery-actor matrix under one oracle.
+The crash-window, matrix, recovery and Lance-guard owners are in
+[test ownership](test-ownership.md#recovery-and-failpoints).
+
 - `crates/omnigraph/tests/schema_apply.rs` and `system_column_upgrade.rs` own
   atomic contract publication, pre-publication refusal and complete published
   outcomes, including later errors.
@@ -296,22 +306,17 @@ logical branch list alone is not proof.
 - `crates/omnigraph/tests/integration/recovery_probe.rs` owns the no-open
   sidecar probe: unknown sidecars and an inventory at its listing bound both
   refuse without a write.
-- `crates/omnigraph/tests/integration/recovery.rs` owns manifest-only contract admission,
-  ignored orphan schema artifacts, read-only opens without writes, and legacy
-  sidecars refusing read-write but not read-only open.
 - The initialization cells in `failpoints.rs` own exact-genesis recovery,
   committed-versus-indeterminate outcomes, and claim retention.
-- `crates/omnigraph/tests/lance_surface_guards.rs` owns the Lance
-  detached-commit facts the pin and the collector depend on.
 - `crates/omnigraph/tests/forbidden_apis.rs` guards durable-call and writer
   registration.
 - Cluster recovery has a separate control-plane protocol described in
   [control-plane.md](control-plane.md); it never substitutes for graph recovery.
 
-The design rationale is [RFC 0067](../rfcs/0067-detached-table-commits.md),
+The design rationale is [RFC 0067](../decisions/0067-detached-table-commits.md),
 which supersedes the sidecar protocol of
-[RFC 0022](../rfcs/0022-unified-write-path.md), and
-[RFC: Detached-only tables](../rfcs/2026-09-21-detached-only-tables.md),
+[RFC 0022](../decisions/0022-unified-write-path.md), and
+[RFC: Detached-only tables](../decisions/2026-09-21-detached-only-tables.md),
 which removes RFC 0067's promotion. The
-[schema-contract RFC](../rfcs/2026-09-30-schema-contract-in-manifest.md)
+[schema-contract RFC](../decisions/2026-09-30-schema-contract-in-manifest.md)
 replaces its separate contract installation.

@@ -1,3 +1,18 @@
+//! Bounded transport for served export and change-feed baseline bodies.
+//!
+//! Each route divides its process reservation into frame credits
+//! (`EXPORT_OUTSTANDING_FRAMES`) and one sequential producer slot, and both
+//! share one sender. A yielded `Bytes` holds its payload, frame credit and
+//! process lease until its last clone or slice drops. The baseline's terminal
+//! record is encoded into one bounded pending chunk only after the snapshot
+//! is produced. Only the initial process-capacity admission has a short
+//! timeout: an admitted producer waits for a frame credit or for the response
+//! to close, the terminal baseline cursor included, so a slow reader keeps its
+//! bounded reservation until delivery or disconnect and no per-frame deadline
+//! truncates a valid stream. A producer hands its failure to the sender, which
+//! ends the body with a constant error and logs the failure's class, never its
+//! message.
+
 use axum::body::Bytes;
 use futures::Stream;
 use omnigraph::db::{EXPORT_CHUNK_MAX_BYTES, ExportCut};

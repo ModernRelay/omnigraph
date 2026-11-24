@@ -1,5 +1,15 @@
 //! Legacy named single-hop execution walks each input batch in bounded slices.
 //! Budgeted windows and legacy multi-hop enter shared BFS through `expand_stream`.
+//!
+//! A single unbound hop never retains its frontier. On the CSR, each input
+//! batch's source ids become dense ids through the source dictionary, and
+//! each source's adjacency slice (the CSC too for an undirected step) is
+//! walked into source ordinals and dense destinations, a generation stamp
+//! emitting each distinct destination of a source once, in first-occurrence
+//! order. Destination ids are copied from the dictionary only for the slice
+//! emitted; source columns are one Arrow `take` of the input batch, both
+//! charged per slice. An indexed start runs one `key IN (batch ids)` scan
+//! per input batch into a per-batch interner and neighbour map.
 
 use std::collections::HashMap;
 use std::sync::Arc;

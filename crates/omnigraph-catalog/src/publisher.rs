@@ -447,8 +447,21 @@ pub struct GraphNamespacePublisher {
     holder_key: OnceLock<HolderKey>,
 }
 
+/// The accounted bytes past which an acknowledged image is not kept: the hot
+/// fragment's Arrow buffers, the Lance manifest and its location. It bounds
+/// what the cache accounts, not the process's memory.
 pub(crate) const PUBLISHED_ROWS_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
+/// The rows of this publisher's last acknowledged publication: at most one
+/// image. A load serves from it only when the opened `__manifest` matches it
+/// exactly (`manifest_image_matches`); the cached rows go through the same
+/// decode and the same collision, expected-version, lineage and exact-head
+/// checks as scanned rows, so the cache changes neither the zero-retry version
+/// CAS nor the lost-acknowledgement read-back. An image over
+/// `PUBLISHED_ROWS_CACHE_BYTES`, one with a dictionary-encoded field, or one at
+/// a stamp this build does not serve is not kept, and the next load of a
+/// foreign version or of missing rows scans. The publication still rewrites
+/// the complete live row set.
 #[derive(Debug)]
 struct PublishedRows {
     manifest: Manifest,
@@ -494,6 +507,9 @@ impl PublishedRows {
     }
 }
 
+/// Whether `dataset` is the image `manifest` and `location` describe: the
+/// same path, version and naming scheme, no differing known ETag or size, the
+/// same Lance manifest and the same schema metadata.
 pub(crate) fn manifest_image_matches(
     manifest: &Manifest,
     location: &ManifestLocation,
@@ -1627,6 +1643,20 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
     /// A claim's one durable effect is its version, so an opaque failure is
     /// marked `Unpublished` unless the attempt that put it marked it in
     /// doubt; a typed refusal is returned as it is.
+    ///
+    /// The claim publishes under `PublishPrecondition::ExactBranchIdentity`:
+    /// the branch's name and Lance-native identifier, with no head compare,
+    /// so a moved head does not refuse it and a branch created again under
+    /// its name does. It writes the loaded rows with the `writer_epoch` row at
+    /// `E + 1` and a fresh attempt id as the next `__manifest` version, which
+    /// records no graph commit and moves no head. A put that loses its version
+    /// loads again and asserts the epoch its first load read, so of two racing
+    /// claims one holds `E + 1` and the other is refused with `read: E`. A put
+    /// with no answer is settled from the version it attempted: the row
+    /// carrying this attempt id is the claim landed, and another publication
+    /// there before any acknowledgement is the claim lost. An unreadable
+    /// version, or another publication there after an acknowledgement, leaves
+    /// the claim in doubt (`claim_outcome_in_doubt`), holding nothing.
     async fn claim_writer_epoch(
         &self,
         branch_identifier: &lance::dataset::refs::BranchIdentifier,

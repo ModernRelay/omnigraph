@@ -1,4 +1,14 @@
 //! CLI application dispatch. Process startup and termination belong to the binary.
+//!
+//! A [`Completion`] carries the exit status of an invocation already handled
+//! and reported; an error not yet rendered stays a `Result` error. Command
+//! handlers consume supplied input, terminal status and fallible output
+//! writers; [`run_from`] supplies the process's standard streams. Handlers
+//! flush a nonzero report before returning its completion, and completion does
+//! not touch their streams again. A successful completion is flushed without
+//! appending a second machine response when the flush fails. Failure
+//! rendering flushes only the stream that carries the failure, so an unused
+//! stream cannot invalidate a delivered refusal.
 
 use crate::*;
 use std::io::{IsTerminal, Read};

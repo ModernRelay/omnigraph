@@ -5,6 +5,12 @@
 //! action would fire inside any concurrently running normal apply test in the
 //! lib-test process. A separate binary isolates the registry by construction —
 //! same reason the engine keeps its failpoint suite in `tests/failpoints.rs`.
+//!
+//! Owns interruption windows, killed-process recovery and corrective
+//! successors: graph deletion before start, during partial removal, after root
+//! absence and before the terminal ledger acknowledgement, same-lifetime older
+//! manifest survivors, replacement refusal and corrective creation in empty
+//! local settlement residue.
 
 #![cfg(feature = "failpoints")]
 // Match the cluster test harness budget for composed deployment/recovery futures.

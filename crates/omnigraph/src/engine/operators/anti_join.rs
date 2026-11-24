@@ -63,7 +63,8 @@ impl Drop for FilledSlot<'_> {
     }
 }
 
-/// The leaf of an anti-join's inner plan: the tagged outer rows.
+/// The leaf of an anti-join's inner plan: the tagged outer rows. The lowering
+/// refuses one outside an `AntiJoin` inner tree.
 #[derive(Debug)]
 pub(crate) struct OuterReferenceExec {
     outer_var: String,

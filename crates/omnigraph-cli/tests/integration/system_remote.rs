@@ -1,3 +1,20 @@
+//! The actual CLI, server and fault proxy end to end, in the ordinary
+//! workspace gate. `Test Workspace` requires its cells by name, so a removed or
+//! ignored case fails the job.
+//!
+//! The lost-delivery matrix covers a disconnect, a truncated response, a proxy
+//! 504 and a caller timeout without replaying a committed merge or a commit
+//! publication or drop (a drop answers 204, with no body to truncate), and a
+//! Blob put's or clear's lost delivery. The deployment matrix holds a real
+//! admitted request through drain, disconnects or times out the caller before
+//! durable acceptance, and loses replies after acceptance: exact-ID
+//! observation finishes with one ledger result, one schema publication and the
+//! same server PID, and neither apply nor recovery polling resubmits.
+//!
+//! The Unix-socket gateway fixture does not qualify an operator transport:
+//! Unix socket targets are unsupported. Lower-level transport coverage stays
+//! distinct from the public resolver's capability and refusal tests.
+
 use std::fs;
 
 use serde_json::json;

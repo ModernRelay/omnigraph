@@ -1,7 +1,7 @@
-//! Shared HTTP wire DTOs (RFC-009 Phase 2) — moved from
-//! omnigraph-server's api module so server and CLI share one definition
-//! and one engine-result -> DTO mapping per verb. Plain serde/utoipa
-//! types; no transport, no server internals.
+//! Shared HTTP contract identifiers, the operation inventory (`operations`)
+//! and wire DTOs, so the server and the CLI share one definition and one
+//! engine-result to DTO mapping per verb. Plain serde and utoipa types; no
+//! transport, no server internals.
 
 use omnigraph::db::{
     GraphCommit, GraphCommitKind, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot,

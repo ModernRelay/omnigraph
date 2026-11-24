@@ -1,6 +1,18 @@
 # Known-misspelling check (crate-ci/typos). CI runs it from the repository
 # root, and so must a local run. Every exemption lives in this file, one
 # comment per entry saying why the token is intended where it occurs.
+#
+# typos matches each word against a list of known misspellings, not a
+# dictionary: an unknown word never fires, and an identifier fires only when
+# a word it splits into is on the list (a CamelCase fragment or a short
+# abbreviation can be). It skips `Cargo.toml` manifests, lock files and
+# binaries. Where an exemption goes: `[default.extend-words]` for a token in
+# prose and code alike; `[type.rust.extend-words]`, or `extend-identifiers`
+# for one exact identifier, for a token only in Rust sources, so the same
+# misspelling in Markdown still fires; `extend-ignore-re` for a hyphenated
+# prefix; an `extend-exclude` glob for a generated text file. CI refuses a
+# sibling `typos.toml` or `_typos.toml` and reads no config in a
+# subdirectory (a local run inside one would).
 
 [files]
 ignore-hidden = false # workflows, issue templates and .cargo/ hold prose too

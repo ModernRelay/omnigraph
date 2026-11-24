@@ -1,3 +1,14 @@
+//! The `omnigraph` command-line client as a library.
+//!
+//! [`app`] is the application entry point: dispatch, invocation-scoped
+//! admission, outcome evidence and completion reporting. The binary in
+//! `main.rs` owns runtime startup, diagnostic hooks, process arguments and the
+//! final process exit status.
+//!
+//! Client setup captures the operator configuration once for ordinary graph
+//! commands, aliases and served cluster commands; scope, endpoint, credential
+//! matching, direct-write actor selection and query and alias presentation
+//! all use those captured values.
 #![recursion_limit = "256"]
 
 use color_eyre::eyre::{Result, bail};

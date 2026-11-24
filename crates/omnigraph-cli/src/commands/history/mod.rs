@@ -1,4 +1,12 @@
 //! Graph history, branches, snapshots and bounded change traversal.
+//!
+//! Preparation types tell a requested page from automatic pagination and keep
+//! an optional branch selection. Human and JSON renderers write to fallible
+//! writers, and a stream flushes each page before it requests the next.
+//! Baseline capture holds its output-file lock through durable installation
+//! and delivery of the resume cursor, its flush included. Dedicated commit
+//! publication and drop share the application's write-outcome observation
+//! with their `mutate` statement forms.
 use crate::client::{self, GraphClient};
 use crate::helpers::resolve_branch;
 use crate::output::{

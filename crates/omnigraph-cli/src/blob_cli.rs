@@ -3,6 +3,19 @@
 //! The engine and server own descriptor interpretation, snapshot fencing, and
 //! bounded payload reads. This module keeps the command line's selector,
 //! range, and error vocabulary identical across the embedded and served arms.
+//!
+//! `blob put` and `blob clear` parse `--if-match` and read the put's file or
+//! stdin before credential acquisition or backend dispatch, so neither arm
+//! starts on bad input. The input bound is the put limit's fixed cap,
+//! `BLOB_WRITE_MAX_BYTES`, which a served caller can rely on without seeing
+//! the server's `write_max_bytes`; a direct put is then bounded by the
+//! process `write_max_bytes` in the engine. The embedded arm renders a
+//! precondition failure through `engine_error_output`, the body a server
+//! answers; the served arm sends the raw `If-Match` value and the bytes once,
+//! with no retry. A served 412 whose only detail is
+//! `blob_precondition_failure` is a verified request precondition, so the
+//! command exits 4, and so does the embedded arm, because the engine's
+//! refusal precedes any effect.
 
 use std::fs::File;
 use std::io::{self, Read, Write};

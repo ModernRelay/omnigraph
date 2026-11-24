@@ -1,3 +1,9 @@
+//! Declared proxy and CA inputs, captured once per invocation.
+//!
+//! Direct routing ignores ambient proxy variables. Control and data transport
+//! settings are independent, and identity-provider traffic inherits neither.
+//! Version 1 refuses a custom destination CA combined with an HTTPS proxy; an
+//! HTTP CONNECT proxy supports a custom destination CA.
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::IpAddr;

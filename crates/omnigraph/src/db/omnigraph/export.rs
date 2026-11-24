@@ -672,6 +672,13 @@ pub(crate) enum LogicalBlobValue {
 }
 
 /// What a Blob value reader does with a ranged external descriptor.
+///
+/// Export passes `Refuse`. The change-feed baseline shares export's table walk
+/// and line format but passes `Describe`: it is the exact state its consumer
+/// starts from, and a refusal would leave the graph with no baseline. Row
+/// images (change-feed images, entity reads) describe ranges too, and
+/// change-row comparison compares the reference exactly, so a ranged row
+/// never wedges a feed cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RangedExternalBlobs {
     /// Fail: the output is reloadable, and a bare URI reloads as the whole

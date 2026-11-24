@@ -1,4 +1,11 @@
 //! Organization membership eligibility. Applied Cedar owns native permissions.
+//!
+//! Read-only member discovery uses the selected organization and the
+//! authenticated adapter; the service requires cluster `status` permission.
+//! It validates the response's cluster identity and bounded member records
+//! before rendering.
+//! The directory reports explicit enrollment and cluster-specific control
+//! grants; provider profile metadata is optional.
 use super::*;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;

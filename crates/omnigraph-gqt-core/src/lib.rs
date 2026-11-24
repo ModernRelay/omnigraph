@@ -4210,6 +4210,8 @@ fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Op
     None
 }
 
+/// Serializes and deserializes an executed step's `BoundPlan` and requires the
+/// copy to carry the same decisions, without executing another query.
 fn check_bound_plan_round_trip(bound: &BoundPlan) -> Result<(), String> {
     let encoded = serde_json::to_vec(bound)
         .map_err(|error| format!("bound plan serialization failed: {error}"))?;
@@ -4218,6 +4220,10 @@ fn check_bound_plan_round_trip(bound: &BoundPlan) -> Result<(), String> {
     check_restored_plan(bound, &restored)
 }
 
+/// Compares a plan with its deserialized copy: valid aggregate specs and typed
+/// plans on both sides, equal physical explain documents, and per node equal
+/// stored schemas, return declarations, named node-object types and complete
+/// block predicates and specs.
 fn check_restored_plan(bound: &BoundPlan, restored: &BoundPlan) -> Result<(), String> {
     omnigraph_planner::validate_aggregate_specs(&bound.plan).map_err(|error| error.to_string())?;
     omnigraph_planner::validate_aggregate_specs(&restored.plan)
@@ -4310,6 +4316,10 @@ fn declared_result_schema(bound: &BoundPlan) -> Result<&Schema, String> {
         .ok_or_else(|| "result schema mismatch: the plan root has no declared schema".to_string())
 }
 
+/// The plan root's declared result schema against the schema the compiler
+/// inferred from the checked query's stored types: names, Arrow types and
+/// nullability flags per column. Inference reads those stored types, so this
+/// checks propagation, not an independent inference algorithm.
 fn check_inferred_results(
     decl: &QueryDecl,
     inferred: &Schema,
@@ -4343,6 +4353,9 @@ fn check_inferred_results(
     Ok(())
 }
 
+/// The plan root's declared result schema against the executed columns: names
+/// in order, full Arrow types (node `Struct` members included) and no null cell
+/// in a column declared non-null.
 fn check_planned_results(bound: &BoundPlan, result: &QueryResult) -> Result<(), String> {
     let declared = declared_result_schema(bound)?;
     let executed = result.schema();
@@ -4372,6 +4385,10 @@ fn check_planned_results(bound: &BoundPlan, result: &QueryResult) -> Result<(), 
 }
 
 /// The executed plan, its explain document and the same run's validated report.
+/// A step's `--- expect plan` reads this explain document, never a second
+/// planning run, and its `ran` lines read this report. A parameter refusal, a
+/// settings error and a failed query produce no inspection and keep their
+/// ordinary checks.
 struct Inspection {
     plan: BoundPlan,
     explain: Value,

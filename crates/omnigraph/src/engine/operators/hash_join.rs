@@ -6,7 +6,10 @@
 //! while the build is drained releases the build and reaches the destination
 //! rows through the per-slice id lookup over the whole probe instead, when
 //! the node declares that fallback. An empty build stops the probe after its
-//! first batch.
+//! first batch. Once the build holds, memory failures propagate, and output,
+//! probe, scratch and non-resource failures never take the fallback. The
+//! `hash_build_fallbacks` counter records a switch, and the report row's
+//! `ran` names the side that ran (`hash_join` or `id_lookup`).
 
 use std::fmt;
 use std::sync::Arc;

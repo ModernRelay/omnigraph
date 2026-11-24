@@ -1,9 +1,12 @@
 # Lance alignment
 
+**Audience:** anyone, an agent included, who changes a Lance-shaped behavior
+or the Lance dependency
+**Authority:** the required upstream reading and the dependency bump
+checklist; the Lance behaviors Omnigraph depends on are in
+[Lance compatibility fences](lance-fences.md)
 **Pinned dependency:** unmodified crates.io Lance 13.0.0, complete package
 family. Omnigraph does not vendor or patch Lance.
-**Purpose:** required upstream reading and the route to Omnigraph's
-compatibility fences
 
 Lance is Omnigraph's storage substrate. Before changing a Lance-shaped
 behavior:
@@ -136,27 +139,14 @@ credentials, or storage fault tests.
 
 Omnigraph's deltas over stock Lance 13 are in
 [Lance compatibility fences](lance-fences.md), one section per surface with
-its test owners. The rules an unrelated change breaks most easily:
-
-- Every production write selects the stable V2_2 file format. Experimental
-  V2_3, spilled row lineage and stable-row-ID fragment-reuse indexes are not
-  graph capabilities ([file format](lance-fences.md#file-format)).
-- Every graph-table write is a detached commit and stays the table's version
-  for life; nothing replays it linearly
-  ([detached commits](lance-fences.md#detached-commits)).
-- Stock `cleanup_old_versions` is never called: it does not trace detached
-  manifests, so it can delete files a retained snapshot needs
-  ([cleanup](lance-fences.md#cleanup)).
-- Every `__manifest` publish is a strict overwrite with zero retries, the
-  version CAS ([catalog publication](lance-fences.md#catalog-publication)).
-- Strict insert and upsert go through the sealed filter-bearing adapter; raw
-  keyed Append is forbidden ([graph keys](lance-fences.md#graph-keys)).
-- Indexes are derived, so reads combine indexed and scan paths
-  ([index coverage](lance-fences.md#index-coverage)), and a lagging index is
-  rebuilt whole, never extended with a delta segment
-  ([index segments](lance-fences.md#index-segments)).
-- A red `lance_surface_guards` test is a required design review, not a test
-  to weaken.
+its test owners, among them [file format](lance-fences.md#file-format),
+[detached commits](lance-fences.md#detached-commits),
+[cleanup](lance-fences.md#cleanup),
+[catalog publication](lance-fences.md#catalog-publication),
+[graph keys](lance-fences.md#graph-keys),
+[index coverage](lance-fences.md#index-coverage) and
+[index segments](lance-fences.md#index-segments). A red `lance_surface_guards`
+test is a required design review, not a test to weaken.
 
 ## Dependency bump checklist
 
@@ -175,7 +165,7 @@ its test owners. The rules an unrelated change breaks most easily:
    [test ownership](test-ownership.md#lance-compatibility).
 7. Update the pinned version and only the affected entries in
    [Lance compatibility fences](lance-fences.md).
-8. Record bump evidence in the release note or owning RFC. Git history is the
+8. Record bump evidence in the release note or decision record. Git history is the
    archive; do not append a permanent audit diary to this live guide.
 
 Namespace REST models and Spark/Trino/Databricks/Python integrations are

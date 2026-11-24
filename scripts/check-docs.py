@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Validate OmniGraph documentation structure and local links."""
+"""Validate Omnigraph documentation structure, budgets and local links."""
 
 from __future__ import annotations
 
-import datetime as dt
 import html
 import re
 import subprocess
@@ -18,30 +17,34 @@ RFC_DIR = ROOT / "docs" / "rfcs"
 SKILL_DIR = ROOT / "skills" / "omnigraph"
 SKILL_PATH = SKILL_DIR / "SKILL.md"
 
-RFC_KEYS = (
-    "rfc",
-    "title",
-    "track",
-    "status",
-    "implementation",
-    "authors",
-    "created",
-    "updated",
-    "discussion",
-    "supersedes",
-    "superseded_by",
-    "blocked_on",
-)
-RFC_TRACKS = {"public", "maintainer"}
-RFC_STATUSES = {"draft", "accepted", "rejected", "superseded"}
-RFC_IMPLEMENTATION = {
-    "not-started",
-    "in-progress",
-    "partial",
-    "complete",
-    "removed",
-    "n/a",
+DEV_DIR = ROOT / "docs" / "dev"
+DECISION_DIR = ROOT / "docs" / "decisions"
+CONTRACT_PATH = DEV_DIR / "contract.md"
+
+# Byte budgets (docs/dev/documentation.md, Kinds of document). A page that
+# every agent session loads is listed by path; every other page of docs/dev/
+# takes GUIDE_BUDGET.
+PAGE_BUDGETS = {
+    "AGENTS.md": 15_000,
+    "docs/dev/contract.md": 53_000,
+    "docs/dev/workload.md": 36_000,
+    "docs/dev/invariants.md": 11_000,
+    "docs/dev/testing.md": 7_500,
 }
+GUIDE_BUDGET = 60_000
+DECISION_BUDGET = 5_000
+
+DECISION_FILENAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\.md")
+DECISION_FIELDS = ("Decides", "Contract", "Code")
+DECISION_SECTIONS = ("Context", "Decision", "Rejected")
+DECISION_FORBIDDEN = {
+    r"(?<![\w/])#\d{2,}\b": "a decision record gives the reason, not an issue or pull request number",
+    r"\b(?:Phase|Step) \d": "a decision record holds no plan; open work is an issue",
+    r"\b20\d\d-\d\d-\d\d(?![\w-])": "a decision record holds no dates; history is git",
+    r"\bOmniGraph\b": "spell the product Omnigraph",
+}
+CONTRACT_KINDS = ("read", "write", "merge", "schema", "branch", "maintain", "reclaim")
+CONTRACT_COLUMNS = ("sees", "changes", "refuses", "cost")
 
 # Leftover merge-conflict markers at line start. git always labels them; the
 # `\s|$` arm also catches hand-mangled label-less leftovers. A lone `=======`
@@ -57,7 +60,7 @@ USER_FORBIDDEN = {
     r"\bprotocol_v\d+\b": "recovery protocol versions belong in developer docs",
     r"\brecovery-v\d+\b": "recovery protocol versions belong in developer docs",
     r"\bReserveFragments\b": "substrate operations belong in developer docs",
-    r"\bRFC[- ]0\d{3}\b": "project design history belongs in RFCs, not user docs",
+    r"\bRFC[- ]0\d{3}\b": "a user page states the behavior; design history is not user documentation",
     r"\bPhase \d+[A-Z]?\b": "implementation phases do not belong in user docs",
 }
 
@@ -188,245 +191,104 @@ def check_links(files: list[Path], errors: list[str]) -> None:
                     )
 
 
-def frontmatter(text: str, path: Path, errors: list[str]) -> tuple[dict[str, str], str]:
-    if not text.startswith("---\n"):
-        errors.append(f"{path.relative_to(ROOT)}: RFC must start with YAML frontmatter")
-        return {}, text
-    end = text.find("\n---\n", 4)
-    if end < 0:
-        errors.append(f"{path.relative_to(ROOT)}: RFC frontmatter has no closing ---")
-        return {}, text
-    block = text[4:end]
-    values: dict[str, str] = {}
-    order: list[str] = []
-    for line in block.splitlines():
-        match = re.match(r"^([a-z_]+):(?:\s*(.*))?$", line)
-        if match:
-            key, value = match.group(1), (match.group(2) or "").strip()
-            values[key] = value
-            order.append(key)
-    missing = [key for key in RFC_KEYS if key not in values]
-    if missing:
-        errors.append(
-            f"{path.relative_to(ROOT)}: missing RFC metadata: {', '.join(missing)}"
-        )
-    known_order = [key for key in order if key in RFC_KEYS]
-    expected_order = [key for key in RFC_KEYS if key in known_order]
-    if known_order != expected_order:
-        errors.append(
-            f"{path.relative_to(ROOT)}: RFC metadata keys are not in template order"
-        )
-    extra = [key for key in order if key not in RFC_KEYS]
-    if extra:
-        errors.append(
-            f"{path.relative_to(ROOT)}: unsupported RFC metadata: {', '.join(extra)}"
-        )
-    return values, text[end + 5 :]
+def defined_contract_addresses() -> set[str]:
+    """Addresses `docs/dev/contract.md` defines, for a record's Contract line."""
+    text = CONTRACT_PATH.read_text(encoding="utf-8")
+    addresses = set(re.findall(r"(?m)^\*\*(E\d+)\.", text))
+    addresses |= set(re.findall(r"(?m)^\| `([GD]\d+)` ", text))
+    addresses |= set(re.findall(r"(?m)^\d+\. `([a-z]+:\d+)` ", text))
+    for kind in CONTRACT_KINDS:
+        addresses |= {f"{kind}.{column}" for column in CONTRACT_COLUMNS}
+        addresses |= {f"{kind}+{other}" for other in CONTRACT_KINDS}
+    return addresses
 
 
-def scalar(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-        return value[1:-1]
-    return value
-
-
-def list_ids(value: str) -> list[str]:
-    return re.findall(r"[\"']([0-9a-z-]+)[\"']", value)
-
-
-RFC_FILENAME = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{4})-([a-z0-9]+(?:-[a-z0-9]+)*)\.md")
-# The numbered namespace closed on 2026-09-15 with these numbers allocated
-# (files on main) or reserved (PRs open at closure: 0047, 0048, 0050, 0056,
-# 0059, 0060, and 0067/0068 by PR #725). The set is final; every other
-# number was never allocated.
-NUMBERED_RFCS = frozenset(
-    f"{number:04d}"
-    for number in (*range(1, 14), 15, 18, 19, *range(22, 69))
+CONTRACT_ADDRESS = re.compile(
+    r"\b(?:[EGD]\d+|(?:%s)(?::\d+|\.[a-z]+|\+[a-z]+))(?![\w-])" % "|".join(CONTRACT_KINDS)
 )
 
 
-def rfc_id_of(path: Path, errors: list[str]) -> tuple[str, str] | None:
-    """Return (id, prefix) for an RFC filename, or None after recording the error.
+def check_budgets(files: list[Path], errors: list[str]) -> None:
+    """Fail a page that passes the byte budget of its kind."""
+    for path in files:
+        relative = path.relative_to(ROOT).as_posix()
+        budget = PAGE_BUDGETS.get(relative)
+        if budget is None and path.parent == DEV_DIR:
+            budget = GUIDE_BUDGET
+        if budget is None and path.parent == DECISION_DIR:
+            budget = DECISION_BUDGET
+        if budget is None:
+            continue
+        size = path.stat().st_size
+        if size > budget:
+            errors.append(
+                f"{relative}: {size} bytes is over its budget of {budget}; "
+                "cut or split the page (docs/dev/documentation.md, Kinds of document)"
+            )
 
-    Numbered RFCs (0001 to 0066) keep the number as id; dated RFCs use the
-    whole stem, so the date prefix alone never has to be unique.
-    """
-    name = RFC_FILENAME.fullmatch(path.name)
-    if not name:
+
+def check_decisions(errors: list[str]) -> None:
+    if RFC_DIR.exists():
         errors.append(
-            f"{path.relative_to(ROOT)}: RFC filename must be YYYY-MM-DD-kebab-title.md"
+            "docs/rfcs/: a proposal is a pull request and a decision is a record "
+            "under docs/decisions/ (docs/dev/documentation.md, Decisions)"
         )
-        return None
-    prefix = name.group(1)
-    if len(prefix) == 4:
-        if prefix not in NUMBERED_RFCS:
-            errors.append(
-                f"{path.relative_to(ROOT)}: numbered RFC namespace is closed and "
-                f"{prefix} was never allocated; use YYYY-MM-DD-kebab-title.md"
-            )
-            return None
-        return prefix, prefix
-    if not valid_date(prefix):
-        errors.append(f"{path.relative_to(ROOT)}: RFC filename date is not a real date")
-        return None
-    return path.stem, prefix
-
-
-def valid_date(value: str) -> bool:
-    try:
-        dt.date.fromisoformat(scalar(value))
-    except ValueError:
-        return False
-    return True
-
-
-def check_rfcs(errors: list[str]) -> None:
-    readme = RFC_DIR / "README.md"
-    registry = readme.read_text(encoding="utf-8") if readme.exists() else ""
-    seen: dict[str, Path] = {}
-    records: dict[str, tuple[str, str, str, str]] = {}
-    references: list[tuple[Path, str, str]] = []
-
-    for path in sorted(RFC_DIR.glob("*.md")):
-        if path.name in {"README.md", "0000-template.md"}:
+    addresses = defined_contract_addresses()
+    for path in sorted(DECISION_DIR.glob("*.md")):
+        if path.name == "README.md":
             continue
-        identity = rfc_id_of(path, errors)
-        if identity is None:
-            continue
-        number, prefix = identity
-        numbered = number == prefix
-        if number in seen:
-            errors.append(
-                f"{path.relative_to(ROOT)}: duplicate RFC {number}; also {seen[number].relative_to(ROOT)}"
-            )
-        seen[number] = path
-
+        relative = path.relative_to(ROOT)
+        if not DECISION_FILENAME.fullmatch(path.name):
+            errors.append(f"{relative}: a decision record is named kebab-title.md")
         text = path.read_text(encoding="utf-8")
-        values, body = frontmatter(text, path, errors)
-        metadata_number = scalar(values.get("rfc", ""))
-        if metadata_number != number:
-            errors.append(
-                f"{path.relative_to(ROOT)}: filename RFC {number} != frontmatter {metadata_number!r}"
+        lines = text.splitlines()
+        if not lines or not lines[0].startswith("# ") or lines[0].startswith("# RFC"):
+            errors.append(f"{relative}: must open with '# Title', a noun phrase")
+        fields: dict[str, str] = {}
+        for label in DECISION_FIELDS:
+            match = re.search(
+                rf"(?ms)^\*\*{label}:\*\* (.+?)(?=^\*\*[A-Z][a-z ]+:\*\* |^\s*$)", text
             )
-        if not numbered and scalar(values.get("created", "")) != prefix:
-            errors.append(
-                f"{path.relative_to(ROOT)}: filename date {prefix} != frontmatter created"
-            )
-        title = scalar(values.get("title", ""))
-        heading = re.search(r"^# RFC(?: (\d{4}))?: (.+)$", body, re.MULTILINE)
-        expected_heading = f"# RFC {number}: Title" if numbered else "# RFC: Title"
-        if not heading:
-            errors.append(
-                f"{path.relative_to(ROOT)}: first H1 must use '{expected_heading}'"
-            )
-        else:
-            heading_number = number if numbered else None
-            heading_title = re.sub(r"[`*_]", "", heading.group(2)).strip()
-            metadata_title = re.sub(r"[`*_]", "", title).strip()
-            if heading.group(1) != heading_number or heading_title != metadata_title:
+            if match is None:
+                errors.append(f"{relative}: missing the '**{label}:**' line")
+            else:
+                fields[label] = " ".join(match.group(1).split())
+        for heading in DECISION_SECTIONS:
+            if f"\n## {heading}\n" not in text:
+                errors.append(f"{relative}: missing the '## {heading}' section")
+        allowed = {*DECISION_SECTIONS, "Not built"}
+        for heading in re.findall(r"(?m)^#{2,} (.+)$", strip_fenced_code(text)):
+            if heading not in allowed:
+                errors.append(f"{relative}: '{heading}' is not a section of a decision record")
+
+        contract = fields.get("Contract", "")
+        cited = CONTRACT_ADDRESS.findall(contract)
+        for address in cited:
+            if address not in addresses:
                 errors.append(
-                    f"{path.relative_to(ROOT)}: H1 must match frontmatter id and title"
+                    f"{relative}: Contract line cites {address}, which docs/dev/contract.md does not define"
                 )
-
-        track = scalar(values.get("track", ""))
-        status = scalar(values.get("status", ""))
-        implementation = scalar(values.get("implementation", ""))
-        if track not in RFC_TRACKS:
-            errors.append(f"{path.relative_to(ROOT)}: invalid RFC track {track!r}")
-        if status not in RFC_STATUSES:
-            errors.append(f"{path.relative_to(ROOT)}: invalid RFC status {status!r}")
-        if implementation not in RFC_IMPLEMENTATION:
+        if contract and not cited and not contract.startswith("none"):
             errors.append(
-                f"{path.relative_to(ROOT)}: invalid implementation state {implementation!r}"
-            )
-        records[number] = (title, track, status, implementation)
-        if status == "superseded" and values.get("superseded_by", "") == "[]":
-            errors.append(
-                f"{path.relative_to(ROOT)}: superseded RFC must name superseded_by"
-            )
-        if status == "draft" and implementation == "complete":
-            errors.append(
-                f"{path.relative_to(ROOT)}: completed implementation cannot remain draft"
-            )
-        for key in ("created", "updated"):
-            if key in values and not valid_date(values[key]):
-                errors.append(
-                    f"{path.relative_to(ROOT)}: {key} must be an ISO date"
-                )
-        if values.get("authors", None) != "":
-            errors.append(
-                f"{path.relative_to(ROOT)}: authors must use the template's YAML list form"
-            )
-        for key in ("supersedes", "superseded_by"):
-            for target in list_ids(values.get(key, "")):
-                references.append((path, key, target))
-
-        if f"]({path.name})" not in registry:
-            errors.append(
-                f"{path.relative_to(ROOT)}: RFC is missing from docs/rfcs/README.md registry"
+                f"{relative}: Contract line cites no address; write 'none' and the invariant it serves"
             )
 
-    for path, key, target in references:
-        if target not in seen:
-            errors.append(
-                f"{path.relative_to(ROOT)}: {key} references missing RFC {target}"
-            )
+        for raw in re.findall(r"`([^`]+)`", fields.get("Code", "")):
+            target = raw.split("::", 1)[0]
+            if "/" in target and not (ROOT / target).exists():
+                errors.append(f"{relative}: Code line names {raw}, which does not exist")
 
-    registry_rows: dict[str, tuple[str, str, str, str, str]] = {}
-    row_pattern = re.compile(
-        r"^\| \[(\d{4}-\d{2}-\d{2}|\d{4})\]\(([^)]+)\) \| (.*?) \| "
-        r"(public|maintainer) \| (draft|accepted|rejected|superseded) \| "
-        r"([^|]+?) \|$",
-        re.MULTILINE,
-    )
-    for match in row_pattern.finditer(registry):
-        label, filename, title, track, status, implementation = match.groups()
-        if filename in registry_rows:
-            errors.append(f"docs/rfcs/README.md: duplicate registry row for {filename}")
-            continue
-        registry_rows[filename] = (
-            label,
-            re.sub(r"[`*_]", "", title).strip(),
-            track,
-            status,
-            implementation.strip(),
-        )
-    for number, path in seen.items():
-        row = registry_rows.pop(path.name, None)
-        if row is None:
-            errors.append(f"docs/rfcs/README.md: registry row missing RFC {number}")
-            continue
-        label, title, track, status, implementation = row
-        expected_title, expected_track, expected_status, expected_implementation = records[number]
-        expected_title = re.sub(r"[`*_]", "", expected_title).strip()
-        expected_label = number if len(number) == 4 else number[:10]
-        if label != expected_label or (
-            title,
-            track,
-            status,
-            implementation,
-        ) != (
-            expected_title,
-            expected_track,
-            expected_status,
-            expected_implementation,
-        ):
-            errors.append(
-                f"docs/rfcs/README.md: registry row for RFC {number} disagrees with its file"
-            )
-    for filename in registry_rows:
-        errors.append(f"docs/rfcs/README.md: registry references missing RFC {filename}")
+        clean = strip_fenced_code(text)
+        for pattern, reason in DECISION_FORBIDDEN.items():
+            match = re.search(pattern, clean)
+            if match:
+                line = clean.count("\n", 0, match.start()) + 1
+                errors.append(f"{relative}:{line}: {reason}")
 
 
 def check_locations(files: list[Path], errors: list[str]) -> None:
     for path in files:
         relative = path.relative_to(ROOT)
-        name = path.name.lower()
-        if ".pre-merge-draft." in name:
-            errors.append(f"{relative}: duplicate RFC draft snapshots are not allowed")
-        if re.search(r"(?:^|[-_])rfc[-_]?\d", name) and path.parent != RFC_DIR:
-            errors.append(f"{relative}: project RFCs must live directly in docs/rfcs/")
         if relative.parts and relative.parts[0] == "docs" and "internal" not in relative.parts:
             text = path.read_text(encoding="utf-8")
             if re.search(r"\bRFC-\d{1,4}\b", text) or re.search(
@@ -543,7 +405,8 @@ def main() -> int:
         or path in {ROOT / "AGENTS.md", ROOT / "README.md"}
     ]
     check_links(link_files, errors)
-    check_rfcs(errors)
+    check_decisions(errors)
+    check_budgets(files, errors)
     check_conflict_markers(files, errors)
     check_user_boundary(files, errors)
     check_skill_version(errors)

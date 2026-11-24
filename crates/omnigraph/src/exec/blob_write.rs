@@ -1,11 +1,30 @@
-//! Blob cell writes (RFC 0033 Phase 3): replace one cell with managed bytes,
-//! or clear it, on an existing node or edge addressed by exact id.
+//! Blob cell writes: replace one cell with managed bytes, or clear it, on an
+//! existing node or edge addressed by exact id.
 //!
 //! A cell write is not a new writer kind. It stages the row's replacement
 //! through Mutation's staging and validation, commits it detached and publishes
 //! it once through the Mutation tail. Lance has no single-cell Blob write, so
 //! the whole row is replaced and every other Blob cell of the row is carried by
 //! value, under the rule a `.gq` update follows.
+//!
+//! The row is rebuilt from one scan of the exact id that omits the target
+//! column, so the target's old payload is never read or charged. The new
+//! value is a logical `{data, uri}` struct whose `LargeBinary` child adopts
+//! the caller's `Bytes` without a copy.
+//!
+//! The precondition is evaluated against the attempt's base: the ETag is
+//! computed from the base table version the attempt opened, as
+//! `Omnigraph::read_blob_at` computes it. A publication that changed no row
+//! (an optimize, an index build) between the attempt's capture and its gates
+//! carries the attempt over it, unless the rewrite replaced the row's
+//! fragment. A pre-effect `ReadSetChanged` re-prepares the whole attempt
+//! under the branch's writer gates, re-reading the cell, re-evaluating the
+//! precondition and re-carrying the row, within the writers' re-prepare
+//! bound; a re-prepared attempt that sees another native branch identifier or
+//! accepted schema returns `ReadSetChanged`. The receipt's ETag is read from
+//! the detached version the commit returned, before the manifest CAS, so
+//! nothing after publication reads storage and a later write cannot change
+//! it.
 
 use std::sync::Arc;
 

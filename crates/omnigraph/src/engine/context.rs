@@ -470,6 +470,18 @@ fn capped_like_spilling(consumer: &MemoryConsumer) -> bool {
 /// Cap each spilling reservation, and a sort's merge reservation, at half the
 /// query budget and total admission at the full budget. Admission locks before
 /// the inner pool's ledger locks.
+///
+/// The half makes an accumulating sort spill before it takes the space its
+/// batch producer needs: with the merge's `sort_spill_reservation_bytes` at
+/// most a sixteenth of the budget from 8 MiB up, the sort holds at most nine
+/// sixteenths while its batches accumulate, and the producer of its input has
+/// the rest; above its two-file minimum a merge grows one
+/// spill-file read buffer at a time and reads fewer files per pass when
+/// refused, so without the cap it could take nearly the whole budget from the
+/// graph work consuming its output. The cap is per reservation, not per
+/// consumer. A reservation that cannot spill and is no sort merge (such as
+/// `SortPreservingMergeExec[n]`) has no half cap. Every reservation of the
+/// query uses this one tracked pool.
 #[derive(Debug)]
 struct SpillHeadroomPool {
     inner: TrackConsumersPool<FairSpillPool>,

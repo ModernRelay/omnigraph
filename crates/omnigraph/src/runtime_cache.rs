@@ -38,6 +38,10 @@ struct GraphIndexTableState {
     table_version: u64,
     /// The detached pin the version resolves to: `table_version` is a
     /// per-lineage counter, so two branches share it with different pins.
+    /// Graph tables never carry a branch's own Lance ref (a branch write
+    /// stages detached on the inherited ref), so a recreated branch's tables
+    /// can repeat a deleted branch's version numbers; every write's new
+    /// random pin keeps their keys apart, and eviction only frees memory.
     staged_version: Option<u64>,
     table_branch: Option<String>,
     /// Lance manifest incarnation token for this edge table version, where the
@@ -122,9 +126,11 @@ impl RuntimeCache {
     /// after the write, and a written table's next read misses on its new
     /// stamp anyway. The shelf stays: `shelf_serve` verifies each requested
     /// table's current stamp, so it stops serving a written table and keeps
-    /// serving untouched ones. A branch create or delete clears nothing (it
-    /// changes no key); a refresh, schema apply and optimize still clear
-    /// everything through `invalidate_all`.
+    /// serving untouched ones. A publish of an unpublished commit passes every
+    /// edge table its commit lists. A branch create or delete clears nothing
+    /// (it changes no key), so a deleted branch's indexes stay until the LRU
+    /// of eight entries drops them; a refresh, schema apply, optimize and the
+    /// system-column upgrade clear everything through `invalidate_all`.
     pub async fn invalidate_edge_tables<'a>(&self, table_keys: impl IntoIterator<Item = &'a str>) {
         let written: std::collections::HashSet<&str> = table_keys.into_iter().collect();
         if written.is_empty() {
