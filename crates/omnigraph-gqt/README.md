@@ -52,14 +52,17 @@ environments:
 
 With schema and seed, the complete scenario executes against a fresh graph
 for each environment. These two target/storage combinations are implemented,
-and a third: `omnigraph-engine-dst` with `storage: s3-compatible` runs the
-case on a simulated bucket, an in-memory store the engine reaches at an
-`s3://` root through the paths a real bucket takes (the control adapter's S3
-client and Lance's `s3` store), with no endpoint and no network; `--store` is
-refused there, since the bucket starts empty.
-With `--store`, direct engine execution opens an existing `file://`, `s3://`
-or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
-`azure-blob-storage` backend. It skips initialization, seed loading and
+and two more: `omnigraph-engine-dst` with `storage: s3-compatible` or
+`storage: google-cloud-storage` runs the case on a simulated bucket, an
+in-memory store the engine reaches at an `s3://` or `gs://` root through the
+paths a real bucket takes (the control adapter's client and Lance's store of
+that scheme), with no endpoint and no network. The simulated GCS bucket
+conditions writes on the object generation and refuses a write conditioned on
+its ETag, as Google Cloud Storage does. `--store` is refused there, since the
+bucket starts empty.
+With `--store`, direct engine execution opens an existing `file://`, `s3://`,
+`az://` or `gs://` root matching the declared `local-filesystem`,
+`s3-compatible`, `azure-blob-storage` or `google-cloud-storage` backend. It skips initialization, seed loading and
 automatic index building; ordinary steps may change the supplied store, and
 seams and concurrent blocks are refused there. An `omnigraph-engine-dst`
 environment takes `--store` with a `file://` root instead: the in-memory

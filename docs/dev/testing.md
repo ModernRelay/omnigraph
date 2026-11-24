@@ -55,9 +55,9 @@ which own hermetic configuration, binary startup and temporary roots. Do not
 copy that setup into a new suite.
 
 Cloud suites skip unless their environment is set (`OMNIGRAPH_S3_TEST_BUCKET`,
-`OMNIGRAPH_AZURE_TEST_CONTAINER` and the documented credentials). A configured
-CI backend treats a skip as failure, and a local file pass does not qualify S3
-or Azure.
+`OMNIGRAPH_AZURE_TEST_CONTAINER`, `OMNIGRAPH_GCS_TEST_BUCKET` and the documented
+credentials). A configured CI backend treats a skip as failure, and a local
+file pass does not qualify S3, Azure or Google Cloud Storage.
 
 ## Lance compatibility
 

@@ -2305,6 +2305,10 @@ fn dst_report(
             storage: crate::runner_config::Storage::S3Compatible,
             ..
         } => "s3://gqt-dst/case",
+        crate::runner_config::Execution::Dst {
+            storage: crate::runner_config::Storage::GoogleCloudStorage,
+            ..
+        } => "gs://gqt-dst/case",
         _ => "shared-memory://gqt-dst/case",
     };
     let environment = omnigraph_dst::memory::MemoryEnvironment::new(

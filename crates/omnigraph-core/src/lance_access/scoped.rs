@@ -18,9 +18,11 @@ pub(super) fn registry(scope: StorageIoScope) -> Arc<ObjectStoreRegistry> {
 }
 
 /// Put the scope over every provider `registry` holds for the schemes it
-/// covers, whatever those providers already wrap.
+/// covers, whatever those providers already wrap: every scheme a storage
+/// root can name (`omnigraph_storage::StorageKind`), and the aliases Lance
+/// resolves them through.
 pub(super) fn wrap_providers(registry: &ObjectStoreRegistry, scope: StorageIoScope) {
-    for scheme in ["file", "file-object-store", "s3", "az", "abfss"] {
+    for scheme in ["file", "file-object-store", "s3", "az", "abfss", "gs"] {
         if let Some(inner) = registry.get_provider(scheme) {
             registry.insert(
                 scheme,
@@ -129,6 +131,66 @@ impl ObjectStoreProvider for ScopedProvider {
 mod tests {
     use super::*;
     use object_store::ObjectStoreExt;
+    use std::collections::HashMap;
+
+    /// A closed lifetime refuses a Lance write on every remote scheme a
+    /// storage root can name before any request leaves. Each endpoint is a
+    /// closed local port and each credential a fixed fake one, so a store
+    /// outside the scope fails with a connection error instead of the
+    /// scope's refusal, and never reads the developer's own credentials.
+    #[tokio::test]
+    async fn closed_lifetime_refuses_remote_lance_writes_issue_1461() {
+        let scope = StorageIoScope::new();
+        let registry = registry(scope.clone());
+        scope.close();
+        for (uri, options) in [
+            (
+                "s3://bucket/graph",
+                vec![
+                    ("aws_endpoint", "http://127.0.0.1:9"),
+                    ("aws_region", "us-east-1"),
+                    ("aws_access_key_id", "test"),
+                    ("aws_secret_access_key", "test"),
+                    ("allow_http", "true"),
+                ],
+            ),
+            (
+                "gs://bucket/graph",
+                vec![
+                    ("google_base_url", "http://127.0.0.1:9"),
+                    // Lance's static-token option; it bypasses the
+                    // application-default chain.
+                    ("google_storage_token", "test"),
+                    ("allow_http", "true"),
+                ],
+            ),
+        ] {
+            let options: HashMap<String, String> = options
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            let params = ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(options),
+                )),
+                ..Default::default()
+            };
+            let (store, path) = ObjectStore::from_uri_and_params(registry.clone(), uri, &params)
+                .await
+                .unwrap();
+            let refused = store
+                .inner
+                .put(&path.clone().join("late.json"), b"late".as_slice().into())
+                .await
+                .unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("storage mutation admission is closed"),
+                "{uri}: {refused}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn closed_lifetime_rejects_cached_and_new_store_writes() {

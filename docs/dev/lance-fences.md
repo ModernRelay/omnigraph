@@ -729,8 +729,10 @@ mapping)
 ### Manifest request resolution
 
 Lance 13 writes a version's manifest with one put-if-absent through the
-dataset's `CommitHandler` (`ConditionalPutCommitHandler` on local Unix, S3 and
-Azure roots). It writes the transaction file first and propagates that put's
+dataset's `CommitHandler` (`ConditionalPutCommitHandler` on local Unix, S3,
+Azure and Google Cloud Storage roots; on GCS the put-if-absent is
+`x-goog-if-generation-match: 0`, whose 412 `object_store` reports as "already
+exists"). It writes the transaction file first and propagates that put's
 failure through a plain `?`, so no manifest request was sent. On a failed
 manifest put it reads the version back (`verify_commit_outcome`), and because
 that handler calls a missing version definitive
