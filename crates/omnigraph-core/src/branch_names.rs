@@ -109,9 +109,12 @@ pub fn ensure_logical_branch_name(logical: &str) -> Result<()> {
 /// read through the suffix, and one stricter: a name ending in `/` is
 /// refused although Lance admits `{name}.{ULID}`, because
 /// [`split_native_branch_name`] cannot split that ref back to the name, so
-/// the branch would list under its native ref and resolve by no name. Only a
-/// create applies the rule: reads keep resolving every live name, legacy
-/// refs (native == logical) included.
+/// the branch would list under its native ref and resolve by no name. Lance's
+/// other checks cannot fire on a minted ref and so are not repeated here: it
+/// always ends in the 26-character ULID, so it never ends in `.lock` and is
+/// never `main`, and `\` is already refused as a character. Only a create
+/// applies the rule: reads keep resolving every live name, legacy refs
+/// (native == logical) included.
 pub fn ensure_new_branch_name(logical: &str) -> Result<()> {
     ensure_logical_branch_name(logical)?;
     let refuse = |rule: String| {
@@ -130,8 +133,11 @@ pub fn ensure_new_branch_name(logical: &str) -> Result<()> {
     if logical.split('/').any(str::is_empty) {
         return refuse("has an empty segment; '/' must separate non-empty segments".to_string());
     }
-    if logical.contains("..") || logical.ends_with('.') {
-        return refuse("contains '..' or ends in '.'".to_string());
+    if logical.contains("..") {
+        return refuse("contains '..'".to_string());
+    }
+    if logical.ends_with('.') {
+        return refuse("ends in '.'".to_string());
     }
     Ok(())
 }
