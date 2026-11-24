@@ -77,8 +77,10 @@ fix.
 | elements, `return` items, order keys, arguments or assignments separated by whitespace | commas | `Q016` |
 | `not { P }` | `not exists { P }` in `where` | `Q012` |
 | `not { φ }`, a block holding only filters, `not { $p.age > 30 }` | `not coalesce(φ, false)`, which keeps the rows a null `φ` kept | `Q012` |
-| a block whose only element re-mentions an outer binding to filter it, `not exists { $p: Person where $p.name = "bob" }` | that filter, `not ($p.name = "bob")`, or `not coalesce($p.age > 30, false)` where the predicate can be null | `T68` |
-| a block's filter clauses | the block's own `where`, inside its braces | `Q017` |
+| a block whose only element re-mentions an outer binding to filter it, `not exists { $p: Person where $p.name = "bob" }` | that filter, `not ($p.name = "bob")`, or `not coalesce($p.age > 30, false)` where the predicate can be null; under `count` or an aggregate, the scalar the block folds to, as in the next row | `T68` |
+| a block holding only filters under `exists`, `count` or an aggregate, `count { $p.age > 30 } > 0` | the scalar the block folds to over the one row it tests: `coalesce(φ, false)` for `exists`, `if(coalesce(φ, false), 1, 0)` for `count`, `if(coalesce(φ, false) and e is not null, 1, 0)` for `count(e)`, `if(coalesce(φ, false), e, null)` for `min` and `max`, and the same over `cast(e, F64)` for `sum` and `avg`; `collect`, `stddev` and `percentile` print no edit | `Q017` |
+| a block's filter clauses, beside its other elements | the block's own `where`, inside its braces | `Q017` |
+| a block among the elements naming a variable that only a later element binds, `$p: Person  exists { $p knows $x }  $x: Company` | the block kept where it was written as `let $block = exists { … }`, and the conjunct `$block`: a block among the elements correlated only on the names bound before it, and in the `where` it would read the later binding | `Q017` |
 | a block, `optional` or inline read naming a new variable only in a triple, `count { $p worksAt $c }` | the binding inserted with the edge's end type, `count { $c: Company, $p worksAt $c }` | `T84` |
 | a triple written against its edge's declared direction, `$c worksAt $p` | the ends swapped, `$p worksAt $c` | `T82` |
 | two pattern components that share no variable, neither key-pinned | a triple joining them, or the product as a named relation drawn with `from` | `T81` |
@@ -89,12 +91,13 @@ fix.
 | `fuzzy($x.t, $q)`, `fuzzy($x.t, $q, n)` | `match_terms($x.t, terms($q, mode: any, max_edits: 2))`, or `max_edits: n` for the third argument (none for `0`); every removed lexical call's fix is a machine edit | `T6` |
 | `delete T where φ` | `match { $x: T } where φ′  delete $x`: each bare property is written `$x.p`, and an edge's `from` and `to` are `$x.@src` and `$x.@dst` | `Q008` |
 | `update T set { … } where φ` | `match { $x: T } where φ′  update $x set { … }`, a bare property in an assignment written `$x.p` | `Q008` |
-| a body of several statements | one group per statement, in order, each opening with its `match`; consecutive statements with no `match` between them stay one group | `Q008` |
-| `insert T { … }` over a type with `@key` | `replace T { … }`, which means what that `insert` meant; narrow it to `insert` where only creation is meant, or `upsert` where only the named properties should change | none: it compiles, and on an existing key fails at run time with `key_conflict`, naming `upsert` and `replace`, changing no data |
+| a body of several statements | one group per `update … where` and `delete … where`, in order, each opening with its `match`; a statement that selects nothing of its own (an `insert`) stays in the group it was written in, ahead of the groups the fix opens, so it runs once rather than once per selected row. A later group that selects a type an earlier statement changes is refused (`T91`, below) | `Q008` |
+| `insert T { … }` over a type with `@key` | `replace T { … }`, which means what that `insert` meant; narrow it to `insert` where only creation is meant, or `upsert` where only the named properties should change | none: it compiles, and on an existing key, or on a key an earlier statement of the same write inserted (where the older release kept the last row), fails at run time with `key_conflict`, naming `upsert` and `replace`, changing no data |
 | `from:` and `to:` in an edge insert | `@src:` and `@dst:` | `T11` |
 | `omnigraph load --mode append`, `load csv … mode append` | `insert` | the CLI's and HTTP's mode refusal, `Q004` |
 | `--mode merge`, `mode merge` | `replace` | the same |
 | a quoted edge name, `$d "in" $x` | the bare name, `$d in $x` (the quoted name is still accepted) | none |
+| a read named after a registry function or an element keyword, `query count()`; a read named `search`, `match_text` or `fuzzy` whose body makes that call | the read renamed to the first `<name>_<n>` from 2 no declaration uses, `count_2`, printed for review since a caller invokes a read by its name; renamed, the call is the older function again and prints its own fix | `T74`; `T69` for the call |
 
 The fix for `$x` picks a name the declaration does not use. A rewrite reads
 the schema: `contains` over a list and over a `String` are different tests.
@@ -139,9 +142,11 @@ query near($v: Vector(3)) {
 | a ranking under an aggregate or `return distinct` | the ranking drawn with `from`, its `k` the old `limit`, and `limit` the cut of the groups; the refusal prints the form without an edit |
 
 The edit also inserts the binding of every name a population's triple
-introduces. It is written only when the read gives it every piece: a `limit`
-to size a `nearest` window, the same call wherever the ranking appears, and
-no aggregate or `distinct`. The `rrf` form ranks the whole type in each arm,
+introduces. For `rrf` it reads the ranked binding's type from its binding, or
+from the end of the edge whose triple alone introduces it, and takes the
+older third argument, `rrf(a, b, 60)`, as `k`. It is written only when the
+read gives it every piece: a `limit` to size a `nearest` window, the same call
+wherever the ranking appears, and no aggregate or `distinct`. The `rrf` form ranks the whole type in each arm,
 which keeps the rows the older read returned; a read written new ranks its
 population instead ([Fusion](../search/fusion.md#populations)).
 
@@ -210,6 +215,20 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
 - A bound plan saved by an earlier release is refused with "unsupported bound
   plan version …; regenerate the saved plan": regenerate it from the query
   ([Explain](explain.md)).
+- Every group of a write selects on the snapshot the write started from, where
+  the older release ran its statements in order. A write whose `update … where`
+  or `delete … where` reads a type an earlier statement of the same write
+  changes is refused (`T91`), with no edit: no single write means the same.
+  Split it into two writes, or write the final row in one keyed statement.
+- `fuzzy(f, q, n)` with `n` above 2 is refused (`T71`: `max_edits` is 0 to 2)
+  with no edit. The older release searched with any budget, and no GQ 3 form
+  matches more than two edits; choose a budget of 2 or less by hand, which
+  can match fewer rows.
+- Three texts the older release refused now run: an empty list `[]` assigned
+  to a list property of any element type (it was typed `[String]`, `T3`); a
+  whole-number float literal assigned to an integer property, `n: 100.0`,
+  stored as `100` (it failed at run time; a fractional one is still refused);
+  and a float literal with an exponent, `4.6e+18` (a parse error, `Q001`).
 
 ## Schemas
 

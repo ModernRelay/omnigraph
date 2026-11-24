@@ -766,16 +766,19 @@ Rewrite what it leaves from the fix and this map:
 | a filter in `match`; `$x: T { p: v }` | `match { $x: T } where $x.p = v and …` (over a list property, then `"v" in $x.p`, `T7`) | `Q017`, `Q010` |
 | items separated by whitespace | commas | `Q016` |
 | `not { P }` | `not exists { P }` in `where`; `not { φ }` holding only filters is `not coalesce(φ, false)` | `Q012` |
-| `not exists { $p: Person where φ }` (re-mentions an outer binding) | `not (φ)`, or `not coalesce(φ, false)` when φ can be null | `T68` |
+| `not exists { $p: Person where φ }` (re-mentions an outer binding) | `not (φ)`, or `not coalesce(φ, false)` when φ can be null; under `count` or an aggregate, the fold of the next row | `T68` |
+| a block of filters alone, `count { $p.age > 3 } > 0` | the scalar the block folds to over its one row: `exists` `coalesce(φ, false)`, `count` `if(coalesce(φ, false), 1, 0)`, `min`/`max` `if(…, e, null)`, `sum`/`avg` over `cast(e, F64)` | `Q017` |
+| a block in `match` naming a variable only a later element binds | kept in place as `let $block = exists { … }` with the conjunct `$block` | `Q017` |
 | a block's or `optional`'s triple naming a new variable | bind it inside: `count { $c: Company, $p worksAt $c }` | `T84` |
 | `optional { $f: Person, $p knows $f }, $f worksAt $c` | `optional { $f: Person, $p knows $f, $c: Company, $f worksAt $c }`, or no `optional` for the inner join | `T90` |
 | `$c worksAt $p` against `WorksAt: Person -> Company` | `$p worksAt $c` | `T82` |
 | `$x.t contains "g"`, list `$x.tags contains "r"`, `$x.t starts_with "O"` | `contains($x.t, "g")`, `"r" in $x.tags`, `starts_with($x.t, "O")` | `T7` |
 | `search(f, q)`, `match_text(f, q)`, `fuzzy(f, q[, n])` | `match_terms(f, terms(q, mode: any))`, fuzzy with `max_edits: 2` (or `n`) | `T6` |
-| `delete T where p = v`, `update T set { … } where …` | `match { $x: T } where $x.p = v  delete $x` / `update $x set { … }`; `from`/`to` are `$x.@src`/`$x.@dst` | `Q008` |
+| `delete T where p = v`, `update T set { … } where …` | `match { $x: T } where $x.p = v  delete $x` / `update $x set { … }`; `from`/`to` are `$x.@src`/`$x.@dst`; an `insert` written after it stays ahead of the new group, so it runs once | `Q008` |
 | `order { nearest($d.e, $q) } limit n` | `match { let $pop = { match { $d: Doc } where φ return { $d } }, from nearest($pop, $d.e, $q, k: n) as $distance } … order { $distance } limit n` | `T65` |
 | `order { bm25($d.t, $q) }` | `from bm25($pop, $d.t, $q) as $score` … `order { $score desc }` | `T65` |
-| `order { rrf(nearest(…), bm25(…), 60) }` | `let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, …, k: n), bm25($all, …), k: 60) as $score` | `T65` |
+| `order { rrf(nearest(…), bm25(…), 60) }` | `let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, …, k: n), bm25($all, …), k: 60) as $score`; the ranked binding's type comes from its triple's edge when no binding names it | `T65` |
+| `query count()`, a read named after a function or keyword | renamed for review, `count_2` (callers invoke it by that name) | `T74`, `T69` |
 | unaliased ranking in `return` (column `d._distance`, `d._score`) | `$distance as _distance`, `$score as _score` (`bm25` scores are now `F64`) | `T65` |
 
 Moved codes: `T2` (unknown property in a read) and `T11` in a write's `where`
@@ -786,7 +789,11 @@ in `return` (`T35`) runs as a Boolean; `T32`/`T33`/`T54` are `T65`; `T58` is `T9
 `T59` is `T75`; a bare name (`T45`, `T36`) is `Q018`; `lint` parse refusals
 carry their own `Q…` code instead of `Q000`. A read named after a function
 (`lower`, `length`, `round`, …) or an element keyword is `T74`; over grouped rows every order key must be returned
-(`T42`). The full map is the user guide's "Upgrading queries to GQ 3" page.
+(`T42`). With no fix: a later `update`/`delete … where` reading a type an
+earlier statement of the write changed (`T91`: split the write), and
+`fuzzy(…, n)` with `n` above 2 (`T71`). Two keyed inserts of one key in one
+write fail with `key_conflict`. The full map is the user guide's "Upgrading
+queries to GQ 3" page.
 
 ## Naming Convention
 

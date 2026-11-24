@@ -185,7 +185,7 @@ expected format instead, without an edit.
 | `Q005` | A declaration body is refused; `expected` names the construct. |
 | `Q006` | The source nests too deeply, checked before the grammar runs: more than 2,048 levels of brackets, `case`s and adjacent prefix operators (`not`, `!`, unary `-`), or an expression deeper than 16,384 levels when each `and`/`or` of a chain and each operator of an arithmetic or comparison chain also counts one. Each expression is measured alone, so sibling write groups, arguments and assignments never add up. Write a long `or` chain over one property as `$p.name in [...]`. |
 | `Q007` | A traversal is written with an arrow; the fix is the triple. |
-| `Q008` | An `update` or `delete` statement carries a `where`; the fix is the group's `match` and `where`, as in `match { $x: Person } where $x.email = $e  delete $x`. |
+| `Q008` | An `update` or `delete` statement carries a `where`; the fix is the group's `match` and `where`, as in `match { $x: Person } where $x.email = $e  delete $x`. A statement written after it that selects nothing of its own (an `insert`) stays ahead of the group the fix opens, so it runs once, not once per selected row. |
 | `Q009` | `mutation` is not a declaration keyword; the fix is `query`. |
 | `Q010` | A binding carries a property map or braces; the fix is the binding and the conjunct in `where`, `match { $p: Person } where $p.handle = $h`. |
 | `Q011` | A read body carries `as commit` or `as unattached branch`. |
@@ -194,7 +194,7 @@ expected format instead, without an edit.
 | `Q014` | A spelling from another language (`==`, `&&`, `!`, `count(*)`, `like`, …); the fix prints the GQ form. `case`, `\|\|`, `<>`, single quotes and another letter case are accepted ([other spellings](functions.md#other-accepted-spellings)). |
 | `Q015` | A form the language does not have yet; the message names it. |
 | `Q016` | Two elements, return items, order keys, call arguments or assignments are separated by whitespace alone; the fix is the comma. |
-| `Q017` | A filter, a `where` or a comparison inside the `match` braces; the fix moves it to the `where` after them, joined with `and`. |
+| `Q017` | A filter, a `where` or a comparison inside the `match` braces; the fix moves it to the `where` after them, joined with `and`. A block that holds only filters binds nothing: the fix writes the scalar it folds to over the row it tests, `if(coalesce(φ, false), 1, 0)` for `count { φ }`. A block that names a variable only a later element binds stays where it was written, as `let $block = …`. |
 | `Q018` | A bare name where a value is read; a bare name is a return alias in `order` only. |
 | `Q019` | A call named by a keyword or a reserved word (`exists(x)`, `where(…)`, `and(a, b)`), or `from` over a parenthesized relation. |
 | `Q020` | A read body's parts are missing, misplaced or unbraced. |
