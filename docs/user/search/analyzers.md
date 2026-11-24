@@ -61,8 +61,12 @@ software version, so upgrading Omnigraph never changes it. An index stores no
 term positions, which its certificate records and the fingerprint does not.
 The certificate also records a fingerprint of the terms the index's analysis
 produced over a fixed set of probe texts, which a later binary must reproduce
-before it may use the index. An index built before its field had a profile is
-rebuilt with the profile by `omnigraph index rebuild`.
+before it may use the index. A full-text index an earlier release built,
+before its field had a profile, is not replaced by declaring
+`@index(fulltext, ...)` on the field: the apply leaves it, and `omnigraph index
+build` counts it as built and neither rebuilds nor reports it. `omnigraph index
+rebuild --kind full-text` rebuilds it with the profile; no read waits for that,
+since none reads the index.
 
 Only `@index(fulltext, ...)` builds a full-text index. A plain `@index` on a
 free-text String builds an NGRAM and a BTREE, and a `@key` alone a BTREE
@@ -72,8 +76,9 @@ index. Replacing `@index(fulltext)` by a plain `@index` is a schema change
 applied in place that leaves the built index as it is. So does opening a graph
 whose earlier release built a full-text index for a plain `@index` or a `@key`.
 Such an index is left in place: no read uses it, no write declares a segment for
-it, an index pass neither removes nor refreshes it and reports it pending once
-rows outpace it, and `omnigraph index rebuild --kind full-text` replaces it.
+it, an index pass neither removes, refreshes nor reports it as pending however
+far rows outpace it, and `omnigraph index rebuild --kind full-text` replaces it.
+An earlier binary's own full-text reads keep using it until then.
 Declare `@index(fulltext)` to keep one built and current.
 
 ## Exact matching and scoring
