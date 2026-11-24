@@ -807,6 +807,37 @@ fn named_non_ranking(rel: &RelExpr, name: &str, span: Option<&SourceSpan>) -> Qu
     d
 }
 
+/// `d`, a refusal of `decl`'s name, with the fix that renames the
+/// declaration to the first `<name>_<n>` from 2 that no declaration of the
+/// source unit uses, as `T83` renames a repeated one. For review: a caller
+/// selects a declaration by its name, and a stored query's name is how its
+/// callers invoke it.
+fn renamed_declaration(
+    d: QueryDiagnostic,
+    decl: &Decl,
+    unit: &HashMap<String, &Decl>,
+) -> QueryDiagnostic {
+    let name = &decl.name;
+    let fresh = (2..)
+        .map(|n| format!("{name}_{n}"))
+        .find(|candidate| !unit.contains_key(candidate))
+        .expect("an unbounded range holds a name no declaration uses");
+    if decl.at.end <= decl.at.start {
+        return d.with_fix(format!("rename the read, for example to `{fresh}`"));
+    }
+    d.with_fix(format!(
+        "rename the read to `{fresh}`, and invoke it by that name"
+    ))
+    .with_suggestion(Suggestion {
+        applicability: Applicability::NeedsReview,
+        edits: vec![TextEdit {
+            start: decl.at.start,
+            end: decl.at.end,
+            replacement: fresh,
+        }],
+    })
+}
+
 /// `T65`: a ranking written as a scalar call, in `order`, `return` or a
 /// filter; the fix draws it with `from` and reads its score column.
 fn ranking_as_scalar(name: &str) -> QueryDiagnostic {
@@ -2190,13 +2221,17 @@ impl Ctx<'_> {
         let top = self.frames.len() == 1;
         let mark = self.refusals.len();
         if is_registry_name(&decl.name) || CLAUSE_KEYWORDS.contains(&decl.name.as_str()) {
-            let refused = err(
-                T74,
-                format!(
-                    "a declared read may not be named `{}`, which is a registry row or an element keyword",
-                    decl.name
+            let refused = E::D(renamed_declaration(
+                QueryDiagnostic::typecheck(
+                    T74,
+                    format!(
+                        "a declared read may not be named `{}`, which is a registry row or an element keyword",
+                        decl.name
+                    ),
                 ),
-            );
+                decl,
+                self.unit,
+            ));
             if !top {
                 return Err(refused);
             }
@@ -6507,11 +6542,22 @@ impl Ctx<'_> {
                 return Err(E::D(ranking_as_scalar(name)));
             }
             if name == "union" || self.unit.contains_key(name) {
-                return Err(err_fix(
+                let d = QueryDiagnostic::typecheck(
                     T69,
                     format!("`{name}(…)` is a relation; a scalar is read here"),
-                    format!("draw it with `from {name}(…)`, or aggregate over it in a block"),
+                )
+                .with_fix(format!(
+                    "draw it with `from {name}(…)`, or aggregate over it in a block"
                 ));
+                // Edition 2's lexical calls are not registry rows: a read
+                // named after one shadows it, so its own call reads the
+                // read. Renaming the read lets the call mean the function.
+                if matches!(name, "search" | "match_text" | "fuzzy")
+                    && let Some(decl) = self.unit.get(name)
+                {
+                    return Err(E::D(renamed_declaration(d, decl, self.unit)));
+                }
+                return Err(E::D(d));
             }
             if matches!(name, "search" | "match_text" | "fuzzy") {
                 return Err(E::D(removed_lexical_call(c)));

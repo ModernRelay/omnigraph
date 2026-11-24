@@ -2395,6 +2395,45 @@ fn a_grouped_order_key_after_a_refused_item_is_refused_with_its_code() {
     );
 }
 
+/// A read named after a registry row or an element keyword is refused
+/// (`T74`), and so is a read named after an edition-2 lexical call that
+/// calls it in its body (`T69`: the call reads the read). The fix renames
+/// the read, printed for review since callers select a read by its name;
+/// applied, the text compiles or meets the call's own refusal.
+#[test]
+fn a_read_named_after_a_function_is_renamed_for_review() {
+    use crate::query::diagnostic::Applicability;
+    use crate::query::syntax::parse::apply_edits;
+    for (written, code, renamed) in [
+        (
+            "query count() { match { $p: Person } return { $p } }",
+            "T74",
+            "query count_2() { match { $p: Person } return { $p } }",
+        ),
+        (
+            "query count() { match { $p: Person } return { $p } }\nquery count_2() { match { $p: Person } return { $p } }",
+            "T74",
+            "query count_3() { match { $p: Person } return { $p } }\nquery count_2() { match { $p: Person } return { $p } }",
+        ),
+        (
+            "query search($s: String) { match { $d: Doc } where search($d.body, $s) return { $d.title } }",
+            "T69",
+            "query search_2($s: String) { match { $d: Doc } where search($d.body, $s) return { $d.title } }",
+        ),
+    ] {
+        let d = refused_with(written, code);
+        let suggestion = d.suggestion.expect("an edit");
+        assert_eq!(suggestion.applicability, Applicability::NeedsReview);
+        assert_eq!(apply_edits(written, &suggestion.edits), renamed);
+    }
+    // Renamed, `search(…)` is edition 2's lexical call, which prints its own
+    // fix.
+    refused_with(
+        "query search_2($s: String) { match { $d: Doc } where search($d.body, $s) return { $d.title } }",
+        "T6",
+    );
+}
+
 /// A literal compared with a property is checked against the property's
 /// type in every scope that compares, either operand order, and in an `in`
 /// list: `T3`, its edit writing the nearest allowed value where the literal
