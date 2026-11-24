@@ -146,6 +146,10 @@ concepts than the specific one (parsimony).
 Validate every assumption. Do not assume how a function, module or symbol
 behaves: read it. For Lance internals, read the upstream implementation.
 
+Before every design, review the Lance primitives that bear on it and use them
+fully: build beside one only where its upstream source shows it cannot serve
+or a [compatibility fence](docs/dev/lance-fences.md) forbids it.
+
 Reason about Omnigraph from first principles, not from database categories. A
 database is **an observable contract, implemented by physical mechanisms
 optimized for an expected distribution of work**. State which contract and
