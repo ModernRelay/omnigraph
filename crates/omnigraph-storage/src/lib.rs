@@ -4227,17 +4227,21 @@ mod tests {
         (endpoint, server)
     }
 
-    /// Serves one HEAD answer per entry of `statuses`, in order, and returns
-    /// how many it served.
-    fn spawn_head_server(statuses: Vec<u16>) -> (String, tokio::task::JoinHandle<usize>) {
+    /// Serves one raw HTTP response per entry of `responses`, in order, each
+    /// to a request whose method is `method`, closing the connection after
+    /// it; returns how many it served.
+    fn spawn_scripted_server(
+        method: &'static str,
+        responses: Vec<Vec<u8>>,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local head server");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local scripted server");
         listener
             .set_nonblocking(true)
-            .expect("configure local head server");
+            .expect("configure local scripted server");
         let endpoint = format!(
             "http://{}",
             listener.local_addr().expect("local server address")
@@ -4245,23 +4249,25 @@ mod tests {
         let server = tokio::task::spawn_blocking(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut served = 0;
-            for status in statuses {
+            for response in responses {
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(connection) => break connection,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < deadline, "head server accept timed out");
+                            if Instant::now() >= deadline {
+                                return served;
+                            }
                             std::thread::sleep(Duration::from_millis(1));
                         }
-                        Err(error) => panic!("head server accept failed: {error}"),
+                        Err(error) => panic!("scripted server accept failed: {error}"),
                     }
                 };
                 stream
                     .set_nonblocking(false)
-                    .expect("configure blocking head connection");
+                    .expect("configure blocking scripted connection");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("configure head server read timeout");
+                    .expect("configure scripted server read timeout");
                 let mut request = [0_u8; 16 * 1024];
                 let mut request_len = 0;
                 while !request[..request_len]
@@ -4270,20 +4276,18 @@ mod tests {
                 {
                     let read = stream
                         .read(&mut request[request_len..])
-                        .expect("read local head request");
-                    assert!(read != 0, "head request ended before its headers");
+                        .expect("read local scripted request");
+                    assert!(read != 0, "scripted request ended before its headers");
                     request_len += read;
                 }
                 assert!(
-                    request[..request_len].starts_with(b"HEAD "),
-                    "the probe must be a real object-store HEAD"
+                    request[..request_len].starts_with(format!("{method} ").as_bytes()),
+                    "expected a real object-store {method}"
                 );
-                write!(
-                    stream,
-                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nETag: \"e\"\r\nLast-Modified: Mon, 23 Nov 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n"
-                )
-                .expect("write local head response");
-                stream.flush().expect("flush local head response");
+                stream
+                    .write_all(&response)
+                    .expect("write scripted response");
+                stream.flush().expect("flush scripted response");
                 served += 1;
             }
             served
@@ -4291,12 +4295,32 @@ mod tests {
         (endpoint, server)
     }
 
-    /// A scoped `s3://` adapter reads through its retrying client whatever
-    /// retry its builder carries: a captured binding's builder and the
-    /// environment's go through the same construction.
-    #[tokio::test]
-    async fn a_scoped_s3_adapter_retries_its_reads_whatever_its_builder_carries() {
-        let (endpoint, server) = spawn_head_server(vec![503, 200]);
+    /// One raw object response; `range` adds a `Content-Range` header.
+    fn object_response(status: u16, range: Option<&str>, length: usize, body: &[u8]) -> Vec<u8> {
+        let range = range.map_or(String::new(), |range| {
+            format!("Content-Range: bytes {range}\r\n")
+        });
+        let mut response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {length}\r\n{range}ETag: \"e\"\r\nLast-Modified: Mon, 23 Nov 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// Serves one HEAD answer per entry of `statuses`, in order, and returns
+    /// how many it served.
+    fn spawn_head_server(statuses: Vec<u16>) -> (String, tokio::task::JoinHandle<usize>) {
+        spawn_scripted_server(
+            "HEAD",
+            statuses
+                .into_iter()
+                .map(|status| object_response(status, None, 0, b""))
+                .collect(),
+        )
+    }
+
+    fn scoped_test_adapter(endpoint: String) -> ObjectStorageAdapter {
         let builder = AmazonS3Builder::new()
             .with_bucket_name("test-bucket")
             .with_region("us-east-1")
@@ -4305,13 +4329,73 @@ mod tests {
             .with_endpoint(endpoint)
             .with_allow_http(true)
             .with_retry(single_attempt_retry_config());
-        let adapter = ObjectStorageAdapter::s3_from_builder(
+        ObjectStorageAdapter::s3_from_builder(
             builder,
             "test-bucket".into(),
             "s3://test-bucket/root",
             Some(StorageIoScope::new()),
         )
-        .expect("scoped S3 adapter");
+        .expect("scoped S3 adapter")
+    }
+
+    /// A body that ends early fails while streaming. The scoped read client's
+    /// retry resumes it with a range request validated by ETag
+    /// (object_store's retrying get stream), so a full read answers from the
+    /// rest. That is the case Lance's outer download retry
+    /// (`download_retry_count`) covers for its own reads; this adapter
+    /// inherits it from its read client instead of repeating it.
+    #[tokio::test]
+    async fn a_scoped_s3_full_read_resumes_a_body_that_ends_early() {
+        let truncated = || object_response(200, None, 5, b"he");
+        let rest = || object_response(206, Some("2-4/5"), 3, b"llo");
+        for read in ["read_text", "read_text_if_exists"] {
+            let (endpoint, server) = spawn_scripted_server("GET", vec![truncated(), rest()]);
+            let adapter = scoped_test_adapter(endpoint);
+            let uri = "s3://test-bucket/root/object";
+            let text = match read {
+                "read_text" => adapter.read_text(uri).await.map(Some),
+                _ => adapter.read_text_if_exists(uri).await,
+            }
+            .unwrap_or_else(|error| panic!("{read}: a resumed read answers: {error}"));
+            assert_eq!(text.as_deref(), Some("hello"), "{read}");
+            assert_eq!(server.await.expect("scripted server"), 2, "{read}");
+        }
+    }
+
+    /// A failure that repeats on every read is answered at once: a denied
+    /// read is not retried, and bytes that are not text fail after one read.
+    #[tokio::test]
+    async fn a_scoped_s3_full_read_does_not_retry_a_failure_that_repeats() {
+        for (response, kind) in [
+            (
+                object_response(403, None, 0, b""),
+                StorageFailureKind::Configuration,
+            ),
+            (
+                object_response(200, None, 2, b"\xff\xfe"),
+                StorageFailureKind::Permanent,
+            ),
+        ] {
+            // One response only: a retry would find no server and fail with
+            // another class, which the class check below refuses.
+            let (endpoint, server) = spawn_scripted_server("GET", vec![response]);
+            let adapter = scoped_test_adapter(endpoint);
+            let error = adapter
+                .read_text("s3://test-bucket/root/object")
+                .await
+                .expect_err("the read fails");
+            assert_eq!(error.failure_kind(), kind, "{error}");
+            assert_eq!(server.await.expect("scripted server"), 1, "{error}");
+        }
+    }
+
+    /// A scoped `s3://` adapter reads through its retrying client whatever
+    /// retry its builder carries: a captured binding's builder and the
+    /// environment's go through the same construction.
+    #[tokio::test]
+    async fn a_scoped_s3_adapter_retries_its_reads_whatever_its_builder_carries() {
+        let (endpoint, server) = spawn_head_server(vec![503, 200]);
+        let adapter = scoped_test_adapter(endpoint);
         assert!(
             adapter
                 .exists("s3://test-bucket/root/object")
