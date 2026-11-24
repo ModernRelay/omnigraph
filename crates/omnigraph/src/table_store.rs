@@ -1278,6 +1278,18 @@ pub(crate) async fn vector_indexes_rank_exactly(
         .all(|index| exact_vector_index_distance(index) == Some(distance)))
 }
 
+/// The name `spec`'s build takes when the engine names it: a companion
+/// BTREE's explicit name, and `{column}_{family}` for a BITMAP, LABEL_LIST or
+/// NGRAM ([`scalar_index_name`]). A build under Lance's default name avoids
+/// the names present, and a full-text or vector build replaces by column.
+fn name_a_build_takes(spec: &IndexBuildSpec) -> Option<String> {
+    match spec {
+        IndexBuildSpec::BTree { name, .. } => name.clone(),
+        IndexBuildSpec::Scalar { column, family } => Some(scalar_index_name(column, *family)),
+        IndexBuildSpec::FullText { .. } | IndexBuildSpec::Vector { .. } => None,
+    }
+}
+
 /// The segments one index batch adds and the segments they replace, all
 /// built from one pinned version and wrapped in one `CreateIndex`.
 #[derive(Default)]
@@ -3569,8 +3581,14 @@ impl TableStore {
                 _ => None,
             })
             .collect();
+        // An index is the declared (column, family) a spec builds, and the
+        // spec's build replaces every segment of the name it takes. A lagging
+        // index under that name is not also folded: an earlier binary that
+        // knew no NGRAM rebuilt `body_ngram` as a BTREE of that name, and a
+        // fold of it beside the NGRAM build would publish the name twice.
+        let replaced: HashSet<String> = specs.iter().filter_map(name_a_build_takes).collect();
         let (mut batch, refreshed, skipped) =
-            Self::index_fold_batch_except(ds, &rebuilt, limit).await?;
+            Self::index_fold_batch_except(ds, &rebuilt, &replaced, limit).await?;
         let mut vector_builds = 0;
         if !specs.is_empty() {
             let (created, builds) = Self::create_index_batch(ds, specs, limit).await?;
@@ -3598,18 +3616,21 @@ impl TableStore {
         ds: &Dataset,
         limit: &MaintenanceBudget,
     ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
-        Self::index_fold_batch_except(ds, &HashSet::new(), limit).await
+        Self::index_fold_batch_except(ds, &HashSet::new(), &HashSet::new(), limit).await
     }
 
-    /// [`Self::index_fold_batch`] leaving out the indexes on `columns`.
+    /// [`Self::index_fold_batch`] leaving out the indexes on `columns` and
+    /// the indexes named `names`, which the batch rebuilds otherwise.
     async fn index_fold_batch_except(
         ds: &Dataset,
         columns: &HashSet<&str>,
+        names: &HashSet<String>,
         limit: &MaintenanceBudget,
     ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
         let lag: Vec<IndexLag> = Self::foldable_index_lag(ds)
             .await?
             .into_iter()
+            .filter(|item| !names.contains(&item.name))
             .filter(|item| {
                 item.fields
                     .first()

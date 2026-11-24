@@ -393,3 +393,131 @@ async fn optimize_shares_one_index_build_budget_across_tables_issue_1385() {
         }
     }
 }
+
+/// An index is the declared (column, family) the engine builds, not the name
+/// it gives it. An earlier binary that knows no NGRAM rebuilds a lagging
+/// `body_ngram` as a BTREE under that name. The next index pass then lacks
+/// the NGRAM and finds the BTREE lagging: the NGRAM's build replaces every
+/// segment of the name, and the BTREE is not also folded under it, which
+/// published the name twice and refused every later pass. The pass leaves
+/// one NGRAM named `body_ngram` beside the declared BTREE, covering every
+/// fragment, and a second pass has nothing to do.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_earlier_binarys_btree_under_the_ngram_name_is_replaced_by_the_ngram() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::scalar::ScalarIndexParams;
+
+    const DOC: &str = "node Doc {\n    k: String @key\n    body: String @index\n}\n";
+    let rows = |from: usize, to: usize, word: &str| {
+        (from..to)
+            .map(|i| format!(r#"{{"type":"Doc","data":{{"k":"d{i}","body":"{word} {i}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, DOC).await.unwrap());
+    db.load_jsonl(&rows(0, 20, "graph"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+    db.load_jsonl(&rows(20, 30, "river"), LoadMode::Replace)
+        .await
+        .unwrap();
+
+    // The earlier binary's fold: `body_ngram` rebuilt as a BTREE.
+    forge_linear_head_from_pin(&db, "main", "node:Doc", 0).await;
+    let table_path = snapshot_main(&db)
+        .await
+        .unwrap()
+        .dataset("node:Doc")
+        .unwrap()
+        .dataset_path
+        .clone();
+    let table_uri = format!("{}/{}", uri.trim_end_matches('/'), table_path);
+    // forbidden-api-allow: test plants the index an earlier binary's fold leaves.
+    let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
+    raw.create_index(
+        &["body"],
+        lance_index::IndexType::BTree,
+        Some("body_ngram".to_string()),
+        &ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
+        .await
+        .unwrap();
+    let planted = snapshot_main(&db)
+        .await
+        .unwrap()
+        .open_dataset("node:Doc")
+        .await
+        .unwrap();
+    assert_eq!(
+        families(&planted, "body").await,
+        ["BTree", "BTree"],
+        "the earlier binary left two BTREEs and no NGRAM"
+    );
+
+    db.load_jsonl(&rows(30, 40, "harbor"), LoadMode::Replace)
+        .await
+        .unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open_dataset("node:Doc").await.unwrap();
+    assert_eq!(families(&ds, "body").await, ["BTree", "NGram"]);
+    let ngram: Vec<_> = ds
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "body_ngram")
+        .map(|index| {
+            index
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(ngram.len(), 1, "one segment named `body_ngram`: {ngram:?}");
+    assert!(ngram[0].ends_with("NGramIndexDetails"), "{ngram:?}");
+    let pinned = open_pinned_dataset_for_test(&db, "main", "node:Doc").await;
+    let current: std::collections::BTreeSet<u32> = pinned
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    for index in ds.load_indices().await.unwrap().iter() {
+        if !index.name.starts_with("body_") {
+            continue;
+        }
+        let covered: std::collections::BTreeSet<u32> = index
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().collect())
+            .unwrap_or_default();
+        assert!(
+            current.is_subset(&covered),
+            "index '{}' covers {covered:?} of {current:?}",
+            index.name
+        );
+    }
+    let version = ds.published_dataset_version();
+    db.ensure_indices_as(None).await.unwrap();
+    let again = snapshot_main(&db)
+        .await
+        .unwrap()
+        .open_dataset("node:Doc")
+        .await
+        .unwrap();
+    assert_eq!(
+        version,
+        again.published_dataset_version(),
+        "a second pass is a no-op"
+    );
+}
