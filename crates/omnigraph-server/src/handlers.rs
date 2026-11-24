@@ -1158,18 +1158,17 @@ pub(crate) async fn server_blob_head(
 /// unchanged. Authorization of `change` on the branch runs before the body is
 /// read. Once admitted the write is owned by the server: a disconnect loses
 /// only the response, never cancels or replays the write.
-///
-/// This is a raw ingress route like `/load/ndjson`: the ingress middleware
-/// reserves the put limit (`AppState::blob_put_limit`) without collecting the
-/// body. The handler checks `Content-Type` (415) and a declared
-/// `Content-Length` against that limit (413) before it polls a byte, then
-/// collects the body under the shared body deadline (408) into one buffer
-/// sized from that length, which the engine's value column adopts; the
-/// ingress reservation shrinks to the received size. The workload admission
-/// and `owned_write` submission match `DELETE`. `BlobWritePreconditionFailed`
-/// maps to 412 with `ErrorCode::PreconditionFailed`, the
-/// `blob_precondition_failure` detail and an `ETag` header, never the
-/// graph-commit `precondition_failure`.
+// This is a raw ingress route like `/load/ndjson`: the ingress middleware
+// reserves the put limit (`AppState::blob_put_limit`) without collecting the
+// body. The handler checks `Content-Type` (415) and a declared
+// `Content-Length` against that limit (413) before it polls a byte, then
+// collects the body under the shared body deadline (408) into one buffer
+// sized from that length, which the engine's value column adopts; the
+// ingress reservation shrinks to the received size. The workload admission
+// and `owned_write` submission match `DELETE`. `BlobWritePreconditionFailed`
+// maps to 412 with `ErrorCode::PreconditionFailed`, the
+// `blob_precondition_failure` detail and an `ETag` header, never the
+// graph-commit `precondition_failure`.
 pub(crate) async fn server_blob_put(
     State(state): State<AppState>,
     Extension(handle): Extension<GraphRequest>,
