@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-29
-updated: 2026-11-19
+updated: 2026-11-24
 discussion: https://github.com/ModernRelay/omnigraph/pull/1214
 supersedes: []
 superseded_by: []
@@ -1653,3 +1653,15 @@ dated pending entry in its decision log:
   known at the failure. The Evidence row that begins “An index link that
   fails after an earlier link of its table committed” gained the coverage
   read. The output token and the record are unchanged.
+- 2026-11-24: Pending amendment. [Merge as a recorded
+  operation](2026-11-24-merge-as-a-recorded-operation.md), a draft, makes
+  `merge` the record's second kind. Once it is accepted, it supersedes these
+  sentences: §2.2's "the **active** operations, keyed by admission scope, at
+  most one per scope" and "the eviction mark", which become a list of active
+  operations and one mark per kind; §2.2's terminal bounds and §2.4's "At
+  most four unresolved records are kept, cluster-wide, across every kind",
+  which hold per kind, with `optimize`'s values unchanged; the `merge` column
+  of §2.6, where "per target branch ... one gate per target branch" becomes
+  no exclusive scope; and §3.1's "lookup and cancel require the grant of the
+  record's kind", which gains the answer `unknown` for an actor without that
+  grant. The body stands unchanged until acceptance.
