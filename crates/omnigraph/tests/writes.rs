@@ -3605,41 +3605,49 @@ query four_blob_updates($b: String) {
     .await;
     assert_eq!(&stored_blob[..], &blob_payload[..]);
 
-    // 3. Unordered `load` duplicate-key and `@unique` refusals remain intact.
-    let dup_append = db
-        .load_jsonl(
-            concat!(
-                r#"{"type":"Doc","data":{"slug":"dup","tag":"u1"}}"#,
-                "\n",
-                r#"{"type":"Doc","data":{"slug":"dup","tag":"u2"}}"#,
-                "\n",
-            ),
+    // 3. Loads do not take the statement fold: a key repeated in one load's
+    //    input is refused in `append` and in `merge` mode alike, and so is a
+    //    `@unique` value shared by two keys. None of them writes a row.
+    for (label, mode, rows, refusal) in [
+        (
+            "append load with a repeated key",
             LoadMode::Append,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        dup_append.to_string().contains("duplicate")
-            || dup_append.to_string().contains("conflict")
-            || dup_append.to_string().contains("@unique"),
-        "append load with duplicate key must still fail loudly: {dup_append}"
-    );
-
-    let dup_merge_unique = db
-        .load_jsonl(
-            concat!(
-                r#"{"type":"Doc","data":{"slug":"m1","tag":"shared"}}"#,
-                "\n",
-                r#"{"type":"Doc","data":{"slug":"m2","tag":"shared"}}"#,
-                "\n",
-            ),
+            [
+                r#"{"type":"Doc","data":{"slug":"dup","tag":"u1"}}"#,
+                r#"{"type":"Doc","data":{"slug":"dup","tag":"u2"}}"#,
+            ],
+            "@unique violation on Doc.slug: value 'dup'",
+        ),
+        (
+            "merge load with a repeated key",
             LoadMode::Merge,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        dup_merge_unique.to_string().contains("@unique"),
-        "merge load with duplicate @unique across distinct keys must still fail: {dup_merge_unique}"
+            [
+                r#"{"type":"Doc","data":{"slug":"rep","tag":"r1","note":"first"}}"#,
+                r#"{"type":"Doc","data":{"slug":"rep","tag":"r2","note":"last"}}"#,
+            ],
+            "@unique violation on Doc.slug: value 'rep'",
+        ),
+        (
+            "merge load with one @unique value on two keys",
+            LoadMode::Merge,
+            [
+                r#"{"type":"Doc","data":{"slug":"m1","tag":"shared"}}"#,
+                r#"{"type":"Doc","data":{"slug":"m2","tag":"shared"}}"#,
+            ],
+            "@unique violation on Doc.tag: value 'shared'",
+        ),
+    ] {
+        let error = db
+            .load_jsonl(&format!("{}\n{}\n", rows[0], rows[1]), mode)
+            .await
+            .expect_err(label)
+            .to_string();
+        assert!(error.contains(refusal), "{label} must fail loudly: {error}");
+    }
+    assert_eq!(
+        count_rows(&db, "node:Doc").await,
+        2,
+        "no refused load wrote a row: only d1 and d2 remain"
     );
 }
 

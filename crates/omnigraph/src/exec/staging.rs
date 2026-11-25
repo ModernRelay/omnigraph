@@ -136,7 +136,8 @@ pub(crate) struct MutationStaging {
     pub(crate) paths: HashMap<String, StagedTablePath>,
     /// In-memory accumulated batches per table (insert/update path).
     pub(crate) pending: HashMap<String, PendingTable>,
-    /// Monotonic retained-batch accounting, updated only by `append_batch`.
+    /// Retained-batch accounting over every table's pending batches, kept by
+    /// `append_batch` and `upsert_statement_batch`.
     pending_bytes: u64,
     pending_payload_bytes: u64,
     write_budget: WriteBudget,
@@ -254,35 +255,15 @@ impl MutationStaging {
         Ok(())
     }
 
-    /// Append a batch to the per-table accumulator.
-    ///
-    /// `mode` is asserted-consistent with prior pushes for the same table:
-    /// `StrictInsert`+`StrictInsert` stays strict; any `Upsert` upgrades the
-    /// table to upsert (e.g. an update after an insert in one mutation). The
-    /// generated ids used by mutation insert make that upgrade semantics-safe;
-    /// bulk load uses one mode for the complete operation.
-    pub(crate) fn append_batch(
-        &mut self,
+    /// Refuse a batch that cannot join the table's accumulator: overwrite
+    /// mixed with an additive mode, a column patch beside another write, or a
+    /// schema that differs from the batches already pending.
+    fn check_accumulable(
+        &self,
         table_key: &str,
-        schema: SchemaRef,
         mode: PendingMode,
-        batch: RecordBatch,
+        batch: &RecordBatch,
     ) -> Result<()> {
-        if batch.num_rows() == 0 && mode != PendingMode::Overwrite {
-            // No-op for additive modes. For Overwrite, an empty batch is
-            // observable: it means "replace this table with zero rows".
-            return Ok(());
-        }
-        // If we've already accumulated a batch on this table, the new
-        // batch's schema MUST match the existing accumulator's schema.
-        // The mismatch case in practice is a blob-bearing table that
-        // sees an `insert` (full schema, blob columns included) and
-        // then an `update` whose `apply_assignments` output omits
-        // unassigned blob columns (subset schema). Concat-time and
-        // MemTable-construction errors would catch this later, but
-        // surfacing it at the offending `append_batch` call gives the
-        // caller a clearer point of failure attached to the specific
-        // op that introduced the drift.
         if let Some(existing) = self.pending.get(table_key) {
             if existing.mode == PendingMode::Overwrite || mode == PendingMode::Overwrite {
                 if existing.mode != mode {
@@ -313,6 +294,39 @@ impl MutationStaging {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Append a batch to the per-table accumulator.
+    ///
+    /// `mode` is asserted-consistent with prior pushes for the same table:
+    /// `StrictInsert`+`StrictInsert` stays strict; any `Upsert` upgrades the
+    /// table to upsert (e.g. an update after an insert in one mutation). The
+    /// generated ids used by mutation insert make that upgrade semantics-safe;
+    /// bulk load uses one mode for the complete operation.
+    pub(crate) fn append_batch(
+        &mut self,
+        table_key: &str,
+        schema: SchemaRef,
+        mode: PendingMode,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        if batch.num_rows() == 0 && mode != PendingMode::Overwrite {
+            // No-op for additive modes. For Overwrite, an empty batch is
+            // observable: it means "replace this table with zero rows".
+            return Ok(());
+        }
+        // If we've already accumulated a batch on this table, the new
+        // batch's schema MUST match the existing accumulator's schema.
+        // The mismatch case in practice is a blob-bearing table that
+        // sees an `insert` (full schema, blob columns included) and
+        // then an `update` whose `apply_assignments` output omits
+        // unassigned blob columns (subset schema). Concat-time and
+        // MemTable-construction errors would catch this later, but
+        // surfacing it at the offending `append_batch` call gives the
+        // caller a clearer point of failure attached to the specific
+        // op that introduced the drift.
+        self.check_accumulable(table_key, mode, &batch)?;
         let batch_usage = crate::table_store::write_batch_bytes(&batch)?;
         let batch_bytes = batch_usage.rows;
         let pending_payload_bytes = self
@@ -390,46 +404,14 @@ impl MutationStaging {
         batch: RecordBatch,
         system_columns: SystemColumns,
     ) -> Result<()> {
-        if batch.num_rows() == 0 && mode != PendingMode::Overwrite {
+        if mode != PendingMode::Upsert || !self.pending.contains_key(table_key) {
+            return self.append_batch(table_key, schema, mode, batch);
+        }
+        if batch.num_rows() == 0 {
             return Ok(());
         }
-
-        let Some(existing) = self.pending.get(table_key) else {
-            return self.append_batch(table_key, schema, mode, batch);
-        };
-
-        if mode != PendingMode::Upsert {
-            return self.append_batch(table_key, schema, mode, batch);
-        }
-
-        if existing.mode == PendingMode::Overwrite || mode == PendingMode::Overwrite {
-            if existing.mode != mode {
-                return Err(OmniError::manifest_internal(format!(
-                    "table '{}' cannot mix overwrite staging with append/merge staging",
-                    table_key
-                )));
-            }
-        }
-        if existing.mode == PendingMode::ColumnPatch || mode == PendingMode::ColumnPatch {
-            return Err(OmniError::manifest_internal(format!(
-                "table '{table_key}' cannot stage a column patch beside another write"
-            )));
-        }
-        if !schemas_compatible(&existing.schema, &batch.schema()) {
-            return Err(OmniError::manifest(format!(
-                "table '{}' accumulated mutation batches with mismatched schemas: \
-                 prior batches have {} columns, this batch has {}. \
-                 This typically happens on a blob-bearing table when one \
-                 op uses the full schema (e.g. an `insert`) and another \
-                 omits unassigned blob columns (e.g. an `update` that \
-                 doesn't set every blob property). Split the mutation \
-                 into two queries: one for the inserts, one for the \
-                 updates.",
-                table_key,
-                existing.schema.fields().len(),
-                batch.schema().fields().len(),
-            )));
-        }
+        self.check_accumulable(table_key, mode, &batch)?;
+        let existing = &self.pending[table_key];
 
         let mut incoming_ids = HashSet::new();
         if let Some(id_col) = batch.column_by_name(system_columns.id) {

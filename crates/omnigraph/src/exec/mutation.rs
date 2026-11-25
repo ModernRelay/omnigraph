@@ -2152,11 +2152,9 @@ impl Omnigraph {
         )?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
-        // Accumulate the updated batch into the Merge-mode pending stream.
-        // The accumulator may now contain entries with the same id as a
-        // prior insert or update on this table; `prepare_pending_table`
-        // dedupes by id (last-occurrence wins) before issuing the single
-        // `stage_keyed_write` call at end-of-query.
+        // Accumulate the updated batch into the Merge-mode pending stream,
+        // replacing the pending version of every id it rewrites, so the next
+        // statement's scan sees one version per entity (issue #925).
         let updated_schema = updated.schema();
         staging.upsert_statement_batch(
             &table_key,
