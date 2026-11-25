@@ -1,6 +1,6 @@
-# OmniGraph user guide
+# Omnigraph user guide
 
-OmniGraph is a typed property-graph engine with atomic graph commits,
+Omnigraph is a typed property-graph engine with atomic graph commits,
 versioned branches, full-text and vector search, and local or object-storage
 deployment.
 

@@ -125,11 +125,11 @@ edge Knows: Person -> Person {}
         ("Person".to_string(), "Person".to_string()),
     )]);
     let left_index = reader
-        .graph_index_for_resolved(&left, &scope, catalog.system_columns)
+        .graph_index_for_snapshot(&left.snapshot, &scope, catalog.system_columns)
         .await
         .unwrap();
     let right_index = reader
-        .graph_index_for_resolved(&right, &scope, catalog.system_columns)
+        .graph_index_for_snapshot(&right.snapshot, &scope, catalog.system_columns)
         .await
         .unwrap();
     assert!(!Arc::ptr_eq(&left_index, &right_index));

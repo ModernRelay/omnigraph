@@ -45,7 +45,7 @@ it with a `table version … already exists` error.
   branch, or a table on a fork left by a branch created before storage format
   v11, `main` ends on its own version of that table, so a later merge from
   that branch can report **Merged**. The merged data is the same.
-- **Merged**: both branches changed, so OmniGraph performs a three-way,
+- **Merged**: both branches changed, so Omnigraph performs a three-way,
   entity-level merge and creates a commit with two parents.
 
 `branch merge --json`, the HTTP merge route and the GQ merge statement all

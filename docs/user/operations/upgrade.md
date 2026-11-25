@@ -1,4 +1,4 @@
-# Upgrading OmniGraph
+# Upgrading Omnigraph
 
 Normal open accepts storage formats v14 to v18 and never migrates a graph: a v14 or v15 branch
 is stamped v16 at its first publish, and only the [storage upgrade](#storage-upgrade) stamps an
@@ -168,7 +168,7 @@ v6, so a graph still on that format needs an [export/import rebuild](#rebuild).
 No query reads a full-text index, so an earlier release's index changes no rows. An index
 qualifies only where its certificate's [analyzer profile](../search/analyzers.md) and terms
 over fixed probe texts match this binary's, never for an earlier release's index. For a graph
-that normal open accepts (formats 14–17), rebuild on each branch that needs new indexes:
+that normal open accepts (formats 14–18), rebuild on each branch that needs new indexes:
 
 ```bash
 omnigraph index rebuild --kind full-text --target ./graph.omni --branch main --as operator --json

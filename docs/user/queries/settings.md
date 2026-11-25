@@ -112,9 +112,9 @@ default cap even when its start node has only one neighbor. Index selectivity
 does not reduce this conservative admission charge. The cap does not bound
 index decoding, bytes read, or storage latency.
 
-Internal traversal pins used by the GQT harness can force indexed execution. A
-forced CSR pin is refused for statements with selections; there is no public
-`set traversal` setting.
+Omnigraph's own tests can force indexed execution with an internal traversal
+pin. A forced CSR pin is refused for statements with selections; there is no
+public `set traversal` setting.
 
 `write_max_bytes` applies to each existing write account: row data and Blob
 descriptors, logical Blob payloads, parser estimates and retained removed IDs.

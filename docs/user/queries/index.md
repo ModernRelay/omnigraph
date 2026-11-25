@@ -280,7 +280,7 @@ branch it is the head inherited from the source branch. See [Branches, Commits, 
 
 ## JSON result spelling
 
-JSON `rows` follow Arrow's JSON conventions: OmniGraph writes them with the
+JSON `rows` follow Arrow's JSON conventions: Omnigraph writes them with the
 `arrow-json` writer from the result batches and keeps no per-type spelling of
 its own. The spellings a consumer sees:
 

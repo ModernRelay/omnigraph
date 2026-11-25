@@ -405,8 +405,14 @@ impl Failure {
         {
             // A refusal keeps its code's action when that action is to fix
             // the request or, when nothing ran, to repeat it, as a server's
-            // own disposition does; any other is read again first.
-            match output.code.map(ErrorCode::action) {
+            // own disposition does; any other is read again first. An
+            // embedded query refusal carries its diagnostic without a code,
+            // and the same refusal served is `bad_request`: fix the query.
+            let own = output
+                .code
+                .map(ErrorCode::action)
+                .or(output.diagnostic.as_ref().map(|_| Action::Fix));
+            match own {
                 Some(Action::Fix) => Action::Fix,
                 Some(Action::Retry) if not_started => Action::Retry,
                 _ => Action::Refresh,
@@ -613,6 +619,38 @@ mod tests {
         assert_ne!(failure.output.code, Some(ErrorCode::OutcomeUnknown));
         assert_eq!(disposition(&failure)["effects"], "none");
         assert_eq!(failure.exit, 1);
+    }
+
+    /// An embedded query refusal carries its diagnostic and no code; it asks
+    /// for the `fix` the same refusal answered as `bad_request` by a server
+    /// asks for, since the same source fails the same way again.
+    #[test]
+    fn an_embedded_query_diagnostic_asks_for_a_fix() {
+        let refused = "query name { match { $p: Person } return { $p.name } }";
+        for kind in [CommandKind::Read, CommandKind::Write] {
+            let error = omnigraph_compiler::query::parser::parse_query(refused).unwrap_err();
+            let failure = Failure::classify(
+                error.into(),
+                Evidence {
+                    kind,
+                    ..Evidence::default()
+                },
+            );
+            assert_eq!(failure.output.code, None);
+            assert_eq!(
+                failure
+                    .output
+                    .diagnostic
+                    .as_ref()
+                    .map(|value| value.code.as_str()),
+                Some("Q002")
+            );
+            assert_eq!(
+                disposition(&failure),
+                serde_json::json!({"effects": "none", "action": "fix"}),
+            );
+            assert_eq!(failure.exit, 1);
+        }
     }
 
     /// A refusal the CLI decides itself takes its code's action, as the same

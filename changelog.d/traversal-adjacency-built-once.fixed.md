@@ -1,0 +1,1 @@
+- Traversals that start together after an edge write build the in-memory adjacency once and share it; each used to build its own copy. `run_query_at` now reuses it too.

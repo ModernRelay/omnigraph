@@ -237,6 +237,7 @@ describes sign-in, which resource identifier to choose, and the endpoint's tools
 | `/graphs/{graph_id}/schema` | Show the accepted schema |
 | `GET /graphs/{graph_id}/access` | The caller's own actor and the actions its credential allows; see [Learn your access](policy.md#learn-your-access) |
 | `/graphs/{graph_id}/export` | Stream a branch snapshot as JSONL |
+| `/graphs/{graph_id}/operations` | Submit a [recorded](recorded-operations.md) optimize (`POST /operations/optimize`), look one up (`GET /operations/{operation_id}`) or cancel it (`POST /operations/{operation_id}/cancel`); off unless `OMNIGRAPH_OPERATION_ROUTES=true` |
 
 `/query` also serves `branch list`, the branch reads (`branch diff`, `branch merge-base`, `branch merge … dry run`), `show`, and [explain](../queries/explain.md).
 `/mutate` serves `branch create`, `branch delete`, `branch merge`, `commit publish`,

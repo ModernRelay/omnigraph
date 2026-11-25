@@ -319,8 +319,7 @@ Independent existing constructive datasets stage concurrently. The
 `stage_write_concurrency` [session setting](../queries/index.md#session-settings)
 controls that width for loads and write statements (default 8, range `1..=64`);
 it is `process` scope, so the server takes it from `OMNIGRAPH_LOAD_CONCURRENCY`
-and a direct CLI run from that variable or from `--set` on `load`, `ingest` or
-`mutate`, and an invalid or `0` value refuses startup. The same width bounds
+and a direct CLI run from that variable or from `--set` on `load` or `mutate`, and an invalid or `0` value refuses startup. The same width bounds
 the Lance writers a `load csv` overwrite runs at once (each writes runs of at
 most one Lance file, published in input order) and the streams that parse its
 source: each parse partition owns an equal byte range, read in 8 MiB pieces and

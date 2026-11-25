@@ -140,9 +140,6 @@ An `edge_ri` check's `probe` follows the same rule as a load's: under
 before it sweeps the staged rows, and under `judged` it looks the endpoints
 up after the sweep. A load and a mutation refuse on the first missing
 endpoint; a branch merge lists every one among its conflicts.
-A GQT case pins these documents with `--- expect plan` after a mutate
-step's expect or a `branch merge` step's expect, in the `load validate …`
-lines of a load plan.
 
 An executed load's receipt carries the same document and an `executed`
 object with `partitions` (the widest operator's), `rows`, `source_bytes` and
@@ -158,4 +155,4 @@ its `rows`, `read_ns`, the wait for the slice's bytes, `elapsed_compute_ns`, and
 `start_ns` and `end_ns` from the source's first poll. The statement's answer, the `ChangeOutput` of
 `omnigraph mutate --json` and of `POST /mutate`, carries the object as
 `executed` beside the counts and the commit. The compute, wait and wall numbers
-are measurements of one run; a GQT case pins only the rows and the partitions.
+are measurements of one run and vary between runs; the rows and partitions do not.

@@ -67,7 +67,7 @@ to replace or clear the reference without reading it. An update rewrites whole
 rows when it assigns a Blob, or when another statement of the same mutation
 writes the type.
 
-Only a graph written outside OmniGraph can hold a stored reference to a byte
+Only a graph written outside Omnigraph can hold a stored reference to a byte
 range of an object. Export writes an external reference as a bare URI, which
 reloads as the whole object, so export refuses a ranged reference instead of
 widening it. Change-feed images, the change-feed baseline and entity reads by
@@ -77,7 +77,7 @@ holds it like any other, and a baseline taken while the row exists succeeds;
 that baseline does not reload with `load`. A stored descriptor with an offset
 but no length is refused as a Blob integrity error.
 
-OmniGraph never deletes the object named by an external reference.
+Omnigraph never deletes the object named by an external reference.
 
 ### Replacing one Blob value
 
@@ -241,7 +241,7 @@ to null.
 The CLI never follows an external URI. `blob get` refuses a whole-object
 reference and points to `blob stat`, which returns it without opening the
 target. A persisted ranged external descriptor is rejected by both commands;
-OmniGraph never widens it to the complete target object.
+Omnigraph never widens it to the complete target object.
 
 ## HTTP reads
 
@@ -334,6 +334,6 @@ those readers first when they must finish reliably.
 Historical reads are fail-closed. Type renames remain addressable through the
 current type name, but a historical property rename, drop/re-add, or branch
 incarnation may be refused when the selected snapshot does not carry enough
-identity information to prove it is the same logical Blob property. OmniGraph
+identity information to prove it is the same logical Blob property. Omnigraph
 returns an error rather than guessing from a reused name or physical field
 position.

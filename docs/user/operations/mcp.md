@@ -38,10 +38,10 @@ later unauthenticated request.
 ### Upgrade tool schemas
 
 After upgrading the server, reconnect clients and refresh cached tool schemas
-with `tools/list`. The `access` tool now returns `actor_id` instead of `actor`;
-clients with fixed response types must update those types before reconnecting.
-Its output matches the [HTTP access report](policy.md#learn-your-access).
-`queries` now lists stored mutations too, marked `mutation: true`, and
+with `tools/list`. Since 0.14 the `access` tool returns `actor_id` instead of
+`actor`; clients with fixed response types must update those types before
+reconnecting. Its output matches the [HTTP access report](policy.md#learn-your-access).
+Since 0.15 `queries` lists stored mutations too, marked `mutation: true`, and
 `mutate` no longer requires `query`.
 
 MCP does not use the `Omnigraph-Http-Api` header, so an old MCP client is not

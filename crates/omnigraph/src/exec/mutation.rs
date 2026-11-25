@@ -929,21 +929,9 @@ async fn selection_rows<'s>(
         let mut read_params = params.clone();
         read_params.remove(NOW_PARAM_NAME);
         let graph_index = if query.ir.pipeline.iter().any(traverses) {
-            let addressed = txn.branch.as_deref().unwrap_or("main");
-            let probe = txn.manifest_probe.captured();
             crate::engine::GraphIndexHandle::cached(
                 Arc::clone(reader.handle),
-                crate::db::ResolvedTarget {
-                    requested: crate::db::ReadTarget::branch(addressed),
-                    branch: txn.branch.clone(),
-                    snapshot_id: crate::db::SnapshotId::synthetic(
-                        txn.branch.as_deref(),
-                        probe.version,
-                        probe.e_tag.as_deref(),
-                    ),
-                    graph_commit_id: txn.effective_graph_head.clone(),
-                    snapshot: txn.base.clone(),
-                },
+                txn.base.clone(),
                 crate::engine::referenced_edge_types(&query.ir.pipeline, &txn.catalog),
                 txn.catalog.system_columns,
             )

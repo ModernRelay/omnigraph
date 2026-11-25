@@ -328,7 +328,10 @@ omnigraph optimize --target ./graph.omni
 ```
 
 after a large load or merge, and on a regular maintenance cadence, to refresh
-coverage and compact data on `main`. On another branch, `index build` builds
-the branch's missing indexes and refreshes lagging BTREE and vector coverage;
-see [Build indexes](../operations/maintenance.md#build-indexes). An empty
-vector property remains pending until it has a non-null vector to index.
+scalar and vector coverage and compact data on `main`; existing full-text
+indexes, which no query reads, are kept as they are (see
+[Rebuild full-text indexes](../operations/maintenance.md#rebuild-full-text-indexes)).
+On another branch, `index build` builds the branch's missing indexes and
+refreshes lagging scalar and vector coverage; see
+[Build indexes](../operations/maintenance.md#build-indexes). An empty vector
+property remains pending until it has a non-null vector to index.

@@ -111,7 +111,9 @@ pub(crate) struct CleanupArgs {
     /// durations: `7d`, `24h`, `90m`. At least one of --keep / --older-than.
     #[arg(long)]
     pub(crate) older_than: Option<String>,
-    /// Required to actually run; without it, prints what would be removed
+    /// Required to actually run. Without it, cleanup only echoes the
+    /// retention policy and exits before opening the graph; it lists no
+    /// candidates.
     #[arg(long)]
     pub(crate) confirm: bool,
     #[arg(long)]

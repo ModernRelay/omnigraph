@@ -636,6 +636,7 @@ statement. "See" names the invariant or the design that bears on it.
 | `G12` | `read:9` | Types and properties carry descriptions, and nothing searches them | No design yet |
 | `G13` | Boundary, Processes | One server serves a cluster, and read-only CLI commands may read beside it. There is no read-only serving mode | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md) |
 | `G14` | `read:11`, `E7` | A `limit` without an `order` returns the first rows in physical order, which `optimize` can change. No test pins it | [GQ 3](https://github.com/ModernRelay/omnigraph/pull/1302), draft: one total order for every read |
+| `G15` | `E5` | Traversal adjacency has no byte limit during construction or retention. A single cold build or successive historical scans filling the cache can exhaust the host | Invariant 11 |
 
 ## Decisions
 

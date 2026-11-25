@@ -1,6 +1,6 @@
 # Embeddings
 
-OmniGraph can turn query text into a vector for
+Omnigraph can turn query text into a vector for
 `nearest(rel, $document.embedding, $text, k: n)`. Use the same provider and model that
 produced the stored document vectors; vectors from different models are not
 comparable.

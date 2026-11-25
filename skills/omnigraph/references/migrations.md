@@ -12,7 +12,8 @@ dispatch or graph access. Earlier prerelease 0.14 builds share the header and
 header admission cannot distinguish their older shapes; refresh clients,
 server and integrations together. See [server policy](server-policy.md).
 
-`omnigraph version` prints the GQ language version, `gq-language 3.0`
+`omnigraph version` and `omnigraph-server --version` print the GQ language
+version, `gq-language 3.0`
 (`gq_language: "3.0"` in `--json` and in `/healthz`); a binary that reports
 none is a GQ language 2 build, which speaks the older query syntax under the
 same version and contract numbers.

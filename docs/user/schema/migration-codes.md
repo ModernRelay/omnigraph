@@ -5,9 +5,6 @@ code rather than the message text.
 
 | Code | Meaning |
 |---|---|
-| `OG-DS-102` | Drop a node type that contains entities. |
-| `OG-DS-103` | Drop an edge type that contains entities. |
-| `OG-DS-104` | Drop a populated property. |
 | `OG-MF-103` | Add a required property to a populated type. |
 | `OG-MF-104` | Make a property required while a stored row holds a null (reported by `schema apply`). |
 | `OG-MF-106` | Change a property's type, including enum narrowing or renaming. |

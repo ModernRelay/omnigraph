@@ -4045,13 +4045,16 @@ impl Omnigraph {
         table_ops::graph_index(self).await
     }
 
-    pub(crate) async fn graph_index_for_resolved(
+    /// The graph index of `edge_types` at `snapshot`, from this handle's
+    /// cache: a live target and a historical version whose edge tables are
+    /// the same share one index.
+    pub(crate) async fn graph_index_for_snapshot(
         &self,
-        resolved: &ResolvedTarget,
+        snapshot: &Snapshot,
         edge_types: &std::collections::HashMap<String, (String, String)>,
         system_columns: SystemColumns,
     ) -> Result<Arc<crate::graph_index::GraphIndex>> {
-        table_ops::graph_index_for_resolved(self, resolved, edge_types, system_columns).await
+        table_ops::graph_index_for_snapshot(self, snapshot, edge_types, system_columns).await
     }
 
     /// [`Self::ensure_indices_on_as`] on this handle's current branch,

@@ -1,8 +1,7 @@
 # CLI guide
 
-Upgrading an existing installation? Start with the
-[0.13 → 0.14 checklist](../operations/upgrade-0.14.md) for before/after YAML
-and command examples.
+This guide covers everyday use of the `omnigraph` CLI: choosing where a
+command runs, then creating, querying, branching and maintaining a graph.
 
 Select resources with `--target NAME|LOCAL_PATH`, or `defaults.target` when
 omitted. Account operations use `--profile NAME` or `defaults.profile`.
@@ -36,6 +35,10 @@ Run `omnigraph <command> --help` for available flags. The
 [CLI reference](reference.md) covers the complete command surface, and
 [operator configuration](targets.md) is the primary reference for profiles,
 targets, authentication providers and the breaking format change.
+
+Upgrading an existing installation? Start with the
+[0.13 → 0.14 checklist](../operations/upgrade-0.14.md) for before/after YAML
+and command examples.
 
 ## Create, load, and query a graph
 
@@ -99,8 +102,8 @@ omnigraph branch merge review/new-data --into main --set merge_lineage=verify --
 ```
 
 `query`, `mutate` and `branch merge` apply settings to their operation.
-`commit changes` and `changes poll` validate settings but they currently have
-no effect. Direct `load` applies settings to its staged write; served `load`
+`commit changes` and `changes poll` apply them to their change reads, for
+example `change_lineage`. Direct `load` applies settings to its staged write; served `load`
 refuses `--set` because its HTTP contract has no settings field.
 
 A direct invocation accepts process settings from `--set`, source and the
