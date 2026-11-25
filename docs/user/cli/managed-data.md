@@ -42,9 +42,11 @@ configuration workflow; editing a source file alone has no effect. Changes use t
 identity credentials do not bypass its ownership or permission checks.
 
 Issuance takes no `--graph`; choose a graph on the
-operation that needs it. `--ttl` accepts seconds or an `s`, `m`, `h`, or `d`
-suffix, defaults to one hour, and must be between 60 seconds and 24 hours.
-The service can shorten the requested lifetime. Issuer clock tolerance is
+operation that needs it. `--ttl` requests a lifetime: seconds or an `s`, `m`, `h`, or `d`
+suffix, one hour by default, between 60 seconds and 24 hours.
+The service can issue a shorter credential than requested (Omnigraph's
+managed service currently issues at most 300 seconds), and the result's `expires_at`
+reports the lifetime it actually issued. Issuer clock tolerance is
 30 seconds; a credential is never accepted after its stated expiry.
 `--json` and human output contain metadata only, never the signed credential.
 
