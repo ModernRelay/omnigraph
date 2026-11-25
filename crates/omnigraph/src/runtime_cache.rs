@@ -152,7 +152,7 @@ impl RuntimeCache {
         let untouched = |key: &GraphIndexCacheKey| {
             !key.edge_tables
                 .iter()
-                .any(|table| written.contains(table.table_key.as_str()))
+                .any(|(table_key, _)| written.contains(table_key.as_str()))
         };
         let mut cache = self.graph_indices.lock().await;
         cache.entries.retain(untouched);
@@ -289,18 +289,18 @@ fn graph_index_cache_key(
     let mut edge_tables: Vec<_> = edge_types
         .iter()
         .map(|(edge_name, endpoints)| {
-            let state =
-                snapshot
-                    .dataset(&format!("edge:{edge_name}"))
-                    .map(|entry| GraphIndexTableState {
-                        identity: entry.identity,
-                        table_version: entry.published_dataset_version,
-                        staged_version: entry.version_metadata.staged_version(),
-                        table_branch: entry.native_dataset_branch.clone(),
-                        e_tag: entry.version_metadata.e_tag().map(str::to_string),
-                        endpoints: endpoints.clone(),
-                    });
-            (edge_name.clone(), state)
+            let table_key = format!("edge:{edge_name}");
+            let state = snapshot
+                .dataset(&table_key)
+                .map(|entry| GraphIndexTableState {
+                    identity: entry.identity,
+                    table_version: entry.published_dataset_version,
+                    staged_version: entry.version_metadata.staged_version(),
+                    table_branch: entry.native_dataset_branch.clone(),
+                    e_tag: entry.version_metadata.e_tag().map(str::to_string),
+                    endpoints: endpoints.clone(),
+                });
+            (table_key, state)
         })
         .collect();
     edge_tables.sort_by(|a, b| a.0.cmp(&b.0));
@@ -501,7 +501,7 @@ mod tests {
         // a snapshot id — it is the physical edge-table identity set, A1).
         GraphIndexCacheKey {
             edge_tables: vec![(
-                format!("t{id}"),
+                format!("edge:t{id}"),
                 Some(GraphIndexTableState {
                     identity: crate::db::manifest::TableIdentity::new(id as u64 + 1, 1).unwrap(),
                     table_version: 1,
@@ -533,10 +533,10 @@ mod tests {
         };
         assert_ne!(
             GraphIndexCacheKey {
-                edge_tables: vec![("Knows".to_string(), Some(on_main))]
+                edge_tables: vec![("edge:Knows".to_string(), Some(on_main))]
             },
             GraphIndexCacheKey {
-                edge_tables: vec![("Knows".to_string(), Some(on_branch))]
+                edge_tables: vec![("edge:Knows".to_string(), Some(on_branch))]
             }
         );
 
@@ -576,10 +576,10 @@ mod tests {
             ..base.clone()
         };
         let k_old = GraphIndexCacheKey {
-            edge_tables: vec![("Knows".to_string(), Some(base))],
+            edge_tables: vec![("edge:Knows".to_string(), Some(base))],
         };
         let k_new = GraphIndexCacheKey {
-            edge_tables: vec![("Knows".to_string(), Some(repointed))],
+            edge_tables: vec![("edge:Knows".to_string(), Some(repointed))],
         };
         assert_ne!(
             k_old, k_new,
@@ -602,10 +602,10 @@ mod tests {
             ..old_lifetime.clone()
         };
         let old_key = GraphIndexCacheKey {
-            edge_tables: vec![("Knows".to_string(), Some(old_lifetime))],
+            edge_tables: vec![("edge:Knows".to_string(), Some(old_lifetime))],
         };
         let new_key = GraphIndexCacheKey {
-            edge_tables: vec![("Knows".to_string(), Some(new_lifetime))],
+            edge_tables: vec![("edge:Knows".to_string(), Some(new_lifetime))],
         };
 
         let mut cache = GraphIndexCache::default();
