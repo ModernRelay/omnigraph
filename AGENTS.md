@@ -55,7 +55,7 @@ compiler: parse, typecheck, IR, lowering
 engine: snapshots, execution, graph publication, recovery
         |
         v
-Lance datasets on file, S3-compatible, or Azure Blob storage
+Lance datasets on file, S3-compatible, Azure Blob, or Google Cloud Storage
 ```
 
 Workspace members live under `crates/`, plus `skills/` and
@@ -127,6 +127,9 @@ section decides.
 - **Orthogonality and composability.** Primitives vary independently and close
   under composition (a composition composes again); extend or compose one
   before adding one.
+- **Information hiding** (Parnas). A module owns one decision and hides more
+  than it shows (a deep module, Ousterhout); code outside it never works on
+  its representation.
 - **Intrinsic naming.** Name a thing by what it is or selects, never by the
   caller, scenario or change that prompted it. The `issue_N` in a regression
   test's name is a cross-reference the gate reads, and stays.
@@ -142,6 +145,10 @@ concepts than the specific one (parsimony).
 
 Validate every assumption. Do not assume how a function, module or symbol
 behaves: read it. For Lance internals, read the upstream implementation.
+
+Before every design, review the Lance primitives that bear on it and use them
+fully: build beside one only where its upstream source shows it cannot serve
+or a [compatibility fence](docs/dev/lance-fences.md) forbids it.
 
 Reason about Omnigraph from first principles, not from database categories. A
 database is **an observable contract, implemented by physical mechanisms

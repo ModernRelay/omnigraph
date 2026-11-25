@@ -2,7 +2,6 @@
 
 use crate::embed::EmbedArgs;
 use color_eyre::eyre::Result;
-use output::VersionOutput;
 use std::io::Write;
 
 pub(crate) mod args;
@@ -24,7 +23,7 @@ pub(crate) fn run_skill(command: SkillCommand, stdout: &mut dyn Write) -> Result
 }
 
 pub(crate) fn run_version(json: bool, stdout: &mut dyn Write) -> Result<()> {
-    output::write_version(&VersionOutput::current(), json, stdout)
+    output::write_version(json, stdout)
 }
 
 pub(crate) async fn run_embed(args: EmbedArgs, stdout: &mut dyn Write) -> Result<()> {

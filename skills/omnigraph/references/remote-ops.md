@@ -15,7 +15,7 @@ than the transport status alone.
 ## Address the graph
 
 Add a server target with `auth: {provider: token, source: {store: {}}}` using
-[operator configuration](../../../docs/user/cli/targets.md), then install it:
+[operator configuration](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md), then install it:
 
 ```bash
 printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --stdin

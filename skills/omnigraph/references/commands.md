@@ -282,7 +282,7 @@ Address either direct storage or a served graph. See [`data.md`](data.md).
 "file:///data/person.csv" into node:Person mode append header'` (optional
 `delimiter "|"`, `columns (…)`, `--branch`). A served graph reads only `s3://`
 sources its external Blob policy admits. See
-[CSV loading](../../../docs/user/mutations/index.md#csv-loading).
+[CSV loading](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/mutations/index.md#csv-loading).
 
 ## Query / Mutate
 
@@ -421,7 +421,7 @@ Distinct from `lint`, which validates authoring source. See
 
 ## Operator Config & Credentials
 
-Use the primary [operator reference](../../../docs/user/cli/targets.md).
+Use the primary [operator reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md).
 The format is `version: 1`.
 `--operator-config FILE` replaces the default operator file without merging.
 Secrets never belong in YAML. Login/logout are platform-session operations;
@@ -442,7 +442,7 @@ omnigraph access --target production --branch main --json
 identity check, with no separate `whoami` command. Direct targets use `--as`
 or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
 update scripts that read protocol 1's `actor`. Managed targets use their issued resource identity. See
-[access scope and policy semantics](../../../docs/user/cli/targets.md#what-you-may-do-at-a-target).
+[access scope and policy semantics](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#what-you-may-do-at-a-target).
 
 Set/remove require `token`/`store`; an existing entry needs `--replace`.
 Status never calls network/helpers or prompts; secure-store availability and
@@ -469,7 +469,7 @@ replaces.
 Managed target add uses `--profile NAME` or `defaults.profile`.
 `config recover-operations --source DIR --profile NAME [--json]`
 preserves matching legacy folder evidence; it neither converts config nor submits
-operations. See the [upgrade reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
+operations. See the [upgrade reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#upgrade-from-the-old-format).
 
 Rename commands preserve custody and update references/defaults:
 
@@ -518,7 +518,7 @@ digest differs from what `target inspect NAME --json` reports in its own
 operator home. Direct and managed targets refuse with
 `target_kind_unsupported`. Where nothing opens Studio's links it prints the
 link and refuses with `studio_unavailable`; it never opens a browser. See
-[Open Studio](../../../docs/user/cli/studio.md).
+[Open Studio](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/studio.md).
 
 ## Addressing a Graph
 
@@ -533,12 +533,14 @@ Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
 `optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
 and endpoint captured from the environment
-([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)),
+([S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)),
 and a graph shallow clone: `--base URI` opens a direct graph target over the
 graph at `URI` (reads fall through to the base, writes land in the target, the
 base is never written) for `query`, `mutate`, `load`, `branch`, `commit`,
 `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`; an inline
-`s3://` clone root with an `s3://` base is admitted there. Nothing in the target
+`s3://` clone root with an `s3://` base is admitted there, each with a path free
+of empty inner segments and percent escapes (a space or a non-ASCII letter is written
+as one). Nothing in the target
 records its base, so every reopen passes the same `--base`; a clone root opened
 without it is refused. `--stats PATH` writes one JSON document per invocation
 with the logical object-store calls, the exit code and the peak resident set.
@@ -639,7 +641,7 @@ revocation before offboarding and verify denial with an existing data credential
 Writes require exact idempotency keys and uncertain outcomes must be reconciled;
 a partial offboard stays partial on replay. Keep the same operator home and profile:
 the CLI retains the resolved request before sending and never resolves its
-subject again on a same-key retry. See [team administration](../../../docs/user/cli/managed-team.md).
+subject again on a same-key retry. See [team administration](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/managed-team.md).
 
 ## Cluster Control Plane
 

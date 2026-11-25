@@ -26,7 +26,7 @@ request discovers a graph to select automatically. Inline addresses are local pa
 [S3 cluster roots](../operations/s3-cluster-roots.md) for deployment, recovery and maintenance commands. Register remote
 endpoints; other cloud-direct and catalogue targets are unsupported. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
-`init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
+`init --schema graph.pg` takes the graph URI positionally (`./graph.omni`) or with `--target`.
 
 `--base URI` opens a direct graph target as a graph shallow clone of the graph
 at `URI`: a read falls through to the base where the target has no object of its
@@ -34,7 +34,12 @@ own, every write lands in the target, and the base is never written. Both are
 local directories or `s3://` prefixes of one endpoint (an S3 pair reads the
 standard `AWS_*` environment, and the clone's `s3://` prefix is named inline as
 the target, the one inline `s3://` graph the CLI admits); a target that contains
-its base, or lies inside it, is refused. The option applies to `query`, `mutate`, `load`, `branch`,
+its base, or lies inside it, is refused, also when the two `s3://` bucket names
+address one bucket or the target's bucket holds a copy of the base under the
+base's key. An `s3://` target or base is refused as well when its path holds an
+empty inner segment, a percent escape or a character a URL writes as one, the
+caret aside (`%41`, a space, a non-ASCII letter), since such a path does not
+name one object key. The option applies to `query`, `mutate`, `load`, `branch`,
 `commit`, `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`;
 maintenance and schema changes keep the one root they are given. A fresh target
 directory or prefix is a new clone; the same target again shows the clone's own

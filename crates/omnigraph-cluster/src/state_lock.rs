@@ -241,7 +241,7 @@ impl Drop for StateLockGuard {
             return;
         }
         match self.kind {
-            StorageKind::Local => {
+            kind if !kind.is_object_store() => {
                 let path = self.uri.trim_start_matches("file://");
                 let still_owned = std::fs::read_to_string(path)
                     .ok()
@@ -251,7 +251,7 @@ impl Drop for StateLockGuard {
                     let _ = std::fs::remove_file(path);
                 }
             }
-            StorageKind::S3 | StorageKind::Azure => {
+            _ => {
                 let adapter = Arc::clone(&self.adapter);
                 let uri = self.uri.clone();
                 let lock_id = self.lock_id().to_string();
@@ -472,6 +472,12 @@ pub(crate) async fn release_settled_lock(
         // independent admission wrapper; server shutdown does not call this
         // as an automatic Azure release path.
         StorageKind::Local | StorageKind::Azure => adapter.delete(uri).await?,
+        // `ClusterStore::for_storage_root` refuses gs:// cluster roots.
+        StorageKind::Gcs => {
+            return Err(StateLockError::InvalidBinding(
+                "cluster state locks do not support gs:// roots".into(),
+            ));
+        }
         StorageKind::S3 => {
             let payload = serde_json::to_string_pretty(&lock.mark_released())
                 .map_err(StateLockError::LockEncode)?;

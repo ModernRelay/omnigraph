@@ -34,6 +34,9 @@ use crate::helpers::collector::{
     detached_versions, insert_person, insert_scored, keep_one, main_plan, merge_three_chunk_chain,
     pins_in_history, retained_on, staged_since,
 };
+use crate::helpers::cost::{
+    assert_sweep_delete_requests_flat_in_files, measure_cleanup_after_inserts,
+};
 use crate::helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, count_rows_branch, init_and_load,
     mixed_params, mutate_main, snapshot_main,
@@ -5691,9 +5694,21 @@ async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
         report.cost.table_opens,
         report.cost
     );
+    let listed: u64 = report
+        .tables
+        .iter()
+        .map(|plan| (plan.present_manifests.len() + plan.linear_present.len()) as u64)
+        .sum();
     assert!(
-        report.cost.index_reads <= report.cost.table_opens,
-        "every index read is one of those opens: {:?}",
+        report.cost.table_opens <= listed,
+        "each listed manifest opens at most once, a chain link at the open that finds its predecessor; {} opens exceed the {listed} listed manifests: {:?}. \
+         The bound holds only while no table forks: `table_opens` also counts the opens of native-tree versions that retained forks borrow from, which no plan lists",
+        report.cost.table_opens,
+        report.cost
+    );
+    assert!(
+        report.cost.index_reads <= report.cost.table_opens + pins,
+        "every index read is one of those opens, plus one per root for the bases it borrows: {:?}",
         report.cost
     );
     assert!(
@@ -6486,4 +6501,21 @@ async fn duplicate_vectors_fallback_and_no_loop_issue_485_issue_486() {
             .any(|d| d.type_key == "node:Doc" && d.committed()),
         "second optimize must NOT rebuild duplicate vector index"
     );
+}
+
+/// Issue 1252: the sweep sends a table's freed files as one delete stream,
+/// which S3 answers as one `DeleteObjects` request per 1,000 objects, and
+/// sends no HEAD for a file whose size its listing gave. The published
+/// manifests stay single deletes, oldest first. So the delete requests beyond
+/// one per manifest stay flat as the files removed grow. The S3 twin is
+/// `write_cost_s3::cleanup_sweep_delete_requests_on_s3_issue_1252`.
+#[tokio::test]
+async fn cleanup_sweep_deletes_files_in_one_stream_per_group_issue_1252() {
+    let mut curve = Vec::new();
+    for commits in [4usize, 16] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        curve.push(measure_cleanup_after_inserts(&db, commits).await);
+    }
+    assert_sweep_delete_requests_flat_in_files(&curve);
 }

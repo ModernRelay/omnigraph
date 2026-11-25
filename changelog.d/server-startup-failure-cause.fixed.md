@@ -1,0 +1,1 @@
+- When no graph opens at startup, or `--require-all-graphs` refuses one, the server's error names the first graph that failed and why, without debug logging.

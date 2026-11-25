@@ -1,6 +1,6 @@
 # Authorization and actors
 
-OmniGraph uses Cedar policy bundles to authorize graph, server, and cluster
+Omnigraph uses Cedar policy bundles to authorize graph, server, and cluster
 configuration actions.
 Policies are declared in `cluster.yaml` and installed by `cluster apply`.
 Servers load applied policies at startup and activate policy changes during
