@@ -69,7 +69,7 @@ pub(super) async fn pull(
                 max_body: MAX_EXPORT,
                 // Preserve the immutable source bytes. They are written privately and
                 // removed from output; unsuccessful responses are still scrubbed.
-                preserve_contents: true,
+                preserved: Some("files"),
                 auth_verification_status: false,
             },
         )

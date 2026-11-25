@@ -27,11 +27,38 @@ Graph-scoped actions:
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved graph administration |
 
-`graph_list` is server-scoped and controls the metadata catalog at
-`GET /graphs`. It does not control the minimal identity-authenticated
-`GET /graphs/discovery` route: every valid cluster identity can discover all
-applied graph IDs and display names, without gaining permission to read their
-schema or contents. See [signed data credentials](server.md#signed-data-credentials).
+Listing needs no permit. `GET /graphs/discovery` (the CLI's `graphs list`,
+MCP's `graphs`) answers every credential with its rule, `visibility: granted`,
+the actor it resolves to (`actor_id`, and `client_id` for an OIDC access
+token) and the IDs and display names of the registered graphs it holds any
+permission on: some action, on any branch,
+by the rules every request obeys, available or not. A rule scoped to
+unprotected branches counts, and so does a grant without `read`, such as a
+writer's or a stored-query invoker's. A holder of `graph_list` lists every
+graph. A caller with no permission anywhere gets an empty list. It is the
+identity check for any credential, and listing a graph grants nothing; ask
+[`access`](#learn-your-access) what you may do on it. A body without
+`visibility` comes from an older release, which lists every graph and names no
+caller; `graphs list` reports it as `unfiltered`.
+
+A registered graph is listed exactly when its routes do not answer
+`graph not found`. Every route under `/graphs/{graph_id}` and every MCP tool
+answers a graph the caller does not list exactly as an unknown graph: the same
+404 body, `{"error":"graph not found","code":"not_found"}` with disposition
+`effects: none`, `action: fix`, so a probe cannot tell them apart. That refusal
+does not say that a grant would help. After its policy changes, a caller lists
+the graphs again rather than retrying the refused request. A caller that lists
+a graph reaches its routes and gets 403 for an action it lacks; a subresource
+of a listed graph, such as an absent branch or a stored query hidden from a
+caller without `invoke_query`, can still answer 404 with its own message. The
+built-in catalogue graph `og_catalog` is not registered: it is never listed
+and keeps its own `read` authorization.
+
+`graph_list` is server-scoped and grants the catalog: `GET /graphs`, every
+registered graph with its root and availability. A holder lists every graph,
+so it is told that a graph is unavailable (503) or that an action is refused
+(403), rather than that it does not exist. See
+[signed data credentials](server.md#signed-data-credentials).
 
 `config_manage` is cluster-scoped. It authorizes configuration changes through
 the identity-authorized cluster API, including stored queries, graph creation,
@@ -196,8 +223,10 @@ a newly granted administrator cannot authorize that grant.
 ## Learn your access
 
 `GET /graphs/{graph_id}/access` tells the caller what its own credential may do
-on a graph, so a client can show only the actions it is allowed instead of
-learning them from a refusal:
+on a graph it lists, so a client can show only the actions it is allowed
+instead of learning them from a refusal. On a graph the caller does not list it
+answers 404 like every other route; `GET /graphs/discovery` names the caller's
+actor whatever it may do:
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" -H "Omnigraph-Http-Api: 0.14" \
@@ -238,10 +267,10 @@ action shaped as the route that performs it shapes it, so it answers exactly as
 those routes decide. It needs no action of its own, reads no graph data, and
 judges branches by name without checking that they exist. It names actions,
 never the rules behind them, and reveals nothing about other actors. A
-credential on a graph without a policy gets nothing (a static token gets `read`
-when the server sets `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`), as those routes
-decide; a server without
-authentication allows every graph action and reports `actor_id: null`. The MCP
+credential granted nothing on a graph, including every credential on a graph
+without a policy, is answered 404, as those routes are (a static token gets
+`read` when the server sets `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`); a server
+without authentication allows every graph action and reports `actor_id: null`. The MCP
 `access` tool returns the same body, and `omnigraph access` prints it for a
 server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 For a direct cluster target it evaluates the policy the cluster applied to the
@@ -299,12 +328,16 @@ For static token authentication:
 | none | configured | Startup fails because no request could establish an actor |
 
 `GET /graphs` is denied unless a `cluster`-scoped policy grants `graph_list`,
-including when graph policies exist.
+including when graph policies exist. `GET /graphs/discovery` lists the graphs
+each caller holds a permission on, in every row: with `--unauthenticated`, every graph except
+one whose configuration or policy was refused at startup; none under default
+deny; and the graphs with no policy for a static token when
+`OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`. A graph a caller does not list
+answers it 404.
 
 Signed-token trust also enables authenticated startup. Signed credentials
 require an explicit policy permit for protected operations even when no
-static tokens are configured. Only the minimal identity discovery route is
-independent of policy membership; it exposes existence, not graph access.
+static tokens are configured.
 
 Policy is enforced for graph writes inside the engine as well as at the HTTP
 boundary. This keeps direct and embedded writers subject to the same action

@@ -189,7 +189,8 @@ submit operations; resume with the original verified principal and original key.
 Managed graph commands acquire missing identity credentials without replaying
 submitted mutations. Credential issuance grants connectivity, not graph
 permissions; applied Cedar policy remains authoritative. `cluster token --target
-production --ttl 1h` administers the cached credential explicitly.
+production` administers the cached credential explicitly; `--ttl` requests a
+lifetime the service may shorten, and `expires_at` reports the one it issued.
 
 ## Serving and references
 

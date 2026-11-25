@@ -50,9 +50,8 @@ refused under `--base` before anything is written.
 
 `--as ACTOR` attributes supported direct operations; on a cluster graph the
 applied graph policy judges them by it ([direct writes](../operations/policy.md#actor-identity)).
-A served target derives its
-actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
-exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
+A served target derives its actor from its credential and sends `--as` as the
+`Omnigraph-If-Actor` assertion, exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
 a managed target refuses it. `--yes` supplies noninteractive consent for destructive
 operations on nonlocal storage. The retired `--quiet` cannot hide the destination.
 
@@ -82,7 +81,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `index build` | Build a branch's missing declared indexes and refresh lagging scalar and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
 | `index rebuild --kind full-text` | Replace full-text indexes on one branch, after which a binary before GQ 3 refuses full-text reads until its own rebuild; `rebuild-full-text-indexes` is its deprecated spelling | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
-| `graphs list` | List graph metadata or minimal identity discovery | served |
+| `graphs list` | Name your actor and list the graphs the credential holds any permission on; `--catalog` lists every graph with its state and root (`graph_list`) | served |
 | `queries list` | List stored queries: a cluster root's registry (`--graph` narrows it to one graph), or one served graph's catalog, whose `--json` is the body of `GET /graphs/{id}/queries` | cluster or served |
 | `queries validate` | Type-check a cluster's applied query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
@@ -95,12 +94,13 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `config validate` | Validate the whole operator file offline | local |
 | `config rename-profile/rename-target/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
 | `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
-| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct, server or managed |
+| `access` | Say which actions a graph's policy grants you, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)); on a served graph you hold no permission on it answers not found, and `graphs list --json` names who you are | direct, server or managed |
 | `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its resource credential, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server or managed |
 | `studio` | Open Omnigraph Studio on a server target through an `omnigraph-studio://open` link and print it; no request or credential; `--json` adds the `binding` and `home` digests ([Open Studio](studio.md)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
 | `organization list` | List the organizations you are an active member of, marking the profile's ([your organizations](managed-team.md#find-your-organizations)) | profile |
 | `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
+| `organization m2m-applications list/create/secret rotate/delete` | List, create and delete M2M applications; deliver and rotate their client secrets only to a file ([M2M applications](managed-m2m-applications.md)) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print the package version, HTTP contract, GQ language version and storage formats; `--json` includes `version`, `http_contract`, `gq_language` (`major.minor`, `3.0`), `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 

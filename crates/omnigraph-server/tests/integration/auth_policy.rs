@@ -22,8 +22,15 @@ use tower::ServiceExt;
 
 use crate::support::*;
 
+/// Graph listing (`GET /graphs/discovery`, MCP `graphs`) names who the caller
+/// is and exactly the graphs it holds any permission on (or every graph, for a
+/// `graph_list` holder), by the rules every request obeys, whatever the
+/// credential and whatever the graph's availability. Listing needs no permit,
+/// so a caller with no permission gets an empty list, never a refusal. A graph
+/// is listed exactly when its routes do not answer that it does not exist.
+// contract: E6
 #[tokio::test(flavor = "multi_thread")]
-async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() {
+async fn graph_listing_names_exactly_the_graphs_a_caller_holds_a_permission_on() {
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
@@ -50,20 +57,32 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
             failure: omnigraph_server::api::GraphStartupFailure::InvalidConfiguration,
         },
     )));
-    let state = AppState::new_multi_entries(
-        entries,
-        vec![("breakglass".into(), "static-token".into())],
-        None,
-        omnigraph_server::workload::WorkloadController::with_defaults(),
-        None,
-    )
-    .unwrap()
-    .with_data_token_trust(tokens.trust.clone());
-    // An unknown refused configuration cannot reveal its availability through
-    // open-mode read defaults, and does not disable healthy public graphs.
+    let no_policy = |reads_without_policy: bool| {
+        AppState::new_multi_entries(
+            entries.clone(),
+            vec![("breakglass".into(), "static-token".into())],
+            None,
+            omnigraph_server::workload::WorkloadController::with_defaults(),
+            None,
+        )
+        .unwrap()
+        .with_data_token_trust(tokens.trust.clone())
+        .with_reads_without_policy(reads_without_policy)
+    };
+    let listed = |ids: &[&str]| {
+        json!({"graphs": ids
+            .iter()
+            .map(|id| json!({"graph_id": id, "display_name": id}))
+            .collect::<Vec<_>>()})
+    };
+    let graphs_of = |body: &Value| json!({"graphs": body["graphs"].clone()});
+
+    // Open mode reads every graph with no policy, so it lists them; a refused
+    // configuration grants no read, so it is neither listed nor routed. The
+    // catalog stays closed.
     let open = build_app(
         AppState::new_multi_entries(
-            state.routing().registry.entries(),
+            entries.clone(),
             vec![],
             None,
             omnigraph_server::workload::WorkloadController::with_defaults(),
@@ -77,47 +96,330 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
         ("/graphs", StatusCode::FORBIDDEN),
     ] {
         let (status, _) = json_response(&open, get_request(path, "")).await;
-        assert_eq!(status, expected);
+        assert_eq!(status, expected, "{path}");
     }
-    let app = build_app(state);
-    let (status, catalog) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        catalog,
-        json!({"graphs":[
-            {"graph_id":"default","display_name":"default"},
-            {"graph_id":"unavailable","display_name":"unavailable"}
-        ]})
+    let (status, body) = json_response(&open, get_request("/graphs/discovery", "")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(graphs_of(&body), listed(&["default"]), "open mode");
+    assert!(
+        body.get("actor_id").is_none(),
+        "open mode resolves no actor"
     );
+
+    // No applied policy: default deny reads nothing, for a static token and
+    // for an identity alike, so each gets an empty list rather than a 403.
+    // The static opt-in to policy-less reads lists what it lets the token
+    // read; a signed credential never gets that opt-in.
+    for (reads_without_policy, token, expected) in [
+        (false, "static-token", listed(&[])),
+        (false, identity.as_str(), listed(&[])),
+        (true, "static-token", listed(&["default"])),
+        (true, identity.as_str(), listed(&[])),
+    ] {
+        let app = build_app(no_policy(reads_without_policy));
+        let (status, body) = json_response(&app, get_request("/graphs/discovery", token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            graphs_of(&body),
+            expected,
+            "reads without policy: {reads_without_policy}, token: {token}"
+        );
+        let actor = if token == "static-token" {
+            "breakglass"
+        } else {
+            tokens.actor.as_str()
+        };
+        assert_eq!(body["actor_id"], actor, "the listing names the caller");
+    }
+    let app = build_app(no_policy(false));
     for (token, expected) in [
         (&restricted[..], StatusCode::UNAUTHORIZED),
-        ("static-token", StatusCode::FORBIDDEN),
+        ("invalid.jwt.signature", StatusCode::UNAUTHORIZED),
     ] {
         let (status, _) = json_response(&app, get_request("/graphs/discovery", token)).await;
-        assert_eq!(
-            status, expected,
-            "retired signed credentials are rejected; static credentials cannot discover"
-        );
+        assert_eq!(status, expected, "an unauthenticated listing is refused");
     }
-    for path in [
-        "/graphs",
-        "/graphs/default/schema",
-        "/graphs/default/snapshot",
-    ] {
-        let (status, _) = json_response(&app, get_request(path, &identity)).await;
-        assert_eq!(
-            status,
+
+    // Per-graph policies. `alpha` and `gamma` let `reader` and the identity
+    // read; `alpha` protects `main` and lets `feature-reader` read only its
+    // unprotected branches; `beta` lets none of them read; `delta`'s policy
+    // was refused at startup. `gamma` and `beta` are unavailable, and a
+    // readable one is still listed. `admin` holds `graph_list`, which shows
+    // it the catalog and every graph's availability but lists nothing.
+    let policy = |graph_id: &str, rules: &str| {
+        Some(Arc::new(
+            omnigraph_server::PolicyEngine::load_graph_from_source(
+                &format!("version: 1\n{rules}"),
+                graph_id,
+            )
+            .unwrap(),
+        ))
+    };
+    let readers = |actors: &[&str]| {
+        let members = actors
+            .iter()
+            .map(|actor| format!("\"{actor}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "groups:\n  readers: [{members}]\nrules:\n  - id: read\n    allow: {{actors: {{group: readers}}, actions: [read], branch_scope: any}}\n"
+        )
+    };
+    let base = state.routing().registry.list().pop().unwrap();
+    base.engine.branch_create("feature").await.unwrap();
+    let key = |id: &str| {
+        omnigraph_server::GraphKey::cluster(omnigraph_server::GraphId::try_from(id).unwrap())
+    };
+    let entries = vec![
+        omnigraph_server::registry::GraphEntry::ready(Arc::new(
+            omnigraph_server::registry::GraphHandle {
+                key: key("alpha"),
+                uri: base.uri.clone(),
+                engine: Arc::clone(&base.engine),
+                policy: policy(
+                    "alpha",
+                    &format!(
+                        "protected_branches: [main]\ngroups:\n  readers: [reader, \"{}\"]\n  feature_readers: [feature-reader]\n  writers: [writer]\nrules:\n  - id: read\n    allow: {{actors: {{group: readers}}, actions: [read], branch_scope: any}}\n  - id: feature-read\n    allow: {{actors: {{group: feature_readers}}, actions: [read], branch_scope: unprotected}}\n  - id: write\n    allow: {{actors: {{group: writers}}, actions: [change], branch_scope: unprotected}}\n",
+                        tokens.actor
+                    ),
+                ),
+                queries: None,
+            },
+        )),
+        omnigraph_server::GraphEntry::Loading(Arc::new(omnigraph_server::LoadingGraph {
+            key: key("beta"),
+            uri: temp.path().join("beta").to_string_lossy().into_owned(),
+            policy: policy("beta", &readers(&["someone-else"])),
+        })),
+        omnigraph_server::registry::GraphEntry::Blocked(Arc::new(
+            omnigraph_server::registry::BlockedGraph {
+                key: key("gamma"),
+                uri: temp.path().join("gamma").to_string_lossy().into_owned(),
+                policy: policy("gamma", &readers(&["reader", &tokens.actor])),
+                failure: omnigraph_server::api::GraphStartupFailure::OpenFailed,
+            },
+        )),
+        omnigraph_server::registry::GraphEntry::Blocked(Arc::new(
+            omnigraph_server::registry::BlockedGraph {
+                key: key("delta"),
+                uri: temp.path().join("delta").to_string_lossy().into_owned(),
+                policy: None,
+                failure: omnigraph_server::api::GraphStartupFailure::InvalidPolicy,
+            },
+        )),
+    ];
+    let server_policy = omnigraph_server::PolicyEngine::load_server_from_source(
+        "version: 1\ngroups:\n  admins: [admin]\nrules:\n  - id: catalog\n    allow:\n      actors: {group: admins}\n      actions: [graph_list]\n",
+    )
+    .unwrap();
+    let state = AppState::new_multi_entries(
+        entries,
+        vec![
+            ("reader".into(), "reader-token".into()),
+            ("feature-reader".into(), "feature-token".into()),
+            ("writer".into(), "writer-token".into()),
+            ("admin".into(), "admin-token".into()),
+            ("nobody".into(), "nobody-token".into()),
+        ],
+        Some(server_policy),
+        omnigraph_server::workload::WorkloadController::with_defaults(),
+        None,
+    )
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone());
+    let app = build_app(state.clone());
+    for (token, expected, catalog) in [
+        (
+            "reader-token",
+            listed(&["alpha", "gamma"]),
             StatusCode::FORBIDDEN,
-            "existence is not permission: {path}"
-        );
+        ),
+        (
+            identity.as_str(),
+            listed(&["alpha", "gamma"]),
+            StatusCode::FORBIDDEN,
+        ),
+        ("feature-token", listed(&["alpha"]), StatusCode::FORBIDDEN),
+        ("writer-token", listed(&["alpha"]), StatusCode::FORBIDDEN),
+        ("nobody-token", listed(&[]), StatusCode::FORBIDDEN),
+        (
+            "admin-token",
+            listed(&["alpha", "beta", "delta", "gamma"]),
+            StatusCode::OK,
+        ),
+    ] {
+        let (status, body) = json_response(&app, get_request("/graphs/discovery", token)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(graphs_of(&body), expected, "{token}");
+        let (status, body) = json_response(&app, get_request("/graphs", token)).await;
+        assert_eq!(status, catalog, "the catalog needs graph_list: {body}");
+        if status == StatusCode::OK {
+            let ids: Vec<&str> = body["graphs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|graph| graph["graph_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, ["alpha", "beta", "delta", "gamma"]);
+        }
     }
-    let (status, _) = json_response(
+    // Routing hides a graph on which the caller holds no grant, ready or not,
+    // exactly like a graph that does not exist. A caller with some grant (a
+    // reader, or `writer`, which may only change) or with `graph_list` sees
+    // it: 503 when unavailable, and on a ready graph the route refuses an
+    // action the caller lacks with 403.
+    for (token, path, expected) in [
+        (
+            "reader-token",
+            "/graphs/gamma/snapshot",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            "reader-token",
+            "/graphs/beta/snapshot",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "reader-token",
+            "/graphs/delta/snapshot",
+            StatusCode::NOT_FOUND,
+        ),
+        ("reader-token", "/graphs/alpha/snapshot", StatusCode::OK),
+        (
+            "feature-token",
+            "/graphs/alpha/snapshot?branch=feature",
+            StatusCode::OK,
+        ),
+        (
+            "feature-token",
+            "/graphs/alpha/snapshot",
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "writer-token",
+            "/graphs/alpha/snapshot",
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "nobody-token",
+            "/graphs/alpha/snapshot",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "nobody-token",
+            "/graphs/alpha/schema",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "nobody-token",
+            "/graphs/missing/snapshot",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "admin-token",
+            "/graphs/alpha/snapshot",
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "admin-token",
+            "/graphs/beta/snapshot",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            "admin-token",
+            "/graphs/delta/snapshot",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let (status, body) = json_response(&app, get_request(path, token)).await;
+        assert_eq!(status, expected, "{token} {path}: {body}");
+    }
+    let (_, hidden) =
+        json_response(&app, get_request("/graphs/alpha/snapshot", "nobody-token")).await;
+    let (_, missing) = json_response(
         &app,
-        get_request("/graphs/discovery", "invalid.jwt.signature"),
+        get_request("/graphs/missing/snapshot", "nobody-token"),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The whole graph-level refusal, disposition included, is the unknown
+    // graph's, so nothing in it tells a probe the graph exists.
+    assert_eq!(hidden, missing, "a hidden graph answers as a missing one");
+    assert_eq!(
+        missing,
+        json!({"error":"graph not found","code":"not_found","disposition":{"effects":"none","action":"fix"}})
+    );
+    // A listed graph's own subresource can still be not found; that refusal
+    // names the subresource, never the graph.
+    let (status, branch_missing) = json_response(
+        &app,
+        get_request("/graphs/alpha/snapshot?branch=absent", "reader-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{branch_missing}");
+    assert_ne!(branch_missing, missing, "{branch_missing}");
+    // A hidden graph is observationally an absent one in every admission
+    // state: the same status and body as a graph that does not exist, while
+    // admission is open and after it closes. `alpha` is ready and `beta` is
+    // loading; neither grants `nobody` anything.
+    let hidden_and_missing = |app: axum::Router| async move {
+        let mut answers = Vec::new();
+        for graph in ["alpha", "beta", "missing"] {
+            answers.push(
+                json_response(
+                    &app,
+                    get_request(&format!("/graphs/{graph}/snapshot"), "nobody-token"),
+                )
+                .await,
+            );
+        }
+        answers
+    };
+    let open_answers = hidden_and_missing(app.clone()).await;
+    // The guarantee a client relies on: a registered graph is listed exactly
+    // when its routes do not answer `graph not found`.
+    for token in [
+        "reader-token",
+        identity.as_str(),
+        "feature-token",
+        "writer-token",
+        "nobody-token",
+        "admin-token",
+    ] {
+        let (_, body) = json_response(&app, get_request("/graphs/discovery", token)).await;
+        assert_eq!(body["visibility"], "granted", "{body}");
+        for graph in ["alpha", "beta", "gamma", "delta", "missing"] {
+            let listed = body["graphs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["graph_id"] == graph);
+            let (status, answer) = json_response(
+                &app,
+                get_request(&format!("/graphs/{graph}/access?branch=main"), token),
+            )
+            .await;
+            assert_eq!(
+                listed,
+                answer != missing,
+                "{token} {graph}: listed {listed}, route answered {status} {answer}"
+            );
+        }
+    }
+    state.operation_runtime().close();
+    let closed_answers = hidden_and_missing(app.clone()).await;
+    for (open, closed) in [(&open_answers, false), (&closed_answers, true)] {
+        let missing = &open[2];
+        for (graph, answer) in ["alpha", "beta"].iter().zip(&open[..2]) {
+            assert_eq!(
+                answer, missing,
+                "{graph} hidden versus missing, admission closed: {closed}"
+            );
+        }
+    }
+    assert_eq!(closed_answers[2].0, StatusCode::SERVICE_UNAVAILABLE);
 
+    // Enrollment follows the applied policy: the same identity lists the
+    // graph once a policy lets it read, and not before.
     let policy_path = temp.path().join("policy.yaml");
     for actors in [vec!["someone-else"], vec![tokens.actor.as_str()]] {
         fs::write(&policy_path, permit_all_policy_yaml(&actors)).unwrap();
@@ -130,20 +432,42 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
         .unwrap()
         .with_data_token_trust(tokens.trust.clone());
         let app = build_app(state);
-        let expected = if actors[0] == tokens.actor {
-            StatusCode::OK
-        } else {
-            StatusCode::FORBIDDEN
-        };
-        let (status, _) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
+        let enrolled = actors[0] == tokens.actor;
+        let (status, body) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
-            status,
-            StatusCode::OK,
-            "policy enrollment cannot hide existence"
+            graphs_of(&body),
+            if enrolled {
+                listed(&["default"])
+            } else {
+                listed(&[])
+            }
         );
         let (status, _) =
             json_response(&app, get_request("/graphs/default/schema", &identity)).await;
-        assert_eq!(status, expected, "the same token follows activated policy");
+        assert_eq!(
+            status,
+            if enrolled {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            },
+            "the same token follows activated policy, and an unreadable graph is not found"
+        );
+    }
+    // Default deny grants an identity nothing, so it sees no graph on any
+    // route; the catalog still needs `graph_list`.
+    let app = build_app(no_policy(false));
+    for (path, expected) in [
+        ("/graphs", StatusCode::FORBIDDEN),
+        ("/graphs/default/schema", StatusCode::NOT_FOUND),
+        ("/graphs/default/snapshot", StatusCode::NOT_FOUND),
+    ] {
+        let (status, _) = json_response(&app, get_request(path, &identity)).await;
+        assert_eq!(
+            status, expected,
+            "default deny reads nothing, so it sees no graph: {path}"
+        );
     }
 }
 
@@ -366,24 +690,20 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
     let (status, _) = json_response(&app, get_request(&g("/snapshot?branch=main"), &token)).await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "JWT must not inherit static no-policy read default"
     );
-    // The access route says the same: the credential resolves, and allows
-    // nothing with no branch named or on `main`.
+    // The access route says the same: a credential granted nothing on the
+    // graph is told the graph does not exist.
     let (status, body) = json_response(&app, get_request(&g("/access?branch=main"), &token)).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["actor_id"].is_string(), "{body}");
-    assert!(body.get("actor").is_none(), "{body}");
-    assert_eq!(body["graph_wide"], json!([]), "{body}");
-    assert_eq!(body["actions"], json!([]), "{body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     // A static token gets nothing on a graph without a policy either.
     let (status, _) = json_response(
         &app,
         get_request(&g("/snapshot?branch=main"), "static-token"),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let policy_path = temp.path().join("other-principal.yaml");
     fs::write(&policy_path, permit_all_policy_yaml(&["someone-else"])).unwrap();
     let unknown_actor_app = build_app(
@@ -403,23 +723,24 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
     .await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "a valid token must not enroll its actor in Cedar"
     );
     let load_token = tokens.identity_token();
-    let (_, before_load) = json_response(&app, get_request(&g("/branches"), "static-token")).await;
+    // Neither graph grants the identity anything, so neither exists for it.
+    let before_load = manifest_dataset_version(&graph).await;
     for denied_app in [&app, &unknown_actor_app] {
         let (status, body) =
             json_response(denied_app, signed_load_request(&load_token, true)).await;
-        assert_forbidden(
+        assert_eq!(
             status,
-            body,
-            "signed load cannot bypass missing Cedar permission",
+            StatusCode::NOT_FOUND,
+            "signed load cannot bypass missing Cedar permission: {body}"
         );
     }
-    let (_, after_load) = json_response(&app, get_request(&g("/branches"), "static-token")).await;
     assert_eq!(
-        before_load, after_load,
+        manifest_dataset_version(&graph).await,
+        before_load,
         "Cedar denial cannot create the load branch"
     );
     let retired =
@@ -1232,10 +1553,11 @@ async fn issue_1020_every_401_carries_the_one_bearer_challenge() {
                 .unwrap();
             let response = app.clone().oneshot(request).await.unwrap();
             // The signed identity has no policy grant; it authenticates where
-            // its trust is installed and is refused elsewhere.
+            // its trust is installed, where the graph does not exist for it,
+            // and is refused elsewhere.
             let expected = if value == identity {
                 if *server == "signed" {
-                    StatusCode::FORBIDDEN
+                    StatusCode::NOT_FOUND
                 } else {
                     StatusCode::UNAUTHORIZED
                 }
@@ -1250,21 +1572,6 @@ async fn issue_1020_every_401_carries_the_one_bearer_challenge() {
             );
         }
     }
-
-    // A server without authentication answers discovery, which needs an
-    // identity it can never resolve, with 401 and a challenge too.
-    let (_open_temp, open_app) = app_for_loaded_graph().await;
-    let response = open_app
-        .oneshot(
-            Request::get("/graphs/discovery")
-                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(response.headers()[WWW_AUTHENTICATE], "Bearer");
 }
 
 /// A valid OIDC token whose subject the admission file does not name is not an
@@ -1468,10 +1775,11 @@ rules:
     )
     .await;
     let denied_error: ErrorOutput = serde_json::from_value(denied_body).unwrap();
-    assert_eq!(denied_status, StatusCode::FORBIDDEN);
+    // act-b holds no grant on the graph, so the graph does not exist for it.
+    assert_eq!(denied_status, StatusCode::NOT_FOUND);
     assert_eq!(
         denied_error.code,
-        Some(omnigraph_server::api::ErrorCode::Forbidden)
+        Some(omnigraph_server::api::ErrorCode::NotFound)
     );
 
     // Unknown token: 401, never reaches the policy engine.
@@ -1546,12 +1854,12 @@ rules:
     let spoof_up_error: ErrorOutput = serde_json::from_value(spoof_up_body).unwrap();
     assert_eq!(
         spoof_up_status,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "X-Actor-Id must not promote a denied bearer to an allowed actor",
     );
     assert_eq!(
         spoof_up_error.code,
-        Some(omnigraph_server::api::ErrorCode::Forbidden),
+        Some(omnigraph_server::api::ErrorCode::NotFound),
     );
 
     // (2) Spoof-down: bearer for act-a (allowed) + X-Actor-Id: act-b (denied).
@@ -1592,7 +1900,7 @@ rules:
     .await;
     assert_eq!(
         empty_spoof_status,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "empty X-Actor-Id must not clear the resolved actor",
     );
 }
@@ -1766,7 +2074,8 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
         )
         .await
         .unwrap();
-    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    // act-denied holds no grant, so the graph does not exist for it.
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
 
     let allowed = app
         .clone()
@@ -3720,7 +4029,9 @@ async fn default_deny_mode_refuses_read_unless_the_operator_opts_in() {
             .body(Body::empty())
             .unwrap()
     };
-    for (allow_reads, expected) in [(false, StatusCode::FORBIDDEN), (true, StatusCode::OK)] {
+    // Default deny grants nothing, so the graph does not exist for the token
+    // until the operator opts in to policy-less reads.
+    for (allow_reads, expected) in [(false, StatusCode::NOT_FOUND), (true, StatusCode::OK)] {
         let (_temp, app) = app_for_graph_with_auth_tokens_only_reading(
             &schema,
             &[("act-andrew", "demo-token")],
@@ -3749,7 +4060,7 @@ async fn default_deny_mode_refuses_read_unless_the_operator_opts_in() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn default_deny_mode_rejects_change_with_forbidden() {
+async fn default_deny_mode_rejects_change_as_not_found() {
     let (_temp, app) = app_for_graph_with_auth_tokens_only(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-andrew", "demo-token")],
@@ -3775,13 +4086,11 @@ async fn default_deny_mode_rejects_change_with_forbidden() {
             .unwrap(),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Default deny grants nothing, so the graph does not exist for the token;
+    // the server logs the default-deny mode at startup.
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let error: ErrorOutput = serde_json::from_value(body).unwrap();
-    assert!(
-        error.error.contains("default-deny"),
-        "expected default-deny in error message, got: {}",
-        error.error
-    );
+    assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::NotFound));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4652,12 +4961,12 @@ rules:
         assert_eq!(body["actions"], actions, "{query}");
     }
 
-    // Without a graph policy a static token may do nothing, or only read
-    // under the operator opt-in, as `authorize` decides; without
-    // authentication every graph action is open.
+    // Without a graph policy a static token may do nothing, so the graph does
+    // not exist for it, or only read under the operator opt-in, as
+    // `authorize` decides; without authentication every graph action is open.
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path()).to_string_lossy().to_string();
-    for (allow_reads, expected) in [(false, json!([])), (true, json!(["read"]))] {
+    for allow_reads in [false, true] {
         let app = build_app(
             AppState::open_with_bearer_tokens(
                 graph.clone(),
@@ -4668,9 +4977,13 @@ rules:
             .with_reads_without_policy(allow_reads),
         );
         let (status, body) = access(&app, "?branch=main", Some("bruno-token")).await;
+        if !allow_reads {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            continue;
+        }
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["graph_wide"], expected, "opt-in {allow_reads}");
-        assert_eq!(body["actions"], expected, "opt-in {allow_reads}");
+        assert_eq!(body["graph_wide"], json!(["read"]), "opt-in {allow_reads}");
+        assert_eq!(body["actions"], json!(["read"]), "opt-in {allow_reads}");
     }
 
     let app = build_app(AppState::open(graph).await.unwrap());

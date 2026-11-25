@@ -148,11 +148,11 @@ version-2 identity credentials, which bind the principal to the cluster and
 contain no permissions. Applied Cedar policy decides graph operations;
 missing policy or an unknown policy actor denies protected access.
 
-Every valid identity credential can call `GET /graphs/discovery` for applied
-graph IDs and names (currently identical), including blocked graphs. It
-requires no policy membership and returns no locations, availability, schema,
-queries or data. Static credentials cannot use it. `GET /graphs`
-requires `graph_list` permission. Discovery grants no graph access or reachability.
+Any credential can call `GET /graphs/discovery` for the actor it resolves to and
+the IDs and names (currently identical) of the graphs it holds any permission on,
+including blocked graphs. It returns no locations, availability, schema, queries
+or data, and grants nothing. A graph it does not list answers 404 on its routes.
+`GET /graphs` requires `graph_list` permission. See [policy](policy.md#actions).
 
 See [managed data access](../cli/managed-data.md) for issuance and CLI discovery.
 
@@ -218,8 +218,8 @@ describes sign-in, which resource identifier to choose, and the endpoint's tools
 | `GET /healthz` | Process health |
 | `GET /readyz` | Replica readiness and booted applied revision |
 | `GET /openapi.json` | Runtime copy of the OpenAPI document |
-| `GET /graphs` | Graph metadata catalog; requires `graph_list` policy |
-| `GET /graphs/discovery` | Graph IDs and display names only; requires an identity credential |
+| `GET /graphs` | Graph catalog: every graph with its root and availability; requires `graph_list` policy |
+| `GET /graphs/discovery` | `visibility: granted`, the caller's `actor_id` (and OAuth `client_id`), and IDs and display names of the registered graphs it holds any permission on, for any credential |
 | `POST /cluster/plan` | Preview source changes against the running cluster without applying them |
 | `POST /cluster/deployments` | Submit an exact-ID deployment: graph creation/deletion or schema, query, policy, provider and Blob-binding changes |
 | `GET /cluster/deployments`, `GET /cluster/deployments/{deployment_id}` | Authorized deployment status and current-process activation observation |

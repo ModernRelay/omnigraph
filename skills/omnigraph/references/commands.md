@@ -41,7 +41,7 @@ prints the exact flags of the installed binary.
 | `commit` | `list` `show` `changes` `publish` `drop` | Read history; publish or drop an unpublished commit |
 | `changes` | `poll` `baseline` | Follow a branch's change feed |
 | `schema` | `show` `plan` `apply` `upgrade-system-columns` | Read, plan or apply a schema; respell legacy system columns |
-| `graphs` | `list` | List the graphs a multi-graph server serves |
+| `graphs` | `list` | Say who you are and list the graphs you hold any permission on; `--catalog` lists every graph |
 | `init` | — | Create a graph from a `.pg` schema |
 | `upgrade` | — | Convert a standalone graph's storage offline |
 | `optimize` | — | Compact data and reconcile declared indexes on `main` |
@@ -50,7 +50,7 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `list` `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | List the organizations you belong to; manage the selected organization's members and invitations; requires a profile; `org` is an alias |
+| `organization` | `list` `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` `m2m-applications list` `m2m-applications create` `m2m-applications secret rotate` `m2m-applications delete` | List the organizations you belong to; manage the selected organization's members, invitations and M2M applications; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
 | `login` | — | Create a profile with `--create-profile` (pass `--organization ID` when you belong to several), or sign in to its `omnigraph` auth provider |
@@ -58,7 +58,7 @@ prints the exact flags of the installed binary.
 | `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
 | `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
-| `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
+| `access` | — | Say which actions a graph's policy grants you, graph-wide and on a branch |
 | `mcp` | — | Relay an agent's stdio MCP to an existing server or managed target's `/mcp`, bound to one graph; read-only tools unless `--write` |
 | `studio` | — | Open Omnigraph Studio on an existing server target through an `omnigraph-studio://open` link, and print the link |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
@@ -188,14 +188,19 @@ baseline recovery, see [`changes.md`](changes.md).
 
 ```bash
 omnigraph graphs list --target <name> --json
+omnigraph graphs list --target <name> --catalog --json
 ```
 
-Lists the graphs a multi-graph server serves, with each graph's `state`. Remote
-servers only (rejects local URIs); a cluster-scoped policy bundle must grant
-`graph_list`, on managed targets too. `--discovery` returns only graph ids and
-names to an identity credential and needs no `graph_list`; pass it explicitly,
-since the CLI never infers it from the target or credential. See
-[`server-policy.md`](server-policy.md).
+Names your actor (on stderr; `--json` carries `actor_id` and `client_id`) and
+lists the ids and names of the graphs the credential holds any permission on,
+available or not, with any credential and no permit; an empty list means it
+holds none. Any other registered graph answers `graph not found`; `access`
+says what you may do on a listed one. An older server's listing, which states
+no `visibility`, is reported as `unfiltered`: it lists every graph and names
+no caller.
+Remote servers only (rejects local URIs). `--catalog` lists every graph with its
+`state` and root instead, and needs `graph_list` from a cluster-scoped policy
+bundle, on managed targets too. See [`server-policy.md`](server-policy.md).
 
 ## Schema
 
@@ -448,9 +453,12 @@ omnigraph config validate --json
 omnigraph access --target production --branch main --json
 ```
 
-`access` reports the server-resolved actor and allowed graph actions; it is the
-identity check, with no separate `whoami` command. Direct targets use `--as`
-or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
+`access` reports the server-resolved actor and allowed graph actions on a graph
+you hold some permission on; a served graph you hold none on answers 404, as it
+does on every route. The identity check for any credential, with no separate
+`whoami` command, is `graphs list --json` on a served target: its `actor_id`
+(and `client_id` for an OAuth client) name who you are even when you may do
+nothing. Direct targets use `--as` or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
 update scripts that read protocol 1's `actor`. Managed targets use their issued resource identity. See
 [access scope and policy semantics](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#what-you-may-do-at-a-target).
 
@@ -617,7 +625,7 @@ its `status`, the booted applied digest, ledger revision/CAS, the registered,
 ready, loading and blocked graph counts and shutdown grace. It returns `503`
 while a graph is still loading, when a nonempty inventory has no ready graph,
 and once draining starts. Readiness is not proof that every configured graph
-is healthy; authorized `graphs list --target NAME --json` on a registered target returns one
+is healthy; authorized `graphs list --target NAME --catalog --json` on a registered target returns one
 `graphs` list with each graph's `state` and `action`, blocked graphs included.
 
 ## Organization Administration
@@ -630,14 +638,36 @@ omnigraph organization members list --profile work --json
 omnigraph organization invitations send person@example.com --role member --profile work --idempotency-key invite-person
 omnigraph organization members set person@example.com --profile work --role member --idempotency-key role-person
 omnigraph organization members offboard person@example.com --profile work --idempotency-key offboard-person --json
+omnigraph organization m2m-applications create ci-sync --profile work --permission status --client-secret-file ~/.omnigraph/ci-sync.secret --create-profile ci-sync --idempotency-key create-ci-sync
+omnigraph organization m2m-applications secret rotate --profile work --application-profile ci-sync --idempotency-key rotate-ci-sync
+omnigraph organization m2m-applications delete ci-sync --profile work --idempotency-key delete-ci-sync --yes
 ```
+
+M2M applications are organization-owned client applications for unattended
+work. `m2m-applications list` shows each one's client ID, permissions and actor
+ID (`principal:ID`). `m2m-applications create` writes the one-time client
+secret only to `--client-secret-file` (0600, atomic; an existing file needs
+`--replace-client-secret-file`) and never prints it; `--create-profile NAME`
+adds an `oauth_client_credentials` profile with a `{file: PATH}` client secret
+(an existing name needs `--replace-profile`). An M2M application has no graph
+access until a cluster's policy names its actor ID. `secret rotate` writes a
+new client secret to the application profile's file, proves a token exchange,
+then revokes the one earlier client secret; with several, pass
+`--revoke SECRET_ID` for each. A failed exchange revokes nothing; repeat with
+the same key; a repeat refuses, revoking nothing, if the file no longer holds
+the new client secret. Writing a client secret works on Linux and macOS only,
+keeps a replaced file's owner, and refuses a path any other output (such as
+`--stats`) writes. `m2m-applications delete` deletes by name or client ID and needs
+`--yes` without a terminal. A client secret whose one disclosure was lost
+cannot be recovered: revoke its ID and generate another, as the command's
+message says.
 
 `organization list` shows the organizations the signed-in person is an active
 member of, with names and IDs, and marks the profile's; it needs no service
 permission, and its `--json` is the API envelope (`data.organizations`).
 Use an ID from it with `login --create-profile NAME --organization ID` to work
 in another organization. The member and invitation commands need current
-provider `members_manage` permission. WorkOS owns
+provider `members_manage` permission. The identity provider owns
 organization membership and service roles; applied cluster configuration owns
 graph and deployment permissions. No local enrollment or member-patch command
 is required. Member operations accept an email or exact user ID. `members set`
