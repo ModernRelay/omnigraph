@@ -570,11 +570,13 @@ pub(crate) async fn resolve_graph_handle(
 /// see ([`VisibleGraphs`]) answers exactly as an unknown graph does, whether
 /// it is ready or unavailable. A visible graph that is unavailable answers 503;
 /// a visible ready graph reaches its handler, whose own authorization decides
-/// the action. Visibility is judged inside the registry's capture section,
-/// before request ownership is taken, so a hidden graph costs what a missing
-/// one does and never counts toward a drain. The judgement is pure policy
-/// evaluation: one decision for a reader, at most one per graph action and
-/// branch class for a caller that holds nothing.
+/// the action. Visibility is judged on a snapshot outside every lock and
+/// honoured only if that snapshot is still current at capture, before request
+/// ownership is taken ([`GraphRegistry::capture_visible`]), so a hidden graph
+/// costs what a missing one does, never counts toward a drain, and never holds
+/// up a registry swap. The judgement is pure policy evaluation: one decision
+/// for a reader, at most one per graph action and branch class for a caller
+/// that holds nothing.
 pub(crate) fn resolve_registered_graph(
     state: &AppState,
     key: &GraphKey,

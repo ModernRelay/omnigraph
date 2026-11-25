@@ -218,6 +218,10 @@ struct TransitionCandidate {
     completion_owned: bool,
 }
 
+/// How many times a capture judges visibility again after the registry
+/// changed under it, before it fails closed.
+pub(crate) const CAPTURE_VISIBILITY_ATTEMPTS: usize = 3;
+
 pub struct GraphRegistry {
     state: Mutex<RegistryState>,
 }
@@ -340,32 +344,47 @@ impl GraphRegistry {
         self.capture_visible(operations, key, |_, _| Ok(true))
     }
 
-    /// Capture `key` for a caller that `sees` it, judged on the entry and the
-    /// server policy of the snapshot the capture comes from. A graph the
-    /// caller does not see is `Hidden` before anything is acquired: no
-    /// request ownership, so it counts toward no drain and costs what an
-    /// unknown graph costs.
+    /// Capture `key` for a caller that `sees` it. Visibility is policy
+    /// evaluation, so it runs on a cloned snapshot with neither the process
+    /// admission lock nor the registry lock held; the capture then takes both
+    /// in their usual order and honours the judgement only while that same
+    /// snapshot is current. A swap in between (activation, transition, startup
+    /// completion) judges again, at most [`CAPTURE_VISIBILITY_ATTEMPTS`] times,
+    /// then fails closed as `Hidden`. A graph the caller does not see is
+    /// `Hidden` before anything is acquired: no request ownership, so it counts
+    /// toward no drain and costs what an unknown graph costs.
     pub(crate) fn capture_visible(
         &self,
         operations: &OperationRuntime,
         key: &GraphKey,
-        sees: impl FnOnce(&GraphEntry, Option<&PolicyEngine>) -> Result<bool, ApiError>,
+        sees: impl Fn(&GraphEntry, Option<&PolicyEngine>) -> Result<bool, ApiError>,
     ) -> Result<RegistryCapture, ApiError> {
-        operations.while_open(|| {
-            let state = locked(&self.state);
-            let Some(entry) = state.snapshot.graphs.get(key) else {
+        for _ in 0..CAPTURE_VISIBILITY_ATTEMPTS {
+            let judged = self.snapshot_ref();
+            let Some(entry) = judged.graphs.get(key) else {
                 return Ok(RegistryCapture::Gone);
             };
-            if !sees(entry, state.snapshot.server_policy.as_deref())? {
-                return Ok(RegistryCapture::Hidden);
+            let visible = sees(entry, judged.server_policy.as_deref())?;
+            let captured = operations.while_open(|| {
+                let state = locked(&self.state);
+                if !Arc::ptr_eq(&state.snapshot, &judged) {
+                    return Ok(None);
+                }
+                if !visible {
+                    return Ok(Some(RegistryCapture::Hidden));
+                }
+                Ok(Some(match entry {
+                    GraphEntry::Loading(_) => RegistryCapture::Loading,
+                    GraphEntry::Ready(view) => RegistryCapture::Ready(view.capture()?),
+                    GraphEntry::Transitioning(_) => RegistryCapture::Transitioning,
+                    GraphEntry::Blocked(_) => RegistryCapture::Blocked,
+                }))
+            })?;
+            if let Some(captured) = captured {
+                return Ok(captured);
             }
-            Ok(match entry {
-                GraphEntry::Loading(_) => RegistryCapture::Loading,
-                GraphEntry::Ready(view) => RegistryCapture::Ready(view.capture()?),
-                GraphEntry::Transitioning(_) => RegistryCapture::Transitioning,
-                GraphEntry::Blocked(_) => RegistryCapture::Blocked,
-            })
-        })
+        }
+        Ok(RegistryCapture::Hidden)
     }
 
     /// Install one startup result, or the complete strict-startup batch. The
@@ -2096,6 +2115,51 @@ mod tests {
         assert!(matches!(seen, RegistryCapture::Ready(_)));
         assert_eq!(view.request_count(), 1);
         drop(seen);
+        assert_eq!(view.request_count(), 0);
+    }
+
+    /// Visibility is judged with no registry lock held, so a swap can land
+    /// while a probe is being judged and is never blocked by it: the judging
+    /// closure below swaps the registry itself, which would deadlock under the
+    /// lock. A judgement made on a replaced snapshot is judged again, and a
+    /// registry that keeps changing fails closed without taking ownership.
+    #[tokio::test]
+    async fn a_visibility_judgement_on_a_replaced_snapshot_is_judged_again() {
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        let registry = GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap();
+        let operations = OperationRuntime::new();
+        let RegistryLookup::Ready(view) = registry.get(&handle.key) else {
+            panic!("alpha is ready");
+        };
+        let judgements = std::cell::Cell::new(0);
+        let seen = registry
+            .capture_visible(&operations, &handle.key, |_, _| {
+                judgements.set(judgements.get() + 1);
+                if judgements.get() == 1 {
+                    registry.initialize_server_policy(None);
+                }
+                Ok(true)
+            })
+            .unwrap();
+        assert!(matches!(seen, RegistryCapture::Ready(_)));
+        assert_eq!(
+            judgements.get(),
+            2,
+            "the first judgement saw a replaced snapshot"
+        );
+        drop(seen);
+
+        judgements.set(0);
+        let churned = registry
+            .capture_visible(&operations, &handle.key, |_, _| {
+                judgements.set(judgements.get() + 1);
+                registry.initialize_server_policy(None);
+                Ok(true)
+            })
+            .unwrap();
+        assert!(matches!(churned, RegistryCapture::Hidden));
+        assert_eq!(judgements.get(), CAPTURE_VISIBILITY_ATTEMPTS);
         assert_eq!(view.request_count(), 0);
     }
 

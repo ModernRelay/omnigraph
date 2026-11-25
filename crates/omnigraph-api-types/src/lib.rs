@@ -3788,10 +3788,6 @@ pub enum GraphVisibility {
     /// permission, or every graph for a `graph_list` holder: a registered
     /// graph is listed exactly when its routes do not answer `graph not found`.
     Granted,
-    /// Every registered graph, as a release before this rule lists it, without
-    /// naming the caller. No server sends it; a client names a body that
-    /// carries no rule this way.
-    Unfiltered,
 }
 
 /// A graph's existence, without storage, schema, data, or serving metadata.
@@ -3808,9 +3804,9 @@ pub struct GraphDiscoveryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GraphDiscoveryOutput {
-    /// The rule the listing follows. A server sends `granted`. A body without
+    /// The rule the listing follows; a server always sends it. A body without
     /// it comes from an older release, whose listing is not filtered and
-    /// names no caller; the CLI reports that body as `unfiltered`.
+    /// names no caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<GraphVisibility>,
     /// The actor the credential resolves to. Absent only on a server that runs
@@ -3859,6 +3855,14 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.visibility, None);
         assert_eq!(legacy.actor_id, None);
+        // `granted` is the only rule on the wire; a client's own name for a
+        // body without one is not.
+        assert!(
+            serde_json::from_value::<GraphDiscoveryOutput>(
+                serde_json::json!({"visibility":"unfiltered","graphs":[]})
+            )
+            .is_err()
+        );
     }
 
     /// Every code says what it means and whether a server sends it, under

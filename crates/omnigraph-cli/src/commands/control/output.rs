@@ -269,22 +269,24 @@ pub(super) fn write_graphs_discovery(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
-    let visibility = payload.visibility.unwrap_or(GraphVisibility::Unfiltered);
     if json {
-        let mut payload = payload.clone();
-        payload.visibility = Some(visibility);
-        write_json(&payload, stdout)?;
+        // The server's rule, or the CLI's own name for a body that states none.
+        let mut body = serde_json::to_value(payload)?;
+        if payload.visibility.is_none() {
+            body["visibility"] = serde_json::json!("unfiltered");
+        }
+        write_json(&body, stdout)?;
     } else {
-        match (visibility, &payload.actor_id, &payload.client_id) {
-            (GraphVisibility::Unfiltered, _, _) => writeln!(
+        match (payload.visibility, &payload.actor_id, &payload.client_id) {
+            (None, _, _) => writeln!(
                 stderr,
                 "this server predates the filtered listing: it lists every registered graph, whether or not you may use it, and does not say who you are"
             )?,
-            (GraphVisibility::Granted, Some(actor), Some(client)) => {
+            (Some(GraphVisibility::Granted), Some(actor), Some(client)) => {
                 writeln!(stderr, "as {actor} (client {client})")?
             }
-            (GraphVisibility::Granted, Some(actor), None) => writeln!(stderr, "as {actor}")?,
-            (GraphVisibility::Granted, None, _) => writeln!(
+            (Some(GraphVisibility::Granted), Some(actor), None) => writeln!(stderr, "as {actor}")?,
+            (Some(GraphVisibility::Granted), None, _) => writeln!(
                 stderr,
                 "as no actor: the server runs without authentication"
             )?,
@@ -556,6 +558,25 @@ mod tests {
         write_graphs_discovery(&discovery, false, &mut human, &mut identity).unwrap();
         assert_eq!(human, b"a\nb\tBee\n");
         assert_eq!(identity, b"as principal:alice\n");
+        // A body that states no rule is an older server's: the CLI names it
+        // `unfiltered` in its own JSON and says so in human output.
+        let legacy = GraphDiscoveryOutput {
+            visibility: None,
+            actor_id: None,
+            client_id: None,
+            graphs: discovery.graphs.clone(),
+        };
+        let mut legacy_json = Vec::new();
+        write_graphs_discovery(&legacy, true, &mut legacy_json, &mut Vec::new()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&legacy_json).unwrap()["visibility"],
+            "unfiltered"
+        );
+        let mut legacy_identity = Vec::new();
+        write_graphs_discovery(&legacy, false, &mut Vec::new(), &mut legacy_identity).unwrap();
+        let legacy_identity = String::from_utf8(legacy_identity).unwrap();
+        assert!(legacy_identity.contains("predates"), "{legacy_identity}");
+        assert!(!legacy_identity.contains("without authentication"));
         human.clear();
         write_graphs_list(&registry, false, &mut human).unwrap();
         assert_eq!(human, b"a\tready\t/graph.omni\n");

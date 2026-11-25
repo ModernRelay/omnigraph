@@ -15927,7 +15927,7 @@
               },
               {
                 "$ref": "#/components/schemas/GraphVisibility",
-                "description": "The rule the listing follows. A server sends `granted`. A body without\nit comes from an older release, whose listing is not filtered and\nnames no caller; the CLI reports that body as `unfiltered`."
+                "description": "The rule the listing follows; a server always sends it. A body without\nit comes from an older release, whose listing is not filtered and\nnames no caller."
               }
             ]
           }
@@ -16007,8 +16007,7 @@
         "type": "string",
         "description": "Which graphs a discovery listing names.",
         "enum": [
-          "granted",
-          "unfiltered"
+          "granted"
         ]
       },
       "HealthOutput": {
