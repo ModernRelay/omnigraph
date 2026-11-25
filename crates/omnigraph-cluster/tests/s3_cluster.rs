@@ -537,11 +537,14 @@ async fn s3_cluster_root_with_two_keys_is_refused_before_any_write_issue_1527() 
         );
         let applied = apply_deployment(dir.path(), None, &caller, |_, _, _| {}).await;
         assert_root_refused(&applied);
+        let direct = Omnigraph::init(&format!("{root}/graphs/direct.omni"), SCHEMA_V1)
+            .await
+            .map(|_| ())
+            .expect_err("a graph opened outside a cluster takes the same rule")
+            .to_string();
         assert!(
-            Omnigraph::init(&format!("{root}/graphs/direct.omni"), SCHEMA_V1)
-                .await
-                .is_err(),
-            "{spelling:?}: a graph opened outside a cluster takes the same rule"
+            direct.contains("must name one object key") && direct.contains("and Lance under"),
+            "{spelling:?}: {direct}"
         );
         assert_eq!(
             bucket_keys(&bucket, &prefix).await,
@@ -551,26 +554,35 @@ async fn s3_cluster_root_with_two_keys_is_refused_before_any_write_issue_1527() 
     }
 }
 
-/// #1527: two roots that differ only in escaping (`aAb`, `a%41b`) were two
-/// clusters with their own ledgers over one set of graph tables. The escaped
-/// spelling is refused, so the bucket holds one cluster under one prefix.
+/// #1527: two roots that differ only in spelling were two cluster identities
+/// over one set of keys. An escape (`a%41b`) split the objects across two
+/// prefixes; a dot segment, escaped or not, named `aAb`'s own ledger under a
+/// second root string. Every other spelling is refused, so the bucket holds
+/// one cluster under one prefix and one identity.
 #[tokio::test(flavor = "multi_thread")]
-async fn s3_cluster_roots_that_differ_only_in_escaping_do_not_collide_issue_1527() {
+async fn s3_cluster_roots_that_differ_only_in_spelling_do_not_collide_issue_1527() {
     let Some((bucket, prefix)) = s3_run_prefix("escaping") else {
         eprintln!("skipping s3 cluster e2e: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
     let plain = format!("s3://{bucket}/{prefix}/aAb");
-    let escaped = format!("s3://{bucket}/{prefix}/a%41b");
     let first = tempfile::tempdir().unwrap();
     write_cluster_fixture(first.path(), &plain, SCHEMA_V1);
     deploy_fixture(first.path(), &plain).await;
 
-    let second = tempfile::tempdir().unwrap();
-    write_cluster_fixture(second.path(), &escaped, SCHEMA_V1);
     let caller = DeploymentCaller::storage_owner(Some("act-admin".into()));
-    let applied = apply_deployment(second.path(), None, &caller, |_, _, _| {}).await;
-    assert_root_refused(&applied);
+    for spelling in ["a%41b", "x/%2e%2e/aAb", "x/../aAb", "./aAb", "aAb/."] {
+        let other = format!("s3://{bucket}/{prefix}/{spelling}");
+        let second = tempfile::tempdir().unwrap();
+        write_cluster_fixture(second.path(), &other, SCHEMA_V1);
+        let applied = apply_deployment(second.path(), None, &caller, |_, _, _| {}).await;
+        assert_root_refused(&applied);
+        let status = deployment_status(&other, None, &caller).await;
+        assert!(
+            format!("{status:?}").contains("must name one object key"),
+            "{spelling:?}: status reads the ledger under another identity: {status:?}"
+        );
+    }
 
     let keys = bucket_keys(&bucket, &prefix).await;
     let outside: Vec<_> = keys

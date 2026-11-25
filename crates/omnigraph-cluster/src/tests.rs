@@ -1236,26 +1236,25 @@ graphs:
 "#
         )
     };
-    // An empty segment names no key, so the root itself is refused (#1527)
-    // before any base is compared with it.
+    // An empty segment names no key and a dot segment respells one, so
+    // either root is itself refused (#1527) before any base is compared.
+    for root in ["s3://assets/a//cluster", "s3://assets/a/../cluster"] {
+        fs::write(dir.path().join(CLUSTER_CONFIG_FILE), config(root)).unwrap();
+        let outcome = load_desired(dir.path());
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "invalid_storage_root"),
+            "{root}: {:?}",
+            outcome.diagnostics
+        );
+    }
+    // A backslash is a key character of its one spelling, which a base URI
+    // cannot express.
     fs::write(
         dir.path().join(CLUSTER_CONFIG_FILE),
-        config("s3://assets/a//cluster"),
-    )
-    .unwrap();
-    let outcome = load_desired(dir.path());
-    assert!(
-        outcome
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "invalid_storage_root"),
-        "{:?}",
-        outcome.diagnostics
-    );
-    // A dot segment names one key, which a base URI cannot spell.
-    fs::write(
-        dir.path().join(CLUSTER_CONFIG_FILE),
-        config("s3://assets/a/../cluster"),
+        config("s3://assets/a\\b/cluster"),
     )
     .unwrap();
     let outcome = load_desired(dir.path());

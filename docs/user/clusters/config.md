@@ -161,8 +161,8 @@ overlaps its own graph root.
 
 A base is compared only with a storage root of its own kind: an `s3://` base
 with an `s3://` root, a `file://` base with a local root. When the root is
-spelled with a path component a base URI cannot express (a dot segment
-such as `s3://bucket/a/../cluster`, or a percent sign in a local path), a
+spelled with a path component a base URI cannot express (a backslash
+such as `s3://bucket/a\b/cluster`, or a percent sign in a local path), a
 same-kind base is refused with `external_blob_storage_root_uncomparable`,
 because disjointness cannot be proven. Moving the base does not clear that
 code; the storage root spelling does.
@@ -202,9 +202,14 @@ character a URL writes as one (a space, a non-ASCII letter, a brace, a quote;
 the caret aside), or with a query or a fragment, is refused before any request
 with `invalid_storage_root` (`target_invalid` for a `--target`): Omnigraph and
 Lance would store its objects under two key prefixes, so removing a graph would
-delete nothing. Two spellings of one prefix, such as `aAb` and `a%41b`, are
-therefore never two clusters. A cluster an earlier release created at such a
-root is refused too; see [the upgrade guide](../operations/upgrade.md#s3-roots-that-name-two-keys).
+delete nothing. The root must also be the one spelling of its key,
+`s3://<bucket>/<key>`, trailing slashes aside: a dot segment (also escaped, as
+`%2e%2e`), a port, user information, or a tab, newline or surrounding space the
+URL parser drops would name the same objects under a second cluster identity,
+so it is refused under the same code, and the message names the spelling to
+use. Two spellings of one prefix, such as `aAb` and `a%41b`, are therefore
+never two clusters. A cluster an earlier release created at such a root is
+refused too; see [the upgrade guide](../operations/upgrade.md#s3-roots-that-name-two-keys).
 
 Registered direct targets accept local files only. The storage assertion above
 describes the deployment root; it does not select a target. An inline `s3://`
