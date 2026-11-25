@@ -9,6 +9,12 @@ environments:
   - target: omnigraph-engine-dst
     storage: in-memory-object-store
     seeds: [42]
+  - target: omnigraph-engine-dst
+    storage: s3-compatible
+    seeds: [0]
+  - target: omnigraph-engine-dst
+    storage: google-cloud-storage
+    seeds: [0]
 
 --- schema
 node Doc { slug: String @key text: String @index }

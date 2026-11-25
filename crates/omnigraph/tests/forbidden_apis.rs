@@ -1086,7 +1086,7 @@ durable_calls! {
     ("db/upgrade.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("db/upgrade.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("omnigraph-core/fts_compat.rs", ".put(", 1, WriteProtocol::Composed("staged index artifact")),
-    ("omnigraph-core/lance_commit.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("the one commit constructor, which applies the commit-timeout policy (Lance's default in production, none while the simulation clock is installed); every commit the engine and the catalog make calls `commit_builder(` and is counted at its own site")),
+    ("omnigraph-core/lance_commit.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("the one commit constructor, which runs every commit on the session its `CommitDestination` carries (an opened dataset's own, or one named beside a URI), never Lance's default, and applies the commit-timeout policy (Lance's default in production, none while the simulation clock is installed); every commit the engine and the catalog make calls `commit_builder(` and is counted at its own site")),
     ("table_store.rs", ".put(", 1, WriteProtocol::Composed("deleted-ids record spilled to `_omnigraph/deleted_ids/<uuid>.json` before the detached delete commit that names it in its transaction properties; marked by the collector as one of the root's files")),
     // The `__manifest` Create write is the manifest's entire birth: entries,
     // genesis lineage, and the internal-schema stamp all ride the one commit,

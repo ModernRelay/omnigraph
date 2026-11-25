@@ -13,6 +13,12 @@ environments:
     seeds: [0]
   - target: omnigraph-server
     storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: s3-compatible
+    seeds: [0]
+  - target: omnigraph-engine-dst
+    storage: google-cloud-storage
+    seeds: [0]
 
 --- schema
 node Person {

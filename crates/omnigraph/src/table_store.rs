@@ -5204,12 +5204,15 @@ impl TableStore {
         )
         .await
         .map_err(OmniError::storage)?;
-        let dataset = crate::lance_commit::commit_builder(dataset_uri)
+        let dataset =
+            crate::lance_commit::commit_builder(crate::lance_commit::CommitDestination::Uri {
+                uri: dataset_uri,
+                session: self.session.clone(),
+            })
             .with_commit_handler(handler)
             .use_stable_row_ids(true)
             .with_storage_format(LanceFileVersion::V2_2)
             .enable_v2_manifest_paths(true)
-            .with_session(self.session.clone())
             .with_store_params(store_params)
             .with_skip_auto_cleanup(true)
             .with_max_retries(0)
