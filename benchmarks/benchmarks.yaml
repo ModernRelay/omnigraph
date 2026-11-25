@@ -762,6 +762,12 @@ scenarios:
     text: |
       --- mutate
       query add() as commit { insert Item { key: "c", val: 3 } }
+# The workload's `--- concurrent measured` block is the measured step, so the
+# entry echoes none; its `--- bench` section holds the warmup, the duration
+# and the swept worker count.
+- id: concurrent-writes
+  fixture: fixtures/concurrent_writes.gqt
+  workload: workloads/concurrent_writes.gqt
 
 suites:
   end-to-end:
@@ -855,6 +861,8 @@ suites:
   - e2e-traversal-hop3
   - e2e-traversal-selective-csr
   - e2e-traversal-selective-indexed
+  concurrency:
+  - concurrent-writes
 
 run:
 - local-fast

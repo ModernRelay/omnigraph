@@ -1,6 +1,6 @@
 # Operating a cluster
 
-An OmniGraph cluster is a declarative bundle of graphs, schemas, stored queries
+An Omnigraph cluster is a declarative bundle of graphs, schemas, stored queries
 and authorization policies. Apply converges graph inventory, schemas, queries,
 policies and provider/Blob settings. Submit to the running server to activate
 changes without a restart.
@@ -81,7 +81,7 @@ For a retained lock, follow [ownership transfer](../deployment.md#writer-topolog
 
 ```bash
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret"}' \
-  omnigraph-server --cluster file:///srv/company-brain --bind 0.0.0.0:8080
+  omnigraph-server --cluster "file://$PWD/company-data" --bind 0.0.0.0:8080
 ```
 
 Use the actual root printed by apply. A directory boot resolves its storage root

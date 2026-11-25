@@ -1,0 +1,82 @@
+# issue: none
+# notes: A create from a branch whose first load of main's catalog meets a retryable contention
+# notes: loads again and lands: the new branch is listed and holds its source's rows, after a
+# notes: restart too.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query add_bob_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- seam
+at: publish.load_state
+occurrence: 1
+action: contention
+scope: next_step
+
+--- mutate
+branch create c from b
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "b"}
+{"name": "c"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query branch: c
+query names_on_c() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- restart
+
+--- query branch: c
+query names_on_c_after_restart() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String

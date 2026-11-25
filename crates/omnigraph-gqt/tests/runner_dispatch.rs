@@ -73,20 +73,20 @@ fn refuses_unknown_or_unobserved_faults() {
     }
 }
 
-/// A concurrent block runs under the DST runner only; a script entry the run
-/// never makes starves the block (the session names the entry), and a script
-/// whose next entry never arrives starves it after half the case budget.
+/// A scripted concurrent block runs under the DST runner only; an entry the
+/// run never makes starves the block (the session names it), and one whose
+/// next entry never arrives starves it after half the case budget.
 #[test]
 fn concurrent_block_refusals() {
     let expected = if cfg!(tokio_unstable) {
         [
-            "omnigraph-engine/local-filesystem without seams or concurrent blocks",
+            "omnigraph-engine/local-filesystem without seams or scripted concurrent blocks",
             "finished without its entry 2 `put no_such_object_is_ever_written`",
             "starved: neither an entry nor a request arrived for 2.0 s of wall time after entry 2 `start`",
         ]
     } else {
         [
-            "omnigraph-engine/local-filesystem without seams or concurrent blocks",
+            "omnigraph-engine/local-filesystem without seams or scripted concurrent blocks",
             "DST runner is unavailable",
             "DST runner is unavailable",
         ]
@@ -627,7 +627,7 @@ fn external_store_admission_refuses_before_workers() {
         (
             text.clone(),
             Some("memory://unsupported"),
-            "--store requires a file://, s3:// or az:// URI",
+            "--store requires a file://, s3://, az:// or gs:// URI",
         ),
     ] {
         std::fs::write(&path, text).unwrap();
@@ -979,7 +979,7 @@ fn prepared_store_under_dst_runs_a_concurrent_block_and_leaves_the_root_unchange
     let path = dir.path().join("prepared.gqt");
     std::fs::write(
         &path,
-        "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- concurrent\nw1: query add_bob() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 park put __manifest/_versions/, r1 start, w1 put __manifest/_versions/, w1, r1\n--- expect\nw1: ok\nr1: ok\n\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n--- expect shape\np.name: String\n",
+        "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- concurrent scripted\nw1: query add_bob() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 park put __manifest/_versions/, r1 start, w1 put __manifest/_versions/, w1, r1\n--- expect\nw1: ok\nr1: ok\n\n--- query\nquery all() { match { $p: Person } return { $p.name } }\n--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n--- expect shape\np.name: String\n",
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
@@ -1867,6 +1867,81 @@ fn clone_cases_run_against_a_bucket() {
     });
 }
 
+/// A clone in a simulated bucket reads its base and writes its own root through
+/// the control adapter and Lance: the S3 clone path with no bucket to run it on.
+/// A `.gqt` case cannot give its bucket a second name, nor put a folder marker in it.
+#[test]
+fn a_clone_runs_on_a_simulated_bucket() {
+    let bucket = omnigraph_storage::simulated_bucket::SimulatedBucket::new(
+        omnigraph_storage::simulated_bucket::Provider::S3,
+    );
+    let _names = bucket
+        .answer_to(&["gqt-simulated-clone", "gqt-simulated-clone-again"])
+        .unwrap();
+    let base = "s3://gqt-simulated-clone/base";
+    let clone = "s3://gqt-simulated-clone/clone";
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let load = |db: omnigraph::db::Omnigraph, name: &str, mode: omnigraph::loader::LoadMode| {
+        let row = format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"{name}\"}}}}");
+        async move {
+            omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
+                .load_jsonl(&row, mode)
+                .await
+                .unwrap();
+        }
+    };
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::init(base, "node Person { name: String @key }")
+            .await
+            .unwrap();
+        load(db, "alice", omnigraph::loader::LoadMode::Overwrite).await;
+    });
+    let before = listing(&runtime, base);
+    assert_eq!(person_names(&runtime, clone, Some(base), "main"), ["alice"]);
+    runtime.block_on(async {
+        let db = omnigraph::db::Omnigraph::open_clone(base, clone)
+            .await
+            .unwrap();
+        load(db, "bob", omnigraph::loader::LoadMode::Append).await;
+    });
+    assert_eq!(
+        person_names(&runtime, clone, Some(base), "main"),
+        ["alice", "bob"]
+    );
+    assert_eq!(person_names(&runtime, base, None, "main"), ["alice"]);
+    assert_eq!(
+        listing(&runtime, base),
+        before,
+        "the base's listing and ETags are as they were"
+    );
+
+    runtime.block_on(async { bucket.put_empty("base/").await.unwrap() });
+    let marked = listing(&runtime, base);
+    assert_eq!(
+        person_names(&runtime, clone, Some(base), "main"),
+        ["alice", "bob"],
+        "a folder marker at the base's key changes nothing for a clone beside it"
+    );
+    let inside = "s3://gqt-simulated-clone-again/base/inner";
+    let refused = runtime.block_on(async {
+        omnigraph::db::Omnigraph::open_clone(base, inside)
+            .await
+            .err()
+            .map(|error| error.to_string())
+    });
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|text| text.contains("do not contain each other")),
+        "a clone root inside its base under the bucket's second name: {refused:?}"
+    );
+    assert_eq!(
+        listing(&runtime, base),
+        marked,
+        "a refused open writes nothing into the base"
+    );
+}
+
 /// A case cannot name the paths and file kinds `--check` is handed.
 #[test]
 fn check_reports_a_path_that_names_no_case_and_checks_the_rest() {
@@ -1947,4 +2022,135 @@ name: String
         ]
     );
     assert_eq!(objects[0]["path"], empty.display().to_string());
+}
+
+/// Every shape of a concurrent block the parser refuses, one fixture per
+/// shape under `tests/fixtures/check/concurrent/`, read by `--check`: the
+/// refusal texts are the format's contract, pinned by files, not Rust strings.
+#[test]
+fn check_refuses_every_concurrent_block_shape() {
+    const REFUSALS: &[(&str, &str)] = &[
+        (
+            "free_running_with_order",
+            "takes no `order:` line; a block with a script is `--- concurrent scripted`",
+        ),
+        (
+            "scripted_without_order",
+            "ends with its `order:` line; a block with no named interleaving is `--- concurrent`",
+        ),
+        ("header_other_word", "got `--- concurrent extra`"),
+        (
+            "counted_label_in_scripted",
+            "a worker count belongs to a free-running `--- concurrent` block",
+        ),
+        ("zero_workers", "`x0` is not a worker count"),
+        ("count_not_a_number", "`xabc` is not a worker count"),
+        ("one_session", "at least two sessions"),
+        ("five_labels", "at most 4 labels"),
+        ("unbound_marker", "only `${worker}` is bound inside a block"),
+        ("per_worker_expect", "`w1.0` is not a session of the block"),
+        ("expect_missing_label", "session `r1` has no expect line"),
+        ("expect_twice", "session `w1` has two expect lines"),
+        ("expect_unknown_label", "`zz` is not a session of the block"),
+        ("expect_with_mode_word", "`--- expect` is bare"),
+        (
+            "expect_hash_line",
+            "`#` lines are refused inside the expect section",
+        ),
+        ("params_after_block", "takes no params"),
+        ("session_with_params", "declares parameters"),
+        ("two_declarations", "holds exactly one declaration"),
+        (
+            "branch_create_statement",
+            "a `branch merge` or a `load generate:` recipe",
+        ),
+        ("settings_line_in_session", "carries `set` or `reset` lines"),
+        ("recipe_too_few_rows", "deals 2 rows to 3 workers"),
+        ("recipe_without_key", "needs a `kind: key` column"),
+        (
+            "recipe_branch_header",
+            "a session's branch is its `on <branch>`",
+        ),
+        ("recipe_two_tables", "a dealt recipe has one table, got 2"),
+        (
+            "recipe_with_marker",
+            "bound on the session line and nowhere in the recipe",
+        ),
+        (
+            "recipe_edge_table",
+            "`Knows` is an edge table, which the readback after the block cannot match by key",
+        ),
+        (
+            "recipe_blob_column",
+            "column `doc` is a blob, which the readback after the block cannot project through GQ",
+        ),
+        ("block_in_loop", "inside a loop"),
+        ("reserved_label", "`setup` is reserved"),
+        ("duplicate_label", "session `w1` is declared twice"),
+        (
+            "uppercase_label",
+            "a block opens with `<label>[ x<n>][ on <branch>]: <statement>`",
+        ),
+        (
+            "empty_branch",
+            "a block opens with `<label>[ x<n>][ on <branch>]: <statement>`",
+        ),
+    ];
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/check/concurrent");
+    let fixtures = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "gqt")
+        })
+        .count();
+    assert_eq!(
+        fixtures,
+        REFUSALS.len(),
+        "a fixture without a row, or a row without a fixture"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg("--check")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).unwrap();
+    for (name, needle) in REFUSALS {
+        let path = dir.join(format!("{name}.gqt"));
+        let prefix = format!("{}:", path.display());
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with(&prefix))
+            .collect();
+        assert!(
+            lines.iter().any(|line| line.contains(needle)),
+            "{name}: expected `{needle}` in {lines:?}"
+        );
+    }
+}
+
+/// A dealt row deleted after it was dealt fails the block at the readback, and
+/// the red names the pass and the session order that produced it (the dealing
+/// worker is declared first, so pass 0 deals the row and then deletes it).
+#[test]
+fn a_dealt_row_tampered_after_dealing_fails_the_block_naming_the_order() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner/dealt_row_tampered.gqt");
+    let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
+        .arg(&path)
+        .output()
+        .expect("run the tampered dealt fixture");
+    assert!(!output.status.success(), "accepted a deleted dealt row");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for needle in [
+        "session `writer` acknowledged dealt row 0 (slug = \"cw-000\") on main and the readback found 0 rows",
+        "pass 0 of 2: step 1 ran its sessions in the order writer, tamper",
+    ] {
+        assert!(stderr.contains(needle), "missing `{needle}` in {stderr}");
+    }
 }

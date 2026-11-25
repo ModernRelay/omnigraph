@@ -107,6 +107,64 @@ pub mod build {
             _ => package.to_string(),
         }
     }
+
+    /// The repository revision whose documentation a build of `package`
+    /// links: the release tag of a stable build, the commit of any other
+    /// stamped build, and none for a local or source build, which cannot
+    /// name a revision that has its pages.
+    pub fn docs_revision(package: &str) -> Option<String> {
+        revision(package, RELEASE_CHANNEL, SOURCE_COMMIT)
+    }
+
+    pub(crate) fn revision(
+        package: &str,
+        channel: Option<&str>,
+        commit: Option<&str>,
+    ) -> Option<String> {
+        match (channel, commit) {
+            (Some("stable"), Some(_)) => Some(format!("v{package}")),
+            (_, Some(commit)) => Some(commit.to_owned()),
+            (_, None) => None,
+        }
+    }
+
+    /// The internal-schema stamp of a graph this build creates, the highest
+    /// it writes.
+    pub const INTERNAL_SCHEMA_WRITES: u32 =
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
+    /// The inclusive range of internal-schema stamps normal open serves,
+    /// lowest first.
+    pub const INTERNAL_SCHEMA_SERVES: [u32; 2] = [
+        omnigraph::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+    ];
+
+    /// The storage-format line of [`version_report`]; the agent skill states
+    /// it verbatim.
+    pub fn internal_schema_line() -> String {
+        let [lowest, highest] = INTERNAL_SCHEMA_SERVES;
+        format!("internal-schema {INTERNAL_SCHEMA_WRITES} (serves v{lowest} to v{highest})")
+    }
+
+    /// What a binary of `package` prints after its own name to report its
+    /// build, one fact per line: the version it reports, the internal-schema
+    /// stamps it writes and serves, the HTTP contract it speaks and, for a
+    /// packaged build, its commit. `omnigraph version` and
+    /// `omnigraph-server --version` both print it, so a CLI and a server can
+    /// be compared without a request.
+    pub fn version_report(package: &str) -> String {
+        let mut report = format!(
+            "{}\n{}\nhttp-contract {}",
+            reported_version(package),
+            internal_schema_line(),
+            super::HTTP_API_CONTRACT
+        );
+        if let Some(commit) = SOURCE_COMMIT {
+            report.push_str("\ncommit ");
+            report.push_str(commit);
+        }
+        report
+    }
 }
 
 /// Lowercase wire name for the raw graph-head conditional-write token.
@@ -449,7 +507,8 @@ pub struct BranchListQuery {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchListOutput {
-    /// Every live branch, sorted by name in byte order.
+    /// Every branch the graph holds, sorted by name in byte order, a branch
+    /// that is not ready or whose retirement is pending included.
     pub branches: Vec<String>,
     /// Present only with `detailed=true`: one entry per branch the caller
     /// may `read`, in the order of `branches`. A branch the caller may not
@@ -462,13 +521,18 @@ pub struct BranchListOutput {
 /// `from_commit_id` say where the branch started, as its `POST /branches`
 /// receipt did. A branch deleted and created again under the same name is a
 /// new lifetime: its start and creation time are the later creation's. The
-/// optional fields are absent on `main`.
+/// optional fields are absent on `main`; `head`, `from_commit_id` and
+/// `updated_at` are absent on a branch that is not ready (a create that
+/// registered the branch and wrote no tree) and on one whose retirement is
+/// pending.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchDetailOutput {
     pub name: String,
     /// The commit a read of the branch sees: its newest commit, or the commit
-    /// it started at while it has written none.
-    pub head: CommitOutput,
+    /// it started at while it has written none. Absent while the branch has
+    /// no tree to read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<CommitOutput>,
     /// The branch this one started from, as that branch was named then; it
     /// may since have been deleted or recreated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -484,8 +548,16 @@ pub struct BranchDetailOutput {
     pub created_at: Option<i64>,
     /// When the head last moved, as Unix epoch microseconds: the time of the
     /// branch's newest commit, or `created_at` while it has written none.
+    /// Absent with `head`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = 1714000000000000i64)]
-    pub updated_at: i64,
+    pub updated_at: Option<i64>,
+    /// `true` when the branch's tree carries a tombstone: a delete crashed
+    /// before it retired the branch, or finished after this listing read the
+    /// branch set. Reads of the branch refuse with `branch_deleted`; the next
+    /// `DELETE /branches/{branch_name}` finishes the retirement.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retirement_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2472,6 +2544,18 @@ error_codes! {
     /// the branch, or the serving process holds no claim on it; see
     /// `writer_fenced`. Nothing was written.
     WriterFenced = "writer_fenced", [409];
+    /// `branch create` names a branch that exists: a live branch has the
+    /// name, or one above or below it in the `/` hierarchy. Nothing was
+    /// created.
+    BranchExists = "branch_exists", [409];
+    /// The branch was deleted: a read or write of a branch whose delete has
+    /// begun, or a `branch create` whose source was deleted under it. Nothing
+    /// was written.
+    BranchDeleted = "branch_deleted", [409];
+    /// The branch is not ready: its create wrote the branch and no tree, so
+    /// reads and writes refuse until `branch delete` removes it and a new
+    /// `branch create` starts it again. Nothing was written.
+    BranchNotReady = "branch_not_ready", [409];
     /// The request body, or the work it asks for, exceeds a bounded limit;
     /// `resource_limit` names the limit when it is the operation's. Split or
     /// reduce the request.
@@ -2574,6 +2658,9 @@ impl ErrorCode {
             | Self::PreconditionFailed
             | Self::Conflict
             | Self::WriterFenced
+            | Self::BranchExists
+            | Self::BranchDeleted
+            | Self::BranchNotReady
             | Self::ExternalBlobSource
             | Self::ChangeFeedGap
             | Self::Internal => DispositionAction::Refresh,
@@ -3286,11 +3373,12 @@ pub fn branch_list_output(listing: &omnigraph::db::BranchListing) -> BranchListO
 pub fn branch_detail_output(detail: &omnigraph::db::BranchDetail) -> BranchDetailOutput {
     BranchDetailOutput {
         name: detail.name.clone(),
-        head: commit_output(&detail.head),
+        head: detail.head.as_ref().map(commit_output),
         from: detail.from.clone(),
         from_commit_id: detail.from_commit_id.clone(),
         created_at: detail.created_at,
         updated_at: detail.updated_at,
+        retirement_pending: detail.retirement_pending,
     }
 }
 
@@ -3750,6 +3838,16 @@ pub struct GraphListOutput {
     pub graphs: Vec<GraphInfo>,
 }
 
+/// Which graphs a discovery listing names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphVisibility {
+    /// Exactly the registered graphs on which the caller holds some
+    /// permission, or every graph for a `graph_list` holder: a registered
+    /// graph is listed exactly when its routes do not answer `graph not found`.
+    Granted,
+}
+
 /// A graph's existence, without storage, schema, data, or serving metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -3759,15 +3857,72 @@ pub struct GraphDiscoveryEntry {
     pub display_name: String,
 }
 
-/// Authenticated minimal inventory from `GET /graphs/discovery`.
+/// `GET /graphs/discovery`: who the caller is, and the graphs it holds any
+/// permission on.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GraphDiscoveryOutput {
+    /// The rule the listing follows; a server always sends it. A body without
+    /// it comes from an older release, whose listing is not filtered and
+    /// names no caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<GraphVisibility>,
+    /// The actor the credential resolves to. Absent only on a server that runs
+    /// without authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    /// The OAuth client the credential was issued to, when it is a verified
+    /// OIDC access token. Opaque text the client chose: render it escaped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub graphs: Vec<GraphDiscoveryEntry>,
 }
 
 #[cfg(test)]
 mod tests {
+    /// Both upgrade directions of the discovery body. A 0.16 client decodes
+    /// discovery with `deny_unknown_fields` and only `graphs`, so it refuses a
+    /// body that states its rule: client and server upgrade together. This
+    /// client reads a 0.16 body, which states no rule, as one with no rule,
+    /// never as a server without authentication.
+    #[test]
+    fn discovery_body_crosses_releases_in_one_direction_only() {
+        use super::{GraphDiscoveryEntry, GraphDiscoveryOutput, GraphVisibility};
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct Release016Discovery {
+            graphs: Vec<GraphDiscoveryEntry>,
+        }
+        let current = serde_json::to_value(GraphDiscoveryOutput {
+            visibility: Some(GraphVisibility::Granted),
+            actor_id: Some("principal:alice".into()),
+            client_id: None,
+            graphs: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            current,
+            serde_json::json!({"visibility":"granted","actor_id":"principal:alice","graphs":[]})
+        );
+        assert!(serde_json::from_value::<Release016Discovery>(current).is_err());
+        let legacy: GraphDiscoveryOutput = serde_json::from_value(
+            serde_json::json!({"graphs":[{"graph_id":"a","display_name":"a"}]}),
+        )
+        .unwrap();
+        assert_eq!(legacy.visibility, None);
+        assert_eq!(legacy.actor_id, None);
+        // `granted` is the only rule on the wire; a client's own name for a
+        // body without one is not.
+        assert!(
+            serde_json::from_value::<GraphDiscoveryOutput>(
+                serde_json::json!({"visibility":"unfiltered","graphs":[]})
+            )
+            .is_err()
+        );
+    }
+
     /// Every code says what it means and whether a server sends it, under
     /// which status; one that no HTTP response carries names the surface that
     /// sends it. The published enum lists every code once, in its wire
@@ -3893,6 +4048,25 @@ mod tests {
         assert_eq!(versioned("0.14.0", Some("stable"), Some(commit)), "0.14.0");
         assert_eq!(versioned("0.14.0", None, Some(commit)), "0.14.0");
         assert_eq!(versioned("0.14.0", None, None), "0.14.0");
+    }
+
+    #[test]
+    fn docs_links_name_the_release_tag_the_commit_or_nothing() {
+        use super::build::revision;
+        let commit = "9c2b3679e8f66062252e7ed6270a9478b4b77413";
+        assert_eq!(
+            revision("0.16.1", Some("stable"), Some(commit)).as_deref(),
+            Some("v0.16.1")
+        );
+        assert_eq!(
+            revision("0.16.1", Some("edge"), Some(commit)).as_deref(),
+            Some(commit)
+        );
+        assert_eq!(
+            revision("0.16.1", None, Some(commit)).as_deref(),
+            Some(commit)
+        );
+        assert_eq!(revision("0.16.1", None, None), None);
     }
 
     #[test]

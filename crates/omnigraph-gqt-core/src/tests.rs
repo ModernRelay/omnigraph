@@ -207,6 +207,7 @@ async fn generated_load_calls_the_host_once_before_checking_its_expectation() {
         &uri,
         None,
         &host,
+        &host,
     )
     .await;
     assert!(result.err().unwrap().contains("load succeeded"));
@@ -257,6 +258,7 @@ async fn generated_load_repeats_the_same_recipe_in_a_loop() {
         session,
         &uri,
         None,
+        &host,
         &host,
     )
     .await
@@ -309,6 +311,7 @@ async fn generated_load_observes_typed_errors_for_single_and_multiple_calls() {
             &uri,
             None,
             &host,
+            &host,
         )
         .await
         .unwrap();
@@ -353,7 +356,7 @@ fn a_fault_section_is_refused() {
 }
 
 const DST_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
-const BLOCK: &str = "--- concurrent\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
+const BLOCK: &str = "--- concurrent scripted\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
 const BLOCK_EXPECT: &str = "--- expect\nw1: ok\nr1: ok\n";
 
 #[test]
@@ -367,51 +370,184 @@ fn a_concurrent_block_parses_with_its_bare_expect() {
     };
     assert_eq!(step.ordinal, 1);
     assert_eq!(step.sessions.len(), 2);
-    assert_eq!(step.sessions[0].kind, SessionKind::Mutation);
-    assert_eq!(step.sessions[1].kind, SessionKind::Query);
+    assert!(matches!(step.sessions[0].kind, SessionKind::Mutation));
+    assert!(matches!(step.sessions[1].kind, SessionKind::Query));
     assert_eq!(step.sessions[0].name, "add");
     assert_eq!(step.order.len(), 3);
     assert_eq!(case.source_lines.get(&1), Some(&15));
 }
 
+const ENGINE_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
+
 #[test]
-fn a_concurrent_block_refuses_what_it_cannot_run() {
-    let refused = |block: &str, expect: &str| {
-        refusal("block", &format!("{HDR}{DST_RUNNER}{SEED}{block}{expect}"))
+fn a_block_without_a_script_is_free_running_on_every_host() {
+    let block = "--- concurrent\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{block}{BLOCK_EXPECT}");
+    let case = parse_case("free", &text).unwrap();
+    assert!(!case.needs_dst());
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
     };
-    assert!(refused(BLOCK, "--- expect ok\n").contains("`--- expect` is bare"));
+    assert!(step.is_free_running());
+    assert!(step.order.is_empty());
+    assert_eq!(step.sessions.len(), 2);
+    assert_eq!(step.sessions[0].group, "w1");
+    assert_eq!(step.sessions[0].label, "w1");
+    assert_eq!(case.plain_passes(), 2);
+    assert!(PlainHost.admit_case(&case).is_ok());
+}
+
+#[test]
+fn a_worker_count_declares_one_session_per_worker_under_one_label() {
+    let block = "--- concurrent\nwriter x3 on w${worker}: query put() { insert Person { name: \"bob\" } }\nreader: query all() { match { $p: Person } return { $p.name } }\n";
+    let expect = "--- expect\nwriter: error: conflict\nreader: ok\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{block}{expect}");
+    let case = parse_case("workers", &text).unwrap();
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    let labels: Vec<&str> = step.sessions.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, ["writer.0", "writer.1", "writer.2", "reader"]);
+    let branches: Vec<&str> = step.sessions.iter().map(|s| s.branch.as_str()).collect();
+    assert_eq!(branches, ["w0", "w1", "w2", "main"]);
+    assert!(step.sessions.iter().take(3).all(|s| s.group == "writer"
+        && s.expect
+            == SessionExpect::Error {
+                needle: "conflict".into()
+            }));
+    assert_eq!(step.sessions[3].expect, SessionExpect::Ok);
+    let nine = parse_case(
+        "nine",
+        &format!(
+            "{HDR}{ENGINE_RUNNER}{SEED}--- concurrent\nwriter x9: query put() {{ insert Person {{ name: \"bob\" }} }}\n--- expect\nwriter: ok\n"
+        ),
+    )
+    .unwrap();
+    assert_eq!(nine.plain_passes(), concurrent::PLAIN_PASSES);
+    let over = admit_workers(&nine).unwrap_err();
     assert!(
-        refused(BLOCK, "--- expect\n# note\nw1: ok\nr1: ok\n")
-            .contains("`#` lines are refused inside the expect section")
+        over.contains("at most 8 workers under one label; step 1 declares 9"),
+        "{over}"
     );
+    assert!(PlainHost.admit_case(&nine).is_err());
+}
+
+#[test]
+fn a_recipe_or_a_merge_is_a_session_statement() {
+    let recipe = "--- concurrent\nwriter x3: load generate: v1 seed: 42 mode: append\n  tables:\n    - kind: node\n      name: Person\n      rows: 4\n      commits: 1\n      columns:\n        name: {kind: key, prefix: cw-, width: 3}\nreader: query all() { match { $p: Person } return { $p.name } }\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{recipe}--- expect\nwriter: ok\nreader: ok\n");
+    let case = parse_case("recipe", &text).unwrap();
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    assert_eq!(step.sessions.len(), 4);
+    let SessionKind::Load(recipe) = &step.sessions[0].kind else {
+        panic!("expected a dealt recipe");
+    };
+    assert_eq!(step.sessions[2].label, "writer.2");
+    assert_eq!(step.sessions[2].worker, Worker { index: 2, count: 3 });
+    let SessionKind::Load(shared) = &step.sessions[1].kind else {
+        panic!("expected the same dealt recipe");
+    };
+    assert!(Arc::ptr_eq(recipe, shared));
+    assert!(matches!(step.sessions[3].kind, SessionKind::Query));
+
+    let merge = "--- concurrent\nmerger x2: branch merge w${worker} into main\n";
+    let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{merge}--- expect\nmerger: ok\n");
+    let case = parse_case("merge", &text).unwrap();
+    let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
+        panic!("expected a concurrent step");
+    };
+    let SessionKind::Merge(merge) = &step.sessions[1].kind else {
+        panic!("expected a merge session");
+    };
+    assert_eq!(
+        *merge,
+        MergeOp {
+            source: "w1".into(),
+            into: Some("main".into()),
+            as_commit: false
+        }
+    );
+    assert_eq!(step.sessions[1].name, "branch merge");
+}
+
+const BARE_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n";
+const PERSON: &str = "--- schema\nnode Person {\n    name: String @key\n}\n";
+const SWEPT: &str =
+    "--- bench\nwarmup_seconds: 2\nduration_seconds: 30\nrepetitions: 3\nsweep: { W: [2, 4, 8] }\n";
+
+/// A case whose one block is `header` with a `writer` label of `workers`
+/// (`x2`, `x${W}`) beside one reader, under the bench section `bench`.
+fn block_case(bench: &str, header: &str, workers: &str) -> String {
+    format!(
+        "{HDR}{BARE_RUNNER}{bench}{PERSON}{SEED}{header}\nwriter {workers}: query put() {{ insert Person {{ name: \"bob\" }} }}\nreader: query all() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect\nwriter: ok\nreader: ok\n"
+    )
+}
+
+#[test]
+fn a_measured_block_runs_under_a_bench_section_whose_swept_name_binds_before_parsing() {
+    let text = block_case(SWEPT, "--- concurrent measured", "x${W}");
+    let case = parse_case("measured", &text).unwrap();
+    assert_eq!(
+        case.bench,
+        Some(BenchSection {
+            warmup_seconds: 2,
+            duration_seconds: 30,
+            repetitions: Some(3),
+            sweep: Some(Sweep {
+                name: "W".into(),
+                values: vec![2, 4, 8]
+            }),
+        })
+    );
+    assert_eq!(case.swept(), Some(("W", 2)), "a bare parse binds the first");
+    let block = case.measured_block().unwrap();
+    assert_eq!(block.sessions.len(), 3);
+    assert!(block.is_free_running() && !case.needs_dst());
+    assert!(PlainHost.admit_case(&case).is_ok());
     assert!(
-        refused(BLOCK, "--- params\n{}\n--- expect\nw1: ok\nr1: ok\n").contains("takes no params")
+        case.steps()[0]
+            .source
+            .starts_with("--- concurrent measured\nwriter x${W}:"),
+        "the case keeps the text as written"
     );
+
+    let at_eight = parse_case_at("measured", &text, Some(8)).unwrap();
+    assert_eq!(at_eight.swept(), Some(("W", 8)));
+    assert_eq!(at_eight.measured_block().unwrap().sessions.len(), 9);
+    let outside = parse_case_at("measured", &text, Some(3)).unwrap_err();
     assert!(
-        refused(
-            "--- concurrent\nw1: query add($n: String) { insert Person { name: $n } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
-            BLOCK_EXPECT
-        )
-        .contains("declares parameters")
+        outside
+            .first()
+            .message
+            .contains("W = 3 is not a value of the sweep [2, 4, 8]")
     );
+
+    let fixed = "--- bench\nduration_seconds: 5\n";
+    let unswept = parse_case(
+        "measured",
+        &block_case(fixed, "--- concurrent measured", "x2"),
+    )
+    .unwrap();
+    assert_eq!(unswept.swept(), None);
+    assert_eq!(unswept.bench.as_ref().unwrap().warmup_seconds, 0);
+    assert!(parse_case_at("measured", unswept.source(), Some(2)).is_err());
+}
+
+#[test]
+fn a_measured_block_with_an_order_line_is_refused_under_its_own_header() {
+    let fixed = "--- bench\nduration_seconds: 5\n";
+    let text = block_case(fixed, "--- concurrent measured", "x2").replace(
+        "--- expect\n",
+        "order: writer start, reader start\n--- expect\n",
+    );
+    let refused = refusal_at("measured", &text);
     assert!(
-        refused(
-            "--- concurrent\nw1: branch create feature\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1, r1\n",
-            BLOCK_EXPECT
-        )
-        .contains("must be a query or mutation declaration")
-    );
-    let in_loop = refused(
-        &format!("--- loop $x 1 2\n{BLOCK}"),
-        &format!("{BLOCK_EXPECT}--- endloop\n"),
-    );
-    assert!(in_loop.contains("inside a loop"), "{in_loop}");
-    assert!(
-        refused(
-            "--- concurrent extra\nw1: query a() {}\norder: w1\n",
-            BLOCK_EXPECT
-        )
-        .contains("takes no arguments")
+        refused.starts_with(
+            "line 18: `--- concurrent measured` is a free-running block and takes no `order:` line"
+        ),
+        "{refused}"
     );
 }
 
@@ -2666,6 +2802,7 @@ async fn writer_header_claims_main_in_one_version_that_moves_no_head() {
             &uri,
             None,
             &PlainHost,
+            &(),
         )
         .await
         .unwrap();
@@ -2823,7 +2960,7 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
         };
         let stage = match step {
             Step::Settings(s) => {
-                run_settings_step(&PlainHost, &mut session, s, None)
+                run_settings_step(&(), &mut session, s, None)
                     .unwrap_or_else(|f| panic!("{}: {}", f.label, f.message));
                 settings_steps += 1;
                 let name = s.statements[0].statement_name();
@@ -3205,7 +3342,7 @@ fn execute_case<'a>(
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
     async move {
         let (session, uri, _dir) = open_case_store(case, Engine::V2).await?;
-        execute_steps(case, path, bless, session, &uri, None, &PlainHost)
+        execute_steps(case, path, bless, session, &uri, None, &PlainHost, &())
             .await
             .map(|_| ())
     }
@@ -3270,6 +3407,21 @@ impl ExecutionHost for RecordingHost {
         PlainHost.finish_seams(guard)
     }
 
+    fn reopen<'a>(
+        &'a self,
+        uri: &'a str,
+        storage: Option<Arc<dyn StorageAdapter>>,
+    ) -> futures::future::BoxFuture<'a, Result<Omnigraph, omnigraph::error::OmniError>> {
+        assert!(Arc::ptr_eq(
+            self.storage.as_ref().unwrap(),
+            storage.as_ref().unwrap()
+        ));
+        self.events.lock().unwrap().push("reopen".into());
+        async move { PlainHost.reopen(uri, storage).await }.boxed()
+    }
+}
+
+impl Observer for RecordingHost {
     fn observe_fault(&self, _error: &omnigraph::error::OmniError) {
         self.faults
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3306,19 +3458,6 @@ impl ExecutionHost for RecordingHost {
                 .unwrap()
                 .push(format!("assertion {}", value()["status"]));
         }
-    }
-
-    fn reopen<'a>(
-        &'a self,
-        uri: &'a str,
-        storage: Option<Arc<dyn StorageAdapter>>,
-    ) -> futures::future::BoxFuture<'a, Result<Omnigraph, omnigraph::error::OmniError>> {
-        assert!(Arc::ptr_eq(
-            self.storage.as_ref().unwrap(),
-            storage.as_ref().unwrap()
-        ));
-        self.events.lock().unwrap().push("reopen".into());
-        async move { PlainHost.reopen(uri, storage).await }.boxed()
     }
 }
 
@@ -3367,6 +3506,7 @@ async fn engine_operation_finishes_before_failed_expectation() {
         &uri,
         None,
         &host,
+        &host,
     )
     .await;
     assert!(result.is_err());
@@ -3395,6 +3535,7 @@ async fn restart_preserves_supplied_storage_and_returns_current_session() {
         session,
         &uri,
         Some(storage),
+        &host,
         &host,
     )
     .await
@@ -3521,6 +3662,22 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
             &[(BatchBound, 12)],
         ),
         ("bind_shape_bind_before_any_write", &[(BindShape, 14)]),
+        ("body_shape_bench_duration_of_zero", &[(BodyShape, 7)]),
+        ("body_shape_bench_names_a_rate", &[(BodyShape, 7)]),
+        (
+            "body_shape_bench_names_a_rate_with_no_value",
+            &[(BodyShape, 7)],
+        ),
+        (
+            "body_shape_bench_sweep_values_do_not_rise",
+            &[(BodyShape, 7)],
+        ),
+        (
+            "body_shape_bench_sweeps_a_lower_case_name",
+            &[(BodyShape, 7)],
+        ),
+        ("body_shape_bench_sweeps_two_names", &[(BodyShape, 7)]),
+        ("body_shape_bench_without_a_duration", &[(BodyShape, 7)]),
         (
             "body_shape_branches_count_above_the_cap",
             &[(BodyShape, 14)],
@@ -3580,12 +3737,23 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
         ),
         ("query_parse_unclosed_brace", &[(QueryParse, 14)]),
         ("runner_config_timeout_as_a_word", &[(RunnerConfig, 2)]),
+        ("section_order_bench_after_the_steps", &[(SectionOrder, 20)]),
+        (
+            "section_order_bench_without_a_measured_block",
+            &[(SectionOrder, 7)],
+        ),
         ("section_order_branches_after_a_step", &[(SectionOrder, 19)]),
+        (
+            "section_order_measured_block_without_a_bench_section",
+            &[(SectionOrder, 14)],
+        ),
         (
             "section_order_schema_after_a_step",
             &[(SectionOrder, 12), (SectionOrder, 17)],
         ),
         ("section_order_seam_before_an_expect", &[(SectionOrder, 16)]),
+        ("section_order_two_measured_blocks", &[(SectionOrder, 22)]),
+        ("step_kind_concurrent_scripted_measured", &[(StepKind, 16)]),
         ("step_kind_mutation_under_query", &[(StepKind, 14)]),
         (
             "substitution_placement_branches_header_names_the_marker",

@@ -1,0 +1,41 @@
+# issue: none
+# red_on: 766fa7ad; the parser refuses `--- bench` as an unknown section and `measured` as a block kind, so no step runs on either host.
+# notes: `${W}` is replaced by one value of the sweep on every line outside the `--- bench` section, before the file is parsed. A host with a scripted clock reads the sweep's first value, 2, in four places here: the seed row's `n`, the worker count of `writer`, the value its statement inserts, and the `--- params` body of the probe. So the seed row holds `n` = 2, two writers insert one row each with `n` = 2, and the probe bound to 2 returns those three rows; a line left at `${W}` would not parse, and a line read at 4 would leave four writers or a probe that finds nothing.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- bench
+duration_seconds: 5
+sweep: { W: [2, 4] }
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed
+{"type":"Chunk","data":{"slug":"seed","n":${W}}}
+
+--- concurrent measured
+writer x${W}: query put() { insert Chunk { slug: "w${worker}", n: ${W} } }
+reader: query seed_row() { match { $c: Chunk { slug: "seed" } } return { $c.n } }
+--- expect
+writer: ok
+reader: ok
+
+--- query
+query rows_at($k: I64) { match { $c: Chunk { n: $k } } return { $c.slug, $c.n } }
+--- params
+{"k": ${W}}
+--- expect unordered
+{"c.slug":"seed","c.n":2}
+{"c.slug":"w0","c.n":2}
+{"c.slug":"w1","c.n":2}
+--- expect shape
+c.slug: String
+c.n: I64

@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-29
-updated: 2026-11-18
+updated: 2026-11-19
 discussion: https://github.com/ModernRelay/omnigraph/pull/1214
 supersedes: []
 superseded_by: []
@@ -404,14 +404,17 @@ Each table the run considers gets exactly one outcome:
 
 | Outcome | Meaning |
 |---|---|
-| `optimized` | A rewrite or index link was staged and is in the publication. Carries fragments removed and added and the table's duration. When an index link failed after an earlier link committed, it also carries that failure as the reason `index_failed` (below). |
+| `optimized` | A rewrite or index link was staged and is in the publication. Carries fragments removed and added and the table's duration. When an index link, or the coverage read after the last one, failed after a link committed, it also carries that failure as the reason `index_failed` (below). |
 | `unchanged` | Planning found nothing to do. |
 | `deferred(reason)` | Not started: `gate_hold_limit`, `byte_budget`, `resource_limit` or `cancelled`. |
 | `failed(code)` | A table-local failure with definite evidence (`BeforeEffect` or `Unpublished`) before any link of the table committed. Nothing of the table is published, its staging is unreachable, and the other tables still publish. |
 
 Pending index work (partial full-text coverage, a vector column that cannot
-train) is listed with the table's outcome as a result, not as a failure. The
-engine's report and the direct CLI carry it. The record does not carry it
+train) is listed with the table's outcome as a result, not as a failure.
+Full-text coverage is read after the table's last link, at the version the
+run publishes for it (the coverage read). An `optimized` table that carries
+`index_failed` still lists the pending work known when the failure happened.
+The engine's report and the direct CLI carry it. The record does not carry it
 yet, and nothing reports which indexes a run rebuilt or built
 (§[Unresolved questions](#unresolved-questions)).
 
@@ -437,7 +440,13 @@ for as long as the index failure lasts, and each discarded rewrite leaves
 files only `cleanup` reclaims, which cannot run while a server holds the
 cluster lock (§3.6). A failure before any link committed is the table's
 `failed` outcome. A failure without definite evidence fails the run, as any
-staging failure does.
+staging failure does. The coverage read is not a link, and its failure
+follows the same rule. When it fails after a link of the table committed,
+every committed link is in the publication, and the outcome carries
+`index_failed` with the read's error although no index link failed: the read
+only reports, so failing the table on it would discard complete links. The
+next run reads coverage again and repeats none of them. When it fails with no
+link committed, it is the table's `failed` outcome.
 
 **Drift.** Each table opens at its pin (`open_pinned_for_write`), never at
 linear HEAD, so optimize neither reads nor reports foreign linear movement:
@@ -1302,7 +1311,7 @@ Every row extends an existing owner in [testing](../dev/testing.md).
 | A table over a ceiling, the first table included, is deferred with its measure and nothing is written for it; counting stops at the ceiling; deletion files are counted; an inherited data or deletion file is sized at its `base_id` location | fixtures over each ceiling, including a large managed Blob, an external reference, a fragment with a deletion file and a table whose files sit under another base | `integration/maintenance.rs` |
 | A size the run cannot read from storage fails the table with the storage error instead of deferring it; nothing is written for it, and the other tables still run | a table whose deletion file is removed before a run that sets a byte ceiling | `integration/maintenance.rs` |
 | A table-local failure fails only that table, and the other tables publish | failpoint in one table's rewrite | `failpoints.rs`, `detached_commit_matrix.rs` |
-| An index link that fails after an earlier link of its table committed leaves the table `optimized` with `index_failed` and the error; the committed links are in the publication, the next run stages only the remaining index work, and the record carries the reason | failpoint before an index link, with a rewrite before it and without one | `failpoints.rs`, server `recorded_operations` tests |
+| An index link that fails after an earlier link of its table committed leaves the table `optimized` with `index_failed` and the error; the committed links are in the publication, the next run stages only the remaining index work, and the record carries the reason. A coverage read that fails after the index build committed keeps the build under the same reason, and the run after it changes nothing | failpoint before an index link, with a rewrite before it and without one; failpoint in the coverage read after an index build | `failpoints.rs`, server `recorded_operations` tests |
 | Partial full-text coverage and an untrainable vector stay pending with their remedy | existing pending-index fixtures | `integration/maintenance.rs` |
 | A vector rebuild is skipped as untrainable only on Lance's `Unprocessable`; a rebuild that fails for another reason is its link's failure | a lagging vector index over a column with too few vectors to train on, then one whose data file is gone | in-source `table_store` tests, `lance_surface_guards.rs` |
 | A failure before the publication is labelled, and the server keeps serving | failpoints in the per-table loop and in `before_publish` | `failpoints.rs`, server `boot_settings` |
@@ -1630,3 +1639,17 @@ dated pending entry in its decision log:
   survives a definite later index failure. With unchanged input, only the
   outstanding index work needs another attempt. The replay and partial
   failure regressions are in [#1418](https://github.com/ModernRelay/omnigraph/pull/1418).
+- 2026-11-19 — Maintainer clarification of `index_failed`, after
+  [#1418](https://github.com/ModernRelay/omnigraph/pull/1418). §1.5 named an
+  index link's failure as the only source of the reason. The read of
+  full-text coverage that follows a table's last link is not a link, so the
+  text did not say what its failure means, and #1418 reports it under the
+  same reason and keeps the links committed before it. The `optimized` row's
+  “When an index link failed after an earlier link committed” now names that
+  read. The paragraph on an index link's failure gained its last four
+  sentences. The pending-index paragraph's “is listed with the table's
+  outcome as a result, not as a failure” gained where coverage is read, and
+  that an `optimized` table carrying `index_failed` keeps the pending work
+  known at the failure. The Evidence row that begins “An index link that
+  fails after an earlier link of its table committed” gained the coverage
+  read. The output token and the record are unchanged.

@@ -1,0 +1,113 @@
+# issue: none
+# notes: A delete that fails after the tombstone on the branch's own chain and before main's
+# notes: catalog retires the entry leaves a branch that is still listed but refuses reads, writes
+# notes: and a fork as deleted, and blocks a create of its name. The next delete of the name
+# notes: finishes the retirement, after a reopen too, and a branch created again under the name
+# notes: starts from main.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- mutate branch: b
+query write_on_b() {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- seam
+at: branch_delete.post_tombstone
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch delete b
+
+--- expect error: injected failpoint triggered: branch_delete.post_tombstone
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "b"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query branch: b
+query read_tombstoned_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: branch 'b' was deleted
+
+--- mutate branch: b
+query write_tombstoned_b() {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect error: branch 'b' was deleted
+
+--- mutate
+branch create c from b
+
+--- expect error: branch 'b' was deleted
+
+--- mutate
+branch create b
+
+--- expect error: branch 'b' already exists
+
+--- restart
+
+--- mutate
+branch delete b
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- query branch: b
+query names_on_recreated_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

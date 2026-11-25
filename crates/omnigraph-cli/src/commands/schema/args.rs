@@ -5,9 +5,8 @@ use std::path::PathBuf;
 pub(crate) struct InitArgs {
     #[arg(long)]
     pub(crate) schema: PathBuf,
-    /// Graph URI (local path, s3://, or az://). Azure is a qualification
-    /// preview pending adversarial live qualification; initialization is
-    /// a write and requires the root-scoped external admission wrapper.
+    /// Local graph path or `file://` URI. Inline access supports local
+    /// storage only; a graph in a cluster is created by `cluster apply`.
     pub(crate) uri: Option<String>,
     /// Replace orphan schema artifacts only after proving that the URI
     /// has no `__manifest`. Without this flag, init refuses a URI that

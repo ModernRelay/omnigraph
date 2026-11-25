@@ -1,0 +1,82 @@
+# issue: none
+# notes: A create whose catalog entry lands, loses its acknowledgement and cannot be read back
+# notes: answers in doubt. The branch is listed, refuses reads as not ready and blocks a second
+# notes: create; a delete retires it and the name is created again from main.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- seam
+at: publish.post_merge_pre_ack
+occurrence: 1
+action: fail
+scope: next_step
+
+--- seam
+at: publish.read_back
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch create b
+
+--- expect error: branch row publication outcome is in doubt
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "b"}
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query branch: b
+query read_not_ready_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: branch 'b' is not ready
+
+--- mutate
+branch create b
+
+--- expect error: branch 'b' already exists
+
+--- mutate
+branch delete b
+
+--- expect ok
+
+--- mutate
+branch create b
+
+--- expect ok
+
+--- query branch: b
+query names_on_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

@@ -286,54 +286,33 @@ fn build_fused_batch(
 /// Lazily provides the in-memory CSR graph index, building it on first use and
 /// memoizing for the rest of the query. Indexed-mode Expand never asks for it,
 /// so a query that is entirely index-served and has no AntiJoin never pays the
-/// O(|E|) CSR build (the whole point of the indexed path). The `Cached` builder
-/// also reuses the cross-query `RuntimeCache` entry; `Direct` builds against an
-/// arbitrary snapshot (time-travel reads) through its graph's storage; `None`
-/// is for queries with no traversal at all.
+/// O(|E|) CSR build (the whole point of the indexed path). A traversing query
+/// takes the index from its handle's cross-query `RuntimeCache`, for a live
+/// target and for a historical snapshot alike, so concurrent queries over the
+/// same edge tables share one index; a query with no traversal has no source.
 pub struct GraphIndexHandle {
     cell: tokio::sync::OnceCell<Option<Arc<GraphIndex>>>,
-    builder: GraphIndexBuilder,
+    source: Option<GraphIndexSource>,
 }
 
 /// Owned by the handle: the lowered plan's graph operators hold the handle
 /// for the query, so nothing in it borrows from the doors.
-enum GraphIndexBuilder {
-    None,
-    Cached(
-        Arc<Omnigraph>,
-        crate::db::ResolvedTarget,
-        HashMap<String, (String, String)>,
-        SystemColumns,
-    ),
-    Direct(
-        Arc<Omnigraph>,
-        Snapshot,
-        HashMap<String, (String, String)>,
-        SystemColumns,
-    ),
+struct GraphIndexSource {
+    db: Arc<Omnigraph>,
+    snapshot: Snapshot,
+    edge_types: HashMap<String, (String, String)>,
+    system_columns: SystemColumns,
 }
 
 impl GraphIndexHandle {
     pub(crate) fn none() -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::None,
+            source: None,
         }
     }
 
     pub(crate) fn cached(
-        db: Arc<Omnigraph>,
-        resolved: crate::db::ResolvedTarget,
-        edge_types: HashMap<String, (String, String)>,
-        system_columns: SystemColumns,
-    ) -> Self {
-        Self {
-            cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Cached(db, resolved, edge_types, system_columns),
-        }
-    }
-
-    pub(crate) fn direct(
         db: Arc<Omnigraph>,
         snapshot: Snapshot,
         edge_types: HashMap<String, (String, String)>,
@@ -341,36 +320,34 @@ impl GraphIndexHandle {
     ) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Direct(db, snapshot, edge_types, system_columns),
+            source: Some(GraphIndexSource {
+                db,
+                snapshot,
+                edge_types,
+                system_columns,
+            }),
         }
     }
 
     /// The CSR index, built on first call. `None` only when the query needs no
-    /// traversal (the `None` builder).
+    /// traversal (a handle from [`Self::none`]).
     pub(super) async fn get(&self) -> Result<Option<&GraphIndex>> {
         let built = self
             .cell
             .get_or_try_init(|| async {
-                match &self.builder {
-                    GraphIndexBuilder::None => Ok::<Option<Arc<GraphIndex>>, OmniError>(None),
-                    GraphIndexBuilder::Cached(db, resolved, edge_types, system_columns) => {
-                        Ok(Some(
-                            db.graph_index_for_resolved(resolved, edge_types, *system_columns)
-                                .await?,
-                        ))
-                    }
-                    GraphIndexBuilder::Direct(db, snapshot, edge_types, system_columns) => {
-                        Ok(Some(Arc::new(
-                            GraphIndex::load_or_build(
-                                snapshot,
-                                edge_types,
-                                db.storage_adapter(),
-                                *system_columns,
-                            )
-                            .await?,
-                        )))
-                    }
-                }
+                let Some(source) = &self.source else {
+                    return Ok::<Option<Arc<GraphIndex>>, OmniError>(None);
+                };
+                Ok(Some(
+                    source
+                        .db
+                        .graph_index_for_snapshot(
+                            &source.snapshot,
+                            &source.edge_types,
+                            source.system_columns,
+                        )
+                        .await?,
+                ))
             })
             .await?;
         Ok(built.as_deref())
@@ -1742,6 +1719,12 @@ pub(super) enum HopPolicy {
 /// One `key IN (keys)` scan per probe, every row's endpoints interned into
 /// `interner` and the opposite appended to `neighbor_map[key]` in scan order
 /// (probe 0's rows, then probe 1's; parallel edges kept, like the CSR).
+///
+/// Each batch is consumed as it streams and held, under its own charge, only
+/// while its rows are interned (issue #1459). A BTREE-answered probe yields
+/// one batch per contiguous row range, each slicing a Lance decode buffer the
+/// pool charges by capacity, so holding the probe whole cost its batch count
+/// times that capacity rather than its rows.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn scan_neighbor_map(
     edge_ds: &Dataset,
@@ -1753,15 +1736,26 @@ pub(super) async fn scan_neighbor_map(
     hop_memory: &WorkMemory,
     memory: &WorkMemory,
 ) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
     for &orientation in probes {
         let EndpointColumns {
             key: key_col,
             opposite: opp_col,
         } = orientation;
-        let batches = scan_edges(edge_ds, orientation, &[], keys, pushdown, hop_memory).await?;
-        for batch in &batches {
-            let keys = utf8_column(batch, key_col)?;
-            let opposites = utf8_column(batch, opp_col)?;
+        let mut stream =
+            scan_edges_stream(edge_ds, orientation, &[], keys, pushdown, hop_memory).await?;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|error| memory.error(error))?;
+            let batch_memory = hop_memory
+                .child("expand probe batch")
+                .map_err(|error| memory.error(error))?;
+            batch_memory
+                .hold(&batch)
+                .map_err(|error| memory.error(error))?;
+            let keys = utf8_column(&batch, key_col)?;
+            let opposites = utf8_column(&batch, opp_col)?;
             for r in 0..batch.num_rows() {
                 let k = intern(interner, keys.value(r), memory)?;
                 let o = intern(interner, opposites.value(r), memory)?;
@@ -1799,24 +1793,6 @@ pub(super) fn intern(
         .string(value.len().saturating_mul(2))
         .map_err(|error| memory.error(error))?;
     Ok(index.get_or_insert(value))
-}
-
-async fn scan_edges(
-    ds: &Dataset,
-    orientation: EndpointColumns,
-    extras: &[&str],
-    keys: &[String],
-    pushdown: Option<bool>,
-    memory: &WorkMemory,
-) -> Result<Vec<RecordBatch>> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let stream = scan_edges_stream(ds, orientation, extras, keys, pushdown, memory).await?;
-    memory
-        .collect(stream)
-        .await
-        .map_err(|error| memory.error(error))
 }
 
 /// The backend has no selective pre-page admission hook. Reserve the

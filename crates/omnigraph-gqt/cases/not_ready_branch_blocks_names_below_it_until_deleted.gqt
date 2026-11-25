@@ -1,0 +1,62 @@
+# issue: none
+# notes: A not-ready branch, left by a create that failed after its catalog entry, blocks a create
+# notes: of its own name and of a name below it, across a restart; deleting it frees both.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- seam
+at: branch_create.post_row
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+branch create b
+
+--- expect error: injected failpoint triggered: branch_create.post_row
+
+--- mutate
+branch create "b/x"
+
+--- expect error: cannot create branch 'b/x' while live branch 'b' shares its physical Lance path
+
+--- restart
+
+--- mutate
+branch create b
+
+--- expect error: branch 'b' already exists
+
+--- mutate
+branch delete b
+
+--- expect ok
+
+--- mutate
+branch create "b/x"
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "b/x"}
+{"name": "main"}
+
+--- expect shape
+name: String

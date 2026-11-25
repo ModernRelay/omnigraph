@@ -466,6 +466,9 @@ pub enum ResetMode {
     /// Each repetition opens an empty graph shallow clone over a frozen
     /// fixture that nothing writes to; a new point beside the restore levels.
     Clone,
+    /// Each repetition starts a server of its own over an empty cluster and
+    /// loads the fixture through it: nothing is restored and nothing shared.
+    Rebuild,
 }
 
 impl ResetMode {
@@ -864,7 +867,7 @@ fn validate_fixture_state(fixture: &Fixture, diagnostics: &mut Vec<Diagnostic>) 
         diagnostics.push(Diagnostic::error(
             "impossible_optimized_index_state",
             "fixture.state.compaction_recency",
-            "synthetic-branch-merge builder v3 cannot truthfully declare optimized state because OmniGraph optimization materializes indexes outside this builder's exact inventory contract; use not-optimized",
+            "synthetic-branch-merge builder v3 cannot truthfully declare optimized state because Omnigraph optimization materializes indexes outside this builder's exact inventory contract; use not-optimized",
         ));
     }
 }

@@ -1,0 +1,1 @@
+- `omnigraph-bench` derives the CPU model on arm64 Linux when `/proc/cpuinfo` names none, from the first `CPU implementer`, `CPU variant`, `CPU part` and `CPU revision` lines, instead of refusing the run.

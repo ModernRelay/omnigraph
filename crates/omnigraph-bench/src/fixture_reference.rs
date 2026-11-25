@@ -473,7 +473,7 @@ fn validate_table_inventory(
             diagnostics.push(Diagnostic::error(
                 "invalid_fixture_graph_type",
                 format!("{base}[{index}].name"),
-                "graph type names must match OmniGraph's uppercase ASCII type grammar",
+                "graph type names must match Omnigraph's uppercase ASCII type grammar",
             ));
         }
         if table.rows > MAX_ROWS_PER_GRAPH_TYPE {
@@ -552,7 +552,7 @@ fn validate_state(
             diagnostics.push(Diagnostic::error(
                 "invalid_fixture_index_column",
                 format!("logical.state.indexes[{index}].column"),
-                "index columns must match OmniGraph's lowercase ASCII property grammar",
+                "index columns must match Omnigraph's lowercase ASCII property grammar",
             ));
         }
         if !indexes.insert((entry.table.as_str(), entry.column.as_str(), entry.kind)) {

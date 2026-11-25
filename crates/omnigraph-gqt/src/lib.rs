@@ -6,11 +6,11 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::storage::StorageAdapter;
 use omnigraph_compiler::settings::{DEFINITIONS, Engine};
 use omnigraph_compiler::{ParamMap, QueryResult};
-use omnigraph_gqt_core::concurrent::ConcurrentStep;
+use omnigraph_gqt_core::concurrent::{ConcurrentStep, Pass, permutation};
 pub use omnigraph_gqt_core::runner_config;
 use omnigraph_gqt_core::runner_config::{Execution, SeamDirective};
 use omnigraph_gqt_core::{
-    Case, ControlStep, ControlWrite, ExecutionHost, Item, QueryStep, Step, StepFail,
+    Case, ControlStep, ControlWrite, ExecutionHost, Item, Observer, QueryStep, Step, StepFail,
     canonical_json, case_session, parse_case, run_session, seed_case,
 };
 pub use omnigraph_gqt_core::{ServerTarget, admit_served};
@@ -41,19 +41,24 @@ pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
 pub const ENGINE_ENV: &str = "OMNIGRAPH_GQ_ENGINE";
 pub(crate) const RETIRED_SETTING_ENVIRONMENT: [&str; 1] = ["OMNIGRAPH_TRAVERSAL_MODE"];
 
-/// The runner's host; with `base`, every reopen of the store root is
-/// `Omnigraph::open_clone` over that base, as the first open was.
+/// The runner's host: `base` makes every reopen an `Omnigraph::open_clone`
+/// over it, `pass` picks a free-running block's session order off DST
+/// (`concurrent::permutation`, `Pass(0)` the declaration order).
 struct GqtHost {
     base: Option<String>,
+    pass: Pass,
 }
 
-const PLAIN_HOST: GqtHost = GqtHost { base: None };
+const PLAIN_HOST: GqtHost = GqtHost {
+    base: None,
+    pass: Pass(0),
+};
 
 impl ExecutionHost for GqtHost {
     type StepGuard = Vec<dst_runner::seams::ArmedSeam>;
 
-    fn admit_case(&self, _case: &Case) -> Result<(), String> {
-        Ok(())
+    fn admit_case(&self, case: &Case) -> Result<(), String> {
+        omnigraph_gqt_core::admit_workers(case)
     }
     fn reopen<'a>(
         &'a self,
@@ -75,35 +80,8 @@ impl ExecutionHost for GqtHost {
     fn finish_seams(&self, guard: Self::StepGuard) -> Result<(), String> {
         dst_runner::finish_seams(guard)
     }
-    fn observe(&self, value: impl FnOnce() -> String) {
-        dst_runner::observe(value);
-    }
-    fn record(&self, kind: &str, value: impl FnOnce() -> Value) {
-        dst_runner::record(kind, value());
-    }
-    fn begin_operation(&self, value: impl FnOnce() -> Value) {
-        dst_runner::begin_operation(value());
-    }
-    fn observe_query<E: std::fmt::Display>(&self, result: &Result<QueryResult, E>, ordered: bool) {
-        dst_runner::observe_query(result, ordered);
-    }
-    fn observe_fault(&self, error: &omnigraph::error::OmniError) {
-        dst_runner::observe_fault(error);
-    }
-    fn lifetime_counts(&self) -> Option<[u64; 2]> {
-        dst_runner::lifetime_counts()
-    }
     fn active(&self) -> bool {
         dst_runner::active()
-    }
-    fn observe_snapshot(&self) -> bool {
-        dst_runner::active()
-    }
-    fn measure_step_begin(&self, ordinal: u64, line: Option<u64>, kind: &'static str) {
-        dst_runner::measure_step_begin(ordinal, line, kind);
-    }
-    fn measure_step_end(&self, ordinal: u64) {
-        dst_runner::measure_step_end(ordinal);
     }
     fn reference_query<'a>(
         &'a self,
@@ -122,13 +100,46 @@ impl ExecutionHost for GqtHost {
         }
         .boxed()
     }
-    fn concurrent_step<'a>(
+    fn concurrent_step<'a, O: Observer>(
         &'a self,
+        observer: &'a O,
         session: &'a Session,
         case: &'a Case,
         step: &'a ConcurrentStep,
     ) -> futures::future::BoxFuture<'a, Result<(), StepFail>> {
-        run_concurrent_step(session, case, step).boxed()
+        run_concurrent_step(observer, session, case, step, self.pass).boxed()
+    }
+}
+
+/// The runner's observer: every fact goes to the DST runner's report, trace
+/// stream and `--measure` ledger.
+impl Observer for GqtHost {
+    fn observe(&self, value: impl FnOnce() -> String) {
+        dst_runner::observe(value);
+    }
+    fn record(&self, kind: &str, value: impl FnOnce() -> Value) {
+        dst_runner::record(kind, value());
+    }
+    fn begin_operation(&self, value: impl FnOnce() -> Value) {
+        dst_runner::begin_operation(value());
+    }
+    fn observe_query<E: std::fmt::Display>(&self, result: &Result<QueryResult, E>, ordered: bool) {
+        dst_runner::observe_query(result, ordered);
+    }
+    fn observe_fault(&self, error: &omnigraph::error::OmniError) {
+        dst_runner::observe_fault(error);
+    }
+    fn lifetime_counts(&self) -> Option<[u64; 2]> {
+        dst_runner::lifetime_counts()
+    }
+    fn observe_snapshot(&self) -> bool {
+        dst_runner::active()
+    }
+    fn measure_step_begin(&self, ordinal: u64, line: Option<u64>, kind: &'static str) {
+        dst_runner::measure_step_begin(ordinal, line, kind);
+    }
+    fn measure_step_end(&self, ordinal: u64) {
+        dst_runner::measure_step_end(ordinal);
     }
 }
 
@@ -204,7 +215,7 @@ fn execute_case_on_server<'a>(
     case: &'a Case,
     target: &'a ServerTarget,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    omnigraph_gqt_core::execute_steps_served(case, target, &PLAIN_HOST)
+    omnigraph_gqt_core::execute_steps_served(case, target, &PLAIN_HOST, &PLAIN_HOST)
 }
 
 fn execute_case_on_engine<'a>(
@@ -239,15 +250,48 @@ async fn execute_case_inner(
         let session = case_session(db, case, engine)?;
         let host = GqtHost {
             base: base.map(str::to_owned),
+            pass: Pass(0),
         };
-        return omnigraph_gqt_core::execute_steps(case, path, bless, session, uri, None, &host)
-            .await
-            .map(|_| ());
-    }
-    let (session, uri, _dir) = open_case_store(case, engine).await?;
-    omnigraph_gqt_core::execute_steps(case, path, bless, session, &uri, None, &PLAIN_HOST)
+        return omnigraph_gqt_core::execute_steps(
+            case, path, bless, session, uri, None, &host, &host,
+        )
         .await
-        .map(|_| ())
+        .map(|_| ());
+    }
+    let passes = if bless { 1 } else { case.plain_passes() };
+    for pass in (0..passes).map(Pass) {
+        let (session, uri, _dir) = open_case_store(case, engine).await?;
+        let host = GqtHost { base: None, pass };
+        omnigraph_gqt_core::execute_steps(case, path, bless, session, &uri, None, &host, &host)
+            .await
+            .map_err(|e| {
+                if passes == 1 {
+                    e
+                } else {
+                    format!("{e}\n({})", pass_note(case, pass, passes))
+                }
+            })?;
+    }
+    Ok(())
+}
+
+/// The sentence a red pass carries: which pass of how many, and the session
+/// order each free-running block ran in, so the reader of a red on pass 3
+/// sees which order failed without the `concurrent_block` observation.
+fn pass_note(case: &Case, pass: Pass, passes: usize) -> String {
+    let orders: Vec<String> = case
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Step(Step::Concurrent(block)) if block.is_free_running() => Some(format!(
+                "step {} ran its sessions in the order {}",
+                block.ordinal,
+                block.order_labels(pass).join(", ")
+            )),
+            _ => None,
+        })
+        .collect();
+    format!("pass {} of {passes}: {}", pass.0, orders.join("; "))
 }
 
 #[cfg(tokio_unstable)]
@@ -278,21 +322,37 @@ async fn execute_case_with_storage(
     if let (None, Some(fixture)) = (prepared, case.fixture.as_ref()) {
         seed_case(&session, fixture, case.needs_indices).await?;
     }
-    omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &PLAIN_HOST)
-        .await
-        .map(|_| ())
+    omnigraph_gqt_core::execute_steps(
+        case,
+        path,
+        false,
+        session,
+        uri,
+        Some(storage),
+        &PLAIN_HOST,
+        &PLAIN_HOST,
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn run_concurrent_step(
+    observer: &impl Observer,
     session: &Session,
     case: &Case,
     step: &ConcurrentStep,
+    pass: Pass,
 ) -> Result<(), StepFail> {
     let label = format!("step {} (concurrent)", step.ordinal);
     let fail = |message: String| StepFail::new(label.clone(), message);
     if !dst_runner::active() {
+        if step.is_free_running() {
+            let order = permutation(step.sessions.len(), pass);
+            return omnigraph_gqt_core::run_free_running_block(observer, session, step, &order)
+                .await;
+        }
         return Err(fail(
-            "a concurrent block runs under the DST runner only; its environment is omnigraph-engine-dst".into(),
+            "a concurrent block with an `order:` line runs under the DST runner only; its environment is omnigraph-engine-dst".into(),
         ));
     }
     let line = case.source_lines.get(&step.ordinal).map(|l| *l as u64);
@@ -307,7 +367,7 @@ async fn run_concurrent_step(
         let run = Arc::clone(&run);
         measure::SESSION.scope(ctx, async move {
             let outcome = match run.start_session(index).await {
-                Ok(()) => run_session(&PLAIN_HOST, session, op).await,
+                Ok(()) => run_session(observer, session, op, 0).await,
                 Err(aborted) => Err(aborted),
             };
             let script = run.finish_session(index).await;
@@ -329,7 +389,11 @@ async fn run_concurrent_step(
             })
         })
         .collect();
-    record_concurrent_outcome(step.ordinal, &sessions_evidence, &block);
+    let conflicts: Vec<Option<u32>> = results
+        .iter()
+        .map(|(outcome, _)| outcome.as_ref().ok().map(|report| report.conflicts))
+        .collect();
+    record_concurrent_outcome(step.ordinal, &sessions_evidence, &conflicts, &block);
     if let Some(failure) = block.failure {
         return Err(fail(failure));
     }
@@ -338,10 +402,20 @@ async fn run_concurrent_step(
             return Err(fail(format!("session `{}`: {message}", op.label)));
         }
     }
-    Ok(())
+    omnigraph_gqt_core::readback_dealt_rows(observer, session, step, 1)
+        .await
+        .map_err(fail)
 }
 
-fn record_concurrent_outcome(ordinal: usize, sessions: &[Value], block: &concurrent::Outcome) {
+/// The block's evidence row, replay-compared, and its measurements: the
+/// grants with their wall times, the unattributed requests and each
+/// session's authority conflicts, which differ between replays of one seed.
+fn record_concurrent_outcome(
+    ordinal: usize,
+    sessions: &[Value],
+    conflicts: &[Option<u32>],
+    block: &concurrent::Outcome,
+) {
     dst_runner::finish_concurrent_observations();
     dst_runner::record(
         "concurrent_block",
@@ -354,7 +428,12 @@ fn record_concurrent_outcome(ordinal: usize, sessions: &[Value], block: &concurr
     measure::push_detail(serde_json::json!({
         "slot": "concurrent",
         "step": ordinal,
-        "value": {"grants": block.log, "wall_ms": block.wall_ms, "unattributed": block.unattributed},
+        "value": {
+            "grants": block.log,
+            "wall_ms": block.wall_ms,
+            "unattributed": block.unattributed,
+            "authority_conflicts": conflicts,
+        },
     }));
 }
 

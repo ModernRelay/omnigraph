@@ -5,6 +5,14 @@
 //! experiment identity. Legacy case/suite readers are retained. The local runner consumes those resolved plans, canonical JSON is
 //! the durable telemetry authority, and OmniGraph provides a disposable query
 //! projection over that archive. Cloud orchestration is a later harness slice.
+//!
+//! Three levels, each inside the one before. The harness is this crate: it
+//! plans the points, prepares and resets the fixture, runs each repetition in
+//! a fresh process, verifies, and writes the record. The host (`BenchHost` in
+//! [`gqt_runner`]) runs one frozen GQT program inside that process and times
+//! the selected step. The driver ([`driver`]) issues the statements of a
+//! measured block, and runs only when the selected step is one.
+#![recursion_limit = "512"]
 
 pub mod archive;
 pub mod branch_merge;
@@ -16,6 +24,7 @@ pub mod dataset_identity;
 #[doc(hidden)]
 pub mod dataset_worker;
 pub mod discovery;
+pub mod driver;
 pub mod environment;
 pub mod fixture_reference;
 #[doc(hidden)]
@@ -24,11 +33,15 @@ pub mod fixture_worker;
 pub mod gqt_case;
 #[doc(hidden)]
 pub mod gqt_evidence;
+#[cfg(unix)]
+mod gqt_owned_server;
 #[doc(hidden)]
 pub mod gqt_protocol;
 pub mod gqt_record;
 pub mod gqt_runner;
 pub mod gqt_served;
+#[cfg(unix)]
+mod gqt_server_process;
 mod gqt_supervisor;
 #[doc(hidden)]
 pub mod gqt_worker;

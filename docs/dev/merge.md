@@ -4,14 +4,14 @@
 **Authority:** current merge routes and invariants; public conflict behavior is
 in [the user merge guide](../user/branching/merge.md)
 
-`Omnigraph::branch_merge` performs a graph-level three-way merge from the
+`Session::branch_merge` performs a graph-level three-way merge from the
 source branch into a target branch. The merge base, source, and target are
 resolved once; final publication revalidates their exact graph and native-ref
 identities.
 
 Merge first tries to prove the same merge base from the captured recent commits
-and already cached history, within a fixed visit budget. An inconclusive proof
-uses the full lineage reader. A successful proof does not validate unread
+and already cached history, within a fixed visit budget. An inconclusive proof runs the lazy
+ancestry walk below, which reads only the history blocks it addresses. A successful proof does not validate unread
 history: missing, malformed, or conflicting settled records outside the proof
 may remain undetected until a history read reaches them.
 
@@ -49,9 +49,11 @@ The table classifier chooses one of four routes:
 1. **No change:** source contributes nothing.
 2. **Pointer adoption:** target still equals the base and the exact source table
    state can become the target's visible pointer without copying rows.
-3. **Proven insertion replay:** target still permits data replay and the
-   complete retained source interval proves a contiguous sequence of exact-ID,
-   insertion-only transactions.
+3. **Proven insertion replay** (main target, source table on a pre-v11 fork
+   only): the complete retained source interval proves a contiguous sequence of
+   exact-ID, insertion-only transactions, and main applies them on its own
+   lineage. On every other adopt the same proof only feeds validation, and the
+   publish is a pointer switch.
 4. **General merge:** compare base/source/target through proven lineage
    candidates or an ordered full walk, and stage the selected delta.
 
@@ -100,7 +102,8 @@ parent. Merge accepts it only when every version in the complete source
 interval is present and structurally proves:
 
 - one exact previous-version link and transaction UUID;
-- an insertion-only filtered Update over exactly physical `id`;
+- an insertion-only filtered Update over exactly physical `id`, or an
+  index-only commit, which moves no row and is crossed as a link;
 - no removed/updated fragments or unrelated maintenance effect;
 - complete nested schema/index-coverage metadata;
 - physical-row totals matching the manifest delta;
@@ -172,7 +175,8 @@ the same cursor (`crates/omnigraph/src/ordered_cursor.rs`):
   updates, and removals as deletes selected by the `_rowid` the target-side
   read returned (the target's own row, or the base row while the target pins
   the base), which Lance takes without an index or a data-column scan;
-- the transaction plan is pre-minted and bounded before recovery arm;
+- each table's detached chain is bounded at 1,024 links
+  (`MAX_BRANCH_MERGE_DATA_TRANSACTIONS`) before the first effect;
 - selected validation deltas share one operation-wide budget for the keys
   validation keeps (see [Constraint validation](#constraint-validation)).
 
@@ -291,24 +295,19 @@ decoded-batch limits.
 Validation is delta-scoped, reads its delta once a batch at a time, and
 retains at most 32 MiB of keys ([Constraint validation](#constraint-validation)).
 Usable physical indexes reduce uniqueness and relationship probe cost;
-missing coverage falls back to scans without changing correctness. Tables and
-chunks publish sequentially inside the one recovery envelope, and all routes
+missing coverage falls back to scans without changing correctness. Tables and chunks stage sequentially before the one manifest CAS, and all routes
 defer index construction to reconciliation.
 
 Cost tests cap common fast-forward manifest opens/scans at three and diverged
 merges at four, five for a non-bound target. A `FastForward` whose target head
 is not the merge base, such as a second merge from the same source, opens the
-base like a diverged merge and compares the two states in memory. Every
-publish rewrites the live
-`__manifest` rows into new files, normally one fragment (Lance splits a write
-at 1,048,576 rows per file), so a scan no longer pays per-fragment and
-per-deletion-file requests. Pages within a file are still read separately; the
-local history curve measured 40-41 requests per write from 1 to 1,024 prior
-publications, which is a measurement, not a guarantee. The rows hold the
+base like a diverged merge and compares the two states in memory. Every publish rewrites the hot `__manifest` rows into exactly one new
+fragment and names the cold registry fragments again, so a scan pays no
+per-fragment or per-deletion-file requests for them. Pages within a file are
+still read separately. The rows hold the
 `table` rows, the head `graph_commit` row and the buffered `settled_commit`
 and `replaced_table` rows, which `HISTORY_RELEASE_BYTES` (or the lower
-`history_release_bytes` a session set) bounds, so the bytes
-decoded per scan no longer grow with retained history; older commits live in
+`history_release_bytes` a session set) bounds, so the bytes decoded per scan do not grow with retained history; older commits live in
 `__history` and are read only when a history read needs them. Read-only scans
 reduce one Arrow batch at a time; the publish scan retains every batch,
 because the copy-on-write publish rewrites them. Each `__manifest` version
@@ -330,9 +329,7 @@ it unset, so timing does not read the clock. Its top-level timing flow is:
 
 `OuterPrepare` -> ((`ProvenInsertHistory` -> `ProvenInsertPlanScan`) | `TableWalk`)
 -> `CandidateValidation` -> `FinalRevalidation` -> `PhysicalPublish` ->
-`ManifestPublish` -> `OuterRestoreRefresh`. The `RecoveryArm`,
-`RecoveryConfirm` and `RecoveryCleanup` phases retired with the merge
-sidecar (RFC 0067).
+`ManifestPublish` -> `OuterRestoreRefresh`.
 
 The parenthesized classification routes are chosen per table, so a mixed-table
 operation can record both route families. `TableWalk` covers one general
@@ -392,12 +389,15 @@ structured result to its public 409 representation.
 
 ## Publication and recovery
 
-A merge into a named branch with physical table effects chains each merged
-table's chunks as detached commits on the target's pin and publishes one pin
-per table, `base + 1` as its `published_dataset_version` and the chain's
-tip as its `staged_version` (RFC 0067, detached-only). A merge onto main is
-a pointer switch: main's registration takes the source's pin, and the merge
-stages nothing; an empty source delta leaves main's registration untouched.
+The route is chosen per table. A table the target changed since the merge base
+chains its chunks as detached commits on the target's pin, on main as on a
+named branch, and publishes one pin per table: the target's version plus the
+chain's link count as its `published_dataset_version` and the chain's tip as
+its `staged_version` (RFC 0067, detached-only). A table the target left at the
+base is a pointer switch and stages nothing: the target's registration takes
+the source's pin. Main keeps its own registration after an empty source delta,
+and for a source table on a pre-v11 fork it stages the delta on its own
+lineage.
 Pointer-only siblings ride the same manifest CAS, and no table fork is
 created. The pure-insert proof walks the source's commit chain by
 `read_version` links from the source pin to the base pin
@@ -411,12 +411,13 @@ fragments, within the candidate budget.
 A failure anywhere before the CAS returns the original error and leaves the
 target untouched: the chunk chains are unpublished staging that `cleanup`'s
 collector reclaims, and a retry plans from scratch. A target that advanced
-meanwhile makes the merge lose its CAS and return the ordinary conflict. After
-the CAS the merge is complete; nothing follows the publication.
+meanwhile makes the merge lose its CAS and return the ordinary conflict. After the CAS the merge is complete:
+no recovery step follows the publication. The merge-input tags are then
+released, and `cleanup` releases any that are left.
 
 ## Outcomes
 
-The engine returns `MergeResult { outcome, commit }`. `MergeOutcome` is one of:
+The engine returns `MergeResult { outcome, commit, plans }`. `MergeOutcome` is one of:
 
 - `AlreadyUpToDate` — source adds no target-visible change;
 - `FastForward` — the target's state equals the merge base's: equal
@@ -432,7 +433,7 @@ The engine returns `MergeResult { outcome, commit }`. `MergeOutcome` is one of:
 - `Merged` — a productive three-way merge publishes a new graph commit.
 
 Both publishing outcomes carry their own `GraphCommit`; `AlreadyUpToDate`
-carries `None`. Return this value through the server and CLI without rereading
+carries `None`, and a dry run reports its outcome with `commit: None`. Return this value through the server and CLI without rereading
 HEAD or history: a concurrent writer may have advanced the target already.
 Optional source deletion is a subsequent action with its own authorization and
 structured error; it cannot replace the successful merge receipt. See
@@ -445,7 +446,7 @@ structured error; it cannot replace the successful merge receipt. See
 - `crates/omnigraph/tests/integration/merge_fast_forward.rs` — pointer/proven-insert routes
   and bounded fallback, and the validation key budget: wide non-key columns
   sweep through (`branch_merge_validation_streams_wide_non_key_columns_issue_1427`)
-  while keys past 32 MiB refuse before arm
+  while keys past 32 MiB refuse before the first effect
   (`branch_merge_validation_delta_is_aggregate_bounded_pre_arm`).
 - `crates/omnigraph/src/validate/load.rs` — the judge's sweep (`Sweep`) the merge
   streams its delta through; `table_store.rs` owns the bytes it charges and

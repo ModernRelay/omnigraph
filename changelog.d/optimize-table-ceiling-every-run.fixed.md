@@ -1,3 +1,4 @@
-- The guides now say a served `optimize` defers a table over a per-table ceiling on every run, and that the run byte budget is also the table byte ceiling. See [table ceilings][optimize-ceiling-every-run].
+- A served `optimize` defers a dataset over its [per-dataset limit][optimize-ceiling-every-run]
+  on every run. Raise the limit or optimize it directly.
 
 [optimize-ceiling-every-run]: ../docs/user/operations/recorded-operations.md#table-ceilings-and-the-byte-budget

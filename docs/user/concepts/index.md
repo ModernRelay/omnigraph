@@ -1,6 +1,6 @@
 # Concepts
 
-OmniGraph is a typed property-graph database. A graph contains **nodes**,
+Omnigraph is a typed property-graph database. A graph contains **nodes**,
 **edges**, and a schema that defines their properties and constraints. The same
 graph can be queried with structured graph patterns, full-text search, and
 vector search.
@@ -45,14 +45,16 @@ you no longer need.
 
 ## Storage and indexes
 
-A graph is stored at one local, S3, or Azure Blob root. That root is the graph's
+A graph is stored at one local, S3, or Azure Blob root. A Google Cloud Storage
+root is a preview, through the embedded Rust API only. That root is the graph's
 consistency and history boundary; cross-graph transactions are not supported.
 See [storage](storage.md) for supported URI forms and backend configuration.
 
 Indexes improve performance but do not define logical correctness. A declared
 index may be missing or cover only part of recent data; queries still return
 matching entities outside its coverage. Run `omnigraph optimize` to compact
-data and refresh index coverage.
+data and refresh BTREE and vector coverage; full-text coverage needs
+`omnigraph index rebuild --kind full-text`.
 
 ## Access paths
 

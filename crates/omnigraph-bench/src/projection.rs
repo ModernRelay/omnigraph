@@ -1689,6 +1689,7 @@ impl ProjectionRecord for crate::gqt_record::AnyRunRecordV1 {
         match self {
             Self::Legacy(r) => legacy_point_row(r),
             Self::Gqt(r) => gqt_point_row(r),
+            Self::Concurrent(r) => gqt_point_row(&r.record),
         }
     }
     fn run_row(
@@ -1698,6 +1699,10 @@ impl ProjectionRecord for crate::gqt_record::AnyRunRecordV1 {
         match self {
             Self::Legacy(r) => legacy_run_row(r, receipt),
             Self::Gqt(r) => gqt_run_row(r, receipt),
+            Self::Concurrent(r) => Ok(RunRow {
+                claim_eligible: r.claim_eligible(),
+                ..gqt_run_row(&r.record, receipt)?
+            }),
         }
     }
 }
@@ -1861,14 +1866,19 @@ fn gqt_run_row(
     {
         GqtEvidence::Embedded(evidence) => embedded_gqt_run_row(record, &evidence, receipt),
         GqtEvidence::Served(sut) => served_gqt_run_row(record, sut, receipt),
-        GqtEvidence::Clone(evidence) => clone_gqt_run_row(record, &evidence, receipt),
+        GqtEvidence::Clone(evidence) => clone_gqt_run_row(record, &evidence, receipt, true),
+        GqtEvidence::OwnedServer(evidence) => clone_gqt_run_row(record, &evidence, receipt, false),
     }
 }
 
+/// The row of a product-binary record. `counted` is whether its samples carry
+/// logical store calls: a clone run's do, and a server the run started
+/// reports none, so its call columns are absent.
 fn clone_gqt_run_row(
     record: &GqtRunRecordV1,
     evidence: &CloneEvidence<'_>,
     receipt: &ArchiveReceiptV1,
+    counted: bool,
 ) -> Result<RunRow, ProjectionError> {
     let &CloneEvidence {
         sut,
@@ -1878,7 +1888,12 @@ fn clone_gqt_run_row(
     } = evidence;
     let harness = &sut.harness;
     let wall = &record.measurements.wall_clock;
-    let calls = gqt_logical_call_summaries(record)?;
+    let calls = counted
+        .then(|| gqt_logical_call_summaries(record))
+        .transpose()?;
+    let control = calls
+        .as_ref()
+        .and_then(|calls| calls.control_plane.as_ref());
     Ok(RunRow {
         invocation_id: record.invocation().invocation_id.clone(),
         record_sha256: receipt.record_sha256.clone(),
@@ -1968,12 +1983,12 @@ fn clone_gqt_run_row(
         p95_supported: wall.p95_supported,
         wall_evidence: json_string(&wall.evidence, "wall evidence")?,
         floor_multiplier_millis: record.measurements.claim_policy.floor_multiplier_millis,
-        lance_data_plane_logical_calls_min: Some(calls.lance_data_plane.min),
-        lance_data_plane_logical_calls_p50: Some(calls.lance_data_plane.p50),
-        lance_data_plane_logical_calls_max: Some(calls.lance_data_plane.max),
-        control_plane_logical_calls_min: calls.control_plane.as_ref().map(|c| c.min),
-        control_plane_logical_calls_p50: calls.control_plane.as_ref().map(|c| c.p50),
-        control_plane_logical_calls_max: calls.control_plane.as_ref().map(|c| c.max),
+        lance_data_plane_logical_calls_min: calls.as_ref().map(|c| c.lance_data_plane.min),
+        lance_data_plane_logical_calls_p50: calls.as_ref().map(|c| c.lance_data_plane.p50),
+        lance_data_plane_logical_calls_max: calls.as_ref().map(|c| c.lance_data_plane.max),
+        control_plane_logical_calls_min: control.map(|c| c.min),
+        control_plane_logical_calls_p50: control.map(|c| c.p50),
+        control_plane_logical_calls_max: control.map(|c| c.max),
         logical_counts_presence_json: canonical_json(
             &record.measurements.layer_presence.logical.counts,
             "logical counts presence",
@@ -4357,7 +4372,7 @@ fn path_to_utf8(path: &Path) -> Result<&str, ProjectionError> {
         ProjectionError::new(
             "projection_path_not_utf8",
             Some(path),
-            "OmniGraph local URIs require a UTF-8 path",
+            "Omnigraph local URIs require a UTF-8 path",
         )
     })
 }
@@ -4590,6 +4605,43 @@ mod tests {
         assert_eq!(row.terminal_failed_repetition, Some(1));
         assert_eq!(row.terminal_stage.as_deref(), Some("measure"));
         assert_eq!(row.terminal_code.as_deref(), Some("worker_timeout"));
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_record_never_projects_as_claim_eligible() {
+        use crate::gqt_record::{AnyRunRecordV1, ConcurrentRunRecordV1, GqtSutIdentityV1};
+
+        let mut inner = crate::gqt_tests::authority_fixture().await;
+        let GqtSutIdentityV1::Embedded(sut) = &mut inner.sut else {
+            panic!("the fixture is an embedded run");
+        };
+        sut.build.effective_codegen_options_proved = true;
+        assert!(
+            inner.claim_eligible(),
+            "the wrapped run alone is a complete acquisition on a proved build"
+        );
+        let receipt = crate::archive::ArchiveReceiptV1 {
+            archive_format_version: ARCHIVE_FORMAT_VERSION,
+            invocation_id: inner.invocation.invocation_id.clone(),
+            record_sha256: "a".repeat(64),
+            object_relative_path: "objects/sha256/aa/record.json".to_string(),
+            pointer_relative_path: "invocations/01/pointer.json".to_string(),
+            newly_published: true,
+        };
+        let record = AnyRunRecordV1::Concurrent(Box::new(ConcurrentRunRecordV1 {
+            format_version: 1,
+            driver: crate::driver::Driver::ClosedLoop,
+            claim_grade: false,
+            warmup_seconds: 0,
+            measured_seconds: 1,
+            sweep: Default::default(),
+            tokio_unstable: false,
+            record: inner,
+        }));
+        assert!(
+            !run_row(&record, &receipt).unwrap().claim_eligible,
+            "a closed-loop block is never a claim, whatever its build proves"
+        );
     }
 
     #[test]

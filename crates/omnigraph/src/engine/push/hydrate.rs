@@ -451,15 +451,3 @@ fn take_in_order(chunk: &HydratedChunk) -> Result<RecordBatch> {
         .collect();
     Ok(take_record_batch(&all, &indices)?)
 }
-
-/// The hydrated schema a side declares: its columns plus the address pair.
-pub fn hydrated_columns(schema: &Schema) -> Schema {
-    let mut fields: Vec<Field> = schema
-        .fields()
-        .iter()
-        .map(|field| field.as_ref().clone())
-        .collect();
-    fields.push(Field::new(lance_core::ROW_ID, DataType::UInt64, true));
-    fields.push(Field::new(lance_core::ROW_ADDR, DataType::UInt64, true));
-    Schema::new(fields)
-}

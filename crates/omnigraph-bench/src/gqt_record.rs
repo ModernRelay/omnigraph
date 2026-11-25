@@ -1,7 +1,10 @@
 //! Scenario-specific GQT authority records; legacy serializers stay unchanged.
 use crate::case::{Backend, ResetMode};
 use crate::dataset_cache::{DatasetManifestV1, validate_manifest_evidence};
-use crate::gqt_case::{GqtPointIdentityV1, MAX_EXPANDED_STEPS, Target, validate_point_spec};
+use crate::driver::Driver;
+use crate::gqt_case::{
+    BlockRun, GqtPointIdentityV1, MAX_EXPANDED_STEPS, Target, validate_point_spec,
+};
 use crate::gqt_evidence::PreparationProofV2;
 use crate::gqt_runner::{
     GqtRepObservation, RunExecution, sample_evidence_matches, validate_merge_evidence,
@@ -12,8 +15,11 @@ use crate::machine::{MachineIdentityV1, validate_machine_identity};
 use crate::model::{typed_sha256, valid_kebab_id};
 use crate::record::*;
 use crate::store::BaseManifestV1;
-use omnigraph_gqt_core::{Item, Step, StepKind, parse_case};
+use omnigraph_gqt_core::{
+    Case, Item, MAX_DURATION_SECONDS, MAX_WARMUP_SECONDS, Step, StepKind, parse_case,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const MAX_SERVED_SUT_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +86,11 @@ pub struct ProductSutIdentityV1 {
     /// of itself is `source_commit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_commit: Option<String>,
+    /// The digest of the build's `omnigraph-server`, on a `reset: rebuild`
+    /// record: the run started that binary per repetition and the workload
+    /// ran against it. Absent where the product binary itself ran the steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_executable_sha256: Option<String>,
     pub harness: SutIdentityV1,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +102,9 @@ impl ProductSutIdentityV1 {
     pub(crate) fn validate(&self) -> RecordResult<()> {
         crate::record::validate_harness(&self.harness)?;
         validate_sha256(&self.executable_sha256, "sut.executable_sha256")?;
+        if let Some(server) = &self.server_executable_sha256 {
+            validate_sha256(server, "sut.server_executable_sha256")?;
+        }
         validate_text(&self.package_version, "sut.package_version")?;
         validate_text(&self.http_contract, "sut.http_contract")?;
         if let Some(commit) = &self.source_commit {
@@ -209,6 +223,9 @@ pub(crate) enum GqtEvidence<'a> {
     Embedded(EmbeddedEvidence<'a>),
     Served(&'a ServedSutIdentityV1),
     Clone(CloneEvidence<'a>),
+    /// A server the run started per repetition: the clone record's evidence,
+    /// its SUT naming the server binary too.
+    OwnedServer(CloneEvidence<'a>),
 }
 pub(crate) struct EmbeddedEvidence<'a> {
     pub(crate) sut: &'a SutIdentityV1,
@@ -262,18 +279,27 @@ impl GqtRunRecordV1 {
             }
             (
                 GqtSutIdentityV1::Product(sut),
-                Target::Engine,
+                target,
                 Some(machine),
                 Some(backend),
                 None,
                 Some(_),
                 Some(base),
-            ) => Ok(GqtEvidence::Clone(CloneEvidence {
-                sut,
-                machine,
-                backend,
-                base,
-            })),
+            ) => {
+                let evidence = CloneEvidence {
+                    sut,
+                    machine,
+                    backend,
+                    base,
+                };
+                match (target, &sut.server_executable_sha256) {
+                    (Target::Engine, None) => Ok(GqtEvidence::Clone(evidence)),
+                    (Target::Server, Some(_)) => Ok(GqtEvidence::OwnedServer(evidence)),
+                    _ => Err(error(
+                        "a product record names a server binary exactly when its target is the server",
+                    )),
+                }
+            }
             _ => Err(error("target and evidence tuple disagree")),
         }
     }
@@ -281,7 +307,67 @@ impl GqtRunRecordV1 {
 fn error(message: impl std::fmt::Display) -> RecordError {
     RecordError::new("invalid_gqt_record", "$", message.to_string())
 }
+/// The record of `execution` in the variant its measured step takes: the
+/// concurrent record for a `--- concurrent measured` block, the GQT record
+/// for one operation.
+pub fn build_any(
+    execution: &RunExecution,
+    invocation: InvocationIdentityV1,
+    terminal: Option<AcquisitionTerminalV1>,
+) -> RecordResult<AnyRunRecordV1> {
+    let Some(run) = execution.bound.plan.block else {
+        return build(execution, invocation, terminal).map(AnyRunRecordV1::from);
+    };
+    let record = assemble(execution, invocation, terminal)?;
+    let record = ConcurrentRunRecordV1 {
+        format_version: 1,
+        driver: Driver::ClosedLoop,
+        claim_grade: false,
+        warmup_seconds: run.warmup_seconds,
+        measured_seconds: run.duration_seconds,
+        sweep: execution.bound.identity.sweep.clone(),
+        tokio_unstable: execution
+            .samples
+            .first()
+            .and_then(|sample| sample.concurrent.as_ref())
+            .is_some_and(|observed| observed.tokio_unstable),
+        record,
+    };
+    let proof = validate_concurrent_with_proof(&record)?;
+    validate_parent_samples(execution, &proof)?;
+    Ok(AnyRunRecordV1::Concurrent(Box::new(record)))
+}
+
 pub fn build(
+    execution: &RunExecution,
+    invocation: InvocationIdentityV1,
+    terminal: Option<AcquisitionTerminalV1>,
+) -> RecordResult<GqtRunRecordV1> {
+    let record = assemble(execution, invocation, terminal)?;
+    let proof = validate_with_proof(&record, None)?;
+    validate_parent_samples(execution, &proof)?;
+    Ok(record)
+}
+
+fn validate_parent_samples(
+    execution: &RunExecution,
+    proof: &PreparationProofV2,
+) -> RecordResult<()> {
+    for (index, sample) in execution.samples.iter().enumerate() {
+        validate_sample(
+            sample,
+            &execution.bound,
+            (index + 1) as u32,
+            proof,
+            sample.elapsed_us,
+            true,
+        )
+        .map_err(error)?;
+    }
+    Ok(())
+}
+
+fn assemble(
     execution: &RunExecution,
     invocation: InvocationIdentityV1,
     terminal: Option<AcquisitionTerminalV1>,
@@ -327,6 +413,10 @@ pub fn build(
                 executable_sha256: product.executable_sha256.clone(),
                 source_commit: product.source_commit.clone(),
                 requested_commit: product.requested_commit.clone(),
+                server_executable_sha256: product
+                    .server
+                    .as_ref()
+                    .map(|server| server.executable_sha256.clone()),
                 harness: {
                     let harness = crate::record::sut_identity_from_build(&execution.build)?;
                     crate::record::validate_harness(&harness)?;
@@ -382,7 +472,7 @@ pub fn build(
             _ => return Err(error("inconsistent execution evidence")),
         }
     };
-    let record = GqtRunRecordV1 {
+    Ok(GqtRunRecordV1 {
         format_version: 1,
         invocation,
         run: GqtRunIdentityV1 {
@@ -421,20 +511,7 @@ pub fn build(
                 floor_multiplier_millis: DEFAULT_FLOOR_MULTIPLIER_MILLIS,
             },
         },
-    };
-    let proof = validate_with_proof(&record)?;
-    for (index, sample) in execution.samples.iter().enumerate() {
-        validate_sample(
-            sample,
-            &execution.bound,
-            (index + 1) as u32,
-            &proof,
-            sample.elapsed_us,
-            true,
-        )
-        .map_err(error)?;
-    }
-    Ok(record)
+    })
 }
 fn summarize(samples: &[GqtRepObservation]) -> RecordResult<WallClockSummaryV1> {
     if samples.is_empty() {
@@ -458,9 +535,112 @@ fn summarize(samples: &[GqtRepObservation]) -> RecordResult<WallClockSummaryV1> 
     })
 }
 pub fn validate(r: &GqtRunRecordV1) -> RecordResult<()> {
-    validate_with_proof(r).map(drop)
+    validate_with_proof(r, None).map(drop)
 }
-fn validate_with_proof(r: &GqtRunRecordV1) -> RecordResult<PreparationProofV2> {
+
+/// The record of a run whose measured step is a `--- concurrent measured`
+/// block: the run every repetition was given, over the GQT record's identity
+/// and evidence, whose samples each carry the block's labels. The loop is
+/// closed, so `claim_grade` is false and no field is a throughput or latency
+/// claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrentRunRecordV1 {
+    pub format_version: u32,
+    pub driver: Driver,
+    pub claim_grade: bool,
+    pub warmup_seconds: u32,
+    pub measured_seconds: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sweep: BTreeMap<String, u64>,
+    pub tokio_unstable: bool,
+    pub record: GqtRunRecordV1,
+}
+
+impl ConcurrentRunRecordV1 {
+    /// Whether a comparison may cite this run: a claim-grade driver's record
+    /// only, on the evidence its GQT record needs.
+    pub fn claim_eligible(&self) -> bool {
+        self.claim_grade && self.record.claim_eligible()
+    }
+}
+
+/// The block a concurrent record's samples each observe: its echo parsed at
+/// the record's swept value, and the run the record states.
+struct BlockSpec<'a> {
+    case: Case,
+    run: BlockRun,
+    header: &'a ConcurrentRunRecordV1,
+}
+
+pub fn validate_concurrent(r: &ConcurrentRunRecordV1) -> RecordResult<()> {
+    validate_concurrent_with_proof(r).map(drop)
+}
+
+fn validate_concurrent_with_proof(r: &ConcurrentRunRecordV1) -> RecordResult<PreparationProofV2> {
+    let spec = &r.record.run.run_spec;
+    let runs_a_block = match spec.environment.target {
+        Target::Engine => spec.protocol.reset != ResetMode::Clone,
+        Target::Server => spec.protocol.reset == ResetMode::Rebuild,
+    };
+    if r.format_version != 1
+        || r.driver != Driver::ClosedLoop
+        || r.claim_grade
+        || r.sweep != spec.sweep
+        || !runs_a_block
+    {
+        return Err(error(
+            "a concurrent record is a closed-loop run at its swept value, of an embedded point on a restored store or a server point under reset: rebuild, and never claim-grade",
+        ));
+    }
+    let run = BlockRun {
+        warmup_seconds: r.warmup_seconds,
+        duration_seconds: r.measured_seconds,
+    };
+    if !run.in_bounds() {
+        return Err(error(format!(
+            "a concurrent record's warmup is 0 to {MAX_WARMUP_SECONDS} seconds and its measured run 1 to {MAX_DURATION_SECONDS}, got {} and {}",
+            r.warmup_seconds, r.measured_seconds
+        )));
+    }
+    let block = BlockSpec {
+        case: selected_block(spec)?,
+        run,
+        header: r,
+    };
+    validate_with_proof(&r.record, Some(&block))
+}
+
+/// The measured block a point's echo names, parsed alone at the point's
+/// swept value: the labels, kinds and worker counts the samples must show.
+fn selected_block(spec: &GqtPointIdentityV1) -> RecordResult<Case> {
+    let mut text = spec.measured_step.text.trim().to_string();
+    for (name, value) in &spec.sweep {
+        text = text.replace(&format!("${{{name}}}"), &value.to_string());
+    }
+    let body: Vec<(usize, &str)> = text.lines().enumerate().skip(1).collect();
+    let (sessions, _) =
+        omnigraph_gqt_core::concurrent::parse_measured_block(&body).map_err(error)?;
+    let expects: String = sessions
+        .iter()
+        .map(|session| format!("{}: ok\n", session.label))
+        .collect();
+    let input = format!(
+        "# issue: none\n# notes: Durable selected block syntax.\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n--- bench\nduration_seconds: 1\n{text}\n--- expect\n{expects}"
+    );
+    let case = parse_case("record_selected_block", &input).map_err(error)?;
+    if case.measured_block().is_none() || case.steps().len() != 1 {
+        return Err(error(
+            "selected echo is not one `--- concurrent measured` block",
+        ));
+    }
+    Ok(case)
+}
+
+fn validate_with_proof(
+    r: &GqtRunRecordV1,
+    block: Option<&BlockSpec<'_>>,
+) -> RecordResult<PreparationProofV2> {
     validate_invocation(&r.invocation)?;
     let proof = validate_target_evidence(r)?;
     let point = typed_sha256(&r.run.run_spec).map_err(error)?;
@@ -524,7 +704,37 @@ fn validate_with_proof(r: &GqtRunRecordV1) -> RecordResult<PreparationProofV2> {
         if let (Some(logical), Some(control)) = (&s.logical_store_calls, &s.control_store_calls) {
             validate_call_totals(i, logical.manifest, logical.table, control)?;
         }
-        let selected_kind = selected_kind(&spec.measured_step.text)?;
+        let selected_kind = match block {
+            Some(_) => StepKind::Concurrent,
+            None => selected_kind(&spec.measured_step.text)?,
+        };
+        match (block, &s.concurrent) {
+            (None, None) => {}
+            (Some(block), Some(observed)) => {
+                let step = block
+                    .case
+                    .measured_block()
+                    .ok_or_else(|| error("the selected block is missing"))?;
+                if observed.tokio_unstable != block.header.tokio_unstable {
+                    return Err(error(
+                        "a sample ran on another runtime build than the record states",
+                    ));
+                }
+                crate::driver::validate(
+                    observed,
+                    step,
+                    block.run,
+                    &block.header.sweep,
+                    s.elapsed_us,
+                )
+                .map_err(error)?;
+            }
+            _ => {
+                return Err(error(
+                    "a block observation belongs to a concurrent record, and every sample of one carries it",
+                ));
+            }
+        }
         validate_merge_evidence(s.merge.as_ref(), selected_kind, spec.protocol.attribution)
             .map_err(error)?;
         validate_receipt_treatment(&s.steps, spec.measured_step.ordinal, &spec.cache_condition)
@@ -589,6 +799,11 @@ fn validate_target_evidence(r: &GqtRunRecordV1) -> RecordResult<PreparationProof
         GqtEvidence::Served(sut) => {
             let receipt = &sut.receipt;
             sut.validate()?;
+            if spec.protocol.reset == ResetMode::Rebuild {
+                return Err(error(
+                    "a deployment receipt names a server an operator provisioned, and reset: rebuild a server the run starts",
+                ));
+            }
             if receipt.backend != spec.environment.backend
                 || receipt.dataset.recipe_sha256 != spec.dataset_recipe_sha256
                 || receipt.dataset.logical_content_sha256 != spec.dataset_logical_digest
@@ -621,6 +836,34 @@ fn validate_target_evidence(r: &GqtRunRecordV1) -> RecordResult<PreparationProof
                 base_manifest_sha256: base.manifest_sha256.clone(),
             })
         }
+        GqtEvidence::OwnedServer(CloneEvidence {
+            sut,
+            machine,
+            backend,
+            base,
+        }) => {
+            sut.validate()?;
+            validate_machine_identity(machine).map_err(error)?;
+            validate_backend(&spec.environment.backend, backend)?;
+            validate_base_evidence(base)?;
+            let Some(server_sha256) = sut.server_executable_sha256.clone() else {
+                return Err(error("an owned-server record names no server binary"));
+            };
+            if base.recipe_sha256 != spec.dataset_recipe_sha256
+                || base.summary.logical_content_sha256 != spec.dataset_logical_digest
+                || base.summary.algorithm != spec.dataset_identity_algorithm
+                || spec.protocol.reset != ResetMode::Rebuild
+                || r.measurements
+                    .raw_samples
+                    .iter()
+                    .any(|sample| sample.peak_rss_bytes.is_none())
+            {
+                return Err(error(
+                    "base binding mismatch, or a sample without its server's peak memory",
+                ));
+            }
+            Ok(PreparationProofV2::OwnedServer { server_sha256 })
+        }
     }
 }
 
@@ -645,24 +888,28 @@ pub(crate) fn layer_presence(target: Target) -> MeasurementLayerPresenceV1 {
 pub enum AnyRunRecordV1 {
     Legacy(Box<RunRecordV1>),
     Gqt(Box<GqtRunRecordV1>),
+    Concurrent(Box<ConcurrentRunRecordV1>),
 }
 impl AnyRunRecordV1 {
     pub fn invocation(&self) -> &InvocationIdentityV1 {
         match self {
             Self::Legacy(r) => &r.invocation,
             Self::Gqt(r) => &r.invocation,
+            Self::Concurrent(r) => &r.record.invocation,
         }
     }
     pub fn point_id(&self) -> &str {
         match self {
             Self::Legacy(r) => &r.run.point_id,
             Self::Gqt(r) => &r.run.point_id,
+            Self::Concurrent(r) => &r.record.run.point_id,
         }
     }
     pub fn validate(&self) -> RecordResult<()> {
         match self {
             Self::Legacy(r) => validate_run_record(r),
             Self::Gqt(r) => validate(r),
+            Self::Concurrent(r) => validate_concurrent(r),
         }
     }
 }
@@ -684,6 +931,19 @@ impl AuthorityRecord for GqtRunRecordV1 {
     }
     fn validate_authority(&self) -> RecordResult<()> {
         validate(self)
+    }
+}
+impl AuthorityRecord for ConcurrentRunRecordV1 {
+    fn invocation(&self) -> &InvocationIdentityV1 {
+        &self.record.invocation
+    }
+    fn validate_authority(&self) -> RecordResult<()> {
+        validate_concurrent(self)
+    }
+}
+impl From<ConcurrentRunRecordV1> for AnyRunRecordV1 {
+    fn from(r: ConcurrentRunRecordV1) -> Self {
+        Self::Concurrent(Box::new(r))
     }
 }
 impl AuthorityRecord for AnyRunRecordV1 {

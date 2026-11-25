@@ -37,7 +37,7 @@ puts each changed path in one class:
 
 | Class | Paths | Jobs that run |
 |---|---|---|
-| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `PR Title`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`; of these only `Check AGENTS.md Links` reads documentation, through `scripts/check-docs.py`) |
+| documentation | `docs/**/*.md` (`.mdx`, `.rst`, `.adoc`), `changelog.d/*.md`, `changelog.d/release.json`, the root `README.md`, `AGENTS.md`, `CLAUDE.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `LICENSE`, `LICENSE.md` | the always-on guards (`Classify Changes`, `Check AGENTS.md Links`, `Check Workflow Action Pins`, `Fix Regression Gate`, `PR Title`, `Storage Upgrade Compatibility`, `Dependency Guard (cargo deny)`, `CI Gate`). `Check AGENTS.md Links` reads documentation through `scripts/check-docs.py`, `Fix Regression Gate` requires `AGENTS.md` to name the corpus path `crates/omnigraph-gqt/cases/`, and `PR Title` reads the `changelog.d/` notes a pull request adds. `Test omnigraph-server --features aws` and the `GQ Logic Tests` cells start and report without building |
 | GQT cases | `.gqt` files anywhere under `crates/omnigraph-gqt/cases/` (recursive discovery) | the guards plus `GQ Logic Tests` (`run_gqt`) |
 | deployment | `Dockerfile`, `.dockerignore`, `docker/**`, `deploy/**` | the guards plus `Azure Contract Guards`, `Container Entrypoint`, `Azure Deployment Validation` (`run_deployment`) |
 | engine input | every other path: `crates/**` (a text fixture under a crate is source code; only the `.gqt` corpus is a class of its own), `tools/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/**`, `scripts/**`, `.github/**`, anything unlisted | every job (`run_full_ci`, which also sets `run_gqt` and `run_deployment`) |
@@ -85,9 +85,10 @@ documentation-only entry skips the same work it skips on a pull request.
 Workspace tests fail fast as they do on pull requests. The PR metadata gates
 stay on `pull_request_target`; on the queue `Fix Regression Gate` reports a
 pass and `PR Title` checks the squash subject the entry is about to land; the
-vocabulary audit, Azurite, the format fence, the RustFS shards and the
-deployment jobs keep their pull-request or post-merge schedule and never run
-on the queue; the DST pinned suite runs there as a reporting context. Queue
+vocabulary audit, Azurite, the format fence, the RustFS shards, the arm64
+benchmark harness tests and the deployment jobs keep their pull-request or
+post-merge schedule and never run on the queue; the DST pinned suite runs
+there as a reporting context. Queue
 runs never publish releases or save the main branch's caches. Details:
 [branch-protection.md](branch-protection.md), Merge queue.
 
@@ -109,31 +110,24 @@ names. Details and the recovery
 routes: [branch-protection.md](branch-protection.md), CI Gate.
 
 `Storage Upgrade Compatibility` (`storage_upgrade_compatibility` in `ci.yml`)
-runs on every change and in the merge queue. It builds the genuine stamp-13
-CLI from the immutable `STAMP_13_SOURCE_COMMIT` in a detached worktree into
-the job's target directory, copies the binary out, cleans the path-package
-artifacts through both manifests (the predecessor and current packages share
-names and versions) and exports `OMNIGRAPH_V13_BIN`. The step
-`Install released v0.10.0 and v0.11.0 CLIs` downloads the two releases with
-`scripts/install.sh` and exports `OMNIGRAPH_V6_BIN` and `OMNIGRAPH_V011_BIN`:
+runs on every change and in the merge queue. It provisions four rows of the
+[predecessor registry](testing.md#predecessor-binaries) with the
+`./.github/actions/predecessors` action and `require: true`: `stamp-13` and
+`lance-11`, each built from its pinned commit in its own checkout and target
+directory, and the releases `release-0.10.0` and `release-0.11.0`, installed by
+`scripts/install.sh` against their pinned archive digests, three attempts each.
 0.11.0 writes stamp 9, and 0.10.0 followed by the 0.11.0 `upgrade` gives the
 stamp-8 source (`--to-format 8`) and the stamp-9 source its default target
-leaves. The step trusts the release assets exactly as the `test` job's
-v0.9.0 and v0.10.0 installs do: `install.sh` downloads the archive and its
-`.sha256` from the same GitHub release and verifies the one against the other
-before extracting; no digest is pinned in the workflow. Each download gets
-three attempts (`install_release`), the only retry in the job; a failed
-attempt leaves no binary behind. The job's added runtime (two downloads and
-the five journeys) is UNVERIFIED against its `timeout-minutes: 90` until the
-first hosted run; the timeout was not changed. With
-`OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1` a missing binary fails the five
-genuine journeys (`genuine_v13_storage_upgrade_preserves_history`,
+leaves. The action caches the provisioned rows under a key of what they are
+made from, so a cold source build runs only when a row, the provisioner or
+the installer changes. With `require`, a missing row fails the six genuine
+journeys (`genuine_v13_storage_upgrade_preserves_history`,
+`genuine_lance11_storage_upgrade_round_trip`,
 `genuine_v0_11_0_storage_upgrade_preserves_history`,
 `genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
 `genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history`,
 `genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`)
-instead of skipping them; the v6 format fence in the `test` job keeps its own
-resolver and skips, never panics, without `OMNIGRAPH_V6_BIN`. Four
+instead of skipping them; the `test` job provisions its rows without it. Four
 scopes then run, each checked against its log by
 `scripts/check-storage-upgrade-ci.py --check-log`: the `storage_upgrade`
 cases of `crossversion_upgrade.rs` (a module of the CLI's `integration`
@@ -147,19 +141,17 @@ engine's `integration` binary, selected as `lance_version_columns::`) and
 `Test Workspace` packages (`--workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude
 omnigraph-dst --features "$FAILPOINT_FEATURES"`), so the job resolves one
 graph, the one `Test Workspace` builds, and the engine scopes reuse the
-crossversion scope's build; a scope that selected `-p omnigraph-engine
---features failpoints` resolved a third graph, about 20 minutes warm. The
+crossversion scope's build; a scope that selects `-p omnigraph-engine
+--features failpoints` resolves a third graph, about 20 minutes warm. The
 script's `--self-test` pins
-the scopes, the predecessor build and install scripts (compared exactly) and
-the required case names, so removing or altering one fails `Check Workflow Action Pins` and
-this job. The 90-minute budget covers two cold builds into one target
-directory: the predecessor CLI alone (one package, one bin, no test features),
-then the current tree's test targets, whose dev-dependency features
-(`test-util`) differ, so only dependency artifacts with matching features are
-reused.
+the scopes, the predecessor step (with `require` and every row the
+`storage_upgrade` cases ask for) and the required case names, so removing or
+altering one fails `Check Workflow Action Pins` and this job. The 120-minute
+budget covers a cold predecessor cache, two source builds of about 25 minutes
+each, then the current tree's test targets.
 
 The released 0.12 cluster-ledger journey is separate
-[manual release qualification](testing.md#manual-012-cluster-upgrade-qualification).
+[manual release qualification](test-ownership.md#manual-012-cluster-upgrade-qualification).
 The complete current-version live-apply CLI journey runs in `Tests slow nightly`.
 `Test Workspace` retains the focused deployment and delivery-loss tests.
 
@@ -201,20 +193,18 @@ same dev-dependency feature world (`cargo build --bins` would compile
 `omnigraph-cluster` again without `failpoints` and `test-util`).
 This is the one job that builds the tests-only `omnigraph-gqt-served` crate,
 so `Test Workspace` excludes it beside `omnigraph-gqt`. All
-four run from the repository root under
-the workspace Cargo configuration, which enables the seeded Tokio runtime.
+four run from the repository root. `dst` and `dst-clippy` build under the
+workspace Cargo configuration, which enables the seeded Tokio runtime; every
+`ordinary` and `served` step clears `RUSTFLAGS`.
 Each job has its own 60-minute budget and cache key. The budget is at least
-twice the observed 27-minute cold `ordinary` build. The roughly 30 minutes
-recorded for `dst.yml` cover a different package selection and workload;
-they do not establish a bound for GQT `dst` or `dst-clippy`. Exact cold
-timings for those jobs remain unverified. See the cache rule under
+twice the observed 27-minute cold `ordinary` build. See the cache rule under
 [Full correctness graphs](#full-correctness-graphs) for the budget policy.
 Matrix fail-fast cancels the remaining jobs when one fails; Cargo retains
 its default fail-fast between test targets.
 The required context fails if classification or any qualification fails,
-is cancelled, or is skipped. A successful run still requires all three jobs
+is cancelled, or is skipped. A successful run still requires all four jobs
 to pass; fail-fast never turns incomplete qualification into success.
-Test jobs upload invocation reports, and all three jobs upload available
+Test jobs upload invocation reports, and all four jobs upload available
 Cargo build timings separately, including on failure.
 Every corpus case is enrolled, including cases whose required graph
 behavior currently fails. `Test Workspace` excludes this separately tested
@@ -339,9 +329,8 @@ Every exemption lives in that one file: the job refuses a sibling
 subdirectory (a local run inside that subdirectory would not).
 
 `Graph Vocabulary Guard` remains a dependency of `CI Gate`, but its
-substrate-sized audit steps are currently disabled everywhere (decision of
-2026-08-28; the job-level `VOCABULARY_AUDIT_ENABLED` variable in `ci.yml` is
-the single switch). The job still
+substrate-sized audit steps are currently disabled everywhere (the job-level
+`VOCABULARY_AUDIT_ENABLED` variable in `ci.yml` is the single switch). The job still
 runs its unit tests and reports success so the exact-SHA release gates stay
 wired. When re-enabled it checks OpenAPI, Rust presentation strings, and public
 Rust against the reviewed terminology inventory after merge, on tags, and by manual
@@ -441,14 +430,14 @@ timings, not asserted here. nextest runs no doctest, so the step keeps a
 `target/nextest/ci/junit.xml` with captured output, and
 `scripts/check-workspace-test-owners.py` reads that report for the owners
 the job requires by name (the two upgrade journeys and the CLI/server/proxy
-journeys listed in the step) and for the upgrade journeys' captured notices,
-in place of grepping a `--nocapture` log. The same profile prints no line for
+journeys listed in the step) and for the upgrade journeys' captured notices.
+The same profile prints no line for
 a passing test (`status-level = "slow"`): the run's log holds the start line,
 the `SLOW` line of a test still running after a minute, each failure with its
 captured output as it happens and once more in the final summary, and the
 summary line, so a log of the workspace's tests opens in GitHub's viewer and
 reads as its failures. The local command in
-[testing.md](testing.md) stays `cargo test`; the two run the same binaries.
+[test ownership](test-ownership.md#commands) stays `cargo test`; the two run the same binaries.
 
 Every run, red or green, uploads that report as `test-workspace-junit` and
 the compile step's `--timings` page as `test-workspace-build-timings`, both
@@ -463,7 +452,8 @@ Every `Swatinem/rust-cache` step in `ci.yml`, `gq-logic-tests.yml`, and
 `dst.yml` saves only from `main` (`save-if`): a save from any other ref, a
 pull-request branch or a tag, is restorable by no pull request and only
 evicts shared entries under the repository cache cap. The pull-request-path
-jobs also save when red (`cache-on-failure`): dependency artifacts are valid
+jobs, except `Azurite Azure Integration` and `DST pinned suite`, also save
+when red (`cache-on-failure`): dependency artifacts are valid
 whatever the test verdict, and a red seed run would otherwise leave every
 pull request cold until `main` is green again.
 
@@ -482,8 +472,8 @@ The same jobs, and the nightly and DST test jobs, install `mold` with the
 other system packages. `.cargo/config.toml` links every Linux target through
 `scripts/cargo-linker.sh`, which uses mold when it is on `PATH` and the
 default `cc` linker otherwise; linking is the uncached part of each test
-binary. The release and publish workflows do not install it and link as
-before ([local builds](local-builds.md#linker)).
+binary. The release and publish workflows do not install it and link with
+the default `cc` linker ([local builds](local-builds.md#linker)).
 
 `rust-cache` restores an archive keyed on the toolchain, build environment,
 manifests and `Cargo.lock`, with prefix fallback when dependencies change.
@@ -492,12 +482,10 @@ whose source, compiler, flags, paths and dependency hashes match.
 `rust-cache` exports `CARGO_INCREMENTAL=0`, so eligible workspace library
 compilations can be cached too. Linking remains uncached, including
 binaries, test executables and proc-macro crates; unchanged source alone
-does not guarantee a hit. Adding `RUSTC_WRAPPER` changes `rust-cache`'s
-environment hash, including its prefix restore key, so existing archives
-do not seed the first run. Changing the pinned `sccache` version also
-changes its cache namespace. Cargo can print `Compiling` on a cache hit:
+does not guarantee a hit. Changing the pinned `sccache` version changes
+its cache namespace. Cargo can print `Compiling` on a cache hit:
 use the action's post-step hit/miss counts and build timings to measure
-reuse. The speedup and cache retention need hosted-run evidence.
+reuse.
 
 A cache is derived state, and no job may need one to fit its budget. The
 repository's caches exceed GitHub's cap, so every save evicts the least
@@ -524,12 +512,12 @@ every cache key, so the pin is what keeps caches warm across Rust releases.
 The release and publish workflows still build on the floating `stable`
 action and save their caches from the tag ref; they are outside this rule.
 
-The remaining jobs own contracts that need special infrastructure. They run after merge, on tags, and by manual dispatch; four of them, the format fence, the RustFS S3 integration, the Azurite Azure integration, and the AWS feature build, also run on pull requests:
+The remaining jobs own contracts that need special infrastructure. They run after merge, on tags, and by manual dispatch; five of them, the format fence, the RustFS S3 integration, the Azurite Azure integration, the AWS feature build, and the arm64 benchmark harness tests, also run on pull requests:
 
 - **Graph vocabulary audit** checks OpenAPI, Rust presentation strings, and
   public Rust against the reviewed terminology inventory (audit steps currently
   disabled; see above).
-- **V5 ↔ V10 format fence** builds the immutable final-v5 CLI and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every pull request that changes engine input, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
+- **V5 ↔ V10 format fence** provisions the `stamp-5` predecessor (the final v5-writing commit, built from source) and proves mutual refusal plus the documented export/init/load rebuild. It also runs on every pull request that changes engine input, as a reporting context: the rebuild check compares the rebuilt export against the predecessor's, so a loss or a spelling change in what it compares reports on the pull request; wait for it before clicking Merge when ready. A red fence on a pull request that touched neither the export, the loader, nor the format is inherited from `main`: compare with the latest `main` run before reading it as the pull request's.
 - **RustFS S3 integration** runs configured engine, server, cluster, CLI, and recovery owners. A configured test that skips is a failure. It also runs on every pull request that changes engine input, as a reporting context: the configured S3 owners run nowhere else, so a contract change that updates only the local-FS twin of an object-store test reports on the pull request instead of first appearing on `main`; wait for both shards before clicking Merge when ready. A red shard on a pull request that touched no object-store code, or one that names no test (the 60-minute ceiling, the image pull, RustFS readiness), is inherited from `main` or from infrastructure: compare with the latest `main` run before reading it as the pull request's. To reproduce locally, the job's `env` block and its `Start RustFS` and `Create RustFS test bucket` steps in `ci.yml` are the complete recipe.
 - **Azurite Azure integration** exercises configured storage, admission-lease,
   recovery, cluster, server, and CLI owners against a digest-pinned Azurite
@@ -552,13 +540,14 @@ The remaining jobs own contracts that need special infrastructure. They run afte
   readiness), is inherited from `main` or from infrastructure: compare with
   the latest `main` run before reading it as the pull request's.
 - **AWS feature** builds and tests `omnigraph-server` with `--features aws`; it also runs on every pull request and blocks `main` through `CI Gate`.
+- **Benchmark harness (arm64 Linux)** runs the unit tests of `omnigraph-bench` on the pinned `ubuntu-24.04-arm` runner. The harness captures the identity of the host it runs on from `/proc/cpuinfo`, the cgroup files and the memory total, the benchmark lab's machines are arm64 Linux, and every other test job is x86_64: a host read that differs between the two architectures fails here and nowhere else. It runs on every pull request that changes engine input, as a reporting context, and after merge, on tags, and by manual dispatch; wait for it before clicking Merge when ready on a pull request that touches `crates/omnigraph-bench`. The job prints the runner's CPU identification before the tests, so a red run shows the file the harness read.
 
 Azure remains a qualification preview. Emulator coverage and the completed
 managed-identity smoke proof do not replace the pending adversarial live-Azure
 matrix, and every mutation-capable Azure server must retain the
 admission-wrapper boundary.
 
-CI checks OpenAPI drift but never rewrites `openapi.json`. Regenerate an intentional API change locally as described in [testing.md](testing.md).
+CI checks OpenAPI drift but never rewrites `openapi.json`. Regenerate an intentional API change locally as described in [test ownership](test-ownership.md#openapi).
 
 ## DST tiers
 
@@ -582,13 +571,15 @@ list):
   the concurrent fleet's `wild` mode makes no replay claim.
 
 `gq-logic-tests.yml` separately owns authored GQT execution through DST. Every
-step runs from the repo root under the workspace Cargo configuration; the
-refusal step clears `RUSTFLAGS` to build the one flagless shape, and the seam
-guard step runs under the same empty `RUSTFLAGS` to share its artifacts. An
+step runs from the repo root; the `dst` and `dst-clippy` cells build under
+the workspace Cargo configuration, the refusal step clears `RUSTFLAGS` to
+build the one flagless shape, and the seam guard step runs under the same
+empty `RUSTFLAGS` to share its artifacts. An
 unavailable-runtime refusal test does not replace executing the DST cases.
 `gqt-slow-nightly.yml` (cron 03:30 UTC + manual dispatch) runs the cases under
 `crates/omnigraph-gqt/cases_slow/` through the `omnigraph-gqt` binary, one at
-a time; it is not a required context, and it is its own workflow because the
+a time, then validates the full `benchmarks/fixtures` dataset recipes; it is
+not a required context, and it is its own workflow because the
 GQT runner refuses the pool-quiescing variables `dst-nightly.yml` sets.
 `tests-slow-nightly.yml` (cron 04:15 UTC + manual dispatch) runs the
 `#[ignore]`d Rust tests enrolled by exact name in its list, the `nightly:`
@@ -596,12 +587,14 @@ deadline and journey tests and the `heavy-repro:` scale repros (`AGENTS.md`,
 ignore species), through `cargo nextest run --run-ignored only` on the
 workspace graph with `--no-fail-fast`, then `check-workspace-test-owners.py`
 over its JUnit report, so an enrolled test that was renamed, filtered out or
-red fails the run; it is not a required context.
+red fails the run, then runs the property tests at nightly breadth
+(`PROPTEST_CASES=48`); it is not a required context.
 
 ## Local pre-push checks
 
 Run the applicable commands before pushing. They report as checks on the pull
-request page (`actionlint` and `shellcheck` run only locally), so the pull
+request page (`actionlint`, `shellcheck` and the
+`check-workspace-test-owners.py` self-test run only locally), so the pull
 request description mentions only what CI does not run.
 
 For Rust changes:
@@ -617,7 +610,7 @@ cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --
 cargo test -p omnigraph-gqt --locked --lib --test runner_dispatch
 ```
 
-From `crates/omnigraph-gqt`, also run the complete configured package:
+From any directory inside the checkout, also run the complete GQT packages:
 
 ```bash
 cargo test -p omnigraph-gqt -p omnigraph-gqt-core --locked
@@ -630,19 +623,27 @@ For repository metadata and workflow changes, first
 ```bash
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
+python3 scripts/test_release_notes.py
+python3 scripts/test_edge_release.py
+python3 scripts/check-release-note.py --self-test
+python3 scripts/check-fix-regression.py --self-test
 python3 scripts/check-workflow-action-pins.py
+python3 scripts/check-classify-copy.py --self-test && python3 scripts/check-classify-copy.py       # after a workflow edit: the classifier copies match
+python3 scripts/check-change-classes.py --self-test && python3 scripts/check-change-classes.py     # after a classifier or path-filter edit
 python3 scripts/check-storage-upgrade-ci.py --self-test
-python3 scripts/check-merge-group-triggers.py --self-test
-python3 scripts/ci_gate.py --self-test
+python3 scripts/predecessors.py --self-test   # after a predecessor row, a `predecessor("…")` request or a workflow `rows:` edit
+python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit; also pins the CI Gate wiring
+python3 scripts/ci_gate.py --self-test   # after a ci.yml job `if:` change or an edit to the gate's needs/table
 python3 scripts/check-pr-title.py --self-test
 python3 scripts/check-pr-title.py --title "<the title you will give the pull request>"
-python3 scripts/check-ci-cells.py --self-test
+python3 scripts/check-ci-cells.py --self-test   # after deleting or renaming a test a workflow requires by name
+python3 scripts/check-workspace-test-owners.py --self-test   # after editing the `Test Workspace` owner list or .config/nextest.toml
 python3 scripts/check-release-vocabulary-gates.py
 python3 scripts/check-container-binary-contract.py
 python3 scripts/check-azure-admission-boundary.py
-python3 scripts/check-dependency-sources.py
+python3 scripts/check-dependency-sources.py   # no path copy, [patch] table, or source replacement
 cargo deny --locked check   # from the repository root, after Cargo.lock is current; allowlist in deny.toml
-typos                       # from the repository root; a subdirectory run scans only that subtree
+typos                       # from the repository root; a subdirectory run scans only that subtree; exemptions in .typos.toml
 actionlint .github/workflows/*.yml
 shellcheck scripts/*.sh
 ```
@@ -685,6 +686,7 @@ release that reports it must agree with that source.
 | `package.yml` / `omnigraph-package.yml` | Manual AWS CodeBuild packaging for default and AWS-feature artifacts, with checksums, digests, and attestations. |
 | `refresh-docs-site.yml` | Documentation changes on `main` or manual dispatch; requests a docs-site redeploy. |
 | `nix.yml` | A change to `flake.nix`, `flake.lock`, `rust-toolchain.toml` or the workflow, weekly, and by manual dispatch; builds the flake on each of its three systems and checks the binaries run and report their commit. Nothing waits on it. The flake sets `RUSTFLAGS` and the release packages and features as `build-release-archives.yml` does, and reads the toolchain from `rust-toolchain.toml` with that channel manifest's hash, which a toolchain bump updates in `flake.nix`. |
+| `bench-binaries.yml` | A push to `main` or a `bench/**` branch, a `v*` tag, a pull request labelled `benchmark`, and manual dispatch; builds `omnigraph`, `omnigraph-bench` and `omnigraph-server` for arm64 Linux on the arm64 runner inside the Amazon Linux 2023 container the benchmark lab's machines run (glibc 2.34, where the release archives need 2.39), one package per build with `RUSTFLAGS` empty, and uploads them as the workflow artifact `bench-binaries-<commit>` with their checksums, the `benchmarks/` catalog and a `build.json` naming the toolchain and the image, kept 90 days. The commit is a pull request's head, never the merge commit. A second job, `harness_from_artifact`, downloads the artifact into the same image with no checkout, no `git` and no toolchain, as the lab's machine holds it, and runs `omnigraph-bench run` with `--at <commit>=<path>`, plain and with `--server-product`, then `report`. The harness measures only on a disk it has proved (on Linux, XFS on EC2 instance-store NVMe) and a GitHub runner has none, so the job accepts two ends of a run: the harness's refusal of the disk, or a completed run with its row in the report; a stop before the disk, such as a step that needs `git` or a repository, fails it. Nothing waits on the workflow: the lab shelves the artifact when the build job uploads it, whatever the second job reports, and its machines measure without compiling. |
 
 Release archives and containers include the CLI, server, and Azure admission wrapper where their packaging contract requires all three. Keep the reusable package workflow, Dockerfile, and binary-contract check aligned.
 
@@ -697,14 +699,15 @@ only these six secrets to the builder. Its macOS job imports the identity
 into a temporary Keychain, signs all three executables with fixed
 `com.modernrelay.<binary>` identifiers, hardened runtime and a secure
 timestamp, and verifies the identifiers and signing team. It submits the
-same executables in a temporary ZIP to Apple and requires `Accepted` within
-30 minutes before packaging them in the existing tarball and computing
-checksums. Failure or missing credentials refuses the macOS release; there
-is no ad hoc fallback. Temporary credentials and the signing Keychain are
-removed on exit. Historical releases are not changed by configuring these
-secrets.
+same executables in a temporary ZIP to Apple and polls for up to 30 minutes
+before packaging them in the existing tarball and computing checksums.
+`Accepted` continues. A rejection, a missing submission ID or missing
+credentials refuses the macOS release; there is no ad hoc fallback. A
+submission Apple has not finished by the deadline is published signed, with a
+warning that names the submission ID to check. Temporary credentials and the
+signing Keychain are removed on exit.
 
-Every release build sets `RUSTFLAGS` itself (`build-release-archives.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, `flake.nix`, the documented source build): empty everywhere except the macOS archive row's `-C code-model=large`. A set `RUSTFLAGS`, empty included, replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. A plain `cargo build --release` outside these paths still inherits the cfg. The cfg serves the DST suite and the GQT DST runner only.
+Every release build sets `RUSTFLAGS` itself (`build-release-archives.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, `flake.nix`, the documented source build): empty, except the macOS archive row's `-C code-model=large` and the flake's `--remap-path-prefix` flags. A set `RUSTFLAGS`, empty included, replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. A plain `cargo build --release` outside these paths still inherits the cfg. The cfg serves the DST suite and the GQT DST runner only.
 
 ## Changing CI
 
@@ -716,4 +719,4 @@ Every release build sets `RUSTFLAGS` itself (`build-release-archives.yml`, `publ
    exact-SHA vocabulary audit; a skipped pull-request context never authorizes
    publication.
 6. Update [branch-protection.md](branch-protection.md) only when the declared required contexts or policy actually change.
-7. Keep every required context reporting on the merge queue's temporary branch too: a workflow that owns one lists `merge_group` under `on:`; a job condition that admits `pull_request` by name (`== 'pull_request'`) also admits `merge_group`; a negative gate written for post-merge venues (`!= 'pull_request'`) also excludes `merge_group`, so the queue runs only what blocks it. `scripts/check-merge-group-triggers.py` enforces the first two ([branch-protection.md](branch-protection.md), Merge queue), and a job the gate needs that skips on the queue where its `if:` says it runs makes `CI Gate` red there.
+7. Keep every required context reporting on the merge queue's temporary branch too: a workflow that owns one lists `merge_group` under `on:`; a job condition that admits `pull_request` by name (`== 'pull_request'`) also admits `merge_group`; a negative gate written for post-merge venues (`!= 'pull_request'`) also excludes `merge_group`, so the queue runs only what blocks it. `scripts/check-merge-group-triggers.py` enforces the first for every workflow that owns a required context, and the second for the job that owns it ([branch-protection.md](branch-protection.md), Merge queue), and a job the gate needs that skips on the queue where its `if:` says it runs makes `CI Gate` red there.

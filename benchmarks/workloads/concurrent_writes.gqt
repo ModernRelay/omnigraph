@@ -1,0 +1,38 @@
+# issue: none
+# notes: W writers append dealt rows to main beside four readers that look a seeded row up by key. The block is the measured step: omnigraph-bench loops every worker for the bench section's warmup and duration, once per value of W, and reports acknowledged statements per second per label; a host with a scripted clock runs every worker once at the first value. The host reads every dealt row back after the block, and the query after it reads a seeded row, which holds however long the block ran.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- bench
+warmup_seconds: 5
+duration_seconds: 30
+sweep: { W: [1, 2, 4, 8, 16] }
+
+--- concurrent measured
+writer x${W}: load generate: v1 seed: 42 mode: append
+  tables:
+    - kind: node
+      name: Chunk
+      rows: 4096000
+      commits: 1000
+      columns:
+        slug: {kind: key, prefix: cw-, width: 7}
+        n: {kind: ordinal, start: 100000, step: 1}
+reader x4: query seeded_row() { match { $c: Chunk { slug: "seed-0017" } } return { $c.n } }
+--- expect
+writer: ok
+reader: ok
+
+--- query branch: main
+query seeded_row() { match { $c: Chunk { slug: "seed-0017" } } return { $c.slug, $c.n } }
+--- expect unordered
+{"c.slug":"seed-0017","c.n":17}
+--- expect shape
+c.slug: String
+c.n: I64
