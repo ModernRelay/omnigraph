@@ -167,7 +167,10 @@ Cancellation stops the run at its next safe boundary. A run that already
 started its publication finishes it and reports that the cancellation arrived
 late; a run that had finished its tables with nothing to publish reports that
 instead. A shutdown and a deployment that affects the graph cancel the running
-operation the same way, and the record names the reason.
+operation the same way, and the record names the reason. A cancel answered
+202 always shows on the terminal record, even when it came after the run's
+last check. A `publishing` record that this server no longer runs is left as
+it is; its publication settles as described above.
 
 The record keeps the 32 newest terminal operations and the time of the newest
 id it evicted: an older id answers `unknown`, and a submission under an id

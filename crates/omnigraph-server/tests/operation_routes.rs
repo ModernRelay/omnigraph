@@ -20,9 +20,14 @@ mod support;
 use support::*;
 
 const ROOT: &str = "OMNIGRAPH_OPERATIONS_TEST_ROOT";
-/// When set, the served child parks the first optimize run at its
-/// authority-capture seam until this file exists.
+/// When set, the served child parks the first optimize run at the seam
+/// `HOLD_SEAM` names until this file exists.
 const HOLD_RELEASE: &str = "OMNIGRAPH_OPERATIONS_TEST_HOLD_RELEASE";
+const HOLD_SEAM: &str = "OMNIGRAPH_OPERATIONS_TEST_HOLD_SEAM";
+/// After the run's `running` write, before any table work.
+const BEFORE_TABLE_WORK: &str = "optimize.post_authority_capture_pre_gates";
+/// After the run's publication, before the engine's final cancellation sample.
+const AFTER_PUBLICATION: &str = "optimize.configuration_clear";
 const OPERATION_ID: &str = "01JC0000000000000000000001";
 
 const POLICY: &str = r#"
@@ -136,10 +141,12 @@ fn applied_cluster() -> tempfile::TempDir {
     temp
 }
 
-fn spawn_server(root: &Path, hold_release: Option<&Path>) -> (ContainedChild, String) {
+/// Start the served child; `hold` parks the first optimize run at the named
+/// seam until the release file exists.
+fn spawn_server(root: &Path, hold: Option<(&str, &Path)>) -> (ContainedChild, String) {
     let mut command = Command::new(std::env::current_exe().unwrap());
-    if let Some(release) = hold_release {
-        command.env(HOLD_RELEASE, release);
+    if let Some((seam, release)) = hold {
+        command.env(HOLD_SEAM, seam).env(HOLD_RELEASE, release);
     }
     let mut child = ContainedChild(
         command
@@ -179,13 +186,15 @@ async fn served_child() {
     let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) else {
         return;
     };
-    // A parked run: the first optimize stops after its `running` write and
-    // before any table work, until the parent creates the release file.
+    // A parked run: the first optimize stops at the named seam until the
+    // parent creates the release file.
     let _scenario = omnigraph::seams::FailScenario::setup();
     let _hold = std::env::var_os(HOLD_RELEASE).map(|release| {
         let release = PathBuf::from(release);
-        let (installed, hold) =
-            omnigraph::seams::catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES.hold();
+        let seam = std::env::var(HOLD_SEAM).unwrap();
+        let (installed, hold) = omnigraph::seams::catalog::decide(&seam)
+            .unwrap_or_else(|| panic!("no decision seam {seam}"))
+            .hold();
         std::thread::spawn(move || {
             while !release.exists() {
                 std::thread::sleep(Duration::from_millis(20));
@@ -404,7 +413,7 @@ async fn a_known_ending_survives_a_failed_final_write_and_a_repeat_answers_the_r
     let temp = applied_cluster();
     apply_cluster_fixture(temp.path()).await;
     let release = temp.path().join("release-the-run");
-    let (mut child, address) = spawn_server(temp.path(), Some(&release));
+    let (mut child, address) = spawn_server(temp.path(), Some((BEFORE_TABLE_WORK, &release)));
     let client = Client {
         http: reqwest::Client::new(),
         base: format!("http://{address}"),
@@ -563,5 +572,161 @@ async fn a_failed_control_read_answers_by_its_storage_class_issue_1356() {
     let (status, accepted) = client.submit("op-secret", body).await;
     assert!(matches!(status, 200 | 202), "{status}: {accepted}");
     assert_eq!(accepted["lookup"], "found", "{accepted}");
+    drop(child);
+}
+
+/// Wait until the run's record leaves the active states and the run is no
+/// longer in progress; return the record.
+async fn wait_terminal(client: &Client, id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (status, found) = client.lookup(id).await;
+        assert_eq!(status, 200, "{found}");
+        if found["in_progress"] == false
+            && matches!(
+                found["operation"]["state"].as_str(),
+                Some("succeeded" | "failed" | "cancelled" | "interrupted" | "unsettled")
+            )
+        {
+            return found["operation"].clone();
+        }
+        assert!(Instant::now() < deadline, "the run never finished: {found}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether a terminal record shows the operator's cancellation: the run
+/// stopped, or it finished and says the cancellation came late (RFC §1.9).
+fn shows_the_cancellation(terminal: &Value) -> bool {
+    terminal["state"] == "cancelled"
+        || (terminal["state"] == "succeeded"
+            && terminal["reason"].as_str().is_some_and(|reason| {
+                reason.starts_with("a cancellation arrived")
+                    && reason.ends_with(": cancelled by operator")
+            }))
+}
+
+/// A cancel answered 202 is never lost: the run it reached ends `cancelled`,
+/// or `succeeded` with a reason saying the cancellation came late. The
+/// engine samples its cancellation once more after its last boundary; a
+/// cancel after that sample, while the record still shows the run active,
+/// must reach the terminal record too, so the run decides its ending under
+/// the record gate the route answers under. A run on a graph with nothing to
+/// compact takes a few milliseconds, so the trials sweep the cancel across
+/// it in quarter-millisecond steps; on the defect most 202 answers were lost.
+// contract: E4
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_answered_202_reaches_the_terminal_record_issue_1554() {
+    const TRIALS: u32 = 90;
+    let temp = applied_cluster();
+    apply_cluster_fixture(temp.path()).await;
+    let (mut child, address) = spawn_server(temp.path(), None);
+    let client = Client {
+        http: reqwest::Client::new(),
+        base: format!("http://{address}"),
+    };
+    client.wait_ready(&mut child.0).await;
+
+    let mut answered_202 = 0;
+    let mut lost = Vec::new();
+    for trial in 0..TRIALS {
+        // Each id has its own time, so an evicted one never expires the next.
+        let id = format!("01JC000{trial:03}0000000000001554");
+        let (status, accepted) = client
+            .submit("op-secret", json!({ "operation_id": id }))
+            .await;
+        assert!(matches!(status, 200 | 202), "{status}: {accepted}");
+        tokio::time::sleep(Duration::from_micros(u64::from(trial % 30) * 250)).await;
+        let (cancel_status, cancelled) = client.cancel(&id).await;
+        let terminal = wait_terminal(&client, &id).await;
+        match cancel_status {
+            202 => {
+                answered_202 += 1;
+                if !shows_the_cancellation(&terminal) {
+                    lost.push(terminal);
+                }
+            }
+            // Too late for the route: it answered the terminal record.
+            200 => assert_eq!(cancelled["operation"], terminal, "{cancelled}"),
+            _ => panic!("{cancel_status}: {cancelled}"),
+        }
+    }
+    assert!(
+        answered_202 > 0,
+        "no cancel reached a run before its end, so the trials prove nothing"
+    );
+    assert!(
+        lost.is_empty(),
+        "{} of {answered_202} cancels answered 202 are missing from the terminal record: {lost:#?}",
+        lost.len()
+    );
+    drop(child);
+}
+
+/// A cancel that reaches a live run whose record is `publishing` is answered
+/// 202 with the record unchanged, and the run finishes its publication and
+/// records that the cancellation came after it started.
+// contract: E4
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_during_the_publication_is_noted_on_the_succeeded_record_issue_1554() {
+    let temp = applied_cluster();
+    apply_cluster_fixture(temp.path()).await;
+    {
+        // Two loads leave two small fragments, so the run publishes.
+        let db = session(
+            omnigraph::db::Omnigraph::open(
+                temp.path().join("graphs/knowledge.omni").to_str().unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        for name in ["Ada", "Grace"] {
+            db.load_jsonl(
+                &json!({"type": "Person", "data": {"name": name}}).to_string(),
+                omnigraph::loader::LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let release = temp.path().join("release-the-run");
+    let (mut child, address) = spawn_server(temp.path(), Some((AFTER_PUBLICATION, &release)));
+    let client = Client {
+        http: reqwest::Client::new(),
+        base: format!("http://{address}"),
+    };
+    client.wait_ready(&mut child.0).await;
+
+    let (status, accepted) = client
+        .submit("op-secret", json!({ "operation_id": OPERATION_ID }))
+        .await;
+    assert_eq!(status, 202, "{accepted}");
+    // The run is parked after its publication until the release file exists.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, found) = client.lookup(OPERATION_ID).await;
+        if found["operation"]["state"] == "publishing" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the run never reached its publication: {found}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (status, answered) = client.cancel(OPERATION_ID).await;
+    assert_eq!(status, 202, "{answered}");
+    assert_eq!(answered["operation"]["state"], "publishing", "{answered}");
+    assert_eq!(answered["in_progress"], true, "{answered}");
+
+    fs::write(&release, b"").unwrap();
+    let terminal = wait_terminal(&client, OPERATION_ID).await;
+    assert_eq!(terminal["state"], "succeeded", "{terminal}");
+    assert!(terminal["published_commit"].is_string(), "{terminal}");
+    assert_eq!(
+        terminal["reason"],
+        "a cancellation arrived after the publication started: cancelled by operator",
+        "{terminal}"
+    );
     drop(child);
 }

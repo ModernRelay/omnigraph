@@ -1084,7 +1084,6 @@ async fn run(
         .optimize_as(Some(operation.principal.as_str()), request)
         .await;
     watch.abort();
-    let cancel_reason = state.recorded.cancel_reason(&id);
 
     if let Some(nonce) = publishing_nonce
         .lock()
@@ -1095,61 +1094,65 @@ async fn run(
     }
     operation.timings.queued_ms = Some(started.duration_since(accepted_at).as_millis() as u64);
     operation.timings.compute_ms = Some(started.elapsed().as_millis() as u64);
-    let (ending, failure) = match result {
-        Ok(report) => (
-            Ending::Terminal(Box::new(terminal_from_report(
-                operation,
-                &report,
-                cancel_reason,
-            ))),
-            None,
-        ),
-        Err(error) => {
-            let landed = publishing_landed.load(std::sync::atomic::Ordering::SeqCst);
-            let in_doubt = publishing_in_doubt.load(std::sync::atomic::Ordering::SeqCst);
-            let uncertain = matches!(
-                error.completion_evidence(),
-                Some(omnigraph::error::CompletionEvidence::Uncertain) | None
-            );
-            let message = error.to_string();
-            let ending = if in_doubt {
-                Ending::Silent
-            } else if landed && uncertain {
-                Ending::Unresolved(format!("the publication has no definite answer: {message}"))
-            } else {
-                operation.state = OperationState::Failed;
-                operation.reason = Some(omnigraph_cluster::truncate_detail(message));
-                Ending::Terminal(Box::new(operation))
-            };
-            (ending, Some(ApiError::from_omni(error)))
-        }
-    };
-    match &ending {
-        Ending::Terminal(terminal) => {
-            if let Some(nonce) = &terminal.nonce {
-                span.record("nonce", nonce.as_str());
-            }
-            if let Some(commit) = &terminal.published_commit {
-                span.record("commit", commit.as_str());
-            }
-            tracing::info!(
-                state = ?terminal.state,
-                gate_hold_ms = terminal.timings.gate_hold_ms,
-                compute_ms = terminal.timings.compute_ms,
-                "recorded operation ended"
-            );
-        }
-        Ending::Unresolved(reason) => {
-            tracing::warn!(%reason, "recorded operation's publication is unresolved");
-        }
-        Ending::Silent => {
-            tracing::warn!("recorded operation's publishing write is in doubt");
-        }
-    }
-    {
+    let failure = {
         // The run leaves the live set in the same step as its final write, so
         // a lookup under the gate never meets an ended run still marked active.
+        // The ending is decided under the same gate.
         let lock = owner.lock_operations().await;
+        let (ending, failure) = match result {
+            // The cancellation request is read under the record gate, where
+            // the cancel route answers: a request it answered 202 is in this
+            // ending, and a later one finds the terminal record.
+            Ok(report) => (
+                Ending::Terminal(Box::new(terminal_from_report(
+                    operation,
+                    &report,
+                    state.recorded.cancel_reason(&id),
+                ))),
+                None,
+            ),
+            Err(error) => {
+                let landed = publishing_landed.load(std::sync::atomic::Ordering::SeqCst);
+                let in_doubt = publishing_in_doubt.load(std::sync::atomic::Ordering::SeqCst);
+                let uncertain = matches!(
+                    error.completion_evidence(),
+                    Some(omnigraph::error::CompletionEvidence::Uncertain) | None
+                );
+                let message = error.to_string();
+                let ending = if in_doubt {
+                    Ending::Silent
+                } else if landed && uncertain {
+                    Ending::Unresolved(format!("the publication has no definite answer: {message}"))
+                } else {
+                    operation.state = OperationState::Failed;
+                    operation.reason = Some(omnigraph_cluster::truncate_detail(message));
+                    Ending::Terminal(Box::new(operation))
+                };
+                (ending, Some(ApiError::from_omni(error)))
+            }
+        };
+        match &ending {
+            Ending::Terminal(terminal) => {
+                if let Some(nonce) = &terminal.nonce {
+                    span.record("nonce", nonce.as_str());
+                }
+                if let Some(commit) = &terminal.published_commit {
+                    span.record("commit", commit.as_str());
+                }
+                tracing::info!(
+                    state = ?terminal.state,
+                    gate_hold_ms = terminal.timings.gate_hold_ms,
+                    compute_ms = terminal.timings.compute_ms,
+                    "recorded operation ended"
+                );
+            }
+            Ending::Unresolved(reason) => {
+                tracing::warn!(%reason, "recorded operation's publication is unresolved");
+            }
+            Ending::Silent => {
+                tracing::warn!("recorded operation's publishing write is in doubt");
+            }
+        }
         let pending = match &ending {
             Ending::Terminal(terminal) => Some(PendingEnding::Finish(terminal.clone())),
             Ending::Unresolved(reason) => Some(PendingEnding::Defer {
@@ -1183,7 +1186,8 @@ async fn run(
             }
             tracing::warn!(operation_id = %id, error = %error.message, "the recorded operation's final record write did not land; a later access re-applies it");
         }
-    }
+        failure
+    };
     match failure {
         // A failure that leaves storage in doubt contains the process, as any
         // other owned write's does; the record already holds the outcome.
@@ -1252,16 +1256,20 @@ fn terminal_from_report(
             },
         ));
     }
+    // The engine samples its cancellation once more after the run, so a
+    // request that came after that sample is late although the report says
+    // `NotRequested`: the request the route recorded decides it.
+    let late = report.cancellation == RunCancellation::ArrivedLate || cancel_reason.is_some();
     match report.cancellation {
         RunCancellation::Cancelled => {
             operation.state = OperationState::Cancelled;
             operation.reason = Some(cancel_reason.unwrap_or_else(|| "cancelled".to_string()));
         }
-        RunCancellation::ArrivedLate => {
+        _ if late => {
             operation.state = OperationState::Succeeded;
-            // The engine reports a late cancellation for every run that
-            // passed its last cancellation point, a run that staged nothing
-            // included: only a run with a commit started a publication.
+            // A cancellation that missed the run's last cancellation point is
+            // late for every run, a run that staged nothing included: only a
+            // run with a commit started a publication.
             let passed = if report.graph_commit_id.is_some() {
                 "after the publication started"
             } else {
@@ -1345,9 +1353,11 @@ async fn find_authorized(
         .as_ref()
         .map_or(OperationKind::Optimize, Operation::kind);
     authorize(handle, actor, kind)?;
+    // Only a run live in this process is told, and it records the request
+    // on its terminal record. A `publishing` record whose run ended in doubt
+    // is not live: the cancellation leaves it as it is (RFC §1.9).
     if let (Some(actor), Some(op)) = (cancel_by, &operation)
         && !op.state.is_terminal()
-        && op.state != OperationState::Publishing
     {
         state.recorded.cancel_under(
             &lock,
@@ -1582,11 +1592,12 @@ mod tests {
         )
     }
 
-    /// The engine reports a late cancellation for every run that passed its
-    /// last cancellation point, so the record says a publication started
-    /// only when the run has a commit.
+    /// A cancellation that missed the run's last cancellation point is late,
+    /// whether the engine saw it (`ArrivedLate`) or it came after the
+    /// engine's final sample (`NotRequested` with a recorded request), and
+    /// the record says a publication started only when the run has a commit.
     #[tokio::test]
-    async fn a_late_cancellation_names_a_publication_only_when_one_started() {
+    async fn a_late_cancellation_names_a_publication_only_when_one_started_issue_1554() {
         let (_dir, mut report) = report_with_one_table().await;
         report.cancellation = RunCancellation::ArrivedLate;
 
@@ -1609,6 +1620,35 @@ mod tests {
             published.reason.as_deref(),
             Some("a cancellation arrived after the publication started")
         );
+
+        // After the engine's final sample, only the route's record of the
+        // request says it came.
+        report.cancellation = RunCancellation::NotRequested;
+        let after_sample = terminal_from_report(
+            accepted(),
+            &report,
+            Some("cancelled by operator".to_string()),
+        );
+        assert_eq!(after_sample.state, OperationState::Succeeded);
+        assert_eq!(
+            after_sample.reason.as_deref(),
+            Some("a cancellation arrived after the publication started: cancelled by operator")
+        );
+        report.graph_commit_id = None;
+        let idle_after_sample = terminal_from_report(
+            accepted(),
+            &report,
+            Some("cancelled by operator".to_string()),
+        );
+        assert_eq!(
+            idle_after_sample.reason.as_deref(),
+            Some(
+                "a cancellation arrived after the run had finished its tables, with nothing to publish: cancelled by operator"
+            )
+        );
+        let uncancelled = terminal_from_report(accepted(), &report, None);
+        assert_eq!(uncancelled.state, OperationState::Succeeded);
+        assert_eq!(uncancelled.reason, None);
     }
 
     /// An optimized table whose index link failed after its rewrite keeps its
