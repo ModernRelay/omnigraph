@@ -23,9 +23,8 @@ For object storage, replace `./company-brain` with the cluster root, for example
 
 The default bind address is `127.0.0.1:8080`. `--require-all-graphs` makes any
 graph startup failure fatal. Otherwise failed graphs remain in the authorized
-inventory as blocked while healthy graphs serve; see [readiness](../deployment.md).
-A stored query that fails to compile makes only itself unavailable unless
-`OMNIGRAPH_STRICT_STORED_QUERIES=1` ([upgrade](../queries/upgrading-to-gq3.md#stored-queries-at-upgrade)).
+inventory as blocked while healthy graphs serve; see [readiness](../deployment.md). A stored query that
+fails to compile makes only itself unavailable unless `OMNIGRAPH_STRICT_STORED_QUERIES=1` ([upgrade](../queries/upgrading-to-gq3.md#stored-queries-at-upgrade)).
 
 An applied empty cluster creates no default graph and serves an empty inventory.
 `/readyz` reports its applied digest, ledger revision/CAS and zero graph counts.
