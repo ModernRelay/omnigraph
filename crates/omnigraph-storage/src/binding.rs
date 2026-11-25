@@ -535,6 +535,75 @@ fn validate_endpoint(endpoint: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Set only in the child process of the test below: the scripted
+    /// server's endpoint.
+    const CAPTURED_S3_ENDPOINT: &str = "OMNIGRAPH_TEST_CAPTURED_S3_ENDPOINT";
+
+    /// A scoped adapter from a captured S3 binding, the one a managed first
+    /// bootstrap reads through, retries a HEAD that times out. Capture takes
+    /// its credentials from the process environment, so the test runs itself
+    /// again as a child process whose environment holds only test
+    /// credentials and the endpoint. Under the single-attempt read client the
+    /// child fails on the first timeout.
+    #[tokio::test]
+    async fn a_scoped_captured_s3_adapter_retries_a_timed_out_head() {
+        if let Ok(endpoint) = env::var(CAPTURED_S3_ENDPOINT) {
+            let mut binding = CapturedStorageBinding::capture(
+                "s3://test-bucket/root",
+                &StorageDestination::S3 {
+                    region: "us-east-1".into(),
+                    endpoint: Some(endpoint),
+                    virtual_hosted_style: false,
+                },
+            )
+            .expect("capture the scripted destination");
+            // Capture sets no request timeout, so object_store's 30 s default
+            // applies; a short one turns the stall into a timeout here.
+            binding
+                .options
+                .insert(ClientConfigKey::Timeout.as_ref().into(), "1s".into());
+            let adapter = binding
+                .adapter(Some(StorageIoScope::new()))
+                .expect("scoped captured adapter");
+            assert!(
+                adapter
+                    .exists("s3://test-bucket/root/object")
+                    .await
+                    .expect("a timed-out HEAD answers on its retry")
+            );
+            return;
+        }
+        let (endpoint, server) = crate::tests::spawn_scripted_server(vec![
+            ("HEAD", None),
+            (
+                "HEAD",
+                Some(crate::tests::object_response(200, None, 0, b"")),
+            ),
+        ]);
+        let module = module_path!().split_once("::").expect("crate path").1;
+        let name = format!("{module}::a_scoped_captured_s3_adapter_retries_a_timed_out_head");
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env::current_exe().expect("test binary"))
+                .args([name.as_str(), "--exact", "--nocapture"])
+                .env_clear()
+                .env("AWS_ACCESS_KEY_ID", "test-access-key")
+                .env("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+                .env(CAPTURED_S3_ENDPOINT, endpoint)
+                .output()
+                .expect("run the child test")
+        })
+        .await
+        .expect("child test task");
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{shown}");
+        assert!(shown.contains("1 passed"), "the child ran no test: {shown}");
+        assert_eq!(server.await.expect("scripted server"), 2, "{shown}");
+    }
+
     #[test]
     fn destination_binding_keeps_provider_authority_across_root_and_graph_uris() {
         let binding = CapturedStorageBinding::capture(
