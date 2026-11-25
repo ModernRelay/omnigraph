@@ -40,6 +40,7 @@ deployment.
 - [Managed M2M applications for unattended workloads](cli/managed-m2m-applications.md)
 - [HTTP server](operations/server.md)
 - [MCP](operations/mcp.md)
+- [Connect Claude to Omnigraph Cloud](operations/claude.md)
 - [Troubleshooting](operations/troubleshooting.md)
 
 ## Operate a deployment
