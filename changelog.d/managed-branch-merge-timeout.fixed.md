@@ -1,1 +1,1 @@
-- A branch merge against a managed target now has the 300-second deadline of a bulk load instead of the 30-second deadline of other requests, so a large merge no longer times out with unknown effects after it was published. This covers `branch merge` and the GQ `branch merge` statement, and the dry run of each.
+- A managed branch merge, by `branch merge` or the GQ statement and dry run included, now waits 300 seconds instead of timing out at 30 with unknown effects.
