@@ -5346,3 +5346,773 @@ fn managed_workload_token_exchange_refuses_redirects_and_errors_without_secret_o
         assert_no_core_effects(temp.path());
     }
 }
+
+const MACHINE_SECRET: &str = "fixture-machine-secret-stays-in-its-file";
+const ROTATED_SECRET: &str = "fixture-rotated-machine-secret-stays-in-its-file";
+const MACHINE_TOKEN_ENDPOINT: &str = "https://auth.example.test/oauth2/token";
+
+fn team_machine(client: &str, name: &str) -> Value {
+    serde_json::json!({"application_id":format!("app_{client}"),"client_id":client,"organization_id":"account-one","name":name,"scopes":["status"],"principal_id":format!("01P{client}"),"actor_id":format!("principal:01P{client}"),"created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})
+}
+
+fn machine_page(machines: Vec<Value>, after: Option<&str>) -> Value {
+    serde_json::json!({"data":{"organization_id":"account-one","machines":machines,"after":after,"allowed_scopes":["create","status"],"token_endpoint":MACHINE_TOKEN_ENDPOINT},"meta":{"provenance":"service_db"}})
+}
+
+fn machine_secret(id: &str) -> Value {
+    serde_json::json!({"id":id,"secret_hint":"ets","created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})
+}
+
+fn machine_secret_page(ids: &[&str]) -> Value {
+    serde_json::json!({"data":{"client_id":"client_one","secrets":ids.iter().map(|id| machine_secret(id)).collect::<Vec<_>>(),"after":null},"meta":{}})
+}
+
+fn generated_secret(id: &str, secret: Option<&str>) -> Value {
+    serde_json::json!({"data":{"client_id":"client_one","secret":machine_secret(id),"client_secret":secret,"secret_available":secret.is_some()},"meta":{}})
+}
+
+/// Neither stream, in any form, carries a disclosed secret.
+fn assert_no_secret_output(output: &std::process::Output) {
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in [MACHINE_SECRET, ROTATED_SECRET] {
+        assert!(!printed.contains(secret), "{printed}");
+    }
+}
+
+/// No operator-home file but the named secret file holds a secret: not the
+/// operator config, request custody or credential state.
+fn assert_secret_only_in(root: &std::path::Path, secret_file: &std::path::Path) {
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path != secret_file {
+                let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+                for secret in [MACHINE_SECRET, ROTATED_SECRET] {
+                    assert!(!text.contains(secret), "{} holds a secret", path.display());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_owner_only(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "{mode:o}");
+}
+
+fn machine_records(root: &std::path::Path) -> Value {
+    let path = organization_record(root).with_file_name("machines.json");
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn managed_organization_machines_list_follows_every_page_and_names_cedar_principals() {
+    for json in [true, false] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(
+                200,
+                machine_page(vec![team_machine("client_one", "ci bot")], Some("cursor/2")),
+            ),
+            IntentReply::json(
+                200,
+                machine_page(vec![team_machine("client_two", "etl")], None),
+            ),
+        ]);
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.args(["machines", "list"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = output_success(&mut command);
+        if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["data"]["machines"].as_array().unwrap().len(), 2);
+            assert_eq!(body["data"]["machines"][1]["client_id"], "client_two");
+            assert_eq!(body["data"]["after"], Value::Null);
+            assert_eq!(body["data"]["token_endpoint"], MACHINE_TOKEN_ENDPOINT);
+            assert_eq!(
+                body["data"]["allowed_scopes"],
+                serde_json::json!(["create", "status"])
+            );
+        } else {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for expected in [
+                "ci bot",
+                "client_two",
+                "principal:01Pclient_one",
+                "CEDAR PRINCIPAL",
+                MACHINE_TOKEN_ENDPOINT,
+                "Scopes you can grant: create, status",
+                "no graph access",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        let requests = api.workflow_requests();
+        assert_control_request(
+            &requests[0],
+            "GET",
+            "/v1/organization/machines",
+            Value::Null,
+            None,
+        );
+        assert_control_request(
+            &requests[1],
+            "GET",
+            "/v1/organization/machines?after=cursor%2F2",
+            Value::Null,
+            None,
+        );
+        assert!(!temp.path().join(".omnigraph").exists());
+        api.assert_complete();
+    }
+    // A foreign machine, a principal Cedar would not name or a repeated
+    // cursor refuses the whole listing.
+    for replies in [
+        vec![machine_page(
+            vec![{
+                let mut machine = team_machine("client_one", "ci");
+                machine["organization_id"] = serde_json::json!("account-two");
+                machine
+            }],
+            None,
+        )],
+        vec![machine_page(
+            vec![{
+                let mut machine = team_machine("client_one", "ci");
+                machine["actor_id"] = serde_json::json!("principal:someone-else");
+                machine
+            }],
+            None,
+        )],
+        vec![
+            machine_page(vec![], Some("same")),
+            machine_page(vec![], Some("same")),
+        ],
+    ] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(
+            replies
+                .into_iter()
+                .map(|reply| IntentReply::json(200, reply))
+                .collect(),
+        );
+        let output = output_failure(
+            organization_cli(temp.path(), &api.origin).args(["machines", "list", "--json"]),
+        );
+        assert_eq!(parse_stdout_json(&output)["type"], "api_response_invalid");
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_machine_create_delivers_its_secret_only_to_the_named_file() {
+    for json in [true, false] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, machine_page(vec![], None)),
+            IntentReply::json(
+                201,
+                serde_json::json!({"data":{"machine":team_machine("client_one", "ci bot")},"meta":{}}),
+            ),
+            IntentReply::json(201, generated_secret("sec_one", Some(MACHINE_SECRET))),
+        ]);
+        fs::create_dir_all(temp.path().join("secrets")).unwrap();
+        let secret_file = temp.path().join("secrets/ci-secret");
+        let arguments = [
+            "machines",
+            "create",
+            "ci bot",
+            "--scope",
+            "status",
+            "--secret-file",
+            secret_file.to_str().unwrap(),
+            "--create-profile",
+            "ci",
+            "--idempotency-key",
+            "machine-key",
+        ];
+        let run = || {
+            let mut command = organization_cli(temp.path(), &api.origin);
+            command.args(arguments);
+            if json {
+                command.arg("--json");
+            }
+            output_success(&mut command)
+        };
+        let output = run();
+        assert_no_secret_output(&output);
+        if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["data"]["machine"]["client_id"], "client_one");
+            assert_eq!(
+                body["data"]["machine"]["actor_id"],
+                "principal:01Pclient_one"
+            );
+            assert_eq!(body["data"]["secret_id"], "sec_one");
+            assert_eq!(body["data"]["secret_file"], secret_file.to_str().unwrap());
+            assert_eq!(body["data"]["profile"], "ci");
+        } else {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for expected in [
+                "Client ID: client_one",
+                "Cedar principal: principal:01Pclient_one",
+                "Secret sec_one written to",
+                "Profile: ci",
+                "no graph access",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), MACHINE_SECRET);
+        #[cfg(unix)]
+        assert_owner_only(&secret_file);
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 3);
+        assert_control_request(
+            &requests[0],
+            "GET",
+            "/v1/organization/machines",
+            Value::Null,
+            None,
+        );
+        assert_control_request(
+            &requests[1],
+            "POST",
+            "/v1/organization/machines",
+            serde_json::json!({"organization_id":"account-one","name":"ci bot","scopes":["status"]}),
+            Some("machine-key:machine"),
+        );
+        assert_control_request(
+            &requests[2],
+            "POST",
+            "/v1/organization/machines/client_one/secrets",
+            serde_json::json!({"organization_id":"account-one"}),
+            Some("machine-key:secret"),
+        );
+        let config: Value = yaml_serde::from_str(
+            &fs::read_to_string(managed_home(temp.path()).join("config.yaml")).unwrap(),
+        )
+        .unwrap();
+        let profile = &config["profiles"]["ci"];
+        assert_eq!(profile["api"], config["profiles"]["managed-account"]["api"]);
+        assert_eq!(profile["organization_id"], "account-one");
+        assert_eq!(
+            profile["auth"],
+            serde_json::json!({"provider":"oauth_client_credentials","token_endpoint":MACHINE_TOKEN_ENDPOINT,"client_id":"client_one","client_secret":{"file":secret_file}})
+        );
+        assert_eq!(
+            profile["transport"],
+            config["profiles"]["managed-account"]["transport"]
+        );
+        assert_secret_only_in(temp.path(), &secret_file);
+
+        // The identical request finds its retained, delivered result and
+        // writes nothing again.
+        let again = run();
+        assert_no_secret_output(&again);
+        assert_eq!(api.workflow_requests().len(), 3);
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), MACHINE_SECRET);
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_machine_create_refuses_unsafe_destinations_before_any_write() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_target(temp.path(), &api.origin);
+    let config_path = managed_home(temp.path()).join("config.yaml");
+    let mut config: Value =
+        yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["profiles"]["taken"] = config["profiles"]["managed-account"].clone();
+    fs::write(&config_path, yaml_serde::to_string(&config).unwrap()).unwrap();
+    let existing = temp.path().join("existing-secret");
+    fs::write(&existing, "keep me").unwrap();
+    let fresh = temp.path().join("fresh-secret");
+    let key = "k".repeat(201);
+    for (arguments, kind) in [
+        (
+            vec!["--secret-file", existing.to_str().unwrap()],
+            "secret_file_exists",
+        ),
+        (
+            vec![
+                "--secret-file",
+                temp.path().join("missing/secret").to_str().unwrap(),
+            ],
+            "secret_file_invalid",
+        ),
+        (
+            vec![
+                "--secret-file",
+                fresh.to_str().unwrap(),
+                "--create-profile",
+                "taken",
+            ],
+            "profile_exists",
+        ),
+        (
+            vec![
+                "--secret-file",
+                fresh.to_str().unwrap(),
+                "--create-profile",
+                "managed-account",
+            ],
+            "profile_invalid",
+        ),
+        (
+            vec![
+                "--secret-file",
+                fresh.to_str().unwrap(),
+                "--scope",
+                "members_manage",
+            ],
+            "scopes_invalid",
+        ),
+        (
+            vec![
+                "--secret-file",
+                fresh.to_str().unwrap(),
+                "--idempotency-key",
+                &key,
+            ],
+            "idempotency_key_invalid",
+        ),
+    ] {
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command
+            .args(["machines", "create", "ci", "--json"])
+            .args(&arguments);
+        if !arguments.contains(&"--idempotency-key") {
+            command.args(["--idempotency-key", "refused-key"]);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(parse_stdout_json(&output)["type"], kind, "{arguments:?}");
+    }
+    assert!(api.workflow_requests().is_empty());
+    assert_eq!(fs::read_to_string(&existing).unwrap(), "keep me");
+    assert!(!fresh.exists());
+    let after: Value = yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(after, config);
+    api.assert_complete();
+}
+
+#[test]
+fn managed_organization_machine_secret_lost_in_delivery_is_reported_by_id_never_resent() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, machine_page(vec![], None)),
+        IntentReply::json(
+            201,
+            serde_json::json!({"data":{"machine":team_machine("client_one", "ci")},"meta":{}}),
+        ),
+        IntentReply::json(
+            503,
+            serde_json::json!({"type":"provider_unavailable","title":"provider unavailable","status":503}),
+        ),
+        // The identical retry replays the stored receipt, which never holds a secret.
+        IntentReply::json(201, generated_secret("sec_one", None)),
+    ]);
+    let secret_file = temp.path().join("ci-secret");
+    let arguments = [
+        "machines",
+        "create",
+        "ci",
+        "--scope",
+        "status",
+        "--secret-file",
+        secret_file.to_str().unwrap(),
+        "--create-profile",
+        "ci",
+        "--idempotency-key",
+        "lost-key",
+    ];
+    let first = output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+    assert_eq!(first.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&first.stderr)
+            .contains("repeat the identical request with the same key"),
+        "{first:?}"
+    );
+    assert!(!secret_file.exists());
+    let records = machine_records(temp.path());
+    assert_eq!(records[0]["progress"]["machine"]["client_id"], "client_one");
+    assert_eq!(records[0]["progress"]["delivered"], Value::Null);
+
+    for json in [false, true] {
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.args(arguments);
+        if json {
+            command.arg("--json");
+        }
+        let output = output_failure(&mut command);
+        assert_no_secret_output(&output);
+        let report = if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["type"], "machine_secret_undelivered");
+            assert_eq!(body["secret_id"], "sec_one");
+            body["detail"].as_str().unwrap().to_owned()
+        } else {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+        assert!(report.contains("Revoke secret sec_one"), "{report}");
+        assert!(
+            report.contains("secret rotate --machine-profile ci"),
+            "{report}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("repeat the identical request"),
+            "{output:?}"
+        );
+        if !json {
+            // The second replay has no further reply; exactly one was scripted.
+            break;
+        }
+    }
+    let requests = api.workflow_requests();
+    // Neither retry created the machine again or listed again.
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[2].path, requests[3].path);
+    assert_eq!(requests[2].body, requests[3].body);
+    assert_eq!(
+        requests[3]
+            .headers
+            .get("idempotency-key")
+            .map(String::as_str),
+        Some("lost-key:secret")
+    );
+    assert!(!secret_file.exists());
+    assert_secret_only_in(temp.path(), &secret_file);
+    api.assert_complete();
+}
+
+/// A configured machine profile `ci` whose secret file holds `old`.
+fn write_machine_profile(
+    root: &std::path::Path,
+    origin: &str,
+    token_endpoint: &str,
+) -> std::path::PathBuf {
+    write_managed_target(root, origin);
+    let secret_file = root.join("ci-secret");
+    fs::write(&secret_file, "old-machine-secret").unwrap();
+    let path = managed_home(root).join("config.yaml");
+    let mut config: Value = yaml_serde::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["profiles"]["ci"] = serde_json::json!({"api":origin,"organization_id":"account-one","auth":{
+        "provider":"oauth_client_credentials","token_endpoint":token_endpoint,
+        "client_id":"client_one","client_secret":{"file":secret_file}}});
+    fs::write(&path, yaml_serde::to_string(&config).unwrap()).unwrap();
+    secret_file
+}
+
+fn token_reply(status: u16) -> IntentReply {
+    if status == 200 {
+        IntentReply::json(
+            200,
+            serde_json::json!({"access_token":"oauth-machine-token","token_type":"Bearer","expires_in":300}),
+        )
+    } else {
+        IntentReply::json(status, serde_json::json!({"error":"invalid_client"}))
+    }
+}
+
+fn rotate_cli(root: &std::path::Path, origin: &str) -> assert_cmd::Command {
+    let mut command = organization_cli(root, origin);
+    command
+        .env("SSL_CERT_FILE", crate::support::tls_gateway::ca_path())
+        .args(["machines", "secret", "rotate", "--machine-profile", "ci"]);
+    command
+}
+
+fn revoked_secret(id: &str) -> Value {
+    serde_json::json!({"data":{"client_id":"client_one","secret_id":id,"revoked":true},"meta":{}})
+}
+
+#[test]
+fn managed_organization_machine_rotation_proves_the_new_secret_before_revoking_the_old() {
+    for json in [true, false] {
+        let temp = tempdir().unwrap();
+        let provider = IntentApiFixture::new(vec![token_reply(200), token_reply(200)]);
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, machine_secret_page(&["sec_old"])),
+            IntentReply::json(201, generated_secret("sec_new", Some(ROTATED_SECRET))),
+            IntentReply::json(200, revoked_secret("sec_old")),
+            IntentReply::json(200, revoked_secret("sec_old")),
+        ]);
+        let secret_file = write_machine_profile(
+            temp.path(),
+            &api.origin,
+            &format!("{}/oauth2/token", provider.origin),
+        );
+        let run = || {
+            let mut command = rotate_cli(temp.path(), &api.origin);
+            command.args(["--idempotency-key", "rotate-key"]);
+            if json {
+                command.arg("--json");
+            }
+            output_success(&mut command)
+        };
+        let output = run();
+        assert_no_secret_output(&output);
+        if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["data"]["secret_id"], "sec_new");
+            assert_eq!(body["data"]["revoked"], serde_json::json!(["sec_old"]));
+            assert_eq!(body["data"]["proved"], true);
+        } else {
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("Token exchange: succeeded"), "{text}");
+            assert!(text.contains("Revoked: sec_old"), "{text}");
+        }
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), ROTATED_SECRET);
+        #[cfg(unix)]
+        assert_owner_only(&secret_file);
+        // The proof sent the new secret, and only to the token endpoint.
+        let exchange = &provider.requests()[0];
+        assert_eq!(exchange.path, "/oauth2/token");
+        assert_eq!(exchange.body["client_id"], "client_one");
+        assert_eq!(exchange.body["client_secret"], ROTATED_SECRET);
+        let requests = api.workflow_requests();
+        assert_control_request(
+            &requests[0],
+            "GET",
+            "/v1/organization/machines/client_one/secrets",
+            Value::Null,
+            None,
+        );
+        assert_control_request(
+            &requests[1],
+            "POST",
+            "/v1/organization/machines/client_one/secrets",
+            serde_json::json!({"organization_id":"account-one"}),
+            Some("rotate-key:secret"),
+        );
+        assert_control_request(
+            &requests[2],
+            "POST",
+            "/v1/organization/machines/client_one/secrets/sec_old:revoke",
+            serde_json::json!({"organization_id":"account-one"}),
+            Some("rotate-key:revoke-0"),
+        );
+        assert_secret_only_in(temp.path(), &secret_file);
+
+        // The identical request generates nothing again: it proves the
+        // delivered secret and repeats the exact revocation.
+        assert_no_secret_output(&run());
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[3].path, requests[2].path);
+        assert_eq!(
+            requests[3].headers.get("idempotency-key"),
+            requests[2].headers.get("idempotency-key")
+        );
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), ROTATED_SECRET);
+        provider.assert_complete();
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_machine_rotation_keeps_both_secrets_until_the_exchange_succeeds() {
+    let temp = tempdir().unwrap();
+    let provider = IntentApiFixture::new(vec![token_reply(401), token_reply(200)]);
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, machine_secret_page(&["sec_old"])),
+        IntentReply::json(201, generated_secret("sec_new", Some(ROTATED_SECRET))),
+        IntentReply::json(200, revoked_secret("sec_old")),
+    ]);
+    let secret_file = write_machine_profile(
+        temp.path(),
+        &api.origin,
+        &format!("{}/oauth2/token", provider.origin),
+    );
+    let failed = output_failure(rotate_cli(temp.path(), &api.origin).args([
+        "--idempotency-key",
+        "rotate-key",
+        "--json",
+    ]));
+    assert_no_secret_output(&failed);
+    let body = parse_stdout_json(&failed);
+    assert_eq!(body["type"], "machine_secret_unproven");
+    assert_eq!(body["secret_id"], "sec_new");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("Nothing was revoked") && detail.contains("same key"),
+        "{detail}"
+    );
+    assert!(!detail.contains("invalid_client"), "{detail}");
+    // The new secret stays in the file; no revocation was sent.
+    assert_eq!(fs::read_to_string(&secret_file).unwrap(), ROTATED_SECRET);
+    assert_eq!(api.workflow_requests().len(), 2);
+
+    let output = output_success(
+        rotate_cli(temp.path(), &api.origin).args(["--idempotency-key", "rotate-key"]),
+    );
+    assert_no_secret_output(&output);
+    let requests = api.workflow_requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].path,
+        "/v1/organization/machines/client_one/secrets/sec_old:revoke"
+    );
+    assert_eq!(provider.requests().len(), 2);
+    assert_secret_only_in(temp.path(), &secret_file);
+    provider.assert_complete();
+    api.assert_complete();
+}
+
+#[test]
+fn managed_organization_machine_rotation_with_several_secrets_needs_an_explicit_revocation() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, machine_secret_page(&["sec_a", "sec_b"])),
+        IntentReply::json(200, machine_secret_page(&["sec_a", "sec_b"])),
+    ]);
+    let secret_file = write_machine_profile(temp.path(), &api.origin, MACHINE_TOKEN_ENDPOINT);
+    let output = output_failure(rotate_cli(temp.path(), &api.origin).args([
+        "--idempotency-key",
+        "ambiguous-key",
+        "--json",
+    ]));
+    let body = parse_stdout_json(&output);
+    assert_eq!(body["type"], "machine_secret_ambiguous");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("sec_a") && detail.contains("sec_b") && detail.contains("--revoke"));
+    let output = output_failure(rotate_cli(temp.path(), &api.origin).args([
+        "--revoke",
+        "sec_c",
+        "--idempotency-key",
+        "missing-key",
+        "--json",
+    ]));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "machine_secret_not_found"
+    );
+    assert!(
+        api.workflow_requests()
+            .iter()
+            .all(|request| request.method == "GET"),
+        "no secret was generated or revoked"
+    );
+    assert_eq!(
+        fs::read_to_string(&secret_file).unwrap(),
+        "old-machine-secret"
+    );
+    // Only a client-credentials profile with a file source can be rotated.
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+        "machines",
+        "secret",
+        "rotate",
+        "--machine-profile",
+        "managed-account",
+        "--idempotency-key",
+        "admin-key",
+        "--json",
+    ]));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "machine_profile_invalid"
+    );
+    api.assert_complete();
+}
+
+#[test]
+fn managed_organization_machine_revoke_resolves_once_and_requires_confirmation() {
+    let listing = machine_page(
+        vec![
+            team_machine("client_one", "ci bot"),
+            team_machine("client_two", "etl"),
+            team_machine("client_three", "etl"),
+        ],
+        None,
+    );
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, listing.clone()),
+        IntentReply::json(200, listing.clone()),
+        IntentReply::json(
+            200,
+            serde_json::json!({"data":{"client_id":"client_one","revoked":true},"meta":{}}),
+        ),
+        IntentReply::json(200, listing.clone()),
+        IntentReply::json(200, listing.clone()),
+        IntentReply::json(
+            200,
+            serde_json::json!({"data":{"client_id":"client_two","revoked":true},"meta":{}}),
+        ),
+    ]);
+    // Without --yes a noninteractive or JSON run refuses before the write.
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+        "machines",
+        "revoke",
+        "ci bot",
+        "--idempotency-key",
+        "retire-key",
+        "--json",
+    ]));
+    assert_eq!(parse_stdout_json(&output)["type"], "confirmation_required");
+    assert!(
+        parse_stdout_json(&output)["detail"]
+            .as_str()
+            .unwrap()
+            .contains("--yes"),
+        "{output:?}"
+    );
+    let output = output_success(organization_cli(temp.path(), &api.origin).args([
+        "machines",
+        "revoke",
+        "ci bot",
+        "--idempotency-key",
+        "retire-key-2",
+        "--yes",
+    ]));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("ci bot (client_one) retired"), "{text}");
+    assert!(text.contains("principal:01Pclient_one"), "{text}");
+    // A shared name is ambiguous; the exact client ID selects one machine.
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+        "machines",
+        "revoke",
+        "etl",
+        "--idempotency-key",
+        "retire-etl",
+        "--yes",
+        "--json",
+    ]));
+    assert_eq!(parse_stdout_json(&output)["type"], "machine_ambiguous");
+    output_success(organization_cli(temp.path(), &api.origin).args([
+        "machines",
+        "revoke",
+        "client_two",
+        "--idempotency-key",
+        "retire-etl-client",
+        "--yes",
+    ]));
+    let posts: Vec<_> = api
+        .workflow_requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 2);
+    assert_control_request(
+        &posts[0],
+        "POST",
+        "/v1/organization/machines/client_one:revoke",
+        serde_json::json!({"organization_id":"account-one"}),
+        Some("retire-key-2"),
+    );
+    assert_eq!(posts[1].path, "/v1/organization/machines/client_two:revoke");
+    api.assert_complete();
+}

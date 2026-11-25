@@ -206,7 +206,7 @@ omnigraph cluster status --target cloud --json
 
 Managed planning uses pushed configuration. It takes no local `--config`;
 `cluster push --config DIR` uploads the declared sources. See
-[managed data access](managed-data.md), [team administration](managed-team.md)
+[managed data access](managed-data.md), [team administration](managed-team.md), [machines](managed-machines.md)
 and the [managed command reference](reference.md#managed-cluster-commands).
 
 ## Output and errors

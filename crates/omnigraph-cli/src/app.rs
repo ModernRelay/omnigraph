@@ -617,12 +617,17 @@ async fn dispatch(
             auth.token().await?;
         }
     }
+    let mut input = crate::input::Input {
+        reader: stdin,
+        is_terminal: stdin_is_terminal,
+    };
     if let Some(targets::ResolvedTarget {
         binding: targets::TargetBinding::Managed(binding),
         ..
     }) = &target
     {
-        if let Some(result) = managed::dispatch(&cli, binding, &operator, stderr).await {
+        if let Some(result) = managed::dispatch(&cli, binding, &operator, &mut input, stderr).await
+        {
             return Ok(Completion::exit(result.emit(stdout, stderr)?));
         }
     }
@@ -630,10 +635,6 @@ async fn dispatch(
         target
             .as_ref()
             .expect("operation applicability requires a target")
-    };
-    let mut input = crate::input::Input {
-        reader: stdin,
-        is_terminal: stdin_is_terminal,
     };
     match cli.command {
         Command::Login { .. } | Command::Logout { .. } => {

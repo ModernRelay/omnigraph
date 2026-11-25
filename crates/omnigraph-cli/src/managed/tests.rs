@@ -495,7 +495,12 @@ async fn incomplete_and_automation_targets_refuse_before_credential_access() {
         vec!["cluster", "token"],
     ] {
         let cli = Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).unwrap();
-        let output = dispatch(&cli, &binding, &input, &mut Vec::new())
+        let mut stdin = std::io::empty();
+        let mut prompt = crate::input::Input {
+            reader: &mut stdin,
+            is_terminal: false,
+        };
+        let output = dispatch(&cli, &binding, &input, &mut prompt, &mut Vec::new())
             .await
             .unwrap();
         assert_eq!(output.body["type"], "organization_required");
@@ -504,7 +509,12 @@ async fn incomplete_and_automation_targets_refuse_before_credential_access() {
     binding.control_auth = ControlAuth::AutomationEnv;
     for verb in ["login", "logout"] {
         let cli = Cli::try_parse_from(["omnigraph", verb]).unwrap();
-        let output = dispatch(&cli, &binding, &input, &mut Vec::new())
+        let mut stdin = std::io::empty();
+        let mut prompt = crate::input::Input {
+            reader: &mut stdin,
+            is_terminal: false,
+        };
+        let output = dispatch(&cli, &binding, &input, &mut prompt, &mut Vec::new())
             .await
             .unwrap();
         assert_eq!(output.body["type"], "authentication_mode_conflict");

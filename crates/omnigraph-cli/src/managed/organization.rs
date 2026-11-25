@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 mod custody;
+mod machines;
 
 const TEAM_TIMEOUT: Duration = Duration::from_secs(35);
 const CREDENTIAL_LIFETIME: u64 = 86400;
@@ -873,16 +874,57 @@ fn mutation_human(
     }
 }
 
+/// What an organization command needs beyond its arguments.
+pub(super) struct Invocation<'a, 'i> {
+    pub input: &'a crate::operator::InvocationConfig,
+    pub binding: &'a Binding,
+    /// `--profile`, when given; machine profiles derive from it.
+    pub profile: Option<&'a str>,
+    /// `--yes` consents to a destructive write without a prompt.
+    pub yes: bool,
+    pub prompt: &'a mut crate::input::Input<'i>,
+}
+
 pub(super) async fn dispatch(
-    input: &crate::operator::InvocationConfig,
-    binding: &Binding,
+    invocation: Invocation<'_, '_>,
     args: &OrganizationArgs,
     command: &OrganizationCommand,
     stderr: &mut dyn Write,
 ) -> Output {
+    let Invocation {
+        input,
+        binding,
+        profile,
+        yes,
+        prompt,
+    } = invocation;
     let operation = Operation::from_command(command);
-    let key = operation.as_ref().map(|(_, key)| *key);
+    let key = match command {
+        OrganizationCommand::Machines { command } => machines::key(command),
+        _ => operation.as_ref().map(|(_, key)| *key),
+    };
     let result = async {
+        if let OrganizationCommand::Machines { command } = command {
+            if let Some(key) = key {
+                idempotency_key(Some(key), stderr)?;
+            }
+            binding.organization()?;
+            let api = binding.client().await?;
+            return machines::dispatch(
+                machines::Invocation {
+                    input,
+                    binding,
+                    api: &api,
+                    admin_profile: profile,
+                    yes,
+                    json: args.json,
+                    prompt,
+                    stderr,
+                },
+                command,
+            )
+            .await;
+        }
         if let Some((operation, key)) = &operation {
             idempotency_key(Some(key), stderr)?;
             operation.validate()?;
@@ -961,7 +1003,11 @@ pub(super) async fn dispatch(
                 && key.bytes().all(|b| b.is_ascii_graphic())
             {
                 error.body["idempotency_key"] = json!(key);
-                if error.body["type"] != "output_delivery_failed" {
+                // A lost secret's own detail names its recovery; repeating
+                // the request cannot recover the value.
+                if error.body["type"] != "output_delivery_failed"
+                    && error.body["type"] != "machine_secret_undelivered"
+                {
                     if let Err(mut delivery) = write_diagnostic(
                         stderr,
                         format_args!(

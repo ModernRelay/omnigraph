@@ -1059,6 +1059,7 @@ pub(crate) async fn dispatch(
     cli: &Cli,
     binding: &Binding,
     input: &crate::operator::InvocationConfig,
+    prompt: &mut crate::input::Input<'_>,
     stderr: &mut dyn Write,
 ) -> Option<Output> {
     match &cli.command {
@@ -1066,7 +1067,21 @@ pub(crate) async fn dispatch(
             if let Err(error) = reject_scope(cli).and_then(|()| binding.account()) {
                 return Some(Output::from_result(Err(error), args.json, 2));
             }
-            Some(organization::dispatch(input, binding, args, command, stderr).await)
+            Some(
+                organization::dispatch(
+                    organization::Invocation {
+                        input,
+                        binding,
+                        profile: cli.profile.as_deref(),
+                        yes: cli.yes,
+                        prompt,
+                    },
+                    args,
+                    command,
+                    stderr,
+                )
+                .await,
+            )
         }
         Command::Login {
             json,
