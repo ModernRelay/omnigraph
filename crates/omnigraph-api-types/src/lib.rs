@@ -107,6 +107,44 @@ pub mod build {
             _ => package.to_string(),
         }
     }
+
+    /// The internal-schema stamp of a graph this build creates, the highest
+    /// it writes.
+    pub const INTERNAL_SCHEMA_WRITES: u32 =
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
+    /// The inclusive range of internal-schema stamps normal open serves,
+    /// lowest first.
+    pub const INTERNAL_SCHEMA_SERVES: [u32; 2] = [
+        omnigraph::db::manifest::MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
+        omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
+    ];
+
+    /// The storage-format line of [`version_report`]; the agent skill states
+    /// it verbatim.
+    pub fn internal_schema_line() -> String {
+        let [lowest, highest] = INTERNAL_SCHEMA_SERVES;
+        format!("internal-schema {INTERNAL_SCHEMA_WRITES} (serves v{lowest} to v{highest})")
+    }
+
+    /// What a binary of `package` prints after its own name to report its
+    /// build, one fact per line: the version it reports, the internal-schema
+    /// stamps it writes and serves, the HTTP contract it speaks and, for a
+    /// packaged build, its commit. `omnigraph version` and
+    /// `omnigraph-server --version` both print it, so a CLI and a server can
+    /// be compared without a request.
+    pub fn version_report(package: &str) -> String {
+        let mut report = format!(
+            "{}\n{}\nhttp-contract {}",
+            reported_version(package),
+            internal_schema_line(),
+            super::HTTP_API_CONTRACT
+        );
+        if let Some(commit) = SOURCE_COMMIT {
+            report.push_str("\ncommit ");
+            report.push_str(commit);
+        }
+        report
+    }
 }
 
 /// Lowercase wire name for the raw graph-head conditional-write token.

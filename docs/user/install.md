@@ -181,6 +181,7 @@ deployment images used for the Azure reference topology.
 
 ```bash
 omnigraph version
+omnigraph-server --version
 omnigraph-server --help
 omnigraph-azure-admission --help
 ```
@@ -195,6 +196,9 @@ internal-schema 17 (serves v14 to v17)
 http-contract 0.14
 commit 00b8cca842f2bf009bebeefcf765672b5ff64b26
 ```
+
+`omnigraph-server --version` prints the same report under its own name, so a
+CLI and a server can be compared before either connects to the other.
 
 `omnigraph version --json` also reports the machine-readable CLI protocols:
 
@@ -221,9 +225,10 @@ is the commit a packaged build was compiled from; a plain source build reports
 it as null and prints no `commit` line. `omnigraph --version` (`-v`) prints
 only the first line.
 
-`omnigraph-server` has no `--version` flag. A running server reports its
-package version as `version`, its commit as `source_version` and the storage
-format it writes as `internal_schema_version` on `GET /healthz`.
+A server older than 0.16.1 has no `--version` flag. A running server of any
+release reports its package version as `version`, its commit as
+`source_version` and the storage format it writes as `internal_schema_version`
+on `GET /healthz`.
 
 `internal_schema.writes` is the storage-format stamp of a graph this binary
 creates, the highest it writes, and the one `omnigraph upgrade` converts a

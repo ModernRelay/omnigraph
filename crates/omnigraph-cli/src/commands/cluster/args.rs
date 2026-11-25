@@ -110,7 +110,7 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// For a managed target, list explicitly enrolled cluster members.
+    /// For a managed target, list the owning organization's active members and their identity eligibility.
     Members {
         #[command(subcommand)]
         command: ClusterMembersCommand,
