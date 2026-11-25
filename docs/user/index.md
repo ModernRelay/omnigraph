@@ -37,6 +37,7 @@ deployment.
 - [Sign in to a managed profile](cli/login.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)
+- [Managed M2M applications for unattended workloads](cli/managed-m2m-applications.md)
 - [HTTP server](operations/server.md)
 - [MCP](operations/mcp.md)
 - [Troubleshooting](operations/troubleshooting.md)

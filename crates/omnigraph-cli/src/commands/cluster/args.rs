@@ -171,7 +171,9 @@ pub(crate) enum ClusterCommand {
         /// Emit JSON instead of human text.
         #[arg(long)]
         json: bool,
-        /// Credential lifetime, 60 seconds to 24 hours (default 1h).
+        /// Requested credential lifetime, 60 seconds to 24 hours (default
+        /// 1h). The service may issue a shorter credential; the result
+        /// reports its actual expiry.
         #[arg(long, value_parser = crate::managed::data::parse_ttl, conflicts_with = "clear")]
         ttl: Option<u64>,
         /// Forget this cluster's cached data credential; does not revoke it at the server.

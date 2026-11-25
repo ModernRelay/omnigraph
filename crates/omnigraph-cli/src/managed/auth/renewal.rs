@@ -788,7 +788,7 @@ async fn verify_session_response(api: &Api) -> Result<Value> {
                 ResponseLimits {
                     timeout: VERIFY_ATTEMPT,
                     max_body: MAX_BODY,
-                    preserve_contents: false,
+                    preserved: None,
                     auth_verification_status: true,
                 },
             ),

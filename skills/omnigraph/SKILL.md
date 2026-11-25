@@ -222,7 +222,7 @@ destination line.
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
-| Managed account | `cluster create/list`, `organization list`, `organization members/invitations`; `--profile NAME` |
+| Managed account | `cluster create/list`, `organization list`, `organization members/invitations/m2m-applications`; `--profile NAME` |
 | Managed cluster | `cluster members/pull/push/plan/apply/status/operation/history/cancel/token/delete/undo-delete`; complete cluster target |
 | Local configuration | `config validate/rename-profile/rename-target/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove`, `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
 | Authentication | `login --create-profile NAME`, `login --profile NAME`, or `logout --profile NAME` for platform sessions; `credentials set/status/remove/export` requires explicit profile or standalone target |
@@ -367,7 +367,8 @@ omnigraph credentials status --profile work --json
 Never put secrets in configuration. Providers are `omnigraph` (managed device
 login), `token` (exactly one `store`, `env` or `file` source), `exec` (absolute
 argv, bounded JSON protocol), managed-only `oauth_client_credentials` (explicit
-HTTPS token endpoint, client ID and env/file client secret), and standalone-only
+HTTPS token endpoint, client ID and env/file client secret; `organization
+m2m-applications create --create-profile` writes one), and standalone-only
 `anonymous`. No fallback is allowed. Static installation uses
 `credentials set --stdin`, not login; existing
 entries require `--replace`. Managed credentials require `--profile NAME`; standalone

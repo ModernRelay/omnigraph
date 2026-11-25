@@ -19,7 +19,8 @@ fn path(input: &InvocationConfig) -> Result<std::path::PathBuf> {
         .ok_or_else(|| eyre!("no operator configuration path"))
 }
 
-fn edit(
+/// Change the operator config under its edit lock, validating the result.
+pub(crate) fn edit(
     input: &InvocationConfig,
     change: impl FnOnce(&mut crate::operator_schema::OperatorConfig) -> Result<()>,
 ) -> Result<()> {
