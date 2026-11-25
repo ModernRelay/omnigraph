@@ -191,13 +191,12 @@ with those binaries. It is not a downgrade path from v0.14.
 ## S3 roots that name two keys
 
 An `s3://` root with a percent escape or a character a URL escapes (a space, a
-non-ASCII letter, a brace) is now refused. Earlier releases stored its cluster
-state and table locations under the escaped key (`my%20data/`) and its tables
-under the decoded one (`my data/`), and no release moves them: export each graph
-with the release that wrote it and [rebuild](#rebuild) it under a plain prefix.
-A root that only respells its key (a dot segment, a port, user information) is
-refused too, but its objects are whole: finish any outstanding deployment with
-the earlier release, then use the spelling the refusal names.
+non-ASCII letter, a brace) is now refused: earlier releases split its objects
+between the escaped key (`my%20data/`) and the decoded one (`my data/`). Export
+each graph with the release that wrote it and [rebuild](#rebuild) it under a
+plain prefix. A root that only respells a key (a dot segment, a port, user
+information) keeps whole objects: finish any outstanding deployment with the
+earlier release, then use the spelling the refusal names.
 
 ## What an export/import rebuild preserves
 
