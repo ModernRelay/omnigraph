@@ -4496,7 +4496,7 @@ async fn prepare_multi_graph_state(
     server_policy_source: Option<&PolicySource>,
     config_path: PathBuf,
     admission: Option<omnigraph_cluster::ClusterAdmission>,
-) -> Result<(AppState, Vec<PreparedGraphOpen>)> {
+) -> Result<(AppState, PendingStartup)> {
     let mut admission = match admission {
         Some(admission) => Some(admission),
         None => omnigraph_cluster::acquire_serving_admission(&config_path.to_string_lossy())
@@ -4567,7 +4567,10 @@ async fn prepare_multi_graph_state(
     // Capture each expected contract without opening engines. Contract checks
     // belong to each graph's startup outcome, alongside open and policy errors.
     let mut entries = Vec::with_capacity(graphs.len());
-    let mut prepared = Vec::with_capacity(graphs.len());
+    let mut prepared = PendingStartup {
+        opens: Vec::with_capacity(graphs.len()),
+        first_failure: None,
+    };
     for cfg in graphs {
         let expected = expected_server_schema_contract(admission.as_ref(), &cfg.uri)?;
         let key = GraphKey::cluster(
@@ -4580,9 +4583,9 @@ async fn prepare_multi_graph_state(
                     .as_ref()
                     .and_then(omnigraph_cluster::ClusterAdmission::io_scope);
                 entries.push(GraphEntry::Loading(Arc::clone(&graph.pending)));
-                prepared.push(graph);
+                prepared.opens.push(graph);
             }
-            Err(error) => entries.push(blocked_startup_graph(key, uri, error)),
+            Err(error) => entries.push(prepared.blocked(key, uri, error)),
         }
     }
     let workload = workload::WorkloadController::from_env();
@@ -4593,11 +4596,35 @@ async fn prepare_multi_graph_state(
     Ok((state, prepared))
 }
 
+/// What a startup pass owes after preparation: the graph opens still to run,
+/// and the first graph that failed, which a refusal of the whole pass names.
+struct PendingStartup {
+    opens: Vec<PreparedGraphOpen>,
+    first_failure: Option<String>,
+}
+
+impl PendingStartup {
+    /// Block a graph that failed to prepare or open, keeping the first cause.
+    fn blocked(&mut self, key: GraphKey, uri: String, error: GraphOpenFailure) -> GraphEntry {
+        self.first_failure
+            .get_or_insert_with(|| format!("{}: {error:#}", key.graph_id));
+        blocked_startup_graph(key, uri, error)
+    }
+
+    /// The suffix a refusal of the whole pass carries, naming its first cause.
+    fn first_cause(&self) -> String {
+        self.first_failure
+            .as_deref()
+            .map(|failure| format!("; first failure: {failure}"))
+            .unwrap_or_default()
+    }
+}
+
 /// Exactly one owned startup pass. A stopped process drains already entered
 /// opens without starting replacements or installing a late serving handle.
 async fn finish_graph_startup(
     state: AppState,
-    graphs: Vec<PreparedGraphOpen>,
+    mut startup: PendingStartup,
     require_all_graphs: bool,
 ) -> Result<()> {
     use futures::StreamExt;
@@ -4611,7 +4638,7 @@ async fn finish_graph_startup(
         .count();
     let mut strict_results = Vec::new();
     let mut completion_failure = None;
-    let mut opens = futures::stream::iter(graphs)
+    let mut opens = futures::stream::iter(std::mem::take(&mut startup.opens))
         .map(|prepared| {
             let operations = state.operations.clone();
             async move {
@@ -4619,19 +4646,18 @@ async fn finish_graph_startup(
                     return None;
                 }
                 let pending = Arc::clone(&prepared.pending);
-                let result = match open_prepared_graph(prepared).await {
-                    Ok(opened) => GraphEntry::ready(opened.handle),
-                    Err(error) => {
-                        blocked_startup_graph(pending.key.clone(), pending.uri.clone(), error)
-                    }
-                };
-                Some((pending, result))
+                let opened = open_prepared_graph(prepared).await;
+                Some((pending, opened))
             }
         })
         .buffer_unordered(4);
     while let Some(result) = opens.next().await {
-        let Some((pending, result)) = result else {
+        let Some((pending, opened)) = result else {
             continue;
+        };
+        let result = match opened {
+            Ok(opened) => GraphEntry::ready(opened.handle),
+            Err(error) => startup.blocked(pending.key.clone(), pending.uri.clone(), error),
         };
         let blocked = matches!(result, GraphEntry::Blocked(_));
         failed += usize::from(blocked);
@@ -4658,16 +4684,18 @@ async fn finish_graph_startup(
     }
     if require_all_graphs && failed > 0 {
         bail!(
-            "strict multi-graph startup requires every graph to open ({} configured, {} failed)",
+            "strict multi-graph startup requires every graph to open ({} configured, {} failed){}",
             configured_graphs,
-            failed
+            failed,
+            startup.first_cause()
         );
     }
     if failed == configured_graphs && configured_graphs > 0 {
         bail!(
-            "no healthy graphs opened from multi-graph startup config ({} configured, {} failed)",
+            "no healthy graphs opened from multi-graph startup config ({} configured, {} failed){}",
             configured_graphs,
-            failed
+            failed,
+            startup.first_cause()
         );
     }
     if require_all_graphs {
@@ -4681,7 +4709,8 @@ async fn finish_graph_startup(
 }
 
 fn blocked_startup_graph(key: GraphKey, uri: String, error: GraphOpenFailure) -> GraphEntry {
-    warn!(graph_id = %key.graph_id, error = %error, "graph blocked during startup");
+    // The whole cause chain, at WARN so the default `info` filter shows it.
+    warn!(graph_id = %key.graph_id, error = %format_args!("{error:#}"), "graph blocked during startup");
     GraphEntry::Blocked(Arc::new(BlockedGraph {
         key,
         uri,
