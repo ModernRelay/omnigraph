@@ -368,7 +368,15 @@ hold from an earlier unacknowledged completion.
 Scoped stores hold two clients. Reads and fresh immutable writes go to one
 with Lance's own bounded transport and AIMD retries; conditional requests and
 mutable keys go to one that makes a single attempt, so their owners see every
-attempt. Scoped control adapters keep three read retries within three minutes.
+attempt. Scoped control adapters split the same way, whatever builds them: an
+`s3://` root from the environment or from a captured binding (one
+construction, `ObjectStorageAdapter::s3_from_builder`), a `gs://` or Azure
+root, and the reads and marker write of an `s3://` clone open. Their retrying
+client retries at most three times, after a 5xx, 429 or 408 answer, a
+connection failure, or a timeout of a safe or idempotent request; a decode or
+unclassified transport error is never retried. It starts no retry once 180
+seconds have passed since the first attempt, a limit on when a retry may
+begin, not on how long the request takes.
 Local Lance uses its object-store file provider so direct file writes cannot
 bypass the scope. Embedded defaults and Azure serving clients are unchanged; the
 automatic scoped shutdown path applies only to local and S3 roots.
