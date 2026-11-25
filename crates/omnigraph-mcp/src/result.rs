@@ -44,25 +44,43 @@ pub(super) fn encodes_within<T: Serialize>(value: &T, limit: usize) -> bool {
     serde_json::to_writer(&mut CountedBytes { written: 0, limit }, value).is_ok()
 }
 
-fn bounded_value<T: Serialize>(value: &T) -> Result<Value, ProtocolError> {
-    let mut bytes = LimitedBytes(Vec::new());
-    serde_json::to_writer(&mut bytes, value).map_err(|_| ProtocolError::ResultTooLarge)?;
-    serde_json::from_slice(&bytes.0).map_err(|_| ProtocolError::InvalidResult)
+/// Why a value has no encoding under the memory cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unencoded {
+    /// Its encoding passed [`RESULT_BYTES`]; the bytes were not kept.
+    OverCap,
+    /// It did not encode as a JSON value.
+    Invalid,
 }
 
-/// Encode a handler DTO under both the value and complete SDK result bounds.
-/// An oversized response is an error, so the host can preserve the fact that
-/// a write ran before its receipt could be delivered.
-pub fn bounded_result<T: Serialize>(value: &T) -> Result<CallToolResult, ProtocolError> {
-    check_result(CallToolResult::structured(bounded_value(value)?))
-}
+/// A handler's value, encoded under the memory cap [`RESULT_BYTES`] and not
+/// yet judged for size: whether it may be sent, and what replaces it when it
+/// may not, is decided once, by the protocol layer, from what the call did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Encoded(Result<Value, Unencoded>);
 
-/// Include the text copy structured results carry for older clients.
-fn check_result(result: CallToolResult) -> Result<CallToolResult, ProtocolError> {
-    if encodes_within(&result, RESULT_BYTES) {
-        Ok(result)
-    } else {
-        Err(ProtocolError::ResultTooLarge)
+impl Encoded {
+    /// Encode `value`, keeping at most [`RESULT_BYTES`] of it in memory.
+    pub fn new<T: Serialize>(value: &T) -> Self {
+        let mut bytes = LimitedBytes(Vec::new());
+        Self(match serde_json::to_writer(&mut bytes, value) {
+            Err(_) => Err(Unencoded::OverCap),
+            Ok(()) => serde_json::from_slice(&bytes.0).map_err(|_| Unencoded::Invalid),
+        })
+    }
+
+    /// The encoded value, or the refusal for a value that has none: `over`
+    /// for one past the cap, which the caller picks by the size rule.
+    pub(crate) fn value(self, over: ProtocolError) -> Result<Value, ProtocolError> {
+        self.0.map_err(|unencoded| match unencoded {
+            Unencoded::OverCap => over,
+            Unencoded::Invalid => ProtocolError::InvalidResult,
+        })
+    }
+
+    /// The encoded value; `None` for one past the cap or not JSON.
+    pub fn as_value(&self) -> Option<&Value> {
+        self.0.as_ref().ok()
     }
 }
 
@@ -74,13 +92,17 @@ fn check_result(result: CallToolResult) -> Result<CallToolResult, ProtocolError>
 pub struct ReadBudget(NonZeroUsize);
 
 impl ReadBudget {
-    /// 96 KiB. A structured result carries its data twice, as
-    /// `structuredContent` and as the text copy, so the text copy stays under
-    /// 49,152 characters. That fits the smallest limit a common client
-    /// documents: Claude Code saves a tool result whose text exceeds 50,000
-    /// characters to a file instead of handing it to the model
+    /// 96 KiB. The budget bounds a complete encoded tool result, and the
+    /// SDK sends a structured result's data twice, as `structuredContent`
+    /// and as a JSON text copy, so a read within it has a text copy of fewer
+    /// than 49,152 characters (escaping only lengthens the encoded copy).
+    /// That is below the 50,000 characters past which Claude Code moves a
+    /// successful tool result to a file instead of handing it to the model
     /// (<https://code.claude.com/docs/en/mcp#mcp-output-limits-and-warnings>).
-    /// ChatGPT and Cursor document no number.
+    /// It promises no token count: Claude Code separately limits a result
+    /// to `MAX_MCP_OUTPUT_TOKENS` and shortens long error text. A resource
+    /// read carries one copy, so its text can approach the whole budget.
+    /// ChatGPT and Cursor document no limit.
     pub const DEFAULT: Self = match Self::new(96 * 1024) {
         Some(budget) => budget,
         None => panic!("the default read budget is within the result cap"),
@@ -114,39 +136,45 @@ impl std::fmt::Display for ReadBudget {
     }
 }
 
-/// A bounded projection of the host's canonical error. The host judges codes,
-/// effect disposition and optional HTTP status before crossing this boundary;
-/// MCP never infers them from a status or changes the body afterward.
-#[derive(Debug)]
+/// The host's canonical error for a call. The host judges codes, effect
+/// disposition and optional HTTP status before crossing this boundary; MCP
+/// never infers them from a status or changes the body afterward. Its size is
+/// judged by the protocol layer with everything else it sends: a body too
+/// large to send is replaced by the host's own `result_too_large` refusal
+/// for the same call.
+#[derive(Debug, Clone, PartialEq)]
 pub struct HostError {
     status: Option<StatusCode>,
-    result: Box<CallToolResult>,
+    body: Encoded,
 }
 
 impl HostError {
-    /// Wrap an already-judged error DTO in the MCP envelope. Errors specific
-    /// to MCP have no HTTP status. If either byte bound is exceeded, the host
-    /// must project a small canonical refusal with the same write context.
-    pub fn from_output<T: Serialize>(
-        status: Option<StatusCode>,
-        output: &T,
-    ) -> Result<Self, ProtocolError> {
-        let mut body = json!({"error": bounded_value(output)?});
-        if let Some(status) = status {
-            body["status"] = json!(status.as_u16());
-        }
-        let result = check_result(CallToolResult::structured_error(body))?;
-        Ok(Self {
+    /// Wrap an already-judged error DTO. Errors specific to MCP have no HTTP
+    /// status.
+    pub fn from_output<T: Serialize>(status: Option<StatusCode>, output: &T) -> Self {
+        Self {
             status,
-            result: Box::new(result),
-        })
+            body: Encoded::new(output),
+        }
     }
 
     pub fn status(&self) -> Option<StatusCode> {
         self.status
     }
 
-    pub fn into_tool_result(self) -> CallToolResult {
-        *self.result
+    /// The error body, or `None` when it has no encoding under the cap.
+    pub fn body(&self) -> Option<&Value> {
+        self.body.as_value()
+    }
+
+    /// The tool result that carries this error, `{"error": <body>,
+    /// "status": <status>}`, before its size is judged; `over` is the
+    /// refusal for a body past the cap.
+    pub(crate) fn tool_result(self, over: ProtocolError) -> Result<CallToolResult, ProtocolError> {
+        let mut body = json!({"error": self.body.value(over)?});
+        if let Some(status) = self.status {
+            body["status"] = json!(status.as_u16());
+        }
+        Ok(CallToolResult::structured_error(body))
     }
 }

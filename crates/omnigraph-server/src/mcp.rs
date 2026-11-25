@@ -10,8 +10,8 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json, Router};
 use omnigraph_mcp::{
-    AdmissionError, ChangeFilters, Host, HostError, Pending, ProtocolError, ResourceOutput,
-    ResourceRequest, ToolCall, ToolRequest, ToolResult, change_query,
+    AdmissionError, ChangeFilters, Encoded, Host, HostError, Pending, ProtocolError,
+    ResourceOutput, ResourceRequest, ToolCall, ToolRequest, change_query,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -69,6 +69,7 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         state.mcp_settings().clone(),
         resource_url.as_deref(),
         crate::api::build::reported_version(env!("CARGO_PKG_VERSION")),
+        crate::api::build::docs_revision(env!("CARGO_PKG_VERSION")).as_deref(),
     )
     .route_layer(middleware::from_fn_with_state(
         state.clone(),
@@ -217,7 +218,7 @@ impl Host for ServerHost {
     }
 
     fn error(&self, error: ProtocolError, write: bool) -> HostError {
-        project_error(protocol_error(error, write), write)
+        project_error(protocol_error(error, write))
     }
 
     fn start_tool(
@@ -225,7 +226,7 @@ impl Host for ServerHost {
         context: Admitted,
         request: ToolRequest,
         permit: OwnedSemaphorePermit,
-    ) -> Pending<ToolResult> {
+    ) -> Pending<Encoded> {
         let host = self.clone();
         let actor = context.actor.clone();
         let input = context.input.clone();
@@ -281,25 +282,17 @@ fn host_error(mut error: ApiError, write: bool) -> HostError {
     if write && (error.completion_uncertain() || error.code == ErrorCode::ResultTooLarge) {
         error = error.after_owned_write();
     }
-    project_error(error, write)
+    project_error(error)
 }
 
-fn project_error(error: ApiError, write: bool) -> HostError {
+fn project_error(error: ApiError) -> HostError {
     let output = error.into_output();
     let status = output
         .http_status()
         .and_then(|status| StatusCode::from_u16(status).ok());
-    HostError::from_output(status, &output).unwrap_or_else(|failure| {
-        let mut error = protocol_error(failure, write);
-        if write {
-            error = error.after_owned_write();
-        }
-        let output = error.into_output();
-        let status = output
-            .http_status()
-            .and_then(|status| StatusCode::from_u16(status).ok());
-        HostError::from_output(status, &output).expect("fixed MCP refusal fits the result bound")
-    })
+    // A body too large to send is replaced by the protocol layer with this
+    // host's `result_too_large` refusal for the same call.
+    HostError::from_output(status, &output)
 }
 
 /// MCP refusals use the server's one error-code and disposition registry.
@@ -388,13 +381,15 @@ fn graphs_output(
     McpGraphsOutput { discovery, setup }
 }
 
-fn bounded_result<T: Serialize>(value: &T) -> Result<ToolResult, ApiError> {
-    omnigraph_mcp::bounded_result(value).map_err(|error| protocol_error(error, false))
+/// A handler's DTO, encoded under the memory cap; the protocol layer judges
+/// its complete size by what the call did.
+fn bounded_result<T: Serialize>(value: &T) -> Result<Encoded, ApiError> {
+    Ok(Encoded::new(value))
 }
 
 /// One tool call's work, in its own allocation.
 type ToolFuture<'a> =
-    std::pin::Pin<Box<dyn Future<Output = Result<ToolResult, ApiError>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn Future<Output = Result<Encoded, ApiError>> + Send + 'a>>;
 
 /// Build one tool call's future on the heap, in a frame of its own. A single
 /// future over every tool would be as large as the largest handler's, and the
@@ -407,7 +402,7 @@ type ToolFuture<'a> =
 fn boxed<'a, F, Fut>(start: F) -> ToolFuture<'a>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<ToolResult, ApiError>> + Send + 'a,
+    Fut: Future<Output = Result<Encoded, ApiError>> + Send + 'a,
 {
     Box::pin(start())
 }
@@ -427,7 +422,7 @@ impl ServerHost {
         actor: AuthenticatedActor,
         input: IngressLease,
         graph: McpGraphRequest,
-    ) -> Result<ToolResult, ApiError> {
+    ) -> Result<Encoded, ApiError> {
         // Reserve write ingress before decoding arguments, matching HTTP
         // admission and preserving refusal precedence.
         let ingress = if request.is_write() {
@@ -1104,11 +1099,12 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
+    /// The body a refusal's tool result carries, `{"error", "status"}`.
     fn error_body(error: HostError) -> Value {
-        let result = error.into_tool_result();
-        assert_eq!(result.is_error, Some(true));
-        assert!(serde_json::to_vec(&result).unwrap().len() <= omnigraph_mcp::RESULT_BYTES);
-        let body = result.structured_content.unwrap();
+        let mut body = json!({"error": error.body().cloned().expect("the body encodes")});
+        if let Some(status) = error.status() {
+            body["status"] = json!(status.as_u16());
+        }
         assert!(body.get("outcome_unknown").is_none(), "{body}");
         body
     }
@@ -1117,7 +1113,7 @@ mod tests {
     fn a_write_whose_wait_ends_first_reports_an_unknown_outcome() {
         let unknown = json!({"effects": "unknown", "action": "reconcile"});
         for refusal in [ProtocolError::Cancelled, ProtocolError::Deadline] {
-            let body = error_body(project_error(protocol_error(refusal, true), true));
+            let body = error_body(project_error(protocol_error(refusal, true)));
             assert_eq!(body["status"], 500, "{body}");
             assert_eq!(body["error"]["code"], "outcome_unknown", "{body}");
             assert_eq!(body["error"]["disposition"], unknown, "{body}");
@@ -1224,7 +1220,7 @@ mod tests {
                     "retry",
                 ),
             ] {
-                let body = error_body(project_error(protocol_error(refusal, write), write));
+                let body = error_body(project_error(protocol_error(refusal, write)));
                 assert_eq!(body["status"], json!(status), "{body}");
                 assert_eq!(body["error"]["code"], code, "{body}");
                 assert_eq!(
@@ -1244,7 +1240,7 @@ mod tests {
                 "fix",
             ),
         ] {
-            let body = error_body(project_error(protocol_error(refusal, false), false));
+            let body = error_body(project_error(protocol_error(refusal, false)));
             assert!(body.get("status").is_none(), "{body}");
             assert_eq!(body["error"]["code"], code, "{body}");
             assert_eq!(
@@ -1296,41 +1292,34 @@ mod tests {
         assert!(message.contains("`limit`"), "{message}");
     }
 
+    /// A DTO or an error body past the memory cap is not kept: the protocol
+    /// layer, which judges every complete response, replaces it with this
+    /// host's `result_too_large` refusal for the same call, which a write
+    /// must reconcile.
     #[test]
     fn oversized_tool_results_and_error_bodies_preserve_write_effects() {
-        // The first DTO fits by itself, but not with the SDK's text copy.
-        // The second exceeds even the DTO bound. Both are call errors, so a
-        // write whose receipt cannot be delivered must be reconciled.
-        for length in [
-            omnigraph_mcp::RESULT_BYTES * 3 / 4,
-            omnigraph_mcp::RESULT_BYTES + 1,
-        ] {
-            let value = json!({"text": "x".repeat(length)});
-            for write in [false, true] {
-                let disposition = if write {
-                    json!({"effects": "unknown", "action": "reconcile"})
-                } else {
-                    json!({"effects": "none", "action": "fix"})
-                };
-                for error in [
-                    bounded_result(&value).unwrap_err(),
-                    // The refusal itself has to fit the complete result too.
-                    ApiError::bad_request("x".repeat(length)),
-                ] {
-                    let body = error_body(host_error(error, write));
-                    assert!(body.get("status").is_none(), "{body}");
-                    assert_eq!(body["error"]["code"], "result_too_large", "{body}");
-                    assert_eq!(body["error"]["disposition"], disposition, "{body}");
-                }
-                // The protocol's final response-size check uses the same
-                // server projection as a handler's bounded DTO conversion.
-                let body = error_body(project_error(
-                    protocol_error(ProtocolError::ResultTooLarge, write),
-                    write,
-                ));
-                assert_eq!(body["error"]["code"], "result_too_large", "{body}");
-                assert_eq!(body["error"]["disposition"], disposition, "{body}");
-            }
+        let over = omnigraph_mcp::RESULT_BYTES + 1;
+        assert!(
+            Encoded::new(&json!({"text": "x".repeat(over)}))
+                .as_value()
+                .is_none()
+        );
+        for write in [false, true] {
+            let disposition = if write {
+                json!({"effects": "unknown", "action": "reconcile"})
+            } else {
+                json!({"effects": "none", "action": "fix"})
+            };
+            let refused = host_error(ApiError::bad_request("x".repeat(over)), write);
+            assert!(refused.body().is_none());
+            assert_eq!(refused.status(), Some(StatusCode::BAD_REQUEST));
+            let body = error_body(project_error(protocol_error(
+                ProtocolError::ResultTooLarge,
+                write,
+            )));
+            assert!(body.get("status").is_none(), "{body}");
+            assert_eq!(body["error"]["code"], "result_too_large", "{body}");
+            assert_eq!(body["error"]["disposition"], disposition, "{body}");
         }
     }
 

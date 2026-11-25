@@ -19,8 +19,7 @@ pub use arguments::{
     MergeBaseArguments, MutateArguments, QueryArguments, ToolCall, ToolRequest, change_query,
 };
 pub use resources::{ResourceOutput, ResourceRequest};
-pub use result::{HostError, ReadBudget, bounded_result};
-pub use rmcp::model::CallToolResult as ToolResult;
+pub use result::{Encoded, HostError, ReadBudget};
 pub use settings::{MCP_ALLOWED_HOSTS_ENV, MCP_SETUP_URL_ENV, McpSettings, format_bytes};
 
 use axum::Router;
@@ -29,10 +28,10 @@ use catalog::*;
 use resources::*;
 use result::encodes_within;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
-    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+    Resource, ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -103,7 +102,7 @@ pub trait Host: Clone + Send + Sync + 'static {
         context: Self::Context,
         request: ToolRequest,
         permit: OwnedSemaphorePermit,
-    ) -> Pending<ToolResult>;
+    ) -> Pending<Encoded>;
     fn start_resource(
         &self,
         context: Self::Context,
@@ -121,6 +120,7 @@ pub fn router<S, H>(
     settings: McpSettings,
     resource_url: Option<&str>,
     version: String,
+    docs_revision: Option<&str>,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -147,6 +147,7 @@ where
         slots: Arc::new(Semaphore::new(16)),
         read_budget: settings.read_budget,
         instructions: Arc::from(instructions(&settings)),
+        tools: Arc::from(tools(docs_revision)),
     };
     let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
@@ -161,10 +162,18 @@ struct GraphTools<H> {
     host: H,
     version: String,
     slots: Arc<Semaphore>,
-    /// [`McpSettings::read_budget`], which [`GraphTools::fit`] applies.
+    /// [`McpSettings::read_budget`], which [`GraphTools::limit`] applies.
     read_budget: ReadBudget,
     /// Built once at boot from the settings.
     instructions: Arc<str>,
+    /// Built once at boot; their guide links name the build's revision.
+    tools: Arc<[Tool]>,
+}
+
+/// What a tool call produced, before its size is judged.
+enum Answer {
+    Output(Encoded),
+    Refusal(HostError),
 }
 
 /// Why a tool call or resource read produced no handler result.
@@ -174,23 +183,18 @@ enum Refusal {
 }
 
 impl Refusal {
-    fn tool_result(self, host: &impl Host, write: bool) -> CallToolResult {
+    /// The host's canonical error for this refusal, in `write`'s context.
+    fn host_error(self, host: &impl Host, write: bool) -> HostError {
         match self {
             Self::Protocol(error) => host.error(error, write),
             Self::Api(error) => error,
         }
-        .into_tool_result()
     }
 
-    /// A resource read carries the same canonical error envelope in `data`.
-    fn resource_error(self, host: &impl Host) -> ErrorData {
-        let status = match &self {
-            Self::Api(error) => error.status(),
-            Self::Protocol(_) => None,
-        };
-        let refused = status.is_some_and(|status| status.is_client_error())
-            || matches!(self, Self::Protocol(ProtocolError::Unauthenticated));
-        let message = match &self {
+    /// What a resource read says about this refusal, beside its error body.
+    fn resource_message(&self, status: Option<StatusCode>) -> &'static str {
+        let refused = status.is_some_and(|status| status.is_client_error());
+        match self {
             Self::Api(_) if status == Some(StatusCode::NOT_FOUND) => "resource not found",
             Self::Api(_) if refused => "resource read refused",
             Self::Api(_) => "resource read failed",
@@ -208,14 +212,6 @@ impl Refusal {
                 "the resource exceeds the read budget"
             }
             Self::Protocol(ProtocolError::InvalidResult) => "could not encode MCP resource",
-        };
-        let data = self.tool_result(host, false).structured_content;
-        if status == Some(StatusCode::NOT_FOUND) {
-            ErrorData::resource_not_found(message, data)
-        } else if refused {
-            ErrorData::invalid_request(message, data)
-        } else {
-            ErrorData::internal_error(message, data)
         }
     }
 }
@@ -247,34 +243,99 @@ where
 }
 
 impl<H: Host> GraphTools<H> {
-    /// The one judgement of a complete result's size, text copy included,
-    /// chosen by what the call does. A successful read must fit the read
-    /// budget, so a client takes it in whole and the model is told to narrow
-    /// a broad read rather than handed a truncated one. A write's result and
-    /// every refusal keep the memory cap, so the budget never hides what a
-    /// call did. The compiled-in references are fixed text and never reach
-    /// it.
-    fn fit<T: Serialize>(
-        &self,
-        result: &T,
-        write: bool,
-        refused: bool,
-    ) -> Result<(), ProtocolError> {
+    /// The size rule: the bytes a complete response may take, text copy
+    /// included, and the refusal past them. A successful read must fit the
+    /// read budget, so a client takes it in whole and the model is told to
+    /// narrow a broad read rather than handed a truncated one. A write's
+    /// result and every refusal keep the memory cap, so the budget never
+    /// hides what a call did. The compiled-in references are fixed text and
+    /// never reach it.
+    fn limit(&self, write: bool, refused: bool) -> (usize, ProtocolError) {
         if write || refused {
-            encodes_within(result, RESULT_BYTES)
-                .then_some(())
-                .ok_or(ProtocolError::ResultTooLarge)
+            (RESULT_BYTES, ProtocolError::ResultTooLarge)
         } else {
-            encodes_within(result, self.read_budget.bytes())
-                .then_some(())
-                .ok_or(ProtocolError::ReadOverBudget(self.read_budget))
+            (
+                self.read_budget.bytes(),
+                ProtocolError::ReadOverBudget(self.read_budget),
+            )
         }
     }
 
-    fn fit_result(&self, result: ToolResult, write: bool) -> ToolResult {
-        match self.fit(&result, write, result.is_error == Some(true)) {
-            Ok(()) => result,
-            Err(error) => self.host.error(error, write).into_tool_result(),
+    /// The one judgement of a complete response's size, by [`Self::limit`]:
+    /// every tool result and resource read, successful or refused, passes
+    /// here and nowhere else.
+    fn fit<T: Serialize>(
+        &self,
+        response: &T,
+        write: bool,
+        refused: bool,
+    ) -> Result<(), ProtocolError> {
+        let (bytes, over) = self.limit(write, refused);
+        if encodes_within(response, bytes) {
+            Ok(())
+        } else {
+            Err(over)
+        }
+    }
+
+    /// The response for a tool call's answer, with the status its refusal
+    /// carries. An answer that does not fit is replaced by the host's
+    /// refusal for the same call, which is fixed and small.
+    fn deliver(&self, answer: Answer, write: bool) -> (CallToolResult, Option<StatusCode>) {
+        match self.encode(answer, write) {
+            Ok(response) => response,
+            Err(error) => self
+                .encode(Answer::Refusal(self.host.error(error, write)), write)
+                .unwrap_or_else(|_| {
+                    // Unreachable for a host that keeps `Host::error`'s
+                    // bound; never send what the rule refused.
+                    let text = ContentBlock::text("the MCP refusal could not be encoded");
+                    (CallToolResult::error(vec![text]), None)
+                }),
+        }
+    }
+
+    fn encode(
+        &self,
+        answer: Answer,
+        write: bool,
+    ) -> Result<(CallToolResult, Option<StatusCode>), ProtocolError> {
+        let refused = matches!(answer, Answer::Refusal(_));
+        let (_, over) = self.limit(write, refused);
+        let (result, status) = match answer {
+            Answer::Output(output) => (CallToolResult::structured(output.value(over)?), None),
+            Answer::Refusal(error) => {
+                let status = error.status();
+                (error.tool_result(over)?, status)
+            }
+        };
+        self.fit(&result, write, refused)?;
+        Ok((result, status))
+    }
+
+    /// A refused call's tool result.
+    fn refusal_result(&self, refusal: Refusal, write: bool) -> CallToolResult {
+        let error = refusal.host_error(&self.host, write);
+        self.deliver(Answer::Refusal(error), write).0
+    }
+
+    /// A refused resource read: the same canonical error envelope in `data`,
+    /// sized as a tool refusal is.
+    fn resource_error(&self, refusal: Refusal) -> ErrorData {
+        let unauthenticated = matches!(refusal, Refusal::Protocol(ProtocolError::Unauthenticated));
+        let error = match &refusal {
+            Refusal::Protocol(error) => self.host.error(*error, false),
+            Refusal::Api(error) => error.clone(),
+        };
+        let (result, status) = self.deliver(Answer::Refusal(error), false);
+        let message = refusal.resource_message(status);
+        let data = result.structured_content;
+        if status == Some(StatusCode::NOT_FOUND) {
+            ErrorData::resource_not_found(message, data)
+        } else if unauthenticated || status.is_some_and(|status| status.is_client_error()) {
+            ErrorData::invalid_request(message, data)
+        } else {
+            ErrorData::internal_error(message, data)
         }
     }
 
@@ -284,7 +345,7 @@ impl<H: Host> GraphTools<H> {
         request: ToolRequest,
         cancelled: C,
         deadline: Duration,
-    ) -> Result<ToolResult, Refusal>
+    ) -> Result<Encoded, Refusal>
     where
         C: Future<Output = ()>,
     {
@@ -317,11 +378,11 @@ impl<H: Host> ServerHandler for GraphTools<H> {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        Ok(ListToolsResult::with_all_items(self.tools.to_vec()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools().into_iter().find(|tool| tool.name == name)
+        self.tools.iter().find(|tool| tool.name == name).cloned()
     }
 
     async fn call_tool(
@@ -336,7 +397,7 @@ impl<H: Host> ServerHandler for GraphTools<H> {
         let admitted = match self.host.admit(context.extensions.get::<Parts>()) {
             Ok(admitted) => admitted,
             Err(refusal) => {
-                return Ok(Refusal::from(refusal).tool_result(&self.host, write).into());
+                return Ok(self.refusal_result(Refusal::from(refusal), write).into());
             }
         };
         let request = ToolRequest::new(
@@ -353,10 +414,10 @@ impl<H: Host> ServerHandler for GraphTools<H> {
             )
             .await;
         let result = match result {
-            Ok(result) => result,
-            Err(refusal) => refusal.tool_result(&self.host, write),
+            Ok(output) => self.deliver(Answer::Output(output), write).0,
+            Err(refusal) => self.refusal_result(refusal, write),
         };
-        Ok(self.fit_result(result, write).into())
+        Ok(result.into())
     }
 
     async fn list_resources(
@@ -421,12 +482,12 @@ impl<H: Host> ServerHandler for GraphTools<H> {
             .map_err(Refusal::from);
         let admitted = match admitted {
             Ok(admitted) => admitted,
-            Err(refusal) => return Err(refusal.resource_error(&self.host)),
+            Err(refusal) => return Err(self.resource_error(refusal)),
         };
         let permit = match Arc::clone(&self.slots).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                return Err(Refusal::Protocol(ProtocolError::Capacity).resource_error(&self.host));
+                return Err(self.resource_error(Refusal::Protocol(ProtocolError::Capacity)));
             }
         };
         let resource = resource.into_request().ok_or_else(|| {
@@ -442,10 +503,10 @@ impl<H: Host> ServerHandler for GraphTools<H> {
                 ]);
                 match self.fit(&result, false, false) {
                     Ok(()) => Ok(result.into()),
-                    Err(error) => Err(Refusal::Protocol(error).resource_error(&self.host)),
+                    Err(error) => Err(self.resource_error(Refusal::Protocol(error))),
                 }
             }
-            Err(refusal) => Err(refusal.resource_error(&self.host)),
+            Err(refusal) => Err(self.resource_error(refusal)),
         }
     }
 }

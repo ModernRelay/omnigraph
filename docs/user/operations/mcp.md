@@ -334,7 +334,7 @@ passed its wait included, answers `outcome_unknown` with `effects: unknown`.
 | Limit | Value |
 |---|---|
 | Request body | 64 KiB |
-| Successful read, tool or graph resource, including the text copy | 96 KiB, the fixed read budget: the text copy stays under the 50,000 characters after which [Claude Code moves a result to a file](https://code.claude.com/docs/en/mcp#mcp-output-limits-and-warnings), the smallest limit a common client documents |
+| Successful read, tool or graph resource, including the text copy | 96 KiB, the fixed read budget. A tool result carries its data twice, so its text copy stays under 49,152 characters, below the 50,000 after which [Claude Code moves a result to a file](https://code.claude.com/docs/en/mcp#mcp-output-limits-and-warnings); a resource carries one copy. No token count is promised |
 | Any other result: a write's result or a refusal | 1 MiB |
 | Wait for one read | 30 seconds |
 | Wait for one write | 30 seconds; the write continues past it |

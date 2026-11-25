@@ -1,1 +1,1 @@
-- The MCP `query` and `mutate` tool descriptions name GQ as the Omnigraph query language and link its guide at the server's release tag, as MCP directory review requires for tools that take queries.
+- The MCP `query` and `mutate` descriptions name GQ, the Omnigraph query language, and link its guide at the server's own revision: a stable release's tag or an edge build's commit.

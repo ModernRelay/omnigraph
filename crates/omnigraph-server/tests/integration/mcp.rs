@@ -2414,6 +2414,75 @@ async fn mcp_read_budget_and_setup_link_apply_end_to_end() {
     );
 }
 
+/// A served read past the default budget, and one past the 1 MiB memory cap
+/// as well, are both refused naming the 96 KiB read budget and how to narrow
+/// the read; a read within it arrives whole. The rows are 30,000-character
+/// names, selected by age.
+#[tokio::test]
+async fn mcp_a_read_past_the_budget_or_the_cap_is_refused_naming_the_budget() {
+    let schema = std::fs::read_to_string(fixture("test.pg")).unwrap();
+    let rows: String = (0..40)
+        .map(|age| {
+            let name = format!("{age:02}{}", "x".repeat(30_000));
+            format!(
+                "{}\n",
+                json!({"type": "Person", "data": {"name": name, "age": age}})
+            )
+        })
+        .collect();
+    let temp = init_graph_with_schema_and_data(&schema, &rows).await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    std::fs::write(&policy_path, permit_all_policy_yaml(&["default"])).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("default".to_string(), "secret".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap()
+    .with_mcp_settings(omnigraph_server::McpSettings::default());
+    let app = omnigraph_server::build_app(state);
+    let query = "query n($below: I32) { match { $p: Person $p.age < $below } return { $p.name } }";
+    let read = |below: i32| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "secret",
+                "query",
+                json!({"graph": "default", "query": query, "params": {"below": below}}),
+            )
+            .await
+        }
+    };
+    let size = |result: &Value| serde_json::to_vec(&result["result"]).unwrap().len();
+
+    // One row fits the budget, its text copy included.
+    let one = read(1).await;
+    assert_eq!(one["result"]["isError"], false, "{}", size(&one));
+    assert_eq!(one["result"]["structuredContent"]["row_count"], 1);
+    assert!(size(&one) <= 96 * 1024, "{}", size(&one));
+
+    // Two rows pass the budget; forty pass the 1 MiB cap while the DTO is
+    // encoded. Both are refused the same way, naming the budget.
+    for below in [2, 40] {
+        let refused = read(below).await;
+        assert_eq!(refused["result"]["isError"], true, "{below}");
+        let error = &refused["result"]["structuredContent"]["error"];
+        assert_eq!(error["code"], "result_too_large", "{error}");
+        assert_eq!(
+            error["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{error}"
+        );
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains("96 KiB read budget"), "{message}");
+        assert!(message.contains("Narrow the read"), "{message}");
+        assert!(size(&refused) < 4096, "{}", size(&refused));
+    }
+}
+
 /// The setup link appears exactly on a successful empty listing, from the
 /// tool and the `omnigraph://graphs` resource alike: a caller who may act on
 /// no graph gets it, and a caller whose listing names a graph does not.

@@ -741,6 +741,16 @@ enums are exhaustive, so an external exhaustive match must add the relevant
 arm when upgrading. Preserving existing constructors and direct storage-holder
 behavior does not remove that source compatibility requirement.
 
+MCP hosts implement `omnigraph_mcp::Host`. `start_tool` answers
+`Encoded::new(&dto)`, which encodes the DTO under the 1 MiB memory cap and
+replaces `bounded_result`; `HostError::from_output` wraps an error body and
+cannot fail. Neither judges size: the protocol crate does, and replaces an
+answer past its limit with `Host::error`'s refusal for the call. `router` takes
+the build's documentation revision (`build::docs_revision`, or `None` to link
+no guide page), and `McpSettings::resolve` takes the setup URL (`None` when
+unset). `ProtocolError` is exhaustive and adds `ReadOverBudget(ReadBudget)`:
+project it as `result_too_large`, naming the budget.
+
 In-process hosts that assemble `AppState` and call its existing
 `with_data_token_trust` method continue to own their graph/root binding. Use
 the managed settings loader when the library should validate the applied
@@ -780,9 +790,10 @@ or token expiry. The exact format and limits are in
 The server mounts `/mcp` whenever it has a bearer credential source: static
 tokens, signed data tokens or OIDC. OIDC additionally enables
 `/.well-known/oauth-protected-resource` and the metadata path advertised in the
-authentication challenge. `/mcp` lists every tool; the only MCP boot setting is the
-allowed-host list (`--mcp-allowed-host`). Every invocation uses the same
-handlers and policy as HTTP.
+authentication challenge. `/mcp` lists every tool; its boot settings are the
+allowed-host list (`--mcp-allowed-host`) and the setup page an empty `graphs`
+listing offers (`--mcp-setup-url`). Every invocation uses the same handlers and
+policy as HTTP.
 A registered resource or listed tool is never a permission grant.
 
 `omnigraph-mcp` owns the SDK integration, tool/resource catalog, settings,
@@ -791,6 +802,9 @@ owns authentication, OAuth metadata, handler dispatch and admission, retaining
 execution ownership when the caller stops waiting. It also supplies the canonical
 `ApiError` projection for protocol refusals and handler failures, including the
 unknown-effect disposition when an admitted write's result cannot be delivered.
-The protocol crate wraps these bodies without a second error-code registry.
+The protocol crate wraps these bodies without a second error-code registry, and
+judges the size of every complete response in one place: a successful read by
+the read budget, a write's result or a refusal by the 1 MiB cap, replacing an
+answer past its limit with the adapter's refusal for the same call.
 Both transports share one listener and serving lifecycle. The supported tools
 and limits live in the [MCP guide](../user/operations/mcp.md).
