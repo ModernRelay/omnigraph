@@ -76,7 +76,7 @@ table view.
 
 The key also carries each table's detached pin (`staged_version`), native ref
 and e_tag. Every write makes a new version or a new random detached pin, so a
-later snapshot never matches a stale key, and eviction only frees memory. A
+later snapshot never matches a stale key. Eviction drops the cache's reference. A
 write (mutation, merge) evicts the cached indexes that cover an edge table it
 changed, on any branch; a publish of an unpublished commit evicts those of
 every edge table its commit lists, which is every edge type. A branch create
@@ -103,7 +103,12 @@ the gate and are then served the index its holder produced, so a scope's edge
 tables are scanned once and not once per query; a miss on one scope also
 waits for a build of another. A build that fails caches nothing and the next
 waiter builds. A historical read (`run_query_at`) takes its index from the
-same cache as a live read, under the key of its snapshot's edge tables.
+same cache as a live read. Its key includes every requested edge name, even
+when the table is absent at that snapshot. Successive historical reads can
+leave eight distinct scan-built indexes resident after their queries finish,
+alongside the full-catalog shelf. The entry count bounds neither retained
+bytes nor peak build memory. Evicted indexes also stay live while readers
+hold them. See G15 in the [engine contract](contract.md).
 
 An explicitly bound edge must scan its edge table because topology alone does
 not contain edge properties. Every edge probe (`graph.rs::scan_edges_stream`:
