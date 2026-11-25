@@ -8,7 +8,7 @@ After configuring a complete managed target and supplying its selected profile's
 credential (login for an `omnigraph` profile), run:
 
 ```bash
-omnigraph graphs list --target production --discovery
+omnigraph graphs list --target production
 omnigraph query find_person --target production --graph knowledge --params '{"name":"Alice"}' --json
 omnigraph mutate add_person --target production --graph knowledge --params '{"name":"Alice"}' --json
 ```
@@ -52,18 +52,22 @@ reports the lifetime it actually issued. Issuer clock tolerance is
 
 ## Discover graphs
 
-With a cached identity credential, `graphs list --target production --discovery`
-shows every graph ID and display name in the server's applied inventory,
-including graphs that failed to open. It does not reveal availability,
-storage locations, schema, stored queries, or graph contents. A display name
-currently equals its graph ID. Listing a graph does not grant access to it;
-an absent policy or unknown policy actor still denies protected operations.
+`graphs list --target production` names the actor your credential resolves to
+(on stderr; `--json` carries `actor_id` and `client_id`) and shows the ID and
+display name of every graph the applied policy grants your credential any
+permission on, including graphs that failed to open. Any other graph is not
+found for your credential. A credential with no permission anywhere gets an
+empty list. It does not reveal availability, storage locations, schema, stored
+queries, or graph contents. A display name currently equals its graph ID.
+Listing a graph grants nothing; `omnigraph access` says what you may do.
 
-Use `--discovery` for this minimal inventory on either managed or standalone
-server targets. Without it, `graphs list` requests graph metadata and requires
-`graph_list` policy permission. The CLI does not guess the credential type from
-its appearance. A server without discovery support, or an incompatible static
-credential, refuses without falling back to another inventory.
+The same listing works with any credential, on managed and standalone server
+targets. `graphs list --catalog` requests the catalog instead: every graph with
+its state and root, which requires `graph_list` policy permission.
+`--discovery`, which selected the listing before it became the default, is
+accepted and ignored for one release. The CLI does
+not guess the credential type from its appearance, and never falls back from
+one inventory to the other.
 
 ## Cached access and routing
 

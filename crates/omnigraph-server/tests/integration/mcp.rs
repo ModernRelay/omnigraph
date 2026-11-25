@@ -191,10 +191,18 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         .unwrap()
         .close()
         .unwrap();
+    // `graphs` names the graphs each identity can read, available or not:
+    // the ones it is told are unavailable below, never the ones it is told
+    // are not found.
+    let discovered = call(&app, &alice, "graphs", json!({})).await;
+    assert_eq!(
+        discovered["result"]["structuredContent"],
+        json!({"visibility":"granted","actor_id":"principal:stable_alice","client_id":"oauth-client","graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"loading","display_name":"loading"}]})
+    );
     let discovered = call(&app, &bob, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
-        json!({"graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"invalid-config","display_name":"invalid-config"},{"graph_id":"invalid-policy","display_name":"invalid-policy"},{"graph_id":"loading","display_name":"loading"}]})
+        json!({"visibility":"granted","actor_id":"principal:stable_bob","client_id":"oauth-client","graphs":[]})
     );
     for (credential, graph, expected) in [
         (&alice, "blocked", 503),
@@ -241,9 +249,10 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         catalog["result"]["structuredContent"],
         http_get(&app, "/graphs/default/queries", &alice).await
     );
+    // bob holds no grant on the graph, so it does not exist for him.
     let denied = call(&app, &bob, "queries", json!({"graph":"default"})).await;
     assert_eq!(denied["result"]["isError"], true);
-    assert_eq!(denied["result"]["structuredContent"]["status"], 403);
+    assert_eq!(denied["result"]["structuredContent"]["status"], 404);
     let read = call(
         &app,
         &alice,
@@ -769,7 +778,8 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
         assert_eq!(read["result"]["structuredContent"], native);
     }
 
-    // A denied actor gets the route's refusal in the shared envelope.
+    // An actor that can read no branch of the graph does not see it: the
+    // route's not-found refusal, in the shared envelope.
     for (tool, arguments) in [
         ("schema", json!({"graph":"default"})),
         (
@@ -780,12 +790,12 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
         let denied = call(&app, &bob, tool, arguments).await;
         assert_eq!(denied["result"]["isError"], true, "{denied}");
         assert_eq!(
-            denied["result"]["structuredContent"]["status"], 403,
+            denied["result"]["structuredContent"]["status"], 404,
             "{denied}"
         );
         assert_eq!(
             denied["result"]["structuredContent"]["error"]["code"],
-            "forbidden"
+            "not_found"
         );
     }
 
@@ -912,8 +922,9 @@ async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
     assert!(names.iter().any(|name| name == "query"), "{names:?}");
     assert!(names.iter().any(|name| name == "mutate"), "{names:?}");
 
-    // Tokens are not scoped to graphs, so a graph without a policy refuses
-    // `read` as it refuses every other action.
+    // Tokens are not scoped to graphs, so a graph without a policy grants
+    // nothing, and does not exist for the token: `read` and every other action
+    // are not found.
     let read = call(
         &app,
         "secret",
@@ -922,7 +933,7 @@ async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
     )
     .await;
     assert_eq!(read["result"]["isError"], true, "{read}");
-    assert_eq!(read["result"]["structuredContent"]["status"], 403, "{read}");
+    assert_eq!(read["result"]["structuredContent"]["status"], 404, "{read}");
 
     let before = manifest_dataset_version(&graph).await;
     let refused = call(
@@ -934,8 +945,8 @@ async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
     .await;
     assert_eq!(refused["result"]["isError"], true, "{refused}");
     let content = &refused["result"]["structuredContent"];
-    assert_eq!(content["status"], 403, "{refused}");
-    assert!(content.to_string().contains("default-deny"), "{refused}");
+    assert_eq!(content["status"], 404, "{refused}");
+    assert_eq!(content["error"]["code"], "not_found", "{refused}");
     assert_eq!(manifest_dataset_version(&graph).await, before);
 }
 
@@ -1003,16 +1014,19 @@ async fn static_token_server_serves_mcp_without_oauth_discovery() {
             "{origin}"
         );
     }
-    // A static token is not an identity, so `graphs` asks `GET /graphs`,
-    // whose `graph_list` action only a server-scoped policy grants.
+    // A static token lists the graphs it can read, as the native listing
+    // does, with no `graph_list` permit; the catalog still needs one.
     let graphs = call(&app, "secret", "graphs", json!({})).await;
+    assert_eq!(graphs["result"]["isError"], false, "{graphs}");
+    let (status, native) = json_response(&app, get_request("/graphs/discovery", "secret")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(graphs["result"]["structuredContent"], native);
     assert_eq!(
-        graphs["result"]["structuredContent"]["status"], 403,
-        "{graphs}"
+        native,
+        json!({"visibility":"granted","actor_id":"default","graphs":[{"graph_id":"default","display_name":"default"}]})
     );
-    let (status, native) = json_response(&app, get_request("/graphs", "secret")).await;
+    let (status, _) = json_response(&app, get_request("/graphs", "secret")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(graphs["result"]["structuredContent"]["error"], native);
     let schema = call(&app, "secret", "schema", json!({"graph":"default"})).await;
     assert_eq!(schema["result"]["isError"], false, "{schema}");
 }
@@ -1449,7 +1463,7 @@ async fn mcp_resources_read_graphs_schema_and_branches_under_policy() {
 
     // Policy decides, and an unknown resource is not found.
     let denied = read(bob, "omnigraph://graphs/default/schema").await;
-    assert_eq!(denied["error"]["data"]["status"], 403, "{denied}");
+    assert_eq!(denied["error"]["data"]["status"], 404, "{denied}");
     for uri in [
         "omnigraph://graphs/unknown/schema",
         "omnigraph://graphs/default/secrets",
@@ -1656,8 +1670,9 @@ async fn mcp_write_tools_are_conditional_and_policy_gated() {
         json!({"graph":"default","query":insert,"params":{"name":"Ivy"}}),
     )
     .await;
+    // bob holds no grant, so the graph does not exist for him.
     assert_eq!(
-        denied["result"]["structuredContent"]["status"], 403,
+        denied["result"]["structuredContent"]["status"], 404,
         "{denied}"
     );
     let allowed = call(
@@ -2116,6 +2131,7 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
 
     // Policy decides each tool exactly as it decides the route. The proposal
     // is live, written at main's current head, so its 404 is the denial's.
+    // The stranger holds no grant, so the graph does not exist for it.
     let pending = propose("Uma").await;
     let pending = pending.as_str();
     let head = main_head(&app).await;
@@ -2143,7 +2159,7 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
                 "/graphs/default/branches/diff?source=main",
                 "stranger-secret",
             ),
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
         ),
         (
             "stranger-secret",
@@ -2153,7 +2169,7 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
                 "/graphs/default/branches/merge-base?source=main",
                 "stranger-secret",
             ),
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
         ),
         (
             "stranger-secret",
@@ -2163,14 +2179,14 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
                 "/graphs/default/commits?listing=unpublished",
                 "stranger-secret",
             ),
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
         ),
         (
             "stranger-secret",
             "blobs_stat",
             blob_cell("notes"),
             get(&blob_uri("notes"), "stranger-secret"),
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
         ),
         (
             "reader-secret",
