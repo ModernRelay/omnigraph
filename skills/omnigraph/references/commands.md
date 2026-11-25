@@ -644,7 +644,7 @@ member of, with names and IDs, and marks the profile's; it needs no service
 permission, and its `--json` is the API envelope (`data.organizations`).
 Use an ID from it with `login --create-profile NAME --organization ID` to work
 in another organization. The member and invitation commands need current
-provider `members_manage` permission. WorkOS owns
+provider `members_manage` permission. The identity provider owns
 organization membership and service roles; applied cluster configuration owns
 graph and deployment permissions. No local enrollment or member-patch command
 is required. Member operations accept an email or exact user ID. `members set`
