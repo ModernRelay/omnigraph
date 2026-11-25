@@ -102,7 +102,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
 | `organization list` | List the organizations you are an active member of, marking the profile's ([your organizations](managed-team.md#find-your-organizations)) | profile |
 | `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
-| `organization machines list/create/secret rotate/revoke` | List, create and retire machine applications; deliver and rotate their secrets only to a file ([machines](managed-machines.md)) | profile |
+| `organization m2m-applications list/create/secret rotate/delete` | List, create and delete M2M applications; deliver and rotate their client secrets only to a file ([M2M applications](managed-m2m-applications.md)) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 

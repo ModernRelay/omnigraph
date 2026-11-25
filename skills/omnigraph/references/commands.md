@@ -50,7 +50,7 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `list` `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` `machines list` `machines create` `machines secret rotate` `machines revoke` | List the organizations you belong to; manage the selected organization's members, invitations and machines; requires a profile; `org` is an alias |
+| `organization` | `list` `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` `m2m-applications list` `m2m-applications create` `m2m-applications secret rotate` `m2m-applications delete` | List the organizations you belong to; manage the selected organization's members, invitations and M2M applications; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
 | `login` | — | Create a profile with `--create-profile` (pass `--organization ID` when you belong to several), or sign in to its `omnigraph` auth provider |
@@ -620,24 +620,26 @@ omnigraph organization members list --profile work --json
 omnigraph organization invitations send person@example.com --role member --profile work --idempotency-key invite-person
 omnigraph organization members set person@example.com --profile work --role member --idempotency-key role-person
 omnigraph organization members offboard person@example.com --profile work --idempotency-key offboard-person --json
-omnigraph organization machines create ci-sync --profile work --scope status --secret-file ~/.omnigraph/ci-sync.secret --create-profile ci-sync --idempotency-key machine-ci-sync
-omnigraph organization machines secret rotate --profile work --machine-profile ci-sync --idempotency-key rotate-ci-sync
-omnigraph organization machines revoke ci-sync --profile work --idempotency-key retire-ci-sync --yes
+omnigraph organization m2m-applications create ci-sync --profile work --permission status --client-secret-file ~/.omnigraph/ci-sync.secret --create-profile ci-sync --idempotency-key create-ci-sync
+omnigraph organization m2m-applications secret rotate --profile work --application-profile ci-sync --idempotency-key rotate-ci-sync
+omnigraph organization m2m-applications delete ci-sync --profile work --idempotency-key delete-ci-sync --yes
 ```
 
-Machines are organization-owned client applications for unattended work.
-`machines list` shows each one's client ID, scopes and Cedar principal.
-`machines create` writes the one-time secret only to `--secret-file` (0600,
-atomic; an existing file needs `--replace-secret-file`) and never prints it;
-`--create-profile NAME` adds an `oauth_client_credentials` profile with a
-`{file: PATH}` secret (an existing name needs `--replace-profile`). A machine
-has no graph access until Cedar names its `principal:ID`. `secret rotate`
-writes a new secret to the machine profile's file, proves a token exchange,
-then revokes the one earlier secret; with several, pass `--revoke SECRET_ID`
-for each. A failed exchange revokes nothing; repeat with the same key.
-`machines revoke` retires by name or client ID and needs `--yes` without a
-terminal. A secret whose one disclosure was lost cannot be recovered: revoke
-its ID and generate another, as the command's message says.
+M2M applications are organization-owned client applications for unattended
+work. `m2m-applications list` shows each one's client ID, permissions and actor
+ID (`principal:ID`). `m2m-applications create` writes the one-time client
+secret only to `--client-secret-file` (0600, atomic; an existing file needs
+`--replace-client-secret-file`) and never prints it; `--create-profile NAME`
+adds an `oauth_client_credentials` profile with a `{file: PATH}` client secret
+(an existing name needs `--replace-profile`). An M2M application has no graph
+access until a cluster's policy names its actor ID. `secret rotate` writes a
+new client secret to the application profile's file, proves a token exchange,
+then revokes the one earlier client secret; with several, pass
+`--revoke SECRET_ID` for each. A failed exchange revokes nothing; repeat with
+the same key. `m2m-applications delete` deletes by name or client ID and needs
+`--yes` without a terminal. A client secret whose one disclosure was lost
+cannot be recovered: revoke its ID and generate another, as the command's
+message says.
 
 `organization list` shows the organizations the signed-in person is an active
 member of, with names and IDs, and marks the profile's; it needs no service

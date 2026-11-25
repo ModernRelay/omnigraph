@@ -1,6 +1,6 @@
 use super::*;
 
-const SECRET: &str = "fixture-disclosed-machine-secret";
+const SECRET: &str = "fixture-disclosed-client-secret";
 
 fn summary(id: &str) -> Value {
     json!({"id":id,"secret_hint":"ret","created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})
@@ -12,13 +12,13 @@ fn secrets(ids: &[&str]) -> Vec<SecretSummary> {
         .collect()
 }
 
-fn machine() -> Machine {
-    serde_json::from_value(json!({"application_id":"app_one","client_id":"client_one","organization_id":"org_one","name":"ci bot","scopes":["status"],"principal_id":"01PRINCIPAL","actor_id":"principal:01PRINCIPAL","created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})).unwrap()
+fn application() -> Application {
+    serde_json::from_value(json!({"client_id":"client_one","organization_id":"org_one","name":"ci bot","permissions":["status"],"actor_id":"principal:01PRINCIPAL","created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})).unwrap()
 }
 
 #[test]
 fn a_disclosed_secret_leaves_the_body_before_validation() {
-    let mut body = json!({"data":{"client_id":"client_one","secret":summary("sec_new"),"client_secret":SECRET,"secret_available":true},"meta":{}});
+    let mut body = json!({"data":{"client_id":"client_one","secret":summary("sec_new"),"client_secret":SECRET},"meta":{}});
     let (secret, value) = take_secret(&mut body, "client_one").unwrap();
     assert_eq!(secret.id, "sec_new");
     assert_eq!(
@@ -27,20 +27,19 @@ fn a_disclosed_secret_leaves_the_body_before_validation() {
     );
     assert!(!body.to_string().contains(SECRET), "{body}");
 
-    // An exact replay discloses nothing and says so.
-    let mut body = json!({"data":{"client_id":"client_one","secret":summary("sec_new"),"client_secret":null,"secret_available":false},"meta":{}});
+    // An exact replay discloses nothing: its client_secret is null.
+    let mut body = json!({"data":{"client_id":"client_one","secret":summary("sec_new"),"client_secret":null},"meta":{}});
     assert!(take_secret(&mut body, "client_one").unwrap().1.is_none());
 
     // Every refusal is generic and the removed value appears in no failure.
     for (pointer, value) in [
-        ("/data/secret_available", json!(false)),
         ("/data/client_id", json!("client_other")),
         ("/data/client_secret", json!(format!("{SECRET}\n"))),
         ("/data/client_secret", json!("")),
         ("/data/client_secret", json!(7)),
         ("/data/secret/id", json!("../sec")),
     ] {
-        let mut body = json!({"data":{"client_id":"client_one","secret":summary("sec_new"),"client_secret":SECRET,"secret_available":true},"meta":{}});
+        let mut body = json!({"data":{"client_id":"client_one","secret":summary("sec_new"),"client_secret":SECRET},"meta":{}});
         *body.pointer_mut(pointer).unwrap() = value;
         let failure = take_secret(&mut body, "client_one").err().unwrap();
         assert_eq!(failure.body["type"], "api_response_invalid", "{pointer}");
@@ -58,7 +57,7 @@ fn rotation_revokes_only_an_unambiguous_or_named_earlier_secret() {
     );
     let two = secrets(&["sec_a", "sec_b"]);
     let ambiguous = revocation_targets(&two, &[]).unwrap_err();
-    assert_eq!(ambiguous.body["type"], "machine_secret_ambiguous");
+    assert_eq!(ambiguous.body["type"], "m2m_application_secret_ambiguous");
     let detail = ambiguous.body["detail"].as_str().unwrap();
     assert!(
         detail.contains("sec_a (hint ret") && detail.contains("sec_b"),
@@ -73,17 +72,17 @@ fn rotation_revokes_only_an_unambiguous_or_named_earlier_secret() {
         ["sec_a", "sec_b"]
     );
     let missing = revocation_targets(&two, &["sec_c".into()]).unwrap_err();
-    assert_eq!(missing.body["type"], "machine_secret_not_found");
+    assert_eq!(missing.body["type"], "m2m_application_secret_not_found");
     assert!(missing.body["detail"].as_str().unwrap().contains("sec_a"));
 }
 
 #[cfg(unix)]
 #[test]
-fn the_secret_file_is_owner_only_atomic_and_never_a_link() {
+fn the_client_secret_file_is_owner_only_atomic_and_never_a_link() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("client-secret");
-    let file = SecretFile::new(&path).unwrap();
+    let file = ClientSecretFile::new(&path).unwrap();
     file.check(false).unwrap();
     file.deliver(file.stage().unwrap(), &ClientSecret(SECRET.into()), false)
         .unwrap();
@@ -95,7 +94,7 @@ fn the_secret_file_is_owner_only_atomic_and_never_a_link() {
 
     assert_eq!(
         file.check(false).unwrap_err().body["type"],
-        "secret_file_exists"
+        "m2m_application_secret_file_exists"
     );
     assert!(
         file.deliver(file.stage().unwrap(), &ClientSecret("other".into()), false)
@@ -114,31 +113,31 @@ fn the_secret_file_is_owner_only_atomic_and_never_a_link() {
     std::os::unix::fs::symlink(&path, &link).unwrap();
     for replace in [false, true] {
         assert_eq!(
-            SecretFile::new(&link)
+            ClientSecretFile::new(&link)
                 .unwrap()
                 .check(replace)
                 .unwrap_err()
                 .body["type"],
-            "secret_file_invalid"
+            "m2m_application_secret_file_invalid"
         );
     }
     assert_eq!(
-        SecretFile::new(directory.path())
+        ClientSecretFile::new(directory.path())
             .unwrap()
             .check(true)
             .unwrap_err()
             .body["type"],
-        "secret_file_invalid"
+        "m2m_application_secret_file_invalid"
     );
     assert_eq!(
-        SecretFile::new(&directory.path().join("missing/client-secret"))
+        ClientSecretFile::new(&directory.path().join("missing/client-secret"))
             .err()
             .unwrap()
             .body["type"],
-        "secret_file_invalid"
+        "m2m_application_secret_file_invalid"
     );
     assert!(
-        SecretFile::new(Path::new("relative-secret"))
+        ClientSecretFile::new(Path::new("relative-secret"))
             .unwrap()
             .path
             .is_absolute()
@@ -146,41 +145,42 @@ fn the_secret_file_is_owner_only_atomic_and_never_a_link() {
 }
 
 #[test]
-fn machines_must_belong_to_the_organization_and_name_their_principal() {
-    let valid = machine();
-    validate_machine(&valid, "org_one").unwrap();
-    assert!(validate_machine(&valid, "org_two").is_err());
+fn applications_must_belong_to_the_organization_and_carry_an_actor_id() {
+    let valid = application();
+    validate_application(&valid, "org_one").unwrap();
+    assert!(validate_application(&valid, "org_two").is_err());
     for change in [
-        (|m: &mut Machine| m.actor_id = "principal:other".into()) as fn(&mut Machine),
-        |m| m.actor_id = "01PRINCIPAL".into(),
-        |m| m.client_id = "client/one".into(),
-        |m| m.name = " padded".into(),
-        |m| m.scopes = vec!["status".into(), "status".into()],
-        |m| m.created_at = "yesterday".into(),
+        (|a: &mut Application| a.actor_id = "principal:".into()) as fn(&mut Application),
+        |a| a.actor_id = "01PRINCIPAL".into(),
+        |a| a.actor_id = "principal:one/two".into(),
+        |a| a.client_id = "client/one".into(),
+        |a| a.name = " padded".into(),
+        |a| a.permissions = vec!["status".into(), "status".into()],
+        |a| a.created_at = "yesterday".into(),
     ] {
         let mut invalid = valid.clone();
         change(&mut invalid);
-        assert!(validate_machine(&invalid, "org_one").is_err());
+        assert!(validate_application(&invalid, "org_one").is_err());
     }
 }
 
 #[test]
-fn requested_scopes_are_canonical_and_bounded() {
+fn requested_permissions_are_canonical_and_bounded() {
     assert_eq!(
-        validate_create_scopes(&["status".into(), "create".into()]).unwrap(),
+        validate_create_permissions(&["status".into(), "create".into()]).unwrap(),
         ["create", "status"]
     );
-    assert!(validate_create_scopes(&[]).unwrap().is_empty());
-    for scopes in [
+    assert!(validate_create_permissions(&[]).unwrap().is_empty());
+    for permissions in [
         vec!["status", "status"],
         vec!["members_manage"],
-        vec!["bad scope"],
+        vec!["bad permission"],
         vec!["a", "b", "c", "d", "e", "f"],
     ] {
-        let scopes: Vec<String> = scopes.into_iter().map(str::to_owned).collect();
+        let permissions: Vec<String> = permissions.into_iter().map(str::to_owned).collect();
         assert_eq!(
-            validate_create_scopes(&scopes).unwrap_err().body["type"],
-            "scopes_invalid"
+            validate_create_permissions(&permissions).unwrap_err().body["type"],
+            "m2m_application_permissions_invalid"
         );
     }
 }
@@ -193,11 +193,11 @@ fn each_write_derives_its_own_key_from_one_bounded_request_key() {
         "idempotency_key_invalid"
     );
     let key = "k".repeat(MAX_KEY);
-    for step in ["machine", "secret", "revoke-127"] {
+    for step in ["application", "secret", "revoke-127"] {
         let derived = step_key(&key, step);
         assert!(derived.len() <= 256 && derived.starts_with(&key));
     }
-    assert_ne!(step_key("k", "machine"), step_key("k", "secret"));
+    assert_ne!(step_key("k", "application"), step_key("k", "secret"));
 }
 
 #[test]
@@ -209,12 +209,12 @@ fn a_retained_request_records_progress_and_never_a_secret() {
     let progress = Progress::Rotate {
         client_id: "client_one".into(),
         token_endpoint: "https://auth.example/oauth2/token".into(),
-        secret_file: "/run/ci-secret".into(),
+        client_secret_file: "/run/ci-secret".into(),
         revoke: vec!["sec_a".into()],
         delivered: Some("sec_new".into()),
     };
     assert!(progress.matches(&request));
-    assert!(!progress.matches(&Request::Revoke {
+    assert!(!progress.matches(&Request::Delete {
         selector: "ci".into()
     }));
     let record = serde_json::to_value(Record {
@@ -241,6 +241,6 @@ fn page_paths_encode_the_cursor_as_one_query_value() {
     assert_eq!(page_path(ROOT, None), ROOT);
     assert_eq!(
         page_path(ROOT, Some("a/b+c")),
-        "/v1/organization/machines?after=a%2Fb%2Bc"
+        "/v1/organization/m2m-applications?after=a%2Fb%2Bc"
     );
 }

@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 mod custody;
-mod machines;
+mod m2m_applications;
 
 const TEAM_TIMEOUT: Duration = Duration::from_secs(35);
 const CREDENTIAL_LIFETIME: u64 = 86400;
@@ -878,7 +878,7 @@ fn mutation_human(
 pub(super) struct Invocation<'a, 'i> {
     pub input: &'a crate::operator::InvocationConfig,
     pub binding: &'a Binding,
-    /// `--profile`, when given; machine profiles derive from it.
+    /// `--profile`, when given; M2M application profiles derive from it.
     pub profile: Option<&'a str>,
     /// `--yes` consents to a destructive write without a prompt.
     pub yes: bool,
@@ -900,18 +900,18 @@ pub(super) async fn dispatch(
     } = invocation;
     let operation = Operation::from_command(command);
     let key = match command {
-        OrganizationCommand::Machines { command } => machines::key(command),
+        OrganizationCommand::M2mApplications { command } => m2m_applications::key(command),
         _ => operation.as_ref().map(|(_, key)| *key),
     };
     let result = async {
-        if let OrganizationCommand::Machines { command } = command {
+        if let OrganizationCommand::M2mApplications { command } = command {
             if let Some(key) = key {
                 idempotency_key(Some(key), stderr)?;
             }
             binding.organization()?;
             let api = binding.client().await?;
-            return machines::dispatch(
-                machines::Invocation {
+            return m2m_applications::dispatch(
+                m2m_applications::Invocation {
                     input,
                     binding,
                     api: &api,
@@ -1003,10 +1003,10 @@ pub(super) async fn dispatch(
                 && key.bytes().all(|b| b.is_ascii_graphic())
             {
                 error.body["idempotency_key"] = json!(key);
-                // A lost secret's own detail names its recovery; repeating
+                // A lost client secret's own detail names its recovery; repeating
                 // the request cannot recover the value.
                 if error.body["type"] != "output_delivery_failed"
-                    && error.body["type"] != "machine_secret_undelivered"
+                    && error.body["type"] != "m2m_application_secret_undelivered"
                 {
                     if let Err(mut delivery) = write_diagnostic(
                         stderr,

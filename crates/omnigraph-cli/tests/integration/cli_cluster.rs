@@ -5347,28 +5347,28 @@ fn managed_workload_token_exchange_refuses_redirects_and_errors_without_secret_o
     }
 }
 
-const MACHINE_SECRET: &str = "fixture-machine-secret-stays-in-its-file";
-const ROTATED_SECRET: &str = "fixture-rotated-machine-secret-stays-in-its-file";
-const MACHINE_TOKEN_ENDPOINT: &str = "https://auth.example.test/oauth2/token";
+const APPLICATION_SECRET: &str = "fixture-client-secret-stays-in-its-file";
+const ROTATED_SECRET: &str = "fixture-rotated-client-secret-stays-in-its-file";
+const APPLICATION_TOKEN_ENDPOINT: &str = "https://auth.example.test/oauth2/token";
 
-fn team_machine(client: &str, name: &str) -> Value {
-    serde_json::json!({"application_id":format!("app_{client}"),"client_id":client,"organization_id":"account-one","name":name,"scopes":["status"],"principal_id":format!("01P{client}"),"actor_id":format!("principal:01P{client}"),"created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})
+fn team_application(client: &str, name: &str) -> Value {
+    serde_json::json!({"client_id":client,"organization_id":"account-one","name":name,"permissions":["status"],"actor_id":format!("principal:01P{client}"),"created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})
 }
 
-fn machine_page(machines: Vec<Value>, after: Option<&str>) -> Value {
-    serde_json::json!({"data":{"organization_id":"account-one","machines":machines,"after":after,"allowed_scopes":["create","status"],"token_endpoint":MACHINE_TOKEN_ENDPOINT},"meta":{"provenance":"service_db"}})
+fn application_page(applications: Vec<Value>, after: Option<&str>) -> Value {
+    serde_json::json!({"data":{"organization_id":"account-one","applications":applications,"after":after,"grantable_permissions":["create","status"],"token_endpoint":APPLICATION_TOKEN_ENDPOINT},"meta":{"provenance":"service_db"}})
 }
 
-fn machine_secret(id: &str) -> Value {
+fn application_secret(id: &str) -> Value {
     serde_json::json!({"id":id,"secret_hint":"ets","created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})
 }
 
-fn machine_secret_page(ids: &[&str]) -> Value {
-    serde_json::json!({"data":{"client_id":"client_one","secrets":ids.iter().map(|id| machine_secret(id)).collect::<Vec<_>>(),"after":null},"meta":{}})
+fn application_secret_page(ids: &[&str]) -> Value {
+    serde_json::json!({"data":{"client_id":"client_one","secrets":ids.iter().map(|id| application_secret(id)).collect::<Vec<_>>(),"after":null},"meta":{}})
 }
 
 fn generated_secret(id: &str, secret: Option<&str>) -> Value {
-    serde_json::json!({"data":{"client_id":"client_one","secret":machine_secret(id),"client_secret":secret,"secret_available":secret.is_some()},"meta":{}})
+    serde_json::json!({"data":{"client_id":"client_one","secret":application_secret(id),"client_secret":secret},"meta":{}})
 }
 
 /// Neither stream, in any form, carries a disclosed secret.
@@ -5378,7 +5378,7 @@ fn assert_no_secret_output(output: &std::process::Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    for secret in [MACHINE_SECRET, ROTATED_SECRET] {
+    for secret in [APPLICATION_SECRET, ROTATED_SECRET] {
         assert!(!printed.contains(secret), "{printed}");
     }
 }
@@ -5394,7 +5394,7 @@ fn assert_secret_only_in(root: &std::path::Path, secret_file: &std::path::Path) 
                 pending.push(path);
             } else if path != secret_file {
                 let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
-                for secret in [MACHINE_SECRET, ROTATED_SECRET] {
+                for secret in [APPLICATION_SECRET, ROTATED_SECRET] {
                     assert!(!text.contains(secret), "{} holds a secret", path.display());
                 }
             }
@@ -5409,39 +5409,42 @@ fn assert_owner_only(path: &std::path::Path) {
     assert_eq!(mode, 0o600, "{mode:o}");
 }
 
-fn machine_records(root: &std::path::Path) -> Value {
-    let path = organization_record(root).with_file_name("machines.json");
+fn application_records(root: &std::path::Path) -> Value {
+    let path = organization_record(root).with_file_name("m2m-applications.json");
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
 
 #[test]
-fn managed_organization_machines_list_follows_every_page_and_names_cedar_principals() {
+fn managed_organization_m2m_applications_list_follows_every_page_and_shows_actor_ids() {
     for json in [true, false] {
         let temp = tempdir().unwrap();
         let api = lifecycle_fixture(vec![
             IntentReply::json(
                 200,
-                machine_page(vec![team_machine("client_one", "ci bot")], Some("cursor/2")),
+                application_page(
+                    vec![team_application("client_one", "ci bot")],
+                    Some("cursor/2"),
+                ),
             ),
             IntentReply::json(
                 200,
-                machine_page(vec![team_machine("client_two", "etl")], None),
+                application_page(vec![team_application("client_two", "etl")], None),
             ),
         ]);
         let mut command = organization_cli(temp.path(), &api.origin);
-        command.args(["machines", "list"]);
+        command.args(["m2m-applications", "list"]);
         if json {
             command.arg("--json");
         }
         let output = output_success(&mut command);
         if json {
             let body = parse_stdout_json(&output);
-            assert_eq!(body["data"]["machines"].as_array().unwrap().len(), 2);
-            assert_eq!(body["data"]["machines"][1]["client_id"], "client_two");
+            assert_eq!(body["data"]["applications"].as_array().unwrap().len(), 2);
+            assert_eq!(body["data"]["applications"][1]["client_id"], "client_two");
             assert_eq!(body["data"]["after"], Value::Null);
-            assert_eq!(body["data"]["token_endpoint"], MACHINE_TOKEN_ENDPOINT);
+            assert_eq!(body["data"]["token_endpoint"], APPLICATION_TOKEN_ENDPOINT);
             assert_eq!(
-                body["data"]["allowed_scopes"],
+                body["data"]["grantable_permissions"],
                 serde_json::json!(["create", "status"])
             );
         } else {
@@ -5450,9 +5453,9 @@ fn managed_organization_machines_list_follows_every_page_and_names_cedar_princip
                 "ci bot",
                 "client_two",
                 "principal:01Pclient_one",
-                "CEDAR PRINCIPAL",
-                MACHINE_TOKEN_ENDPOINT,
-                "Scopes you can grant: create, status",
+                "ACTOR ID",
+                APPLICATION_TOKEN_ENDPOINT,
+                "Permissions you can grant: create, status",
                 "no graph access",
             ] {
                 assert!(text.contains(expected), "{text}");
@@ -5462,42 +5465,42 @@ fn managed_organization_machines_list_follows_every_page_and_names_cedar_princip
         assert_control_request(
             &requests[0],
             "GET",
-            "/v1/organization/machines",
+            "/v1/organization/m2m-applications",
             Value::Null,
             None,
         );
         assert_control_request(
             &requests[1],
             "GET",
-            "/v1/organization/machines?after=cursor%2F2",
+            "/v1/organization/m2m-applications?after=cursor%2F2",
             Value::Null,
             None,
         );
         assert!(!temp.path().join(".omnigraph").exists());
         api.assert_complete();
     }
-    // A foreign machine, a principal Cedar would not name or a repeated
+    // A foreign application, an actor ID that is not `principal:<id>` or a repeated
     // cursor refuses the whole listing.
     for replies in [
-        vec![machine_page(
+        vec![application_page(
             vec![{
-                let mut machine = team_machine("client_one", "ci");
-                machine["organization_id"] = serde_json::json!("account-two");
-                machine
+                let mut application = team_application("client_one", "ci");
+                application["organization_id"] = serde_json::json!("account-two");
+                application
             }],
             None,
         )],
-        vec![machine_page(
+        vec![application_page(
             vec![{
-                let mut machine = team_machine("client_one", "ci");
-                machine["actor_id"] = serde_json::json!("principal:someone-else");
-                machine
+                let mut application = team_application("client_one", "ci");
+                application["actor_id"] = serde_json::json!("someone-else");
+                application
             }],
             None,
         )],
         vec![
-            machine_page(vec![], Some("same")),
-            machine_page(vec![], Some("same")),
+            application_page(vec![], Some("same")),
+            application_page(vec![], Some("same")),
         ],
     ] {
         let temp = tempdir().unwrap();
@@ -5507,40 +5510,42 @@ fn managed_organization_machines_list_follows_every_page_and_names_cedar_princip
                 .map(|reply| IntentReply::json(200, reply))
                 .collect(),
         );
-        let output = output_failure(
-            organization_cli(temp.path(), &api.origin).args(["machines", "list", "--json"]),
-        );
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+            "m2m-applications",
+            "list",
+            "--json",
+        ]));
         assert_eq!(parse_stdout_json(&output)["type"], "api_response_invalid");
         api.assert_complete();
     }
 }
 
 #[test]
-fn managed_organization_machine_create_delivers_its_secret_only_to_the_named_file() {
+fn managed_organization_m2m_application_create_delivers_its_secret_only_to_the_named_file() {
     for json in [true, false] {
         let temp = tempdir().unwrap();
         let api = lifecycle_fixture(vec![
-            IntentReply::json(200, machine_page(vec![], None)),
+            IntentReply::json(200, application_page(vec![], None)),
             IntentReply::json(
                 201,
-                serde_json::json!({"data":{"machine":team_machine("client_one", "ci bot")},"meta":{}}),
+                serde_json::json!({"data":{"application":team_application("client_one", "ci bot")},"meta":{}}),
             ),
-            IntentReply::json(201, generated_secret("sec_one", Some(MACHINE_SECRET))),
+            IntentReply::json(201, generated_secret("sec_one", Some(APPLICATION_SECRET))),
         ]);
         fs::create_dir_all(temp.path().join("secrets")).unwrap();
         let secret_file = temp.path().join("secrets/ci-secret");
         let arguments = [
-            "machines",
+            "m2m-applications",
             "create",
             "ci bot",
-            "--scope",
+            "--permission",
             "status",
-            "--secret-file",
+            "--client-secret-file",
             secret_file.to_str().unwrap(),
             "--create-profile",
             "ci",
             "--idempotency-key",
-            "machine-key",
+            "application-key",
         ];
         let run = || {
             let mut command = organization_cli(temp.path(), &api.origin);
@@ -5554,27 +5559,33 @@ fn managed_organization_machine_create_delivers_its_secret_only_to_the_named_fil
         assert_no_secret_output(&output);
         if json {
             let body = parse_stdout_json(&output);
-            assert_eq!(body["data"]["machine"]["client_id"], "client_one");
+            assert_eq!(body["data"]["application"]["client_id"], "client_one");
             assert_eq!(
-                body["data"]["machine"]["actor_id"],
+                body["data"]["application"]["actor_id"],
                 "principal:01Pclient_one"
             );
             assert_eq!(body["data"]["secret_id"], "sec_one");
-            assert_eq!(body["data"]["secret_file"], secret_file.to_str().unwrap());
+            assert_eq!(
+                body["data"]["client_secret_file"],
+                secret_file.to_str().unwrap()
+            );
             assert_eq!(body["data"]["profile"], "ci");
         } else {
             let text = String::from_utf8_lossy(&output.stdout);
             for expected in [
                 "Client ID: client_one",
-                "Cedar principal: principal:01Pclient_one",
-                "Secret sec_one written to",
+                "Actor ID: principal:01Pclient_one",
+                "Client secret sec_one written to",
                 "Profile: ci",
                 "no graph access",
             ] {
                 assert!(text.contains(expected), "{text}");
             }
         }
-        assert_eq!(fs::read_to_string(&secret_file).unwrap(), MACHINE_SECRET);
+        assert_eq!(
+            fs::read_to_string(&secret_file).unwrap(),
+            APPLICATION_SECRET
+        );
         #[cfg(unix)]
         assert_owner_only(&secret_file);
         let requests = api.workflow_requests();
@@ -5582,23 +5593,23 @@ fn managed_organization_machine_create_delivers_its_secret_only_to_the_named_fil
         assert_control_request(
             &requests[0],
             "GET",
-            "/v1/organization/machines",
+            "/v1/organization/m2m-applications",
             Value::Null,
             None,
         );
         assert_control_request(
             &requests[1],
             "POST",
-            "/v1/organization/machines",
-            serde_json::json!({"organization_id":"account-one","name":"ci bot","scopes":["status"]}),
-            Some("machine-key:machine"),
+            "/v1/organization/m2m-applications",
+            serde_json::json!({"organization_id":"account-one","name":"ci bot","permissions":["status"]}),
+            Some("application-key:application"),
         );
         assert_control_request(
             &requests[2],
             "POST",
-            "/v1/organization/machines/client_one/secrets",
+            "/v1/organization/m2m-applications/client_one/secrets",
             serde_json::json!({"organization_id":"account-one"}),
-            Some("machine-key:secret"),
+            Some("application-key:secret"),
         );
         let config: Value = yaml_serde::from_str(
             &fs::read_to_string(managed_home(temp.path()).join("config.yaml")).unwrap(),
@@ -5609,7 +5620,7 @@ fn managed_organization_machine_create_delivers_its_secret_only_to_the_named_fil
         assert_eq!(profile["organization_id"], "account-one");
         assert_eq!(
             profile["auth"],
-            serde_json::json!({"provider":"oauth_client_credentials","token_endpoint":MACHINE_TOKEN_ENDPOINT,"client_id":"client_one","client_secret":{"file":secret_file}})
+            serde_json::json!({"provider":"oauth_client_credentials","token_endpoint":APPLICATION_TOKEN_ENDPOINT,"client_id":"client_one","client_secret":{"file":secret_file}})
         );
         assert_eq!(
             profile["transport"],
@@ -5622,13 +5633,16 @@ fn managed_organization_machine_create_delivers_its_secret_only_to_the_named_fil
         let again = run();
         assert_no_secret_output(&again);
         assert_eq!(api.workflow_requests().len(), 3);
-        assert_eq!(fs::read_to_string(&secret_file).unwrap(), MACHINE_SECRET);
+        assert_eq!(
+            fs::read_to_string(&secret_file).unwrap(),
+            APPLICATION_SECRET
+        );
         api.assert_complete();
     }
 }
 
 #[test]
-fn managed_organization_machine_create_refuses_unsafe_destinations_before_any_write() {
+fn managed_organization_m2m_application_create_refuses_unsafe_destinations_before_any_write() {
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![]);
     write_managed_target(temp.path(), &api.origin);
@@ -5643,46 +5657,46 @@ fn managed_organization_machine_create_refuses_unsafe_destinations_before_any_wr
     let key = "k".repeat(201);
     for (arguments, kind) in [
         (
-            vec!["--secret-file", existing.to_str().unwrap()],
-            "secret_file_exists",
+            vec!["--client-secret-file", existing.to_str().unwrap()],
+            "m2m_application_secret_file_exists",
         ),
         (
             vec![
-                "--secret-file",
+                "--client-secret-file",
                 temp.path().join("missing/secret").to_str().unwrap(),
             ],
-            "secret_file_invalid",
+            "m2m_application_secret_file_invalid",
         ),
         (
             vec![
-                "--secret-file",
+                "--client-secret-file",
                 fresh.to_str().unwrap(),
                 "--create-profile",
                 "taken",
             ],
-            "profile_exists",
+            "m2m_application_profile_exists",
         ),
         (
             vec![
-                "--secret-file",
+                "--client-secret-file",
                 fresh.to_str().unwrap(),
                 "--create-profile",
                 "managed-account",
             ],
-            "profile_invalid",
+            "m2m_application_profile_invalid",
         ),
         (
             vec![
-                "--secret-file",
+                "--client-secret-file",
                 fresh.to_str().unwrap(),
-                "--scope",
+                "--permission",
                 "members_manage",
             ],
-            "scopes_invalid",
+            "m2m_application_permissions_invalid",
         ),
         (
             vec![
-                "--secret-file",
+                "--client-secret-file",
                 fresh.to_str().unwrap(),
                 "--idempotency-key",
                 &key,
@@ -5692,7 +5706,7 @@ fn managed_organization_machine_create_refuses_unsafe_destinations_before_any_wr
     ] {
         let mut command = organization_cli(temp.path(), &api.origin);
         command
-            .args(["machines", "create", "ci", "--json"])
+            .args(["m2m-applications", "create", "ci", "--json"])
             .args(&arguments);
         if !arguments.contains(&"--idempotency-key") {
             command.args(["--idempotency-key", "refused-key"]);
@@ -5710,13 +5724,13 @@ fn managed_organization_machine_create_refuses_unsafe_destinations_before_any_wr
 }
 
 #[test]
-fn managed_organization_machine_secret_lost_in_delivery_is_reported_by_id_never_resent() {
+fn managed_organization_m2m_application_secret_lost_in_delivery_is_reported_by_id_never_resent() {
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![
-        IntentReply::json(200, machine_page(vec![], None)),
+        IntentReply::json(200, application_page(vec![], None)),
         IntentReply::json(
             201,
-            serde_json::json!({"data":{"machine":team_machine("client_one", "ci")},"meta":{}}),
+            serde_json::json!({"data":{"application":team_application("client_one", "ci")},"meta":{}}),
         ),
         IntentReply::json(
             503,
@@ -5727,12 +5741,12 @@ fn managed_organization_machine_secret_lost_in_delivery_is_reported_by_id_never_
     ]);
     let secret_file = temp.path().join("ci-secret");
     let arguments = [
-        "machines",
+        "m2m-applications",
         "create",
         "ci",
-        "--scope",
+        "--permission",
         "status",
-        "--secret-file",
+        "--client-secret-file",
         secret_file.to_str().unwrap(),
         "--create-profile",
         "ci",
@@ -5747,8 +5761,11 @@ fn managed_organization_machine_secret_lost_in_delivery_is_reported_by_id_never_
         "{first:?}"
     );
     assert!(!secret_file.exists());
-    let records = machine_records(temp.path());
-    assert_eq!(records[0]["progress"]["machine"]["client_id"], "client_one");
+    let records = application_records(temp.path());
+    assert_eq!(
+        records[0]["progress"]["application"]["client_id"],
+        "client_one"
+    );
     assert_eq!(records[0]["progress"]["delivered"], Value::Null);
 
     for json in [false, true] {
@@ -5761,15 +5778,15 @@ fn managed_organization_machine_secret_lost_in_delivery_is_reported_by_id_never_
         assert_no_secret_output(&output);
         let report = if json {
             let body = parse_stdout_json(&output);
-            assert_eq!(body["type"], "machine_secret_undelivered");
+            assert_eq!(body["type"], "m2m_application_secret_undelivered");
             assert_eq!(body["secret_id"], "sec_one");
             body["detail"].as_str().unwrap().to_owned()
         } else {
             String::from_utf8_lossy(&output.stderr).into_owned()
         };
-        assert!(report.contains("Revoke secret sec_one"), "{report}");
+        assert!(report.contains("Revoke client secret sec_one"), "{report}");
         assert!(
-            report.contains("secret rotate --machine-profile ci"),
+            report.contains("secret rotate --application-profile ci"),
             "{report}"
         );
         assert!(
@@ -5782,7 +5799,7 @@ fn managed_organization_machine_secret_lost_in_delivery_is_reported_by_id_never_
         }
     }
     let requests = api.workflow_requests();
-    // Neither retry created the machine again or listed again.
+    // Neither retry created the application again or listed again.
     assert_eq!(requests.len(), 4);
     assert_eq!(requests[2].path, requests[3].path);
     assert_eq!(requests[2].body, requests[3].body);
@@ -5798,15 +5815,15 @@ fn managed_organization_machine_secret_lost_in_delivery_is_reported_by_id_never_
     api.assert_complete();
 }
 
-/// A configured machine profile `ci` whose secret file holds `old`.
-fn write_machine_profile(
+/// A configured application profile `ci` whose client secret file holds `old`.
+fn write_application_profile(
     root: &std::path::Path,
     origin: &str,
     token_endpoint: &str,
 ) -> std::path::PathBuf {
     write_managed_target(root, origin);
     let secret_file = root.join("ci-secret");
-    fs::write(&secret_file, "old-machine-secret").unwrap();
+    fs::write(&secret_file, "old-client-secret").unwrap();
     let path = managed_home(root).join("config.yaml");
     let mut config: Value = yaml_serde::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     config["profiles"]["ci"] = serde_json::json!({"api":origin,"organization_id":"account-one","auth":{
@@ -5820,7 +5837,7 @@ fn token_reply(status: u16) -> IntentReply {
     if status == 200 {
         IntentReply::json(
             200,
-            serde_json::json!({"access_token":"oauth-machine-token","token_type":"Bearer","expires_in":300}),
+            serde_json::json!({"access_token":"oauth-application-token","token_type":"Bearer","expires_in":300}),
         )
     } else {
         IntentReply::json(status, serde_json::json!({"error":"invalid_client"}))
@@ -5831,7 +5848,13 @@ fn rotate_cli(root: &std::path::Path, origin: &str) -> assert_cmd::Command {
     let mut command = organization_cli(root, origin);
     command
         .env("SSL_CERT_FILE", crate::support::tls_gateway::ca_path())
-        .args(["machines", "secret", "rotate", "--machine-profile", "ci"]);
+        .args([
+            "m2m-applications",
+            "secret",
+            "rotate",
+            "--application-profile",
+            "ci",
+        ]);
     command
 }
 
@@ -5840,17 +5863,17 @@ fn revoked_secret(id: &str) -> Value {
 }
 
 #[test]
-fn managed_organization_machine_rotation_proves_the_new_secret_before_revoking_the_old() {
+fn managed_organization_m2m_application_rotation_proves_the_new_secret_before_revoking_the_old() {
     for json in [true, false] {
         let temp = tempdir().unwrap();
         let provider = IntentApiFixture::new(vec![token_reply(200), token_reply(200)]);
         let api = lifecycle_fixture(vec![
-            IntentReply::json(200, machine_secret_page(&["sec_old"])),
+            IntentReply::json(200, application_secret_page(&["sec_old"])),
             IntentReply::json(201, generated_secret("sec_new", Some(ROTATED_SECRET))),
             IntentReply::json(200, revoked_secret("sec_old")),
             IntentReply::json(200, revoked_secret("sec_old")),
         ]);
-        let secret_file = write_machine_profile(
+        let secret_file = write_application_profile(
             temp.path(),
             &api.origin,
             &format!("{}/oauth2/token", provider.origin),
@@ -5887,21 +5910,21 @@ fn managed_organization_machine_rotation_proves_the_new_secret_before_revoking_t
         assert_control_request(
             &requests[0],
             "GET",
-            "/v1/organization/machines/client_one/secrets",
+            "/v1/organization/m2m-applications/client_one/secrets",
             Value::Null,
             None,
         );
         assert_control_request(
             &requests[1],
             "POST",
-            "/v1/organization/machines/client_one/secrets",
+            "/v1/organization/m2m-applications/client_one/secrets",
             serde_json::json!({"organization_id":"account-one"}),
             Some("rotate-key:secret"),
         );
         assert_control_request(
             &requests[2],
             "POST",
-            "/v1/organization/machines/client_one/secrets/sec_old:revoke",
+            "/v1/organization/m2m-applications/client_one/secrets/sec_old:revoke",
             serde_json::json!({"organization_id":"account-one"}),
             Some("rotate-key:revoke-0"),
         );
@@ -5924,15 +5947,15 @@ fn managed_organization_machine_rotation_proves_the_new_secret_before_revoking_t
 }
 
 #[test]
-fn managed_organization_machine_rotation_keeps_both_secrets_until_the_exchange_succeeds() {
+fn managed_organization_m2m_application_rotation_keeps_both_secrets_until_the_exchange_succeeds() {
     let temp = tempdir().unwrap();
     let provider = IntentApiFixture::new(vec![token_reply(401), token_reply(200)]);
     let api = lifecycle_fixture(vec![
-        IntentReply::json(200, machine_secret_page(&["sec_old"])),
+        IntentReply::json(200, application_secret_page(&["sec_old"])),
         IntentReply::json(201, generated_secret("sec_new", Some(ROTATED_SECRET))),
         IntentReply::json(200, revoked_secret("sec_old")),
     ]);
-    let secret_file = write_machine_profile(
+    let secret_file = write_application_profile(
         temp.path(),
         &api.origin,
         &format!("{}/oauth2/token", provider.origin),
@@ -5944,7 +5967,7 @@ fn managed_organization_machine_rotation_keeps_both_secrets_until_the_exchange_s
     ]));
     assert_no_secret_output(&failed);
     let body = parse_stdout_json(&failed);
-    assert_eq!(body["type"], "machine_secret_unproven");
+    assert_eq!(body["type"], "m2m_application_secret_unproven");
     assert_eq!(body["secret_id"], "sec_new");
     let detail = body["detail"].as_str().unwrap();
     assert!(
@@ -5964,7 +5987,7 @@ fn managed_organization_machine_rotation_keeps_both_secrets_until_the_exchange_s
     assert_eq!(requests.len(), 3);
     assert_eq!(
         requests[2].path,
-        "/v1/organization/machines/client_one/secrets/sec_old:revoke"
+        "/v1/organization/m2m-applications/client_one/secrets/sec_old:revoke"
     );
     assert_eq!(provider.requests().len(), 2);
     assert_secret_only_in(temp.path(), &secret_file);
@@ -5973,20 +5996,22 @@ fn managed_organization_machine_rotation_keeps_both_secrets_until_the_exchange_s
 }
 
 #[test]
-fn managed_organization_machine_rotation_with_several_secrets_needs_an_explicit_revocation() {
+fn managed_organization_m2m_application_rotation_with_several_secrets_needs_an_explicit_revocation()
+{
     let temp = tempdir().unwrap();
     let api = lifecycle_fixture(vec![
-        IntentReply::json(200, machine_secret_page(&["sec_a", "sec_b"])),
-        IntentReply::json(200, machine_secret_page(&["sec_a", "sec_b"])),
+        IntentReply::json(200, application_secret_page(&["sec_a", "sec_b"])),
+        IntentReply::json(200, application_secret_page(&["sec_a", "sec_b"])),
     ]);
-    let secret_file = write_machine_profile(temp.path(), &api.origin, MACHINE_TOKEN_ENDPOINT);
+    let secret_file =
+        write_application_profile(temp.path(), &api.origin, APPLICATION_TOKEN_ENDPOINT);
     let output = output_failure(rotate_cli(temp.path(), &api.origin).args([
         "--idempotency-key",
         "ambiguous-key",
         "--json",
     ]));
     let body = parse_stdout_json(&output);
-    assert_eq!(body["type"], "machine_secret_ambiguous");
+    assert_eq!(body["type"], "m2m_application_secret_ambiguous");
     let detail = body["detail"].as_str().unwrap();
     assert!(detail.contains("sec_a") && detail.contains("sec_b") && detail.contains("--revoke"));
     let output = output_failure(rotate_cli(temp.path(), &api.origin).args([
@@ -5998,7 +6023,7 @@ fn managed_organization_machine_rotation_with_several_secrets_needs_an_explicit_
     ]));
     assert_eq!(
         parse_stdout_json(&output)["type"],
-        "machine_secret_not_found"
+        "m2m_application_secret_not_found"
     );
     assert!(
         api.workflow_requests()
@@ -6008,14 +6033,14 @@ fn managed_organization_machine_rotation_with_several_secrets_needs_an_explicit_
     );
     assert_eq!(
         fs::read_to_string(&secret_file).unwrap(),
-        "old-machine-secret"
+        "old-client-secret"
     );
     // Only a client-credentials profile with a file source can be rotated.
     let output = output_failure(organization_cli(temp.path(), &api.origin).args([
-        "machines",
+        "m2m-applications",
         "secret",
         "rotate",
-        "--machine-profile",
+        "--application-profile",
         "managed-account",
         "--idempotency-key",
         "admin-key",
@@ -6023,18 +6048,18 @@ fn managed_organization_machine_rotation_with_several_secrets_needs_an_explicit_
     ]));
     assert_eq!(
         parse_stdout_json(&output)["type"],
-        "machine_profile_invalid"
+        "m2m_application_profile_invalid"
     );
     api.assert_complete();
 }
 
 #[test]
-fn managed_organization_machine_revoke_resolves_once_and_requires_confirmation() {
-    let listing = machine_page(
+fn managed_organization_m2m_application_revoke_resolves_once_and_requires_confirmation() {
+    let listing = application_page(
         vec![
-            team_machine("client_one", "ci bot"),
-            team_machine("client_two", "etl"),
-            team_machine("client_three", "etl"),
+            team_application("client_one", "ci bot"),
+            team_application("client_two", "etl"),
+            team_application("client_three", "etl"),
         ],
         None,
     );
@@ -6044,22 +6069,22 @@ fn managed_organization_machine_revoke_resolves_once_and_requires_confirmation()
         IntentReply::json(200, listing.clone()),
         IntentReply::json(
             200,
-            serde_json::json!({"data":{"client_id":"client_one","revoked":true},"meta":{}}),
+            serde_json::json!({"data":{"client_id":"client_one","deleted":true},"meta":{}}),
         ),
         IntentReply::json(200, listing.clone()),
         IntentReply::json(200, listing.clone()),
         IntentReply::json(
             200,
-            serde_json::json!({"data":{"client_id":"client_two","revoked":true},"meta":{}}),
+            serde_json::json!({"data":{"client_id":"client_two","deleted":true},"meta":{}}),
         ),
     ]);
     // Without --yes a noninteractive or JSON run refuses before the write.
     let output = output_failure(organization_cli(temp.path(), &api.origin).args([
-        "machines",
-        "revoke",
+        "m2m-applications",
+        "delete",
         "ci bot",
         "--idempotency-key",
-        "retire-key",
+        "delete-key",
         "--json",
     ]));
     assert_eq!(parse_stdout_json(&output)["type"], "confirmation_required");
@@ -6071,33 +6096,36 @@ fn managed_organization_machine_revoke_resolves_once_and_requires_confirmation()
         "{output:?}"
     );
     let output = output_success(organization_cli(temp.path(), &api.origin).args([
-        "machines",
-        "revoke",
+        "m2m-applications",
+        "delete",
         "ci bot",
         "--idempotency-key",
-        "retire-key-2",
+        "delete-key-2",
         "--yes",
     ]));
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("ci bot (client_one) retired"), "{text}");
+    assert!(text.contains("ci bot (client_one) deleted"), "{text}");
     assert!(text.contains("principal:01Pclient_one"), "{text}");
-    // A shared name is ambiguous; the exact client ID selects one machine.
+    // A shared name is ambiguous; the exact client ID selects one application.
     let output = output_failure(organization_cli(temp.path(), &api.origin).args([
-        "machines",
-        "revoke",
+        "m2m-applications",
+        "delete",
         "etl",
         "--idempotency-key",
-        "retire-etl",
+        "delete-etl",
         "--yes",
         "--json",
     ]));
-    assert_eq!(parse_stdout_json(&output)["type"], "machine_ambiguous");
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "m2m_application_ambiguous"
+    );
     output_success(organization_cli(temp.path(), &api.origin).args([
-        "machines",
-        "revoke",
+        "m2m-applications",
+        "delete",
         "client_two",
         "--idempotency-key",
-        "retire-etl-client",
+        "delete-etl-client",
         "--yes",
     ]));
     let posts: Vec<_> = api
@@ -6109,10 +6137,13 @@ fn managed_organization_machine_revoke_resolves_once_and_requires_confirmation()
     assert_control_request(
         &posts[0],
         "POST",
-        "/v1/organization/machines/client_one:revoke",
+        "/v1/organization/m2m-applications/client_one:delete",
         serde_json::json!({"organization_id":"account-one"}),
-        Some("retire-key-2"),
+        Some("delete-key-2"),
     );
-    assert_eq!(posts[1].path, "/v1/organization/machines/client_two:revoke");
+    assert_eq!(
+        posts[1].path,
+        "/v1/organization/m2m-applications/client_two:delete"
+    );
     api.assert_complete();
 }

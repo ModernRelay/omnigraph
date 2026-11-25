@@ -9,7 +9,8 @@ pub(crate) use crate::commands::studio::StudioArgs;
 pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
 pub(crate) use crate::managed::args::{
     OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
-    OrganizationMachineSecretCommand, OrganizationMachinesCommand, OrganizationMembersCommand,
+    OrganizationM2mApplicationSecretCommand, OrganizationM2mApplicationsCommand,
+    OrganizationMembersCommand,
 };
 use clap::{Parser, Subcommand};
 
@@ -74,7 +75,7 @@ pub(crate) struct Cli {
     pub(crate) graph: Option<String>,
 
     /// Skip the confirmation prompt for a destructive write (`cleanup`,
-    /// overwrite `load`, `branch delete`, `organization machines revoke`)
+    /// overwrite `load`, `branch delete`, `organization m2m-applications delete`)
     /// against a non-local scope.
     /// Without it, a non-local destructive write prompts on a TTY
     /// and refuses (errors) when there is no TTY or `--json` is set.
@@ -87,7 +88,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Manage people, invitations and machines in the selected organization.
+    /// Manage people, invitations and M2M applications in the selected organization.
     #[command(visible_alias = "org")]
     Organization {
         #[command(flatten)]

@@ -24,7 +24,7 @@ pub(crate) fn uri_is_local(uri: &str) -> bool {
 }
 
 /// Gate a destructive write (`cleanup`, overwrite `load`, `branch delete`,
-/// `organization machines revoke`) against a non-local scope (RFC-011
+/// `organization m2m-applications delete`) against a non-local scope (RFC-011
 /// Decision 9). A local target needs no confirmation; otherwise `--yes` consents, an interactive TTY is prompted, and
 /// a non-TTY / `--json` run refuses rather than silently proceeding.
 pub(crate) fn confirm_destructive(

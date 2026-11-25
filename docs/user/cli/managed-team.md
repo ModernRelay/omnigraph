@@ -1,7 +1,7 @@
 # Onboard and remove organization members
 
 Invite teammates and manage organization membership through the managed CLI.
-Identities for unattended workloads are [machines](managed-machines.md).
+Identities for unattended workloads are [M2M applications](managed-m2m-applications.md).
 The identity provider owns membership and organization-wide service permissions;
 the applied cluster configuration owns graph, branch, schema and deployment
 permissions.
@@ -213,11 +213,12 @@ storage fallback.
 
 ## Configure an unattended workload profile
 
-The managed service must support workload sessions. Create a machine for the
-workload with [`organization machines create`](managed-machines.md), or in
-the managed console's Credentials page, and grant its principal graph
-access in Cedar. `--create-profile` writes the profile below for you; rotate
-its secret with `organization machines secret rotate`. To write a profile by
+The managed service must support workload sessions. Create an M2M application
+for the workload with
+[`organization m2m-applications create`](managed-m2m-applications.md), or in
+the managed console's Credentials page, and grant its actor ID graph access in
+Cedar. `--create-profile` writes the profile below for you; rotate its client
+secret with `organization m2m-applications secret rotate`. To write a profile by
 hand, add it to
 `~/.omnigraph/config.yaml` (or `$OMNIGRAPH_HOME/config.yaml`):
 
