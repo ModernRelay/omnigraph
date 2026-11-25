@@ -28,9 +28,22 @@ five, each one you hold yourself, never `members_manage`; none is valid. The
 command prints the client ID and the actor ID; neither output stream,
 `--json`, a log nor the operator configuration ever contains the client
 secret. The file is created with owner-only permission (0600) by an atomic
-rename in its directory, which must already exist. An existing file refuses
-unless you pass `--replace-client-secret-file`; a symbolic link or a directory
-always refuses.
+rename in its directory, which must already exist. The path must end in a file
+name: a trailing `/` or `.` refuses. An existing file refuses unless you pass
+`--replace-client-secret-file`; a symbolic link or a directory always refuses.
+A replaced file keeps its owner and group; when the account running the
+command cannot give the new file that owner, the command refuses before
+anything is created, so run it as that user or as root.
+
+The client secret file must not be any other file the command writes: the
+`--stats` file, the operator configuration, or the CLI's state under the
+operator home (`organization/`, `lifecycle/`, `auth-state/`). Such a path
+refuses before anything is written, statistics included.
+
+Writing a client secret needs a platform that can create a file only its
+owner can read: Linux or macOS. On other platforms, `create` and
+`secret rotate` refuse before any request; `list` and `delete` work
+everywhere. Use the managed console's Credentials page there.
 
 `--create-profile NAME` also adds an `oauth_client_credentials` profile for the
 application, with your profile's API, organization and transport, the token
@@ -68,8 +81,11 @@ one.
 If the token exchange fails, nothing is revoked: the new client secret stays in
 the file and both remain active. A new client secret can take a moment to reach
 the identity provider; repeat the same command with the same key to prove it
-again and finish the revocation. Tokens issued with a revoked client secret
-stay valid until they expire.
+again and finish the revocation. A repeat proves and revokes only while the
+file still holds the client secret that rotation wrote: if you restored an
+earlier client secret to roll back, the repeat refuses, revokes nothing, and
+names the new client secret ID to revoke instead. Tokens issued with a revoked
+client secret stay valid until they expire.
 
 ## Delete an M2M application
 
@@ -94,7 +110,8 @@ each requires `--idempotency-key` (at most 200 characters, since the CLI
 derives one key per write from it), retains its progress in the same private
 custody, and repeats only the identical request. A retry continues where the
 request stopped: it never creates a second application or generates a second
-client secret.
+client secret. A completed `create` returns its result without writing its
+profile or file again, so it cannot undo a later change to either.
 
 A generated client secret is disclosed in one response only. If that response
 was lost, or the file could not be written, the identical retry learns the

@@ -636,7 +636,10 @@ access until a cluster's policy names its actor ID. `secret rotate` writes a
 new client secret to the application profile's file, proves a token exchange,
 then revokes the one earlier client secret; with several, pass
 `--revoke SECRET_ID` for each. A failed exchange revokes nothing; repeat with
-the same key. `m2m-applications delete` deletes by name or client ID and needs
+the same key; a repeat refuses, revoking nothing, if the file no longer holds
+the new client secret. Writing a client secret works on Linux and macOS only,
+keeps a replaced file's owner, and refuses a path any other output (such as
+`--stats`) writes. `m2m-applications delete` deletes by name or client ID and needs
 `--yes` without a terminal. A client secret whose one disclosure was lost
 cannot be recovered: revoke its ID and generate another, as the command's
 message says.

@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-11-25
-updated: 2026-11-25
+updated: 2026-11-26
 discussion: null
 supersedes: []
 superseded_by: []
@@ -152,7 +152,27 @@ write, so an unwritable directory refuses while nothing exists remotely; then
 write, `fsync`, rename (`create` uses a no-clobber rename unless replacement
 was allowed), and `fsync` of the directory. The CLI writes regular files only;
 it refuses to write through or over a symbolic link, so a link-rotated mount
-stays under its own manager. The codebase has no zeroization dependency, and
+stays under its own manager.
+
+A destination is accepted in one place, `ClientSecretFile::new`, before
+anything is staged or sent. The path as written must end in a file name; a
+trailing separator, `.` or `..` refuses, since the rename would fail only after
+the client secret existed. A replacement keeps the replaced file's owner and
+group: the staged file is given them before the first remote write, and when
+the running account cannot do that, the command refuses, naming the owner, so a
+rotation run by another account never leaves the workload unable to read its
+own file. Owner-only files need Unix permission bits; on other platforms
+`create` and `secret rotate` refuse before any request, and `list` and `delete`
+work as everywhere. Windows is a release target, but no CI job builds or tests
+it, so an access-control implementation would first compile at release time; an
+explicit refusal is the honest boundary until such a job exists.
+
+The client secret file must not coincide with any other file the invocation or
+the CLI writes: the `--stats` file, the operator configuration, the credential
+binding state, or anything under the operator home's state directories
+(`organization/`, `lifecycle/`, `auth-state/`). One check compares their
+resolved locations before the statistics recorder starts, so a refusal is never
+followed by another output writing over the secret. The codebase has no zeroization dependency, and
 this change does not add one: the client secret lives in one owned string
 dropped right after the write.
 
@@ -175,7 +195,16 @@ two commands that write a client secret, the ID of the client secret whose
 value the request wrote to its file. A retry skips what is recorded and
 resumes at the first unrecorded step, so it never creates a second application
 or generates a second client secret, and never re-resolves a name after the
-application it named has gone. Records live in `m2m-applications.json` beside
+application it named has gone. The profile is a recorded step too: consent to
+replace an existing profile covers the first attempt only, a retry after an
+attempt accepts its own profile or none, and an installed profile is never
+written again, so a completed create's replay changes nothing local and cannot
+undo a later request's profile.
+
+A delivery is recorded as a binding to the value written, not only its ID: a
+random salt and the SHA-256 of salt and value. The value is a high-entropy
+secret the service generated, so the digest identifies it without disclosing
+it, and the salt keeps two records of one value from matching. Records live in `m2m-applications.json` beside
 the organization custody file, under the same lock and the same bounds (128
 records, 1 MiB, no eviction). A separate file keeps an older CLI, which
 validates `requests.json` strictly, from refusing all organization writes after
@@ -225,11 +254,17 @@ not guessed. The list is read before generation so the new client secret is
 never a candidate. Revocation follows the exchange: a client secret that cannot
 sign in never replaces a working one. If the exchange fails, both client
 secrets stay active and the file keeps the new value; the same key repeats the
-exchange and then revokes.
+exchange and then revokes. Before proving, the command reads the file once and
+requires it to hold the delivered value; it exchanges exactly the bytes it
+checked. A file that holds anything else, such as an earlier client secret an
+operator restored to roll back, refuses with
+`m2m_application_secret_file_changed`: nothing is proven or revoked, and the
+message names the new client secret to revoke instead.
 
-The exchange reuses the `oauth_client_credentials` provider's acquisition: one
-form-encoded request with system trust and a 25-second bound, reading the
-client secret back from the file, so it proves the file as written. The token
+The exchange reuses the `oauth_client_credentials` provider's acquisition,
+split into its two halves: the provider's rule for reading a client secret
+source and its exchange of a given value. It is one form-encoded request with
+system trust and a 25-second bound, so it proves the file as written. The token
 is dropped unused.
 
 ## Invariants
@@ -329,3 +364,15 @@ without them answers the first request with its usual not-found refusal.
   actor ID). `machines … revoke` became `m2m-applications … delete`,
   `--machine-profile` `--application-profile`, `--scope` `--permission` and
   `--secret-file` `--client-secret-file`. No other decision changed.
+- 2026-11-26: Review of PR 1546. Decided, each with a regression test:
+  a delivery binds the value written (a salted SHA-256), and a rotation proves
+  and revokes only while the file holds that value, exchanging the bytes it
+  checked, so a restored earlier client secret is never revoked; the profile
+  is a recorded create step whose replacement consent covers the first attempt
+  only, so a completed create never writes its profile again; a replacement
+  keeps the replaced file's owner and group or refuses before any remote write;
+  the client secret file may not coincide with `--stats`, the operator
+  configuration, the credential binding state or the CLI's state directories,
+  checked once before the statistics recorder starts; a destination must end in
+  a file name; and writing a client secret is refused on platforms without
+  owner-only files (all but Unix today), documented here.
