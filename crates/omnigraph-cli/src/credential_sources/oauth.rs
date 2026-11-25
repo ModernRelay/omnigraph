@@ -46,7 +46,9 @@ pub(crate) fn validate_client_credentials(
     Ok(())
 }
 
-fn secret(source: &ClientSecretSource) -> Result<String> {
+/// The client secret a source holds, read by the provider's rules: an exact
+/// environment value, or a file with at most one final LF or CRLF.
+pub(crate) fn read_client_secret(source: &ClientSecretSource) -> Result<String> {
     let value = match source {
         ClientSecretSource::Env { env } => {
             super::read_environment(env, |name| std::env::var_os(name))?
@@ -123,6 +125,23 @@ pub(crate) async fn acquire_client_credentials(
     if request.purpose() != Purpose::Control {
         return Err(CredentialError::InvalidBinding);
     }
+    let secret = read_client_secret(source)?;
+    exchange_client_credentials(request, endpoint, client_id, &secret, scope).await
+}
+
+/// The exchange for a client secret already read, so a caller that checked
+/// the value it read exchanges exactly that value.
+pub(crate) async fn exchange_client_credentials(
+    request: &CredentialRequest,
+    endpoint: &str,
+    client_id: &str,
+    secret: &str,
+    scope: Option<&str>,
+) -> Result<AcquiredCredential> {
+    validate_client_credentials(endpoint, client_id, scope)?;
+    if request.purpose() != Purpose::Control {
+        return Err(CredentialError::InvalidBinding);
+    }
     let client = reqwest::Client::builder()
         .no_proxy()
         .tls_built_in_webpki_certs(false)
@@ -132,11 +151,10 @@ pub(crate) async fn acquire_client_credentials(
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|_| CredentialError::ClientCredentialsUnavailable)?;
-    let secret = secret(source)?;
     let mut form = vec![
         ("grant_type", "client_credentials"),
         ("client_id", client_id),
-        ("client_secret", secret.as_str()),
+        ("client_secret", secret),
     ];
     if let Some(scope) = scope {
         form.push(("scope", scope));

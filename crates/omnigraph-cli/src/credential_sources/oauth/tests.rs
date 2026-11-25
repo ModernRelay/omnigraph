@@ -135,12 +135,12 @@ fn mounted_secret_allows_oauth_characters_without_logging_or_trimming_them() {
         ("test-secret\r\n", "test-secret"),
     ] {
         std::fs::write(&file, raw).unwrap();
-        assert_eq!(secret(&source).unwrap(), expected);
+        assert_eq!(read_client_secret(&source).unwrap(), expected);
     }
     for invalid in ["", "secret\n\n", "secret\r", "secret\0"] {
         std::fs::write(&file, invalid).unwrap();
         assert_eq!(
-            secret(&source),
+            read_client_secret(&source),
             Err(CredentialError::InvalidClientCredentials)
         );
     }
