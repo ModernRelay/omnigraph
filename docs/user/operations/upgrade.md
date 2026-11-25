@@ -188,6 +188,15 @@ For the historical v0.10-to-v0.9 rollback, including `external_blobs` state,
 follow the [tagged rollback procedure](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md#cluster-state-and-rollback)
 with those binaries. It is not a downgrade path from v0.14.
 
+## S3 roots that name two keys
+
+An `s3://` root whose path holds a percent escape or a character a URL writes as
+one (a space, a non-ASCII letter, a brace) is now refused before any request.
+Earlier releases stored such a root's cluster state and table locations under the
+escaped key (`my%20data/`) and its tables under the decoded one (`my data/`).
+No release moves those objects: before upgrading, export each graph with the
+release that wrote it and [rebuild](#rebuild) it under a plain prefix.
+
 ## What an export/import rebuild preserves
 
 This table describes rebuilding a graph at a new URI for a graph-format change,
