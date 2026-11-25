@@ -188,6 +188,8 @@ pub(crate) enum RegistryCapture {
     Transitioning(Arc<ServingView>),
     Blocked(Arc<BlockedGraph>),
     Gone,
+    /// Registered, but not visible to the caller: answered as `Gone`.
+    Hidden,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -335,27 +337,34 @@ impl GraphRegistry {
         operations: &OperationRuntime,
         key: &GraphKey,
     ) -> Result<RegistryCapture, ApiError> {
-        self.capture_with_policy(operations, key)
-            .map(|(capture, _)| capture)
+        self.capture_visible(operations, key, |_, _| Ok(true))
     }
 
-    pub(crate) fn capture_with_policy(
+    /// Capture `key` for a caller that `sees` it, judged on the entry and the
+    /// server policy of the snapshot the capture comes from. A graph the
+    /// caller does not see is `Hidden` before anything is acquired: no
+    /// request ownership, so it counts toward no drain and costs what an
+    /// unknown graph costs.
+    pub(crate) fn capture_visible(
         &self,
         operations: &OperationRuntime,
         key: &GraphKey,
-    ) -> Result<(RegistryCapture, Option<Arc<PolicyEngine>>), ApiError> {
+        sees: impl FnOnce(&GraphEntry, Option<&PolicyEngine>) -> Result<bool, ApiError>,
+    ) -> Result<RegistryCapture, ApiError> {
         operations.while_open(|| {
             let state = locked(&self.state);
-            let capture = match state.snapshot.graphs.get(key) {
-                Some(GraphEntry::Loading(graph)) => RegistryCapture::Loading(Arc::clone(graph)),
-                Some(GraphEntry::Ready(view)) => RegistryCapture::Ready(view.capture()?),
-                Some(GraphEntry::Transitioning(view)) => {
-                    RegistryCapture::Transitioning(Arc::clone(view))
-                }
-                Some(GraphEntry::Blocked(graph)) => RegistryCapture::Blocked(Arc::clone(graph)),
-                None => RegistryCapture::Gone,
+            let Some(entry) = state.snapshot.graphs.get(key) else {
+                return Ok(RegistryCapture::Gone);
             };
-            Ok((capture, state.snapshot.server_policy.clone()))
+            if !sees(entry, state.snapshot.server_policy.as_deref())? {
+                return Ok(RegistryCapture::Hidden);
+            }
+            Ok(match entry {
+                GraphEntry::Loading(graph) => RegistryCapture::Loading(Arc::clone(graph)),
+                GraphEntry::Ready(view) => RegistryCapture::Ready(view.capture()?),
+                GraphEntry::Transitioning(view) => RegistryCapture::Transitioning(Arc::clone(view)),
+                GraphEntry::Blocked(graph) => RegistryCapture::Blocked(Arc::clone(graph)),
+            })
         })
     }
 
@@ -2062,6 +2071,32 @@ mod tests {
             ));
             drop(transition);
         }
+    }
+
+    /// A graph its caller may not see is refused before any request ownership
+    /// is taken: it counts toward no drain, as a missing graph does not, and a
+    /// transition never waits for it.
+    #[tokio::test]
+    async fn a_hidden_ready_graph_takes_no_request_ownership() {
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        let registry = GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap();
+        let operations = OperationRuntime::new();
+        let RegistryLookup::Ready(view) = registry.get(&handle.key) else {
+            panic!("alpha is ready");
+        };
+        let hidden = registry
+            .capture_visible(&operations, &handle.key, |_, _| Ok(false))
+            .unwrap();
+        assert!(matches!(hidden, RegistryCapture::Hidden));
+        assert_eq!(view.request_count(), 0);
+        let seen = registry
+            .capture_visible(&operations, &handle.key, |_, _| Ok(true))
+            .unwrap();
+        assert!(matches!(seen, RegistryCapture::Ready(_)));
+        assert_eq!(view.request_count(), 1);
+        drop(seen);
+        assert_eq!(view.request_count(), 0);
     }
 
     #[tokio::test]

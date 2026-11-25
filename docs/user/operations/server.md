@@ -219,7 +219,7 @@ describes sign-in, which resource identifier to choose, and the endpoint's tools
 | `GET /readyz` | Replica readiness and booted applied revision |
 | `GET /openapi.json` | Runtime copy of the OpenAPI document |
 | `GET /graphs` | Graph catalog: every graph with its root and availability; requires `graph_list` policy |
-| `GET /graphs/discovery` | The caller's `actor_id` (and OAuth `client_id`), and IDs and display names of the graphs it holds any permission on, for any credential |
+| `GET /graphs/discovery` | `visibility: granted`, the caller's `actor_id` (and OAuth `client_id`), and IDs and display names of the registered graphs it holds any permission on, for any credential |
 | `POST /cluster/plan` | Preview source changes against the running cluster without applying them |
 | `POST /cluster/deployments` | Submit an exact-ID deployment: graph creation/deletion or schema, query, policy, provider and Blob-binding changes |
 | `GET /cluster/deployments`, `GET /cluster/deployments/{deployment_id}` | Authorized deployment status and current-process activation observation |

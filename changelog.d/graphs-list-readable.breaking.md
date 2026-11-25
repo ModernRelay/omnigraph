@@ -1,3 +1,3 @@
-- `omnigraph graphs list` lists only the graphs your credential holds any permission on, and every other graph now answers 404 on every route, ready or not, instead of 403. Pass `--catalog` for every graph with its state and root, which still needs `graph_list`. A CLI older than this server cannot read the listing. See [policy][graphs-list-readable-policy].
+- `omnigraph graphs list` lists only the registered graphs your credential holds any permission on, and every other one now answers `graph not found` (404) on every route instead of 403; `og_catalog` keeps its own authorization. `--catalog` lists every graph. Upgrade the CLI with the server: an older CLI cannot read the new listing, and this one reports an older server's listing as `unfiltered`. See [policy][graphs-list-readable-policy].
 
 [graphs-list-readable-policy]: ../docs/user/operations/policy.md#actions

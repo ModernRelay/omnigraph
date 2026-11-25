@@ -28,24 +28,31 @@ Graph-scoped actions:
 | `admin` | Reserved graph administration |
 
 Listing needs no permit. `GET /graphs/discovery` (the CLI's `graphs list`,
-MCP's `graphs`) answers every credential with the actor it resolves to
-(`actor_id`, and `client_id` for an OIDC access token) and the IDs and display
-names of the graphs it holds any permission on: some action, on any branch,
+MCP's `graphs`) answers every credential with its rule, `visibility: granted`,
+the actor it resolves to (`actor_id`, and `client_id` for an OIDC access
+token) and the IDs and display names of the registered graphs it holds any
+permission on: some action, on any branch,
 by the rules every request obeys, available or not. A rule scoped to
 unprotected branches counts, and so does a grant without `read`, such as a
 writer's or a stored-query invoker's. A holder of `graph_list` lists every
 graph. A caller with no permission anywhere gets an empty list. It is the
 identity check for any credential, and listing a graph grants nothing; ask
-[`access`](#learn-your-access) what you may do on it.
+[`access`](#learn-your-access) what you may do on it. A body without
+`visibility` comes from an older release, which lists every graph and names no
+caller; `graphs list` reports it as `unfiltered`.
 
-A graph is listed exactly when its routes do not answer that it does not
-exist. Every route under `/graphs/{graph_id}` and every MCP tool answers a
-graph the caller does not list exactly as an unknown graph: the same 404
-`not_found` body, disposition included (`effects: none`, `action: fix`), so a
-probe cannot tell them apart. That refusal does not say that a grant would
-help. After its policy changes, a caller lists the graphs again rather than
-retrying the refused request. A caller that lists a graph reaches its routes
-and gets 403 for an action it lacks.
+A registered graph is listed exactly when its routes do not answer
+`graph not found`. Every route under `/graphs/{graph_id}` and every MCP tool
+answers a graph the caller does not list exactly as an unknown graph: the same
+404 body, `{"error":"graph not found","code":"not_found"}` with disposition
+`effects: none`, `action: fix`, so a probe cannot tell them apart. That refusal
+does not say that a grant would help. After its policy changes, a caller lists
+the graphs again rather than retrying the refused request. A caller that lists
+a graph reaches its routes and gets 403 for an action it lacks; a subresource
+of a listed graph, such as an absent branch or a stored query hidden from a
+caller without `invoke_query`, can still answer 404 with its own message. The
+built-in catalogue graph `og_catalog` is not registered: it is never listed
+and keeps its own `read` authorization.
 
 `graph_list` is server-scoped and grants the catalog: `GET /graphs`, every
 registered graph with its root and availability. A holder lists every graph,

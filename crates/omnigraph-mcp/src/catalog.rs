@@ -577,6 +577,7 @@ pub(super) fn graphs_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "visibility": {"type": "string", "enum": ["granted"]},
             "actor_id": {"type": "string"},
             "client_id": {"type": "string"},
             "graphs": {"type": "array", "items": {

@@ -210,12 +210,8 @@ policy still only reads: `query` answers, and a write tool returns 403.
 | `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/changes` | `read` |
 | `blobs_stat` | `graph`, `entity`, `type`, `id`, `property`, optional `branch`, `snapshot` | `HEAD /graphs/{graph_id}/blob` | `read` |
 
-`graphs` needs no permit, for any credential: it names the caller's
-`actor_id` (and `client_id`) and lists the graphs it holds any permission on,
-available or not, or every graph for a `graph_list` holder; an empty list when
-there are none. Every tool answers a graph the caller does not list as not
-found (404), as the HTTP routes do, and `access` says what it may do on one it
-lists.
+`graphs` needs no permit: it returns `visibility: granted`, the caller's `actor_id` (and `client_id`) and the registered graphs it holds any permission on, available or not, or every one for a `graph_list` holder.
+Every tool answers any other registered graph as `graph not found`, as HTTP does; `access` says what the caller may do on a listed one. `og_catalog` is never listed and keeps its own authorization.
 
 The server's `initialize` instructions tell a model to call `graphs`, then
 `schema`, then `query` with a stored read's `name` or its own GQ source.

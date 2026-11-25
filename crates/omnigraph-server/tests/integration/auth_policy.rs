@@ -342,9 +342,24 @@ async fn graph_listing_names_exactly_the_graphs_a_caller_holds_a_permission_on()
         get_request("/graphs/missing/snapshot", "nobody-token"),
     )
     .await;
+    // The whole graph-level refusal, disposition included, is the unknown
+    // graph's, so nothing in it tells a probe the graph exists.
     assert_eq!(hidden, missing, "a hidden graph answers as a missing one");
-    // The guarantee a client relies on: a graph is listed exactly when its
-    // routes do not answer that it does not exist.
+    assert_eq!(
+        missing,
+        json!({"error":"graph not found","code":"not_found","disposition":{"effects":"none","action":"fix"}})
+    );
+    // A listed graph's own subresource can still be not found; that refusal
+    // names the subresource, never the graph.
+    let (status, branch_missing) = json_response(
+        &app,
+        get_request("/graphs/alpha/snapshot?branch=absent", "reader-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{branch_missing}");
+    assert_ne!(branch_missing, missing, "{branch_missing}");
+    // The guarantee a client relies on: a registered graph is listed exactly
+    // when its routes do not answer `graph not found`.
     for token in [
         "reader-token",
         identity.as_str(),
@@ -354,21 +369,22 @@ async fn graph_listing_names_exactly_the_graphs_a_caller_holds_a_permission_on()
         "admin-token",
     ] {
         let (_, body) = json_response(&app, get_request("/graphs/discovery", token)).await;
+        assert_eq!(body["visibility"], "granted", "{body}");
         for graph in ["alpha", "beta", "gamma", "delta", "missing"] {
             let listed = body["graphs"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|entry| entry["graph_id"] == graph);
-            let (status, _) = json_response(
+            let (status, answer) = json_response(
                 &app,
                 get_request(&format!("/graphs/{graph}/access?branch=main"), token),
             )
             .await;
             assert_eq!(
                 listed,
-                status != StatusCode::NOT_FOUND,
-                "{token} {graph}: listed {listed}, route answered {status}"
+                answer != missing,
+                "{token} {graph}: listed {listed}, route answered {status} {answer}"
             );
         }
     }

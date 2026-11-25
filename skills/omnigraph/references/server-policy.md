@@ -53,7 +53,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `/graphs/{graph_id}/snapshot`, `/commits` | Snapshot and paged history; `GET /commits?listing=unpublished\|unattached`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}` |
 | `/graphs/{graph_id}/commits/{commit}/changes`, `GET /graphs/{graph_id}/diff` | One first-parent commit diff; net change between two branches or commit ids |
 | `GET /graphs/{graph_id}/changes`, `POST /graphs/{graph_id}/changes/baseline` | Poll a feed or capture a baseline |
-| `GET /graphs/discovery` | The caller's `actor_id` and the graphs it holds any permission on, for any credential; the identity check. A graph it does not list answers 404 |
+| `GET /graphs/discovery` | `visibility: granted`, the caller's `actor_id` and the registered graphs it holds any permission on, for any credential; the identity check. A registered graph it does not list answers `graph not found`; `og_catalog` keeps its own authorization |
 | `/mcp` | MCP endpoint; see [MCP, OIDC sign-in and logs](#mcp-oidc-sign-in-and-logs) |
 | `/graphs/{graph_id}/schema` | Read the accepted schema |
 | `/graphs/{graph_id}/export` | Stream a branch snapshot |

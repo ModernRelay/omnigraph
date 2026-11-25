@@ -545,7 +545,7 @@ reachability is outside the serving request path. The profile boundary and
 applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
-`GraphVisibility` in `crates/omnigraph-server/src/handlers.rs` decides which
+`VisibleGraphs` in `crates/omnigraph-server/src/handlers.rs` decides which
 graphs a caller may know exist, with one predicate: the caller holds some grant
 on the graph (`PolicyEngine::may_act_on_graph`: any graph action on some
 branch) or holds the server-scoped `graph_list`. The Cedar request context
@@ -557,15 +557,19 @@ or configuration grants nothing. Every surface that names a graph applies the
 predicate, so a graph is listed exactly when it is not answered as unknown:
 
 - `GET /graphs/discovery` (CLI `graphs list`, MCP `graphs` and
-  `omnigraph://graphs`) returns the caller's `actor_id` and `client_id` and the
-  IDs and display names of the visible graphs in the current serving registry
+  `omnigraph://graphs`) returns its rule (`visibility: granted`), the caller's
+  `actor_id` and `client_id` and the IDs and display names of the visible
+  graphs in the current serving registry
   (loading, ready, transitioning or blocked), as last installed by boot or a
   deployment activation, for any credential. It neither scans storage nor
   discloses availability, paths, policy, schema, or query definitions. It logs
   one summary line per listing, not a policy decision per graph.
-- HTTP and MCP graph resolution atomically capture a serving view with its
-  graph-epoch lease. A graph that is not visible, ready or not, answers exactly
-  as an unknown graph, 404. A visible loading, blocked or transitioning graph
+- HTTP and MCP graph resolution judge visibility inside the registry's capture
+  section, before taking a serving view's graph-epoch lease, so a hidden graph
+  takes no request ownership and counts toward no drain. A graph that is not
+  visible, ready or not, answers exactly as an unknown graph, `graph not
+  found`. The built-in `og_catalog` is not in the registry; its catalogue
+  policy authorizes it separately. A visible loading, blocked or transitioning graph
   yields 503; a visible ready graph reaches its route, whose own authorization
   decides the action.
 

@@ -194,8 +194,10 @@ omnigraph graphs list --target <name> --catalog --json
 Names your actor (on stderr; `--json` carries `actor_id` and `client_id`) and
 lists the ids and names of the graphs the credential holds any permission on,
 available or not, with any credential and no permit; an empty list means it
-holds none. Any other graph answers 404; `access` says what you may do on a
-listed one.
+holds none. Any other registered graph answers `graph not found`; `access`
+says what you may do on a listed one. An older server's listing, which states
+no `visibility`, is reported as `unfiltered`: it lists every graph and names
+no caller.
 Remote servers only (rejects local URIs). `--catalog` lists every graph with its
 `state` and root instead, and needs `graph_list` from a cluster-scoped policy
 bundle, on managed targets too. See [`server-policy.md`](server-policy.md).

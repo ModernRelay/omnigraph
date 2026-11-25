@@ -1635,8 +1635,8 @@
         "tags": [
           "management"
         ],
-        "summary": "Who the caller is and which graphs it holds any permission on: each graph\nwhose policy grants it some action on some branch, or every graph for a\n`graph_list` holder, whatever the graph's availability. Any credential may\nask; one with no permission anywhere gets an empty list. A graph is listed\nexactly when its routes do not answer that it does not exist, and\n`GET /graphs/{graph_id}/access` says what the caller may do on it.",
-        "description": "Returns the resolved actor and OAuth client, and graph ids and display\nnames only, from the server's current registry: no roots, availability,\nschema or policy. The catalog (`GET /graphs`, `graph_list`) holds every\ngraph with its availability and root.",
+        "summary": "Who the caller is and which registered graphs it holds any permission on:\neach graph whose policy grants it some action on some branch, or every\ngraph for a `graph_list` holder, whatever the graph's availability. Any\ncredential may ask; one with no permission anywhere gets an empty list.\n`visibility: granted` states that rule: a registered graph is listed\nexactly when its routes do not answer `graph not found`, the refusal an\nunknown graph gets. A listed graph's subresources can still be not found,\nand `GET /graphs/{graph_id}/access` says what the caller may do on it. The\nbuilt-in `og_catalog` is not a registered graph: it is never listed and\nkeeps its own authorization.",
+        "description": "Returns the rule, the resolved actor and OAuth client, and graph ids and\ndisplay names only, from the server's current registry: no roots,\navailability, schema or policy. It evaluates every registered graph's\npolicy, bounded by the registry. The catalog (`GET /graphs`, `graph_list`)\nholds every graph with its availability and root.",
         "operationId": "discoverGraphs",
         "parameters": [
           {
@@ -1663,7 +1663,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The caller's actor and the graphs it holds any permission on",
+            "description": "The listing rule (`visibility: granted`), the caller's actor, and the registered graphs it holds any permission on; `og_catalog` is never listed",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -15919,6 +15919,17 @@
             "items": {
               "$ref": "#/components/schemas/GraphDiscoveryEntry"
             }
+          },
+          "visibility": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GraphVisibility",
+                "description": "The rule the listing follows. A server sends `granted`. A body without\nit comes from an older release, whose listing is not filtered and\nnames no caller; the CLI reports that body as `unfiltered`."
+              }
+            ]
           }
         },
         "additionalProperties": false
@@ -15990,6 +16001,14 @@
           "invalid_external_blob_policy",
           "open_failed",
           "invalid_stored_queries"
+        ]
+      },
+      "GraphVisibility": {
+        "type": "string",
+        "description": "Which graphs a discovery listing names.",
+        "enum": [
+          "granted",
+          "unfiltered"
         ]
       },
       "HealthOutput": {

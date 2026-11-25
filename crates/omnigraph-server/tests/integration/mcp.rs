@@ -197,12 +197,12 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     let discovered = call(&app, &alice, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
-        json!({"actor_id":"principal:stable_alice","client_id":"oauth-client","graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"loading","display_name":"loading"}]})
+        json!({"visibility":"granted","actor_id":"principal:stable_alice","client_id":"oauth-client","graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"loading","display_name":"loading"}]})
     );
     let discovered = call(&app, &bob, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
-        json!({"actor_id":"principal:stable_bob","client_id":"oauth-client","graphs":[]})
+        json!({"visibility":"granted","actor_id":"principal:stable_bob","client_id":"oauth-client","graphs":[]})
     );
     for (credential, graph, expected) in [
         (&alice, "blocked", 503),
@@ -1023,7 +1023,7 @@ async fn static_token_server_serves_mcp_without_oauth_discovery() {
     assert_eq!(graphs["result"]["structuredContent"], native);
     assert_eq!(
         native,
-        json!({"actor_id":"default","graphs":[{"graph_id":"default","display_name":"default"}]})
+        json!({"visibility":"granted","actor_id":"default","graphs":[{"graph_id":"default","display_name":"default"}]})
     );
     let (status, _) = json_response(&app, get_request("/graphs", "secret")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);

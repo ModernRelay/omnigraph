@@ -4,7 +4,8 @@ use std::io::Write;
 
 use color_eyre::eyre::Result;
 use omnigraph_api_types::{
-    GraphDiscoveryOutput, GraphListOutput, ParamDescriptor, ParamKind, QueriesCatalogOutput,
+    GraphDiscoveryOutput, GraphListOutput, GraphVisibility, ParamDescriptor, ParamKind,
+    QueriesCatalogOutput,
 };
 use omnigraph_server::{PolicyDecision, PolicyRequest};
 
@@ -258,20 +259,32 @@ fn write_query_annotation(label: &str, value: &str, stdout: &mut dyn Write) -> R
 
 /// The listing: graph ids on stdout, one per line, so a script can read them;
 /// in human output the actor the credential resolves to (and its OAuth client)
-/// goes to stderr, the identity check `--json` carries in its body.
+/// goes to stderr, the identity check `--json` carries in its body. A body that
+/// states no rule comes from an older server, whose listing is not filtered and
+/// names no caller: `--json` reports it as `visibility: unfiltered`, and human
+/// output says so instead of naming an actor.
 pub(super) fn write_graphs_discovery(
     payload: &GraphDiscoveryOutput,
     json: bool,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
+    let visibility = payload.visibility.unwrap_or(GraphVisibility::Unfiltered);
     if json {
-        write_json(payload, stdout)?;
+        let mut payload = payload.clone();
+        payload.visibility = Some(visibility);
+        write_json(&payload, stdout)?;
     } else {
-        match (&payload.actor_id, &payload.client_id) {
-            (Some(actor), Some(client)) => writeln!(stderr, "as {actor} (client {client})")?,
-            (Some(actor), None) => writeln!(stderr, "as {actor}")?,
-            (None, _) => writeln!(
+        match (visibility, &payload.actor_id, &payload.client_id) {
+            (GraphVisibility::Unfiltered, _, _) => writeln!(
+                stderr,
+                "this server predates the filtered listing: it lists every registered graph, whether or not you may use it, and does not say who you are"
+            )?,
+            (GraphVisibility::Granted, Some(actor), Some(client)) => {
+                writeln!(stderr, "as {actor} (client {client})")?
+            }
+            (GraphVisibility::Granted, Some(actor), None) => writeln!(stderr, "as {actor}")?,
+            (GraphVisibility::Granted, None, _) => writeln!(
                 stderr,
                 "as no actor: the server runs without authentication"
             )?,
@@ -513,6 +526,7 @@ mod tests {
     #[test]
     fn graph_inventory_keeps_discovery_and_operator_shapes() {
         let discovery = GraphDiscoveryOutput {
+            visibility: Some(GraphVisibility::Granted),
             actor_id: Some("principal:alice".into()),
             client_id: None,
             graphs: vec![
@@ -550,6 +564,7 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
             json!({
+                "visibility":"granted",
                 "actor_id":"principal:alice",
                 "graphs":[{"graph_id":"a","display_name":"a"},{"graph_id":"b","display_name":"Bee"}]
             })
