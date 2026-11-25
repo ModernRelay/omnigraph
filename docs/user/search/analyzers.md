@@ -138,7 +138,10 @@ score(d)    = the sum of part(q,d) over the distinct query terms q, in ascending
 ```
 
 `N` is the field corpus: every entity of the type whose value has at least one
-analyzed term, before any filter of the query. `df_q` counts the entities
+analyzed term, before any filter of the query. The type is the ranked
+binding's, one node type, so the corpus is one table: a property an interface
+declares adds nothing to it, and declaring that `Person` implements an
+interface moves no `Person` score. `df_q` counts the entities
 holding a term within `q`'s budget, `len_d` and `avg_len` are a value's and
 the corpus's mean term counts, and `tf(t,d)` counts `t` in `d`. Because the
 statistics come from the whole field, a filter that narrows the population

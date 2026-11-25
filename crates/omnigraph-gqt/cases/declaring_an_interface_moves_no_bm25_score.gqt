@@ -1,0 +1,72 @@
+# issue: none
+# notes: A property an interface declares adds nothing to a member's `bm25_v1` corpus: with `Person` and `Org` both
+# notes: implementing `Named`, which declares the scored `name`, a `Person` binding still scores against `Person`'s
+# notes: table alone, so declaring an implementor moves no score. The scores are those
+# notes: a_bm25_corpus_is_one_node_types_table.gqt pins for the same data without the interface.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+interface Named {
+    name: String @index
+}
+node Person implements Named {
+    handle: String @key
+    name: String @index
+}
+node Org implements Named {
+    slug: String @key
+    name: String @index
+}
+
+--- seed
+{"type":"Person","data":{"handle":"p1","name":"river stone"}}
+{"type":"Person","data":{"handle":"p2","name":"river river field"}}
+{"type":"Person","data":{"handle":"p3","name":"mountain lake"}}
+{"type":"Org","data":{"slug":"o1","name":"river works"}}
+{"type":"Org","data":{"slug":"o2","name":"river river river"}}
+{"type":"Org","data":{"slug":"o3","name":"stone river delta"}}
+
+--- query
+query people($q: String) {
+    match { let $all = { match { $p: Person } return { $p } }, from bm25($all, $p.name, $q) as $score }
+    return { $p.handle, $score }
+    order { $score desc, $p.handle }
+}
+
+--- params
+{"q": "river stone"}
+
+--- expect ordered
+{"p.handle":"p1","score":1.540884578398}
+{"p.handle":"p2","score":0.598186437222}
+
+--- expect shape
+p.handle: String
+score: F64
+
+--- query
+query orgs($q: String) {
+    match { let $all = { match { $o: Org } return { $o } }, from bm25($all, $o.name, $q) as $score }
+    return { $o.slug, $score }
+    order { $score desc, $o.slug }
+}
+
+--- params
+{"q": "river stone"}
+
+--- expect ordered
+{"o.slug":"o3","score":1.060148506119}
+{"o.slug":"o2","score":0.204361087843}
+{"o.slug":"o1","score":0.148743829759}
+
+--- expect shape
+o.slug: String
+score: F64

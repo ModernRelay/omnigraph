@@ -287,9 +287,10 @@ linear in that text (about 50 ms per MiB on two CPUs; see the user guide's
 `match_terms($d.f, terms($q, mode: all | any, max_edits: 0..=2))` matches a
 query term to a stored term within the budget (one edit per inserted, deleted
 or substituted character; a swap costs two). `bm25` is `bm25_v1`, an `F64`
-scored against the whole field (every entity whose value has at least one
-analyzed term, before filters), so a filter never changes a surviving row's
-score; the plan shows a `Score` node, not a ranked scan, in an `rrf` arm too.
+scored against the whole field (every entity of the ranked binding's one
+node type whose value has at least one analyzed term, before filters), so a
+filter never changes a surviving row's score, and a property an interface
+declares adds no other type's rows to it; the plan shows a `Score` node, not a ranked scan, in an `rrf` arm too.
 A query over 64 KiB or 1,024 distinct terms, or a value over
 16 MiB, fails with a resource-limit error (HTTP 413, detail `resource_limit`
 with `resource` `lexical_query_bytes`, `lexical_query_terms` or
