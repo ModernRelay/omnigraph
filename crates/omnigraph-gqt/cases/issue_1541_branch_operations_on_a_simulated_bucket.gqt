@@ -1,0 +1,137 @@
+# issue: 1541
+# red_on: be6f89f8; `branch create feature` on s3-compatible panicked with "A Tokio 1.x context was found, but IO is disabled".
+# notes: The branch tree's commit ran on Lance's default session, whose registry built a real S3 client for the
+# notes: simulated bucket's name. Every branch operation on a simulated S3 bucket now stays in the bucket: branch
+# notes: create, a write on the branch, a snapshot (`as unattached branch`) read back, a merge proposal (`as commit`)
+# notes: published, a three-way merge and a branch delete, with the same steps on a local filesystem beside it.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: s3-compatible
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query insert_bob() {
+    insert Person { name: "bob", age: 40 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: feature
+query root_carol() as unattached branch {
+    insert Person { name: "carol", age: 22 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $snapshot
+
+--- query snapshot: $snapshot
+query names_at_snapshot() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+query insert_dave() {
+    insert Person { name: "dave", age: 50 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge feature into main as commit
+
+--- expect outcome: merged
+
+--- bind commit $proposal
+
+--- mutate
+commit publish "${proposal}"
+
+--- expect ok
+
+--- mutate
+branch create second
+
+--- expect ok
+
+--- mutate branch: second
+query age_alice() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_erin() {
+    insert Person { name: "erin", age: 60 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge second into main
+
+--- expect outcome: merged
+
+--- mutate
+branch delete feature
+
+--- expect ok
+
+--- mutate
+branch delete second
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "main"}
+
+--- expect shape
+name: String
+
+--- query
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "alice", "p.age": 31}
+{"p.name": "bob", "p.age": 40}
+{"p.name": "dave", "p.age": 50}
+{"p.name": "erin", "p.age": 60}
+
+--- expect shape
+p.name: String
+p.age: I32
