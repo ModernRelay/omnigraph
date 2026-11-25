@@ -218,8 +218,12 @@ struct TransitionCandidate {
     completion_owned: bool,
 }
 
-/// How many times a capture judges visibility again after the registry
-/// changed under it, before it fails closed.
+/// The most visibility judgements one capture makes, the first included: a
+/// bound on the synchronous policy work a single graph request can cost. A
+/// registry that changes under every one of them (sustained activation or
+/// transition churn) makes the capture fail closed, so a graph the caller may
+/// see can answer `graph not found` until the churn stops. A hidden probe can
+/// cost up to this many judgements where a missing graph costs none.
 pub(crate) const CAPTURE_VISIBILITY_ATTEMPTS: usize = 3;
 
 pub struct GraphRegistry {
@@ -346,13 +350,16 @@ impl GraphRegistry {
 
     /// Capture `key` for a caller that `sees` it. Visibility is policy
     /// evaluation, so it runs on a cloned snapshot with neither the process
-    /// admission lock nor the registry lock held; the capture then takes both
-    /// in their usual order and honours the judgement only while that same
-    /// snapshot is current. A swap in between (activation, transition, startup
-    /// completion) judges again, at most [`CAPTURE_VISIBILITY_ATTEMPTS`] times,
-    /// then fails closed as `Hidden`. A graph the caller does not see is
-    /// `Hidden` before anything is acquired: no request ownership, so it counts
-    /// toward no drain and costs what an unknown graph costs.
+    /// admission lock nor the registry lock held. The capture then takes both
+    /// in their usual order, and only after checking that the same snapshot is
+    /// still current does it resolve absence, the judgement, or an error the
+    /// judgement raised. So a graph the caller does not see answers exactly as
+    /// an absent one in every admission state: refused alike while admission
+    /// is closed, `Gone` and `Hidden` alike while it is open. A swap in between
+    /// (activation, transition, startup completion) is judged again; the
+    /// whole capture makes at most [`CAPTURE_VISIBILITY_ATTEMPTS`] judgements,
+    /// then fails closed as `Hidden`. A hidden graph takes no request
+    /// ownership, so it counts toward no drain.
     pub(crate) fn capture_visible(
         &self,
         operations: &OperationRuntime,
@@ -361,16 +368,19 @@ impl GraphRegistry {
     ) -> Result<RegistryCapture, ApiError> {
         for _ in 0..CAPTURE_VISIBILITY_ATTEMPTS {
             let judged = self.snapshot_ref();
-            let Some(entry) = judged.graphs.get(key) else {
-                return Ok(RegistryCapture::Gone);
-            };
-            let visible = sees(entry, judged.server_policy.as_deref())?;
+            let judgement = judged
+                .graphs
+                .get(key)
+                .map(|entry| sees(entry, judged.server_policy.as_deref()));
             let captured = operations.while_open(|| {
                 let state = locked(&self.state);
                 if !Arc::ptr_eq(&state.snapshot, &judged) {
                     return Ok(None);
                 }
-                if !visible {
+                let (Some(entry), Some(judgement)) = (judged.graphs.get(key), judgement) else {
+                    return Ok(Some(RegistryCapture::Gone));
+                };
+                if !judgement? {
                     return Ok(Some(RegistryCapture::Hidden));
                 }
                 Ok(Some(match entry {
@@ -2118,13 +2128,73 @@ mod tests {
         assert_eq!(view.request_count(), 0);
     }
 
-    /// Visibility is judged with no registry lock held, so a swap can land
-    /// while a probe is being judged and is never blocked by it: the judging
-    /// closure below swaps the registry itself, which would deadlock under the
-    /// lock. A judgement made on a replaced snapshot is judged again, and a
-    /// registry that keeps changing fails closed without taking ownership.
+    /// Visibility is judged with neither the process admission lock nor the
+    /// registry lock held: a swap that takes both, in their usual order, lands
+    /// while a probe is being judged. The swap flips the judgement (it installs
+    /// a server policy, which the probe reads as "not visible"), so the first
+    /// judgement is stale and the capture judges again on the new snapshot,
+    /// refusing with no request owner. The wait is bounded: a judgement made
+    /// under either lock fails the test after five seconds instead of hanging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_swap_under_both_locks_lands_while_visibility_is_judged() {
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        let registry = Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap());
+        let operations = OperationRuntime::new();
+        let RegistryLookup::Ready(view) = registry.get(&handle.key) else {
+            panic!("alpha is ready");
+        };
+        let policy = Arc::new(
+            PolicyEngine::load_server_from_source(
+                "version: 1\ngroups:\n  admins: [admin]\nrules:\n  - id: list\n    allow:\n      actors: {group: admins}\n      actions: [graph_list]\n",
+            )
+            .unwrap(),
+        );
+        let (judging, judging_started) = std::sync::mpsc::channel::<()>();
+        let (swapped, swap_landed) = std::sync::mpsc::channel::<()>();
+        let swapper = {
+            let registry = Arc::clone(&registry);
+            let operations = operations.clone();
+            std::thread::spawn(move || {
+                judging_started
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a judgement started");
+                operations
+                    .while_open(|| -> Result<(), ApiError> {
+                        let mut state = locked(&registry.state);
+                        let mut next = state.snapshot.with_graphs(state.snapshot.graphs.clone());
+                        next.server_policy = Some(policy);
+                        state.snapshot = Arc::new(next);
+                        Ok(())
+                    })
+                    .unwrap();
+                swapped.send(()).unwrap();
+            })
+        };
+        let judgements = std::cell::Cell::new(0);
+        let captured = registry
+            .capture_visible(&operations, &handle.key, |_, server_policy| {
+                judgements.set(judgements.get() + 1);
+                if judgements.get() == 1 {
+                    judging.send(()).unwrap();
+                    swap_landed
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("the swap lands while visibility is judged: no lock is held");
+                }
+                Ok(server_policy.is_none())
+            })
+            .unwrap();
+        swapper.join().unwrap();
+        assert!(matches!(captured, RegistryCapture::Hidden));
+        assert_eq!(judgements.get(), 2, "the stale judgement was judged again");
+        assert_eq!(view.request_count(), 0);
+    }
+
+    /// A registry that changes under every judgement makes the capture fail
+    /// closed after [`CAPTURE_VISIBILITY_ATTEMPTS`] judgements, the first
+    /// included, without taking request ownership.
     #[tokio::test]
-    async fn a_visibility_judgement_on_a_replaced_snapshot_is_judged_again() {
+    async fn sustained_registry_churn_fails_closed_after_the_judgement_cap() {
         let dir = TempDir::new().unwrap();
         let handle = build_handle("alpha", dir.path()).await;
         let registry = GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap();
@@ -2133,24 +2203,6 @@ mod tests {
             panic!("alpha is ready");
         };
         let judgements = std::cell::Cell::new(0);
-        let seen = registry
-            .capture_visible(&operations, &handle.key, |_, _| {
-                judgements.set(judgements.get() + 1);
-                if judgements.get() == 1 {
-                    registry.initialize_server_policy(None);
-                }
-                Ok(true)
-            })
-            .unwrap();
-        assert!(matches!(seen, RegistryCapture::Ready(_)));
-        assert_eq!(
-            judgements.get(),
-            2,
-            "the first judgement saw a replaced snapshot"
-        );
-        drop(seen);
-
-        judgements.set(0);
         let churned = registry
             .capture_visible(&operations, &handle.key, |_, _| {
                 judgements.set(judgements.get() + 1);

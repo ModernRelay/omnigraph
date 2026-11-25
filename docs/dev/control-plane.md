@@ -566,11 +566,16 @@ predicate, so a graph is listed exactly when it is not answered as unknown:
   one summary line per listing, not a policy decision per graph.
 - HTTP and MCP graph resolution judge visibility on a registry snapshot with
   no lock held, then take the process and registry locks in their usual order
-  and honour the judgement only if that snapshot is still current; a swap in
-  between is judged again, a bounded number of times, then refused as an
-  unknown graph. Only then is a serving view's graph-epoch lease taken, so a
-  hidden graph takes no request ownership, counts toward no drain, and never
-  holds up a swap. A graph that is not
+  and, only if that snapshot is still current, resolve absence, the judgement
+  and any evaluation error. A hidden graph therefore answers as an absent one
+  in every admission state, closed included. A swap in between is judged
+  again; one capture makes at most three judgements, the first included, which
+  bounds its synchronous policy work, and then refuses as an unknown graph, so
+  sustained registry churn can give a visible graph a transient
+  `graph not found`. Only then is a serving view's graph-epoch lease taken, so
+  a hidden graph takes no request ownership, counts toward no drain, and never
+  holds up a swap; a hidden probe still costs its judgements, which a missing
+  graph does not. A graph that is not
   visible, ready or not, answers exactly as an unknown graph, `graph not
   found`. The built-in `og_catalog` is not in the registry; its catalogue
   policy authorizes it separately. A visible loading, blocked or transitioning graph

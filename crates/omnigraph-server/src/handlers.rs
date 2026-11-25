@@ -573,10 +573,14 @@ pub(crate) async fn resolve_graph_handle(
 /// the action. Visibility is judged on a snapshot outside every lock and
 /// honoured only if that snapshot is still current at capture, before request
 /// ownership is taken ([`GraphRegistry::capture_visible`]), so a hidden graph
-/// costs what a missing one does, never counts toward a drain, and never holds
-/// up a registry swap. The judgement is pure policy evaluation: one decision
-/// for a reader, at most one per graph action and branch class for a caller
-/// that holds nothing.
+/// answers as a missing one in every admission state, never counts toward a
+/// drain, and never holds up a registry swap. It is not free: one judgement is
+/// one decision for a reader and at most one per graph action and branch class
+/// for a caller that holds nothing, and a capture makes at most
+/// [`CAPTURE_VISIBILITY_ATTEMPTS`](crate::registry::CAPTURE_VISIBILITY_ATTEMPTS)
+/// judgements, so a hidden probe can cost more than a missing one, and
+/// sustained registry churn can give a visible graph a transient
+/// `graph not found`.
 pub(crate) fn resolve_registered_graph(
     state: &AppState,
     key: &GraphKey,

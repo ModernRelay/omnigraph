@@ -212,23 +212,22 @@ async fn graph_listing_names_exactly_the_graphs_a_caller_holds_a_permission_on()
         "version: 1\ngroups:\n  admins: [admin]\nrules:\n  - id: catalog\n    allow:\n      actors: {group: admins}\n      actions: [graph_list]\n",
     )
     .unwrap();
-    let app = build_app(
-        AppState::new_multi_entries(
-            entries,
-            vec![
-                ("reader".into(), "reader-token".into()),
-                ("feature-reader".into(), "feature-token".into()),
-                ("writer".into(), "writer-token".into()),
-                ("admin".into(), "admin-token".into()),
-                ("nobody".into(), "nobody-token".into()),
-            ],
-            Some(server_policy),
-            omnigraph_server::workload::WorkloadController::with_defaults(),
-            None,
-        )
-        .unwrap()
-        .with_data_token_trust(tokens.trust.clone()),
-    );
+    let state = AppState::new_multi_entries(
+        entries,
+        vec![
+            ("reader".into(), "reader-token".into()),
+            ("feature-reader".into(), "feature-token".into()),
+            ("writer".into(), "writer-token".into()),
+            ("admin".into(), "admin-token".into()),
+            ("nobody".into(), "nobody-token".into()),
+        ],
+        Some(server_policy),
+        omnigraph_server::workload::WorkloadController::with_defaults(),
+        None,
+    )
+    .unwrap()
+    .with_data_token_trust(tokens.trust.clone());
+    let app = build_app(state.clone());
     for (token, expected, catalog) in [
         (
             "reader-token",
@@ -358,6 +357,24 @@ async fn graph_listing_names_exactly_the_graphs_a_caller_holds_a_permission_on()
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{branch_missing}");
     assert_ne!(branch_missing, missing, "{branch_missing}");
+    // A hidden graph is observationally an absent one in every admission
+    // state: the same status and body as a graph that does not exist, while
+    // admission is open and after it closes. `alpha` is ready and `beta` is
+    // loading; neither grants `nobody` anything.
+    let hidden_and_missing = |app: axum::Router| async move {
+        let mut answers = Vec::new();
+        for graph in ["alpha", "beta", "missing"] {
+            answers.push(
+                json_response(
+                    &app,
+                    get_request(&format!("/graphs/{graph}/snapshot"), "nobody-token"),
+                )
+                .await,
+            );
+        }
+        answers
+    };
+    let open_answers = hidden_and_missing(app.clone()).await;
     // The guarantee a client relies on: a registered graph is listed exactly
     // when its routes do not answer `graph not found`.
     for token in [
@@ -388,6 +405,18 @@ async fn graph_listing_names_exactly_the_graphs_a_caller_holds_a_permission_on()
             );
         }
     }
+    state.operation_runtime().close();
+    let closed_answers = hidden_and_missing(app.clone()).await;
+    for (open, closed) in [(&open_answers, false), (&closed_answers, true)] {
+        let missing = &open[2];
+        for (graph, answer) in ["alpha", "beta"].iter().zip(&open[..2]) {
+            assert_eq!(
+                answer, missing,
+                "{graph} hidden versus missing, admission closed: {closed}"
+            );
+        }
+    }
+    assert_eq!(closed_answers[2].0, StatusCode::SERVICE_UNAVAILABLE);
 
     // Enrollment follows the applied policy: the same identity lists the
     // graph once a policy lets it read, and not before.
