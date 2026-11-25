@@ -76,10 +76,13 @@ pub enum Value {
     Float(f64),
     Str(String),
     List(Vec<Value>),
-    /// A node or edge reference: its kind, type and identity.
+    /// A node or edge reference: its kind, type and identity. `type_order`
+    /// is its type's stable type id, by which an identity orders (the GQ 3
+    /// RFC, `Order`): a rename never reorders references.
     Ref {
         edge: bool,
         type_name: String,
+        type_order: u64,
         id: String,
     },
 }
@@ -178,17 +181,44 @@ fn cmp_values(a: &Value, b: &Value) -> Ordering {
         (
             Ref {
                 edge: e1,
-                type_name: t1,
+                type_order: t1,
                 id: i1,
+                ..
             },
             Ref {
                 edge: e2,
-                type_name: t2,
+                type_order: t2,
                 id: i2,
+                ..
             },
         ) => (e1, t1, i1).cmp(&(e2, t2, i2)),
         _ => rank(a).cmp(&rank(b)),
     }
+}
+
+/// The order of every node and edge type of `catalog`: its stable type id.
+/// A catalog no graph accepted (a parsed schema) has none yet; its types take
+/// the ids accepting it would allocate, within a kind in name order, so a
+/// reference interpreted over it orders as the accepted graph's does.
+fn type_orders(catalog: &Catalog) -> HashMap<(bool, String), u64> {
+    let mut orders = HashMap::new();
+    for (edge, names) in [
+        (false, catalog.node_types.keys().collect::<Vec<_>>()),
+        (true, catalog.edge_types.keys().collect::<Vec<_>>()),
+    ] {
+        let mut names = names;
+        names.sort();
+        for (rank, name) in names.into_iter().enumerate() {
+            let stable = if edge {
+                catalog.edge_type_id(name)
+            } else {
+                catalog.node_type_id(name)
+            };
+            let order = stable.map_or(rank as u64 + 1, |id| id.get());
+            orders.insert((edge, name.clone()), order);
+        }
+    }
+    orders
 }
 
 /// One order key's comparison: a null is placed by `nulls_first` whatever
@@ -338,6 +368,9 @@ pub struct Interpreter<'a> {
     binds_now: bool,
     /// The current value of each recursive read inside its `Fix`.
     rec: HashMap<String, Vec<Row>>,
+    /// Each node (`false`) and edge (`true`) type's order: its stable type
+    /// id ([`type_orders`]).
+    type_orders: HashMap<(bool, String), u64>,
     /// The operator laws' record of every evaluated term (law 7).
     #[cfg(test)]
     audit: Option<laws::Audit>,
@@ -361,8 +394,25 @@ impl<'a> Interpreter<'a> {
                 values
             },
             rec: HashMap::new(),
+            type_orders: type_orders(catalog),
             #[cfg(test)]
             audit: None,
+        }
+    }
+
+    /// The reference to entity `id` of node (`edge` false) or edge type
+    /// `type_name`.
+    fn reference(&self, edge: bool, type_name: String, id: String) -> Value {
+        let type_order = self
+            .type_orders
+            .get(&(edge, type_name.clone()))
+            .copied()
+            .unwrap_or(u64::MAX);
+        Value::Ref {
+            edge,
+            type_name,
+            type_order,
+            id,
         }
     }
 
@@ -519,6 +569,7 @@ impl<'a> Interpreter<'a> {
                 edge,
                 type_name,
                 id,
+                ..
             } => {
                 let entity = if *edge {
                     self.graph.edge(type_name, id)
@@ -642,11 +693,7 @@ impl<'a> Interpreter<'a> {
                         for e in entities.into_iter().flatten() {
                             rows.push(vec![(
                                 var.clone(),
-                                Value::Ref {
-                                    edge,
-                                    type_name: t.to_string(),
-                                    id: e.id.clone(),
-                                },
+                                self.reference(edge, t.to_string(), e.id.clone()),
                             )]);
                         }
                     }
@@ -709,22 +756,8 @@ impl<'a> Interpreter<'a> {
                                 // `R + [$y] + [$k]`: the column order the
                                 // tie rule reads.
                                 let mut r = row.clone();
-                                r.push((
-                                    dst.clone(),
-                                    Value::Ref {
-                                        edge: false,
-                                        type_name: nt,
-                                        id: nid,
-                                    },
-                                ));
-                                r.push((
-                                    k.clone(),
-                                    Value::Ref {
-                                        edge: true,
-                                        type_name: et,
-                                        id: eid,
-                                    },
-                                ));
+                                r.push((dst.clone(), self.reference(false, nt, nid)));
+                                r.push((k.clone(), self.reference(true, et, eid)));
                                 rows.push(r);
                             }
                             continue;
@@ -774,14 +807,7 @@ impl<'a> Interpreter<'a> {
                             .collect();
                         for (nt, nid) in seen.into_keys() {
                             let mut r = row.clone();
-                            r.push((
-                                dst.clone(),
-                                Value::Ref {
-                                    edge: false,
-                                    type_name: nt,
-                                    id: nid,
-                                },
-                            ));
+                            r.push((dst.clone(), self.reference(false, nt, nid)));
                             rows.push(r);
                         }
                     }
@@ -1288,11 +1314,13 @@ impl<'a> Interpreter<'a> {
                 edge: false,
                 type_name,
                 id,
+                ..
             } => self.graph.node(type_name, id),
             Value::Ref {
                 edge: true,
                 type_name,
                 id,
+                ..
             } => self.graph.edge(type_name, id),
             _ => None,
         }

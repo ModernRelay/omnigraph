@@ -5,10 +5,15 @@ use serde::{Deserialize, Serialize};
 use crate::catalog::Catalog;
 use crate::types::{Direction, PropType};
 
-/// Query-only column carrying a bound edge's canonical schema type name.
+/// Query-only column carrying a bound edge's canonical schema type name, the
+/// value `$e.@type` reads.
 pub const EDGE_TYPE_COLUMN: &str = "~edge_type";
 
-/// Read-only metadata spelling for a bound edge's concrete schema type.
+/// Read-only metadata spelling for a bound edge's concrete schema type. As
+/// the property of an order key or a tie-rule column it is the type part of
+/// the edge's identity, compared by its stable type id rather than its name
+/// (the GQ 3 RFC, `Order`), so a rename never reorders rows; execution reads
+/// it from [`EDGE_TYPE_COLUMN`].
 pub const EDGE_TYPE_META: &str = "@type";
 
 /// One concrete member of a traversal, oriented from its query source.

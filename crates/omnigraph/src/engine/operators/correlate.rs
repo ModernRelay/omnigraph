@@ -68,8 +68,12 @@ pub(crate) struct CorrelateRead {
     /// expression over the read's rows and its type.
     pub(crate) values: Vec<(String, IRExpr, DataType)>,
     pub(crate) order_by: Vec<IROrdering>,
-    /// The tie rule's columns after the keys, by name.
-    pub(crate) tiebreak: Vec<String>,
+    /// The tie rule's columns after the keys, by name, each with whether it
+    /// is an edge identity's type, compared by stable type id.
+    pub(crate) tiebreak: Vec<(String, bool)>,
+    /// The order of an edge identity's type, where a key or a tie column is
+    /// one.
+    pub(crate) types: Option<Arc<super::TypeOrder>>,
     pub(crate) limit: Option<usize>,
     /// A `nearest` window: the ranked binding's identity column and the
     /// window `k`, the rows of the first `k` distinct identities of each
@@ -502,23 +506,51 @@ fn ordered_cut(
             }),
         });
     }
+    let identity = |name: &str, values: ArrayRef| match &read.types {
+        Some(types) => types.identity(&values),
+        None => Err(OmniError::manifest_internal(format!(
+            "the correlated read orders `{name}` as an edge identity with no type order"
+        ))),
+    };
     for key in &read.order_by {
-        keys.push(SortColumn {
-            values: evaluate_expr(rows, &key.expr, &read.params)?,
-            options: Some(SortOptions {
-                descending: key.descending,
-                nulls_first: key.places_nulls_first(),
-            }),
+        let values = match &key.expr {
+            IRExpr::PropAccess {
+                variable, property, ..
+            } if property == omnigraph_compiler::traversal::EDGE_TYPE_META => {
+                let (name, _) = crate::engine::lower::key_column(variable, property);
+                identity(&name, column(rows, &name)?)?
+            }
+            expr @ IRExpr::AliasRef(alias, ty) if ty.selects_several_edge_types() => {
+                identity(alias, evaluate_expr(rows, expr, &read.params)?)?
+            }
+            expr => vec![evaluate_expr(rows, expr, &read.params)?],
+        };
+        let options = Some(SortOptions {
+            descending: key.descending,
+            nulls_first: key.places_nulls_first(),
         });
+        keys.extend(
+            values
+                .into_iter()
+                .map(|values| SortColumn { values, options }),
+        );
     }
-    for name in &read.tiebreak {
-        keys.push(SortColumn {
-            values: column(rows, name)?,
-            options: Some(SortOptions {
-                descending: false,
-                nulls_first: true,
-            }),
+    for (name, is_type) in &read.tiebreak {
+        let values = column(rows, name)?;
+        let values = if *is_type {
+            identity(name, values)?
+        } else {
+            vec![values]
+        };
+        let options = Some(SortOptions {
+            descending: false,
+            nulls_first: true,
         });
+        keys.extend(
+            values
+                .into_iter()
+                .map(|values| SortColumn { values, options }),
+        );
     }
     let sorted = if keys.is_empty() {
         UInt32Array::from_iter_values(0..rows.num_rows() as u32)

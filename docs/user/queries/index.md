@@ -231,14 +231,14 @@ limiting, so the limit counts distinct rows. Aggregates with `distinct` are refu
 DISTINCT order keys must be projected values or aliases, including property keys (`T42`).
 
 Order is total under the tie rule: after the written keys (ascending puts nulls
-first, descending last; `nulls first` or `nulls last` after a key, as in `order { $p.age desc nulls first }`, places that key's nulls, and rows whose key is null fall to the later keys), each entity id in the order the pattern writes it (a
-traversal's destination before its edge), then a `from`'s value columns, all
+first, descending last; `nulls first` or `nulls last` after a key, as in `order { $p.age desc nulls first }`, places that key's nulls, and rows whose key is null fall to the later keys), each entity identity in the order the pattern writes it (a
+traversal's destination before its edge; an edge over several types by its type, then its id), then a `from`'s value columns, all
 ascending; group rows use their keys, bare nodes (by id) first. Ids are read
 only when they can change the order. A `limit` with no `order` cuts this order
 alone: `limit 2` returns the two smallest ids, not a scan's first rows, and
 reads every match, at the cost of a sorted `limit`. On ungrouped,
 non-DISTINCT rows an order key need not be projected, as in `order { $p.age > 30 }`. A reference key sorts by identity:
-`$p` by `$p.@id`, a multi-type edge by `@type`, then `@id`. Over grouped rows,
+`$p` by `$p.@id`, a multi-type edge by its type, then `@id`, returned whole or not; an identity's type compares by its stable type id, which a rename keeps, so a rename never reorders rows (`order { $e.@type }` orders the name, a `String`). Over grouped rows,
 an aggregated or DISTINCT return, an order key must be a return item or its
 alias (`T42`): `count($d)` after `return { count($d) as deals }`.
 

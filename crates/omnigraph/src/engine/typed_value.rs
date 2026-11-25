@@ -763,7 +763,10 @@ pub(super) fn validate_plan_values(
                 return Ok((field.data_type().clone(), field.is_nullable()));
             }
             if let Some(members) = edge_bindings.get(variable) {
+                // The type's name: read as a value, or as an identity key's
+                // type, which the sort orders by stable type id.
                 if property == omnigraph_compiler::traversal::EDGE_TYPE_COLUMN
+                    || property == omnigraph_compiler::traversal::EDGE_TYPE_META
                     || members.is_empty()
                         && [
                             catalog.system_columns.id,

@@ -458,6 +458,12 @@ pub enum ExprType {
 }
 
 impl ExprType {
+    /// An edge reference whose selector holds several edge types: its
+    /// identity is its type and its id, not its id alone.
+    pub fn selects_several_edge_types(&self) -> bool {
+        matches!(self, Self::Edge { type_name, .. } if type_name.contains('|'))
+    }
+
     pub fn from_prop(prop: &PropType) -> Self {
         Self::Value {
             scalar: prop.scalar,

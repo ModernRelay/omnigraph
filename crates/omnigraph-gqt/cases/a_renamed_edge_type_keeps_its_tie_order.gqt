@@ -1,0 +1,122 @@
+# issue: none
+# notes: A rename keeps a type's stable type id, so it never reorders rows the tie rule decides. `A` and `B`, accepted
+# notes: together, take their ids in name order, and both hold an edge with the id "e1": the rows tie on every key
+# notes: and the type alone orders them, `A` first. Renamed to `C`, the type keeps its id and its place, ahead of
+# notes: `B`, though its new name sorts after `B`. Counting by identity keeps the two edges apart: one id string in
+# notes: two types is two edges. a_tie_orders_an_edge_type_by_its_stable_type_id.gqt orders a type added later.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node P {
+    name: String @key
+}
+edge A: P -> P
+edge B: P -> P
+
+--- seed
+{"type":"P","data":{"name":"p1"}}
+{"type":"P","data":{"name":"p2"}}
+{"edge":"A","id":"e1","from":"p1","to":"p2"}
+{"edge":"B","id":"e1","from":"p1","to":"p2"}
+
+--- query
+query tied() {
+    match { $p: P, $p $e:(a | b) $q }
+    return { $e.@type as t, $e.@id as i }
+    order { $p.name }
+}
+
+--- expect ordered
+{"t":"A","i":"e1"}
+{"t":"B","i":"e1"}
+
+--- expect shape
+t: String
+i: String
+
+--- apply schema
+node P {
+    name: String @key
+}
+edge C: P -> P @rename_from("A")
+edge B: P -> P
+
+--- query
+query tied() {
+    match { $p: P, $p $e:(c | b) $q }
+    return { $e.@type as t, $e.@id as i }
+    order { $p.name }
+}
+
+--- expect ordered
+{"t":"C","i":"e1"}
+{"t":"B","i":"e1"}
+
+--- expect shape
+t: String
+i: String
+
+--- query
+query by_edge() {
+    match { $p: P, $p $e:(c | b) $q }
+    return { $e.@type as t, $e.@id as i }
+    order { $e }
+}
+
+--- expect ordered
+{"t":"C","i":"e1"}
+{"t":"B","i":"e1"}
+
+--- expect shape
+t: String
+i: String
+
+--- query
+query by_type_name() {
+    match { $p: P, $p $e:(c | b) $q }
+    return { $e.@type as t, $e.@id as i }
+    order { $e.@type }
+}
+
+--- expect ordered
+{"t":"B","i":"e1"}
+{"t":"C","i":"e1"}
+
+--- expect shape
+t: String
+i: String
+
+--- query
+query edges() {
+    match { $p: P, $p $e:(c | b) $q }
+    return { count($e) as n, count(distinct $e.@id) as ids }
+}
+
+--- expect unordered
+{"n":2,"ids":1}
+
+--- expect shape
+n: I64
+ids: I64
+
+--- query
+query distinct_edges() {
+    match { $p: P, $p $e:(c | b) $q }
+    return distinct { $e }
+    order { $e }
+}
+
+--- expect ordered
+{"e":{"@id":"e1","@src":"p1","@dst":"p2","@type":"C"}}
+{"e":{"@id":"e1","@src":"p1","@dst":"p2","@type":"B"}}
+
+--- expect shape
+e: edge B|C

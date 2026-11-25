@@ -1,0 +1,95 @@
+# issue: none
+# notes: The tie rule orders an edge identity's type by its stable type id, not its name. `B` is accepted first and
+# notes: `A` is added by a later schema apply, so `A`'s stable type id is the higher although its name sorts first:
+# notes: rows that tie on every key, and an order by the edge itself, put `B` before `A`, while an order by the value
+# notes: `$e.@type`, a String, puts `A` first. A type accepted with others takes its id in name order, so the two
+# notes: orders part only after a later addition or a rename; a_renamed_edge_type_keeps_its_tie_order.gqt holds the
+# notes: order across a rename, with one id string in both types.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node P {
+    name: String @key
+}
+edge B: P -> P
+
+--- seed
+{"type":"P","data":{"name":"p1"}}
+{"type":"P","data":{"name":"p2"}}
+{"edge":"B","id":"e1","from":"p1","to":"p2"}
+
+--- apply schema
+node P {
+    name: String @key
+}
+edge B: P -> P
+edge A: P -> P
+
+--- mutate
+query add_a() {
+    insert A { @src: "p1", @dst: "p2" }
+}
+
+--- expect affected: nodes=0 edges=1
+
+--- query
+query tied() {
+    match { $p: P, $p $e:(a | b) $q }
+    return { $e.@type as t }
+    order { $p.name }
+}
+
+--- expect ordered
+{"t":"B"}
+{"t":"A"}
+
+--- expect shape
+t: String
+
+--- query
+query by_edge() {
+    match { $p: P, $p $e:(a | b) $q }
+    return { $e.@type as t }
+    order { $e }
+}
+
+--- expect ordered
+{"t":"B"}
+{"t":"A"}
+
+--- expect shape
+t: String
+
+--- query
+query by_type_name() {
+    match { $p: P, $p $e:(a | b) $q }
+    return { $e.@type as t }
+    order { $e.@type }
+}
+
+--- expect ordered
+{"t":"A"}
+{"t":"B"}
+
+--- expect shape
+t: String
+
+--- query
+query edges() {
+    match { $p: P, $p $e:(a | b) $q }
+    return { count($e) as n }
+}
+
+--- expect unordered
+{"n":2}
+
+--- expect shape
+n: I64

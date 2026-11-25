@@ -33,7 +33,7 @@ use crate::query::file::Param;
 use crate::query::value::{
     AggFunc, BinaryOp, CompOp, DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN,
 };
-use crate::traversal::{EDGE_TYPE_COLUMN, EdgeMember, EdgeSelection};
+use crate::traversal::{EDGE_TYPE_META, EdgeMember, EdgeSelection};
 use crate::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 
 use super::{Construct, ElementKind, ProgrammeStage, ShapeError, Unlowered};
@@ -1408,10 +1408,11 @@ impl<'a> Shaper<'a> {
     /// The identity keys of an order key that is a reference, a binding or
     /// a return item holding one: `(@type, @id)` for an edge whose selector
     /// has several types, `@id` otherwise (one type: the type is constant).
-    /// Over groups the rows carry only the return items, so a node key is
-    /// its returned node object, whose first member is `@id`, a unique
-    /// key: ordering by the object is ordering by the identity. `None` for
-    /// a value key.
+    /// Over groups the rows carry only the return items, so a reference key
+    /// is its returned object: a node's or a one-type edge's first member is
+    /// `@id`, a unique key, so ordering by the object is ordering by the
+    /// identity; an edge over several types is ordered by its object's
+    /// `@type`, by stable type id, then its `@id`. `None` for a value key.
     fn reference_key(
         &self,
         key: &IRExpr,
@@ -1433,7 +1434,7 @@ impl<'a> Shaper<'a> {
         };
         if grouped {
             let item = item?;
-            return matches!(ty, ExprType::Node { .. }).then(|| {
+            return matches!(ty, ExprType::Node { .. } | ExprType::Edge { .. }).then(|| {
                 vec![IRExpr::AliasRef(
                     item.alias.clone().unwrap_or_else(|| item.column.clone()),
                     ty.clone(),
@@ -4968,7 +4969,9 @@ fn holds_lexical_call(expr: &IRExpr) -> bool {
 
 /// The identity keys of the reference `variable` of type `ty`: its id
 /// column `id`, after its edge type for an edge whose selector has several
-/// types (one type: the type is constant). `None` for a value.
+/// types (one type: the type is constant). The type key is spelled
+/// [`EDGE_TYPE_META`], the identity's type, which orders by stable type id;
+/// `$e.@type` is the name, a value ordered as text. `None` for a value.
 fn reference_identity(variable: &str, ty: &ExprType, id: &str) -> Option<Vec<IRExpr>> {
     let string = ExprType::from_prop(&PropType::scalar(ScalarType::String, false));
     let property = |property: &str| IRExpr::PropAccess {
@@ -4978,8 +4981,8 @@ fn reference_identity(variable: &str, ty: &ExprType, id: &str) -> Option<Vec<IRE
     };
     match ty {
         ExprType::Node { .. } => Some(vec![property(id)]),
-        ExprType::Edge { type_name, .. } if type_name.contains('|') => {
-            Some(vec![property(EDGE_TYPE_COLUMN), property(id)])
+        ExprType::Edge { .. } if ty.selects_several_edge_types() => {
+            Some(vec![property(EDGE_TYPE_META), property(id)])
         }
         ExprType::Edge { .. } => Some(vec![property(id)]),
         ExprType::Value { .. } | ExprType::ExactInteger { .. } => None,

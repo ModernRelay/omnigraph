@@ -1105,14 +1105,7 @@ fn fixpoint_laws(export: &str, base_src: &str, step_src: &str) -> Result<(), Str
     closure.dedup();
     let mut frontier = closure.clone();
     while let Some(id) = frontier.pop() {
-        let one = vec![vec![(
-            "q".to_string(),
-            Value::Ref {
-                edge: false,
-                type_name: "A".into(),
-                id,
-            },
-        )]];
+        let one = vec![vec![("q".to_string(), it.reference(false, "A".into(), id))]];
         for next in ids(&eval_step(&mut it, one)?) {
             if !closure.contains(&next) {
                 closure.push(next.clone());
@@ -1175,6 +1168,7 @@ fn the_tie_rule_compares_a_null_reference_in_its_column() {
     let x = Value::Ref {
         edge: false,
         type_name: "A".into(),
+        type_order: 1,
         id: "x".into(),
     };
     let a: Row = vec![("q".into(), x.clone()), ("r".into(), Value::Null)];

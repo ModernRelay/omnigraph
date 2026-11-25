@@ -1119,11 +1119,7 @@ fn bm25_v1_scores_by_the_rfc_formula() {
     let it = Interpreter::new(&catalog, &graph, &HashMap::new());
     let row = vec![(
         "d".to_string(),
-        Value::Ref {
-            edge: false,
-            type_name: "Doc".into(),
-            id: "x".into(),
-        },
+        it.reference(false, "Doc".into(), "x".into()),
     )];
     let score = scorer.score(&it, &row, "d", "text").unwrap().unwrap();
     assert_eq!(score.to_bits(), expected.to_bits());

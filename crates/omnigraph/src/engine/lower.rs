@@ -44,8 +44,8 @@ use super::operators::{
     ExpandStep, FilterExec, FuseExec, FuseMethod, GraphEnv, HashJoinExec, HydrateExec,
     LanceFragmentSink, LetExec, LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec,
     OuterReferenceExec, OuterSlot, ProjectionExec, RuntimeFilterSlot, ScanExec, ScanSource,
-    ScoreExec, SortExec, SortKey, TargetCutExec, UnionExec, ValidateExec, fresh_tag_column,
-    tagged_schema,
+    ScoreExec, SortExec, SortKey, TargetCutExec, TypeOrder, UnionExec, ValidateExec,
+    fresh_tag_column, tagged_schema,
 };
 use super::*;
 use crate::loader::LoadMode;
@@ -639,6 +639,11 @@ impl<'l, 'a> Walk<'l, 'a> {
             }
             None => Err(domain("`percentile`'s fraction p is null".into()).into()),
         }
+    }
+
+    /// The order of an edge identity's type in this read's catalog.
+    fn type_order(&self) -> Result<Arc<TypeOrder>> {
+        TypeOrder::of(self.lowering.catalog).map(Arc::new)
     }
 
     fn not_a_pipeline_node(name: &str) -> LowerError {
@@ -1342,7 +1347,14 @@ impl Lower for Walk<'_, '_> {
         let tiebreak = tiebreak
             .iter()
             .map(|key| tiebreak_column(key, id_column))
-            .collect::<Result<Vec<String>>>()?;
+            .collect::<Result<Vec<(String, bool)>>>()?;
+        let identity_types = tiebreak.iter().any(|(_, identity_type)| *identity_type)
+            || read.order_by.iter().any(|key| match &key.expr {
+                IRExpr::PropAccess { property, .. } => property == EDGE_TYPE_MEMBER,
+                IRExpr::AliasRef(_, ty) => ty.selects_several_edge_types(),
+                _ => false,
+            });
+        let types = identity_types.then(|| self.type_order()).transpose()?;
         let scores = read
             .columns
             .iter()
@@ -1367,6 +1379,7 @@ impl Lower for Walk<'_, '_> {
             values,
             order_by: read.order_by.clone(),
             tiebreak,
+            types,
             limit: read
                 .limit
                 .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
@@ -1648,24 +1661,36 @@ impl Lower for Walk<'_, '_> {
         };
         let mut keys = Vec::with_capacity(order_by.len() + tiebreak.len());
         for key in order_by {
+            let mut types = None;
             let column = match &key.expr {
                 IRExpr::PropAccess {
                     variable,
                     property,
                     ty: _,
                 } => {
-                    let name = format!("{variable}.{property}");
-                    carried(&name).ok_or_else(|| {
+                    let (name, identity_type) = key_column(variable, property);
+                    let column = carried(&name).ok_or_else(|| {
                         OmniError::manifest_internal(format!(
                             "the planned sort key column '{name}' is not in the sort input"
                         ))
+                    })?;
+                    if identity_type {
+                        types = Some(self.type_order()?);
+                    }
+                    column
+                }
+                IRExpr::AliasRef(alias, ty) => {
+                    // A returned edge over several types orders by its
+                    // identity, its type by stable type id.
+                    if ty.selects_several_edge_types() {
+                        types = Some(self.type_order()?);
+                    }
+                    carried(alias).ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "the planned sort alias '{alias}' is not in the sort input"
+                        ))
                     })?
                 }
-                IRExpr::AliasRef(alias, _) => carried(alias).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "the planned sort alias '{alias}' is not in the sort input"
-                    ))
-                })?,
                 expr if computed_key(expr) => {
                     let name = expr.to_string();
                     carried(&name).ok_or_else(|| {
@@ -1695,10 +1720,12 @@ impl Lower for Walk<'_, '_> {
                 column,
                 descending: key.descending,
                 nulls_first: key.places_nulls_first(),
+                types,
             });
         }
         for key in tiebreak {
-            let name = tiebreak_column(key, self.lowering.catalog.system_columns.id)?;
+            let (name, identity_type) =
+                tiebreak_column(key, self.lowering.catalog.system_columns.id)?;
             let column = carried(&name).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
                     "the planned tie-break column '{name}' is not in the sort input"
@@ -1708,6 +1735,7 @@ impl Lower for Walk<'_, '_> {
                 column,
                 descending: false,
                 nulls_first: true,
+                types: identity_type.then(|| self.type_order()).transpose()?,
             });
         }
         let drains = self.lowering.plan.can_fail_below(id);
@@ -1903,7 +1931,7 @@ fn hidden_columns(
                 property,
                 ty: _,
             } => {
-                let name = format!("{variable}.{property}");
+                let (name, _) = key_column(variable, property);
                 if input_schema.column_with_name(&name).is_none() {
                     return Err(OmniError::manifest_internal(format!(
                         "the planned sort key column '{name}' is not in the sort input"
@@ -1933,7 +1961,7 @@ fn hidden_columns(
         }
     }
     for key in tiebreak {
-        let name = tiebreak_column(key, id_column)?;
+        let (name, _) = tiebreak_column(key, id_column)?;
         if input_schema.column_with_name(&name).is_none() {
             return Err(OmniError::manifest_internal(format!(
                 "the planned tie-break column '{name}' is not in the sort input"
@@ -1948,19 +1976,29 @@ fn hidden_columns(
 
 /// Resolve a tie-break key declared by the plan to its runtime column: an
 /// identity or edge type, or a value column a correlated read or a union
-/// carries (`values.column`).
-fn tiebreak_column(key: &ColumnRef, id_column: &str) -> Result<String> {
-    let property = match key.property.as_deref() {
-        Some(IDENTITY_MEMBER) => id_column,
-        Some(EDGE_TYPE_MEMBER) => EDGE_TYPE_COLUMN,
-        Some(value) => value,
-        None => {
-            return Err(OmniError::manifest_internal(format!(
-                "the planned tie-break '{key}' names no column"
-            )));
-        }
-    };
-    Ok(format!("{}.{}", key.binding, property))
+/// carries (`values.column`); with whether it is an identity's edge type,
+/// compared by stable type id.
+fn tiebreak_column(key: &ColumnRef, id_column: &str) -> Result<(String, bool)> {
+    match key.property.as_deref() {
+        Some(IDENTITY_MEMBER) => Ok((format!("{}.{id_column}", key.binding), false)),
+        Some(property) => Ok(key_column(&key.binding, property)),
+        None => Err(OmniError::manifest_internal(format!(
+            "the planned tie-break '{key}' names no column"
+        ))),
+    }
+}
+
+/// The column a sort key on `variable.property` reads, and whether it is the
+/// type part of an edge identity, [`EDGE_TYPE_MEMBER`], which reads the
+/// type's name from [`EDGE_TYPE_COLUMN`] and orders it by stable type id; a
+/// name read as a value (`$e.@type`, bound to `EDGE_TYPE_COLUMN`) orders as
+/// text.
+pub(crate) fn key_column(variable: &str, property: &str) -> (String, bool) {
+    if property == EDGE_TYPE_MEMBER {
+        (format!("{variable}.{EDGE_TYPE_COLUMN}"), true)
+    } else {
+        (format!("{variable}.{property}"), false)
+    }
 }
 
 /// A sort key the projection below computes beside the return items: an

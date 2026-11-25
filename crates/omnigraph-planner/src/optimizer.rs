@@ -13,7 +13,7 @@ use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::query::value::AggFunc;
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
-use omnigraph_compiler::types::{Direction, ExprType};
+use omnigraph_compiler::types::Direction;
 
 use crate::cost::{
     AccessPath, AntiJoinStrategy, CoverageProvenance, EndpointProbe, ExpandCostInputs, ExpandMode,
@@ -1664,6 +1664,12 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
                 property,
                 ty: _,
             } => {
+                // An identity key's edge type reads the edge's type column.
+                let property = if property == EDGE_TYPE_MEMBER {
+                    EDGE_TYPE_COLUMN
+                } else {
+                    property
+                };
                 out.push(ColumnRef::property(variable, property));
             }
             IRExpr::Variable(variable, _) => out.push(ColumnRef::entity(variable)),
@@ -1680,7 +1686,7 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
                 (AggFunc::Count, IRExpr::Variable(variable, ty)) => {
                     // An edge over several types is identified by its type and
                     // its id together.
-                    if matches!(ty, ExprType::Edge { type_name, .. } if type_name.contains('|')) {
+                    if ty.selects_several_edge_types() {
                         out.push(ColumnRef::property(variable, EDGE_TYPE_MEMBER));
                     }
                     out.push(ColumnRef::property(variable, IDENTITY_MEMBER));

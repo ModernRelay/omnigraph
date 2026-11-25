@@ -85,7 +85,7 @@ pub(super) use projection::ProjectionExec;
 use scan::{Filled, Needles};
 pub(super) use scan::{RuntimeFilterSlot, ScanExec, ScanSource};
 pub(super) use score::ScoreExec;
-pub(super) use sort::{SortExec, SortKey};
+pub(super) use sort::{SortExec, SortKey, TypeOrder};
 pub(crate) use subquery_aggregate::RowCountPredicate;
 pub(super) use target_cut::{SELECTED_TARGETS, TargetCutExec};
 pub(super) use union::UnionExec;

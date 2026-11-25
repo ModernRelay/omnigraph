@@ -345,7 +345,9 @@ expressions would collide. Aliases can be used in `order`, including after a
 leading score key (`order { $distance, title }`), but cannot be projected again
 in `return`: a bare name there is not a value (`Q018`). On ungrouped rows any expression may be an order key, returned
 or not; a node or edge reference sorts by its identity (`order { $p }` by
-`$p.@id`, an edge over several types by `@type`, then `@id`). Over grouped rows (an aggregate or `return distinct`) an order key must
+`$p.@id`, an edge over several types by its type, then `@id`; the type by its
+stable type id, which a rename keeps, not by its name, which
+`order { $e.@type }` orders as a `String`). Over grouped rows (an aggregate or `return distinct`) an order key must
 be a `return` item or its alias, such as `order { count($f) desc }` after
 `count($f)` in `return` (`T42`).
 
