@@ -257,19 +257,24 @@ refuses a `sum`, `avg`, `min`, `max` or `collect` block without its argument.
   pass, until a later apply stores none of them or the backup taken before
   the upgrade is restored:
 
-  | Construct | `construct` |
-  |---|---|
-  | an explicit `distance` on a Vector, `l2` included | `vector_distance` |
-  | `@index` on a List property | `list_index` |
-  | `@index(fulltext)`, with or without options | `full_text_index` |
-  | an `analyzer` in `@index(fulltext, …)` | `full_text_analyzer` |
-  | a `scorer` in `@index(fulltext, …)` | `full_text_scorer` |
+  | Construct | `construct` | First read by |
+  |---|---|---|
+  | an explicit `distance` on a Vector, `l2` included | `vector_distance` | 0.17.0 |
+  | `@index` on a List property | `list_index` | 0.17.0 |
+  | `@index(fulltext)`, with or without options | `full_text_index` | 0.17.0 |
+  | an `analyzer` in `@index(fulltext, …)` | `full_text_analyzer` | 0.17.0 |
+  | a `scorer` in `@index(fulltext, …)` | `full_text_scorer` | 0.17.0 |
 
   A plan with a step (`schema plan`, `schema apply`, `cluster plan`) names
-  each one the schema it applies holds, under `one_way_constructs`, with the
-  line `binaries before this release refuse the whole graph after this apply,
-  until an apply stores none of these constructs or the backup taken before
-  the upgrade is restored`. A plan with no step applies nothing, so it names
+  each one the schema it applies holds, under `one_way_constructs`: its
+  `construct`, `description`, `first_release` (the first release that reads
+  it), `type_name`, `property` and position. A construct of a whole
+  declaration, which a later release can add, names no `property`. The
+  report ends with the line `binaries before 0.17.0 refuse the whole graph
+  after this apply, until an apply stores none of these constructs or the
+  backup taken before the upgrade is restored`, naming the latest
+  `first_release` among them; the human report also ends each construct's
+  line with `first read by 0.17.0`. A plan with no step applies nothing, so it names
   none, whatever the stored schema holds. They report only; nothing gates the
   apply.
 

@@ -118,15 +118,18 @@ explicit `distance = "l2"`). A cluster applies such a text-only change of a
 graph's schema file with no graph commit: `cluster plan` marks it
 `text_only`, and `omnigraph schema show` still shows the stored source.
 
-**One-way constructs.** A binary before GQ 3 re-parses the stored schema on
-every open, so once an apply stores one of these it refuses the whole graph
+**One-way constructs.** A binary re-parses the stored schema on every open, so
+once an apply stores one of these, every binary before the release that first
+reads it (0.17.0 for each of these) refuses the whole graph
 until a later apply stores none of them or a backup taken before the upgrade
 is restored: an explicit `distance` on a Vector (`l2` included), `@index` on a
 List property,
 `@index(fulltext)` with or without options, an `analyzer` or a `scorer` in it.
 A plan with a step (`schema plan`, `schema apply`, `cluster plan`) names each
-one under `one_way_constructs` (`construct`, `type_name`, `property`, `line`,
-`column`) with a `one_way_note`; a plan with no step names none. Nothing gates
+one under `one_way_constructs` (`construct`, `first_release`, `type_name`,
+`property`, `line`, `column`; no `property` for a whole declaration's
+construct) with a `one_way_note` naming the latest `first_release`; a plan
+with no step names none. Nothing gates
 the apply. A later apply takes one back where the schema allows it:
 `@index(fulltext, …)` respelled as a plain `@index`, a non-`l2` `distance`
 omitted again, or the property dropped; `@index` on a List only by dropping the

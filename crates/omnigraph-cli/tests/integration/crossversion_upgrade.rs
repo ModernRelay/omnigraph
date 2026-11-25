@@ -3786,7 +3786,7 @@ fn run_current(args: &[&str]) -> std::process::Output {
 /// nothing.
 #[test]
 fn genuine_edition_2_storage_upgrade_names_every_one_way_schema_construct() {
-    use omnigraph_compiler::schema::one_way::{ONE_WAY_CONSTRUCTS, ONE_WAY_NOTE};
+    use omnigraph_compiler::schema::one_way::{ONE_WAY_CONSTRUCTS, one_way_note};
     let Some(old) = predecessor("edition-2") else {
         return;
     };
@@ -3845,7 +3845,12 @@ fn genuine_edition_2_storage_upgrade_names_every_one_way_schema_construct() {
             .map(|c| c["construct"].as_str().unwrap())
             .collect();
         assert!(named.contains(&row.id), "{}: {applied}", row.id);
-        assert_eq!(applied["one_way_note"], ONE_WAY_NOTE);
+        let releases = applied["one_way_constructs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["first_release"].as_str().unwrap());
+        assert_eq!(applied["one_way_note"], one_way_note(releases).unwrap());
         let refused = run_old(
             &old,
             &["snapshot", "--target", graph.to_str().unwrap(), "--json"],

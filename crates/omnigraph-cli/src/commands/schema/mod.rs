@@ -77,8 +77,7 @@ pub(crate) async fn plan_schema(
         step_count: plan.steps.len(),
         steps: &plan.steps,
         one_way_constructs: &plan.one_way_constructs,
-        one_way_note: (!plan.one_way_constructs.is_empty())
-            .then_some(omnigraph_compiler::schema::one_way::ONE_WAY_NOTE),
+        one_way_note: plan.one_way_note.clone(),
     };
     if json {
         write_json(&output, stdout)?;

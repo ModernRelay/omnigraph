@@ -31,7 +31,7 @@ pub struct SchemaMigrationPlan {
     /// has no step, since such an apply stores nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub one_way_constructs: Vec<crate::schema::one_way::OneWayConstruct>,
-    /// [`crate::schema::one_way::ONE_WAY_NOTE`], present with the constructs.
+    /// [`crate::schema::one_way::one_way_note`], present with the constructs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_way_note: Option<String>,
 }
@@ -45,8 +45,11 @@ impl SchemaMigrationPlan {
         } else {
             crate::schema::one_way::one_way_constructs(desired_source)?
         };
-        self.one_way_note = (!self.one_way_constructs.is_empty())
-            .then(|| crate::schema::one_way::ONE_WAY_NOTE.to_string());
+        self.one_way_note = crate::schema::one_way::one_way_note(
+            self.one_way_constructs
+                .iter()
+                .map(|c| c.first_release.as_str()),
+        );
         Ok(self)
     }
 }

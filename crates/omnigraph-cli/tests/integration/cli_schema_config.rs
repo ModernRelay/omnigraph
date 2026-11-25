@@ -741,7 +741,7 @@ fn schema_apply_human_reports_noop() {
 /// a plan with no step names nothing, since its apply stores nothing.
 #[test]
 fn schema_plan_and_apply_name_each_one_way_construct() {
-    use omnigraph_compiler::schema::one_way::{ONE_WAY_CONSTRUCTS, ONE_WAY_NOTE};
+    use omnigraph_compiler::schema::one_way::{ONE_WAY_CONSTRUCTS, one_way_note};
     for row in ONE_WAY_CONSTRUCTS {
         let temp = tempdir().unwrap();
         let graph = graph_path(temp.path());
@@ -766,7 +766,20 @@ fn schema_plan_and_apply_name_each_one_way_construct() {
                 .map(|c| c["construct"].as_str().unwrap())
                 .collect();
             assert!(named.contains(&row.id), "{} {command}: {payload}", row.id);
-            assert_eq!(payload["one_way_note"], ONE_WAY_NOTE, "{payload}");
+            // Each construct names the first release that reads it, and the
+            // note the latest of those releases.
+            let releases: Vec<_> = payload["one_way_constructs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["first_release"].as_str().unwrap())
+                .collect();
+            assert!(releases.contains(&row.first_release), "{payload}");
+            assert_eq!(
+                payload["one_way_note"],
+                one_way_note(releases).unwrap(),
+                "{payload}"
+            );
         }
     }
 

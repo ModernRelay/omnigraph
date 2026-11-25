@@ -361,29 +361,40 @@ pub(crate) struct SchemaPlanOutput<'a> {
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub(crate) one_way_constructs: &'a [omnigraph_compiler::schema::one_way::OneWayConstruct],
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) one_way_note: Option<&'static str>,
+    pub(crate) one_way_note: Option<String>,
 }
 
-/// The one-way constructs of a schema plan or apply, one line each, then the
-/// line naming what they cost.
-pub(crate) fn write_one_way_human(
-    constructs: impl IntoIterator<Item = (String, String, usize, usize, String)>,
+/// One one-way construct as the human report prints it.
+pub(crate) struct OneWayLine<'a> {
+    pub(crate) type_name: &'a str,
+    pub(crate) property: Option<&'a str>,
+    pub(crate) line: usize,
+    pub(crate) column: usize,
+    pub(crate) description: &'a str,
+    pub(crate) first_release: &'a str,
+}
+
+/// The one-way constructs of a schema plan or apply, one line each naming
+/// the first release that reads it, then the line naming what they cost.
+pub(crate) fn write_one_way_human<'a>(
+    constructs: impl IntoIterator<Item = OneWayLine<'a>>,
     writer: &mut dyn Write,
 ) -> Result<()> {
-    let mut any = false;
-    for (type_name, property, line, column, description) in constructs {
-        any = true;
+    let mut releases = Vec::new();
+    for c in constructs {
+        let at = match c.property {
+            Some(property) => format!("{}.{property}", c.type_name),
+            None => c.type_name.to_string(),
+        };
         writeln!(
             writer,
-            "one-way: {type_name}.{property} (line {line}, column {column}): {description}"
+            "one-way: {at} (line {}, column {}): {}; first read by {}",
+            c.line, c.column, c.description, c.first_release
         )?;
+        releases.push(c.first_release);
     }
-    if any {
-        writeln!(
-            writer,
-            "{}",
-            omnigraph_compiler::schema::one_way::ONE_WAY_NOTE
-        )?;
+    if let Some(note) = omnigraph_compiler::schema::one_way::one_way_note(releases) {
+        writeln!(writer, "{note}")?;
     }
     Ok(())
 }
@@ -420,14 +431,13 @@ pub(crate) fn write_schema_apply_human(
         writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
     write_one_way_human(
-        output.one_way_constructs.iter().map(|c| {
-            (
-                c.type_name.clone(),
-                c.property.clone(),
-                c.line,
-                c.column,
-                c.description.clone(),
-            )
+        output.one_way_constructs.iter().map(|c| OneWayLine {
+            type_name: &c.type_name,
+            property: c.property.as_deref(),
+            line: c.line,
+            column: c.column,
+            description: &c.description,
+            first_release: &c.first_release,
         }),
         writer,
     )
@@ -598,14 +608,13 @@ pub(crate) fn write_cluster_plan_human(output: &PlanOutput, stdout: &mut dyn Wri
                 }
                 let mut one_way = Vec::new();
                 write_one_way_human(
-                    migration.one_way_constructs.iter().map(|c| {
-                        (
-                            c.type_name.clone(),
-                            c.property.clone(),
-                            c.line,
-                            c.column,
-                            c.description.clone(),
-                        )
+                    migration.one_way_constructs.iter().map(|c| OneWayLine {
+                        type_name: &c.type_name,
+                        property: c.property.as_deref(),
+                        line: c.line,
+                        column: c.column,
+                        description: &c.description,
+                        first_release: &c.first_release,
                     }),
                     &mut one_way,
                 )?;
@@ -847,14 +856,13 @@ pub(crate) fn write_schema_plan_human(
         writeln!(writer, "- {}", render_schema_plan_step(step))?;
     }
     write_one_way_human(
-        plan.one_way_constructs.iter().map(|c| {
-            (
-                c.type_name.clone(),
-                c.property.clone(),
-                c.line,
-                c.column,
-                c.description.clone(),
-            )
+        plan.one_way_constructs.iter().map(|c| OneWayLine {
+            type_name: &c.type_name,
+            property: c.property.as_deref(),
+            line: c.line,
+            column: c.column,
+            description: &c.description,
+            first_release: &c.first_release,
         }),
         writer,
     )
@@ -2536,12 +2544,13 @@ mod tests {
         let distance = omnigraph_compiler::schema::one_way::OneWayConstruct {
             construct: "vector_distance".to_string(),
             description: "an explicit `distance` on a Vector, `l2` included".to_string(),
+            first_release: "0.17.0".to_string(),
             type_name: "Doc".to_string(),
-            property: "emb".to_string(),
+            property: Some("emb".to_string()),
             line: 1,
             column: 30,
         };
-        let one_way = "one-way: Doc.emb (line 1, column 30): an explicit `distance` on a Vector, `l2` included\nbinaries before this release refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored\n";
+        let one_way = "one-way: Doc.emb (line 1, column 30): an explicit `distance` on a Vector, `l2` included; first read by 0.17.0\nbinaries before 0.17.0 refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored\n";
         for (plan, expected) in [
             (
                 SchemaMigrationPlan {

@@ -3359,14 +3359,18 @@ async fn plan_embeds_migration_preview_for_schema_update() {
             (
                 c.construct.as_str(),
                 c.type_name.as_str(),
-                c.property.as_str(),
+                c.property.as_deref(),
+                c.first_release.as_str(),
             )
         })
         .collect();
-    assert_eq!(named, [("full_text_index", "Person", "bio")]);
     assert_eq!(
-        migration.one_way_note.as_deref(),
-        Some(omnigraph_compiler::schema::one_way::ONE_WAY_NOTE)
+        named,
+        [("full_text_index", "Person", Some("bio"), "0.17.0")]
+    );
+    assert_eq!(
+        migration.one_way_note,
+        omnigraph_compiler::schema::one_way::one_way_note(["0.17.0"])
     );
 
     // Text that keeps the accepted identity plans no step: the plan names it

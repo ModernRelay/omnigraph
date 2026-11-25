@@ -73,7 +73,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
 | `schema show` | Read the accepted schema | direct or served |
-| `schema apply` | Apply a schema to a standalone graph; a plan with no step publishes nothing, and `one_way_constructs` names what a binary before GQ 3 cannot read back ([Schemas](../queries/upgrading-to-gq3.md#schemas)) | direct |
+| `schema apply` | Apply a schema to a standalone graph; a plan with no step publishes nothing, and `one_way_constructs` names each stored construct an earlier binary cannot read back, with the first release that reads it ([Schemas](../queries/upgrading-to-gq3.md#schemas)) | direct |
 | `schema plan` | Preview a schema migration, with its `one_way_constructs` | direct |
 | `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
 | `lint` | Validate `.gq` source; `--json` gives each refusal and canonical form its `fix` and byte-range `suggestion.edits`, the edits `--fix` applies to a file, a directory or a configuration's stored-query files ([Lint](../queries/lint.md#fix)) | local schema, direct graph or configuration directory |

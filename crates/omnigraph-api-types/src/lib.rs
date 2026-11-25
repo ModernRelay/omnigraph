@@ -2103,8 +2103,9 @@ pub struct SchemaApplyOutput {
     pub graph_manifest_version: u64,
     #[schema(value_type = Vec<Value>)]
     pub steps: Vec<SchemaMigrationStep>,
-    /// The stored constructs a binary before this release refuses: after
-    /// this apply such a binary refuses the whole graph. Absent when none.
+    /// The stored constructs an earlier binary refuses, each naming the
+    /// first release that reads it: after this apply a binary before that
+    /// release refuses the whole graph. Absent when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub one_way_constructs: Vec<OneWayConstructOutput>,
     /// The consequence of `one_way_constructs`, present with them.
@@ -2112,15 +2113,21 @@ pub struct SchemaApplyOutput {
     pub one_way_note: Option<String>,
 }
 
-/// A schema construct that a binary before this release refuses once a graph
-/// stores it.
+/// A schema construct that a binary before `first_release` refuses once a
+/// graph stores it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct OneWayConstructOutput {
     /// The construct's stable name, such as `vector_distance`.
     pub construct: String,
     pub description: String,
+    /// The first release that reads the construct, `major.minor.patch`.
+    pub first_release: String,
+    /// The interface, node or edge declaring the construct.
     pub type_name: String,
-    pub property: String,
+    /// The property writing it; absent for a construct of the declaration
+    /// itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property: Option<String>,
     pub line: usize,
     pub column: usize,
 }
@@ -2130,6 +2137,7 @@ impl From<omnigraph_compiler::schema::one_way::OneWayConstruct> for OneWayConstr
         Self {
             construct: c.construct,
             description: c.description,
+            first_release: c.first_release,
             type_name: c.type_name,
             property: c.property,
             line: c.line,
@@ -2143,8 +2151,9 @@ impl From<omnigraph_compiler::schema::one_way::OneWayConstruct> for OneWayConstr
 pub fn one_way_report(
     constructs: Vec<omnigraph_compiler::schema::one_way::OneWayConstruct>,
 ) -> (Vec<OneWayConstructOutput>, Option<String>) {
-    let note = (!constructs.is_empty())
-        .then(|| omnigraph_compiler::schema::one_way::ONE_WAY_NOTE.to_string());
+    let note = omnigraph_compiler::schema::one_way::one_way_note(
+        constructs.iter().map(|c| c.first_release.as_str()),
+    );
     (constructs.into_iter().map(Into::into).collect(), note)
 }
 

@@ -205,8 +205,9 @@ omnigraph schema apply --schema next.pg --target $REPO
 ```
 
 Both commands require a direct target; server and managed targets refuse. A
-plan with no step publishes nothing; `one_way_constructs` names what a binary
-before GQ 3 cannot read back. Cluster-managed
+plan with no step publishes nothing; `one_way_constructs` names each construct
+an earlier binary cannot read back, with the `first_release` that reads it.
+Cluster-managed
 graphs evolve through `cluster apply`. See `references/schema.md` for the full
 workflow.
 
