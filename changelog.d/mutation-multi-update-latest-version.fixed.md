@@ -1,5 +1,3 @@
-- Repeated updates to the same row in one mutation now retain only the latest
-  pending version, preventing false `@unique` violations, silent lost updates,
-  and row duplication. See [mutations][mutation-multi-update-limits].
+- Writes of one entity in one mutation keep only its latest pending version, so a later statement matches it once: no false `@unique` violation, lost update or inflated affected count. See [mutations][mutation-multi-update-limits].
 
 [mutation-multi-update-limits]: ../docs/user/mutations/index.md#limits-and-conflicts
