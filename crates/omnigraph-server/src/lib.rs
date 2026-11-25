@@ -39,7 +39,7 @@ pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, AuthenticatedActor, GraphKey, ResolvedActor, Scope, TenantId};
-pub use mcp::McpSettings;
+pub use mcp::{McpSettings, ReadBudget};
 pub use registry::{
     BlockedGraph, GraphEntry, GraphHandle, GraphRegistry, InsertError, LoadingGraph,
     RegistryLookup, RegistrySnapshot, StartupFailure,

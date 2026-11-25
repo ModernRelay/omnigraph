@@ -1,5 +1,6 @@
 //! MCP tool descriptions, annotations and JSON schemas.
 
+use crate::McpSettings;
 use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -15,10 +16,27 @@ enum Effect {
     },
 }
 
+/// A piece of a tool description: fixed text, or a link to a page of the
+/// user guide at the build's source revision.
+pub(super) enum Part {
+    Text(&'static str),
+    /// A guide page by its path in the repository, written as ` (<url>)`.
+    /// A build that names no source revision leaves it out rather than link
+    /// a revision that may not have the page.
+    Guide(&'static str),
+}
+use Part::{Guide, Text};
+
+/// The URL of `page` in the repository at `revision`: a release tag or a
+/// commit, never a branch, so the page is the one the build was made from.
+pub(super) fn guide_url(revision: &str, page: &str) -> String {
+    format!("https://github.com/ModernRelay/omnigraph/blob/{revision}/{page}")
+}
+
 pub(super) struct ToolSpec {
     pub(super) name: &'static str,
     title: &'static str,
-    description: &'static str,
+    pub(super) description: &'static [Part],
     input: fn() -> Value,
     /// Success shape, for tools whose result is fixed. The declared output
     /// schema also admits the error envelope: clients validate any structured
@@ -41,7 +59,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "health",
         title: "Server health",
-        description: "Return the server's status, version and the storage format version it serves.",
+        description: &[Text(
+            "Return the server's status, version and the storage format version it serves.",
+        )],
         input: no_arguments_schema,
         output: Some(health_output_schema),
         effect: Effect::Read,
@@ -49,7 +69,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "graphs",
         title: "List graphs",
-        description: "Say who your credential is (`actor_id`, and `client_id` for an OAuth client) and list the graphs it holds any permission on: each graph's `graph_id` and display name. Every other tool takes one of these ids as `graph`; any other graph is not found. Any credential may call it; an empty list means your credential holds no permission on any graph here. A listed graph can still be unavailable, and `access` says what you may do on it.",
+        description: &[Text(
+            "Say who your credential is (`actor_id`, and `client_id` for an OAuth client) and list the graphs it holds any permission on: each graph's `graph_id` and display name. Every other tool takes one of these ids as `graph`; any other graph is not found. Any credential may call it; an empty list means your credential holds no permission on any graph here. A listed graph can still be unavailable, and `access` says what you may do on it.",
+        )],
         input: no_arguments_schema,
         output: Some(graphs_output_schema),
         effect: Effect::Read,
@@ -57,7 +79,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "schema",
         title: "Read a graph's schema",
-        description: "Return a graph's schema as `.pg` source (`schema_source`): its node and edge types, properties with their types, keys, edge endpoints and declared embeddings. Call this before writing any query: GQ names types, properties and edges exactly as declared here, and edges are matched in lowerCamelCase.",
+        description: &[Text(
+            "Return a graph's schema as `.pg` source (`schema_source`): its node and edge types, properties with their types, keys, edge endpoints and declared embeddings. Call this before writing any query: GQ names types, properties and edges exactly as declared here, and edges are matched in lowerCamelCase.",
+        )],
         input: graph_schema,
         output: Some(schema_output_schema),
         effect: Effect::Read,
@@ -65,7 +89,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "queries",
         title: "List stored queries",
-        description: "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run a stored read with `query` and a stored mutation with `mutate`, each passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused.",
+        description: &[Text(
+            "List a graph's stored queries: each `name`, its description and instruction, whether it is a `mutation`, and typed `params` (`name`, `kind`, `nullable`; `item_kind` for lists, `vector_dim` for vectors). A non-nullable parameter is required. Run a stored read with `query` and a stored mutation with `mutate`, each passing its `name` and no `query`. Invocation is authorized separately, so a listed query can still be refused.",
+        )],
         input: graph_schema,
         output: Some(queries_output_schema),
         effect: Effect::Read,
@@ -73,7 +99,13 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "query",
         title: "Run a read",
-        description: "Run a read: GQ source you write in `query`, or a stored read by `name` (see `queries`), with `params` keyed by the declared parameter names. Call `schema` before writing source. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; with source, `name` picks one declared query when it declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Source may also be `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` or `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; or `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations, stored mutations and branch writes are refused here; `mutate` runs them. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist.",
+        description: &[
+            Text("Run a read: source you write in `query` in GQ, the Omnigraph query language"),
+            Guide("docs/user/queries/index.md"),
+            Text(
+                ", or a stored read by `name` (see `queries`), with `params` keyed by the declared parameter names. Call `schema` before writing source. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; with source, `name` picks one declared query when it declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Source may also be `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` or `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; or `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations, stored mutations and branch writes are refused here; `mutate` runs them. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist.",
+            ),
+        ],
         input: query_schema,
         output: None,
         effect: Effect::Read,
@@ -81,7 +113,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "snapshot",
         title: "Branch snapshot",
-        description: "Return a branch's current snapshot (default `main`): the graph manifest version, the storage format version and every node and edge table with its entity count. Use it to judge a graph's size before querying.",
+        description: &[Text(
+            "Return a branch's current snapshot (default `main`): the graph manifest version, the storage format version and every node and edge table with its entity count. Use it to judge a graph's size before querying.",
+        )],
         input: branch_schema,
         output: None,
         effect: Effect::Read,
@@ -89,7 +123,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "access",
         title: "Your access",
-        description: "Return what your credential may do on a graph: your `actor_id`, the actions allowed whatever the branch (`graph_wide`), and, for a `branch` you name, the actions allowed on it (`actions`). Name a `target_branch` too to learn whether you may create it from `branch` or merge `branch` into it. Check this before a write instead of learning from a refusal. Branches are judged by name and need not exist.",
+        description: &[Text(
+            "Return what your credential may do on a graph: your `actor_id`, the actions allowed whatever the branch (`graph_wide`), and, for a `branch` you name, the actions allowed on it (`actions`). Name a `target_branch` too to learn whether you may create it from `branch` or merge `branch` into it. Check this before a write instead of learning from a refusal. Branches are judged by name and need not exist.",
+        )],
         input: access_schema,
         output: Some(access_output_schema),
         effect: Effect::Read,
@@ -97,7 +133,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "branches_list",
         title: "List branches",
-        description: "List a graph's branch names. With `detailed`, also each readable branch's head commit, the branch and commit it started from, and when it was created and last moved.",
+        description: &[Text(
+            "List a graph's branch names. With `detailed`, also each readable branch's head commit, the branch and commit it started from, and when it was created and last moved.",
+        )],
         input: branches_list_schema,
         output: Some(branches_output_schema),
         effect: Effect::Read,
@@ -105,7 +143,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "branches_diff",
         title: "What a branch changed",
-        description: "Return one bounded page of what branch `source` changed since its merge base with `target` (default `main`): the net entity changes from that base to the source head, each with `before` and `after`, which is what `branches_merge` would bring. Changes `target` made after the base do not appear. Filter by `kind`, `type` and `op`, and continue with the returned `next_page_token` as `page_token`, keeping the other arguments.",
+        description: &[Text(
+            "Return one bounded page of what branch `source` changed since its merge base with `target` (default `main`): the net entity changes from that base to the source head, each with `before` and `after`, which is what `branches_merge` would bring. Changes `target` made after the base do not appear. Filter by `kind`, `type` and `op`, and continue with the returned `next_page_token` as `page_token`, keeping the other arguments.",
+        )],
         input: branch_diff_schema,
         output: None,
         effect: Effect::Read,
@@ -113,7 +153,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "branches_merge_base",
         title: "Merge base of two branches",
-        description: "Return the commit a merge of branch `source` into `target` (default `main`) would compare against, with the two heads it was found from (`source_commit_id`, `target_commit_id`). Reads lineage only.",
+        description: &[Text(
+            "Return the commit a merge of branch `source` into `target` (default `main`) would compare against, with the two heads it was found from (`source_commit_id`, `target_commit_id`). Reads lineage only.",
+        )],
         input: merge_base_schema,
         output: None,
         effect: Effect::Read,
@@ -121,7 +163,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "commits_list",
         title: "List commits",
-        description: "List a branch's commits (default `main`), newest first, each with its `graph_commit_id`, parents, actor and time. Pass `limit` to page a long history: the page names `head_commit_id` and continues with its `next_page_token` as `page_token`, keeping the same `branch`. Pass `listing` as `unpublished` for the proposals written `as commit` that await `commits_publish`, or `unattached` for snapshots written `as unattached branch`, whose recorded target is `branch`; these listings take no `limit` or `page_token`.",
+        description: &[Text(
+            "List a branch's commits (default `main`), newest first, each with its `graph_commit_id`, parents, actor and time. Pass `limit` to page a long history: the page names `head_commit_id` and continues with its `next_page_token` as `page_token`, keeping the same `branch`. Pass `listing` as `unpublished` for the proposals written `as commit` that await `commits_publish`, or `unattached` for snapshots written `as unattached branch`, whose recorded target is `branch`; these listings take no `limit` or `page_token`.",
+        )],
         input: commits_list_schema,
         output: None,
         effect: Effect::Read,
@@ -129,7 +173,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "commits_get",
         title: "Get a commit",
-        description: "Return one commit by its `graph_commit_id`.",
+        description: &[Text("Return one commit by its `graph_commit_id`.")],
         input: commit_schema,
         output: None,
         effect: Effect::Read,
@@ -137,7 +181,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "commits_changes",
         title: "A commit's entity changes",
-        description: "Return one bounded page of a commit's exact entity changes relative to its first parent, each with `before` and `after`. Filter by `kind`, `type` and `op`. Continue with the returned `next_page_token` as `page_token`, keeping the same filters; a page token is not a feed cursor.",
+        description: &[Text(
+            "Return one bounded page of a commit's exact entity changes relative to its first parent, each with `before` and `after`. Filter by `kind`, `type` and `op`. Continue with the returned `next_page_token` as `page_token`, keeping the same filters; a page token is not a feed cursor.",
+        )],
         input: commit_changes_schema,
         output: None,
         effect: Effect::Read,
@@ -145,7 +191,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "diff",
         title: "Diff two read targets",
-        description: "Return one bounded page of the net entity changes between `from` and `to`, each a branch name (its head now) or a graph commit id (published, an unpublished proposal or an unattached snapshot), each change with `before` and `after`. The first page names the two commits it resolved; continue with the returned `next_page_token` as `page_token`, keeping the other arguments, and every page answers for those same commits. Filter by `kind`, `type` and `op`. A side you cannot read is reported as not found.",
+        description: &[Text(
+            "Return one bounded page of the net entity changes between `from` and `to`, each a branch name (its head now) or a graph commit id (published, an unpublished proposal or an unattached snapshot), each change with `before` and `after`. The first page names the two commits it resolved; continue with the returned `next_page_token` as `page_token`, keeping the other arguments, and every page answers for those same commits. Filter by `kind`, `type` and `op`. A side you cannot read is reported as not found.",
+        )],
         input: diff_schema,
         output: None,
         effect: Effect::Read,
@@ -153,7 +201,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "changes_poll",
         title: "Poll a change feed",
-        description: "Read one bounded page of a branch's change feed (default `main`), at least once, in first-parent commit order. Start from `start` (`now`, the default, `beginning`, or `after:<commit id>`), a durable `cursor` from an earlier terminal page, or a `page_token`; these three are mutually exclusive. Keep filters unchanged across pages. Only a terminal page's `cursor` is durable: apply its complete commit blocks idempotently by `graph_commit_id`, then keep the cursor. A 410 `change_feed_gap` needs a new baseline, a full snapshot stream that MCP does not carry: capture it over HTTP or with the CLI.",
+        description: &[Text(
+            "Read one bounded page of a branch's change feed (default `main`), at least once, in first-parent commit order. Start from `start` (`now`, the default, `beginning`, or `after:<commit id>`), a durable `cursor` from an earlier terminal page, or a `page_token`; these three are mutually exclusive. Keep filters unchanged across pages. Only a terminal page's `cursor` is durable: apply its complete commit blocks idempotently by `graph_commit_id`, then keep the cursor. A 410 `change_feed_gap` needs a new baseline, a full snapshot stream that MCP does not carry: capture it over HTTP or with the CLI.",
+        )],
         input: changes_poll_schema,
         output: None,
         effect: Effect::Read,
@@ -161,7 +211,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "blobs_stat",
         title: "Describe a Blob cell",
-        description: "Describe one non-null Blob cell, selected by `entity` (`node` or `edge`), `type`, `id` and `property`, on `branch` (default `main`) or at a `snapshot`, never both: a `managed` value's `size` and strong `etag`, or an `external` value's `uri`, with the resolved `target`. Reads no payload bytes, and payloads are not served over MCP. A null cell or an unknown entity is not found.",
+        description: &[Text(
+            "Describe one non-null Blob cell, selected by `entity` (`node` or `edge`), `type`, `id` and `property`, on `branch` (default `main`) or at a `snapshot`, never both: a `managed` value's `size` and strong `etag`, or an `external` value's `uri`, with the resolved `target`. Reads no payload bytes, and payloads are not served over MCP. A null cell or an unknown entity is not found.",
+        )],
         input: blobs_stat_schema,
         output: None,
         effect: Effect::Read,
@@ -169,7 +221,13 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "mutate",
         title: "Run a GQ mutation",
-        description: "Run a GQ mutation (`insert`, `update`, `delete`) on `branch` (default `main`) as one atomic commit, with every value passed as a declared, typed parameter in `params`. To run a stored mutation from `queries` instead, pass its `name` and `params` without `query`. For read-modify-write, pass the `graph_commit_id` of your read as `if_graph_commit`: if the branch moved, the call fails with 412 and nothing is written; read again and reconsider, never retry without it. Returns affected counts and the exact `commit` (null for a successful no-op). Also runs `branch create`, `branch delete` and `branch merge` statements, sent without `branch`, `name` or `params`.",
+        description: &[
+            Text("Run a mutation in GQ, the Omnigraph query language"),
+            Guide("docs/user/mutations/index.md"),
+            Text(
+                ": `insert`, `update` or `delete` on `branch` (default `main`) as one atomic commit, with every value passed as a declared, typed parameter in `params`. To run a stored mutation from `queries` instead, pass its `name` and `params` without `query`. For read-modify-write, pass the `graph_commit_id` of your read as `if_graph_commit`: if the branch moved, the call fails with 412 and nothing is written; read again and reconsider, never retry without it. Returns affected counts and the exact `commit` (null for a successful no-op). Also runs `branch create`, `branch delete` and `branch merge` statements, sent without `branch`, `name` or `params`.",
+            ),
+        ],
         input: mutate_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
@@ -177,7 +235,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "load",
         title: "Load NDJSON",
-        description: "Load NDJSON records (`{\"type\": \"<Type>\", \"data\": {...}}` per line) into `branch` (default `main`) as one commit. `mode`: `merge` upserts by key, `append` refuses an existing key, `overwrite` replaces the supplied types. Without `from` the branch must exist; with `from` a missing branch is created from it. The whole call must fit in 64 KiB; split larger loads into separate commits.",
+        description: &[Text(
+            "Load NDJSON records (`{\"type\": \"<Type>\", \"data\": {...}}` per line) into `branch` (default `main`) as one commit. `mode`: `merge` upserts by key, `append` refuses an existing key, `overwrite` replaces the supplied types. Without `from` the branch must exist; with `from` a missing branch is created from it. The whole call must fit in 64 KiB; split larger loads into separate commits.",
+        )],
         input: load_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
@@ -185,7 +245,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "blobs_clear",
         title: "Clear a Blob cell",
-        description: "Set one nullable Blob cell, selected by `entity` (`node` or `edge`), `type`, `id` and `property`, to null on `branch` (default `main`) as one commit. A cell that is already null publishes nothing and returns `commit: null`. Pass the `etag` from `blobs_stat` as `if_match`, or `*` to require a value: if the cell no longer matches, the call fails with 412 and nothing is written.",
+        description: &[Text(
+            "Set one nullable Blob cell, selected by `entity` (`node` or `edge`), `type`, `id` and `property`, to null on `branch` (default `main`) as one commit. A cell that is already null publishes nothing and returns `commit: null`. Pass the `etag` from `blobs_stat` as `if_match`, or `*` to require a value: if the cell no longer matches, the call fails with 412 and nothing is written.",
+        )],
         input: blobs_clear_schema,
         output: None,
         effect: Effect::Destructive { idempotent: true },
@@ -193,7 +255,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "branches_create",
         title: "Create a branch",
-        description: "Create branch `name` from `from` (default `main`). Fails with 409 if it already exists.",
+        description: &[Text(
+            "Create branch `name` from `from` (default `main`). Fails with 409 if it already exists.",
+        )],
         input: branch_create_schema,
         output: None,
         effect: Effect::Additive,
@@ -201,7 +265,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "branches_delete",
         title: "Delete a branch",
-        description: "Delete branch `name`. Its commits stay reachable only through other branches. Fails with 404 if it does not exist.",
+        description: &[Text(
+            "Delete branch `name`. Its commits stay reachable only through other branches. Fails with 404 if it does not exist.",
+        )],
         input: branch_delete_schema,
         output: None,
         effect: Effect::Destructive { idempotent: true },
@@ -209,7 +275,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "branches_merge",
         title: "Merge a branch",
-        description: "Merge branch `source` into `target` (default `main`). A merge that publishes returns its exact commit; an already up-to-date merge returns none. A conflict fails with 409 and `merge_conflicts`, writing nothing. To preview, run `branch merge <source> into <target> dry run` with `query`.",
+        description: &[Text(
+            "Merge branch `source` into `target` (default `main`). A merge that publishes returns its exact commit; an already up-to-date merge returns none. A conflict fails with 409 and `merge_conflicts`, writing nothing. To preview, run `branch merge <source> into <target> dry run` with `query`.",
+        )],
         input: branch_merge_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
@@ -217,7 +285,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "commits_publish",
         title: "Publish a proposal",
-        description: "Publish an unpublished commit, one written `as commit` (list them with `commits_list` and `listing: unpublished`), onto the branch it recorded, and return it as published. A commit already published is returned as it stands. If that branch moved past the commit's parent, the call fails with 412 and the commit can only be dropped. An unattached snapshot never publishes (409).",
+        description: &[Text(
+            "Publish an unpublished commit, one written `as commit` (list them with `commits_list` and `listing: unpublished`), onto the branch it recorded, and return it as published. A commit already published is returned as it stands. If that branch moved past the commit's parent, the call fails with 412 and the commit can only be dropped. An unattached snapshot never publishes (409).",
+        )],
         input: commit_schema,
         output: None,
         effect: Effect::Destructive { idempotent: true },
@@ -225,7 +295,9 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "commits_drop",
         title: "Drop a proposal or snapshot",
-        description: "Drop an unpublished commit or an unattached snapshot by its `graph_commit_id`, together with every unattached descendant. Irreversible. A published commit is never dropped (409). Returns an empty object.",
+        description: &[Text(
+            "Drop an unpublished commit or an unattached snapshot by its `graph_commit_id`, together with every unattached descendant. Irreversible. A published commit is never dropped (409). Returns an empty object.",
+        )],
         input: commit_schema,
         output: None,
         effect: Effect::Destructive { idempotent: true },
@@ -236,18 +308,34 @@ pub(super) fn spec(name: &str) -> Option<&'static ToolSpec> {
     TOOLS.iter().find(|spec| spec.name == name)
 }
 
-/// The instructions every MCP session receives.
-pub(super) const INSTRUCTIONS: &str = concat!(
+/// The fixed part of the instructions every MCP session receives.
+const INSTRUCTIONS_HEAD: &str = concat!(
     "Omnigraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n",
     "1. Call `graphs` for who you are and the ids of the graphs your credential holds any permission on; any other graph is not found. `access` says what you may do on one.\n",
     "2. Call `schema` for the graph (or read `omnigraph://graphs/{graph}/schema`) before writing a query: it declares the types, properties, keys and edges a query may name.\n",
     "3. Prefer a stored read: `queries` lists stored queries with typed parameters, and `query` runs one by `name`.\n",
     "4. Otherwise write a GQ read and pass it to `query` as `query`, with every value passed as a declared, typed parameter. `query` refuses mutations.\n",
     "Writes: `mutate`, `load`, `blobs_clear`, `branches_create`, `branches_delete`, `branches_merge`, `commits_publish` and `commits_drop` each publish at most one commit. `mutate` with `name` and no `query` runs a stored mutation from `queries`. For read-modify-write, pass your read's `graph_commit_id` to `mutate` as `if_graph_commit`; a 412 means nothing was written. The server never retries a write. A result with `outcome_unknown`, or no response at all (a client timeout, a cancellation or a dropped connection), means the write may or may not have happened: read the target or list its commits and reconcile before replaying, and replay a `mutate` with `if_graph_commit`. Schema and deployment changes are operator-owned and not available here.\n",
-    "Reads carry their `graph_commit_id`. A result is limited to 1 MiB and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
 );
 
-pub(super) fn tools() -> Vec<Tool> {
+/// The instructions every MCP session receives, built once at boot from the
+/// settings: the read budget and, with a setup URL, what to do when `graphs`
+/// is empty.
+pub(super) fn instructions(settings: &McpSettings) -> String {
+    let mut text = String::from(INSTRUCTIONS_HEAD);
+    text.push_str(&format!(
+        "Reads carry their `graph_commit_id`. A read's result is limited to {}, its text copy included, and a read to 30 seconds. A broader read is refused with `result_too_large`, never cut short: narrow it with filters, a lower `limit` or fewer returned properties. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
+        settings.read_budget,
+    ));
+    if settings.setup_url.is_some() {
+        text.push_str("\nIf `graphs` succeeds with no graphs and returns a `setup` link, tell the user they have no graph yet and offer that link to create one. Creation happens on that page, not through these tools. Don't say a graph exists until `graphs` lists it; when the user says they created one, call `graphs` again.");
+    }
+    text
+}
+
+/// The tools, their guide links naming `docs_revision`, the release tag or
+/// commit the build was made from; a build with none links no page.
+pub(super) fn tools(docs_revision: Option<&str>) -> Vec<Tool> {
     TOOLS
         .iter()
         .map(|spec| {
@@ -262,11 +350,18 @@ pub(super) fn tools() -> Vec<Tool> {
                     .destructive(true)
                     .idempotent(idempotent),
             };
-            let description = if spec.writes() {
-                format!("{}{WRITE_CONTRACT}", spec.description)
-            } else {
-                spec.description.to_owned()
-            };
+            let mut description: String = spec
+                .description
+                .iter()
+                .map(|part| match (part, docs_revision) {
+                    (Text(text), _) => (*text).to_owned(),
+                    (Guide(page), Some(revision)) => format!(" ({})", guide_url(revision, page)),
+                    (Guide(_), None) => String::new(),
+                })
+                .collect();
+            if spec.writes() {
+                description.push_str(WRITE_CONTRACT);
+            }
             let mut tool = Tool::new(spec.name, description, object((spec.input)()))
                 .with_title(spec.title)
                 .with_annotations(annotations.open_world(false));
@@ -585,6 +680,12 @@ pub(super) fn graphs_output_schema() -> Value {
                 "properties": {"graph_id": {"type": "string"}, "display_name": {"type": "string"}},
                 "required": ["graph_id", "display_name"],
             }},
+            "setup": {
+                "type": "object",
+                "description": "Present only on a successful empty list when the operator configured a setup page.",
+                "properties": {"message": {"type": "string"}, "url": {"type": "string", "format": "uri"}},
+                "required": ["message", "url"],
+            },
         },
         "required": ["graphs"],
     })
