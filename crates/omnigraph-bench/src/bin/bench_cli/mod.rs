@@ -179,9 +179,13 @@ pub fn load_for(args: &CatalogArgs, selector: Option<&str>) -> Result<Catalog, V
         format!("unknown suite or scenario '{name}' in {paths}"),
     ))
 }
+/// The JSON a failed catalog command reports, for a caller that picks the stream.
+pub fn failure_report(diagnostics: &[Diagnostic]) -> Value {
+    json!({"cli_output_version":1,"ok":false,"diagnostics":diagnostics})
+}
 pub fn failure(diagnostics: Vec<Diagnostic>, json_output: bool) -> ExitCode {
     if json_output {
-        print_json_success(&json!({"cli_output_version":1,"ok":false,"diagnostics":diagnostics}));
+        print_json_success(&failure_report(&diagnostics));
         ExitCode::FAILURE
     } else {
         print_diagnostics(&diagnostics)

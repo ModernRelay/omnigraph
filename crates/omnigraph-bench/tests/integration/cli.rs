@@ -1662,3 +1662,93 @@ fn json_failures_remain_json_for_non_utf8_archive_and_projection_paths() {
         );
     }
 }
+
+#[test]
+fn projection_export_reports_on_the_stream_its_rows_do_not_use() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = directory.path().join("store");
+    fs::create_dir_all(store.join("records")).expect("store records");
+    fs::write(
+        store
+            .join("records")
+            .join(format!("{}.json", "0".repeat(64))),
+        b"{}",
+    )
+    .expect("a record whose bytes do not hash to its name");
+    let store = store.to_str().expect("UTF-8 store path");
+    let absent = directory.path().join("absent");
+    let absent = absent.to_str().expect("UTF-8 catalog path");
+    let export = |arguments: &[&str]| {
+        Command::cargo_bin("omnigraph-bench")
+            .expect("benchmark binary")
+            .args(["projection", "export", "--json"])
+            .args(arguments)
+            .output()
+            .expect("run projection export")
+    };
+
+    for (arguments, pointer, expected) in [
+        (
+            vec!["--store", store],
+            "/error/code",
+            serde_json::json!("export_record_unreadable"),
+        ),
+        (
+            vec!["--store", "gs://bucket/prefix"],
+            "/diagnostics/0/path",
+            serde_json::json!("store"),
+        ),
+        (
+            vec!["--store", store, "--catalog", absent],
+            "/cli_output_version",
+            serde_json::json!(1),
+        ),
+    ] {
+        let output = export(&arguments);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "stdout carries rows alone: {output:?}"
+        );
+        let failure: serde_json::Value = serde_json::from_slice(&output.stderr)
+            .unwrap_or_else(|error| panic!("failure must be JSON on stderr: {error}; {output:?}"));
+        assert_eq!(failure["ok"], false, "{arguments:?}");
+        assert_eq!(failure.pointer(pointer), Some(&expected), "{failure}");
+    }
+
+    let rows = directory.path().join("rows.jsonl");
+    let output = export(&[
+        "--store",
+        store,
+        "--out",
+        rows.to_str().expect("UTF-8 out path"),
+    ]);
+    assert!(!output.status.success(), "{output:?}");
+    let failure: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("with --out the report is on stdout");
+    assert_eq!(failure["error"]["code"], "export_record_unreadable");
+    assert!(
+        fs::read(&rows).expect("the --out file").is_empty(),
+        "an export that stops writes no row"
+    );
+
+    let empty = directory.path().join("empty");
+    fs::create_dir_all(empty.join("records")).expect("empty store records");
+    let catalog = repository_root().join("benchmarks");
+    let output = export(&[
+        "--store",
+        empty.to_str().expect("UTF-8 store path"),
+        "--catalog",
+        catalog.to_str().expect("UTF-8 catalog path"),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let exported = String::from_utf8(output.stdout).expect("UTF-8 rows");
+    assert!(exported.lines().count() > 0, "the catalog alone has rows");
+    for line in exported.lines() {
+        let row: serde_json::Value = serde_json::from_str(line).expect("a row is JSON");
+        assert!(row.get("type").or(row.get("edge")).is_some(), "{line}");
+    }
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("the summary is JSON on stderr");
+    assert_eq!(summary["rows"], exported.lines().count(), "{summary}");
+}

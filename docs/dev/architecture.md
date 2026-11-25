@@ -178,9 +178,10 @@ for frozen destinations; they cannot return routing authority. Managed acquisiti
 exchanges control access for a verified cluster-bound data credential before
 constructing the common served `GraphClient`. There is no per-command managed
 allowlist or control credential at a graph endpoint. Real direct-only capability
-boundaries remain in dispatch. Registered direct targets accept `file://` only; an inline `s3://` root reaches
-stopped-writer deployment commands, direct maintenance, and clone roots under
-an `s3://` base;
+boundaries remain in dispatch. Registered direct targets accept `file://` only; an inline `s3://` address reaches
+stopped-writer deployment commands, direct maintenance, clone roots under
+an `s3://` base and, as a graph, the direct reads and `init`, `schema apply`
+and `load` (`planes::admits_inline_s3_graph`);
 engine/server cloud-storage constructors retain their independent contracts.
 Acquired credentials retain their typed binding and expiry through client
 construction. HTTP dispatch checks expiry after public discovery and before
