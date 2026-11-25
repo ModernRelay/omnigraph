@@ -1351,7 +1351,9 @@ fn live_policy_grants_revocations_and_management_handoff(
     let original_management = fs::read_to_string(&management_path).unwrap();
 
     let before = live_snapshot(server, "knowledge");
-    live_policy_expect_forbidden(&mut live_policy_mutation(server, "PolicyBeforeGrant"));
+    // act-reader holds no grant on the graph yet, so the graph does not exist
+    // for it.
+    live_policy_expect_not_found(&mut live_policy_mutation(server, "PolicyBeforeGrant"));
     assert_eq!(live_snapshot(server, "knowledge"), before);
     let before_status = live_policy_status(server, "live-deployment-token");
 
@@ -1588,6 +1590,13 @@ fn live_policy_expect_forbidden(command: &mut assert_cmd::Command) {
         message.contains("forbidden") || message.contains("policy denied"),
         "expected an authorization refusal, got {error}"
     );
+}
+
+fn live_policy_expect_not_found(command: &mut assert_cmd::Command) {
+    let output = output_failure(command);
+    let error = parse_stdout_json(&output);
+    assert_eq!(error["code"], "not_found", "{error}");
+    assert_eq!(error["http_status"], 404, "{error}");
 }
 
 fn live_policy_status(server: &TestServer, token: &str) -> serde_json::Value {

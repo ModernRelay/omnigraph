@@ -1,6 +1,6 @@
 # Open Studio
 
-`omnigraph studio` opens [OmniGraph Studio](https://github.com/ModernRelay/omnigraph-studio)
+`omnigraph studio` opens [Omnigraph Studio](https://github.com/ModernRelay/omnigraph-studio)
 on a configured server target, prints the link it opened, and exits:
 
 ```bash
@@ -55,7 +55,7 @@ target changed since the link was made.
 With `--json` the command prints the link and the facts it was built from:
 
 ```json
-{"protocol":1,"target":"staging","binding":"sha256:…","home":"sha256:…","link":"omnigraph-studio://open?target=staging&binding=sha256:…&home=sha256:…"}
+{"protocol":1,"target":"staging","binding":"sha256:…","home":"sha256:…","link":"omnigraph-studio://open?target=staging&binding=sha256:…&home=sha256:…&graph=knowledge"}
 ```
 
 `protocol` is `protocols.studio` in [`omnigraph version --json`](../install.md#verify).

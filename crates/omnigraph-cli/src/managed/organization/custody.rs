@@ -150,6 +150,16 @@ impl Journal {
         })
     }
 
+    /// The private directory this identity's custody files share, under the lock.
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
+    /// The API, organization, principal and owning profile every record binds.
+    pub fn identity(&self) -> [&str; 4] {
+        [&self.api, &self.organization, &self.principal, &self.owner]
+    }
+
     pub fn retained(&self, key: &str, operation: &Operation) -> Result<Option<ExactRequest>> {
         if let Some(record) = self
             .records

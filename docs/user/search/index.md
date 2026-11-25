@@ -1,6 +1,6 @@
 # Search
 
-OmniGraph combines vector, full-text, and graph patterns in one `.gq` query.
+Omnigraph combines vector, full-text, and graph patterns in one `.gq` query.
 Search expressions can filter or order a matched node set; a `limit` is required
 for nearest-neighbor ordering.
 
@@ -53,7 +53,7 @@ query similar($q: Vector(4)) {
 }
 ```
 
-Raw vectors are ranked with L2 distance. Vectors produced by OmniGraph's
+Raw vectors are ranked with L2 distance. Vectors produced by Omnigraph's
 embedding client are normalized, so L2 and cosine similarity produce the same
 ordering for those generated vectors. See [Embeddings](embeddings.md) for text
 queries and provider configuration.
@@ -231,7 +231,7 @@ has no `ranking`.
 ## Indexes
 
 `@index` and `@key` declare index intent. For a single-property node declaration,
-OmniGraph currently creates:
+Omnigraph currently creates:
 
 | Property | Index use |
 |---|---|
@@ -261,7 +261,10 @@ omnigraph optimize --target ./graph.omni
 ```
 
 after a large load or merge, and on a regular maintenance cadence, to refresh
-coverage and compact data on `main`. On another branch, `index build` builds the
+BTREE and vector coverage and compact data on `main`. Full-text coverage needs
+`omnigraph index rebuild --kind full-text`; see
+[Rebuild full-text indexes](../operations/maintenance.md#rebuild-full-text-indexes).
+On another branch, `index build` builds the
 branch's missing indexes and refreshes lagging BTREE and vector coverage; see
 [Build indexes](../operations/maintenance.md#build-indexes). An empty vector property remains pending until it has a
 non-null vector to index.

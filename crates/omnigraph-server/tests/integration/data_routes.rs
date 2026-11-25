@@ -1785,6 +1785,81 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     );
 }
 
+/// A load the engine refuses before its first effect answers a plain code,
+/// with no typed details: a malformed or unknown row, a missing key or a
+/// missing endpoint. Nothing ran, so on either load route the
+/// answer is no effects and a fixed request, never a reconcile, and the head
+/// does not move. After a fork of a missing branch the same refusal follows
+/// that fork's publication, which stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn load_refused_before_its_first_effect_reports_no_effects() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let head = main_head_commit_id(&app).await;
+    let ndjson = |query: &str, data: &str| {
+        Request::builder()
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .uri(g(&format!("/load/ndjson?{query}")))
+            .method(Method::POST)
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from(data.to_string()))
+            .unwrap()
+    };
+    let refused = [
+        ("{not json", "invalid"),
+        (r#"{"type":"Nope","data":{}}"#, "unknown node type 'Nope'"),
+        (r#"{"type":"Person","data":{"age":3}}"#, "'name'"),
+        (
+            r#"{"edge":"Knows","from":"nobody","to":"nada","data":{}}"#,
+            "'nobody' not found",
+        ),
+    ];
+    for (data, needle) in refused {
+        for request in [
+            ndjson("branch=main&mode=append", data),
+            json_post(
+                "/load",
+                &json!({"branch": "main", "mode": "append", "data": data}),
+            ),
+        ] {
+            let path = request.uri().path().to_string();
+            let (status, body) = json_response(&app, request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {data}: {body}");
+            assert_eq!(body["code"], "bad_request", "{path} {data}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains(needle),
+                "{path} {data}: {body}"
+            );
+            assert_eq!(
+                body["disposition"],
+                json!({"effects": "none", "action": "fix"}),
+                "{path} {data}: {body}"
+            );
+        }
+    }
+    assert_eq!(main_head_commit_id(&app).await, head);
+
+    let (status, body) = json_response(
+        &app,
+        ndjson("branch=forked&from=main&mode=append", "{not json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["disposition"],
+        json!({"effects": "partial", "action": "fix"}),
+        "the fork published before the rows: {body}"
+    );
+    let (_, branches) =
+        json_response(&app, json_post("/query", &json!({"query": "branch list"}))).await;
+    assert!(
+        branches["rows"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name": "forked"})),
+        "{branches}"
+    );
+}
+
 /// Whether a load forked its branch is the engine's fact, not the route's. A
 /// branch deleted after the route authorized the load, while its body is still
 /// arriving, is forked by the load itself, and a refusal of the rows then
@@ -2707,6 +2782,192 @@ async fn branch_merge_receipts_keep_own_publication_when_a_later_writer_finishes
     }
 }
 
+/// A client that lost the response to a merge and sends the same merge again
+/// while the first is still running must not merge twice. The first request
+/// is held after its detached table effects, right before it publishes. The
+/// resend is admitted meanwhile and has to wait on the target branch gate the
+/// first holds through publication, then finds the source already merged.
+/// Both publishing routes: a fast-forward (main unmoved) and a three-way merge
+/// (main moved). A `.gqt` concurrent block cannot pin this: its host runs a
+/// session again when its write authority changed, while the server never
+/// retries, and its expect names no merge outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_identical_merges_publish_once_issue_415() {
+    use omnigraph::seams::catalog::{
+        BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT, GATE_BRANCH_ACQUIRE, GATE_BRANCH_HOLD,
+    };
+    use std::sync::atomic::AtomicU64;
+
+    for outcome in ["fast_forward", "merged"] {
+        let (_temp, app) = app_for_loaded_graph().await;
+        let (status, body) = json_response(
+            &app,
+            json_post("/mutate", &json!({"query": "branch create feature"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for (branch, name, write) in [
+            ("feature", "Source", true),
+            ("main", "Target", outcome == "merged"),
+        ] {
+            if write {
+                let (status, body) = json_response(
+                    &app,
+                    json_post(
+                        "/mutate",
+                        &json!({
+                            "query": MUTATION_QUERIES,
+                            "name": "insert_person",
+                            "params": {"name": name, "age": 31},
+                            "branch": branch
+                        }),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+        }
+        let commits = |app: axum::Router| async move {
+            let request = Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(g("/commits?branch=main"))
+                .body(Body::empty())
+                .unwrap();
+            json_response(&app, request).await.1["commits"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let people = |app: axum::Router| async move {
+            let (status, rows) = json_response(
+                &app,
+                json_post(
+                    "/query",
+                    &json!({"query": "query people() { match { $p: Person } return { $p.name } }"}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{rows}");
+            rows["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["p.name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let main_before = commits(app.clone()).await;
+        let people_before = people(app.clone()).await;
+        assert!(!people_before.iter().any(|name| name == "Source"));
+
+        // Each request runs on a thread of its own, so a seam decision can
+        // pick out one request's crossings.
+        let spawn_merge = |app: axum::Router| {
+            let (start, started) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                started.recv().unwrap();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(json_response(
+                        &app,
+                        json_post(
+                            "/branches/merge",
+                            &json!({"source": "feature", "target": "main"}),
+                        ),
+                    ))
+            });
+            (start, thread)
+        };
+
+        let (first_start, first) = spawn_merge(app.clone());
+        let hold = Arc::new(omnigraph::seams::Hold::default());
+        let hold_guard =
+            BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.install(Arc::new(MergeReturnHold {
+                thread: first.thread().id(),
+                hold: hold.clone(),
+            }));
+        first_start.send(()).unwrap();
+        hold.wait_until_reached();
+        assert_eq!(
+            commits(app.clone()).await,
+            main_before,
+            "the held merge has not published"
+        );
+
+        // The resend: count its branch-gate acquisitions and holds. An
+        // acquisition without its hold is a wait on a gate.
+        let (second_start, second) = spawn_merge(app.clone());
+        let second_thread = second.thread().id();
+        let acquires = Arc::new(AtomicU64::new(0));
+        let holds = Arc::new(AtomicU64::new(0));
+        let acquire_guard = GATE_BRANCH_ACQUIRE.observe({
+            let acquires = acquires.clone();
+            move || {
+                if std::thread::current().id() == second_thread {
+                    acquires.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let gate_hold_guard = GATE_BRANCH_HOLD.observe({
+            let holds = holds.clone();
+            move || {
+                if std::thread::current().id() == second_thread {
+                    holds.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        let waiting = || acquires.load(Ordering::SeqCst) > holds.load(Ordering::SeqCst);
+        second_start.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !waiting() {
+            assert!(
+                std::time::Instant::now() < deadline && !second.is_finished(),
+                "{outcome}: the resend never waited on a branch gate \
+                 (finished: {})",
+                second.is_finished()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Still waiting a while later: blocked behind the held merge, not
+        // between an acquisition and its hold.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            waiting() && !second.is_finished(),
+            "{outcome}: the resend ran past the target gate while the first merge held it"
+        );
+
+        hold.release();
+        let (status, first_receipt) = first.join().unwrap();
+        assert!(!hold.timed_out(), "the test must release the reached hold");
+        assert_eq!(status, StatusCode::OK, "{outcome}: {first_receipt}");
+        let (status, second_receipt) = second.join().unwrap();
+        drop((hold_guard, acquire_guard, gate_hold_guard));
+        assert_eq!(status, StatusCode::OK, "{outcome}: {second_receipt}");
+
+        assert_eq!(first_receipt["outcome"], outcome, "{first_receipt}");
+        assert_eq!(
+            second_receipt["outcome"], "already_up_to_date",
+            "{outcome}: the resend must find the source merged: {second_receipt}"
+        );
+        assert_eq!(second_receipt["commit"], Value::Null, "{second_receipt}");
+        let main_after = commits(app.clone()).await;
+        assert_eq!(
+            main_after.len(),
+            main_before.len() + 1,
+            "{outcome}: one merge publication"
+        );
+        assert_eq!(main_after[0], first_receipt["commit"]);
+        let people_after = people(app.clone()).await;
+        assert_eq!(
+            people_after.iter().filter(|name| *name == "Source").count(),
+            1,
+            "{outcome}: the merged row lands once: {people_after:?}"
+        );
+        assert_eq!(people_after.len(), people_before.len() + 1);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_statements_dispatch_to_their_route_bodies() {
     let (_temp, app) = app_for_loaded_graph().await;
@@ -2936,6 +3197,11 @@ async fn load_csv_statement_is_denied_served_without_a_policy_and_moves_no_head(
         assert!(
             error.contains("ingress is denied for this graph"),
             "{request}: {error}"
+        );
+        assert_eq!(
+            body["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{request}: {body}"
         );
     }
     assert_eq!(
@@ -3189,9 +3455,20 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn parse_error_precedes_policy_denial_on_every_door() {
+    // `act-writer` may change unprotected branches and read none, so its
+    // reads reach the route and are refused there; `act-nobody` holds no
+    // grant, so the graph does not exist for it and nothing is parsed.
+    let policy = POLICY_YAML.replace(
+        "  admins: [act-ragnor]\n",
+        "  admins: [act-ragnor]\n  writers: [act-writer]\n",
+    ) + "  - id: writers-change\n    allow:\n      actors: { group: writers }\n      actions: [change]\n      branch_scope: unprotected\n";
     let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
-        &[("act-bruno", "team-token"), ("act-nobody", "nobody-token")],
-        POLICY_YAML,
+        &[
+            ("act-bruno", "team-token"),
+            ("act-writer", "writer-token"),
+            ("act-nobody", "nobody-token"),
+        ],
+        &policy,
     )
     .await;
     let send = |path: &str, token: &str, body: Value, expected_head: bool| {
@@ -3215,8 +3492,15 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         "params": {"name": "Nia", "age": 20},
         "branch": "main"
     });
+    for body in [
+        read.clone(),
+        json!({"query": "not gq at all", "branch": "main"}),
+    ] {
+        let (status, out) = json_response(&app, send("/query", "nobody-token", body, false)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{out}");
+    }
     let denied = [
-        ("/query", "nobody-token", read.clone(), false),
+        ("/query", "writer-token", read.clone(), false),
         ("/mutate", "team-token", write.clone(), false),
         ("/mutate/if-graph-commit", "team-token", write, true),
     ];

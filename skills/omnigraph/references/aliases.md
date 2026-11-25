@@ -3,7 +3,7 @@
 An operator alias binds a personal name to a stored read query on a registered
 served target. The registry remains the team's deployed contract; see
 [stored queries](stored-queries.md). The primary
-[operator reference](../../../docs/user/cli/targets.md#read-aliases) owns the grammar.
+[operator reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#read-aliases) owns the grammar.
 
 Add this mapping to a complete `version: 1` operator document:
 
@@ -45,4 +45,4 @@ conditional mutation; JSONL metadata does not carry those fields. See
 Never put credentials or helper definitions in aliases. Authentication comes
 from the target's owner-local provider, with no source fallback. Validation and
 inspection never run helpers; execution can acquire the selected credential.
-See [credentials](../../../docs/user/cli/targets.md#manage-credentials).
+See [credentials](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#manage-credentials).

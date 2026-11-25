@@ -28,7 +28,7 @@ use crate::{FrozenDirectory, ReadThroughStore};
 /// S3 fixture's base and clone roots.
 pub fn s3_prefix_store(uri: &str) -> crate::Result<Arc<dyn ObjectStore>> {
     let location = crate::parse_s3_uri(uri)?;
-    let bucket = crate::build_s3_store(crate::s3_bucket_builder(&location.bucket), uri)?;
+    let bucket = crate::s3_store(&location.bucket, uri, |builder| builder)?;
     Ok(Arc::new(PrefixStore::new(
         bucket,
         Path::from(location.key.trim_end_matches('/')),

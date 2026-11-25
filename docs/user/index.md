@@ -1,6 +1,6 @@
-# OmniGraph user guide
+# Omnigraph user guide
 
-OmniGraph is a typed property-graph engine with atomic graph commits,
+Omnigraph is a typed property-graph engine with atomic graph commits,
 versioned branches, full-text and vector search, and local or object-storage
 deployment.
 
@@ -37,8 +37,10 @@ deployment.
 - [Sign in to a managed profile](cli/login.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)
+- [Managed M2M applications for unattended workloads](cli/managed-m2m-applications.md)
 - [HTTP server](operations/server.md)
 - [MCP](operations/mcp.md)
+- [Connect Claude to Omnigraph Cloud](operations/claude.md)
 - [Troubleshooting](operations/troubleshooting.md)
 
 ## Operate a deployment

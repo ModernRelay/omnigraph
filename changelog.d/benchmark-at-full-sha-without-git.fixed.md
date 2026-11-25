@@ -1,0 +1,1 @@
+- `omnigraph-bench run --at <sha>=<path>` takes a full lowercase 40-character commit sha as written, so it runs on a host with no `git` and no repository.

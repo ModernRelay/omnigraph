@@ -88,6 +88,24 @@ async fn branch_claim_adds_no_request_to_a_write_on_s3() {
     helpers::cost::assert_branch_claim_adds_no_request_to_a_write(&unclaimed, &held).await;
 }
 
+/// Issue 1252 on an object store: the sweep's delete requests beyond one per
+/// removed manifest stay flat as the freed files grow. The local twin is
+/// `maintenance::cleanup_sweep_deletes_files_in_one_stream_per_group_issue_1252`.
+#[tokio::test]
+async fn cleanup_sweep_delete_requests_on_s3_issue_1252() {
+    let mut curve = Vec::new();
+    for commits in [4usize, 16] {
+        let Some(db) = s3_graph(&format!("cleanup-sweep-{commits}")).await else {
+            eprintln!(
+                "SKIP cleanup_sweep_delete_requests_on_s3_issue_1252: OMNIGRAPH_S3_TEST_BUCKET unset"
+            );
+            return;
+        };
+        curve.push(helpers::cost::measure_cleanup_after_inserts(&db, commits).await);
+    }
+    helpers::cost::assert_sweep_delete_requests_flat_in_files(&curve);
+}
+
 /// RFC-033's external-source cost gate runs against the real S3-compatible
 /// provider. A fixed batch of normalized aliases must cause one source metadata
 /// request and one payload read, not one cold setup/HEAD/GET per row.

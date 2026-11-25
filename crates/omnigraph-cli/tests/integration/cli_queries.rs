@@ -1672,6 +1672,9 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
         json.get("code").is_none(),
         "an embedded refusal has no HTTP code: {json}"
     );
+    // The same source fails the same way again, on either transport.
+    let fix = serde_json::json!({"effects": "none", "action": "fix"});
+    assert_eq!(json["disposition"], fix, "{json}");
 
     let jsonl = output_failure(
         embedded("query", &graph)
@@ -1772,6 +1775,7 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
             .arg("--json"),
     ));
     assert_eq!(json["code"], "bad_request");
+    assert_eq!(json["disposition"], fix, "{json}");
     assert_eq!(json["diagnostic"]["code"], "Q002");
     assert_eq!(json["diagnostic"]["suggestion"], suggestion);
     assert_eq!(json["diagnostic"]["fix"], "query name()");

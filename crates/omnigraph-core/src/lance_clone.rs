@@ -300,7 +300,7 @@ pub async fn create_branch_tree(
     source_version: u64,
     binding: Option<&crate::storage::CapturedStorageBinding>,
 ) -> Result<Dataset> {
-    use lance::dataset::WriteDestination;
+    use crate::lance_commit::CommitDestination;
     use lance::dataset::transaction::{Operation, Transaction};
 
     let mut store_params = source.store_params().cloned().unwrap_or_default();
@@ -333,9 +333,10 @@ pub async fn create_branch_tree(
     CLONE_CONTEXT
         .scope(
             context,
-            crate::lance_commit::commit_builder(WriteDestination::Uri(
-                branch_location.uri.as_str(),
-            ))
+            crate::lance_commit::commit_builder(CommitDestination::Uri {
+                uri: branch_location.uri.as_str(),
+                session: source.session(),
+            })
             .with_store_params(store_params)
             .with_object_store(object_store)
             .with_commit_handler(handler)

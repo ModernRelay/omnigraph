@@ -84,8 +84,8 @@ the request it answered by the first row that matches:
 |---|---|---|
 | Any error before the request submitted a write | `none` | the refusal's own |
 | A write whose completion the server could not settle; `code` becomes `outcome_unknown` unless the action is `recover` | `unknown` | `reconcile`, or `recover` |
-| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a writer-epoch refusal, a resource limit, an external Blob source, a query diagnostic), or a failure the engine proved published nothing, such as a storage failure before publication; `code` is kept | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
-| Any other error after a write, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
+| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), a refusal the engine gives before its one publication, with or without details (a malformed, unknown or invalid row, a missing edge endpoint, a source or Blob URI the external Blob policy refuses, a merge, key, read-set or dataset-version conflict, a writer-epoch refusal, a resource limit, an external Blob source, a query diagnostic), or a failure the engine proved published nothing, such as a storage failure before publication; `code` is kept | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
+| Any other error after a write, one the engine cannot type as a refusal, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
 
 A refusal's own action follows its code: `recover` for a recovery intent or a
 full-text index to build, `retry` for `too_many_requests`,
@@ -168,9 +168,9 @@ The disposition covers the entire command. A later refused subrequest cannot
 undo an earlier branch creation, load or publication. An embedded write's own
 refusal says what the engine did, projected as a server would project it: a
 policy refusal precedes every publication, a `load --from` fork included, so it
-has `effects: none` on both planes. The engine marks an error that follows a
-fork which did publish: a typed refusal then has `effects: partial` on both
-planes, and an error the engine cannot prove wrote nothing has `unknown`. A
+has `effects: none` on both planes, as does a `load csv` source over a storage
+root. After a fork that published, a typed refusal has `effects: partial` on
+both planes, and an error the engine cannot prove wrote nothing has `unknown`. A
 `load --from` onto a branch that already exists forks nothing. Any later
 failure, such as rendering a committed receipt, stays `unknown`.
 Disconnecting an admitted HTTP write does not cancel it: the server keeps
@@ -206,7 +206,7 @@ A `409` is not one universal retry signal:
 
 ### Writer epoch
 
-A branch at storage format v17 carries a writer epoch, a number that starts at
+A branch at storage format v17 or later carries a writer epoch, a number that starts at
 0. A claim raises it by one and makes the claiming process the branch's
 owner; a claim by the process that already holds the epoch writes nothing.
 From then on, every publication to the branch, which is how a mutation, a
@@ -227,7 +227,7 @@ there.
 No CLI command or HTTP route claims a branch in this release. Only a program
 that embeds the engine does, through `Omnigraph::claim_branch_writer`, under
 the [`branch_claim`](policy.md#actions) action, and only on a branch at
-storage format v17: below it the claim is refused and names
+storage format v17 or later: below it the claim is refused and names
 `omnigraph upgrade`. A branch nobody claimed stays at epoch 0 and accepts
 every writer as before. A process holds its claim until it exits or another
 process claims the branch, so an owner that restarts claims again before it
@@ -302,37 +302,14 @@ state before another attempt; for an interrupted upgrade, follow the
 - Recovery required: reopen the graph read-write or restart its server. A
   graph carrying a sidecar from a release before 0.12 must first be opened
   read-write with that release (`omnigraph snapshot <graph>` is such an open).
-- Foreign versions: `cleanup` lists Lance commits above a table's last linear
-  version under `foreign_versions`; no read or write uses them and no command
-  adopts them (below).
+- Foreign versions: `cleanup` lists Lance commits Omnigraph did not write
+  under `foreign_versions`; no read or write uses them. See
+  [foreign versions](cleanup-foreign-versions.md).
 - Cleanup row with `error`: the collector's trace of that table did not
   finish, so nothing of that table was deleted; fix the named cause and
   rerun. Other tables are collected and the command exits 0.
 - Azure admission failure: inspect the lease owner before using the admission
   tool's break-glass flow.
-
-### Foreign versions
-
-A table has foreign versions when its Lance linear history carries commits
-above the table's recorded last linear version
-(`omnigraph.last_linear_version` on the registration). Every Omnigraph write
-is a detached commit that a graph commit pins, so such a commit came from
-something else writing the table directory directly. The condition is per
-table.
-
-- Queries, mutations, loads, merges, index builds, schema apply, optimize
-  and cleanup are unaffected: none of them resolves the linear HEAD, and no
-  command adopts a foreign commit.
-- A confirmed `cleanup --keep N --confirm` run lists them per table, under
-  `foreign_versions` with `--json` and by name in the human report, and never
-  deletes a foreign version or its files. The preview without `--confirm`
-  lists nothing.
-- The `repair` command that reported them as `foreign_drift` was removed; read
-  `foreign_versions` from cleanup instead.
-
-There is no command to run before writing: the write path has no
-precondition on a table's linear history. To discard the foreign commits,
-export the graph and load it into a new one.
 
 See [Maintenance](maintenance.md) and [Deployment](../deployment.md).
 

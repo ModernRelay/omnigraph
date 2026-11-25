@@ -1,4 +1,4 @@
-# Upgrading OmniGraph
+# Upgrading Omnigraph
 
 Normal open accepts storage formats v14 to v18 and never migrates a graph: a v14 or v15 branch
 is stamped v16 at its first publish, and only the [storage upgrade](#storage-upgrade) stamps an
@@ -157,7 +157,7 @@ v6, so a graph still on that format needs an [export/import rebuild](#rebuild).
 In v0.14, certified full-text indexes from Lance 11 remain searchable with
 Lance 13 because the analyzer generation is unchanged. Missing or incompatible
 analyzer proofs still fail closed. For a graph that normal open accepts
-(formats 14–17), use the explicit maintenance command on each branch that needs
+(formats 14–18), use the explicit maintenance command on each branch that needs
 new indexes:
 
 ```bash

@@ -608,13 +608,17 @@ rules:
         false,
     )
     .await;
+    let all_failed = all_failed.err().unwrap().to_string();
     assert!(
-        all_failed
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("no healthy graphs opened"),
+        all_failed.contains("no healthy graphs opened"),
         "a nonempty failed graph set must not become an empty serving revision"
+    );
+    // The refusal names the graph and the cause, which default logging also
+    // carries, so an operator need not rerun with debug logging to learn it.
+    assert!(
+        all_failed.contains("first failure: broken: open graph 'broken' at")
+            && all_failed.contains("missing.omni"),
+        "{all_failed}"
     );
     let strict_err = match omnigraph_server::open_multi_graph_state(
         graphs.clone(),
@@ -632,6 +636,10 @@ rules:
         strict_err
             .to_string()
             .contains("strict multi-graph startup requires every graph to open"),
+        "{strict_err}"
+    );
+    assert!(
+        strict_err.to_string().contains("first failure: broken: "),
         "{strict_err}"
     );
     let state = omnigraph_server::open_multi_graph_state(

@@ -208,7 +208,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 **Property-level shorthand:**
 - `@key` — single-property node key
 - `@unique` — single-property uniqueness constraint
-- `@index` — single-property index intent (currently materialized automatically only for node properties). A String property used in `search`, `fuzzy`, `match_text` or `bm25` must declare it, or the call is refused at type check (`T27`); an enum takes no full-text index (compare it with `=`)
+- `@index` — single-property index intent (currently materialized automatically only for node properties). A String property used in `search`, `fuzzy`, `match_text` or `bm25` must declare it (or be a one-property `@key`), or the call is refused at type check (`T27`); an enum takes no full-text index (compare it with `=`)
 - `@embed("source_prop")` — associates a node Vector property with a String source; does not populate it during writes
 - `@description("...")` — metadata (no migration impact)
 

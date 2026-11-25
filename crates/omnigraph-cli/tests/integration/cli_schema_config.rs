@@ -426,6 +426,35 @@ fn graph_vocabulary_help_exposes_only_canonical_export_selection() {
     assert!(cleanup_help.contains("backing dataset"));
     assert!(cleanup_help.contains("graph commits to keep on every live branch"));
     assert!(!cleanup_help.contains("per dataset"));
+    // Without --confirm, cleanup echoes its policy and enumerates nothing.
+    assert!(cleanup_help.contains("it lists no"), "{cleanup_help}");
+    assert!(
+        !cleanup_help.contains("what would be removed"),
+        "{cleanup_help}"
+    );
+
+    // Inline init addresses local storage only; cloud URIs refuse.
+    let init_help = stdout_string(&output_success(cli().arg("init").arg("--help")));
+    let uri_help = init_help
+        .lines()
+        .find(|line| line.trim_start().starts_with("[URI]"))
+        .unwrap_or_else(|| panic!("[URI] missing from init --help:\n{init_help}"));
+    assert!(
+        uri_help.contains("Local graph path or `file://` URI"),
+        "{uri_help}"
+    );
+    assert!(
+        !uri_help.contains("s3://") && !uri_help.contains("az://"),
+        "{uri_help}"
+    );
+
+    // Members are the organization's active members; nothing enrolls them.
+    let cluster_help = stdout_string(&output_success(cli().arg("cluster").arg("--help")));
+    assert!(
+        cluster_help.contains("active members and their identity eligibility"),
+        "{cluster_help}"
+    );
+    assert!(!cluster_help.contains("enrolled"), "{cluster_help}");
 
     let embed_help = stdout_string(&output_success(cli().arg("embed").arg("--help")));
     assert!(embed_help.contains("matching records"));
@@ -1025,11 +1054,26 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         "header.{}.signature",
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    for (discovery, json_output) in [(false, false), (false, true), (true, true)] {
-        let reply = if discovery {
+    // `graphs list` names the caller and the graphs it holds a permission
+    // on; `--catalog` asks for the full registry with each graph's state and
+    // root. The deprecated `--discovery` is accepted and selects the default
+    // listing. A listing without `visibility` comes from an older server: it is
+    // reported as `unfiltered`, never as a server without authentication.
+    for (catalog, json_output, discovery, legacy) in [
+        (false, false, false, false),
+        (false, true, false, false),
+        (true, false, false, false),
+        (true, true, false, false),
+        (false, true, true, false),
+        (false, false, false, true),
+        (false, true, false, true),
+    ] {
+        let reply = if catalog {
+            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"apply_correction_or_restart"}]})
+        } else if legacy {
             serde_json::json!({"graphs":[{"graph_id":"alpha","display_name":"alpha"}]})
         } else {
-            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"apply_correction_or_restart"}]})
+            serde_json::json!({"visibility":"granted","actor_id":"principal:alice","graphs":[{"graph_id":"alpha","display_name":"alpha"}]})
         };
         let server = IntentApiFixture::graph(vec![IntentReply::json(200, reply.clone())]);
         let operator = KeyedServer::new(&server.origin);
@@ -1042,25 +1086,41 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         if json_output {
             command.arg("--json");
         }
+        if catalog {
+            command.arg("--catalog");
+        }
         if discovery {
             command.arg("--discovery");
         }
         let output = output_success(&mut command);
         if json_output {
             let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(actual, reply);
-        } else {
+            let mut expected = reply.clone();
+            if legacy {
+                expected["visibility"] = serde_json::json!("unfiltered");
+            }
+            assert_eq!(actual, expected);
+        } else if catalog {
             assert_eq!(
                 stdout_string(&output),
                 "alpha\tready\tfile:///private/alpha\nbeta\tblocked\tfile:///private/beta\n"
             );
+        } else {
+            assert_eq!(stdout_string(&output), "alpha\n");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if legacy {
+                assert!(stderr.contains("predates the filtered listing"), "{stderr}");
+                assert!(!stderr.contains("without authentication"), "{stderr}");
+            } else {
+                assert!(stderr.contains("as principal:alice"), "{stderr}");
+            }
         }
         assert_eq!(
             server.workflow_requests()[0].path,
-            if discovery {
-                "/graphs/discovery"
-            } else {
+            if catalog {
                 "/graphs"
+            } else {
+                "/graphs/discovery"
             }
         );
         assert_eq!(

@@ -52,7 +52,7 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Concern | Existing owners |
 |---|---|
 | Initialization and representative journeys | `integration/lifecycle.rs`, `integration/end_to_end.rs`, `integration/composite_flow.rs`, `integration/consistency.rs` |
-| Query results and operators | `integration/aggregation.rs`, `integration/literal_filters.rs`, `integration/ordering.rs`, `integration/traversal_indexed.rs`, `integration/traversal_adaptive.rs`, `integration/proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
+| Query results and operators | `integration/aggregation.rs`, `integration/literal_filters.rs`, `integration/ordering.rs`, `integration/traversal_indexed.rs`, `integration/traversal_adaptive.rs`, `integration/proptest_equivalence.rs`; `failpoints.rs` owns the graph index build gate (concurrent misses build once), whose seams are process-wide; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
 | V2 execution and memory | `integration/engine_v2.rs`, `integration/engine_v2_memory.rs`; `integration/repro_issue_703.rs` and `integration/repro_issue_723.rs` own ignored scale symptoms |
 | Frozen engine v1, the reference | `crates/omnigraph-reference-engine/tests/frozen.rs` pins every source file's bytes; `forbidden_apis.rs` owns that `omnigraph-gqt` is the crate's only dependent and that its source names neither the engine nor the planner; the crate has no other tests, and a `.gqt` step's `--- expect same as v1` compares v2's rows with its answer |
 | V2 plan nodes' operators and the execution report | In-source `engine/report/tests.rs` owns which operator each node builds and what its row says (`ran`, `actual_rows`, `drained`); `crates/omnigraph-planner/tests/integration/lower_walk.rs` owns the walk's order and refusals; the `ran` lines of `--- expect plan` read the report of the case's own run |
@@ -374,13 +374,14 @@ The system tests start workspace binaries on ephemeral localhost ports. Set `OMN
 
 ### Cross-version rebuild and storage upgrade
 
-The cross-version rebuild owner, `integration/crossversion_upgrade.rs`, skips each predecessor case when its binary is not configured, so a local `cargo test -p omnigraph-cli --test integration crossversion_upgrade::` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, build the predecessor CLI from the commit `ci.yml` pins as `FINAL_INTERNAL_V5_COMMIT` (`git worktree add <dir> <sha>`, then `cargo build --locked -p omnigraph-cli --bin omnigraph` inside it) and run the exact case with that binary:
+The cross-version rebuild owner, `integration/crossversion_upgrade.rs`, runs each predecessor case against a row of the [predecessor registry](testing.md#predecessor-binaries) and skips it when the row is not provisioned, so a local `cargo test -p omnigraph-cli --test integration crossversion_upgrade::` is green even while CI's `V5 ↔ V10 Format Fence` is red. To run the fence locally, provision its row and run the exact case:
 
 ```bash
-OMNIGRAPH_V5_BIN=<dir>/target/debug/omnigraph cargo test --locked -p omnigraph-cli --test integration crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 -- --exact --nocapture
+python3 scripts/predecessors.py provision stamp-5
+cargo test --locked -p omnigraph-cli --test integration crossversion_upgrade::current_v10_refuses_and_rebuilds_genuine_v5_and_v5_refuses_v10 -- --exact --nocapture
 ```
 
-The v6↔v10 fence works the same way with a released binary: `OMNIGRAPH_V6_BIN` (the 0.10.0 release). The stamps between them are described in [versioning](versioning.md#current-storage-contract). The v0.9 journey is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` runs both on every pull request that changes engine input, with the releases it installs.
+The v6↔v10 fence works the same way with the `release-0.10.0` row. The stamps between them are described in [versioning](versioning.md#current-storage-contract). The v0.9 journey (`release-0.9.0`) is a different case, a fully exercised v6 graph — branches, edges, vectors, full-text and blobs — that the current binary refuses and that is rebuilt from a 0.9 export; `Test Workspace` provisions both rows and runs both journeys on every pull request that changes engine input. The v3 (`release-0.7.2`) and v4 (`release-0.8.1`) cases run only where a row is provisioned.
 
 The separate `Storage Upgrade Compatibility` CI job requires the
 `storage_upgrade` cases of `integration/crossversion_upgrade.rs` (the report on a fresh
@@ -394,10 +395,9 @@ graph, the cluster-path refusal and the six genuine journeys:
 `db::upgrade::tests`, `lance_version_columns` and `forbidden_apis`. Missing
 cases, empty runs and skipped required cases fail the job.
 
-The Lance dependency journey uses `OMNIGRAPH_LANCE11_BIN`. CI builds the exact
-main commit `0a62bb7b2aa5b99b012f413807c216277f7f9596`, pinned as
-`LANCE11_SOURCE_COMMIT`, and the test checks its actual manifest writer version
-is Lance 11.0.0. The predecessor writes graph format 16 and the candidate's
+The Lance dependency journey uses the `lance-11` row, an exact main commit
+built from source, and the test checks its actual manifest writer version is
+Lance 11.0.0. The predecessor writes graph format 16 and the candidate's
 publishes keep it; this journey calls no `upgrade`. The predecessor builds full-text and vector indexes, managed Blobs,
 nullable outer vectors, an uncovered search tail, branches and history. Cold
 candidate reads must leave its whole root unchanged, including index UUIDs and
@@ -408,16 +408,15 @@ restores its offline whole-root byte-copy backup at the original path and reads
 it with both binaries. This qualifies those exercised shapes, not arbitrary
 external Lance datasets or every possible downgrade.
 
-The stamp-13 journey needs the stamp-13 CLI: the job builds it from the commit
-`ci.yml` pins as `STAMP_13_SOURCE_COMMIT` and exports `OMNIGRAPH_V13_BIN`. It
-proves its predecessor by behaviour (that binary's `snapshot --json` reports
+The stamp-13 journey needs the `stamp-13` row, the last main commit that wrote
+stamp 13, built from source. It proves its predecessor by behaviour (that binary's `snapshot --json` reports
 `internal_schema_version` 13 and the current `upgrade --check` observes 13),
 builds branches, a merge, a deleted branch, a recreated one and a fork of a
 deleted branch with the old binary, upgrades, and compares commit history,
 rows, `cleanup` and a backup restore after it.
 
-The 0.11.x journeys need the released CLIs, which the job installs:
-`OMNIGRAPH_V011_BIN` (0.11.0, writes stamp 9) and `OMNIGRAPH_V6_BIN` (0.10.0).
+The 0.11.x journeys need the released CLIs, rows `release-0.11.0` (writes
+stamp 9) and `release-0.10.0`.
 `genuine_v0_11_0_storage_upgrade_preserves_history` runs the same script as
 the stamp-13 journey plus a schema apply (a new type and a nullable property
 on the existing `Doc`, with a commit before and one after it) and an
@@ -446,35 +445,19 @@ written before the respelling among them. Main builds 10 to 13 also
 print `0.11.0`, so these journeys prove their source by the stamp
 `snapshot --json` reports, not by `--version`.
 
-Each journey resolver reads its variable, else the binary under
-`target/storage-upgrade-binaries/` (`lance-11/`, `stamp-13/`, `v0.11.0/`, `v0.10.0/`).
-Without a binary the journey prints a skip line locally and panics when
-`OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS=1`, as CI sets. The v6 format fence
-reads `OMNIGRAPH_V6_BIN` alone and skips when it is unset, whatever that
-variable says. To run the
-crossversion scope locally, build the pinned Lance 11 and stamp-13 predecessors
-as for the v5 fence above, install the two releases with `scripts/install.sh` (`VERSION=v0.11.0`
-and `VERSION=v0.10.0`, each with its `INSTALL_DIR`), place the four binaries
-in those directories and run the job's sequence (bash: the cases live in the
-CLI's `integration` binary, where a bare `crossversion_upgrade::` filter would
-add the module's other journeys, so the exact names come from the compiled
-listing, discovery must succeed and the list must be nonempty before Cargo runs
-them, and the log must equal the generated file):
+The job provisions its four rows with `require: true`, so a journey whose row
+is missing fails instead of skipping. To run the crossversion scope locally,
+provision the same rows and run its cases:
 
 ```bash
-set -euo pipefail
-features=omnigraph-engine/failpoints,omnigraph-cluster/failpoints
-scratch=$(mktemp -d)
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$features" crossversion_upgrade:: -- --list 2>&1 | tee "$scratch/list.log"
-python3 scripts/check-storage-upgrade-ci.py --list-cases crossversion --compiled "$scratch/list.log" > "$scratch/cases.txt"
-cases=()
-while IFS= read -r name; do
-  cases+=("$name")
-done < "$scratch/cases.txt"
-[ "${#cases[@]}" -gt 0 ]
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --test integration --features "$features" -- --exact --test-threads=1 "${cases[@]}" 2>&1 | tee "$scratch/run.log"
-python3 scripts/check-storage-upgrade-ci.py --check-log crossversion "$scratch/run.log" --cases "$scratch/cases.txt"
+python3 scripts/predecessors.py provision stamp-13 lance-11 release-0.10.0 release-0.11.0
+cargo dev-test --test integration crossversion_upgrade:: -- --test-threads=1
 ```
+
+The job itself runs the exact `storage_upgrade` names
+`check-storage-upgrade-ci.py --list-cases crossversion --compiled` takes from a
+`-- --list` of the same feature graph, and checks the log against them
+([ci.md](ci.md)).
 
 `db/upgrade/tests.rs` owns the `upgrade_storage` protocol over
 `legacy::write::LegacyHistory`, the test-only writer of
@@ -509,21 +492,19 @@ Ordinary CI keeps current-version live-deployment coverage; it does
 not download 0.12 or run this journey.
 
 Run explicitly from the repository root when qualifying that upgrade path,
-using a native build with Cargo's default `target/` directory.
-Both predecessor variables are required; missing binaries fail. The installer
-verifies the official archive checksum. Copy the freshly built candidate server
-so another build cannot replace it during qualification:
+using a native build with Cargo's default `target/` directory. The test
+requires the `release-0.12.0` row, CLI and server, and fails without it.
+Copy the freshly built candidate server so another build cannot replace it
+during qualification:
 
 ```bash
 set -euo pipefail
 qualification_dir=$(mktemp -d)
-REPO_SLUG=ModernRelay/omnigraph VERSION=v0.12.0 INSTALL_DIR="$qualification_dir/v012" bash scripts/install.sh
+python3 scripts/predecessors.py provision release-0.12.0
 qualification_features=omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 cargo build --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster --features "$qualification_features"
 cp target/debug/omnigraph-server "$qualification_dir/omnigraph-server"
 env RUST_MIN_STACK=16777216 \
-  OMNIGRAPH_V012_BIN="$qualification_dir/v012/omnigraph" \
-  OMNIGRAPH_V012_SERVER_BIN="$qualification_dir/v012/omnigraph-server" \
   "CARGO_BIN_EXE_omnigraph-server=$qualification_dir/omnigraph-server" \
   cargo test --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-engine -p omnigraph-cluster \
     --features "$qualification_features" --test integration \
@@ -651,7 +632,7 @@ AWS server support has a separate feature owner:
 cargo test -p omnigraph-server --features aws
 ```
 
-S3-backed tests skip unless `OMNIGRAPH_S3_TEST_BUCKET` and the corresponding AWS endpoint/credential variables are set. Azure-backed tests skip unless `OMNIGRAPH_AZURE_TEST_CONTAINER` and the documented Azure/Azurite variables are set. A configured CI backend treats a skip as failure.
+S3-backed tests skip unless `OMNIGRAPH_S3_TEST_BUCKET` and the corresponding AWS endpoint/credential variables are set. Azure-backed tests skip unless `OMNIGRAPH_AZURE_TEST_CONTAINER` and the documented Azure/Azurite variables are set. Google Cloud Storage tests skip unless `OMNIGRAPH_GCS_TEST_BUCKET` names a bucket the application-default credentials can write: `omnigraph-storage`'s `conditional_contract_gcs_when_configured` (generation-checked create and replace, single objects only) and `contract_suite_gcs_when_configured` (the whole shared contract), and the engine's `integration/gcs_storage.rs` journey. No public emulator both serves `object_store`'s XML API and enforces generation preconditions, so CI runs `gs://` on `omnigraph-storage`'s simulated bucket (`simulated_bucket`, `Provider::Gcs`) instead: `gcs_conditions_on_the_object_generation_not_the_etag_issue_1461` runs the shared contract on it, and the `.gqt` cases that declare `omnigraph-engine-dst` with `storage: google-cloud-storage` run the engine through both the control adapter and Lance's `gs` store on it. That proves the generation plumbing, not Google's service. `omnigraph-storage`'s `gcs::tests` pin the one captured `GOOGLE_*` configuration both clients receive: unprefixed names Lance alone would read are refused, Lance's HTTP allowances are mirrored and drift is refused. A configured CI backend treats a skip as failure.
 
 ### GQT execution through DST
 
@@ -820,7 +801,13 @@ tails and stop. Its two ignored tests,
 `every_statement_kind_runs_against_the_builds_own_server`, run a repetition
 against the built `omnigraph` and `omnigraph-server`, which they take from
 the test executable's profile directory; `tests-slow-nightly.yml` enrolls
-both, after the compile that leaves the binaries there. The release tests of
+both, after the compile that leaves the binaries there.
+`rustfs_integration_a_rebuild_repetition_runs_against_the_builds_own_server_over_a_bucket`
+runs one repetition with the same two binaries over a prefix of a bucket:
+the apply onto the prefix, the lock read from `cluster status`, the server
+started on the prefix, and the root's deletion. It returns early without
+`OMNIGRAPH_S3_TEST_BUCKET`, and the RustFS job of `ci.yml` enrolls it after
+the call that leaves the binaries in `target/debug`. The release tests of
 `tests/integration/cli.rs` named `the_rebuild_route_…` own the owner loop end
 to end. Each returns early unless the build is release and
 `OMNIGRAPH_BENCH_PRODUCT` and `OMNIGRAPH_BENCH_SERVER_PRODUCT` name the
