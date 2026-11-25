@@ -111,7 +111,11 @@ server's live-run set changes under the same gate, so a lookup never meets a
 run that ended while its record was still active. Each write is a conditional put against the version read: at
 acceptance, when the run starts, in the optimize run's before-publish hook
 (`publishing`, with the intent nonce, the input head and the per-table
-outcomes), and at the end. The record is generic over `kind`: the header
+outcomes), at the end, and when the cancel route accepts a request: the
+request (`cancellation_request`) goes on the active operation before the run
+is told and before the 202, and `OperationRecord::finish` takes it from the
+active record rather than the run's copy, so every later state keeps it. The
+record is generic over `kind`: the header
 keys its active operations by admission scope and each kind's state by graph
 and kind, and each record names its settlement branch; `optimize` is the
 first kind. A write with no definite answer (`OperationWrite::InDoubt`) stops

@@ -11588,7 +11588,7 @@
             }
           },
           "202": {
-            "description": "Cancellation requested; a `publishing` operation is unchanged",
+            "description": "The request is on the operation's record (`cancellation_request`) and the run on this server is told; every later state of the record keeps it, and its terminal state says whether it took effect: `cancelled` if the run stopped, otherwise the run's own outcome. A `publishing` run still finishes its publication, and an artifact refresh whose write has not started is skipped",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11726,7 +11726,7 @@
             }
           },
           "409": {
-            "description": "Conflict (code `conflict`): a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)",
+            "description": "Conflict (code `conflict`): the operation is `publishing` and no run on this server holds it, so its publication may still land and nothing can stop it (`[operation_publication_in_doubt]`; nothing changed, look it up until it settles); a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11795,7 +11795,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a resolution write with no definite answer (code `outcome_unknown`); look the operation up by its id",
+            "description": "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a record write with no definite answer (code `outcome_unknown`): the request may be on the record or not, and the run was not told; look the operation up by its id",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11816,7 +11816,7 @@
             }
           },
           "503": {
-            "description": "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed, retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed and the run was not told, retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {

@@ -135,9 +135,12 @@ durable before any effect and before the response. From then on:
   not hold the id. It proves neither that the operation never ran nor that it
   may be replayed.
 - **Cancellation.** A cancellation request takes effect at the next safe
-  boundary. A publication that has started always finishes, and a record whose
-  publication is in doubt stays `publishing`: a cancellation never hides a
-  commit that may still land.
+  boundary. It is on the operation's record before it is acknowledged, and
+  every later state of that record keeps it, so an acknowledged request is
+  never lost to a failure, a settlement or a restart. A publication that has
+  started always finishes, and a record whose publication is in doubt stays
+  `publishing` and refuses the request: a cancellation never hides a commit
+  that may still land.
 - **Disconnection** stops waiting, not execution.
 - **Restart.** An unfinished record is resolved from main's history, and the
   run is never executed again.
@@ -620,8 +623,11 @@ publication. A table in progress is dropped where it stands. Its effects are
 detached commits and staged files that nothing references (invariant 5). Once
 the publication starts, it finishes, and so do the configuration clear and an
 issued artifact write. A cancellation that arrives after the publication
-started leaves the run `succeeded`, and the report notes it. A cancellation
-of a record whose publication is in doubt changes nothing: it stays
+started leaves the run `succeeded`, and the report notes it. A request the
+server accepts is written to the record (`cancellation_request`: who asked,
+and when) before the live run is told and before the answer, and every later
+state of the record keeps it, whatever ends the run. A cancellation of a
+record whose publication is in doubt is refused and changes nothing: it stays
 `publishing` until §2.4 resolves it, because its manifest request may still
 land. `cancelled` is written only when no manifest request has been sent, so
 it always means unpublished.
@@ -665,7 +671,7 @@ its report synchronously, as today.
 | Section | Holds |
 |---|---|
 | Header | the ledger id; the **active** operations, keyed by admission scope, at most one per scope (§2.6); the **unresolved** operations (§2.4); a bounded list of **terminal** operations, newest first; the eviction mark (§2.5); and each kind's state per graph, keyed by graph and kind (for `optimize`, the resume position, §1.3) |
-| Per operation | the operation id; the request digest; graph (its id and its `schema_identity_domain`) and its settlement branch (§2.6); kind; exact options; principal; acceptance time; state; the intent nonce and input head (from §1.6); the published commit's history id, written by the terminal write (from the publisher's answer) or by resolution (§2.4), or the resolution cursor while the walk is open; per-table outcomes; tail outcomes; timings (queued, gates held, computing); the terminal reason |
+| Per operation | the operation id; the request digest; graph (its id and its `schema_identity_domain`) and its settlement branch (§2.6); kind; exact options; principal; acceptance time; state; the intent nonce and input head (from §1.6); the published commit's history id, written by the terminal write (from the publisher's answer) or by resolution (§2.4), or the resolution cursor while the walk is open; per-table outcomes; tail outcomes; timings (queued, gates held, computing); the terminal reason; the cancellation request, once one is accepted (§1.9) |
 
 Terminal records are bounded by count (32), per-record size (1 MiB) and total
 size (4 MiB). The oldest is evicted first. These are the deployment receipts'
@@ -923,7 +929,7 @@ run.
 |---|---|---|
 | `POST /graphs/{graph_id}/operations/optimize` (`startOptimize`) | Submit. The body (`StartOptimizeRequest`) carries `operation_id` (a canonical ULID the caller chose), optional `datasets` and an optional `max_gate_hold_ms`; nothing else (§1.1). | 202 with the record (`OperationOutput`) while it is non-terminal, including for a repeated POST of the same id and request; 200 once it is terminal |
 | `GET /graphs/{graph_id}/operations/{operation_id}` (`getOperation`) | Look up by original id, whatever the kind. | 200 with the record, or 200 with `lookup: unknown` |
-| `POST /graphs/{graph_id}/operations/{operation_id}/cancel` (`cancelOperation`) | Ask the run to stop at its next safe boundary. | 202 with the record while it is non-terminal, and a `publishing` record unchanged (§1.9); 200 with a terminal record, unchanged |
+| `POST /graphs/{graph_id}/operations/{operation_id}/cancel` (`cancelOperation`) | Ask the run to stop at its next safe boundary. | 202 with the record, holding the request, while a run on this server holds it (§1.9); 409 `[operation_publication_in_doubt]` for a `publishing` record no run holds, unchanged; 200 with a terminal record, unchanged |
 
 This is deployment's split (`deployment.rs`): 202 until the work is terminal
 and 200 when it is done, so a running record never looks complete.
@@ -1653,3 +1659,16 @@ dated pending entry in its decision log:
   known at the failure. The Evidence row that begins “An index link that
   fails after an earlier link of its table committed” gained the coverage
   read. The output token and the record are unchanged.
+- 2026-11-25 — Amended with the fix for
+  [#1554](https://github.com/ModernRelay/omnigraph/issues/1554), after a
+  review of [#1555](https://github.com/ModernRelay/omnigraph/pull/1555).
+  The cancel route answered 202 from in-memory state only: a request that
+  came after the engine's last sample, or before a failure, an unresolved
+  publication or a restart, was acknowledged and then absent from the
+  terminal record. The Observable contract's Cancellation bullet and §1.9
+  gained that an acknowledged request is on the record before the answer and
+  that every later state keeps it; §2.2's per-operation row gained the
+  request. The route table's “a `publishing` record unchanged” became a 409
+  refusal when no run holds the record, since nothing can stop it, and a
+  202 only while a run on the server holds it. The record gains one optional
+  field, so a server older than this change refuses a record that holds it.

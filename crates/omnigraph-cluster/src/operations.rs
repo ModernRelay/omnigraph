@@ -4,7 +4,8 @@
 //! `deny_unknown_fields` ledger an older binary must keep reading). Only the
 //! process that holds the cluster lock writes it, and every write is a
 //! conditional put against the version the writer read: at acceptance, when
-//! execution starts, before the publication, and at the end. A write whose
+//! execution starts, before the publication, at the end, and when a
+//! cancellation request is accepted. A write whose
 //! answer is lost is in doubt; the caller then starts no table work and no
 //! publication until a re-read settles the key.
 //!
@@ -314,6 +315,32 @@ pub struct Operation {
     /// publication's resolution stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A caller's request to cancel, written before the request is answered
+    /// and owned by the record from then on: every later state of this
+    /// operation keeps it, whatever ends the run. The state says whether it
+    /// took effect: only `cancelled` means it stopped the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_request: Option<CancellationRequest>,
+}
+
+/// Who asked to cancel an operation, and when the record took the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancellationRequest {
+    /// The actor the request's token resolved to.
+    pub by: String,
+    /// When the record took the request (RFC 3339).
+    pub at: String,
+}
+
+impl CancellationRequest {
+    /// A request by `by`, stamped now.
+    pub fn now(by: impl Into<String>) -> Self {
+        Self {
+            by: by.into(),
+            at: crate::now_rfc3339(),
+        }
+    }
 }
 
 /// Each kind's state per graph.
@@ -480,6 +507,7 @@ impl Operation {
             outcome,
             timings: OperationTimings::default(),
             reason: None,
+            cancellation_request: None,
         }
     }
 
@@ -625,19 +653,43 @@ impl OperationRecord {
             .find(|op| op.operation_id == operation_id)
     }
 
+    /// Record a caller's request to cancel the active operation
+    /// `operation_id`. Only an active operation takes one: a terminal record
+    /// is never rewritten, and an unresolved publication has no run left to
+    /// stop. The first request is kept. Returns whether the record changed.
+    pub fn request_cancellation(
+        &mut self,
+        operation_id: &str,
+        request: CancellationRequest,
+    ) -> Result<bool, Diagnostic> {
+        let Some(active) = self.active_mut(operation_id) else {
+            return Err(invalid("only an active operation takes a cancellation"));
+        };
+        if active.cancellation_request.is_some() {
+            return Ok(false);
+        }
+        active.cancellation_request = Some(request);
+        Ok(true)
+    }
+
     /// End an active operation with its terminal record, and keep the state
     /// its kind records per graph. A `publishing` operation whose publication
-    /// is in doubt goes to [`Self::defer_publication`] instead.
-    pub fn finish(&mut self, operation: Operation) -> Result<(), Diagnostic> {
+    /// is in doubt goes to [`Self::defer_publication`] instead. The record
+    /// owns the cancellation request: the terminal record keeps the one the
+    /// active record holds, whatever the finishing copy carries.
+    pub fn finish(&mut self, mut operation: Operation) -> Result<(), Diagnostic> {
         if !operation.state.is_terminal() {
             return Err(invalid("a finished operation must be terminal"));
         }
         let scope = operation.scope();
-        if self.active.get(&scope).map(|active| &active.operation_id)
-            != Some(&operation.operation_id)
-        {
+        let Some(active) = self
+            .active
+            .get(&scope)
+            .filter(|active| active.operation_id == operation.operation_id)
+        else {
             return Err(invalid("only an active operation can finish"));
-        }
+        };
+        operation.cancellation_request = active.cancellation_request.clone();
         self.active.remove(&scope);
         self.keep_kind_state(&operation);
         self.push_terminal(operation);
@@ -1519,5 +1571,111 @@ mod tests {
         assert_eq!(operation.timings.gate_hold_ms, Some(40));
         let rewritten = encode(&decoded).unwrap();
         assert!(!rewritten.contains("writer_yield_ms"), "{rewritten}");
+    }
+
+    /// A cancellation request is the record's from the moment it is written,
+    /// so every way an operation can end keeps it: the run's own ending
+    /// (built from a copy that never saw the request), a definite failure, a
+    /// publication in doubt and its settlement either way, an interruption
+    /// after the server stopped, and a graph deletion. Only an active
+    /// operation takes one, and the first request is kept.
+    #[test]
+    fn a_cancellation_request_survives_every_way_an_operation_ends_issue_1554() {
+        let request = CancellationRequest {
+            by: "act-op".to_string(),
+            at: "2026-11-25T00:00:00Z".to_string(),
+        };
+        let requested = |n: u8, state: OperationState| {
+            let mut record = OperationRecord::new(LEDGER);
+            let mut active = operation(n, "g");
+            active.state = state;
+            record.admit_now(active).unwrap();
+            assert_eq!(
+                record.request_cancellation(&id(n), request.clone()),
+                Ok(true)
+            );
+            let later = CancellationRequest {
+                by: "act-other".to_string(),
+                at: "2026-11-25T00:00:01Z".to_string(),
+            };
+            assert_eq!(
+                record.request_cancellation(&id(n), later),
+                Ok(false),
+                "the first request is kept"
+            );
+            record
+        };
+        let kept = |record: &OperationRecord, n: u8, state: OperationState| {
+            let found = record.find("g", &id(n)).expect("the record holds it");
+            assert_eq!(found.state, state, "{found:?}");
+            assert_eq!(
+                found.cancellation_request.as_ref(),
+                Some(&request),
+                "{found:?}"
+            );
+            decode(&encode(record).unwrap()).unwrap();
+        };
+
+        // The run's ending, a success or a definite failure, from its own copy.
+        for state in [
+            OperationState::Succeeded,
+            OperationState::Failed,
+            OperationState::Cancelled,
+        ] {
+            let mut record = requested(1, OperationState::Running);
+            record.finish(finished(operation(1, "g"), state)).unwrap();
+            kept(&record, 1, state);
+        }
+        // A publication in doubt, then settled either way or ended by the
+        // graph's deletion.
+        for (resolution, state) in [
+            (
+                Some(Resolution::Committed {
+                    published_commit: "c".to_string(),
+                }),
+                OperationState::Succeeded,
+            ),
+            (Some(Resolution::NotCommitted), OperationState::Failed),
+            (None, OperationState::Unsettled),
+        ] {
+            let mut record = requested(2, OperationState::Publishing);
+            record
+                .defer_publication(&id(2), "in doubt".to_string())
+                .unwrap();
+            kept(&record, 2, OperationState::Publishing);
+            assert!(
+                record
+                    .request_cancellation(&id(2), request.clone())
+                    .is_err(),
+                "an unresolved publication has no run to stop"
+            );
+            match resolution {
+                Some(resolution) => assert!(record.settle(&id(2), resolution)),
+                None => assert!(record.settle_graph_deleted("g", DOMAIN)),
+            }
+            kept(&record, 2, state);
+            assert!(
+                record
+                    .request_cancellation(&id(2), request.clone())
+                    .is_err(),
+                "a terminal record is never rewritten"
+            );
+        }
+        // The server stopped: no live run holds it at the next access.
+        let mut record = requested(3, OperationState::Running);
+        assert!(record.interrupt_orphans(&[]));
+        kept(&record, 3, OperationState::Interrupted);
+        let mut record = requested(4, OperationState::Publishing);
+        assert!(record.interrupt_orphans(&[]));
+        kept(&record, 4, OperationState::Publishing);
+        assert!(record.settle(&id(4), Resolution::NotCommitted));
+        kept(&record, 4, OperationState::Failed);
+
+        // A record an earlier build wrote has no request, and still decodes.
+        let mut record = OperationRecord::new(LEDGER);
+        record.admit_now(operation(5, "g")).unwrap();
+        let text = encode(&record).unwrap();
+        assert!(!text.contains("cancellation_request"), "{text}");
+        assert_eq!(decode(&text).unwrap(), record);
     }
 }

@@ -5,7 +5,8 @@
 //! every change of the operation's state go through the cluster's record,
 //! `__cluster/operations.json`, which this process, the lock holder, writes
 //! with one conditional put each time: at acceptance, when the run starts,
-//! before its publication and at its end. The run is an owned server
+//! before its publication, at its end, and when a cancellation is accepted,
+//! before the run is told. The run is an owned server
 //! operation and holds its graph request, so a deployment that affects the
 //! graph cancels it before draining it, and shutdown cancels it too.
 //!
@@ -39,9 +40,10 @@ use omnigraph::db::{
     RunCancellation, TableCeilings, TableOptimizeOutcome,
 };
 use omnigraph_cluster::{
-    AdmissionRefusal, AdmissionScope, Admitted, ClusterAdmission, Operation, OperationKind,
-    OperationRecord, OperationRequest, OperationState, OperationWrite, OperationsLock,
-    OperationsUpdate, OptimizeOptions, Resolution, ResolutionProgress, TableOutcome, TailOutcome,
+    AdmissionRefusal, AdmissionScope, Admitted, CancellationRequest, ClusterAdmission, Operation,
+    OperationKind, OperationRecord, OperationRequest, OperationState, OperationWrite,
+    OperationsLock, OperationsUpdate, OptimizeOptions, Resolution, ResolutionProgress,
+    TableOutcome, TailOutcome,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
@@ -1100,9 +1102,11 @@ async fn run(
         // The ending is decided under the same gate.
         let lock = owner.lock_operations().await;
         let (ending, failure) = match result {
-            // The cancellation request is read under the record gate, where
-            // the cancel route answers: a request it answered 202 is in this
-            // ending, and a later one finds the terminal record.
+            // The cancellation is read under the record gate, where the
+            // cancel route writes its request and tells the run: a request
+            // it answered 202 is in this ending's reason, and a later one
+            // finds the terminal record. The request itself is the record's,
+            // and `finish` keeps it on every ending, a failed one included.
             Ok(report) => (
                 Ending::Terminal(Box::new(terminal_from_report(
                     operation,
@@ -1326,7 +1330,9 @@ async fn unlocked_answer(
 
 /// Find the record under the gate and authorize the actor for its kind's
 /// grant; an unknown id is authorized for the start kind, so the refusal
-/// says nothing about which ids exist.
+/// says nothing about which ids exist. With `cancel_by`, a non-terminal
+/// record takes the cancellation request before the live run is told, and a
+/// publication in doubt refuses it.
 async fn find_authorized(
     state: &AppState,
     handle: &GraphRequest,
@@ -1353,20 +1359,40 @@ async fn find_authorized(
         .as_ref()
         .map_or(OperationKind::Optimize, Operation::kind);
     authorize(handle, actor, kind)?;
-    // Only a run live in this process is told, and it records the request
-    // on its terminal record. A `publishing` record whose run ended in doubt
-    // is not live: the cancellation leaves it as it is (RFC §1.9).
-    if let (Some(actor), Some(op)) = (cancel_by, &operation)
-        && !op.state.is_terminal()
-    {
-        state.recorded.cancel_under(
-            &lock,
-            Some(&op.operation_id),
-            None,
-            &format!("cancelled by {actor}"),
-        );
+    let (Some(actor), Some(op)) = (cancel_by, &operation) else {
+        return Ok(operation);
+    };
+    if op.state.is_terminal() {
+        return Ok(operation);
     }
-    Ok(operation)
+    // The orphans were settled above, so a non-terminal record no run here
+    // holds is a publication in doubt: nothing can stop it, and it settles
+    // from history (RFC §1.9). The cancellation is refused, changing nothing.
+    if !state.recorded.live_ids().contains(&op.operation_id) {
+        return Err(ApiError::conflict(format!(
+            "[operation_publication_in_doubt] operation {operation_id} is publishing and no run on this server holds it, so its publication may still land and a cancellation cannot stop it; nothing changed. Look the operation up until main's history settles it"
+        ))
+        .applied_nothing());
+    }
+    // The request is on the record before the run is told and before the
+    // answer: every later state of the record keeps it, whatever ends the
+    // run and across a restart, so a 202 and the terminal record agree. A
+    // write that did not land tells the run nothing.
+    let request = CancellationRequest::now(actor);
+    let written = update(state, &owner, &lock, &[], |record| {
+        let changed = record
+            .request_cancellation(operation_id, request)
+            .unwrap_or(false);
+        (changed, record.find(&graph, operation_id).cloned())
+    })
+    .await?;
+    state.recorded.cancel_under(
+        &lock,
+        Some(operation_id),
+        None,
+        &format!("cancelled by {actor}"),
+    );
+    Ok(written.value)
 }
 
 #[utoipa::path(
@@ -1400,11 +1426,11 @@ pub(crate) async fn get_operation(
     params(("operation_id" = String, Path, description = "The id the caller submitted")),
     responses(
         (status = 200, description = "The operation is terminal, unchanged; or `lookup: unknown`", body = OperationOutput),
-        (status = 202, description = "Cancellation requested; a `publishing` operation is unchanged", body = OperationOutput),
+        (status = 202, description = "The request is on the operation's record (`cancellation_request`) and the run on this server is told; every later state of the record keeps it, and its terminal state says whether it took effect: `cancelled` if the run stopped, otherwise the run's own outcome. A `publishing` run still finishes its publication, and an artifact refresh whose write has not started is skipped", body = OperationOutput),
         (status = 403, body = crate::api::ErrorOutput),
-        (status = 409, description = "Conflict (code `conflict`): a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)", body = crate::api::ErrorOutput),
-        (status = 500, description = "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a resolution write with no definite answer (code `outcome_unknown`); look the operation up by its id", body = crate::api::ErrorOutput),
-        (status = 503, description = "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed, retry", body = crate::api::ErrorOutput),
+        (status = 409, description = "Conflict (code `conflict`): the operation is `publishing` and no run on this server holds it, so its publication may still land and nothing can stop it (`[operation_publication_in_doubt]`; nothing changed, look it up until it settles); a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)", body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a record write with no definite answer (code `outcome_unknown`): the request may be on the record or not, and the run was not told; look the operation up by its id", body = crate::api::ErrorOutput),
+        (status = 503, description = "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed and the run was not told, retry", body = crate::api::ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
