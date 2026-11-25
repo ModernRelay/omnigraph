@@ -174,20 +174,6 @@ impl Binding {
     /// Narrow the server's answer to a request the bridge sent. Returns
     /// whether the answer changed.
     pub(super) fn narrow(&self, method: &str, request: &Value, answer: &mut Value) -> bool {
-        if method == "resources/read"
-            && request.pointer("/params/uri").and_then(Value::as_str) == Some(GRAPHS_RESOURCE)
-            && answer
-                .pointer("/error/data")
-                .is_some_and(graph_list_forbidden)
-        {
-            // The resource form of the `graphs` fallback below: the server
-            // carries the same refusal body in the JSON-RPC error's `data`.
-            if let Some(answer) = answer.as_object_mut() {
-                answer.remove("error");
-            }
-            answer["result"] = bound_resource(&self.graph);
-            return true;
-        }
         let Some(result) = answer.get_mut("result") else {
             return false;
         };
@@ -202,14 +188,6 @@ impl Binding {
                 tools.len() != listed
             }
             "tools/call" if tool_name(request) == Some(GRAPHS_TOOL) => {
-                if graph_list_refused(result) {
-                    // A credential without `graph_list` may not list the
-                    // server's graphs, but this connection is already bound
-                    // to one: answer with it. A listing is not permission;
-                    // every later call is still the server's to refuse.
-                    *result = bound_listing(&self.graph);
-                    return true;
-                }
                 let mut changed = false;
                 if let Some(structured) = result.get_mut("structuredContent") {
                     changed |= narrow_listing(structured, &self.graph);
@@ -297,45 +275,6 @@ fn tool_name(message: &Value) -> Option<&str> {
 fn resource_graph(uri: &str) -> Option<&str> {
     let (graph, _) = uri.strip_prefix(GRAPH_RESOURCE_PREFIX)?.split_once('/')?;
     Some(graph)
-}
-
-/// A `graphs` call the server refused with 403 `forbidden`: the credential
-/// lacks `graph_list`. Other refusals (401, `not_admitted`, transport
-/// failures) stay errors, so an authentication problem is never hidden behind
-/// a successful listing.
-fn graph_list_refused(result: &Value) -> bool {
-    result.get("isError").and_then(Value::as_bool) == Some(true)
-        && result
-            .get("structuredContent")
-            .is_some_and(graph_list_forbidden)
-}
-
-/// The server's refusal body for a missing `graph_list` permit.
-fn graph_list_forbidden(body: &Value) -> bool {
-    body.get("status").and_then(Value::as_u64) == Some(403)
-        && body.pointer("/error/code").and_then(Value::as_str) == Some("forbidden")
-}
-
-/// The successful `graphs` result naming only the bound graph, in the
-/// server's layout: structured content plus its text copy.
-fn bound_listing(graph: &str) -> Value {
-    let listing = serde_json::json!({"graphs": [{"graph_id": graph, "display_name": graph}]});
-    serde_json::json!({
-        "content": [{"type": "text", "text": listing.to_string()}],
-        "structuredContent": listing,
-        "isError": false,
-    })
-}
-
-/// The `omnigraph://graphs` read naming only the bound graph, in the
-/// server's layout.
-fn bound_resource(graph: &str) -> Value {
-    let listing = serde_json::json!({"graphs": [{"graph_id": graph, "display_name": graph}]});
-    serde_json::json!({"contents": [{
-        "uri": GRAPHS_RESOURCE,
-        "mimeType": "application/json",
-        "text": serde_json::to_string_pretty(&listing).unwrap_or_default(),
-    }]})
 }
 
 /// Keep only `graph` in a `{"graphs": [...]}` listing.
@@ -595,52 +534,6 @@ mod tests {
             resources["result"]["resources"].as_array().unwrap().len(),
             3
         );
-
-        // A credential without `graph_list` gets the bound graph instead of
-        // a 403; any other refusal stays as it is.
-        let forbidden = |code: &str, status: u64| {
-            json!({"id": 8, "result": {
-                "content": [{"type": "text", "text": "refused"}],
-                "structuredContent": {"error": {"code": code, "error": "refused"}, "status": status},
-                "isError": true,
-            }})
-        };
-        let mut refused_listing = forbidden("forbidden", 403);
-        assert!(binding.narrow("tools/call", &call("graphs", None), &mut refused_listing));
-        assert_eq!(refused_listing["result"]["structuredContent"], only);
-        assert_eq!(refused_listing["result"]["isError"], json!(false));
-        for (code, status) in [("not_admitted", 403), ("unauthorized", 401)] {
-            let mut kept = forbidden(code, status);
-            assert!(!binding.narrow("tools/call", &call("graphs", None), &mut kept));
-            assert_eq!(kept["result"]["isError"], json!(true));
-        }
-
-        // The resource form: the same refusal arrives as a JSON-RPC error.
-        let refused_resource = |code: &str, status: u64| {
-            json!({"id": 9, "error": {
-                "code": -32600,
-                "message": "resource read refused",
-                "data": {"error": {"code": code, "error": "refused"}, "status": status},
-            }})
-        };
-        let mut read = refused_resource("forbidden", 403);
-        assert!(binding.narrow("resources/read", &request, &mut read));
-        assert!(read.get("error").is_none());
-        assert_eq!(
-            read["result"]["contents"][0]["uri"],
-            json!("omnigraph://graphs")
-        );
-        let text: Value =
-            serde_json::from_str(read["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(text, only);
-        for (code, status) in [("not_admitted", 403), ("unauthorized", 401)] {
-            let mut kept = refused_resource(code, status);
-            assert!(!binding.narrow("resources/read", &request, &mut kept));
-            assert!(kept.get("error").is_some());
-        }
-        let schema_request = json!({"params": {"uri": "omnigraph://graphs/knowledge/schema"}});
-        let mut schema_refused = refused_resource("forbidden", 403);
-        assert!(!binding.narrow("resources/read", &schema_request, &mut schema_refused));
 
         // An error answer, or another tool's result, is left as it is.
         let mut refused = json!({"id": 6, "error": {"code": -32602, "message": "no"}});
