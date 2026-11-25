@@ -98,7 +98,7 @@ never activates a revision.
 Bearer tokens map actors at the server boundary. Request headers and bodies
 cannot choose another actor. Configure token sources on the server process;
 clients configure `auth: {provider: token, source: {store: {}}}` on `production`
-using the [operator reference](../../../docs/user/cli/targets.md), then install it:
+using the [operator reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md), then install it:
 
 ```bash
 printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --stdin
@@ -148,8 +148,8 @@ Logs go to stdout (`OMNIGRAPH_LOG_FORMAT=json` for JSON, level from
 `RUST_LOG`). OTLP trace export is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is
 set; JSON logs carry `trace_id`/`span_id`. A publication with an unknown
 outcome is logged with its graph commit in a `publication` field. See
-[MCP](../../../docs/user/operations/mcp.md) and
-[logs and traces](../../../docs/user/operations/observability.md).
+[MCP](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/mcp.md) and
+[logs and traces](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/observability.md).
 
 ## Cedar actions
 

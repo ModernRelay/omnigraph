@@ -56,8 +56,8 @@ its process default and 1000000); ask the operator to raise
 `OMNIGRAPH_TRAVERSAL_WORK_LIMIT` instead.
 Historical wildcard targets are refused. Stored-query validation can refuse a
 schema addition that would invalidate a wildcard common-property reference.
-See [traversal](../../docs/user/queries/traversal.md) and
-[session settings](../../docs/user/queries/settings.md).
+See [traversal](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/queries/traversal.md) and
+[session settings](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/queries/settings.md).
 
 ## The Seven Rules
 
@@ -134,7 +134,7 @@ omnigraph load --data delta.jsonl --from main --branch review --mode replace --t
 
 - `--mode`, the write statement of its name: `insert` (fails on ID collision, `key_conflict`) · `upsert` (sets the properties a record names; an absent key keeps its value, `null` clears) · `replace` (writes a matched row whole — an omitted property becomes null) · `overwrite` (destructive, staged). Keyed node and edge IDs derive from their `@key` tuple; re-running a file duplicates unkeyed edges. `append` and `merge` are refused with `insert` and `replace` as fixes; a retried load uses `upsert` or `replace`. `--from <base>` forks a missing `--branch`; bare `load` needs an existing branch. Works local **and** remote.
 - **Date values**: use a calendar-day string (`YYYY-MM-DD`) for `Date` and an ISO timestamp to the millisecond for `DateTime` (`.123` or `.123000`; `.123456` is refused), in both `mutate --params` and JSONL. `load` also accepts integer epoch days for `Date`.
-- **CSV** is a GQ statement, not an `omnigraph load` format (`load` reads JSONL only): `omnigraph mutate --target $GRAPH -e 'load csv "s3://imports/person.csv" into node:Person mode insert header'`, with `mode` required, optional `delimiter "|"`, and `columns (a, b)` when there is no `header`. The source must lie under the graph's external Blob policy base (a direct run admits its own `file://` directory; a served run refuses `file://`) and within `load_source_max_bytes` (32 MiB default). See [CSV loading](../../docs/user/mutations/index.md#csv-loading).
+- **CSV** is a GQ statement, not an `omnigraph load` format (`load` reads JSONL only): `omnigraph mutate --target $GRAPH -e 'load csv "s3://imports/person.csv" into node:Person mode insert header'`, with `mode` required, optional `delimiter "|"`, and `columns (a, b)` when there is no `header`. The source must lie under the graph's external Blob policy base (a direct run admits its own `file://` directory; a served run refuses `file://`) and within `load_source_max_bytes` (32 MiB default). See [CSV loading](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/mutations/index.md#csv-loading).
 
 ### Blob values
 
@@ -182,10 +182,8 @@ The non-obvious facts that bite, then the full grammar:
 - **Undirected traversal**: `$p <knows> $f` matches the edge in either direction, deduplicated (a pair connected both ways appears once). Same-endpoint-type edges only (e.g. `Related: Issue -> Issue`) — asymmetric edges are rejected (T22). Composes with bounds (`$p <knows>{1,3} $f`) and correlated blocks (`not exists { }`, `exists { }`, `count { } > 2`).
 - **Edge bindings**: an optional `$var:` prefix on the edge word — `$src $w:knows $dst`, undirected `$a $w:<related> $b` — binds the matched edge row, so edge properties work in filters (`$w.confidence = "asserted"`), projections (`return { $w.role }`), aggregates, and ordering. A bound traversal returns one row per edge (parallel edges stay distinct); binding a `{min,max}` multi-hop or rebinding a taken name is `T23` (`T68` inside a block, an `optional` or an inline read), and returning bare `$w` gives its edge object (`@id`, `@src`, `@dst`, `@type` over several types, its properties).
 - **Literals & calls**: `now()`, `date("2026-04-29")`, `datetime("…T00:00:00Z")`, list `[…]` of literals (`[-1, 2]`) and non-null scalar parameters of one declared type (`[$a, $b, 3]`, also a `nearest` vector); no element is cast (`T53`), and a list or nullable parameter, a binding or a `let` name as an element is `T7`. Scalar functions: `if`, `coalesce`, `concat`, `lower`, `upper`, `trim`/`ltrim`/`rtrim`, `length`, `left`, `right`, `substring(s, start, len)` (1-based), `abs`, `floor`, `ceil`, `round(x, digits: n)`, `sqrt`, `power`, `exp`, `ln`, `log10`, `size(list)`, `cast(x, T)`; each is null on a null argument (`if`, `coalesce` aside), and one outside its domain or a failed `cast` refuses the read (`E5`, `E6`). A predicate over a function of a column (`lower($p.email) = $q`) uses no index: compare the bare column where an index should answer. See [functions](references/queries.md#filter-operators).
-`starts_with($x.f, "A")`, `contains($x.f, "g")`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`, `is null`, `is not null`
-
-Those are the complete **filter operators** (`$m.number in $numbers` tests membership in a list parameter or literal, `"rust" in $m.tags` in a list property; infix `contains`/`starts_with` is `T7`); conditions compose with `and`, `or`, `not`, parentheses and `is null` / `is not null`, and a filter keeps only rows whose expression is true (a comparison with a null operand is null). A literal compared with a property (or listed in an `in` against one), in any `where` or `let`, must fit the property's type: an enum value outside the set, a number against a non-numeric property, an integer out of an integer property's range or a malformed date is `T3`, whose fix names the nearest allowed value (a float against an integer property is fine: it compares through a cast). String predicates are exact and
-case-sensitive. **Aggregates** are `count/sum/avg/min/max/collect/stddev/percentile` (`count($f) as n`, `count(distinct $f.city) as cities`, `collect($r.key) as keys`, a `[T]` list in value order; `stddev($d.amount)` the sample deviation, `percentile($d.amount, 0.5)` exact with linear interpolation, `p` a literal from 0 to 1 or a parameter); `min`/`max` also accept String, Bool, Date, and DateTime. Alias aggregates and order by the alias; `nulls first` or `nulls last` after an order key places its nulls (`order { $d.closed desc nulls last }`). `return distinct { … }` keeps one row per distinct projected tuple.
+- **Filter operators**, the complete set: `starts_with($x.f, "A")`, `contains($x.f, "g")`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`, `is null`, `is not null` (`$m.number in $numbers` tests membership in a list parameter or literal, `"rust" in $m.tags` in a list property; infix `contains`/`starts_with` is `T7`); conditions compose with `and`, `or`, `not`, parentheses and `is null` / `is not null`, and a filter keeps only rows whose expression is true (a comparison with a null operand is null). A literal compared with a property (or listed in an `in` against one), in any `where` or `let`, must fit the property's type: an enum value outside the set, a number against a non-numeric property, an integer out of an integer property's range or a malformed date is `T3`, whose fix names the nearest allowed value (a float against an integer property is fine: it compares through a cast). String predicates are exact and case-sensitive.
+- **Aggregates** are `count/sum/avg/min/max/collect/stddev/percentile` (`count($f) as n`, `count(distinct $f.city) as cities`, `collect($r.key) as keys`, a `[T]` list in value order; `stddev($d.amount)` the sample deviation, `percentile($d.amount, 0.5)` exact with linear interpolation, `p` a literal from 0 to 1 or a parameter); `min`/`max` also accept String, Bool, Date, and DateTime. Alias aggregates and order by the alias; `nulls first` or `nulls last` after an order key places its nulls (`order { $d.closed desc nulls last }`). `return distinct { … }` keeps one row per distinct projected tuple.
 - **Result column names must be distinct** (`T25`): alias projections that would collide.
 - **Stored-query metadata**: `@description("…")` / `@instruction("…")` may follow the param list.
 - **Casing**: type names uppercase-initial (`Signal`); idents/edges lowercase-initial (`formsPattern`); variables `$`-prefixed. `//` and `/* */` comments only.
@@ -301,7 +299,7 @@ mappings: [`references/schema-design.md`](references/schema-design.md).
 
 ## Storage & Credentials
 
-A graph's bytes live in one of three supported URI families:
+A graph's bytes live in one of four URI families, two of them previews:
 
 - **Local filesystem** — a path or `file://` URI. The target selects the graph or cluster root explicitly; a source directory does not select storage. Local development needs no object store.
 - **S3-compatible object storage** — AWS, Railway, Tigris, etc. (`s3://bucket/prefix`). Authenticate with the standard `AWS_*` environment contract.
@@ -311,7 +309,7 @@ A graph's bytes live in one of three supported URI families:
 Direct CLI targets are local, with one exception: a stopped S3 cluster accepts
 an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger`
 and the maintenance commands with `--graph` (see
-[S3 cluster roots](../../docs/user/operations/s3-cluster-roots.md)); the CLI
+[S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)); the CLI
 then reads `AWS_REGION` (or `AWS_DEFAULT_REGION`) and endpoint variables from its environment. Otherwise,
 for cloud-backed graphs, use a registered server or managed target; the server
 owns storage credentials. Keep development credentials in a git-ignored
@@ -350,7 +348,7 @@ The team owns `cluster.yaml` and referenced schemas, queries and policies.
 The operator owns the `version: 1` document at `~/.omnigraph/config.yaml`.
 `OMNIGRAPH_HOME` changes the operator directory; `--operator-config FILE`
 selects one replacement file without merging. `--config DIR` is deployment source.
-The primary [operator reference](../../docs/user/cli/targets.md) owns the complete
+The primary [operator reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md) owns the complete
 schema, providers, transport, defaults and upgrade procedure.
 
 Profiles pin API/organization and own one auth provider for one identity. Managed targets
@@ -407,13 +405,13 @@ discovery never supply a missing destination.
 
 ### What to commit
 
-**Commit:** `schema.pg`, `queries/*.gq`, `cluster.yaml`, `seed.md`, `seed.jsonl`, and the project's `README.md` and `CLAUDE.md`.
+**Commit:** `schema.pg`, `queries/*.gq`, `cluster.yaml`, `seed.md`, `seed.jsonl`, and the project's `README.md`, `AGENTS.md` and `CLAUDE.md`.
 
 **Ignore:** `.env.omni` (credentials), `.claude/` (local agent state), `*.omni/` (local graph artifacts), `__cluster/` and `graphs/` (cluster state + derived graph roots).
 
-### Give agents a `CLAUDE.md`
+### Give agents an `AGENTS.md`
 
-A per-project `CLAUDE.md` tells coding agents where files live and what conventions matter. Without it, agents re-discover the same things every session.
+A per-project `AGENTS.md` tells coding agents where files live, which graph target holds what, and what conventions matter; for Claude Code, add a `CLAUDE.md` whose only line is `@AGENTS.md`. Without it, agents re-discover the same things every session. [Onboarding step 8](references/onboarding.md#8-leave-the-project-ready-for-the-next-session) has the sections to write.
 
 ## Common Gotchas
 
