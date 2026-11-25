@@ -642,7 +642,9 @@ struct Response {
 struct ResponseLimits {
     timeout: Duration,
     max_body: usize,
-    preserve_contents: bool,
+    /// The one `data` field a successful response keeps verbatim, exempt from
+    /// credential scrubbing: exact source files, or a secret disclosed once.
+    preserved: Option<&'static str>,
     auth_verification_status: bool,
 }
 
@@ -774,7 +776,7 @@ impl Api {
             ResponseLimits {
                 timeout,
                 max_body: MAX_BODY,
-                preserve_contents: false,
+                preserved: None,
                 auth_verification_status: false,
             },
         )
@@ -792,7 +794,7 @@ impl Api {
         let ResponseLimits {
             timeout,
             max_body,
-            preserve_contents,
+            preserved,
             auth_verification_status,
         } = limits;
         if auth_verification_status && (method != Method::GET || path != "/v1/auth/session") {
@@ -892,18 +894,18 @@ impl Api {
         }
         let mut body: Value = serde_json::from_slice(&bytes).map_err(|_| Failure::protocol())?;
         if let Some(token) = &token {
-            // Source export is byte-exact, but reflected credentials in its
+            // A preserved field is byte-exact, but reflected credentials in the
             // remaining metadata and in every error must still be redacted.
-            let files = (status.is_success() && preserve_contents)
-                .then(|| {
-                    body.get_mut("data")
-                        .and_then(Value::as_object_mut)?
-                        .remove("files")
-                })
-                .flatten();
+            let kept = preserved.filter(|_| status.is_success()).and_then(|field| {
+                let value = body
+                    .get_mut("data")
+                    .and_then(Value::as_object_mut)?
+                    .remove(field)?;
+                Some((field, value))
+            });
             auth::scrub_value(&mut body, token);
-            if let Some(files) = files {
-                body["data"]["files"] = files;
+            if let Some((field, value)) = kept {
+                body["data"][field] = value;
             }
         }
         let validate = || -> Result<()> {
