@@ -1,6 +1,6 @@
 # Schema Language (`.pg`)
 
-A schema declares the node and edge types a graph accepts. OmniGraph validates
+A schema declares the node and edge types a graph accepts. Omnigraph validates
 the same schema and constraints for mutation queries, loads, and branch merges.
 Actor attribution on a commit does not create a graph node. Applications may
 declare their own `Actor`, `OmniActor`, or other provenance types; these are
@@ -59,7 +59,7 @@ letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 Property names starting with `_` are reserved for system columns and are
 rejected when a schema is admitted. The reserved namespace covers Lance's
 virtual system columns (`_rowid`, `_rowaddr`, `_rowoffset`,
-`_row_created_at_version`, `_row_last_updated_at_version`) and OmniGraph's
+`_row_created_at_version`, `_row_last_updated_at_version`) and Omnigraph's
 own implicit stored columns, spelled `__id` on nodes and edges and
 `__src`/`__dst` on edges for newly created graphs.
 Supported existing graphs without the `system-columns` feature keep the earlier spellings `id`, `src`,
@@ -205,7 +205,7 @@ is always a user property of that name.
   created by this binary.
 
 For hand-authored load data, omit a keyed node's or keyed edge's top-level `id`
-and let OmniGraph derive it; a supplied id on a keyed edge must equal the
+and let Omnigraph derive it; a supplied id on a keyed edge must equal the
 derived id exactly. Export includes ids so a graph can be rebuilt without losing edge
 references.
 
@@ -305,7 +305,7 @@ cannot be undone. See [optimize](../operations/maintenance.md#optimize) and
 [cleanup](../operations/maintenance.md#cleanup).
 
 Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
-schema apply and the server schema-apply endpoint refuse cluster-managed graphs.
+`omnigraph schema apply` refuses them.
 
 ## Diagnostic codes
 
@@ -314,9 +314,6 @@ code rather than the message text.
 
 | Code | Meaning |
 |---|---|
-| `OG-DS-102` | Drop a node type that contains entities. |
-| `OG-DS-103` | Drop an edge type that contains entities. |
-| `OG-DS-104` | Drop a populated property. |
 | `OG-MF-103` | Add a required property to a populated type. |
 | `OG-MF-104` | Make a property required while a stored row holds a null (reported by `schema apply`). |
 | `OG-MF-106` | Change a property's type, including enum narrowing or renaming. |
