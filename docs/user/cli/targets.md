@@ -57,9 +57,9 @@ versions, duplicate keys, YAML tags, anchors, aliases, merge keys and implicit n
 Organization IDs contain 1–128 ASCII letters, digits, underscores or hyphens;
 cluster IDs and incarnations use the same characters with a 256-character limit.
 Graph IDs use the server's rule: 1–64 ASCII letters, digits or hyphens, excluding
-`policies`, `healthz`, `openapi` and `graphs`. Served targets additionally accept
-the system scope `og_catalog`; direct-root targets do not. Validation checks these
-rules for defaults and alias graph selectors before any network or credential access.
+`policies`, `healthz`, `openapi` and `graphs`; a graph `cluster.yaml` declares must also start with a letter
+([cluster configuration](../clusters/config.md)). Served targets additionally accept the system scope `og_catalog`;
+direct-root targets do not. Validation checks these rules for defaults and alias graph selectors before any network or credential access.
 There is no interpolation, include or inheritance. The input limit is 1 MiB.
 Relative token and CA paths resolve beside the selected operator file.
 Credential, helper and CA availability are checked only for selected operations.
@@ -114,7 +114,7 @@ Token profiles declare exactly one source. `store` uses secure local custody;
 `env` reads only the named variable; `file` reads one bounded regular-file
 snapshot, allowing symlink-based atomic rotation. Missing or empty sources fail
 without fallback. Environment names match `[A-Za-z_][A-Za-z0-9_]*`; there is no
-shell expansion. OmniGraph never writes or removes externally owned token files.
+shell expansion. Omnigraph never writes or removes externally owned token files.
 Tokens are bounded to 64 KiB and must be valid bearer tokens. Stdin/file input
 may remove one terminal LF or CRLF; environment values must contain only the
 token. Installation does not verify server acceptance or establish the principal

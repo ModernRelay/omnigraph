@@ -581,9 +581,7 @@ mod tests {
     /// change fails here until the skill says what `omnigraph version` says.
     #[test]
     fn skill_states_the_storage_formats_this_binary_reports() {
-        let line = crate::commands::local::output::VersionOutput::current()
-            .internal_schema
-            .line();
+        let line = omnigraph_api_types::build::internal_schema_line();
         assert!(
             embedded_text("SKILL.md").contains(&format!("`{line}`")),
             "SKILL.md must state `{line}`, as `omnigraph version` prints it"

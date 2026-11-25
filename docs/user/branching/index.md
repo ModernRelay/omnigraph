@@ -114,7 +114,7 @@ process holds proceeds, and that process's next write is refused `branch_deleted
 
 ## Atomicity model
 
-OmniGraph does not provide connection-scoped `BEGIN` and `ROLLBACK`.
+Omnigraph does not provide connection-scoped `BEGIN` and `ROLLBACK`.
 
 | Scope | Guarantee |
 |---|---|

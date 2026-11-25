@@ -43,22 +43,8 @@ pub(crate) struct InternalSchemaOutput {
     pub(crate) serves: [u32; 2],
 }
 
-impl InternalSchemaOutput {
-    /// The line `omnigraph version` prints; the agent skill states it verbatim.
-    pub(crate) fn line(&self) -> String {
-        let [lowest, highest] = self.serves;
-        format!(
-            "internal-schema {} (serves v{lowest} to v{highest})",
-            self.writes
-        )
-    }
-}
-
 impl VersionOutput {
     pub(crate) fn current() -> Self {
-        use omnigraph::db::manifest::{
-            INTERNAL_MANIFEST_SCHEMA_VERSION, MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
-        };
         Self {
             version: PACKAGE_VERSION.clone(),
             channel: omnigraph_api_types::build::RELEASE_CHANNEL,
@@ -71,29 +57,23 @@ impl VersionOutput {
                 access: crate::targets::ACCESS_PROTOCOL,
             },
             internal_schema: InternalSchemaOutput {
-                writes: INTERNAL_MANIFEST_SCHEMA_VERSION,
-                serves: [
-                    MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION,
-                    INTERNAL_MANIFEST_SCHEMA_VERSION,
-                ],
+                writes: omnigraph_api_types::build::INTERNAL_SCHEMA_WRITES,
+                serves: omnigraph_api_types::build::INTERNAL_SCHEMA_SERVES,
             },
         }
     }
 }
 
-pub(crate) fn write_version(
-    output: &VersionOutput,
-    json: bool,
-    stdout: &mut dyn Write,
-) -> Result<()> {
+/// `omnigraph version`: the JSON object, or the report
+/// `omnigraph-server --version` prints too.
+pub(crate) fn write_version(json: bool, stdout: &mut dyn Write) -> Result<()> {
     if json {
-        return write_json(output, stdout);
+        return write_json(&VersionOutput::current(), stdout);
     }
-    writeln!(stdout, "omnigraph {}", output.version)?;
-    writeln!(stdout, "{}", output.internal_schema.line())?;
-    writeln!(stdout, "http-contract {}", output.http_contract)?;
-    if let Some(commit) = output.commit {
-        writeln!(stdout, "commit {commit}")?;
-    }
+    writeln!(
+        stdout,
+        "omnigraph {}",
+        omnigraph_api_types::build::version_report(env!("CARGO_PKG_VERSION"))
+    )?;
     Ok(())
 }

@@ -147,8 +147,9 @@ against the query's requirements alone. A plan that fails acceptance is never
 explained: the query fails as it would fail to run. The
 last `plan` row is `assumptions`, what the planner read to build the plan,
 as one JSON object: `params`, the names of the parameters it read (never a
-value); `settings`, each setting it read with its spelling (`traversal`,
-`ann_nprobes`); `env`, each environment variable it read with the value it
+value); `settings`, each setting it read with its spelling (`ann_nprobes`;
+`traversal` is the internal traversal pin, which has no public setting and
+reads `auto`); `env`, each environment variable it read with the value it
 resolved (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`,
 `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`, when the query traverses); `gate_policy`,
 the `rrf_plan` mode and the prefilter gate's admission thresholds;

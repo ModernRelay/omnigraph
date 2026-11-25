@@ -597,6 +597,114 @@ async fn run_query_at_traversal_uses_historical_graph_index() {
 }
 
 #[tokio::test]
+async fn historical_exists_never_sees_an_edge_from_a_warm_live_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = version_main(&db).await.unwrap();
+    db.apply_schema(&format!("{TEST_SCHEMA}\nedge Likes: Person -> Person\n"))
+        .await
+        .unwrap();
+    db.load_jsonl(
+        r#"{"edge":"Likes","from":"Alice","to":"Charlie"}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    db.optimize_as(
+        None,
+        omnigraph::db::OptimizeRequest::default().with_datasets(["node:Person"]),
+    )
+    .await
+    .unwrap();
+    let csr = with_traversal(&db, Traversal::Csr);
+    let alice = params(&[("$name", "Alice")]);
+    query_main(&csr, FRIENDS_QUERY, "friends_of", &alice)
+        .await
+        .unwrap();
+    let both = r#"query both() {
+        match { $p: Person exists { $p knows $_ } exists { $p likes $_ } }
+        return { $p.name }
+    }"#;
+    let error = csr
+        .run_query_at(before, both, "both", &ParamMap::new())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Likes"), "{error}");
+}
+
+/// A historical traversal takes its graph index from the handle's cache, as a
+/// live read does: a second read of the version builds nothing, and the live
+/// head, whose edge tables are that version's, reuses the same index. Before
+/// that, every `run_query_at` built an index of its own and held it for the
+/// query, so concurrent historical reads each held a copy.
+#[tokio::test]
+async fn run_query_at_reuses_the_cached_adjacency() {
+    use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let version = version_main(&db).await.unwrap();
+    // A node-only write: `Knows` at `version` is still the live edge table.
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    let csr = with_traversal(&db, Traversal::Csr);
+    let alice = params(&[("$name", "Alice")]);
+
+    let builds = Arc::new(AtomicU64::new(0));
+    let probes = || QueryIoProbes {
+        graph_build_count: Arc::clone(&builds),
+        ..Default::default()
+    };
+    let historical = with_query_io_probes(
+        probes(),
+        csr.run_query_at(version, FRIENDS_QUERY, "friends_of", &alice),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        1,
+        "the first historical traversal scans the edge table"
+    );
+    let again = with_query_io_probes(
+        probes(),
+        csr.run_query_at(version, FRIENDS_QUERY, "friends_of", &alice),
+    )
+    .await
+    .unwrap();
+    let live = with_query_io_probes(
+        probes(),
+        csr.query(
+            ReadTarget::branch("main"),
+            FRIENDS_QUERY,
+            "friends_of",
+            &alice,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        1,
+        "a second read of the version and a read of the live head reuse its index"
+    );
+    let friends = vec!["Bob".to_string(), "Charlie".to_string()];
+    for result in [&historical, &again, &live] {
+        let mut names = collect_column_strings(result.batches(), "f.name");
+        names.sort();
+        assert_eq!(names, friends);
+    }
+}
+
+#[tokio::test]
 async fn snapshot_at_graph_manifest_version_fails_for_nonexistent_version() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;

@@ -1,6 +1,6 @@
 # Deployment
 
-OmniGraph can keep a cluster on a local filesystem, S3-compatible object
+Omnigraph can keep a cluster on a local filesystem, S3-compatible object
 storage, or Azure Blob Storage. The server always boots from one cluster root
 and exposes its ready applied graphs under `/graphs/{graph_id}/…`; use
 `--require-all-graphs` when any blocked graph must fail startup.
@@ -222,8 +222,8 @@ a gateway can relay a socket to its loopback listener:
 socat UNIX-LISTEN:/run/omnigraph/server.sock,fork TCP:127.0.0.1:8080
 ```
 
-The version-1 CLI does not accept Unix socket targets; use a registered HTTPS
-endpoint instead. Relay requests and responses unchanged, including
+The CLI's operator configuration (`version: 1`) refuses a `unix://` server
+endpoint; register an HTTPS endpoint instead. Relay requests and responses unchanged, including
 `Omnigraph-Http-Api`. Restrict socket-directory permissions; bearer authentication
 and policy still apply.
 

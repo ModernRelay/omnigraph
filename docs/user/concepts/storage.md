@@ -1,6 +1,6 @@
 # Storage
 
-One OmniGraph graph lives at one storage root. The root contains the graph's
+One Omnigraph graph lives at one storage root. The root contains the graph's
 schema, data, branches, and commit history. Treat it as a single unit: do not
 edit files beneath it with storage-provider tools or write to its underlying
 datasets directly.
@@ -14,7 +14,7 @@ datasets directly.
 | `az://container/prefix/graph.omni` | Azure Blob Storage qualification preview |
 | `gs://bucket/prefix/graph.omni` | Google Cloud Storage preview, embedded API only |
 
-An `http://` or `https://` URL addresses an OmniGraph server; it is not a graph
+An `http://` or `https://` URL addresses an Omnigraph server; it is not a graph
 storage URI. These are engine/server storage capabilities, not CLI target variants.
 Operator version 1 permits only local direct targets. Register a server or managed
 target to access remotely served graphs, including servers using cloud storage;
@@ -28,7 +28,7 @@ mutation-capable Azure process must use the admission wrapper described in
 
 ## Consistency and history
 
-Although a graph contains separate data for each node and edge type, OmniGraph
+Although a graph contains separate data for each node and edge type, Omnigraph
 presents one graph-wide snapshot. A successful write makes all affected types
 visible together. Readers never see half of a graph commit.
 
@@ -57,7 +57,7 @@ local filesystem rather than a mount that emulates files incompletely.
 
 ## S3 configuration
 
-OmniGraph uses the standard AWS credential chain. Common settings include:
+Omnigraph uses the standard AWS credential chain. Common settings include:
 
 - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optional
   `AWS_SESSION_TOKEN`;
@@ -100,7 +100,7 @@ the real-bucket tests run only when an operator points them at a bucket, and
 Lance's multipart uploads of large files have not been exercised there.
 
 Roots use the strict form `gs://<bucket>/<prefix>`. Credentials never belong
-in the URI. OmniGraph reads its Google configuration once per process from
+in the URI. Omnigraph reads its Google configuration once per process from
 `GOOGLE_*` environment variables and gives the same options to the client for
 control objects and to Lance's client for datasets:
 

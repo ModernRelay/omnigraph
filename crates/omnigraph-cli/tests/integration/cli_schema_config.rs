@@ -426,6 +426,35 @@ fn graph_vocabulary_help_exposes_only_canonical_export_selection() {
     assert!(cleanup_help.contains("backing dataset"));
     assert!(cleanup_help.contains("graph commits to keep on every live branch"));
     assert!(!cleanup_help.contains("per dataset"));
+    // Without --confirm, cleanup echoes its policy and enumerates nothing.
+    assert!(cleanup_help.contains("it lists no"), "{cleanup_help}");
+    assert!(
+        !cleanup_help.contains("what would be removed"),
+        "{cleanup_help}"
+    );
+
+    // Inline init addresses local storage only; cloud URIs refuse.
+    let init_help = stdout_string(&output_success(cli().arg("init").arg("--help")));
+    let uri_help = init_help
+        .lines()
+        .find(|line| line.trim_start().starts_with("[URI]"))
+        .unwrap_or_else(|| panic!("[URI] missing from init --help:\n{init_help}"));
+    assert!(
+        uri_help.contains("Local graph path or `file://` URI"),
+        "{uri_help}"
+    );
+    assert!(
+        !uri_help.contains("s3://") && !uri_help.contains("az://"),
+        "{uri_help}"
+    );
+
+    // Members are the organization's active members; nothing enrolls them.
+    let cluster_help = stdout_string(&output_success(cli().arg("cluster").arg("--help")));
+    assert!(
+        cluster_help.contains("active members and their identity eligibility"),
+        "{cluster_help}"
+    );
+    assert!(!cluster_help.contains("enrolled"), "{cluster_help}");
 
     let embed_help = stdout_string(&output_success(cli().arg("embed").arg("--help")));
     assert!(embed_help.contains("matching records"));

@@ -1,6 +1,6 @@
 # Changes, Diffs and Change Feeds
 
-OmniGraph can describe what one commit changed, compare any two points in
+Omnigraph can describe what one commit changed, compare any two points in
 history, review what a branch changed, or deliver an ordered feed of changes
 on a branch. Every surface reports logical nodes and edges, not storage
 details, in one change shape.

@@ -1,0 +1,1 @@
+- A query the compiler refuses on a direct target reports `action: fix`, as the same refusal from a server does, instead of `refresh`.
