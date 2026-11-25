@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 mod custody;
+mod m2m_applications;
 
 const TEAM_TIMEOUT: Duration = Duration::from_secs(35);
 const CREDENTIAL_LIFETIME: u64 = 86400;
@@ -873,16 +874,73 @@ fn mutation_human(
     }
 }
 
-pub(super) async fn dispatch(
+/// A refusal when an M2M application's client secret file would coincide
+/// with another file this invocation writes; see
+/// [`m2m_applications::output_collision`].
+pub(super) fn output_collision(
+    command: &OrganizationCommand,
     input: &crate::operator::InvocationConfig,
-    binding: &Binding,
+    stats: Option<&std::path::Path>,
+) -> Option<Failure> {
+    match command {
+        OrganizationCommand::M2mApplications { command } => {
+            m2m_applications::output_collision(command, input, stats)
+        }
+        _ => None,
+    }
+}
+
+/// What an organization command needs beyond its arguments.
+pub(super) struct Invocation<'a, 'i> {
+    pub input: &'a crate::operator::InvocationConfig,
+    pub binding: &'a Binding,
+    /// `--profile`, when given; M2M application profiles derive from it.
+    pub profile: Option<&'a str>,
+    /// `--yes` consents to a destructive write without a prompt.
+    pub yes: bool,
+    pub prompt: &'a mut crate::input::Input<'i>,
+}
+
+pub(super) async fn dispatch(
+    invocation: Invocation<'_, '_>,
     args: &OrganizationArgs,
     command: &OrganizationCommand,
     stderr: &mut dyn Write,
 ) -> Output {
+    let Invocation {
+        input,
+        binding,
+        profile,
+        yes,
+        prompt,
+    } = invocation;
     let operation = Operation::from_command(command);
-    let key = operation.as_ref().map(|(_, key)| *key);
+    let key = match command {
+        OrganizationCommand::M2mApplications { command } => m2m_applications::key(command),
+        _ => operation.as_ref().map(|(_, key)| *key),
+    };
     let result = async {
+        if let OrganizationCommand::M2mApplications { command } = command {
+            if let Some(key) = key {
+                idempotency_key(Some(key), stderr)?;
+            }
+            binding.organization()?;
+            let api = binding.client().await?;
+            return m2m_applications::dispatch(
+                m2m_applications::Invocation {
+                    input,
+                    binding,
+                    api: &api,
+                    admin_profile: profile,
+                    yes,
+                    json: args.json,
+                    prompt,
+                    stderr,
+                },
+                command,
+            )
+            .await;
+        }
         if let Some((operation, key)) = &operation {
             idempotency_key(Some(key), stderr)?;
             operation.validate()?;
@@ -961,7 +1019,11 @@ pub(super) async fn dispatch(
                 && key.bytes().all(|b| b.is_ascii_graphic())
             {
                 error.body["idempotency_key"] = json!(key);
-                if error.body["type"] != "output_delivery_failed" {
+                // A lost client secret's own detail names its recovery; repeating
+                // the request cannot recover the value.
+                if error.body["type"] != "output_delivery_failed"
+                    && error.body["type"] != "m2m_application_secret_undelivered"
+                {
                     if let Err(mut delivery) = write_diagnostic(
                         stderr,
                         format_args!(

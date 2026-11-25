@@ -21,6 +21,7 @@ mod engine_v2;
 mod engine_v2_memory;
 mod engine_v2_plan_replay;
 mod export;
+mod gcs_storage;
 #[path = "../helpers/mod.rs"]
 mod helpers;
 mod lance_version_columns;

@@ -950,34 +950,17 @@ impl ServerHost {
         }
     }
 
-    /// Graph ids and names. An identity credential uses `GET /graphs/discovery`,
-    /// which admits every identity; any other credential uses `GET /graphs`
-    /// under the `graph_list` action, narrowed to the same two fields.
+    /// The caller's actor and the graphs it may use, as `GET /graphs/discovery`
+    /// lists them.
     async fn discover(
         &self,
         actor: AuthenticatedActor,
     ) -> Result<crate::api::GraphDiscoveryOutput, ApiError> {
-        let state = State(self.state.clone());
-        if actor.is_identity() {
-            return Ok(
-                handlers::server_graphs_discovery(state, Some(Extension(actor)))
-                    .await?
-                    .0,
-            );
-        }
-        let listed = handlers::server_graphs_list(state, Some(Extension(actor)))
-            .await?
-            .0;
-        Ok(crate::api::GraphDiscoveryOutput {
-            graphs: listed
-                .graphs
-                .into_iter()
-                .map(|graph| crate::api::GraphDiscoveryEntry {
-                    display_name: graph.graph_id.clone(),
-                    graph_id: graph.graph_id,
-                })
-                .collect(),
-        })
+        Ok(
+            handlers::server_graphs_discovery(State(self.state.clone()), Some(Extension(actor)))
+                .await?
+                .0,
+        )
     }
 
     /// A write reserves write ingress for its argument bytes, as the write's

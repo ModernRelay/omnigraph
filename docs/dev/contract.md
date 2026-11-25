@@ -284,8 +284,18 @@ last chooses consistency over availability [K17, ch. 9].
 
 **E6. It is checked.** The server resolves the caller from its token; a client
 cannot name itself. The server checks every action against the installed
-policy. The engine checks every write when a policy is installed, before the
-first lasting effect, so a denied write changes nothing. A direct CLI write to
+policy. Listing graphs needs no permission, states its rule
+(`visibility: granted`), names the actor the caller resolves to, and returns
+exactly the registered graphs on which the caller holds some permission, for
+any action on any branch, or every registered graph to a holder of
+`graph_list`, whatever their availability. A registered graph is listed
+exactly when its routes do not answer `graph not found`: every other one,
+ready or not, gets the refusal an unknown graph gets, whole. A listed graph's
+subresources can still be not found, and a caller is refused only the actions
+it lacks on a graph it lists. The built-in `og_catalog` is not a registered
+graph: it is never listed and keeps its own authorization.
+The engine checks every write when a policy is installed, before the first
+lasting effect, so a denied write changes nothing. A direct CLI write to
 a cluster graph uses that cluster's policy. Reads through the engine or the
 direct CLI are not checked `D9`, and a direct or embedded caller states its
 own actor. A served graph with no policy denies every authenticated request,
@@ -636,6 +646,7 @@ statement. "See" names the invariant or the design that bears on it.
 | `G12` | `read:9` | Types and properties carry descriptions, and nothing searches them | No design yet |
 | `G13` | Boundary, Processes | One server serves a cluster, and read-only CLI commands may read beside it. There is no read-only serving mode | [Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md) |
 | `G14` | `read:11`, `E7` | A `limit` without an `order` returns the first rows in physical order, which `optimize` can change. No test pins it | [GQ 3](https://github.com/ModernRelay/omnigraph/pull/1302), draft: one total order for every read |
+| `G15` | `E5` | Traversal adjacency has no byte limit during construction or retention. A single cold build or successive historical scans filling the cache can exhaust the host | Invariant 11 |
 
 ## Decisions
 

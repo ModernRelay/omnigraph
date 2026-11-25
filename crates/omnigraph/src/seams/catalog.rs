@@ -108,6 +108,8 @@ omnigraph_seams::catalog! {
     crate::exec::staging::LOAD_BETWEEN_TABLE_STAGES,
     crate::exec::staging::MUTATION_POST_TABLE_COMMIT,
     crate::loader::LOAD_POST_BRANCH_CREATE_PRE_STAGE,
+    crate::runtime_cache::GRAPH_INDEX_BUILD_QUEUED,
+    crate::runtime_cache::GRAPH_INDEX_SCAN_BUILD,
     crate::table_store::CHANGE_FEED_ETAG_WITNESS,
     crate::db::omnigraph::collector::CLEANUP_COLLECTOR_MID_BRANCH_READ,
     crate::db::omnigraph::collector::CLEANUP_COLLECTOR_POST_SNAPSHOT,

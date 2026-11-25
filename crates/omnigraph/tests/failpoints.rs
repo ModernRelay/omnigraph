@@ -6582,6 +6582,147 @@ async fn optimize_cancelled_during_the_artifact_scan_writes_no_artifact() {
     assert!(!artifact.exists(), "a cancelled refresh writes no artifact");
 }
 
+/// A graph with one `Knows` edge from `Walker` to `Alice`, and a CSR-pinned
+/// reader over it whose graph index cache is empty: the artifact is absent,
+/// so the first traversal scans the edge table.
+async fn cold_csr_reader(dir: &tempfile::TempDir) -> Session {
+    let writer = init_and_load(dir).await;
+    mutate_main(
+        &writer,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(
+            &[("$name", "Walker"), ("$friend", "Alice")],
+            &[("$age", 41)],
+        ),
+    )
+    .await
+    .unwrap();
+    drop(writer);
+    let reader = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    helpers::with_traversal(&reader, helpers::Traversal::Csr)
+}
+
+/// Traversals that miss the graph index cache together run one scan build and
+/// share its index. The first build is held at its seam until every reader
+/// has missed the cache, so all of them are behind the build gate when it
+/// resumes. Before the gate covered the scan build, each reader scanned the
+/// edge tables and built its own copy, and all but one were dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial]
+async fn concurrent_cold_traversals_build_the_adjacency_once_issue_1539() {
+    const READERS: usize = 8;
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let reader = Arc::new(cold_csr_reader(&dir).await);
+
+    let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _queued_observer = {
+        let queued = Arc::clone(&queued);
+        catalog::GRAPH_INDEX_BUILD_QUEUED.observe(move || {
+            queued.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let build = helpers::failpoint::Rendezvous::park_first(&catalog::GRAPH_INDEX_SCAN_BUILD);
+    let builds = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let runs: Vec<_> = (0..READERS)
+        .map(|_| {
+            let reader = Arc::clone(&reader);
+            let probes = QueryIoProbes {
+                graph_build_count: Arc::clone(&builds),
+                ..Default::default()
+            };
+            tokio::spawn(with_query_io_probes(probes, async move {
+                reader
+                    .query(
+                        ReadTarget::branch("main"),
+                        TEST_QUERIES,
+                        "friends_of",
+                        &params(&[("$name", "Walker")]),
+                    )
+                    .await
+            }))
+        })
+        .collect();
+
+    build.wait_until_reached().await;
+    for _ in 0..2400 {
+        if queued.load(Ordering::SeqCst) == READERS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        queued.load(Ordering::SeqCst),
+        READERS,
+        "every reader missed the cache while the first build was held"
+    );
+    build.release();
+
+    for run in runs {
+        let friends = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("a reader hung behind the build gate")
+            .unwrap()
+            .unwrap();
+        assert_eq!(helpers::first_column_sorted(&friends), vec!["Alice"]);
+    }
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        1,
+        "{READERS} readers that missed the cache together scan the edge tables once"
+    );
+}
+
+/// A scan build that fails fails its own query only: the gate passes on,
+/// nothing is cached for the key, and the next traversal builds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_failed_adjacency_build_releases_the_gate_and_caches_nothing() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let reader = cold_csr_reader(&dir).await;
+    let walker = params(&[("$name", "Walker")]);
+    let friends_of_walker = || {
+        reader.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &walker,
+        )
+    };
+
+    let failed = {
+        let _failure = catalog::GRAPH_INDEX_SCAN_BUILD.fail_once_at(1);
+        friends_of_walker().await.unwrap_err()
+    };
+    assert!(
+        failed
+            .to_string()
+            .contains("injected failpoint triggered: runtime_cache.graph_index_scan_build"),
+        "{failed}"
+    );
+
+    let builds = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let probes = QueryIoProbes {
+        graph_build_count: Arc::clone(&builds),
+        ..Default::default()
+    };
+    let friends = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        with_query_io_probes(probes, friends_of_walker()),
+    )
+    .await
+    .expect("the failed build kept the gate")
+    .unwrap();
+    assert_eq!(helpers::first_column_sorted(&friends), vec!["Alice"]);
+    assert_eq!(
+        builds.load(Ordering::SeqCst),
+        1,
+        "the failed build cached nothing, so the next traversal builds"
+    );
+}
+
 /// While one table's rewrite is in flight, the planner runs `planning` tables
 /// ahead into the ready queue. When those are no-ops, their turns stage
 /// nothing and drain the queue; the pipeline must then plan the rest of the

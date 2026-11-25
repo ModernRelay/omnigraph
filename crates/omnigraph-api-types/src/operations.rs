@@ -219,11 +219,10 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs",
         Capability::Read,
         Some("listGraphs"),
-        Surface::restricted(
-            &["graphs"],
-            "A static or signed bearer credential gets this listing.",
+        Surface::absent(
+            "MCP `graphs` lists the graphs the caller may use; no tool reads the catalog.",
         ),
-        Surface::restricted(&["graphs list"], "Ordinary listing, without --discovery."),
+        Surface::restricted(&["graphs list"], "--catalog selects the catalog."),
     ),
     operation(
         "discover graphs",
@@ -231,14 +230,8 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs/discovery",
         Capability::Read,
         Some("discoverGraphs"),
-        Surface::restricted(
-            &["graphs"],
-            "An identity credential gets this discovery shape.",
-        ),
-        Surface::restricted(
-            &["graphs list"],
-            "--discovery selects the identity-only discovery route.",
-        ),
+        Surface::bound(&["graphs"]),
+        Surface::restricted(&["graphs list"], "Ordinary listing, without --catalog."),
     ),
     operation(
         "access",
@@ -688,6 +681,10 @@ pub const CLI_ONLY_OPERATIONS: &[CliOnlyOperation] = &[
     cli_only("organization invitations send", MANAGED),
     cli_only("organization invitations resend", MANAGED),
     cli_only("organization invitations revoke", MANAGED),
+    cli_only("organization m2m-applications list", MANAGED),
+    cli_only("organization m2m-applications create", MANAGED),
+    cli_only("organization m2m-applications secret rotate", MANAGED),
+    cli_only("organization m2m-applications delete", MANAGED),
     cli_only("policy validate", APPLIED),
     cli_only("policy test", APPLIED),
     cli_only("policy explain", APPLIED),

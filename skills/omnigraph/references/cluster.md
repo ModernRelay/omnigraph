@@ -41,7 +41,7 @@ accept local paths and `file://` URIs and, with the server stopped, an inline
 `s3://` cluster root for `cluster plan`, `apply`, `status`, `force-unlock` and
 `upgrade-ledger` and for direct maintenance with `--graph` (region from
 `AWS_REGION` or `AWS_DEFAULT_REGION`; see
-[S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+[S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)).
 Every direct writer on the root (`cluster apply`, maintenance) takes the
 cluster's admission lock. Maintenance keeps it after it finishes; `cluster
 apply` releases it after convergence and settlement on local storage and S3.
@@ -84,7 +84,7 @@ not fencing for older binaries or raw storage tools. Azure writers also require
 ## Live server deployment
 
 Configure `production` as a server target with `auth: {provider: token, source: {store: {}}}`;
-see [operator configuration](../../../docs/user/cli/targets.md).
+see [operator configuration](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md).
 
 ```bash
 printf '%s' "$TOKEN" | omnigraph credentials set --target production --stdin
@@ -157,7 +157,7 @@ backup restoration; apply does not adopt or recreate them.
 A profile pins API, organization and one auth provider for one identity. A managed
 target references it and pins cluster ID/incarnation plus an optional endpoint.
 Graph work needs that endpoint and an explicit/default graph. See
-[registration](../../../docs/user/cli/targets.md#login-and-registration).
+[registration](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#login-and-registration).
 
 ```bash
 omnigraph login --profile work
@@ -189,7 +189,8 @@ submit operations; resume with the original verified principal and original key.
 Managed graph commands acquire missing identity credentials without replaying
 submitted mutations. Credential issuance grants connectivity, not graph
 permissions; applied Cedar policy remains authoritative. `cluster token --target
-production --ttl 1h` administers the cached credential explicitly.
+production` administers the cached credential explicitly; `--ttl` requests a
+lifetime the service may shorten, and `expires_at` reports the one it issued.
 
 ## Serving and references
 
@@ -200,6 +201,6 @@ unless `--require-all-graphs` is set; global failures refuse startup. `/readyz`
 reports graph counts and `/graphs` requires `graph_list`. The bounded shutdown
 uses `--shutdown-grace-seconds` (default 25) and exits 2 if drain expires.
 
-See the repository's `docs/user/clusters/index.md` for deployment and recovery,
-`docs/user/clusters/config.md` for configuration and limits, and
-`docs/user/cli/managed-lifecycle.md` for service operations and custody.
+See [clusters](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/clusters/index.md) for deployment and recovery,
+[cluster configuration](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/clusters/config.md) for configuration and limits, and
+[managed lifecycle](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/managed-lifecycle.md) for service operations and custody.

@@ -4513,7 +4513,7 @@ async fn branch_delete_defers_pin_collection_and_allows_recreate() {
 }
 
 #[tokio::test]
-async fn branch_names_reject_incarnation_shaped_suffixes() {
+async fn branch_create_refuses_names_no_native_ref_can_carry() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
 
@@ -4535,9 +4535,94 @@ async fn branch_names_reject_incarnation_shaped_suffixes() {
             "native refs are not addressable on reads either; got: {err}"
         );
     }
+    // A name no native ref can carry is refused by the branch name as
+    // written, before any effect, on every create route: never with the
+    // storage error about the internal `{name}.{ULID}` ref the caller did
+    // not write.
+    let loaded = newest_commit(&db, "main").await;
+
+    for name in [
+        "sp ace",
+        "x^y",
+        "q?x",
+        "h#x",
+        "a~b",
+        "a%2Fb",
+        "a:b",
+        "a\\b",
+        "a//b",
+        "/a",
+        "a/",
+        "a..b",
+        "end.",
+        "team/end.",
+    ] {
+        let attempts = [
+            ("create", db.branch_create(name).await),
+            (
+                "create from main",
+                db.branch_create_from("main", name).await.map(drop),
+            ),
+            (
+                "create at a commit",
+                db.branch_create_from(
+                    ReadTarget::snapshot(SnapshotId::new(loaded.graph_commit_id.clone())),
+                    name,
+                )
+                .await
+                .map(drop),
+            ),
+        ];
+        for (route, result) in attempts {
+            let (error, evidence) = result
+                .expect_err("a name no native ref can carry is refused")
+                .into_completion_evidence();
+            assert_eq!(
+                evidence,
+                Some(CompletionEvidence::BeforeEffect),
+                "{route} '{name}': {error}"
+            );
+            let OmniError::Manifest(ref manifest) = error else {
+                panic!("{route} '{name}': expected a bad request, got {error:?}");
+            };
+            assert_eq!(
+                manifest.kind,
+                ManifestErrorKind::BadRequest,
+                "{route} '{name}': {error}"
+            );
+            assert!(
+                manifest
+                    .message
+                    .starts_with(&format!("branch name '{name}' ")),
+                "{route} '{name}' must be refused by the name as written; got: {error}"
+            );
+            let names_a_native_ref = manifest.message.match_indices('.').any(|(dot, _)| {
+                let suffix = &manifest.message.as_bytes()[dot + 1..];
+                suffix.len() >= 26
+                    && suffix[..26]
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+            });
+            assert!(
+                !names_a_native_ref && !manifest.message.contains("Ref is invalid"),
+                "{route} '{name}' must not name the internal native ref; got: {error}"
+            );
+        }
+    }
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
+
+    // Letters and digits of any script, '.', '-', '_' and '/' stay legal.
+    for name in ["é/ü", "team/v1.2-rc_3", ".hidden"] {
+        db.branch_create(name).await.unwrap();
+    }
     // Ordinary dotted names stay legal.
     db.branch_create("release.1.2").await.unwrap();
-    assert_eq!(db.branch_list().await.unwrap(), vec!["main", "release.1.2"]);
+    let mut listed = db.branch_list().await.unwrap();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![".hidden", "main", "release.1.2", "team/v1.2-rc_3", "é/ü"]
+    );
 }
 
 #[tokio::test]

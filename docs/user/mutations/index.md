@@ -315,7 +315,7 @@ Independent existing constructive datasets stage concurrently. The
 controls that width for both Load and insert/update mutations (default 8,
 range `1..=64`); it is `process` scope, so the server takes it from
 `OMNIGRAPH_LOAD_CONCURRENCY` and a direct CLI run from that variable or from
-`--set` on `load`, `ingest` or `mutate` (a JSONL input carries no `set` line),
+`--set` on `load` or `mutate` (a JSONL input carries no `set` line),
 and an invalid or `0` value refuses startup instead of running the default.
 The same width is the number of Lance writers a `load csv` overwrite runs at
 once: its batches are cut into runs of at most one Lance file (1 M rows), each

@@ -4,7 +4,7 @@ The rest of this skill describes the current CLI and HTTP contract. This page
 covers moving a 0.13 deployment to it and the offline conversion this binary
 performs. A graph in any other storage format is rebuilt by export and load
 with the binary that wrote it; the
-[upgrade guide](../../../docs/user/operations/upgrade.md) owns that procedure.
+[upgrade guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/upgrade.md) owns that procedure.
 
 Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.14`, including
 the current routes, shapes and credentials. A `0.13` peer is refused before data
@@ -50,7 +50,7 @@ recording every branch in the catalog, then removes the branch ref files; a
 run that stops is finished by running it again. `upgrade` refuses cluster graphs; publish ordinarily on the
 branch instead. A binary refuses a graph stamped above the formats it
 serves, so upgrade every binary first.
-See the [0.13 to 0.14 checklist](../../../docs/user/operations/upgrade-0.14.md).
+See the [0.13 to 0.14 checklist](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/upgrade-0.14.md).
 
 ## Operator configuration rewrite
 
@@ -66,7 +66,7 @@ Bare login uses the existing default profile.
 `config recover-operations --source DIR --profile NAME` preserves matching
 folder lifecycle evidence; keep the old operator home and reconcile unresolved
 operations under the original identity and key. See the primary
-[operator reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
+[operator reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#upgrade-from-the-old-format).
 
 ## Convert a v8, v9 or v13 graph
 
@@ -129,7 +129,7 @@ source brings these with it:
   full-text --target ./graph.omni --branch <branch>` on each live branch that
   searches text.
 
-The [upgrade guide](../../../docs/user/operations/upgrade.md#storage-upgrade)
+The [upgrade guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/upgrade.md#storage-upgrade)
 owns the findings table, the limits and the recovery actions. Upgrade the CLI,
 server and HTTP integrations together: every protected request needs the
 `Omnigraph-Http-Api: 0.14` header described at the top of this page.

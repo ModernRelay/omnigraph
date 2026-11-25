@@ -1,5 +1,7 @@
 //! Fresh graph namespaces over the shared-memory Lance provider.
 //! Backend ETag counters and incomplete multipart uploads are not reset.
+//! An `s3://` root is a fresh simulated bucket that answers to the root's
+//! bucket name until teardown: one store for the adapter and for Lance.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -11,6 +13,7 @@ use object_store::path::Path;
 use omnigraph::object_store_seam::{ReadThroughMountGuard, mount_read_through};
 use omnigraph::storage::ObjectStorageAdapter;
 use omnigraph_storage::FrozenDirectory;
+use omnigraph_storage::simulated_bucket::{BucketNames, Provider, SimulatedBucket};
 use url::Url;
 
 use crate::environment::{UniverseEnvironment, UniverseProcess};
@@ -43,6 +46,7 @@ pub struct MemoryStorage {
     prefix: Path,
     authority: String,
     mount: Option<ReadThroughMountGuard>,
+    names: Option<BucketNames>,
     _lease: AuthorityLease,
 }
 
@@ -67,6 +71,11 @@ impl MemoryStorage {
     /// every write of the run stays in memory, and the root is never
     /// written. The mount lasts until teardown.
     pub async fn mount_prepared(&mut self, uri: &str) -> Result<(), String> {
+        if self.names.is_some() {
+            return Err(format!(
+                "a prepared store is read through below a shared-memory root, not a simulated bucket: {uri}"
+            ));
+        }
         let root = prepared_root(uri)?;
         let frozen = FrozenDirectory::open(&root)
             .await
@@ -122,7 +131,8 @@ impl UniverseEnvironment for MemoryEnvironment {
     async fn setup(&self) -> Result<MemoryStorage, String> {
         let url = Url::parse(&self.root)
             .map_err(|error| format!("invalid memory environment root: {error}"))?;
-        if url.scheme() != "shared-memory"
+        let simulated = Provider::for_scheme(url.scheme());
+        if !(simulated.is_some() || url.scheme() == "shared-memory")
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
@@ -130,12 +140,31 @@ impl UniverseEnvironment for MemoryEnvironment {
             || url.fragment().is_some()
         {
             return Err(format!(
-                "memory environment requires a shared-memory root with an authority and no credentials, query or fragment: {}",
+                "memory environment requires a shared-memory root, or an s3 or gs root for a simulated bucket, with an authority and no credentials, query or fragment: {}",
                 self.root
             ));
         }
         let lease = AuthorityLease::acquire(url.authority())?;
         let authority = url.authority().to_string();
+        if let Some(provider) = simulated {
+            let bucket = SimulatedBucket::new(provider);
+            let names = bucket.answer_to(&[authority.as_str()])?;
+            let adapter = match provider {
+                Provider::S3 => ObjectStorageAdapter::s3_from_root_uri(&self.root),
+                Provider::Gcs => ObjectStorageAdapter::gcs_from_root_uri(&self.root),
+            }
+            .map_err(|error| format!("memory environment storage setup failed: {error}"))?;
+            return Ok(MemoryStorage {
+                root: self.root.clone(),
+                adapter: Arc::new(adapter),
+                lance: bucket,
+                prefix: Path::from(url.path()),
+                authority,
+                mount: None,
+                names: Some(names),
+                _lease: lease,
+            });
+        }
         let provider = SharedMemoryStoreProvider::default();
         let prefix = provider
             .extract_path(&url)
@@ -164,12 +193,16 @@ impl UniverseEnvironment for MemoryEnvironment {
             prefix,
             authority,
             mount: None,
+            names: None,
             _lease: lease,
         })
     }
 
     async fn teardown(&self, resources: &mut MemoryStorage) -> Result<(), String> {
         resources.mount = None;
+        if resources.names.take().is_some() {
+            return Ok(());
+        }
         let locations = resources
             .lance
             .list(Some(&resources.prefix))
@@ -266,6 +299,41 @@ mod tests {
             .delete(&Path::from("graph-other/foreign"))
             .await
             .unwrap();
+    }
+
+    /// An `s3://` or `gs://` root: one simulated bucket serves the adapter and
+    /// Lance, and its name stops answering at teardown.
+    #[tokio::test]
+    async fn a_simulated_bucket_root_serves_both_realms_until_teardown() {
+        for provider in [Provider::S3, Provider::Gcs] {
+            simulated_bucket_root_serves_both_realms(provider).await;
+        }
+    }
+
+    async fn simulated_bucket_root_serves_both_realms(provider: Provider) {
+        let root = &format!("{}://memory-env-simulated/graph", provider.scheme());
+        let environment = MemoryEnvironment::new(root, 1, UniverseProcess::Shared);
+        let mut resources = environment.setup().await.unwrap();
+        let uri = format!("{root}/control");
+        resources.adapter.write_text(&uri, "control").await.unwrap();
+        assert!(
+            resources
+                .lance
+                .head(&Path::from("graph/control"))
+                .await
+                .is_ok(),
+            "the adapter's object is in the bucket Lance reads"
+        );
+        assert!(resources.mount_prepared("file:///").await.is_err());
+        environment.teardown(&mut resources).await.unwrap();
+        drop(resources);
+        assert!(
+            omnigraph_storage::simulated_bucket::bucket(provider, "memory-env-simulated").is_none()
+        );
+
+        let mut again = environment.setup().await.unwrap();
+        assert!(again.lance.list(None).try_next().await.unwrap().is_none());
+        environment.teardown(&mut again).await.unwrap();
     }
 
     /// The engine's registry store and the adapter both read the mounted

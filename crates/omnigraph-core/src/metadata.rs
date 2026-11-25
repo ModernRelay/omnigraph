@@ -363,7 +363,7 @@ pub fn object_store_path_from_uri(uri: &str) -> Result<String> {
             })?;
             Ok(omnigraph_storage::s3_object_key(uri, &url))
         }
-        StorageKind::Azure => {
+        StorageKind::Azure | StorageKind::Gcs => {
             let url = url::Url::parse(uri).map_err(|e| {
                 OmniError::manifest_internal(format!(
                     "invalid remote object-store uri '{}': {}",

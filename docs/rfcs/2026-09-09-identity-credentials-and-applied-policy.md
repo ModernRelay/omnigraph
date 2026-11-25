@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-10-29
+updated: 2026-11-24
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -72,11 +72,14 @@ CLI `--actions` is removed. Unsupported caches refuse without automatic
 replacement; `cluster token --managed` explicitly requests a current identity credential.
 Permission denial never switches credentials or storage addressing.
 
-`GET /graphs/discovery` returns only
+`GET /graphs/discovery` returns only the caller's actor and
 `{"graphs":[{"graph_id":"knowledge","display_name":"knowledge"}]}`
-for a valid version 2 identity. It uses the effective inventory, including
-unavailable graphs. No policy group or `graph_list` permit is required. Graph
-data, schema, query bodies, roots, diagnostics and topology are absent.
+for a valid version 2 identity, and for every other credential. It names the
+graphs of the effective inventory, unavailable ones included, on which the
+caller holds any permission (every graph for a `graph_list` holder); every
+other graph answers 404 on every graph route (amended 2026-11-24, see the
+decision log). Graph data, schema, query
+bodies, roots, diagnostics and topology are absent.
 The existing `/graphs` response and authorization retain their contract.
 Display names currently equal graph IDs. Inventory availability presumes a
 running server; an invalid cluster policy can still fail existing boot
@@ -203,8 +206,9 @@ to expire, and explicitly reverting unsupported policy configuration.
 
 Keep mandatory token grants: preserves attenuation but leaves two ordinary
 permission lists and the categorical schema exclusion. Silently ignore legacy
-grants: widens credentials and breaks delegation. Hide unauthorized graphs:
-prevents basic discovery and confuses absence with lack of data access.
+grants: widens credentials and breaks delegation. List every graph to every
+identity: the rule this RFC first chose, replaced on 2026-11-24 (see the
+decision log).
 Let a proposed policy authorize apply: lets a caller grant itself permission.
 Teach each caller to evaluate policy: duplicates semantics and permits drift.
 
@@ -252,6 +256,27 @@ of a particular deployment remain separate from the accepted library contract.
 
 ## Decision log
 
+- 2026-11-24: Discovery lists the graphs the caller may use. The first rule,
+  every graph for every identity with no policy check, contradicted graph
+  resolution, which answers 404 for an unavailable graph the caller cannot
+  use, so discovery named graphs that routing hid. Static and OAuth client
+  credentials got 403 unless the cluster policy granted `graph_list`. One
+  predicate now decides which graphs a caller may know exist, for the listing
+  and for every graph route alike: the caller holds some permission on the
+  graph, for any action on any branch, or holds `graph_list`. The policy
+  context carries only whether a branch is named and protected, so one
+  protected and one unprotected branch decide every branch scope. A graph is
+  therefore listed exactly when its routes do not answer that it does not
+  exist, and a probe finds nothing the listing hides. A grant without `read`
+  counts, because a writer or stored-query invoker must reach its routes
+  (a write needs no permission to read). Discovery also names the caller's
+  actor and OAuth client, so it is the identity check for every credential,
+  including one granted nothing, which `access` answers with 404. The empty
+  list a caller with no grant receives is the case the rejected alternative
+  feared; a setup link for it belongs to the MCP surface
+  ([#1526](https://github.com/ModernRelay/omnigraph/pull/1526)). This replaces
+  User behavior's every-graph discovery sentence and Alternatives' rejection
+  of hiding graphs.
 - 2026-10-29: New human logins receive a 30-day absolute renewal deadline;
   existing saved deadlines remain unchanged. Required provider inactivity is 14 days,
   access JWTs remain at most 15 minutes, and graph credentials retain their
