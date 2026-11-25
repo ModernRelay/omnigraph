@@ -50,7 +50,7 @@ datafusion-functions-aggregate = "54"
 
 # Lance 13.0.0 (crates.io), kept in lockstep. Graph writes explicitly use V2_2;
 # current compatibility requirements and native guards live in docs/dev/lance.md.
-lance = { version = "=13.0.0", default-features = false, features = ["aws", "azure"] }
+lance = { version = "=13.0.0", default-features = false, features = ["aws", "azure", "gcp"] }
 lance-core = "=13.0.0"
 # lance-io: the engine's `dst` object-store seam (provider trait) and
 # omnigraph-dst's fault injection; rand: the harness PRNG seeds.
@@ -112,7 +112,7 @@ bytes = "1"
 ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-object_store = { version = "0.14.1", default-features = false, features = ["aws", "azure", "fs"] }
+object_store = { version = "0.14.1", default-features = false, features = ["aws", "azure", "gcp", "fs"] }
 time = { version = "0.3.47", features = ["formatting"] }
 axum = { version = "0.8", features = ["json", "macros"] }
 utoipa = { version = "5", features = ["axum_extras"] }

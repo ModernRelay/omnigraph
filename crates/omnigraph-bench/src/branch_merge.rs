@@ -2460,6 +2460,7 @@ mod tests {
             uri,
             None,
             &omnigraph_gqt_core::PlainHost,
+            &(),
         )
         .await
         .unwrap();

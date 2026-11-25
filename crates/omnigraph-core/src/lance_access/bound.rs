@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use lance::io::{ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
 use lance_io::object_store::{ObjectStore, ObjectStoreProvider, StorageOptions};
-use object_store::{aws::AmazonS3ConfigKey, azure::AzureConfigKey, path::Path};
+use object_store::{
+    aws::AmazonS3ConfigKey, azure::AzureConfigKey, gcp::GoogleConfigKey, path::Path,
+};
 use omnigraph_storage::{CapturedStorageBinding, StorageIoScope, StorageKind};
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 use url::Url;
@@ -27,6 +29,8 @@ pub(super) fn registry(
         StorageKind::Local => &["file", "file-object-store"],
         StorageKind::S3 => &["s3"],
         StorageKind::Azure => &["az", "abfss"],
+        // No captured GCS destination exists (`CapturedStorageBinding::capture`).
+        StorageKind::Gcs => &["gs"],
     };
     for scheme in schemes {
         if let Some(inner) = registry.get_provider(scheme) {
@@ -57,6 +61,7 @@ impl BoundProvider {
         options.retain(|key, _| match self.binding.kind() {
             StorageKind::S3 => AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).is_err(),
             StorageKind::Azure => AzureConfigKey::from_str(&key.to_ascii_lowercase()).is_err(),
+            StorageKind::Gcs => GoogleConfigKey::from_str(&key.to_ascii_lowercase()).is_err(),
             StorageKind::Local => true,
         });
         options.extend(self.binding.lance_options());
@@ -87,6 +92,7 @@ impl ObjectStoreProvider for BoundProvider {
         match self.binding.kind() {
             StorageKind::S3 => options.with_env_s3(),
             StorageKind::Azure => options.with_env_azure(),
+            StorageKind::Gcs => options.with_env_gcs(),
             StorageKind::Local => {}
         }
         self.binding

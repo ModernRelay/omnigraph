@@ -832,6 +832,17 @@ pub async fn lance_append_inline(ds: &mut lance::Dataset, batch: RecordBatch) {
     ds.append(reader, Some(params)).await.unwrap();
 }
 
+/// Unique per-run graph root under `OMNIGRAPH_GCS_TEST_BUCKET`, or `None` to
+/// skip. Credentials come from Google's application-default chain.
+pub fn gcs_test_graph_uri(suite: &str) -> Option<String> {
+    let bucket = std::env::var("OMNIGRAPH_GCS_TEST_BUCKET").ok()?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!("gs://{bucket}/omnigraph-itests/{suite}/{unique}"))
+}
+
 pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
     let bucket = std::env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let prefix = std::env::var("OMNIGRAPH_S3_TEST_PREFIX")

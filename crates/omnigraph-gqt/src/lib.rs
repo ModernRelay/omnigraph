@@ -10,8 +10,8 @@ use omnigraph_gqt_core::concurrent::{ConcurrentStep, Pass, permutation};
 pub use omnigraph_gqt_core::runner_config;
 use omnigraph_gqt_core::runner_config::{Execution, SeamDirective};
 use omnigraph_gqt_core::{
-    Case, ControlStep, ControlWrite, ExecutionHost, Item, ReferenceRefusal, Step, StepFail,
-    canonical_json, case_session, parse_case, run_session, seed_case,
+    Case, ControlStep, ControlWrite, ExecutionHost, Item, Observer, ReferenceRefusal, Step,
+    StepFail, canonical_json, case_session, parse_case, run_session, seed_case,
 };
 pub use omnigraph_gqt_core::{ServerTarget, admit_served};
 use serde_json::Value;
@@ -83,36 +83,6 @@ impl ExecutionHost for GqtHost {
     fn finish_seams(&self, guard: Self::StepGuard) -> Result<(), String> {
         dst_runner::finish_seams(guard)
     }
-    fn observe(&self, value: impl FnOnce() -> String) {
-        dst_runner::observe(value);
-    }
-    fn record(&self, kind: &str, value: impl FnOnce() -> Value) {
-        dst_runner::record(kind, value());
-    }
-    fn begin_operation(&self, value: impl FnOnce() -> Value) {
-        dst_runner::begin_operation(value());
-    }
-    fn observe_query<E: std::fmt::Display>(&self, result: &Result<QueryResult, E>, ordered: bool) {
-        dst_runner::observe_query(result, ordered);
-    }
-    fn observe_fault(&self, error: &omnigraph::error::OmniError) {
-        dst_runner::observe_fault(error);
-    }
-    fn lifetime_counts(&self) -> Option<[u64; 2]> {
-        dst_runner::lifetime_counts()
-    }
-    fn active(&self) -> bool {
-        dst_runner::active()
-    }
-    fn observe_snapshot(&self) -> bool {
-        dst_runner::active()
-    }
-    fn measure_step_begin(&self, ordinal: u64, line: Option<u64>, kind: &'static str) {
-        dst_runner::measure_step_begin(ordinal, line, kind);
-    }
-    fn measure_step_end(&self, ordinal: u64) {
-        dst_runner::measure_step_end(ordinal);
-    }
     fn compares_reference(&self) -> bool {
         !dst_runner::active()
     }
@@ -166,13 +136,46 @@ impl ExecutionHost for GqtHost {
         }
         .boxed()
     }
-    fn concurrent_step<'a>(
+    fn concurrent_step<'a, O: Observer>(
         &'a self,
+        observer: &'a O,
         session: &'a Session,
         case: &'a Case,
         step: &'a ConcurrentStep,
     ) -> futures::future::BoxFuture<'a, Result<(), StepFail>> {
-        run_concurrent_step(session, case, step, self.pass).boxed()
+        run_concurrent_step(observer, session, case, step, self.pass).boxed()
+    }
+}
+
+/// The runner's observer: every fact goes to the DST runner's report, trace
+/// stream and `--measure` ledger.
+impl Observer for GqtHost {
+    fn observe(&self, value: impl FnOnce() -> String) {
+        dst_runner::observe(value);
+    }
+    fn record(&self, kind: &str, value: impl FnOnce() -> Value) {
+        dst_runner::record(kind, value());
+    }
+    fn begin_operation(&self, value: impl FnOnce() -> Value) {
+        dst_runner::begin_operation(value());
+    }
+    fn observe_query<E: std::fmt::Display>(&self, result: &Result<QueryResult, E>, ordered: bool) {
+        dst_runner::observe_query(result, ordered);
+    }
+    fn observe_fault(&self, error: &omnigraph::error::OmniError) {
+        dst_runner::observe_fault(error);
+    }
+    fn lifetime_counts(&self) -> Option<[u64; 2]> {
+        dst_runner::lifetime_counts()
+    }
+    fn observe_snapshot(&self) -> bool {
+        dst_runner::active()
+    }
+    fn measure_step_begin(&self, ordinal: u64, line: Option<u64>, kind: &'static str) {
+        dst_runner::measure_step_begin(ordinal, line, kind);
+    }
+    fn measure_step_end(&self, ordinal: u64) {
+        dst_runner::measure_step_end(ordinal);
     }
 }
 
@@ -245,7 +248,7 @@ fn execute_case_on_server<'a>(
     case: &'a Case,
     target: &'a ServerTarget,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    omnigraph_gqt_core::execute_steps_served(case, target, &PLAIN_HOST)
+    omnigraph_gqt_core::execute_steps_served(case, target, &PLAIN_HOST, &PLAIN_HOST)
 }
 
 fn execute_case_on_engine<'a>(
@@ -281,9 +284,11 @@ async fn execute_case_inner(
             layout: None,
             pass: Pass(0),
         };
-        return omnigraph_gqt_core::execute_steps(case, path, bless, session, uri, None, &host)
-            .await
-            .map(|_| ());
+        return omnigraph_gqt_core::execute_steps(
+            case, path, bless, session, uri, None, &host, &host,
+        )
+        .await
+        .map(|_| ());
     }
     let passes = if bless { 1 } else { case.plain_passes() };
     for pass in (0..passes).map(Pass) {
@@ -293,7 +298,7 @@ async fn execute_case_inner(
             layout: None,
             pass,
         };
-        omnigraph_gqt_core::execute_steps(case, path, bless, session, &uri, None, &host)
+        omnigraph_gqt_core::execute_steps(case, path, bless, session, &uri, None, &host, &host)
             .await
             .map_err(|e| {
                 if passes == 1 {
@@ -352,12 +357,22 @@ async fn execute_case_with_storage(
     if let (None, Some(fixture)) = (prepared, case.fixture.as_ref()) {
         seed_case(&session, fixture, case.needs_indices).await?;
     }
-    omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &PLAIN_HOST)
-        .await
-        .map(|_| ())
+    omnigraph_gqt_core::execute_steps(
+        case,
+        path,
+        false,
+        session,
+        uri,
+        Some(storage),
+        &PLAIN_HOST,
+        &PLAIN_HOST,
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn run_concurrent_step(
+    observer: &impl Observer,
     session: &Session,
     case: &Case,
     step: &ConcurrentStep,
@@ -368,7 +383,7 @@ async fn run_concurrent_step(
     if !dst_runner::active() {
         if step.is_free_running() {
             let order = permutation(step.sessions.len(), pass);
-            return omnigraph_gqt_core::run_free_running_block(&PLAIN_HOST, session, step, &order)
+            return omnigraph_gqt_core::run_free_running_block(observer, session, step, &order)
                 .await;
         }
         return Err(fail(
@@ -387,7 +402,7 @@ async fn run_concurrent_step(
         let run = Arc::clone(&run);
         measure::SESSION.scope(ctx, async move {
             let outcome = match run.start_session(index).await {
-                Ok(()) => run_session(&PLAIN_HOST, session, op, 0).await,
+                Ok(()) => run_session(observer, session, op, 0).await,
                 Err(aborted) => Err(aborted),
             };
             let script = run.finish_session(index).await;
@@ -422,7 +437,7 @@ async fn run_concurrent_step(
             return Err(fail(format!("session `{}`: {message}", op.label)));
         }
     }
-    omnigraph_gqt_core::readback_dealt_rows(&PLAIN_HOST, session, step, 1)
+    omnigraph_gqt_core::readback_dealt_rows(observer, session, step, 1)
         .await
         .map_err(fail)
 }
@@ -755,7 +770,7 @@ pub async fn execute_with_layout(case: &Case, path: &Path, layout: Layout) -> Re
         layout: Some(layout),
         pass: Pass(0),
     };
-    omnigraph_gqt_core::execute_steps(case, path, false, session, &uri, None, &host)
+    omnigraph_gqt_core::execute_steps(case, path, false, session, &uri, None, &host, &host)
         .await
         .map(|_| ())
 }

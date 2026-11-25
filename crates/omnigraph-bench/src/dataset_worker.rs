@@ -817,6 +817,7 @@ pub(crate) async fn build_dataset(
         uri,
         None,
         &PlainHost,
+        &(),
     )
     .await?;
     drop(session);

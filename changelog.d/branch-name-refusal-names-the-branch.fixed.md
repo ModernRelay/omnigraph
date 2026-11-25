@@ -1,0 +1,1 @@
+- `branch create` refuses a name with a space, a character such as `^` or `~`, a `..`, or a final `.` by the name as written, not by an internal ref; the branching guide states the rule.

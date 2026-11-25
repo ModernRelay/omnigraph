@@ -119,6 +119,7 @@ pub fn cli_process() -> StdCommand {
 }
 
 pub mod managed_http;
+pub mod predecessors;
 pub mod tls_gateway;
 #[cfg(unix)]
 pub mod unix_gateway;

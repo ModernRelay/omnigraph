@@ -209,6 +209,7 @@ async fn generated_load_calls_the_host_once_before_checking_its_expectation() {
         &uri,
         None,
         &host,
+        &host,
     )
     .await;
     assert!(result.err().unwrap().contains("load succeeded"));
@@ -260,6 +261,7 @@ async fn generated_load_repeats_the_same_recipe_in_a_loop() {
         &uri,
         None,
         &host,
+        &host,
     )
     .await
     .unwrap();
@@ -310,6 +312,7 @@ async fn generated_load_observes_typed_errors_for_single_and_multiple_calls() {
             session,
             &uri,
             None,
+            &host,
             &host,
         )
         .await
@@ -2925,6 +2928,7 @@ async fn writer_header_claims_main_in_one_version_that_moves_no_head() {
             &uri,
             None,
             &PlainHost,
+            &(),
         )
         .await
         .unwrap();
@@ -3082,7 +3086,7 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
         };
         let stage = match step {
             Step::Settings(s) => {
-                run_settings_step(&PlainHost, &mut session, s, None)
+                run_settings_step(&(), &mut session, s, None)
                     .unwrap_or_else(|f| panic!("{}: {}", f.label, f.message));
                 settings_steps += 1;
                 let name = s.statements[0].statement_name();
@@ -3477,7 +3481,7 @@ fn execute_case<'a>(
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
     async move {
         let (session, uri, _dir) = open_case_store(case).await?;
-        execute_steps(case, path, bless, session, &uri, None, &PlainHost)
+        execute_steps(case, path, bless, session, &uri, None, &PlainHost, &())
             .await
             .map(|_| ())
     }
@@ -3537,6 +3541,21 @@ impl ExecutionHost for RecordingHost {
         PlainHost.finish_seams(guard)
     }
 
+    fn reopen<'a>(
+        &'a self,
+        uri: &'a str,
+        storage: Option<Arc<dyn StorageAdapter>>,
+    ) -> futures::future::BoxFuture<'a, Result<Omnigraph, omnigraph::error::OmniError>> {
+        assert!(Arc::ptr_eq(
+            self.storage.as_ref().unwrap(),
+            storage.as_ref().unwrap()
+        ));
+        self.events.lock().unwrap().push("reopen".into());
+        async move { PlainHost.reopen(uri, storage).await }.boxed()
+    }
+}
+
+impl Observer for RecordingHost {
     fn observe_fault(&self, _error: &omnigraph::error::OmniError) {
         self.faults
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3573,19 +3592,6 @@ impl ExecutionHost for RecordingHost {
                 .unwrap()
                 .push(format!("assertion {}", value()["status"]));
         }
-    }
-
-    fn reopen<'a>(
-        &'a self,
-        uri: &'a str,
-        storage: Option<Arc<dyn StorageAdapter>>,
-    ) -> futures::future::BoxFuture<'a, Result<Omnigraph, omnigraph::error::OmniError>> {
-        assert!(Arc::ptr_eq(
-            self.storage.as_ref().unwrap(),
-            storage.as_ref().unwrap()
-        ));
-        self.events.lock().unwrap().push("reopen".into());
-        async move { PlainHost.reopen(uri, storage).await }.boxed()
     }
 }
 
@@ -3634,6 +3640,7 @@ async fn engine_operation_finishes_before_failed_expectation() {
         &uri,
         None,
         &host,
+        &host,
     )
     .await;
     assert!(result.is_err());
@@ -3662,6 +3669,7 @@ async fn restart_preserves_supplied_storage_and_returns_current_session() {
         session,
         &uri,
         Some(storage),
+        &host,
         &host,
     )
     .await
@@ -4054,6 +4062,7 @@ async fn with_reference(
         &uri,
         None,
         &host,
+        &(),
     )
     .await
     .map(|_| ())

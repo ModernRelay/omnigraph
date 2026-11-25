@@ -120,8 +120,8 @@ run's: `--server` names a server, `--store` a fixture store (a directory or an
 `s3://` prefix, the latter with `--backend`) at the `clone` reset level, whose
 completed records the store keeps and `report` reads back as a series, and
 `--at <ref>` beside it measures a commit's `omnigraph` from the store's
-`builds/`, and `--server-product` beside a local store starts the build's
-`omnigraph-server` for every repetition, at the `rebuild` reset level
+`builds/`, and `--server-product` beside a store of either kind starts the
+build's `omnigraph-server` for every repetition, at the `rebuild` reset level
 ([below](#the-same-block-against-the-builds-server)); and
 without either the host's local default applies (APFS/clonefile on macOS,
 qualified XFS/plain-copy elsewhere), so the one file runs on a macOS
@@ -299,8 +299,8 @@ refuse it, and no driver issues statements at a set rate.
 
 ### The same block against the build's server
 
-`run <scenario> --store <directory> --server-product[=<path>]` plans the
-scenario as a server point at the reset level `rebuild`: every repetition
+`run <scenario> --store <directory | s3://bucket/prefix> --server-product[=<path>]`
+plans the scenario as a server point at the reset level `rebuild`: every repetition
 gets an `omnigraph-server` of its own, started by the bench and stopped when
 the repetition ends. The workload lists `omnigraph-server` among its
 environments; `concurrent-writes` does.
@@ -308,19 +308,22 @@ environments; `concurrent-writes` does.
 ```bash
 target/release/omnigraph-bench run concurrent-writes --store /qualified/store   --product /build/omnigraph --server-product=/build/omnigraph-server   --dataset-cache /qualified/cache --json
 target/release/omnigraph-bench run concurrent-writes --store /qualified/store   --at main=/builds/main/omnigraph --at topic=/builds/topic/omnigraph --server-product   --dataset-cache /qualified/cache --json
+target/release/omnigraph-bench run concurrent-writes --store s3://bucket/prefix --backend backend.json   --product /build/omnigraph --server-product   --dataset-cache /qualified/cache --json
 ```
 
 `--server-product=<path>` names the server binary. Without a value it is
 `omnigraph-server` in the directory of the product binary. Under `--at` only
 that form is accepted and every `--at` names its `omnigraph` as
 `<ref>=<path>`, so each commit runs beside the server of its own build. The
-store is a local directory, the route runs on Unix, and a block holds at most
+store is a local directory or an `s3://` prefix, the latter with `--backend`
+as at the `clone` level; the route runs on Unix, and a block holds at most
 64 sessions.
 
 One repetition, in order:
 
 1. The product's `omnigraph cluster apply` writes a cluster with the
-   fixture's schema into an empty root under the store's `servers/`. Its
+   fixture's schema into an empty root under the store's `servers/`, a
+   directory or a prefix of the bucket. Its
    policy names one actor for the workload's own steps and one per session
    of the block, each with a token made for the repetition.
 2. The bench starts `omnigraph-server` over that root on a loopback port the

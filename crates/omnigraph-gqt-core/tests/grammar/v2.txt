@@ -29,7 +29,7 @@ rules:
   loop_structure: a loop holds at least one step, closes with a bare `--- endloop`, and nests no loop, bind, seam or concurrent block
   bind_shape: `--- bind commit $name` follows a write expected to succeed, once per name, with no body
   unbound_name: a `${name}` operand, a `snapshot: $name` or a `from commit ${name}` names a commit bound by an earlier `--- bind commit $name`
-  substitution_placement: `${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit, or is `${branch}` in a branches recipe; a `${` in the branches header is refused as on any header line; the name a `--- bench` section sweeps is replaced by its value before anything is parsed
+  substitution_placement: `${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit, or is `${branch}` in a branches recipe; a `${` in the branches header is refused as on any section header; a `# <key>: <value>` header before the first section is outside this rule; the name a `--- bench` section sweeps is replaced by its value before anything is parsed
   batch_bound: a generated load's batch stays within 16 MiB and 4096 rows, with `commits` in 1..=rows and `batch_rows` producing exactly `commits` nonempty batches
   corpus_timeout: a case under the required corpus (the runner's `cases/`, not `cases_slow/`) declares `timeout_ms` of at most 10000
   reference_skip: `--- reference skipped: <reason>` directly follows a query declaration step's last expect section, with a nonempty reason and no body

@@ -40,7 +40,7 @@ in [lance.md](lance.md).
 | A Lance behavior Omnigraph depends on | `lance_surface_guards.rs` and its fence | [Lance compatibility](#lance-compatibility) |
 | An HTTP route, authentication, MCP or OpenAPI | `crates/omnigraph-server/tests/`, by public route. Never test a server promise only through the engine facade | [Server and CLI ownership](test-ownership.md#server-and-cli-ownership) |
 | A CLI command, its output or its delivery | `crates/omnigraph-cli/tests/`, by plane | [Server and CLI ownership](test-ownership.md#server-and-cli-ownership) |
-| A storage stamp, an upgrade or a predecessor binary | CLI `integration/crossversion_upgrade.rs`, engine `db/upgrade/tests.rs` | [Cross-version tests](test-ownership.md#cross-version-rebuild-and-storage-upgrade), [support matrix](versioning.md#storage-upgrade-support-matrix) |
+| A storage stamp, an upgrade or a predecessor binary | CLI `integration/crossversion_upgrade.rs`, engine `db/upgrade/tests.rs` | [Predecessor binaries](#predecessor-binaries), [cross-version tests](test-ownership.md#cross-version-rebuild-and-storage-upgrade), [support matrix](versioning.md#storage-upgrade-support-matrix) |
 | A bound plan reproducing its run | `integration/plan_replay.rs`, `scrubbed_replay.rs` | [Plan replay](test-ownership.md#plan-replay) |
 | The core IR's semantics: an operator, a lowered form, a lexical rule | `crates/omnigraph-reference`, updated in the same change; GQT compares every read step on the direct engine with it | [Test layout](test-ownership.md#test-layout), [GQT README](../../crates/omnigraph-gqt/README.md#reference-comparison) |
 | A law over generated schemas, graphs and reads | The law's owner, with its nightly twin | [Generated laws](test-ownership.md#generated-laws) |
@@ -59,9 +59,9 @@ which own hermetic configuration, binary startup and temporary roots. Do not
 copy that setup into a new suite.
 
 Cloud suites skip unless their environment is set (`OMNIGRAPH_S3_TEST_BUCKET`,
-`OMNIGRAPH_AZURE_TEST_CONTAINER` and the documented credentials). A configured
-CI backend treats a skip as failure, and a local file pass does not qualify S3
-or Azure.
+`OMNIGRAPH_AZURE_TEST_CONTAINER`, `OMNIGRAPH_GCS_TEST_BUCKET` and the documented
+credentials). A configured CI backend treats a skip as failure, and a local
+file pass does not qualify S3, Azure or Google Cloud Storage.
 
 ## Lance compatibility
 
@@ -80,6 +80,49 @@ and never enable an experimental capability to make qualification pass. The
 full procedure is in
 [test ownership](test-ownership.md#lance-compatibility); the fences are in
 [Lance compatibility fences](lance-fences.md).
+
+## Predecessor binaries
+
+A cross-version test runs an older Omnigraph beside the current tree. Each
+older binary is one row of
+[`.github/predecessors.toml`](../../.github/predecessors.toml), named by what
+it is (`stamp-13`, `lance-11`, `release-0.11.0`): its source, either a release
+tag that `scripts/install.sh` installs against a pinned SHA256 or a commit
+built in its own checkout with a pinned toolchain; the binaries it provides;
+the version its `omnigraph --version` must report; and the condition under
+which it is retired. The file's header lists the fields.
+
+A test asks for a row with `support::predecessors::predecessor("<row>")`
+(`crates/omnigraph-cli/tests/support/predecessors.rs`). It reads the manifest
+that `OMNIGRAPH_PREDECESSORS` names, else `target/predecessors/manifest.json`,
+and applies one rule: a provisioned row is returned once its binaries exist
+and report the row's version; a row the manifest lacks prints
+`skipping: predecessor <row> is not provisioned` and returns `None`, or fails
+the test when the manifest was provisioned with `--require`.
+
+`scripts/predecessors.py provision` installs or builds rows into
+`target/predecessors/` and writes that manifest, naming every row stored
+there; a stored row is reused while its registry entry and version still
+match. To run every cross-version case locally, provision once:
+
+```bash
+python3 scripts/predecessors.py provision --all
+```
+
+Then run the cases as usual, for example
+`cargo dev-test --test integration crossversion_upgrade::`. Name rows instead
+of `--all` to provision fewer: a source row builds a debug CLI from scratch
+(about 25 minutes cold) in a temporary directory outside the repository, so
+only the predecessor's own Cargo configuration applies, and removes it
+afterwards.
+
+In CI a job names the rows it needs with the `./.github/actions/predecessors`
+action (`rows:`, and `require: true` where a skipped journey must fail), which
+caches them by what they are made from. A new predecessor is a row and a
+`rows:` entry, never a build step. `scripts/predecessors.py --self-test`, run
+by `Check Workflow Action Pins`, requires every row to be asked for by a test
+and every row a test or workflow names to exist: a row no test asks for is
+retired.
 
 ## Commands
 

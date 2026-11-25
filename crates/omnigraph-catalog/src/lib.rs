@@ -3169,7 +3169,7 @@ impl ManifestCoordinator {
         name: &str,
         binding: Option<&crate::storage::CapturedStorageBinding>,
     ) -> Result<()> {
-        crate::branch_names::ensure_logical_branch_name(name)?;
+        crate::branch_names::ensure_new_branch_name(name).map_err(OmniError::before_effect)?;
         let version = self.version();
         if layout::has_branch_rows(self.main_manifest()) {
             let source = self.dataset.clone();
@@ -3203,7 +3203,7 @@ impl ManifestCoordinator {
         graph_commit_id: &str,
         binding: Option<&crate::storage::CapturedStorageBinding>,
     ) -> Result<()> {
-        crate::branch_names::ensure_logical_branch_name(name)?;
+        crate::branch_names::ensure_new_branch_name(name).map_err(OmniError::before_effect)?;
         let dataset = if version == self.version() {
             self.dataset.clone()
         } else {

@@ -34,15 +34,19 @@ own, every write lands in the target, and the base is never written. Both are
 local directories or `s3://` prefixes of one endpoint (an S3 pair reads the
 standard `AWS_*` environment, and the clone's `s3://` prefix is named inline as
 the target, the one inline `s3://` graph the CLI admits); a target that contains
-its base, or lies inside it, is refused. The option applies to `query`, `mutate`, `load`, `branch`,
-`commit`, `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`;
-maintenance and schema changes keep the one root they are given. A fresh target
-directory or prefix is a new clone; the same target again shows the clone's own
-state. Nothing in the target records its base, so pass the same `--base` on
-every open of that target; a clone root opened without `--base` is refused,
-since its marker says it is a clone and not which base it was cloned from.
-A target that already holds objects but no clone marker, an ordinary graph
-for example, is refused under `--base` before anything is written.
+its base, or lies inside it, is refused, also when the two `s3://` bucket names
+address one bucket or the target's bucket holds a copy of the base under the
+base's key. An `s3://` target or base whose path holds an empty inner segment, a
+percent escape or a character other than `^` that a URL writes as one (`%41`, a
+space, a non-ASCII letter) is refused too: it names no one object key. The
+option applies to `query`, `mutate`, `load`, `branch`, `commit`, `changes`,
+`diff`, `snapshot`, `export`, `blob` and `schema show`; maintenance and schema
+changes keep the one root they are given. A fresh target directory or prefix is
+a new clone; the same target again shows the clone's own state. Nothing in the
+target records its base, so pass the same `--base` on every open of that target;
+a clone root opened without `--base` is refused, since its marker names no base.
+A target holding objects but no clone marker, such as an ordinary graph, is
+refused under `--base` before anything is written.
 
 `--as ACTOR` attributes supported direct operations; on a cluster graph the
 applied graph policy judges them by it ([direct writes](../operations/policy.md#actor-identity)).
@@ -116,24 +120,23 @@ params; see [Work with branches](index.md#work-with-branches)), or one
 as rows under the query's own target and params; see [Explain](../queries/explain.md).
 
 Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, `toon`, and, for
-`query`, `arrow`. With no
-`--format`, no `--json`, and no `defaults.output`, a read prints a table. `--json` is the
-stable machine-readable form for commands that do not use `--format`. Result
-cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
-`table` and `kv` print strings unquoted. CSV writes a null as an empty field
-and an empty string as `""`, and quotes fields containing a comma, double
-quote, or line break, so [`load csv`](../mutations/index.md#csv-loading)
-reads a null back as null and the string `null` as that string. `load csv`
-also reads `""` as null, because it has no spelling for an empty string, and
-it skips empty lines, so a null row of a one-column result is not loaded back.
-`--format json` prints the
-envelope pretty and the `rows` array compact. `--format toon` encodes that same
-document as [TOON](https://github.com/toon-format/spec) (specification 4.4,
-comma delimiter, two-space indent). `rows` declares its fields once when every
-row has the same keys. A null cell omits its key, so one null makes the rows
-non-uniform and TOON repeats every key. Numbers use TOON's canonical spelling,
-so an integral value is `1` where the JSON writer may spell `1.0`. The CLI ends
-the TOON document with a newline. The HTTP API returns JSON. A refusal follows
+`query`, `arrow`. With no `--format`, no `--json`, and no `defaults.output`, a
+read prints a table. `--json` is the stable machine-readable form for commands
+that do not use `--format`. Result cells use the [JSON result
+spelling](../queries/index.md#json-result-spelling); `table` and `kv` print
+strings unquoted. CSV writes a null as an empty field and an empty string as
+`""`, and quotes fields containing a comma, double quote, or line break, so
+[`load csv`](../mutations/index.md#csv-loading) reads a null back as null and
+the string `null` as that string. `load csv` also reads `""` as null, because it
+has no spelling for an empty string, and it skips empty lines, so a null row of
+a one-column result is not loaded back. `--format json` prints the envelope
+pretty and the `rows` array compact. `--format toon` encodes that same document
+as [TOON](https://github.com/toon-format/spec) (specification 4.4, comma
+delimiter, two-space indent). `rows` declares its fields once when every row has
+the same keys. A null cell omits its key, so one null makes the rows non-uniform
+and TOON repeats every key. Numbers use TOON's canonical spelling, so an
+integral value is `1` where the JSON writer may spell `1.0`. The CLI ends the
+TOON document with a newline. The HTTP API returns JSON. A refusal follows
 [Diagnostics](../queries/diagnostics.md).
 
 `query --format arrow` writes the result's columns and rows to stdout as one
@@ -232,11 +235,9 @@ addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-u
 | `replace` | Replaced whole by ID; a property a record omits becomes null | Idempotent synchronization of complete records |
 | `overwrite` | Each node or edge type represented in the batch is replaced; other types remain | Initial load or import of a complete export |
 
-`append` and `merge`, edition 2's names, are refused with `insert` and
-`replace` as the fixes, before anything is read; with `--json` the refusal is a
-`bad_request` error whose `diagnostic` is `Q004` with the fix `--mode insert` or
-`--mode replace`, as `load csv` and the HTTP route refuse them. A job that retries a load after an uncertain outcome
-uses `upsert` or `replace`.
+Edition 2's `append` and `merge` are refused before anything is read with `Q004`
+and the fix `--mode insert` or `--mode replace`, as [`load csv`](../mutations/index.md#csv-loading)
+and HTTP refuse them. A load retried after an uncertain outcome uses `upsert` or `replace`.
 
 `--branch <NAME>` selects an existing branch. Add `--from <BASE>` to create a
 missing branch from an explicit base. Overwrite is destructive and may require
@@ -336,11 +337,10 @@ progress and idempotency information go to stderr.
 A managed target uses the common served graph client, including schema reads,
 access introspection, stored-query catalogs, the stdio MCP bridge, branches,
 snapshots, history, exports, Blob operations and change feeds. Select a graph
-explicitly or use its configured
-`default_graph`; discovery only lists available IDs. A separate identity
-credential authenticates the data endpoint, and applied Cedar policy decides
-permissions. Direct-only maintenance, schema changes and root administration
-remain unavailable through a managed data endpoint.
+explicitly or use its configured `default_graph`; discovery only lists available
+IDs. A separate identity credential authenticates the data endpoint, and applied
+Cedar policy decides permissions. Direct-only maintenance, schema changes and
+root administration remain unavailable through a managed data endpoint.
 
 ## Confirmation rules
 

@@ -20,6 +20,7 @@ mod end_to_end;
 mod execution;
 mod execution_memory;
 mod export;
+mod gcs_storage;
 #[path = "../helpers/mod.rs"]
 mod helpers;
 mod lance_version_columns;

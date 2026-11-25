@@ -19,8 +19,8 @@ use std::time::Duration;
 use crate::served::{check_read_expect, control_statement, wire_params};
 use crate::{
     Bindings, BranchReadStep, Case, ControlStep, ControlWrite, ExecutionHost, Item, ListStep,
-    LoadStep, MergeExpect, MutateExpect, MutateStep, QueryExpect, QueryStep, ShowStep, Step,
-    StepFail, WriteExpect, bound_snapshot, bound_source, check_error_expect, check_rows_json,
+    LoadStep, MergeExpect, MutateExpect, MutateStep, Observer, QueryExpect, QueryStep, ShowStep,
+    Step, StepFail, WriteExpect, bound_snapshot, bound_source, check_error_expect, check_rows_json,
     expectation_evidence, merge_outcome_word, operation, record_binding, step_kind, step_label,
     substitute_bound,
 };
@@ -131,25 +131,27 @@ pub fn admit_process_workload(case: &Case, measured: usize) -> Result<(), String
 /// Executes a measured workload admitted by [`admit_process_workload`]: one
 /// child per step, a restart off the measured step as a no-op (the next step
 /// is a fresh process either way), every step reported like the others.
-pub fn execute_measured_process<'a, H: ExecutionHost>(
+pub fn execute_measured_process<'a, H: ExecutionHost, O: Observer>(
     case: &'a Case,
     target: &'a ProcessTarget,
     host: &'a H,
+    observer: &'a O,
     measured: usize,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_process_inner(case, target, host, measured).boxed()
+    execute_process_inner(case, target, host, observer, measured).boxed()
 }
 
-async fn execute_process_inner<H: ExecutionHost>(
+async fn execute_process_inner<H: ExecutionHost, O: Observer>(
     case: &Case,
     target: &ProcessTarget,
     host: &H,
+    observer: &O,
     measured: usize,
 ) -> Result<(), String> {
     host.admit_case(case)?;
     admit_process_workload(case, measured)?;
     let client = ProcessClient::new(target, Duration::from_millis(case.runner.timeout_ms));
-    host.observe(|| {
+    observer.observe(|| {
         format!(
             "lifetime: one `{}` process per step over clone {} of base {}",
             target.executable.display(),
@@ -171,37 +173,35 @@ async fn execute_process_inner<H: ExecutionHost>(
             let binding = var.zip(value);
             for step in &steps {
                 let ordinal = step.ordinal();
-                host.begin_operation(|| {
+                observer.begin_operation(|| {
                     serde_json::json!({"ordinal": ordinal, "source_line": case.source_lines.get(&ordinal), "loop_binding": binding, "generation": 0})
                 });
-                host.observe(|| {
+                observer.observe(|| {
                     format!(
                         "operation: ordinal={ordinal} line={:?} binding={binding:?} process expected={step:?}",
                         case.source_lines.get(&ordinal)
                     )
                 });
-                host.record("expectation", || expectation_evidence(step));
-                host.measure_step_begin(
+                observer.record("expectation", || expectation_evidence(step));
+                observer.measure_step_begin(
                     ordinal as u64,
                     case.source_lines.get(&ordinal).map(|line| *line as u64),
                     step_kind(step),
                 );
                 let outcome = match step {
-                    Step::Query(q) => query(host, &client, q, binding, &bindings).await,
-                    Step::Mutate(m) => {
-                        mutate(host, &client, m, binding, &bindings)
-                            .await
-                            .and_then(|commit| {
-                                record_binding(
-                                    &mut bindings,
-                                    m.bind.as_deref(),
-                                    commit,
-                                    &step_label(ordinal, "mutate", binding),
-                                )
-                            })
-                    }
-                    Step::Load(l) => load(host, &client, l, binding).await,
-                    Step::Control(c) => control(host, &client, c, binding, &bindings)
+                    Step::Query(q) => query(observer, &client, q, binding, &bindings).await,
+                    Step::Mutate(m) => mutate(observer, &client, m, binding, &bindings)
+                        .await
+                        .and_then(|commit| {
+                            record_binding(
+                                &mut bindings,
+                                m.bind.as_deref(),
+                                commit,
+                                &step_label(ordinal, "mutate", binding),
+                            )
+                        }),
+                    Step::Load(l) => load(observer, &client, l, binding).await,
+                    Step::Control(c) => control(observer, &client, c, binding, &bindings)
                         .await
                         .and_then(|commit| {
                             record_binding(
@@ -211,11 +211,13 @@ async fn execute_process_inner<H: ExecutionHost>(
                                 &step_label(ordinal, c.name, binding),
                             )
                         }),
-                    Step::List(l) => list(host, &client, l, binding).await,
-                    Step::Show(s) => show(host, &client, s, binding).await,
-                    Step::BranchRead(r) => branch_read(host, &client, r, binding, &bindings).await,
+                    Step::List(l) => list(observer, &client, l, binding).await,
+                    Step::Show(s) => show(observer, &client, s, binding).await,
+                    Step::BranchRead(r) => {
+                        branch_read(observer, &client, r, binding, &bindings).await
+                    }
                     Step::Restart { .. } => {
-                        host.observe(|| {
+                        observer.observe(|| {
                             "restart: the next step is a fresh process; no door opened".to_string()
                         });
                         Ok(())
@@ -227,14 +229,14 @@ async fn execute_process_inner<H: ExecutionHost>(
                         ))
                     }
                 };
-                host.measure_step_end(ordinal as u64);
-                host.record("assertion", || match &outcome {
+                observer.measure_step_end(ordinal as u64);
+                observer.record("assertion", || match &outcome {
                     Ok(()) => serde_json::json!({"status": "passed"}),
                     Err(error) => {
                         serde_json::json!({"status": "failed", "code": "assertion_failed", "message": error.message})
                     }
                 });
-                host.observe(|| {
+                observer.observe(|| {
                     format!(
                         "operation result: {:?}",
                         outcome.as_ref().map_err(|f| (&f.label, &f.message))
@@ -286,7 +288,7 @@ impl<'a> ProcessClient<'a> {
     /// the `--stats` document lands under [`PROCESS_STATS_RECORD`] on exit.
     async fn run<Res: DeserializeOwned>(
         &self,
-        host: &impl ExecutionHost,
+        observer: &impl Observer,
         ordinal: usize,
         suffix: &str,
         args: &[String],
@@ -339,7 +341,7 @@ impl<'a> ProcessClient<'a> {
         }
         match std::fs::read(&stats) {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                Ok(document) => host.record(
+                Ok(document) => observer.record(
                     PROCESS_STATS_RECORD,
                     || serde_json::json!({"ordinal": ordinal, "stats": document}),
                 ),
@@ -384,12 +386,15 @@ impl<'a> ProcessClient<'a> {
     /// operation timer includes decoding, as the served path's does.
     async fn read(
         &self,
-        host: &impl ExecutionHost,
+        observer: &impl Observer,
         ordinal: usize,
         suffix: &str,
         args: &[String],
     ) -> Result<Result<Vec<Value>, String>, String> {
-        match self.run::<ReadOutput>(host, ordinal, suffix, args).await? {
+        match self
+            .run::<ReadOutput>(observer, ordinal, suffix, args)
+            .await?
+        {
             Ok(output) => rows_of(&output).map(Ok),
             Err(error) => Ok(Err(error)),
         }
@@ -399,12 +404,12 @@ impl<'a> ProcessClient<'a> {
     /// `query -e <text>`, sent bare: no name, params, branch or snapshot.
     async fn statement(
         &self,
-        host: &impl ExecutionHost,
+        observer: &impl Observer,
         ordinal: usize,
         text: &str,
     ) -> Result<Result<Vec<Value>, String>, String> {
         self.read(
-            host,
+            observer,
             ordinal,
             "",
             &["query".into(), "-e".into(), text.into()],
@@ -415,7 +420,7 @@ impl<'a> ProcessClient<'a> {
     /// Every generated batch through `load --data <file>`; one child per batch.
     async fn load_generated(
         &self,
-        host: &impl ExecutionHost,
+        observer: &impl Observer,
         ordinal: usize,
         generated: &crate::Generated,
         branch: &str,
@@ -437,7 +442,7 @@ impl<'a> ProcessClient<'a> {
                 "--branch".into(),
                 branch.to_string(),
             ];
-            self.run::<Value>(host, ordinal, &format!("-batch-{index:04}"), &args)
+            self.run::<Value>(observer, ordinal, &format!("-batch-{index:04}"), &args)
                 .await?
                 .map_err(|error| {
                     format!(
@@ -486,7 +491,7 @@ fn params_argument(params: Option<Value>) -> Result<Vec<String>, String> {
 }
 
 async fn query(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ProcessClient<'_>,
     step: &QueryStep,
     binding: Option<(&str, &str)>,
@@ -499,7 +504,7 @@ async fn query(
         Err(e) => {
             return match &step.expect {
                 QueryExpect::Error { needle } if e.contains(needle) => {
-                    host.record("parameter_error", || serde_json::json!({"message": e}));
+                    observer.record("parameter_error", || serde_json::json!({"message": e}));
                     Ok(())
                 }
                 QueryExpect::Error { needle } => {
@@ -522,15 +527,15 @@ async fn query(
     }
     args.extend(params_argument(params).map_err(&fail)?);
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
-        client.read(host, step.ordinal, "", &args),
+        client.read(observer, step.ordinal, "", &args),
     )
     .await
     .map_err(&fail)?
     .map_err(&fail)?;
     check_read_expect(
-        host,
+        observer,
         &label,
         &step.expect,
         outcome,
@@ -541,7 +546,7 @@ async fn query(
 }
 
 async fn mutate(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ProcessClient<'_>,
     step: &MutateStep,
     binding: Option<(&str, &str)>,
@@ -555,7 +560,7 @@ async fn mutate(
         Err(e) => {
             return match &step.expect {
                 MutateExpect::Error { needle } if e.contains(needle) => {
-                    host.record("parameter_error", || serde_json::json!({"message": e}));
+                    observer.record("parameter_error", || serde_json::json!({"message": e}));
                     Ok(None)
                 }
                 MutateExpect::Error { needle } => {
@@ -576,14 +581,14 @@ async fn mutate(
     }
     args.extend(params_argument(params).map_err(&fail)?);
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
-        client.run::<ChangeOutput>(host, step.ordinal, "", &args),
+        client.run::<ChangeOutput>(observer, step.ordinal, "", &args),
     )
     .await
     .map_err(&fail)?
     .map_err(&fail)?;
-    host.record("mutation_result", || match &outcome {
+    observer.record("mutation_result", || match &outcome {
         Ok(result) => {
             serde_json::json!({"nodes": result.affected_nodes, "edges": result.affected_edges})
         }
@@ -594,9 +599,9 @@ async fn mutate(
         ..
     }) = &outcome
     {
-        host.record("commit", || crate::commit_evidence(commit.published));
+        observer.record("commit", || crate::commit_evidence(commit.published));
     }
-    host.observe(|| match &outcome {
+    observer.observe(|| match &outcome {
         Ok(result) => format!(
             "actual affected: nodes={} edges={}",
             result.affected_nodes, result.affected_edges
@@ -621,7 +626,7 @@ async fn mutate(
             }
         }
         MutateExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "the mutation succeeded")
+            check_error_expect(observer, needle, outcome, "the mutation succeeded")
                 .map(|()| None)
                 .map_err(fail)
         }
@@ -629,7 +634,7 @@ async fn mutate(
 }
 
 async fn load(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ProcessClient<'_>,
     step: &LoadStep,
     binding: Option<(&str, &str)>,
@@ -637,22 +642,28 @@ async fn load(
     let label = step_label(step.ordinal, "load", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
-        client.load_generated(host, step.ordinal, &step.generated, &step.branch, step.mode),
+        client.load_generated(
+            observer,
+            step.ordinal,
+            &step.generated,
+            &step.branch,
+            step.mode,
+        ),
     )
     .await
     .map_err(&fail)?;
     match &step.expect {
         WriteExpect::Ok => outcome.map_err(fail),
         WriteExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "load succeeded").map_err(fail)
+            check_error_expect(observer, needle, outcome, "load succeeded").map_err(fail)
         }
     }
 }
 
 fn check_write_expect(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     name: &str,
     expect: &WriteExpect,
     outcome: Result<ChangeOutput, String>,
@@ -662,7 +673,7 @@ fn check_write_expect(
             .map(|_| ())
             .map_err(|e| format!("`{name}` failed: {e}")),
         WriteExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, &format!("`{name}` succeeded"))
+            check_error_expect(observer, needle, outcome, &format!("`{name}` succeeded"))
         }
     }
 }
@@ -676,7 +687,7 @@ fn merge_outcome(wire: BranchMergeOutcome) -> MergeOutcome {
 }
 
 async fn control(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ProcessClient<'_>,
     step: &ControlStep,
     binding: Option<(&str, &str)>,
@@ -698,17 +709,17 @@ async fn control(
         args.extend(["--branch".into(), branch.clone()]);
     }
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
-        client.run::<ChangeOutput>(host, step.ordinal, "", &args),
+        client.run::<ChangeOutput>(observer, step.ordinal, "", &args),
     )
     .await
     .map_err(&fail)?
     .map_err(&fail)?;
-    host.observe(|| format!("actual control: {:?}", outcome.as_ref().map(|o| &o.outcome)));
+    observer.observe(|| format!("actual control: {:?}", outcome.as_ref().map(|o| &o.outcome)));
     let commit = outcome.as_ref().ok().and_then(|output| {
         output.commit.as_ref().map(|c| {
-            host.record("commit", || crate::commit_evidence(c.published));
+            observer.record("commit", || crate::commit_evidence(c.published));
             c.graph_commit_id.clone()
         })
     });
@@ -741,7 +752,7 @@ async fn control(
                     )));
                 }
             }
-            check_write_expect(host, name, expect, outcome)
+            check_write_expect(observer, name, expect, outcome)
                 .map(|()| commit)
                 .map_err(fail)
         }
@@ -754,14 +765,14 @@ async fn control(
                     output.outcome
                 )));
             }
-            check_write_expect(host, name, expect, outcome)
+            check_write_expect(observer, name, expect, outcome)
                 .map(|()| commit)
                 .map_err(fail)
         }
         ControlWrite::Merge {
             expect: MergeExpect::Write(expect),
             ..
-        } => check_write_expect(host, name, expect, outcome)
+        } => check_write_expect(observer, name, expect, outcome)
             .map(|()| commit)
             .map_err(fail),
         ControlWrite::Merge {
@@ -789,7 +800,7 @@ async fn control(
 }
 
 async fn list(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ProcessClient<'_>,
     step: &ListStep,
     binding: Option<(&str, &str)>,
@@ -797,15 +808,15 @@ async fn list(
     let label = step_label(step.ordinal, "branch list", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
-        client.statement(host, step.ordinal, "branch list"),
+        client.statement(observer, step.ordinal, "branch list"),
     )
     .await
     .map_err(&fail)?
     .map_err(&fail)?;
     check_read_expect(
-        host,
+        observer,
         &label,
         &step.expect,
         outcome,
@@ -816,7 +827,7 @@ async fn list(
 }
 
 async fn show(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ProcessClient<'_>,
     step: &ShowStep,
     binding: Option<(&str, &str)>,
@@ -825,15 +836,15 @@ async fn show(
     let label = step_label(step.ordinal, &name, binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
-        client.statement(host, step.ordinal, &format!("{name};")),
+        client.statement(observer, step.ordinal, &format!("{name};")),
     )
     .await
     .map_err(&fail)?
     .map_err(&fail)?;
     check_read_expect(
-        host,
+        observer,
         &label,
         &step.expect,
         outcome,
@@ -844,7 +855,7 @@ async fn show(
 }
 
 async fn branch_read(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ProcessClient<'_>,
     step: &BranchReadStep,
     binding: Option<(&str, &str)>,
@@ -855,9 +866,9 @@ async fn branch_read(
     let fail = |message: String| StepFail::new(label.clone(), message);
     let text = substitute_bound(&step.source, bindings);
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
-        client.statement(host, step.ordinal, &text),
+        client.statement(observer, step.ordinal, &text),
     )
     .await
     .map_err(&fail)?
@@ -871,7 +882,7 @@ async fn branch_read(
         } => {
             let actual = outcome.map_err(|e| fail(format!("`{name}` failed: {e}")))?;
             check_rows_json(
-                host,
+                observer,
                 &label,
                 &actual,
                 *ordered,
@@ -881,7 +892,8 @@ async fn branch_read(
             )
         }
         QueryExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, &format!("`{name}` succeeded")).map_err(fail)
+            check_error_expect(observer, needle, outcome, &format!("`{name}` succeeded"))
+                .map_err(fail)
         }
     }
 }

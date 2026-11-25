@@ -597,9 +597,9 @@ async fn s3_read_through_adapter_masks_the_base_and_leaves_its_listing_as_it_was
         .unwrap();
 }
 
-/// `Omnigraph::open_clone` over two prefixes: the clone answers as its base,
+/// `Omnigraph::open_clone` over a base prefix: the clone answers as its base,
 /// a write lands only under the clone prefix, the base's listing and ETags
-/// are unchanged, and a second open over the same clone root finds the write.
+/// are unchanged, a second open finds the write, and a root with `^` does the same.
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_open_clone_reads_the_base_and_writes_only_its_own_prefix() {
     let Some(root) = s3_test_graph_uri("shallow-clone") else {
@@ -643,6 +643,28 @@ async fn s3_open_clone_reads_the_base_and_writes_only_its_own_prefix() {
 
     let reopened = session(Omnigraph::open_clone(&base_uri, &clone_uri).await.unwrap());
     assert_eq!(count_rows(&reopened, "node:Person").await, persons + 1);
+
+    let caret_uri = format!("{root}/clone^1");
+    let caret = session(Omnigraph::open_clone(&base_uri, &caret_uri).await.unwrap());
+    assert_eq!(
+        count_rows(&caret, "node:Person").await,
+        persons,
+        "a clone root with a caret reads through its base"
+    );
+    mutate_main(
+        &caret,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Careted")], &[("$age", 2)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count_rows(&caret, "node:Person").await, persons + 1);
+    assert_eq!(
+        listing(&base_uri).await,
+        before,
+        "the base prefix is unchanged under a caret clone"
+    );
     storage_for_uri(&root)
         .unwrap()
         .delete_prefix(&root)

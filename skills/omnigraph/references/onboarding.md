@@ -446,18 +446,17 @@ with `studio_unavailable`. `./served` is a second graph, so writes through
 
 ### Show the user things in Studio
 
-From 0.4.8, Studio serves MCP tools that open views in its window: a type's
+Studio 0.4.9 and later serves MCP tools that open views in its window: a type's
 table, a node's page, a canvas or tree from a node, the schema's map, a branch's
 review or history, a commit, or a query tab that is not run. They never write,
 run queries or return property values, so read and write with the CLI and use
 Studio to show the user what you found. Agents in Studio's own panel have the
 tools already.
 
-An agent outside Studio needs **Settings › Agent › Let agents outside Studio
-show things in Studio** on. It ships off in 0.4.8 and on in later releases, and
-only the user changes it. Studio then offers a Claude Code command and a Codex
-`config.toml` entry to copy. You can run the same command; it reads the token
-from a file, so the token never appears on screen (macOS path):
+An agent outside Studio connects once. **Settings › Agent** shows a Claude Code
+command and a Codex `config.toml` entry to copy. You can run the same command;
+it reads the token from a file, so the token never appears on screen (macOS
+path):
 
 ```bash
 D="$HOME/Library/Application Support/Omnigraph Studio/ui-tools"
@@ -465,11 +464,11 @@ claude mcp add --transport http omnigraph-studio "$(jq -r .url "$D/endpoint.json
   --header "Authorization: Bearer $(cat "$D/token")"
 ```
 
-Most agents load MCP servers when a session starts, so the user starts a new
-session before you use the tools. In 0.4.8 the address and token change each
-time Studio starts, so after a restart run `claude mcp remove omnigraph-studio`
-and add it again; later releases keep both by default (port 24187, the token in
-the system keychain).
+The address (port 24187) and token survive restarts. Most agents load MCP
+servers when a session starts, so the user starts a new session before you use
+the tools. If `endpoint.json` is missing, Studio is older than 0.4.9 or the user
+turned off **Let agents outside Studio show things in Studio** in that tab: ask
+them to update or turn it on.
 
 Call `studio_windows` first: it gives each window's id, server, graph and
 branch, and every other tool takes a window id. `graph_open_type` opens a table,

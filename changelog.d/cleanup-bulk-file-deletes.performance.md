@@ -1,0 +1,1 @@
+- `cleanup` sends a table's freed files as one bulk delete (S3: up to 1,000 per request) and reads each removed version once while planning.

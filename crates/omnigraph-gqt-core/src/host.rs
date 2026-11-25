@@ -66,7 +66,11 @@ pub fn admit_ungated_case(
     Ok(())
 }
 
-/// Runner-owned observation and execution facilities around ordinary GQT steps.
+/// The half of a run that changes what a step does: the store a restart
+/// reopens, the seam armed around a step, how a concurrent block runs,
+/// whether a read step is compared with the core reference interpreter and
+/// a plan with its `--- expect plan`, and whether the case is admitted at
+/// all. One per run; what only watches a step is an [`Observer`].
 pub trait ExecutionHost: Sync {
     type StepGuard: Send;
 
@@ -76,31 +80,6 @@ pub trait ExecutionHost: Sync {
 
     fn arm_seams(&self, seams: &[SeamDirective], step: &Step) -> Result<Self::StepGuard, String>;
     fn finish_seams(&self, guard: Self::StepGuard) -> Result<(), String>;
-    fn observe(&self, _value: impl FnOnce() -> String) {}
-    fn record(&self, _kind: &str, _value: impl FnOnce() -> Value) {}
-    fn begin_operation(&self, _value: impl FnOnce() -> Value) {}
-    fn observe_query<E: Display>(&self, _result: &Result<QueryResult, E>, _ordered: bool) {}
-    fn observe_fault(&self, _error: &OmniError) {}
-    fn lifetime_counts(&self) -> Option<[u64; 2]> {
-        None
-    }
-    fn active(&self) -> bool {
-        false
-    }
-    fn observe_snapshot(&self) -> bool {
-        false
-    }
-    fn measure_step_begin(&self, _ordinal: u64, _line: Option<u64>, _kind: &'static str) {}
-    fn measure_step_end(&self, _ordinal: u64) {}
-    /// Called immediately before polling the engine operation, after preparing its arguments.
-    fn operation_started(&self, _ordinal: usize) -> Result<(), String> {
-        Ok(())
-    }
-    /// Called after the engine operation resolves, before validating its result.
-    fn operation_finished(&self, _ordinal: usize) -> Result<(), String> {
-        Ok(())
-    }
-
     /// Reopens the current store; hosts may replace generation-scoped storage decorators here.
     fn reopen<'a>(
         &'a self,
@@ -147,17 +126,15 @@ pub trait ExecutionHost: Sync {
         .boxed()
     }
 
-    /// A block as [`run_block_once`] runs it.
-    fn concurrent_step<'a>(
+    /// A block as [`run_block_once`] runs it; its sessions report to `observer`.
+    fn concurrent_step<'a, O: Observer>(
         &'a self,
+        observer: &'a O,
         session: &'a Session,
         _case: &'a Case,
         step: &'a ConcurrentStep,
-    ) -> BoxFuture<'a, Result<(), StepFail>>
-    where
-        Self: Sized,
-    {
-        run_block_once(self, session, step)
+    ) -> BoxFuture<'a, Result<(), StepFail>> {
+        run_block_once(observer, session, step)
     }
 
     /// The measured block of a workload against a server. Only a host that
@@ -177,17 +154,55 @@ pub trait ExecutionHost: Sync {
     }
 }
 
+/// The half of a run that only watches a step: the facts the executor reports
+/// as it runs a case, in the order it reports them. Every method has a no-op
+/// default and takes its value as a closure, so an observer that ignores a
+/// fact pays nothing for it; `()` is the observer that ignores them all. Any
+/// number of observers could watch one run; the two moments around the engine
+/// call, [`Observer::operation_started`] and [`Observer::operation_finished`],
+/// may refuse, which ends the case, since a measuring observer uses them as
+/// integrity checks.
+pub trait Observer: Sync {
+    fn observe(&self, _value: impl FnOnce() -> String) {}
+    fn record(&self, _kind: &str, _value: impl FnOnce() -> Value) {}
+    fn begin_operation(&self, _value: impl FnOnce() -> Value) {}
+    fn observe_query<E: Display>(&self, _result: &Result<QueryResult, E>, _ordered: bool) {}
+    fn observe_fault(&self, _error: &OmniError) {}
+    /// The engine's init and open counts so far, when the observer keeps them;
+    /// the executor fails a step that moved them unexpectedly.
+    fn lifetime_counts(&self) -> Option<[u64; 2]> {
+        None
+    }
+    /// Whether the executor resolves and reports the `main` snapshot after each step.
+    fn observe_snapshot(&self) -> bool {
+        false
+    }
+    fn measure_step_begin(&self, _ordinal: u64, _line: Option<u64>, _kind: &'static str) {}
+    fn measure_step_end(&self, _ordinal: u64) {}
+    /// Called immediately before polling the engine operation, after preparing its arguments.
+    fn operation_started(&self, _ordinal: usize) -> Result<(), String> {
+        Ok(())
+    }
+    /// Called after the engine operation resolves, before validating its result.
+    fn operation_finished(&self, _ordinal: usize) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The observer that watches nothing.
+impl Observer for () {}
+
 /// A block on a host without the DST runner's gate. A free-running block runs
 /// its sessions once each, one after another in declaration order, on the
 /// case session; a block with an `order:` line is refused.
 pub fn run_block_once<'a>(
-    host: &'a impl ExecutionHost,
+    observer: &'a impl Observer,
     session: &'a Session,
     step: &'a ConcurrentStep,
 ) -> BoxFuture<'a, Result<(), StepFail>> {
     if step.is_free_running() {
         let order = permutation(step.sessions.len(), Pass(0));
-        return async move { crate::run_free_running_block(host, session, step, &order).await }
+        return async move { crate::run_free_running_block(observer, session, step, &order).await }
             .boxed();
     }
     futures::future::ready(Err(StepFail::new(

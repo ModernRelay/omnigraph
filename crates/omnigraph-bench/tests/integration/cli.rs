@@ -1013,6 +1013,53 @@ fn report_rows(catalog: &Path, store: &Path, selector: &str) -> usize {
         .sum()
 }
 
+/// `--at <full sha>=<path>` names its commit itself: outside any repository
+/// and with no `git` on `PATH` the run gets as far as the binary it names,
+/// while that sha without a path or in uppercase is resolved in the repository.
+#[test]
+fn at_a_full_lowercase_commit_sha_with_a_path_needs_no_repository() {
+    let directory = tempfile::tempdir().unwrap();
+    let sha = "a".repeat(40);
+    let product = directory.path().join("absent").join("omnigraph");
+    for (spec, code, named) in [
+        (
+            format!("{sha}={}", product.display()),
+            "product_binary_unreadable",
+            "absent",
+        ),
+        (sha.clone(), "invalid_run_input", "`git` could not be run"),
+        (
+            format!("{}={}", sha.to_uppercase(), product.display()),
+            "invalid_run_input",
+            "`git` could not be run",
+        ),
+    ] {
+        let output = Command::cargo_bin("omnigraph-bench")
+            .unwrap()
+            .current_dir(directory.path())
+            .env("PATH", directory.path())
+            .args(["run", "tiny-read", "--config"])
+            .arg(repository_root().join("benchmarks/benchmarks.yaml"))
+            .arg("--dataset-cache")
+            .arg(directory.path().join("cache"))
+            .arg("--store")
+            .arg(directory.path().join("store"))
+            .arg("--at")
+            .arg(&spec)
+            .arg("--json")
+            .output()
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let diagnostic = &result["diagnostics"][0];
+        assert!(!output.status.success(), "{spec}: {result}");
+        assert_eq!(diagnostic["code"], code, "{spec}: {result}");
+        assert!(
+            diagnostic["message"].as_str().unwrap().contains(named),
+            "{spec}: {result}"
+        );
+    }
+}
+
 /// A selection with one point that resets another way is refused before any
 /// run: every scenario's options are checked for every ref first, so no ref
 /// measures the scenarios before it and no record is put.

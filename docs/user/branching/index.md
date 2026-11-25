@@ -89,11 +89,11 @@ after review. Live branches keep the history they depend on from `cleanup`.
 
 ## Branch names
 
-Branch names may contain `/`, but live names must not be path prefixes of one
-another (`review` and `review/alice` cannot coexist); `main` is reserved. A
-parent branch can be deleted while descendants remain. A path segment may not
-end in `.` followed by 26 upper-case letters and digits, the shape reserved for
-Omnigraph's internal per-life branch identity; `release.1.2` is fine.
+A new branch name holds letters and digits (`é` too), `.`, `-`, `_` and `/`, in
+non-empty segments, with no `..` or final `.`; create refuses others by name.
+Live names must not be path prefixes of one another (`review`, `review/alice`);
+`main` is reserved. Deleting a parent keeps its descendants. A segment ending in
+`.` and 26 upper-case letters and digits is reserved; `release.1.2` is fine.
 
 A branch name is used exactly as written, never trimmed: `main ` does not name
 `main`. A name that is empty, has leading or trailing whitespace, or contains a

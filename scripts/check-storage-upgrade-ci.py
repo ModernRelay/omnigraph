@@ -18,8 +18,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTEXT = "Storage Upgrade Compatibility"
 JOB = "storage_upgrade_compatibility"
 FEATURES = "omnigraph-engine/failpoints,omnigraph-cluster/failpoints"
-STAMP_13_SOURCE_COMMIT = "c0a4519f38d65dc1356728981983da8b096cfbef"
-LANCE11_SOURCE_COMMIT = "0a62bb7b2aa5b99b012f413807c216277f7f9596"
 CASES = (
     "storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph",
     "genuine_v13_storage_upgrade_preserves_history",
@@ -176,96 +174,30 @@ CROSSVERSION_INVENTORY_SCRIPT = (
     'mapfile -t cases < "$cases_file"\n'
     '[ "${#cases[@]}" -gt 0 ] || { echo "::error::the crossversion storage upgrade inventory is empty"; exit 1; }'
 )
-PREDECESSOR_TOKENS = (
-    "OMNIGRAPH_REQUIRE_STORAGE_UPGRADE_TESTS: '1'",
-    f"STAMP_13_SOURCE_COMMIT: {STAMP_13_SOURCE_COMMIT}",
-    f"LANCE11_SOURCE_COMMIT: {LANCE11_SOURCE_COMMIT}",
-    'echo "OMNIGRAPH_LANCE11_BIN=$lance11_bin" >> "$GITHUB_ENV"',
-    'git worktree add --detach "$v13_source" "$STAMP_13_SOURCE_COMMIT"',
-    'echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV"',
+# The job provisions its predecessors with the registry action and `require`,
+# so a journey whose row is missing fails instead of skipping. The rows it
+# must name are those the crossversion `storage_upgrade` cases ask for.
+PREDECESSOR_STEP = re.compile(
+    r"^      - name: Provision predecessors\n"
+    r"        uses: \./\.github/actions/predecessors\n"
+    r"        with:\n"
+    r"          rows: (?P<rows>[^\n]+)\n"
+    r"          require: true\n",
+    re.MULTILINE,
 )
-PREDECESSOR_SCRIPT = """\
-set -euo pipefail
-v13_source="$RUNNER_TEMP/omnigraph-stamp-13"
-v13_bin="$RUNNER_TEMP/omnigraph-stamp-13-bin"
-git fetch --no-tags --depth=1 origin "$STAMP_13_SOURCE_COMMIT"
-git worktree add --detach "$v13_source" "$STAMP_13_SOURCE_COMMIT"
-cargo build --locked \\
-  --manifest-path "$v13_source/Cargo.toml" \\
-  --package omnigraph-cli \\
-  --bin omnigraph \\
-  --target-dir "$GITHUB_WORKSPACE/target"
-cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$v13_bin"
-test -x "$v13_bin"
-# Clean path-package artifacts through both workspace manifests while
-# retaining shared registry dependencies: the predecessor and current
-# packages share names and versions, so either manifest alone can
-# miss a stale path identity and link the wrong rlib.
-cargo clean --workspace --locked \\
-  --manifest-path "$v13_source/Cargo.toml" \\
-  --target-dir "$GITHUB_WORKSPACE/target"
-cargo clean --workspace --locked \\
-  --target-dir "$GITHUB_WORKSPACE/target"
-echo "OMNIGRAPH_V13_BIN=$v13_bin" >> "$GITHUB_ENV\""""
-LANCE11_SCRIPT = """\
-set -euo pipefail
-lance11_source="$RUNNER_TEMP/omnigraph-lance-11"
-lance11_bin="$RUNNER_TEMP/omnigraph-lance-11-bin"
-git fetch --no-tags --depth=1 origin "$LANCE11_SOURCE_COMMIT"
-git worktree add --detach "$lance11_source" "$LANCE11_SOURCE_COMMIT"
-test "$(git -C "$lance11_source" rev-parse HEAD)" = "$LANCE11_SOURCE_COMMIT"
-# Run inside the predecessor checkout so its workspace configuration applies.
-(cd "$lance11_source" && cargo build --locked \\
-  --package omnigraph-cli \\
-  --bin omnigraph \\
-  --target-dir "$GITHUB_WORKSPACE/target")
-cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$lance11_bin"
-test -x "$lance11_bin"
-# Remove both path-package identities before linking the candidate tests.
-cargo clean --workspace --locked \\
-  --manifest-path "$lance11_source/Cargo.toml" \\
-  --target-dir "$GITHUB_WORKSPACE/target"
-cargo clean --workspace --locked \\
-  --target-dir "$GITHUB_WORKSPACE/target"
-echo "OMNIGRAPH_LANCE11_BIN=$lance11_bin" >> "$GITHUB_ENV\""""
-RELEASE_TOKENS = (
-    'echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"',
-    'echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV"',
-    'echo "OMNIGRAPH_EDITION_2_RELEASE_BIN=$edition2_dir/omnigraph" >> "$GITHUB_ENV"',
-)
-RELEASE_SCRIPT = """\
-set -euo pipefail
-v6_dir="$RUNNER_TEMP/omnigraph-v010"
-v011_dir="$RUNNER_TEMP/omnigraph-v011"
-edition2_dir="$RUNNER_TEMP/omnigraph-edition-2"
-# The installer downloads the official archive and verifies its
-# SHA256 before extraction. An exact VERSION never falls back to edge.
-# A failed download leaves nothing behind, so each release gets three
-# attempts before this blocking job fails.
-install_release() {
-  for attempt in 1 2 3; do
-    REPO_SLUG=ModernRelay/omnigraph VERSION="$1" INSTALL_DIR="$2" \\
-      bash scripts/install.sh && return 0
-    echo "install of $1 failed on attempt $attempt/3; retrying"
-    sleep 10
-  done
-  return 1
-}
-install_release v0.10.0 "$v6_dir"
-test -x "$v6_dir/omnigraph"
-[[ "$("$v6_dir/omnigraph" --version)" == "omnigraph 0.10.0" ]] \\
-  || { echo "::error::the storage upgrades of a 0.10.0 graph require the genuine v0.10.0 CLI"; exit 1; }
-install_release v0.11.0 "$v011_dir"
-test -x "$v011_dir/omnigraph"
-[[ "$("$v011_dir/omnigraph" --version)" == "omnigraph 0.11.0" ]] \\
-  || { echo "::error::the release storage upgrade requires the genuine v0.11.0 CLI"; exit 1; }
-install_release edge-20261118-fd4d61f "$edition2_dir"
-test -x "$edition2_dir/omnigraph"
-[[ "$("$edition2_dir/omnigraph" --version)" == "omnigraph 0.15.1-edge+fd4d61f" ]] \\
-  || { echo "::error::the one-way journeys require the published edition-2 CLI"; exit 1; }
-echo "OMNIGRAPH_V6_BIN=$v6_dir/omnigraph" >> "$GITHUB_ENV"
-echo "OMNIGRAPH_V011_BIN=$v011_dir/omnigraph" >> "$GITHUB_ENV"
-echo "OMNIGRAPH_EDITION_2_RELEASE_BIN=$edition2_dir/omnigraph" >> "$GITHUB_ENV\""""
+PREDECESSOR_REQUEST = re.compile(r'\bpredecessor\(\s*"([^"]+)"\s*\)')
+
+
+def required_rows(root: Path = ROOT) -> set[str]:
+    """The registry rows the bodies of the crossversion `storage_upgrade` cases ask for."""
+    source = (root / SCOPES["crossversion"][1]).read_text()
+    rows = set()
+    for body in re.findall(
+        r"^#\[test\][^\n]*\n(?:#\[[^\n]*\]\n)*fn \w*storage_upgrade\w*\(\)[^\n]*\n(.*?)^\}$",
+        source, re.MULTILINE | re.DOTALL,
+    ):
+        rows |= set(PREDECESSOR_REQUEST.findall(body))
+    return rows
 
 
 def scope_script(scope: str) -> str:
@@ -311,21 +243,20 @@ def validate(workflow: str, table: dict | None = None) -> list[str]:
     for token in (
         f"name: {CONTEXT}",
         "run: python3 scripts/check-storage-upgrade-ci.py --self-test",
-        *PREDECESSOR_TOKENS,
-        *RELEASE_TOKENS,
     ):
         if token not in job:
             failures.append(f"storage compatibility is missing {token!r}")
+    steps = PREDECESSOR_STEP.findall(job)
+    if len(steps) != 1:
+        failures.append("storage compatibility requires one predecessors step with `require: true`")
+    else:
+        missing = sorted(required_rows() - set(steps[0].split()))
+        if missing:
+            failures.append(f"storage compatibility does not provision {missing}")
     scripts = re.findall(
         r"^        run: \|\n((?:^          .*\n|^\n)+)", job, re.MULTILINE
     )
     scripts = {"\n".join(line[10:] for line in body.rstrip().splitlines()) for body in scripts}
-    if PREDECESSOR_SCRIPT not in scripts:
-        failures.append("storage compatibility requires the exact genuine stamp-13 build script")
-    if LANCE11_SCRIPT not in scripts:
-        failures.append("storage compatibility requires the exact genuine Lance 11 build script")
-    if RELEASE_SCRIPT not in scripts:
-        failures.append("storage compatibility requires the exact released v0.10.0, v0.11.0 and edition-2 install script")
     for scope in SCOPES:
         if scope_script(scope) not in scripts:
             failures.append(f"storage compatibility requires the exact fail-closed {scope} command and log check")
@@ -488,75 +419,32 @@ class GuardTests(unittest.TestCase):
             self.assertTrue(validate(changed))
         self.assertTrue(validate(self.workflow.replace(FEATURES, "")))
 
-    def test_missing_predecessor_build_or_requirement_fails(self):
-        for token in PREDECESSOR_TOKENS:
-            with self.subTest(token=token):
-                changed = self.workflow.replace(token, "")
+    def test_missing_predecessor_step_or_requirement_fails(self):
+        job = self.storage_job()
+        step = PREDECESSOR_STEP.search(job)
+        self.assertIsNotNone(step)
+        self.assertEqual(required_rows(), {"stamp-13", "lance-11", "release-0.10.0", "release-0.11.0", "edition-2"})
+        for before, after in (
+            (step.group(0), ""),
+            ("          require: true\n", "          require: false\n"),
+            ("          require: true\n", ""),
+            (step.group(0), step.group(0).replace("        with:", "        if: false\n        with:")),
+            (step.group(0), step.group(0) + step.group(0)),
+        ):
+            with self.subTest(before=before, after=after):
+                changed = self.workflow.replace(job, job.replace(before, after))
                 self.assertNotEqual(changed, self.workflow)
                 self.assertTrue(validate(changed))
-        for commit in (STAMP_13_SOURCE_COMMIT, LANCE11_SOURCE_COMMIT):
-            moved = self.workflow.replace(commit, "0" * 40)
-            self.assertNotEqual(moved, self.workflow)
-            self.assertTrue(validate(moved))
-
-    def test_removed_or_altered_predecessor_build_line_fails(self):
-        errors = []
-        for script, label in ((PREDECESSOR_SCRIPT, "stamp-13"), (LANCE11_SCRIPT, "Lance 11")):
-            error = f"storage compatibility requires the exact genuine {label} build script"
-            errors.append(error)
-            lines = script.splitlines()
-            block = "".join(f"          {line}\n" for line in lines)
-            self.assertEqual(self.workflow.count(block), 1)
-            for index, line in enumerate(lines):
-                for replacement in ([], [f"true # {line}"], [f"{line} || true"]):
-                    with self.subTest(script=label, line=line, replacement=replacement):
-                        altered = lines[:index] + replacement + lines[index + 1:]
-                        changed = self.workflow.replace(
-                            block, "".join(f"          {line}\n" for line in altered)
-                        )
-                        self.assertIn(error, validate(changed))
-        swapped = self.workflow.replace("--package omnigraph-cli", "--package omnigraph-server")
-        self.assertNotEqual(swapped, self.workflow)
-        self.assertEqual(validate(swapped), errors)
+        for row in required_rows():
+            with self.subTest(dropped=row):
+                rows = " ".join(name for name in step.group("rows").split() if name != row)
+                changed = self.workflow.replace(job, job.replace(step.group("rows"), rows))
+                self.assertIn(f"storage compatibility does not provision {[row]}", validate(changed))
 
     def storage_job(self):
         start = self.workflow.index("  storage_upgrade_compatibility:\n")
         end = self.workflow.index("\n  v5_v10_format_fence:\n", start)
         return self.workflow[start:end]
-
-    def test_missing_release_binary_export_fails(self):
-        job = self.storage_job()
-        for token in RELEASE_TOKENS:
-            with self.subTest(token=token):
-                self.assertEqual(job.count(token), 1)
-                changed = self.workflow.replace(job, job.replace(token, ""))
-                failures = validate(changed)
-                self.assertIn(f"storage compatibility is missing {token!r}", failures)
-
-    def test_removed_or_altered_release_install_line_fails(self):
-        exact = ["storage compatibility requires the exact released v0.10.0, v0.11.0 and edition-2 install script"]
-        job = self.storage_job()
-        lines = RELEASE_SCRIPT.splitlines()
-        block = "".join(f"          {line}\n" for line in lines)
-        self.assertEqual(job.count(block), 1)
-        for index, line in enumerate(lines):
-            for replacement in ([], [f"true # {line}"], [f"{line} || true"]):
-                with self.subTest(line=line, replacement=replacement):
-                    altered = lines[:index] + replacement + lines[index + 1:]
-                    changed = self.workflow.replace(job, job.replace(
-                        block, "".join(f"          {line}\n" for line in altered)
-                    ))
-                    failures = validate(changed)
-                    self.assertTrue(set(exact) <= set(failures), failures)
-        for before, after in (
-            ("install_release v0.11.0", "install_release v0.12.0"),
-            ("for attempt in 1 2 3", "for attempt in 1"),
-            ("bash scripts/install.sh && return 0", "bash scripts/install.sh; return 0"),
-        ):
-            with self.subTest(before=before, after=after):
-                moved = self.workflow.replace(job, job.replace(before, after))
-                self.assertNotEqual(moved, self.workflow)
-                self.assertEqual(validate(moved), exact)
 
     def test_gate_must_need_the_job_and_never_let_it_skip(self):
         self.assertEqual(validate(self.workflow), [])
@@ -708,7 +596,7 @@ class GuardTests(unittest.TestCase):
         )
         ignored = good.replace("test crossversion_upgrade::beta ... ok", "test crossversion_upgrade::beta ... ignored")
         self.assertTrue(validate_log(ignored, expected, exact=True))
-        self.assertTrue(validate_log(good + "skipping genuine stamp-13 storage upgrade\n", expected, exact=True))
+        self.assertTrue(validate_log(good + "skipping: predecessor stamp-13 is not provisioned\n", expected, exact=True))
         self.assertIn("crossversion", CASES_FILE_SCOPES)
         self.assertIn("lance", EXACT_SCOPES)
 
@@ -733,9 +621,8 @@ class GuardTests(unittest.TestCase):
             good.replace("test beta ... ok", "test beta ... ignored"),
             good.replace("2 passed", "0 passed"),
             good.replace("0 ignored", "1 ignored"),
-            good + "skipping genuine stamp-13 storage upgrade: OMNIGRAPH_V13_BIN is unset\n",
-            good + "skipping genuine v0.11.0 storage upgrade: OMNIGRAPH_V011_BIN is unset\n",
-            good + "skipping genuine v0.10.0 storage upgrade: OMNIGRAPH_V6_BIN is unset\n",
+            good + "skipping: predecessor stamp-13 is not provisioned\n",
+            good + "skipping: predecessor release-0.11.0 is not provisioned\n",
             good + good,
         ):
             with self.subTest(log=log):
@@ -784,7 +671,7 @@ def main() -> int:
         for failure in failures:
             print(f"Storage upgrade CI: {failure}", file=sys.stderr)
         return 1
-    print("Storage upgrade CI OK (genuine stamp-13 route, genuine v0.11.0 and v0.10.0 release route, cluster refusal, engine protocol, Lance and registry coverage).")
+    print("Storage upgrade CI OK (required predecessors, cluster refusal, engine protocol, Lance and registry coverage).")
     return 0
 
 
