@@ -893,6 +893,21 @@ edge Likes: Person -> Person {}
         );
         // Sanity that the shared index really is the artifact's full catalog.
         assert!(knows.csr("Knows").is_some() && knows.csr("Likes").is_some());
+
+        // A historical request may name an edge that has no table in its
+        // snapshot. It cannot reuse the full artifact under the Knows key.
+        let mut incomplete_scope = scope("Knows");
+        incomplete_scope.insert("Future".into(), ("Person".into(), "Person".into()));
+        let scoped = db
+            .graph_index_for_snapshot(
+                &resolved.snapshot,
+                &incomplete_scope,
+                catalog.system_columns,
+            )
+            .await
+            .unwrap();
+        assert!(scoped.csr("Knows").is_some());
+        assert!(scoped.csr("Likes").is_none());
     }
 
     /// A hit needs the live `Arc<Catalog>` the entry was compiled under: an
