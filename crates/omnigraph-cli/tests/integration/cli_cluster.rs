@@ -5654,6 +5654,7 @@ fn managed_organization_m2m_application_create_refuses_unsafe_destinations_befor
     let existing = temp.path().join("existing-secret");
     fs::write(&existing, "keep me").unwrap();
     let fresh = temp.path().join("fresh-secret");
+    let slashed = format!("{}/", fresh.display());
     let key = "k".repeat(201);
     for (arguments, kind) in [
         (
@@ -5665,6 +5666,12 @@ fn managed_organization_m2m_application_create_refuses_unsafe_destinations_befor
                 "--client-secret-file",
                 temp.path().join("missing/secret").to_str().unwrap(),
             ],
+            "m2m_application_secret_file_invalid",
+        ),
+        // Regression (review of PR 1546): a slash-terminated destination
+        // was accepted and failed only after the client secret existed.
+        (
+            vec!["--client-secret-file", &slashed],
             "m2m_application_secret_file_invalid",
         ),
         (
@@ -6145,5 +6152,183 @@ fn managed_organization_m2m_application_revoke_resolves_once_and_requires_confir
         posts[1].path,
         "/v1/organization/m2m-applications/client_two:delete"
     );
+    api.assert_complete();
+}
+
+/// Regression (review of PR 1546): replaying a completed
+/// `create --replace-profile` wrote its profile again, overwriting a profile
+/// a later request had installed under the same name.
+#[test]
+fn managed_organization_m2m_application_create_replay_never_rewrites_its_profile() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, application_page(vec![], None)),
+        IntentReply::json(
+            201,
+            serde_json::json!({"data":{"application":team_application("client_one", "ci")},"meta":{}}),
+        ),
+        IntentReply::json(201, generated_secret("sec_one", Some(APPLICATION_SECRET))),
+    ]);
+    write_managed_target(temp.path(), &api.origin);
+    let config_path = managed_home(temp.path()).join("config.yaml");
+    let mut config: Value =
+        yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["profiles"]["ci"] = config["profiles"]["managed-account"].clone();
+    fs::write(&config_path, yaml_serde::to_string(&config).unwrap()).unwrap();
+    let secret_file = temp.path().join("ci-secret");
+    let run = || {
+        output_success(organization_cli(temp.path(), &api.origin).args([
+            "m2m-applications",
+            "create",
+            "ci",
+            "--permission",
+            "status",
+            "--client-secret-file",
+            secret_file.to_str().unwrap(),
+            "--create-profile",
+            "ci",
+            "--replace-profile",
+            "--idempotency-key",
+            "replace-key",
+            "--json",
+        ]))
+    };
+    run();
+    let mut later: Value =
+        yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(later["profiles"]["ci"]["auth"]["client_id"], "client_one");
+    // A later request installs another application under the same profile.
+    later["profiles"]["ci"]["auth"]["client_id"] = serde_json::json!("client_later");
+    fs::write(&config_path, yaml_serde::to_string(&later).unwrap()).unwrap();
+    let before = fs::read(&config_path).unwrap();
+    assert_no_secret_output(&run());
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert_eq!(api.workflow_requests().len(), 3);
+    api.assert_complete();
+}
+
+/// Regression (review of PR 1546): a same-key rotation retry proved whatever
+/// the file held and then revoked the earlier client secret, even after the
+/// operator had restored that secret to the file.
+#[test]
+fn managed_organization_m2m_application_rotation_retry_never_revokes_a_restored_secret() {
+    let temp = tempdir().unwrap();
+    let provider = IntentApiFixture::new(vec![token_reply(401)]);
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, application_secret_page(&["sec_old"])),
+        IntentReply::json(201, generated_secret("sec_new", Some(ROTATED_SECRET))),
+    ]);
+    let secret_file = write_application_profile(
+        temp.path(),
+        &api.origin,
+        &format!("{}/oauth2/token", provider.origin),
+    );
+    let failed = output_failure(rotate_cli(temp.path(), &api.origin).args([
+        "--idempotency-key",
+        "rotate-key",
+        "--json",
+    ]));
+    assert_eq!(
+        parse_stdout_json(&failed)["type"],
+        "m2m_application_secret_unproven"
+    );
+    // The operator rolls back by restoring the earlier client secret.
+    fs::write(&secret_file, "old-client-secret").unwrap();
+    for json in [true, false] {
+        let mut command = rotate_cli(temp.path(), &api.origin);
+        command.args(["--idempotency-key", "rotate-key"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = output_failure(&mut command);
+        assert_no_secret_output(&output);
+        let report = if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["type"], "m2m_application_secret_file_changed");
+            assert_eq!(body["secret_id"], "sec_new");
+            body["detail"].as_str().unwrap().to_owned()
+        } else {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+        assert!(report.contains("nothing was proven or revoked"), "{report}");
+    }
+    // No exchange with the restored value and no revocation was sent.
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(api.workflow_requests().len(), 2);
+    assert_eq!(
+        fs::read_to_string(&secret_file).unwrap(),
+        "old-client-secret"
+    );
+    provider.assert_complete();
+    api.assert_complete();
+}
+
+/// Regression (review of PR 1546): `--stats` naming the client secret file
+/// overwrote the delivered secret with statistics after the command
+/// succeeded. Every collision with another output refuses before anything,
+/// the statistics recorder included, writes.
+#[test]
+fn managed_organization_m2m_application_secret_file_never_shares_a_path_with_another_output() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    let secret_file =
+        write_application_profile(temp.path(), &api.origin, APPLICATION_TOKEN_ENDPOINT);
+    let fresh = temp.path().join("fresh-secret");
+    let config = managed_home(temp.path()).join("config.yaml");
+    let custody = managed_home(temp.path())
+        .join("organization")
+        .join("secret");
+    fs::create_dir_all(custody.parent().unwrap()).unwrap();
+    let config_before = fs::read(&config).unwrap();
+    for (destination, stats) in [
+        (fresh.clone(), Some(fresh.clone())),
+        (config.clone(), None),
+        (custody.clone(), None),
+    ] {
+        let mut command = organization_cli(temp.path(), &api.origin);
+        if let Some(stats) = &stats {
+            command.arg("--stats").arg(stats);
+        }
+        command.args([
+            "m2m-applications",
+            "create",
+            "ci",
+            "--client-secret-file",
+            destination.to_str().unwrap(),
+            "--replace-client-secret-file",
+            "--idempotency-key",
+            "collision-key",
+            "--json",
+        ]);
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(
+            parse_stdout_json(&output)["type"],
+            "m2m_application_secret_file_collision",
+            "{destination:?}"
+        );
+    }
+    assert!(
+        !fresh.exists(),
+        "the statistics recorder wrote the refused path"
+    );
+    assert!(!custody.exists());
+    assert_eq!(fs::read(&config).unwrap(), config_before);
+    // Rotation's destination comes from the profile; its file is unchanged.
+    let output = output_failure(
+        rotate_cli(temp.path(), &api.origin)
+            .arg("--stats")
+            .arg(&secret_file)
+            .args(["--idempotency-key", "rotate-collision", "--json"]),
+    );
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "m2m_application_secret_file_collision"
+    );
+    assert_eq!(
+        fs::read_to_string(&secret_file).unwrap(),
+        "old-client-secret"
+    );
+    assert!(api.workflow_requests().is_empty());
     api.assert_complete();
 }

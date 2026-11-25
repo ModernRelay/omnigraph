@@ -1054,6 +1054,22 @@ async fn cluster_command(
     deployment::dispatch(&api, context, command, stderr).await
 }
 
+/// Refuse, before anything writes, a client secret destination that another
+/// output of this invocation would replace. Returns the refusal and whether
+/// it should render as JSON.
+pub(crate) fn output_collision(
+    cli: &Cli,
+    input: &crate::operator::InvocationConfig,
+) -> Option<(Failure, bool)> {
+    match &cli.command {
+        Command::Organization { args, command } => {
+            organization::output_collision(command, input, cli.stats.as_deref())
+                .map(|failure| (failure, args.json))
+        }
+        _ => None,
+    }
+}
+
 /// Only a resolved managed target enters this dispatcher; project folders never route.
 pub(crate) async fn dispatch(
     cli: &Cli,

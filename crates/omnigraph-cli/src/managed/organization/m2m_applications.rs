@@ -48,8 +48,10 @@ enum Progress {
     Create {
         token_endpoint: Option<String>,
         application: Option<Application>,
-        /// The client secret ID whose value this request wrote to its file.
-        delivered: Option<String>,
+        /// How far this request has gone in installing its profile.
+        profile: Option<ProfileStep>,
+        /// The client secret this request wrote to its file.
+        delivered: Option<Delivered>,
     },
     Rotate {
         client_id: String,
@@ -57,13 +59,23 @@ enum Progress {
         client_secret_file: PathBuf,
         /// Client secret IDs chosen from those that existed before the new one.
         revoke: Vec<String>,
-        delivered: Option<String>,
+        delivered: Option<Delivered>,
     },
     Delete {
         client_id: String,
         actor_id: String,
         name: String,
     },
+}
+
+/// The profile step of a create. Consent to replace a profile covers the
+/// first attempt only: a retry after an attempt accepts its own profile or an
+/// absent one, never another, and an installed profile is never written again.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProfileStep {
+    Attempted,
+    Installed,
 }
 
 impl Progress {
@@ -424,7 +436,14 @@ fn take_secret(body: &mut Value, client: &str) -> Result<(SecretSummary, Option<
     Ok((generated.secret, secret))
 }
 
-/// The client secret's destination: an absolute path in an existing directory.
+/// Whether this platform can create a file only its owner can read. Unix
+/// permission bits do; elsewhere the CLI refuses to write a client secret
+/// rather than leave it to whatever access the directory grants.
+const OWNER_ONLY_FILES: bool = cfg!(unix);
+
+/// The client secret's destination: a file name in an existing directory.
+/// Construction is the one place a destination is accepted, so every command
+/// and every collision check sees the same normalized path.
 struct ClientSecretFile {
     path: PathBuf,
     directory: PathBuf,
@@ -432,19 +451,53 @@ struct ClientSecretFile {
 
 impl ClientSecretFile {
     fn new(path: &Path) -> Result<Self> {
+        Self::new_on(path, OWNER_ONLY_FILES)
+    }
+
+    fn new_on(path: &Path, owner_only_files: bool) -> Result<Self> {
         let invalid =
             |detail: &str| Failure::refused("m2m_application_secret_file_invalid", detail);
-        let path = std::path::absolute(path)
-            .map_err(|_| invalid("the client secret file path cannot be made absolute"))?;
-        if path.file_name().is_none() {
-            return Err(invalid("the client secret file path must name a file"));
+        if !owner_only_files {
+            return Err(Failure::refused(
+                "m2m_application_secret_file_unsupported",
+                "this platform cannot create a client secret file only its owner can read; create or rotate the client secret on Linux or macOS, or in the managed console's Credentials page; nothing was changed",
+            ));
         }
-        let directory = path
-            .parent()
-            .filter(|parent| parent.is_dir())
-            .ok_or_else(|| invalid("the client secret file's directory must already exist"))?
-            .to_owned();
-        Ok(Self { path, directory })
+        let absolute = std::path::absolute(path)
+            .map_err(|_| invalid("the client secret file path cannot be made absolute"))?;
+        // `file_name` ignores a final separator and `.`, and `absolute` drops
+        // a final `.`, so a path such as `dir/secret/` would pass here and fail
+        // only at the rename, after the client secret exists. The path as
+        // written must end in its file name.
+        let raw = path.as_os_str().as_encoded_bytes();
+        let last = raw
+            .rsplit(|byte| std::path::is_separator(char::from(*byte)))
+            .next()
+            .unwrap_or_default();
+        let ends_in_name = !last.is_empty() && last != b"." && last != b"..";
+        let (Some(name), Some(parent)) = (absolute.file_name(), absolute.parent()) else {
+            return Err(invalid("the client secret file path must name a file"));
+        };
+        if !ends_in_name {
+            return Err(invalid(
+                "the client secret file path must end in a file name, without a trailing separator or `.`",
+            ));
+        }
+        if !parent.is_dir() {
+            return Err(invalid(
+                "the client secret file's directory must already exist",
+            ));
+        }
+        Ok(Self {
+            path: parent.join(name),
+            directory: parent.to_owned(),
+        })
+    }
+
+    /// Where the destination resolves: through the directory's links, since
+    /// the file itself is never a link. Two outputs collide when these match.
+    fn location(&self) -> PathBuf {
+        resolved_location(&self.path)
     }
 
     /// An existing file must be a regular file, never a link the write would
@@ -471,8 +524,22 @@ impl ClientSecretFile {
     }
 
     /// Create the owner-only temporary file before any remote write, so a
-    /// directory that cannot hold it refuses before a secret exists.
+    /// directory that cannot hold it refuses before a client secret exists.
+    /// A replacement keeps the owner and group of the file it replaces: a
+    /// rename installs the new inode, so without this a rotation run by
+    /// another account would leave the workload unable to read its secret.
     fn stage(&self) -> Result<tempfile::NamedTempFile> {
+        #[cfg(unix)]
+        let owner = std::fs::symlink_metadata(&self.path).ok().map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.uid(), metadata.gid())
+        });
+        #[cfg(not(unix))]
+        let owner = None;
+        self.stage_owned(owner)
+    }
+
+    fn stage_owned(&self, owner: Option<(u32, u32)>) -> Result<tempfile::NamedTempFile> {
         let mut builder = tempfile::Builder::new();
         builder.prefix(".omnigraph-secret-");
         #[cfg(unix)]
@@ -480,12 +547,35 @@ impl ClientSecretFile {
             use std::os::unix::fs::PermissionsExt;
             builder.permissions(std::fs::Permissions::from_mode(0o600));
         }
-        builder.tempfile_in(&self.directory).map_err(|_| {
+        let staged = builder.tempfile_in(&self.directory).map_err(|_| {
             Failure::refused(
                 "m2m_application_secret_file_invalid",
                 "cannot create a file in the client secret file's directory; nothing was changed",
             )
-        })
+        })?;
+        #[cfg(unix)]
+        if let Some((uid, gid)) = owner {
+            use std::os::unix::fs::MetadataExt;
+            let current = staged.as_file().metadata().map_err(|_| {
+                Failure::refused(
+                    "m2m_application_secret_file_invalid",
+                    "the staged client secret file cannot be inspected; nothing was changed",
+                )
+            })?;
+            if (current.uid(), current.gid()) != (uid, gid)
+                && std::os::unix::fs::fchown(staged.as_file(), Some(uid), Some(gid)).is_err()
+            {
+                return Err(Failure::refused(
+                    "m2m_application_secret_file_owner",
+                    &format!(
+                        "the client secret file belongs to user {uid} and group {gid}, and this account cannot give its replacement that owner; run the command as that user or as root; nothing was changed"
+                    ),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = owner;
+        Ok(staged)
     }
 
     fn deliver(
@@ -505,6 +595,65 @@ impl ClientSecretFile {
                 .map_err(|error| error.error)?;
         }
         crate::sync_dir(&self.directory)
+    }
+
+    /// The client secret the file holds now, read as the provider reads it.
+    fn read(
+        &self,
+    ) -> std::result::Result<ClientSecret, crate::credential_sources::CredentialError> {
+        crate::credential_sources::read_client_secret(&ClientSecretSource::File {
+            file: self.path.clone(),
+        })
+        .map(ClientSecret)
+    }
+}
+
+/// A path as the file system resolves it: the whole path when it exists,
+/// otherwise its directory resolved and its name appended.
+fn resolved_location(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    if let Ok(resolved) = std::fs::canonicalize(&absolute) {
+        return resolved;
+    }
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or(absolute),
+        _ => absolute,
+    }
+}
+
+/// Which delivered client secret a file holds, without keeping its value: a
+/// salted SHA-256 of the value this request wrote. A retry compares the file
+/// against it before it proves or revokes anything.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Delivered {
+    secret_id: String,
+    salt: String,
+    digest: String,
+}
+
+impl Delivered {
+    fn of(secret_id: &str, ClientSecret(value): &ClientSecret) -> Self {
+        let salt = uuid::Uuid::new_v4().simple().to_string();
+        Self {
+            secret_id: secret_id.into(),
+            digest: Self::digest(&salt, value),
+            salt,
+        }
+    }
+
+    fn digest(salt: &str, value: &str) -> String {
+        use sha2::{Digest as _, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{salt}\0{value}").as_bytes())
+        )
+    }
+
+    fn holds(&self, ClientSecret(value): &ClientSecret) -> bool {
+        Self::digest(&self.salt, value) == self.digest
     }
 }
 
@@ -618,6 +767,92 @@ impl Journal {
         files::save(&self.directory, RECORDS, &self.records, MAX_BYTES)
             .map_err(|_| custody_failure())
     }
+}
+
+/// The directories under the operator home that hold the CLI's own state.
+const HOME_STATE: &[&str] = &["organization", "lifecycle", "auth-state"];
+
+/// The client secret file `command` would write: the create flag, or the
+/// rotated profile's `{file: PATH}`. `None` when the command writes none, or
+/// when its destination is invalid, which the command itself refuses.
+fn destination(
+    command: &Applications,
+    input: &crate::operator::InvocationConfig,
+) -> Option<ClientSecretFile> {
+    let path = match command {
+        Applications::Create {
+            client_secret_file, ..
+        } => client_secret_file.clone(),
+        Applications::Secret {
+            command:
+                Secrets::Rotate {
+                    application_profile,
+                    ..
+                },
+        } => {
+            let profile = input
+                .get(&mut std::io::sink())
+                .ok()?
+                .schema
+                .as_ref()?
+                .profiles
+                .get(application_profile)?;
+            match &profile.auth {
+                AuthProfile::OauthClientCredentials {
+                    client_secret: ClientSecretSource::File { file },
+                    ..
+                } => file.clone(),
+                _ => return None,
+            }
+        }
+        Applications::List | Applications::Delete { .. } => return None,
+    };
+    ClientSecretFile::new(&path).ok()
+}
+
+/// A refusal when the client secret file would coincide with another output
+/// of this invocation (`--stats`) or with the CLI's own files: the operator
+/// config, credential binding state, or request custody. The caller checks
+/// before anything writes, so no output can replace a delivered secret.
+pub(super) fn output_collision(
+    command: &Applications,
+    input: &crate::operator::InvocationConfig,
+    stats: Option<&Path>,
+) -> Option<Failure> {
+    let destination = destination(command, input)?.location();
+    let mut files: Vec<(&str, PathBuf)> = Vec::new();
+    if let Some(stats) = stats {
+        files.push(("the --stats file", stats.to_owned()));
+    }
+    if let Some(config) = input.config_path() {
+        files.push(("the operator configuration", config));
+    }
+    if let Ok(state) = input.auth_state_path() {
+        files.push(("the credential binding state", state));
+    }
+    let directories = input
+        .directory()
+        .into_iter()
+        .flat_map(|home| HOME_STATE.iter().map(move |name| home.join(name)));
+    let collision = files
+        .into_iter()
+        .find(|(_, path)| resolved_location(path) == destination)
+        .map(|(what, _)| what.to_owned())
+        .or_else(|| {
+            directories
+                .map(|directory| resolved_location(&directory))
+                .find(|directory| destination.starts_with(directory))
+                .map(|directory| {
+                    format!("inside the CLI's state directory {}", directory.display())
+                })
+        })?;
+    Some(Failure::refused(
+        "m2m_application_secret_file_collision",
+        &format!(
+            "the client secret file {} is {collision}, which this command also writes; choose another path; nothing was changed",
+            destination.display()
+        ),
+    ))
 }
 
 /// The invocation facts every M2M application command shares.
@@ -943,10 +1178,12 @@ async fn create(
     let Progress::Create {
         mut token_endpoint,
         mut application,
+        profile: mut profile_step,
         mut delivered,
     } = retained.unwrap_or(Progress::Create {
         token_endpoint: None,
         application: None,
+        profile: None,
         delivered: None,
     })
     else {
@@ -955,13 +1192,15 @@ async fn create(
     let save = |journal: &mut Journal,
                 token_endpoint: &Option<String>,
                 application: &Option<Application>,
-                delivered: &Option<String>| {
+                profile_step: Option<ProfileStep>,
+                delivered: &Option<Delivered>| {
         journal.save(
             args.key,
             &request,
             &Progress::Create {
                 token_endpoint: token_endpoint.clone(),
                 application: application.clone(),
+                profile: profile_step,
                 delivered: delivered.clone(),
             },
         )
@@ -975,7 +1214,13 @@ async fn create(
         validate_token_endpoint(&page.token_endpoint)?;
         token_endpoint = Some(page.token_endpoint);
     }
-    save(&mut journal, &token_endpoint, &application, &delivered)?;
+    save(
+        &mut journal,
+        &token_endpoint,
+        &application,
+        profile_step,
+        &delivered,
+    )?;
     let staged = delivered.is_none().then(|| file.stage()).transpose()?;
     let created = match application.clone() {
         Some(created) => created,
@@ -996,23 +1241,50 @@ async fn create(
                 return Err(Failure::protocol());
             }
             application = Some(created.clone());
-            save(&mut journal, &token_endpoint, &application, &delivered)?;
+            save(
+                &mut journal,
+                &token_endpoint,
+                &application,
+                profile_step,
+                &delivered,
+            )?;
             created
         }
     };
     let client = created.client_id.as_str();
     // The profile precedes the client secret, so `secret rotate
-    // --application-profile` recovers one that could not be delivered.
-    if let (Some(profile), Some(endpoint)) = (args.profile, token_endpoint.as_deref()) {
+    // --application-profile` recovers one that could not be delivered. It is
+    // written at most once: an installed profile is never rewritten, so a
+    // replay cannot overwrite a profile a later request changed.
+    if let (Some(profile), Some(endpoint)) = (args.profile, token_endpoint.as_deref())
+        && profile_step != Some(ProfileStep::Installed)
+    {
+        let replace = args.replace_profile && profile_step.is_none();
+        profile_step = Some(ProfileStep::Attempted);
+        save(
+            &mut journal,
+            &token_endpoint,
+            &application,
+            profile_step,
+            &delivered,
+        )?;
         write_profile(
             run.input,
             profile,
             application_profile(admin, endpoint, client, &file.path),
-            args.replace_profile,
+            replace,
+        )?;
+        profile_step = Some(ProfileStep::Installed);
+        save(
+            &mut journal,
+            &token_endpoint,
+            &application,
+            profile_step,
+            &delivered,
         )?;
     }
     let secret_id = match (delivered.clone(), staged) {
-        (Some(secret_id), _) => secret_id,
+        (Some(delivered), _) => delivered.secret_id,
         (None, staged) => {
             let mut body =
                 generate(run.api, organization, client, &step_key(args.key, "secret")).await?;
@@ -1043,9 +1315,15 @@ async fn create(
                     &recovery,
                 ));
             }
+            delivered = Some(Delivered::of(&summary.id, &secret));
             drop(secret);
-            delivered = Some(summary.id.clone());
-            save(&mut journal, &token_endpoint, &application, &delivered)?;
+            save(
+                &mut journal,
+                &token_endpoint,
+                &application,
+                profile_step,
+                &delivered,
+            )?;
             summary.id
         }
     };
@@ -1114,13 +1392,14 @@ fn revocation_targets(existing: &[SecretSummary], explicit: &[String]) -> Result
 }
 
 /// One client-credentials exchange through the provider's acquisition code,
-/// reading the client secret back from its file. The token is dropped unused.
+/// with the value read back from the file and checked against the delivery.
+/// The token is dropped unused.
 async fn prove(
     profile: &str,
     organization: &str,
     token_endpoint: &str,
     client: &str,
-    client_secret_file: &Path,
+    ClientSecret(value): &ClientSecret,
     scope: Option<&str>,
 ) -> std::result::Result<(), crate::credential_sources::CredentialError> {
     use crate::credential_sources::{CredentialRequest, OwnerBinding, OwnerKind, Purpose};
@@ -1133,13 +1412,11 @@ async fn prove(
     )?;
     let request =
         CredentialRequest::new(owner, Purpose::Control, token_endpoint.into(), None, None)?;
-    crate::credential_sources::acquire_client_credentials(
+    crate::credential_sources::exchange_client_credentials(
         &request,
         token_endpoint,
         client,
-        &ClientSecretSource::File {
-            file: client_secret_file.to_owned(),
-        },
+        value,
         scope,
     )
     .await
@@ -1221,7 +1498,7 @@ async fn rotate(
         token_endpoint: retained_endpoint,
         client_secret_file: retained_file,
         revoke: targets,
-        mut delivered,
+        delivered,
     } = progress
     else {
         return Err(custody_failure());
@@ -1236,8 +1513,8 @@ async fn rotate(
         ));
     }
     let client = client_id.as_str();
-    let secret_id = match delivered.clone() {
-        Some(secret_id) => secret_id,
+    let delivered = match delivered {
+        Some(delivered) => delivered,
         None => {
             let staged = file.stage()?;
             let mut body =
@@ -1269,8 +1546,8 @@ async fn rotate(
                     &recovery,
                 ));
             }
+            let delivered = Delivered::of(&summary.id, &secret);
             drop(secret);
-            delivered = Some(summary.id.clone());
             journal.save(
                 key,
                 &request,
@@ -1279,22 +1556,42 @@ async fn rotate(
                     token_endpoint: token_endpoint.clone(),
                     client_secret_file: file.path.clone(),
                     revoke: targets.clone(),
-                    delivered: delivered.clone(),
+                    delivered: Some(delivered.clone()),
                 },
             )?;
-            summary.id
+            delivered
         }
     };
-    if let Err(error) = prove(
+    let secret_id = delivered.secret_id.clone();
+    // Prove and revoke only while the file holds the client secret this
+    // request delivered. A file restored to an earlier client secret after a
+    // failed proof would otherwise prove that one and then revoke it.
+    let current = match file.read() {
+        Ok(current) if delivered.holds(&current) => current,
+        _ => {
+            let mut failure = Failure::refused(
+                "m2m_application_secret_file_changed",
+                &format!(
+                    "{} no longer holds client secret {secret_id}, which this request wrote, so nothing was proven or revoked; the new and earlier client secrets both remain active. If you restored an earlier client secret on purpose, revoke {secret_id}, which no file holds; otherwise start a new rotation with a new key",
+                    file.path.display()
+                ),
+            );
+            failure.body["client_id"] = json!(client);
+            failure.body["secret_id"] = json!(secret_id);
+            return Err(failure);
+        }
+    };
+    let proof = prove(
         profile_name,
         organization,
         token_endpoint,
         client,
-        &file.path,
+        &current,
         scope.as_deref(),
     )
-    .await
-    {
+    .await;
+    drop(current);
+    if let Err(error) = proof {
         let mut failure = Failure::new(
             "m2m_application_secret_unproven",
             &format!(

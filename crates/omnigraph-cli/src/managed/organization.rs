@@ -874,6 +874,22 @@ fn mutation_human(
     }
 }
 
+/// A refusal when an M2M application's client secret file would coincide
+/// with another file this invocation writes; see
+/// [`m2m_applications::output_collision`].
+pub(super) fn output_collision(
+    command: &OrganizationCommand,
+    input: &crate::operator::InvocationConfig,
+    stats: Option<&std::path::Path>,
+) -> Option<Failure> {
+    match command {
+        OrganizationCommand::M2mApplications { command } => {
+            m2m_applications::output_collision(command, input, stats)
+        }
+        _ => None,
+    }
+}
+
 /// What an organization command needs beyond its arguments.
 pub(super) struct Invocation<'a, 'i> {
     pub input: &'a crate::operator::InvocationConfig,

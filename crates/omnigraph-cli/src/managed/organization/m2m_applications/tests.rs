@@ -211,7 +211,7 @@ fn a_retained_request_records_progress_and_never_a_secret() {
         token_endpoint: "https://auth.example/oauth2/token".into(),
         client_secret_file: "/run/ci-secret".into(),
         revoke: vec!["sec_a".into()],
-        delivered: Some("sec_new".into()),
+        delivered: Some(Delivered::of("sec_new", &ClientSecret(SECRET.into()))),
     };
     assert!(progress.matches(&request));
     assert!(!progress.matches(&Request::Delete {
@@ -230,7 +230,9 @@ fn a_retained_request_records_progress_and_never_a_secret() {
     .unwrap();
     assert_eq!(record["request"]["operation"], "rotate");
     assert_eq!(record["progress"]["state"], "rotate");
-    assert_eq!(record["progress"]["delivered"], "sec_new");
+    assert_eq!(record["progress"]["delivered"]["secret_id"], "sec_new");
+    // The binding identifies the value without holding it.
+    assert!(!record.to_string().contains(SECRET), "{record}");
     let mut unknown = record.clone();
     unknown["progress"]["client_secret"] = json!(SECRET);
     assert!(serde_json::from_value::<Record>(unknown).is_err());
@@ -242,5 +244,95 @@ fn page_paths_encode_the_cursor_as_one_query_value() {
     assert_eq!(
         page_path(ROOT, Some("a/b+c")),
         "/v1/organization/m2m-applications?after=a%2Fb%2Bc"
+    );
+}
+
+/// Regression (review of PR 1546): a same-key rotation retry proved and
+/// revoked whatever the file held, so restoring the earlier client secret
+/// after a failed proof got that secret revoked. The delivery now binds the
+/// value it wrote, and only that value passes.
+#[test]
+fn a_delivery_binds_the_value_it_wrote_not_only_its_id() {
+    let delivered = Delivered::of("sec_new", &ClientSecret(SECRET.into()));
+    assert!(delivered.holds(&ClientSecret(SECRET.into())));
+    assert!(!delivered.holds(&ClientSecret("the-restored-earlier-secret".into())));
+    // Each delivery salts its own digest, so equal values do not correlate.
+    let again = Delivered::of("sec_new", &ClientSecret(SECRET.into()));
+    assert_ne!(delivered.digest, again.digest);
+    assert!(again.holds(&ClientSecret(SECRET.into())));
+}
+
+/// Regression (review of PR 1546): a slash- or dot-terminated destination
+/// passed validation and failed only at the rename, after the client secret
+/// had been generated.
+#[test]
+fn a_destination_must_end_in_its_file_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path().display().to_string();
+    for path in [
+        format!("{base}/secret/"),
+        format!("{base}/secret/."),
+        format!("{base}/."),
+        format!("{base}/.."),
+        format!("{base}/secret//"),
+    ] {
+        let failure = ClientSecretFile::new(Path::new(&path)).err().unwrap();
+        assert_eq!(
+            failure.body["type"], "m2m_application_secret_file_invalid",
+            "{path}"
+        );
+    }
+    let accepted = ClientSecretFile::new(&directory.path().join("secret")).unwrap();
+    assert_eq!(accepted.path, directory.path().join("secret"));
+}
+
+/// Regression (review of PR 1546): a platform without owner-only files would
+/// have written the client secret with whatever access its directory grants.
+#[test]
+fn a_platform_without_owner_only_files_refuses_to_write_a_secret() {
+    let directory = tempfile::tempdir().unwrap();
+    let failure = ClientSecretFile::new_on(&directory.path().join("secret"), false)
+        .err()
+        .unwrap();
+    assert_eq!(
+        failure.body["type"],
+        "m2m_application_secret_file_unsupported"
+    );
+    assert!(!directory.path().join("secret").exists());
+}
+
+/// Regression (review of PR 1546): replacing a file another account owns
+/// installed a new inode owned by the caller, so a rotation run by root locked
+/// the workload out of its own secret. The replacement takes the replaced
+/// file's owner and group, or refuses before any remote write.
+#[cfg(unix)]
+#[test]
+fn a_replacement_keeps_the_owner_and_group_or_refuses() {
+    use std::os::unix::fs::MetadataExt;
+    let directory = tempfile::tempdir().unwrap();
+    let file = ClientSecretFile::new(&directory.path().join("secret")).unwrap();
+    // SAFETY: geteuid has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    if root {
+        let staged = file.stage_owned(Some((65534, 65534))).unwrap();
+        let metadata = staged.as_file().metadata().unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), (65534, 65534));
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+    } else {
+        let failure = file.stage_owned(Some((0, 0))).err().unwrap();
+        assert_eq!(failure.body["type"], "m2m_application_secret_file_owner");
+        assert!(failure.body["detail"].as_str().unwrap().contains("user 0"));
+    }
+    // A file the caller already owns needs no change, and the destination's
+    // own owner is what staging adopts.
+    std::fs::write(&file.path, "earlier").unwrap();
+    let staged = file.stage().unwrap();
+    let (destination, replacement) = (
+        std::fs::metadata(&file.path).unwrap(),
+        staged.as_file().metadata().unwrap(),
+    );
+    assert_eq!(
+        (replacement.uid(), replacement.gid()),
+        (destination.uid(), destination.gid())
     );
 }

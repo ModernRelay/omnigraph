@@ -467,6 +467,12 @@ async fn run(
     stdout_is_terminal: bool,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
+    // Before the statistics recorder exists: a refused client secret
+    // destination must not be written by any output, the recorder included.
+    let operator = operator.with_path(cli.operator_config.as_deref(), &std::env::current_dir()?);
+    if let Some((failure, json)) = managed::output_collision(&cli, &operator) {
+        return Ok(Completion::exit(failure.emit(json, stdout, stderr)?));
+    }
     let Some(stats) = cli.stats.clone() else {
         return run_resolved(
             cli,
