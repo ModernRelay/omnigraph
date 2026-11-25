@@ -13,7 +13,7 @@ use object_store::path::Path;
 use omnigraph::object_store_seam::{ReadThroughMountGuard, mount_read_through};
 use omnigraph::storage::ObjectStorageAdapter;
 use omnigraph_storage::FrozenDirectory;
-use omnigraph_storage::simulated_s3::{BucketNames, SimulatedBucket};
+use omnigraph_storage::simulated_bucket::{BucketNames, Provider, SimulatedBucket};
 use url::Url;
 
 use crate::environment::{UniverseEnvironment, UniverseProcess};
@@ -131,8 +131,8 @@ impl UniverseEnvironment for MemoryEnvironment {
     async fn setup(&self) -> Result<MemoryStorage, String> {
         let url = Url::parse(&self.root)
             .map_err(|error| format!("invalid memory environment root: {error}"))?;
-        let simulated = url.scheme() == "s3";
-        if !(simulated || url.scheme() == "shared-memory")
+        let simulated = Provider::for_scheme(url.scheme());
+        if !(simulated.is_some() || url.scheme() == "shared-memory")
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
@@ -140,17 +140,20 @@ impl UniverseEnvironment for MemoryEnvironment {
             || url.fragment().is_some()
         {
             return Err(format!(
-                "memory environment requires a shared-memory root, or an s3 root for a simulated bucket, with an authority and no credentials, query or fragment: {}",
+                "memory environment requires a shared-memory root, or an s3 or gs root for a simulated bucket, with an authority and no credentials, query or fragment: {}",
                 self.root
             ));
         }
         let lease = AuthorityLease::acquire(url.authority())?;
         let authority = url.authority().to_string();
-        if simulated {
-            let bucket = SimulatedBucket::new();
+        if let Some(provider) = simulated {
+            let bucket = SimulatedBucket::new(provider);
             let names = bucket.answer_to(&[authority.as_str()])?;
-            let adapter = ObjectStorageAdapter::s3_from_root_uri(&self.root)
-                .map_err(|error| format!("memory environment storage setup failed: {error}"))?;
+            let adapter = match provider {
+                Provider::S3 => ObjectStorageAdapter::s3_from_root_uri(&self.root),
+                Provider::Gcs => ObjectStorageAdapter::gcs_from_root_uri(&self.root),
+            }
+            .map_err(|error| format!("memory environment storage setup failed: {error}"))?;
             return Ok(MemoryStorage {
                 root: self.root.clone(),
                 adapter: Arc::new(adapter),
@@ -298,11 +301,17 @@ mod tests {
             .unwrap();
     }
 
-    /// An `s3://` root: one simulated bucket serves the adapter and Lance, and
-    /// its name stops answering at teardown.
+    /// An `s3://` or `gs://` root: one simulated bucket serves the adapter and
+    /// Lance, and its name stops answering at teardown.
     #[tokio::test]
     async fn a_simulated_bucket_root_serves_both_realms_until_teardown() {
-        let root = "s3://memory-env-simulated/graph";
+        for provider in [Provider::S3, Provider::Gcs] {
+            simulated_bucket_root_serves_both_realms(provider).await;
+        }
+    }
+
+    async fn simulated_bucket_root_serves_both_realms(provider: Provider) {
+        let root = &format!("{}://memory-env-simulated/graph", provider.scheme());
         let environment = MemoryEnvironment::new(root, 1, UniverseProcess::Shared);
         let mut resources = environment.setup().await.unwrap();
         let uri = format!("{root}/control");
@@ -318,7 +327,9 @@ mod tests {
         assert!(resources.mount_prepared("file:///").await.is_err());
         environment.teardown(&mut resources).await.unwrap();
         drop(resources);
-        assert!(omnigraph_storage::simulated_s3::bucket("memory-env-simulated").is_none());
+        assert!(
+            omnigraph_storage::simulated_bucket::bucket(provider, "memory-env-simulated").is_none()
+        );
 
         let mut again = environment.setup().await.unwrap();
         assert!(again.lance.list(None).try_next().await.unwrap().is_none());

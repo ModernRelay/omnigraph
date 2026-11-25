@@ -44,6 +44,21 @@ pub enum Storage {
     S3Compatible,
     #[serde(rename = "azure-blob-storage")]
     AzureBlob,
+    #[serde(rename = "google-cloud-storage")]
+    GoogleCloudStorage,
+}
+
+impl Storage {
+    /// The name a case declares the storage by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LocalFilesystem => "local-filesystem",
+            Self::InMemoryObjectStore => "in-memory-object-store",
+            Self::S3Compatible => "s3-compatible",
+            Self::AzureBlob => "azure-blob-storage",
+            Self::GoogleCloudStorage => "google-cloud-storage",
+        }
+    }
 }
 
 impl Environment {
@@ -54,10 +69,13 @@ impl Environment {
         let storage = match self.execution {
             Execution::Engine { storage } => storage,
             Execution::Dst {
-                storage: Storage::S3Compatible,
+                storage: storage @ (Storage::S3Compatible | Storage::GoogleCloudStorage),
                 ..
             } => {
-                return Err("unsupported_environment: under omnigraph-engine-dst --store is read through below in-memory-object-store; s3-compatible is a simulated bucket that starts empty".into());
+                return Err(format!(
+                    "unsupported_environment: under omnigraph-engine-dst --store is read through below in-memory-object-store; {} is a simulated bucket that starts empty",
+                    storage.name()
+                ));
             }
             Execution::Dst { .. } => {
                 let root = uri.strip_prefix("file://").ok_or(
@@ -79,11 +97,13 @@ impl Environment {
                 "unsupported_environment: --store cannot execute seams or scripted concurrent blocks on the direct engine; select or declare omnigraph-engine-dst (--target omnigraph-engine-dst)".into(),
             );
         }
-        if !["file://", "s3://", "az://"]
+        if !["file://", "s3://", "az://", "gs://"]
             .iter()
             .any(|prefix| uri.starts_with(prefix))
         {
-            return Err("invalid_case: --store requires a file://, s3:// or az:// URI".into());
+            return Err(
+                "invalid_case: --store requires a file://, s3://, az:// or gs:// URI".into(),
+            );
         }
         let normalized = omnigraph::storage::normalize_root_uri(uri)
             .map_err(|e| format!("invalid_case: --store: {e}"))?;
@@ -93,6 +113,7 @@ impl Environment {
             omnigraph::storage::StorageKind::Local => Storage::LocalFilesystem,
             omnigraph::storage::StorageKind::S3 => Storage::S3Compatible,
             omnigraph::storage::StorageKind::Azure => Storage::AzureBlob,
+            omnigraph::storage::StorageKind::Gcs => Storage::GoogleCloudStorage,
         };
         if storage != actual {
             return Err(format!(
@@ -109,14 +130,8 @@ impl Environment {
             Execution::Server { storage } => ("omnigraph-server", storage),
             Execution::ServerDst { storage, .. } => ("omnigraph-server-dst", storage),
         };
-        let actual_storage = match actual_storage {
-            Storage::LocalFilesystem => "local-filesystem",
-            Storage::InMemoryObjectStore => "in-memory-object-store",
-            Storage::S3Compatible => "s3-compatible",
-            Storage::AzureBlob => "azure-blob-storage",
-        };
         target.is_none_or(|value| value == actual_target)
-            && storage.is_none_or(|value| value == actual_storage)
+            && storage.is_none_or(|value| value == actual_storage.name())
     }
 
     pub fn seeds(&self) -> Vec<Option<u64>> {
@@ -160,7 +175,8 @@ impl Environment {
                 storage: Storage::LocalFilesystem,
             } if !needs_dst => Ok(()),
             Execution::Dst {
-                storage: Storage::InMemoryObjectStore | Storage::S3Compatible,
+                storage:
+                    Storage::InMemoryObjectStore | Storage::S3Compatible | Storage::GoogleCloudStorage,
                 ..
             } => {
                 if cfg!(tokio_unstable) {
@@ -170,7 +186,7 @@ impl Environment {
                 }
             }
             _ => Err(format!(
-                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams or scripted concurrent blocks, omnigraph-engine-dst/in-memory-object-store and omnigraph-engine-dst/s3-compatible (a simulated bucket)",
+                "unsupported_environment: {} requests an unavailable combination; implemented combinations are omnigraph-engine/local-filesystem without seams or scripted concurrent blocks, omnigraph-engine-dst/in-memory-object-store, and omnigraph-engine-dst/s3-compatible and omnigraph-engine-dst/google-cloud-storage (simulated buckets)",
                 self
             )),
         }
@@ -412,6 +428,7 @@ mod tests {
             (Storage::LocalFilesystem, "file:///tmp/graph"),
             (Storage::S3Compatible, "s3://bucket/graph"),
             (Storage::AzureBlob, "az://container/graph"),
+            (Storage::GoogleCloudStorage, "gs://bucket/graph"),
         ] {
             let env = Environment {
                 execution: Execution::Engine { storage },
@@ -423,6 +440,7 @@ mod tests {
                 Storage::LocalFilesystem,
                 Storage::S3Compatible,
                 Storage::AzureBlob,
+                Storage::GoogleCloudStorage,
                 Storage::InMemoryObjectStore,
             ] {
                 if storage != other {

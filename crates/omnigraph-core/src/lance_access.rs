@@ -162,7 +162,8 @@ pub mod object_store_seam {
         PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
     };
     use omnigraph_seams::{Behavior, Global, Op, Seam};
-    use omnigraph_storage::{FrozenDirectory, ReadThroughStore, simulated_s3};
+    use omnigraph_storage::simulated_bucket::{self, Provider};
+    use omnigraph_storage::{FrozenDirectory, ReadThroughStore};
     use url::Url;
 
     /// A frozen directory and the key prefix it is mounted at.
@@ -229,9 +230,10 @@ pub mod object_store_seam {
     /// wrapped store, so that lane sees manifest and listing traffic only.
     const HOOKED_SCHEMES: [&str; 2] = ["shared-memory", "file"];
 
-    /// Hooks the schemes above and, where Lance has an `s3` provider, `s3`:
-    /// the store of a simulated bucket ([`simulated_s3`]) routes through the
-    /// seam, and the store of any other bucket is Lance's, untouched.
+    /// Hooks the schemes above and, for each provider a simulated bucket can
+    /// stand for, its scheme where Lance has a provider for it (`s3`, `gs`):
+    /// the store of a simulated bucket ([`simulated_bucket`]) routes through
+    /// the seam, and the store of any other bucket is Lance's, untouched.
     ///
     /// # Panics
     ///
@@ -244,8 +246,10 @@ pub mod object_store_seam {
                 .unwrap_or_else(|| panic!("Lance registry has no `{scheme}` provider to hook"));
             registry.insert(scheme, Arc::new(HookedProvider { inner }));
         }
-        if let Some(inner) = registry.get_provider("s3") {
-            registry.insert("s3", Arc::new(HookedProvider { inner }));
+        for provider in [Provider::S3, Provider::Gcs] {
+            if let Some(inner) = registry.get_provider(provider.scheme()) {
+                registry.insert(provider.scheme(), Arc::new(HookedProvider { inner }));
+            }
         }
     }
 
@@ -263,9 +267,10 @@ pub mod object_store_seam {
             base_path: Url,
             params: &ObjectStoreParams,
         ) -> lance_core::Result<LanceObjectStore> {
-            if base_path.scheme() == "s3" {
+            if let Some(provider) = Provider::for_scheme(base_path.scheme()) {
                 let simulated = base_path.host_str().and_then(|name| {
-                    simulated_s3::bucket(name).map(|bucket| (name.to_owned(), bucket))
+                    simulated_bucket::bucket(provider, name)
+                        .map(|bucket| ((provider, name.to_owned()), bucket))
                 });
                 let Some((name, bucket)) = simulated else {
                     return self.inner.new_store(base_path, params).await;
@@ -316,19 +321,24 @@ pub mod object_store_seam {
 
     /// Forwards every call through the seam (module doc); `authority` is the
     /// `shared-memory` authority a read-through mount is looked up by, and
-    /// `simulated` the bucket name a simulated bucket is looked up by.
+    /// `simulated` the provider and bucket name a simulated bucket is looked
+    /// up by.
     #[derive(Debug)]
     struct HookedStore {
         base: Arc<dyn ObjectStore>,
         authority: Option<String>,
-        simulated: Option<String>,
+        simulated: Option<(Provider, String)>,
     }
 
     impl HookedStore {
         /// The bucket that answers to the store's name now, else the one it was
         /// built over: Lance caches the store, and a later run reuses the name.
         fn named_base(&self) -> Arc<dyn ObjectStore> {
-            match self.simulated.as_deref().and_then(simulated_s3::bucket) {
+            let named = self
+                .simulated
+                .as_ref()
+                .and_then(|(provider, name)| simulated_bucket::bucket(*provider, name));
+            match named {
                 Some(bucket) => bucket,
                 None => Arc::clone(&self.base),
             }

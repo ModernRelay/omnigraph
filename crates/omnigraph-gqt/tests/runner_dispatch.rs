@@ -627,7 +627,7 @@ fn external_store_admission_refuses_before_workers() {
         (
             text.clone(),
             Some("memory://unsupported"),
-            "--store requires a file://, s3:// or az:// URI",
+            "--store requires a file://, s3://, az:// or gs:// URI",
         ),
     ] {
         std::fs::write(&path, text).unwrap();
@@ -1872,7 +1872,9 @@ fn clone_cases_run_against_a_bucket() {
 /// A `.gqt` case cannot give its bucket a second name, nor put a folder marker in it.
 #[test]
 fn a_clone_runs_on_a_simulated_bucket() {
-    let bucket = omnigraph_storage::simulated_s3::SimulatedBucket::new();
+    let bucket = omnigraph_storage::simulated_bucket::SimulatedBucket::new(
+        omnigraph_storage::simulated_bucket::Provider::S3,
+    );
     let _names = bucket
         .answer_to(&["gqt-simulated-clone", "gqt-simulated-clone-again"])
         .unwrap();

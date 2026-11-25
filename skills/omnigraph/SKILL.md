@@ -1,6 +1,6 @@
 ---
 name: omnigraph
-description: Operate Omnigraph graphs and deployments. Use for first-time setup and onboarding, `.pg` schemas, `.gq` queries, Omnigraph CLI commands, `file://`/`s3://`/`az://` graph URIs, `cluster.yaml`, operator config, bearer-authenticated servers, graph-backed knowledge or memory, Blob values, embeddings, branches, commits, and change feeds. Apply especially before schema changes, bulk loads, and retries after uncertain remote outcomes.
+description: Operate Omnigraph graphs and deployments. Use for first-time setup and onboarding, `.pg` schemas, `.gq` queries, Omnigraph CLI commands, `file://`/`s3://`/`az://`/`gs://` graph URIs, `cluster.yaml`, operator config, bearer-authenticated servers, graph-backed knowledge or memory, Blob values, embeddings, branches, commits, and change feeds. Apply especially before schema changes, bulk loads, and retries after uncertain remote outcomes.
 license: MIT (see LICENSE at repo root)
 compatibility: Covers the current Omnigraph CLI and server, using HTTP contract 0.14. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
@@ -301,6 +301,7 @@ A graph's bytes live in one of three supported URI families:
 - **Local filesystem** — a path or `file://` URI. The target selects the graph or cluster root explicitly; a source directory does not select storage. Local development needs no object store.
 - **S3-compatible object storage** — AWS, Railway, Tigris, etc. (`s3://bucket/prefix`). Authenticate with the standard `AWS_*` environment contract.
 - **Azure Blob storage preview** — `az://container/prefix`. Reads and Azurite qualification are available, but Azure is not production-supported; every write or maintenance process must be launched through the root-scoped `omnigraph-azure-admission` wrapper.
+- **Google Cloud Storage preview** — `gs://bucket/prefix`, through the embedded Rust API only: cluster roots, CLI targets and servers refuse it. Configure with `GOOGLE_*` variables only; an unprefixed Google option name such as `BEARER_TOKEN` or `SERVICE_ACCOUNT` is refused.
 
 Direct CLI targets are local, with one exception: a stopped S3 cluster accepts
 an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger`
