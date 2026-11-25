@@ -3606,12 +3606,12 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     // its certificate names that profile's fingerprint.
     assert_eq!(search("body", "run").await, ["d1"]);
     assert_eq!(search("body", "cafe").await, ["d2"]);
-    let (edition_2, edition_2_segments) = segments("body").await;
-    assert_eq!(edition_2_segments.len(), 1);
+    let (gq_2, gq_2_segments) = segments("body").await;
+    assert_eq!(gq_2_segments.len(), 1);
     let default_english = fingerprint("body").expect("every full-text field has a fingerprint");
     qualify(
-        &edition_2,
-        &edition_2_segments[0],
+        &gq_2,
+        &gq_2_segments[0],
         &default_english,
         AnalyzerProfile::EnglishV1,
     )
@@ -3636,7 +3636,7 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     let standard = fingerprint("body").expect("a declared profile has a fingerprint");
     let (declared, declared_segments) = segments("body").await;
     assert_eq!(declared_segments.len(), 1);
-    assert_ne!(declared_segments[0].uuid, edition_2_segments[0].uuid);
+    assert_ne!(declared_segments[0].uuid, gq_2_segments[0].uuid);
     assert_eq!(
         declared_segments[0]
             .fragment_bitmap
@@ -3657,8 +3657,8 @@ async fn full_text_analyzer_change_is_applied_in_place_with_its_profile() {
     // the new one the old.
     assert!(rebuild_required(
         qualify(
-            &edition_2,
-            &edition_2_segments[0],
+            &gq_2,
+            &gq_2_segments[0],
             &standard,
             AnalyzerProfile::StandardV1
         )

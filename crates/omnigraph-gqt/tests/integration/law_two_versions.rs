@@ -1,4 +1,4 @@
-//! Edition 2 and edition 3 answer the reads both can express alike.
+//! GQ 2 and GQ 3 answer the reads both can express alike.
 //!
 //! The generator draws a read as a tree over a generated schema (p21's
 //! `GenSchema` and `GenGraph`): node bindings, triples in their edges'
@@ -7,24 +7,24 @@
 //! list), a negated pattern, return items with and without aliases, a
 //! count grouped by a key, and `order` over every returned column with an
 //! optional `limit`. Two test-only printers write the same tree as
-//! edition-2 text (the clause list inside `match`, `not { }` with the
-//! fresh name only in its triple) and as edition-3 text (`match { … }`,
+//! GQ 2 text (the clause list inside `match`, `not { }` with the
+//! fresh name only in its triple) and as GQ 3 text (`match { … }`,
 //! `where … and …`, `not exists { $z: T, … }`). Nothing here reads user
 //! text: the printers start from generated trees, and they exist only in
 //! this test.
 //!
-//! The law: the edition-2 binary (`OMNIGRAPH_EDITION_2_BIN`, the `omnigraph`
-//! CLI of the pinned merge base, `EDITION_2_SOURCE_COMMIT` in `ci.yml`) and
+//! The law: the GQ 2 binary (`OMNIGRAPH_GQ_2_BIN`, the `omnigraph`
+//! CLI of the pinned merge base, `GQ_2_SOURCE_COMMIT` in `ci.yml`) and
 //! this tree's engine return equal rows under the read's order rule, or
 //! both refuse. The tree avoids the shapes whose answers the GQ 3 RFC's
 //! Compatibility section changes on purpose (a `limit` without a total
 //! `order`, an integer compared with a float literal, full-text and vector
 //! search, letter case), so every difference is a defect; the RFC's
-//! sanctioned differences are the cross-edition table's
-//! (`crates/omnigraph-gqt/cross-edition.tsv`).
+//! sanctioned differences are the cross-version table's
+//! (`crates/omnigraph-gqt/cross-version.tsv`).
 //!
 //! Without the binary the law prints a skip line; with
-//! `OMNIGRAPH_REQUIRE_EDITION_2=1`, as the `Cross-Edition Comparison` job
+//! `OMNIGRAPH_REQUIRE_GQ_2=1`, as the `Cross-Version Comparison` job
 //! sets, a missing binary fails it.
 
 use std::fmt::Write as _;
@@ -128,8 +128,8 @@ impl Read {
 // ---------------------------------------------------------------------------
 // Generation over a schema and the graph it will run on.
 
-/// A JSON scalar as a literal both editions read: numbers, `true`/`false`,
-/// and a JSON string, whose escapes GQ reads alike. Edition 2 has no
+/// A JSON scalar as a literal both versions read: numbers, `true`/`false`,
+/// and a JSON string, whose escapes GQ reads alike. GQ 2 has no
 /// exponent in a number, so `1.5e3` is written `1500.0`, and a number that
 /// needs one has no literal there.
 fn literal(json: &str) -> Option<String> {
@@ -184,7 +184,7 @@ fn generate(c: &mut Choices, schema: &GenSchema, graph: &GenGraph) -> Read {
             continue;
         }
         let p = props[c.below(props.len())];
-        // Edition 2 has no negative literal (its grammar has no unary
+        // GQ 2 has no negative literal (its grammar has no unary
         // minus), so a negative value stays out of its subset.
         let values: Vec<String> = graph.nodes[b.ty]
             .iter()
@@ -270,7 +270,7 @@ fn generate(c: &mut Choices, schema: &GenSchema, graph: &GenGraph) -> Read {
                 .collect();
             let prop = props[c.below(props.len())].clone();
             let alias = c.flag(40).then(|| format!("c{i}"));
-            // Two items with one column name are refused by both editions.
+            // Two items with one column name are refused by both versions.
             let name = alias
                 .clone()
                 .unwrap_or_else(|| format!("{}.{prop}", &b.var[1..]));
@@ -379,9 +379,9 @@ fn tail(read: &Read) -> String {
     s
 }
 
-/// Edition 2: one clause per line inside `match`, `not { }` naming the fresh
+/// GQ 2: one clause per line inside `match`, `not { }` naming the fresh
 /// node only in its triple.
-fn edition_2(schema: &GenSchema, read: &Read) -> String {
+fn gq_2(schema: &GenSchema, read: &Read) -> String {
     let mut clauses: Vec<String> = read
         .bindings
         .iter()
@@ -404,9 +404,9 @@ fn edition_2(schema: &GenSchema, read: &Read) -> String {
     )
 }
 
-/// Edition 3: the pattern in `match`, the filters and the negated pattern
+/// GQ 3: the pattern in `match`, the filters and the negated pattern
 /// in `where`, joined by `and` in written order.
-fn edition_3(schema: &GenSchema, read: &Read) -> String {
+fn gq_3(schema: &GenSchema, read: &Read) -> String {
     let mut elements: Vec<String> = read
         .bindings
         .iter()
@@ -434,26 +434,26 @@ fn edition_3(schema: &GenSchema, read: &Read) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Running both editions.
+// Running both versions.
 
-fn edition_2_binary() -> Option<PathBuf> {
-    match std::env::var_os("OMNIGRAPH_EDITION_2_BIN") {
+fn gq_2_binary() -> Option<PathBuf> {
+    match std::env::var_os("OMNIGRAPH_GQ_2_BIN") {
         Some(path) => Some(PathBuf::from(path)),
-        None if std::env::var("OMNIGRAPH_REQUIRE_EDITION_2").as_deref() == Ok("1") => {
-            panic!("OMNIGRAPH_EDITION_2_BIN is unset and OMNIGRAPH_REQUIRE_EDITION_2=1")
+        None if std::env::var("OMNIGRAPH_REQUIRE_GQ_2").as_deref() == Ok("1") => {
+            panic!("OMNIGRAPH_GQ_2_BIN is unset and OMNIGRAPH_REQUIRE_GQ_2=1")
         }
         None => None,
     }
 }
 
-/// The edition-2 binary over one graph: `init` and `load` once, then a
+/// The GQ 2 binary over one graph: `init` and `load` once, then a
 /// query per call.
-struct Edition2 {
+struct Gq2 {
     binary: PathBuf,
     dir: tempfile::TempDir,
 }
 
-impl Edition2 {
+impl Gq2 {
     fn command(&self) -> Command {
         let mut command = Command::new(&self.binary);
         command
@@ -474,10 +474,10 @@ impl Edition2 {
             .command()
             .args(["init", "--schema", "s.pg", "./g"])
             .output()
-            .map_err(|e| format!("could not run the edition-2 binary: {e}"))?;
+            .map_err(|e| format!("could not run the GQ 2 binary: {e}"))?;
         if !init.status.success() {
             return Err(format!(
-                "edition-2 init: {}",
+                "GQ 2 init: {}",
                 String::from_utf8_lossy(&init.stderr)
             ));
         }
@@ -498,7 +498,7 @@ impl Edition2 {
                 .map_err(|e| e.to_string())?;
             if !load.status.success() {
                 return Err(format!(
-                    "edition-2 load: {}",
+                    "GQ 2 load: {}",
                     String::from_utf8_lossy(&load.stdout)
                 ));
             }
@@ -514,21 +514,18 @@ impl Edition2 {
             .output()
             .map_err(|e| e.to_string())?;
         let doc: Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| format!("undecodable edition-2 output: {e}"))?;
+            .map_err(|e| format!("undecodable GQ 2 output: {e}"))?;
         if let Some(error) = doc.get("error") {
             return Err(error.as_str().unwrap_or_default().to_string());
         }
         match doc.get("rows") {
             Some(Value::Array(rows)) => Ok(rows.clone()),
-            other => Err(format!("edition-2 output without rows: {other:?}")),
+            other => Err(format!("GQ 2 output without rows: {other:?}")),
         }
     }
 }
 
-async fn edition_3_session(
-    schema: &str,
-    jsonl: &str,
-) -> Result<(tempfile::TempDir, Session), String> {
+async fn gq_3_session(schema: &str, jsonl: &str) -> Result<(tempfile::TempDir, Session), String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
         .await
@@ -551,8 +548,8 @@ fn canonical_rows(rows: &[Value], ordered: bool) -> Vec<String> {
     out
 }
 
-/// A row with its object keys sorted and its numbers as `f64` (edition 2
-/// and edition 3 may render one value `1` and `1.0`).
+/// A row with its object keys sorted and its numbers as `f64` (GQ 2
+/// and GQ 3 may render one value `1` and `1.0`).
 fn canonical(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
@@ -570,8 +567,8 @@ fn canonical(v: &Value) -> Value {
     }
 }
 
-/// The schema both editions accept: edition 2 indexes no list property.
-fn edition_2_schema(mut schema: GenSchema) -> GenSchema {
+/// The schema both versions accept: GQ 2 indexes no list property.
+fn gq_2_schema(mut schema: GenSchema) -> GenSchema {
     for node in &mut schema.nodes {
         for p in &mut node.props {
             if matches!(p.ty, PropTy::ListStr) {
@@ -604,33 +601,33 @@ fn without_start_node(read: &Read) -> Option<Read> {
 }
 
 fn run_law(cases: u32) {
-    let Some(binary) = edition_2_binary() else {
-        eprintln!("skipping the two-edition law: OMNIGRAPH_EDITION_2_BIN is unset");
+    let Some(binary) = gq_2_binary() else {
+        eprintln!("skipping the two-version law: OMNIGRAPH_GQ_2_BIN is unset");
         return;
     };
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let mut runner = law_runner(cases, "tests/regressions/law_two_editions.txt");
+    let mut runner = law_runner(cases, "tests/regressions/law_two_versions.txt");
     let options = SchemaOptions {
         search: false,
         ..SchemaOptions::default()
     };
     let result = runner.run(&(choices(64), choices(1024), choices(64)), |(s, g, q)| {
-        let schema = edition_2_schema(GenSchema::generate(&mut Choices::new(&s), options));
+        let schema = gq_2_schema(GenSchema::generate(&mut Choices::new(&s), options));
         let graph = GenGraph::generate(&mut Choices::new(&g), &schema, 5, 8);
         let read = generate(&mut Choices::new(&q), &schema, &graph);
-        let (old, new) = (edition_2(&schema, &read), edition_3(&schema, &read));
+        let (old, new) = (gq_2(&schema, &read), gq_3(&schema, &read));
         let jsonl = graph.jsonl(&schema);
         let describe = || {
             format!(
-                "--- schema\n{}\n--- seed\n{jsonl}\n--- edition 2\n{old}\n--- edition 3\n{new}",
+                "--- schema\n{}\n--- seed\n{jsonl}\n--- GQ 2\n{old}\n--- GQ 3\n{new}",
                 schema.text()
             )
         };
-        let e2 = Edition2::new(&binary, &schema.text(), &jsonl)
+        let gq2 = Gq2::new(&binary, &schema.text(), &jsonl)
             .map_err(|e| TestCaseError::fail(format!("{e}\n{}", describe())))?;
-        let a = e2.query(&old);
+        let a = gq2.query(&old);
         let b = rt.block_on(async {
-            let (_dir, session) = edition_3_session(&schema.text(), &jsonl).await?;
+            let (_dir, session) = gq_3_session(&schema.text(), &jsonl).await?;
             session
                 .query(ReadTarget::branch("main"), &new, "q", &ParamMap::new())
                 .await
@@ -651,14 +648,14 @@ fn run_law(cases: u32) {
                 if canonical_rows(x, ordered) == canonical_rows(y, ordered) {
                     Ok(())
                 } else if let Some(without) = without_start_node(&read) {
-                    // The difference the cross-edition table cites as
+                    // The difference the cross-version table cites as
                     // `results.hop-range-self-loop`: a hop range no longer
                     // returns its start node through a self-loop. With
                     // the start node excluded, the rows must agree.
-                    let (old, new) = (edition_2(&schema, &without), edition_3(&schema, &without));
-                    let a = e2.query(&old);
+                    let (old, new) = (gq_2(&schema, &without), gq_3(&schema, &without));
+                    let a = gq2.query(&old);
                     let b = rt.block_on(async {
-                        let (_dir, session) = edition_3_session(&schema.text(), &jsonl).await?;
+                        let (_dir, session) = gq_3_session(&schema.text(), &jsonl).await?;
                         session
                             .query(ReadTarget::branch("main"), &new, "q", &ParamMap::new())
                             .await
@@ -682,12 +679,12 @@ fn run_law(cases: u32) {
                 BOTH_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            (Err(_), Ok(_)) => Err("edition 2 refused, edition 3 answered"),
-            (Ok(_), Err(_)) => Err("edition 2 answered, edition 3 refused"),
+            (Err(_), Ok(_)) => Err("GQ 2 refused, GQ 3 answered"),
+            (Ok(_), Err(_)) => Err("GQ 2 answered, GQ 3 refused"),
         };
         verdict.map_err(|why| {
             TestCaseError::fail(format!(
-                "{why}\n{}\n--- edition 2 answer\n{a:?}\n--- edition 3 answer\n{b:?}",
+                "{why}\n{}\n--- GQ 2 answer\n{a:?}\n--- GQ 3 answer\n{b:?}",
                 describe()
             ))
         })
@@ -714,21 +711,21 @@ fn run_law(cases: u32) {
 }
 
 #[test]
-fn edition_2_and_edition_3_answer_generated_reads_alike() {
+fn gq_2_and_gq_3_answer_generated_reads_alike() {
     run_law(CASES);
 }
 
 #[test]
 #[ignore = "nightly: 1,500 generated reads; the gate runs 48"]
-fn edition_2_and_edition_3_answer_generated_reads_alike_at_nightly_breadth() {
+fn gq_2_and_gq_3_answer_generated_reads_alike_at_nightly_breadth() {
     run_law(NIGHTLY);
 }
 
-/// The two printers write one tree: the edition-3 text type-checks, and
+/// The two printers write one tree: the GQ 3 text type-checks, and
 /// both name the same bindings, triples and return items.
 #[test]
-fn the_printers_write_one_tree_in_two_editions() {
-    let mut runner = law_runner(256, "tests/regressions/law_two_editions_printers.txt");
+fn the_printers_write_one_tree_in_two_versions() {
+    let mut runner = law_runner(256, "tests/regressions/law_two_versions_printers.txt");
     let options = SchemaOptions {
         search: false,
         ..SchemaOptions::default()
@@ -738,7 +735,7 @@ fn the_printers_write_one_tree_in_two_editions() {
             let schema = GenSchema::generate(&mut Choices::new(&s), options);
             let graph = GenGraph::generate(&mut Choices::new(&g), &schema, 5, 8);
             let read = generate(&mut Choices::new(&q), &schema, &graph);
-            let new = edition_3(&schema, &read);
+            let new = gq_3(&schema, &read);
             let catalog = omnigraph_compiler::catalog::build_catalog(
                 &omnigraph_compiler::schema::parser::parse_schema(&schema.text()).unwrap(),
             )

@@ -416,7 +416,7 @@ Data, vectors and blobs are preserved; commit history and branches are not. See
 
 The `storage_upgrade_compatibility` CI job (Storage Upgrade Compatibility)
 provisions the genuine predecessors `stamp-13`, `lance-11`, `release-0.10.0`,
-`release-0.11.0` and `edition-2` of the
+`release-0.11.0` and `gq-2` of the
 [predecessor registry](testing.md#predecessor-binaries), and requires the
 `storage_upgrade` cases of `crossversion_upgrade.rs`, the engine
 `db::upgrade::tests`, Lance version qualification and protocol guards on

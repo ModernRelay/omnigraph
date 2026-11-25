@@ -260,7 +260,7 @@ pub(crate) struct LiteralMismatch {
 /// outside the declared set, a number against a property that is not
 /// numeric (a String, an enum, a Bool, a Date or a DateTime), an integer
 /// outside an integer property's range, and a `Date` or `DateTime` that
-/// does not parse. Edition 2 checked these inside property braces; without
+/// does not parse. GQ 2 checked these inside property braces; without
 /// the check a misspelled enum value returns no rows. A float against an
 /// integer property is not refused: the comparison casts it (section 2's
 /// numeric comparison), and so is a float against an `F32`, compared as

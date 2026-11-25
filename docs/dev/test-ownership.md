@@ -219,7 +219,7 @@ forms. Each law lives with the owner of its boundary:
 | 4. Every single edit of a generated plan's replay envelope is refused or replays the run | engine `integration/plan_replay.rs` | 24 plans, 40 edits each | 300 plans, 100 edits |
 | 5. The refusals: one table keyed by the code catalog (`codes::ALL`), 242 compile rows over ten schemas and nine run rows. Every code has a row that raises it first, or a stated reason no query does (`P002` and `P003`, whose traversal allowance the settings layer always supplies in range, the result typer's `T51`, and the planner's assertion `P006`); each row pins its message's start and its printed fix exactly, and one pass of its printed edits repairs it to its intended text, compared as parse trees; the run rows (`T89`, `P004`, `E1` to `E6`) are refused by the engine with their code, and a read the same way by the reference interpreter; every row and every other corpus step the compiler refuses reaches a fixed point within three passes of machine-applicable fixes; no cut or one-character deletion of a parse refusal's source panics the parser. Over generated reads, `parse(apply_fixes(misprint(t))) == parse(t)` for each misprint of `arbitrary::misprint` (`==`, `&&`, `x not in`, an arrow traversal, a missing comma, a filter inside `match`, `mutation` for `query`): the misprint is refused with its code and one pass of its fixes writes the read back | `omnigraph-gqt` `integration/law_refusals.rs` (rows in `law_refusals/rows.rs`) | every row; 2,000 misprinted reads (about 5 s) | 50,000 misprinted reads (about 2 minutes) |
 | Every refusal resting on a claim about every conforming graph holds it: with the refusal let through by the checker's test-only switch (`query::check::soundness`), the reference interpreter finds no row (a comparison with `null` in `where`, a literal outside its property's domain under `=` and `in`, a reversed triple or selection, a hop range past one hop between two types, two references of two types under `=`) or a null column on every row (a comparison with `null` in `return`); a selection with one member along the written order returns rows on some generated graph | `omnigraph-gqt` `integration/law_refusal_soundness.rs` | 1,000 schemas and graphs | 50,000 |
-| Edition 2 and edition 3 answer alike the generated reads both express: a test-only tree of bindings, triples in declared direction, filters, a negated pattern, return items, a grouped count and a total `order` with `limit`, printed once as edition-2 text for the pinned merge base's `omnigraph` CLI (`OMNIGRAPH_EDITION_2_BIN`) and once as edition-3 text for the engine; equal rows, both refusing, or the one difference the cross-edition table sanctions as `results.hop-range-self-loop`, recognized by re-running both with the start node excluded. Without the binary it skips; `OMNIGRAPH_REQUIRE_EDITION_2=1` fails instead | `omnigraph-gqt` `integration/law_two_editions.rs`, run by `Cross-Edition Comparison` | 48 reads | 1,500 |
+| GQ 2 and GQ 3 answer alike the generated reads both express: a test-only tree of bindings, triples in declared direction, filters, a negated pattern, return items, a grouped count and a total `order` with `limit`, printed once as GQ 2 text for the pinned merge base's `omnigraph` CLI (`OMNIGRAPH_GQ_2_BIN`) and once as GQ 3 text for the engine; equal rows, both refusing, or the one difference the cross-version table sanctions as `results.hop-range-self-loop`, recognized by re-running both with the start node excluded. Without the binary it skips; `OMNIGRAPH_REQUIRE_GQ_2=1` fails instead | `omnigraph-gqt` `integration/law_two_versions.rs`, run by `Cross-Version Comparison` | 48 reads | 1,500 |
 | 6. Search answers do not depend on index state: over generated cases of one node type declaring every index kind (BTREE, BITMAP, LABEL_LIST, NGRAM, full text under each analyzer profile, a vector index under each distance; `arbitrary::search`), filters on each indexed column, `contains` over a name and over its `lower`, `match_terms` in both modes with every edit budget, and `distance`, `nearest`, `bm25` and `rrf` of two to four arms with and without `weights` answer as the reference does with no index built, with every index built, and with the indexes built over the first rows before new keys are added and earlier rows replaced whole; the indexed states probe each scalar family. A lone `match_terms` under the profiles without a stemmer keeps the rows a dynamic-programming edit distance admits; a `distance` or `nearest` read returns the RFC's distance computed apart from both implementations, every row or the `k` smallest distances under the tie rule; an `rrf` answers alike under every permutation of its arms and weights, its scores are the formula over each arm's own answer with equal scores broken by the smaller key, and a cut keeps the largest scores under that rule. `cosine` vectors have power-of-two norms, so every distance is exact in `F32` | `omnigraph-gqt` `integration/law_search.rs` | 40 cases of four reads, about 30 s | 2,000 |
 | The engine's banded edit distance equals the full dynamic-programming table on generated term pairs (`arbitrary::search::{term, edited}`: a term and the same term after up to four edits, transpositions among them, over ASCII, an accented letter, a sharp s, an ideograph and a digit), at every budget from 0 to 2 | engine `engine::lexical_scan::tests` | 20,000 pairs | 1,000,000 |
 | 6b. Every direct-engine case keeps its rows under each physical layout | `omnigraph-gqt` `tests/gq_layout_tests.rs` ([GQT README](../../crates/omnigraph-gqt/README.md#physical-layouts)) | layouts `a`, `b` | `a` to `d` |
@@ -436,9 +436,9 @@ graph, the cluster-path refusal and the eight genuine journeys:
 `genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
 `genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history`,
 `genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`,
-`genuine_edition_2_storage_upgrade_names_every_one_way_schema_construct` and
-`genuine_edition_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor`,
-the last two with the `edition-2` row, the published main build before the
+`genuine_gq_2_storage_upgrade_names_every_one_way_schema_construct` and
+`genuine_gq_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor`,
+the last two with the `gq-2` row, the published main build before the
 GQ 3 break), the engine
 `db::upgrade::tests`, `lance_version_columns` and `forbidden_apis`. Missing
 cases, empty runs and skipped required cases fail the job.
@@ -506,7 +506,7 @@ is missing fails instead of skipping. To run the crossversion scope locally,
 provision the same rows and run its cases:
 
 ```bash
-python3 scripts/predecessors.py provision stamp-13 lance-11 release-0.10.0 release-0.11.0 edition-2
+python3 scripts/predecessors.py provision stamp-13 lance-11 release-0.10.0 release-0.11.0 gq-2
 cargo dev-test --test integration crossversion_upgrade:: -- --test-threads=1
 ```
 
@@ -689,21 +689,21 @@ DST cases. The [GQT README](../../crates/omnigraph-gqt/README.md)
 defines supported targets, hooks, replay observations, and limits. The configured
 CI owner enrolls the complete corpus.
 
-### Cross-edition comparison
+### Cross-version comparison
 
 GQ 3 replaced the query language in one break, and the corpus was respelled
-with it. `scripts/cross-edition.py` makes "the respelled corpus answers as
-edition 2 did" a check: for every `.gqt` case present at the pinned edition-2
-commit (`EDITION_2_SOURCE_COMMIT` in `ci.yml`, the merge base with `main`) and
+with it. `scripts/cross-version.py` makes "the respelled corpus answers as
+GQ 2 did" a check: for every `.gqt` case present at the pinned GQ 2
+commit (`GQ_2_SOURCE_COMMIT` in `ci.yml`, the merge base with `main`) and
 in this tree, under the same path or one git's rename detection pairs, it runs
 the commit's text of the case with that commit's `omnigraph-gqt` and this
-tree's text with this tree's runner. Edition-2 text found after that commit,
+tree's text with this tree's runner. GQ 2 text found after that commit,
 such as a repro of a respelling defect, lives in this tree under
-`crates/omnigraph-gqt/edition-2/`: each case there is the edition-2 side of the
+`crates/omnigraph-gqt/gq-2/`: each case there is the GQ 2 side of the
 case of the same path under `cases/`, its hand rewrite, and a case there with
 no hand rewrite fails the script. Write the hand rewrite as the text `lint
---fix --review-fixes` writes for each step, with the edition-2 case's
-expectations, which the edition-2 runner blesses (`OMNIGRAPH_GQ_BLESS=1`). Both texts get one rewrite, the same on
+--fix --review-fixes` writes for each step, with the GQ 2 case's
+expectations, which the GQ 2 runner blesses (`OMNIGRAPH_GQ_BLESS=1`). Both texts get one rewrite, the same on
 both sides: the `--- runner` section becomes a single deterministic-simulation
 environment (in-memory store, seed 0), because only that environment's trace
 (`--trace`) records each step's result: a read's Arrow schema and rows, a
@@ -712,23 +712,23 @@ query name in sequence order, so an inserted or removed step does not shift
 the rest. For each pair the script compares column names, Arrow types, rows (a
 multiset unless both steps' rows are ordered), affected counts, and the error:
 whether the step failed and its diagnostic code. A difference passes only when
-`crates/omnigraph-gqt/cross-edition.tsv` lists it by case, current step
-ordinal (`e2:<n>` for an edition-2 step with no counterpart) and aspect,
+`crates/omnigraph-gqt/cross-version.tsv` lists it by case, current step
+ordinal (`gq2:<n>` for a GQ 2 step with no counterpart) and aspect,
 naming the bullet of the GQ 3 RFC's Compatibility and reversibility section
 that sanctions it (`BULLETS` in the script, each with the sentence it cites)
 and why; a row that excuses no difference fails too. A row citing an `open:`
 key (`OPEN` in the script) is a difference no Compatibility bullet names: it
 does not fail the job, which prints it as a warning, and the key leaves the
-list when the RFC decides it. A case both editions fail at the same step with
+list when the RFC decides it. A case both versions fail at the same step with
 the same message under the simulation is a warning, its later steps
 uncompared; any other run failure is an error.
 
 ```bash
-git worktree add --detach /tmp/e2 <EDITION_2_SOURCE_COMMIT>
-(cd /tmp/e2 && cargo build --locked -p omnigraph-gqt --bin omnigraph-gqt --target-dir /tmp/e2-target)
+git worktree add --detach /tmp/gq2 <GQ_2_SOURCE_COMMIT>
+(cd /tmp/gq2 && cargo build --locked -p omnigraph-gqt --bin omnigraph-gqt --target-dir /tmp/gq2-target)
 cargo build --locked -p omnigraph-gqt --bin omnigraph-gqt
-python3 scripts/cross-edition.py run --edition-2-runner /tmp/e2-target/debug/omnigraph-gqt \
-  --current-runner target/debug/omnigraph-gqt --base-ref <EDITION_2_SOURCE_COMMIT> --work /tmp/cross-edition
+python3 scripts/cross-version.py run --gq-2-runner /tmp/gq2-target/debug/omnigraph-gqt \
+  --current-runner target/debug/omnigraph-gqt --base-ref <GQ_2_SOURCE_COMMIT> --work /tmp/cross-version
 ```
 
 With `--measure`, each side also runs under `--measure`, and an aligned
@@ -743,26 +743,26 @@ every changed step's requests and class deltas under `costs`.
 `--case <path>` (repeatable) selects cases; `--reuse` compares the traces an
 earlier run left under `--work`.
 
-`fix_edition_2::printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite`
+`fix_gq_2::printed_fixes_respell_the_gq_2_corpus_into_its_hand_rewrite`
 in `omnigraph-gqt`'s `integration` binary is the gate for `omnigraph lint
---fix`: it gives every query step edition 2 ran in the commit's tree
-(`OMNIGRAPH_EDITION_2_TREE`; the GQT and benchmark corpora and the `.gq`
-files beside a `.pg`), and every case under `crates/omnigraph-gqt/edition-2/`,
+--fix`: it gives every query step GQ 2 ran in the commit's tree
+(`OMNIGRAPH_GQ_2_TREE`; the GQT and benchmark corpora and the `.gq`
+files beside a `.pg`), and every case under `crates/omnigraph-gqt/gq-2/`,
 to the fix loop with review fixes applied, requires
 every one whose refusals print fixes to converge, and compares each
 declaration's typed IR with the hand rewrite of the same case and name in
 this tree. A difference passes as a row of
-`crates/omnigraph-gqt/lint-fix-edition-2.tsv` naming a reason (`REASONS` in
+`crates/omnigraph-gqt/lint-fix-gq-2.tsv` naming a reason (`REASONS` in
 the test; an `open:` reason prints a warning), and a row that matches nothing
 fails; a keyed `insert` the fix leaves, where the hand rewrite wrote the
 respelling map's `replace`, is recognized by applying that row. The in-tree
 cases run on every run; without the pinned tree it skips that corpus and says
-so, and `OMNIGRAPH_REQUIRE_EDITION_2=1` fails instead.
+so, and `OMNIGRAPH_REQUIRE_GQ_2=1` fails instead.
 
-Fix coverage over edition-2 text is an instrument beside it,
-`fix_coverage::fix_coverage_over_edition_2_text` in `omnigraph-gqt`'s
+Fix coverage over GQ 2 text is an instrument beside it,
+`fix_coverage::fix_coverage_over_gq_2_text` in `omnigraph-gqt`'s
 `integration` binary (`#[ignore = "instrument: …"]`): point
-`OMNIGRAPH_FIX_COVERAGE_DIR` at the edition-2 commit's `cases/` or at stored
+`OMNIGRAPH_FIX_COVERAGE_DIR` at the GQ 2 commit's `cases/` or at stored
 queries exported as `<name>.gq` beside `<name>.pg`, and it applies every
 printed suggestion pass by pass and prints counts only (compiled as written,
 respelled by the fixes per pass, stuck by code and message shape), so it may

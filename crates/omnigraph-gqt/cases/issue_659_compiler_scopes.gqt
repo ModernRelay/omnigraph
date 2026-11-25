@@ -3,7 +3,7 @@
 # notes: Endpoint declarations belong to their lexical block; checked nested directions and anonymous endpoints survive lowering.
 # notes: A block in `where` correlates on every element's names (section 3), so a block whose variable must stay its own names a variable no element binds.
 # notes: A `let` sees only the elements before it (section 3, "Scope and correlation"): a name an element binds after it is not
-# notes: correlated, and the `let`'s block binds its own (`future_outer_*`, edition 2's blocks written before that element).
+# notes: correlated, and the `let`'s block binds its own (`future_outer_*`, GQ 2's blocks written before that element).
 
 --- runner
 timeout_ms: 10000

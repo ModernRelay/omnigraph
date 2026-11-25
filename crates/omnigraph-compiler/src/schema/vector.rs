@@ -3,10 +3,10 @@
 //! (the GQ 3 RFC, section 4, Schema: Vectors).
 //!
 //! `distance(…)` and `nearest(…)` both read the field's declared distance;
-//! an omitted distance is `l2`, edition 2's meaning, so no accepted schema
+//! an omitted distance is `l2`, GQ 2's meaning, so no accepted schema
 //! changes meaning. Every value is ascending: a smaller distance is nearer.
 //! A property that declares `l2` or omits the option carries no
-//! [`VectorDistance`] in its shape or IR, so an edition 2 schema keeps its
+//! [`VectorDistance`] in its shape or IR, so a GQ 2 schema keeps its
 //! bytes and hashes; the absent value resolves to [`VectorDistance::L2`].
 
 use std::fmt;

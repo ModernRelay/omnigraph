@@ -1,9 +1,9 @@
 # issue: none
 # notes: the three analyzer profiles of `@index(fulltext, analyzer = ...)` (the GQ 3 RFC
 # notes: section 4, Schema: Text) match one corpus differently, and an index declaring no analyzer keeps
-# notes: edition 2's analysis (Lance's default). Every profile lowercases (`RUNNING`); only `english_v1`
-# notes: and edition 2 stem (`run` finds `Runners were RUNNING`); `standard_folded_v1`, `english_v1` and
-# notes: edition 2 fold accents (`cafe` finds `Café`); only edition 2 drops a token over 40 bytes.
+# notes: GQ 2's analysis (Lance's default). Every profile lowercases (`RUNNING`); only `english_v1`
+# notes: and GQ 2 stem (`run` finds `Runners were RUNNING`); `standard_folded_v1`, `english_v1` and
+# notes: GQ 2 fold accents (`cafe` finds `Café`); only GQ 2 drops a token over 40 bytes.
 # notes: The three profiled columns are answered by the exact lexical scan, which applies NFC and the
 # notes: profile's tokenizer and filters and reads no index; `legacy` comes from Lance's native path,
 # notes: its index's default analysis.

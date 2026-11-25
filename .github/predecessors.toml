@@ -96,10 +96,10 @@ binaries = ["omnigraph"]
 reports = "omnigraph 0.14.0"
 retire_when = "Graphs a Lance 11 writer stored are no longer read and written without conversion"
 
-[predecessors."edition-2"]
-about = "The published main build `edge-20261118-fd4d61f`, before the GQ 3 break: the edition-2 binary that reads a graph back until a one-way schema construct or full-text rebuild is applied to it"
+[predecessors."gq-2"]
+about = "The published main build `edge-20261118-fd4d61f`, before the GQ 3 break: the GQ 2 binary that reads a graph back until a one-way schema construct or full-text rebuild is applied to it"
 release = "edge-20261118-fd4d61f"
 sha256 = { linux-x86_64 = "c2562b5ef072392b7eecf8ac5936e4d276472471cedca253269d7e3ad7e62af1", linux-arm64 = "352f90e1dfbbc519d96919605a5ae45f11e0c15a50b0e25e57304a0ce13b1c2d", macos-arm64 = "f50fc459dcc3cb581aba9915f006bf67759373d7214601acfb534eab388b565c" }
 binaries = ["omnigraph"]
 reports = "omnigraph 0.15.1-edge+fd4d61f"
-retire_when = "Schema apply and index rebuild no longer name the steps an edition-2 binary cannot read back"
+retire_when = "Schema apply and index rebuild no longer name the steps a GQ 2 binary cannot read back"

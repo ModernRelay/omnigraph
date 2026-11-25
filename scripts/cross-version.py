@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Compare every GQT case the edition-2 merge base and this tree share.
+"""Compare every GQT case the GQ 2 merge base and this tree share.
 
-The edition-2 side is the `omnigraph-gqt` runner built from the pinned merge
-base with main (`EDITION_2_SOURCE_COMMIT` in `.github/workflows/ci.yml`); it
+The GQ 2 side is the `omnigraph-gqt` runner built from the pinned merge
+base with main (`GQ_2_SOURCE_COMMIT` in `.github/workflows/ci.yml`); it
 links that commit's engine, so it answers every case exactly as main did. The
 current side is this tree's runner. For each case path present at both
 commits, each side runs its own text of the case: the merge base's case with
-the edition-2 runner, this tree's case with the current one. Edition-2 text
-written after the merge base lives in this tree under `EDITION_2_DIR`, each
+the GQ 2 runner, this tree's case with the current one. GQ 2 text
+written after the merge base lives in this tree under `GQ_2_DIR`, each
 case paired with the case of the same path under `CASES_DIR`, its hand
-rewrite; the edition-2 runner runs the first and the current runner the
+rewrite; the GQ 2 runner runs the first and the current runner the
 second, as for a case of the merge base.
 
 Both texts get one rewrite before they run: their `--- runner` section is
@@ -25,14 +25,14 @@ compares the column names, the Arrow column types, the rows (as an unordered
 multiset unless both steps' rows are ordered), the affected counts, and the
 error: whether the step failed, and its diagnostic code (`T7`, `Q018`, ...)
 when either side prints one. A difference passes only when
-`crates/omnigraph-gqt/cross-edition.tsv` lists it, keyed by case, step and
+`crates/omnigraph-gqt/cross-version.tsv` lists it, keyed by case, step and
 aspect, naming the bullet of the GQ 3 RFC's Compatibility and reversibility
 section that sanctions it (`BULLETS` below) and why. A listed row that matches
 no difference fails too, so the table never outlives what it excuses.
 
-    cross-edition.py run --edition-2-runner BIN --current-runner BIN \\
+    cross-version.py run --gq-2-runner BIN --current-runner BIN \\
         --base-ref SHA --work DIR [--jobs N] [--case PATH ...]
-    cross-edition.py --self-test
+    cross-version.py --self-test
 """
 
 from __future__ import annotations
@@ -53,11 +53,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES_DIR = "crates/omnigraph-gqt/cases"
-# Edition-2 text kept in this tree (a repro of a respelling defect found
-# after the merge base), each case the edition-2 side of the case of the same
+# GQ 2 text kept in this tree (a repro of a respelling defect found
+# after the merge base), each case the GQ 2 side of the case of the same
 # path under CASES_DIR.
-EDITION_2_DIR = "crates/omnigraph-gqt/edition-2"
-TABLE = ROOT / "crates/omnigraph-gqt/cross-edition.tsv"
+GQ_2_DIR = "crates/omnigraph-gqt/gq-2"
+TABLE = ROOT / "crates/omnigraph-gqt/cross-version.tsv"
 ASPECTS = ("columns", "types", "rows", "affected", "error", "steps", "requests")
 
 # The bullets of the RFC's "Compatibility and reversibility" section a table
@@ -72,22 +72,22 @@ BULLETS = {
     "language.accepted-order-key-not-returned": "Language: an order key that is not a return item (`T42`) is accepted.",
     "language.accepted-item-beside-aggregates": "Language: a Boolean or property item beside aggregates (`T9`, `T58`) is accepted.",
     "language.accepted-lexical-under-not-or": "Language: a lexical predicate under `not` or `or` (`T38`) is accepted.",
-    "language.diagnostic": "Language: no edition-2 text compiles after the break; it fails with its diagnostic, whose printed fix an agent applies.",
-    "results.index-state": "Results: rows change where edition 2's answer depended on index state.",
-    "results.letter-case": "Results: rows change where edition 2's answer depended on letter case.",
-    "results.full-text-analysis": "Results: rows change on every full-text field where edition 2's analysis differs from its profile (`english_v1` by default: the token filter, the stop list's stems and NFC).",
-    "results.bm25-f64": "Results: `bm25` scores are `bm25_v1`'s `F64` on every field, where edition 2 gave Lance's `F32`.",
-    "results.full-text-index-required": "Results: a read that edition 2 refused with `FullTextIndexRequired` returns rows.",
+    "language.diagnostic": "Language: no GQ 2 text compiles after the break; it fails with its diagnostic, whose printed fix an agent applies.",
+    "results.index-state": "Results: rows change where GQ 2's answer depended on index state.",
+    "results.letter-case": "Results: rows change where GQ 2's answer depended on letter case.",
+    "results.full-text-analysis": "Results: rows change on every full-text field where GQ 2's analysis differs from its profile (`english_v1` by default: the token filter, the stop list's stems and NFC).",
+    "results.bm25-f64": "Results: `bm25` scores are `bm25_v1`'s `F64` on every field, where GQ 2 gave Lance's `F32`.",
+    "results.full-text-index-required": "Results: a read that GQ 2 refused with `FullTextIndexRequired` returns rows.",
     "results.fusion-window": "Results: fusion rows change where an arm's window differs from today's `limit`-sized one, and a fusion result loses the fan-out rows and population columns today's carries.",
     "results.limit-tie-rule": "Results: a read with `limit` and no `order` returns the first rows under the tie rule rather than the first rows a scan yields.",
     "results.integer-float-comparison": "Results: an integer property compared with a whole-number float literal compares as `F64`.",
     "results.distance-rename": "Language (respelling map): an unaliased `nearest` column `d._distance` becomes `_distance`, the one rename the fixed map carries.",
     "results.hop-range-self-loop": "Results: a hop range other than the single hop no longer returns its start node through a self-loop, since the start is at distance 0 and the range starts at 1 (section 2's `Expand` row).",
-    "results.avg-exact-integer": "Results: `avg` over integers is computed exactly and rounded once to `F64`, where edition 2 summed in `F64`, so its value changes only where that sum lost precision.",
-    "results.bm25-score-rename": "Results: a full-text score edition 2 returned as `<binding>._score` is the `_score` column, the same rename the fixed map makes for `_distance`.",
+    "results.avg-exact-integer": "Results: `avg` over integers is computed exactly and rounded once to `F64`, where GQ 2 summed in `F64`, so its value changes only where that sum lost precision.",
+    "results.bm25-score-rename": "Results: a full-text score GQ 2 returned as `<binding>._score` is the `_score` column, the same rename the fixed map makes for `_distance`.",
     "results.mutation-where-lexical": "Results: a lexical predicate in a write's `where` is accepted, as in a read (`T38` lifted).",
     "settings.engine-setting-removed": "Settings and introspection: the `engine` setting, whose only value since 0.12 is `v2` and which changes nothing, is removed: `set engine = v2;` and `OMNIGRAPH_ENGINE` are refused as an unknown setting, with a fix that deletes the line.",
-    "settings.catalogue-operators": "Settings and introspection: the catalogue's operator rows describe edition 3's operators, so a read of them returns different rows.",
+    "settings.catalogue-operators": "Settings and introspection: the catalogue's operator rows describe GQ 3's operators, so a read of them returns different rows.",
 }
 
 # Why a step's store requests may rise (aspect `requests`, under
@@ -95,7 +95,7 @@ BULLETS = {
 # row names one of these.
 COSTS = {
     "cost.exact-lexical-scan": "RFC section 4: the exact lexical scan answers every `match_terms` and `bm25`, and no query reads a full-text index, so a lexical read reads its text column's data files.",
-    "cost.accepted-refusal": "Compatibility, Language: a text edition 2 refused is accepted, so the step runs a read where edition 2 refused before reading.",
+    "cost.accepted-refusal": "Compatibility, Language: a text GQ 2 refused is accepted, so the step runs a read where GQ 2 refused before reading.",
 }
 
 # Differences this branch makes that no Compatibility bullet names. A row may
@@ -104,16 +104,16 @@ COSTS = {
 # the key leaves this list when the RFC's Compatibility section decides it
 # (adds a bullet, which a row then cites) or the branch reverts the change.
 OPEN = {
-    "open:concurrent-index-searches-reread-a-page": "Lance 13 reads an index page or posting list that concurrent searches of one filter (an `or`, an `in` list, an NGRAM's trigrams) all find uncached once per search, since `search_missing_pages` reads it outside the cache's loader; edition 2 read no such index for this text.",
-    "open:index-probe-where-edition-2-scanned": "The read probes a scalar index the edition-2 plan for this text did not read (a String key or `@index` BTREE edition 2 could not use, or one an earlier step no longer warms); on the simulation's one-fragment tables its requests exceed the data read edition 2's scan shared.",
-    "open:empty-list-without-context": "An empty list literal takes its element type from its context, as `null` does, and nothing fixes it in a bare `return` item, so it is refused (`T7`) where edition 2 typed it `[String]`; section 5 states the rule for `null`, and no Compatibility bullet names the refusal.",
-    "open:write-groups-one-snapshot": "Every group of a write selects on the write's one snapshot, and a group whose selection reads a type an earlier group of the write changes is refused (`T91`), where edition 2 ran its statements in order, each reading the ones before it; the case's edition-2 text is refused or was rewritten into a form the rule admits (one group, separate writes, or a selection over another type), which changes its steps, rows or store requests, and no Compatibility bullet names the refusal.",
-    "open:full-text-call-as-a-value": "A full-text call read as a value (`match_terms` in `return`, `order` or an aggregate), which edition 2 refused (`T35`), returns the row's Boolean; the Compatibility bullet's list of edition-2 refusals edition 3 accepts does not name `T35`.",
-    "open:pushed-filter-late-materializes": "The respelled text tests a key equality at the top level, where it is pushed into the scan, and Lance's heuristic late materialization reads the filter column, then fetches the scan's other projected columns (`__id`) for the matching rows: on the simulation's one-fragment tables, a second request for the same small data file; edition 2's text tested the equality inside a nested block, in memory over the one read.",
+    "open:concurrent-index-searches-reread-a-page": "Lance 13 reads an index page or posting list that concurrent searches of one filter (an `or`, an `in` list, an NGRAM's trigrams) all find uncached once per search, since `search_missing_pages` reads it outside the cache's loader; GQ 2 read no such index for this text.",
+    "open:index-probe-where-gq-2-scanned": "The read probes a scalar index the GQ 2 plan for this text did not read (a String key or `@index` BTREE GQ 2 could not use, or one an earlier step no longer warms); on the simulation's one-fragment tables its requests exceed the data read GQ 2's scan shared.",
+    "open:empty-list-without-context": "An empty list literal takes its element type from its context, as `null` does, and nothing fixes it in a bare `return` item, so it is refused (`T7`) where GQ 2 typed it `[String]`; section 5 states the rule for `null`, and no Compatibility bullet names the refusal.",
+    "open:write-groups-one-snapshot": "Every group of a write selects on the write's one snapshot, and a group whose selection reads a type an earlier group of the write changes is refused (`T91`), where GQ 2 ran its statements in order, each reading the ones before it; the case's GQ 2 text is refused or was rewritten into a form the rule admits (one group, separate writes, or a selection over another type), which changes its steps, rows or store requests, and no Compatibility bullet names the refusal.",
+    "open:full-text-call-as-a-value": "A full-text call read as a value (`match_terms` in `return`, `order` or an aggregate), which GQ 2 refused (`T35`), returns the row's Boolean; the Compatibility bullet's list of GQ 2 refusals GQ 3 accepts does not name `T35`.",
+    "open:pushed-filter-late-materializes": "The respelled text tests a key equality at the top level, where it is pushed into the scan, and Lance's heuristic late materialization reads the filter column, then fetches the scan's other projected columns (`__id`) for the matching rows: on the simulation's one-fragment tables, a second request for the same small data file; GQ 2's text tested the equality inside a nested block, in memory over the one read.",
 }
 
 # A failed step's label is its kind followed by a prefix of its text, cut at
-# a fixed length, and the respelling changes the text (edition 2's keyed
+# a fixed length, and the respelling changes the text (GQ 2's keyed
 # `insert` is `replace`), so two failures are the same when their messages
 # are equal and their steps are of one kind.
 def same_failure(old: tuple[str, str] | None, new: tuple[str, str] | None) -> bool:
@@ -274,7 +274,7 @@ def observations(trace: Path) -> tuple[dict[tuple, Observation], list[tuple[tupl
 
 
 def align(old: list[tuple[tuple, str]], new: list[tuple[tuple, str]]) -> dict[tuple, tuple]:
-    """Current step -> edition-2 step: equal signatures in sequence order, and
+    """Current step -> GQ 2 step: equal signatures in sequence order, and
     within a replaced run of equal length, position for position."""
     import difflib
 
@@ -301,7 +301,7 @@ def differences(old: Observation, new: Observation) -> list[tuple[str, str]]:
         found.append(
             (
                 "error",
-                f"edition 2 {'failed: ' + short(old.error) if old.error else 'succeeded'}; "
+                f"GQ 2 {'failed: ' + short(old.error) if old.error else 'succeeded'}; "
                 f"current {'failed: ' + short(new.error) if new.error else 'succeeded'}",
             )
         )
@@ -369,9 +369,9 @@ def read_table(path: Path) -> list[Sanction]:
             errors.append(f"{path.name}:{number}: expected 5 tab-separated fields, found {len(parts)}")
             continue
         case, step, aspect, bullet, why = (p.strip() for p in parts)
-        if not (step == "*" or step.isdigit() or (step.startswith("e2:") and step[3:].isdigit())):
+        if not (step == "*" or step.isdigit() or (step.startswith("gq2:") and step[4:].isdigit())):
             errors.append(
-                f"{path.name}:{number}: step `{step}` is not a current ordinal, `e2:<ordinal>` or `*`"
+                f"{path.name}:{number}: step `{step}` is not a current ordinal, `gq2:<ordinal>` or `*`"
             )
         if aspect not in ASPECTS:
             errors.append(f"{path.name}:{number}: aspect `{aspect}` is not one of {', '.join(ASPECTS)}")
@@ -429,26 +429,26 @@ def paired_cases(base_ref: str) -> list[tuple[str, str]]:
 
 
 def in_tree_pairs(root: Path) -> dict[str, str]:
-    """(edition-2 path, current path) of every case under `EDITION_2_DIR`:
+    """(GQ 2 path, current path) of every case under `GQ_2_DIR`:
     the case of the same path under `CASES_DIR` is its hand rewrite, which
     must exist."""
     pairs = {}
-    for path in sorted((root / EDITION_2_DIR).rglob("*.gqt")):
-        relative = path.relative_to(root / EDITION_2_DIR)
+    for path in sorted((root / GQ_2_DIR).rglob("*.gqt")):
+        relative = path.relative_to(root / GQ_2_DIR)
         current = Path(CASES_DIR) / relative
         if not (root / current).is_file():
             raise SystemExit(
                 f"{path.relative_to(root)} has no hand rewrite at {current}: "
-                "an in-tree edition-2 case pairs with the case of the same path under the corpus"
+                "an in-tree GQ 2 case pairs with the case of the same path under the corpus"
             )
         pairs[str(path.relative_to(root))] = str(current)
     return pairs
 
 
-def edition_2_text(base_ref: str, path: str) -> str:
-    """A pair's edition-2 text: this tree's file under `EDITION_2_DIR`, else
+def gq_2_text(base_ref: str, path: str) -> str:
+    """A pair's GQ 2 text: this tree's file under `GQ_2_DIR`, else
     the merge base's case."""
-    if path.startswith(EDITION_2_DIR + "/"):
+    if path.startswith(GQ_2_DIR + "/"):
         return (ROOT / path).read_text()
     return base_text(base_ref, path)
 
@@ -591,9 +591,9 @@ def run(args: argparse.Namespace) -> int:
         return 1
     work = Path(args.work).resolve()
     work.mkdir(parents=True, exist_ok=True)
-    edition_2_runner = Path(args.edition_2_runner).resolve()
+    gq_2_runner = Path(args.gq_2_runner).resolve()
     current_runner = Path(args.current_runner).resolve()
-    for label, runner in (("edition-2", edition_2_runner), ("current", current_runner)):
+    for label, runner in (("GQ 2", gq_2_runner), ("current", current_runner)):
         if not (runner.is_file() and os.access(runner, os.X_OK)):
             print(f"::error::the {label} GQT runner {runner} is missing or not executable", file=sys.stderr)
             return 1
@@ -601,9 +601,9 @@ def run(args: argparse.Namespace) -> int:
     def compare_case(pair: tuple[str, str]):
         old_path, relative = pair
         old = run_side(
-            edition_2_runner,
-            edition_2_text(args.base_ref, old_path),
-            work / "edition-2",
+            gq_2_runner,
+            gq_2_text(args.base_ref, old_path),
+            work / "gq-2",
             relative,
             args.timeout,
             args.reuse,
@@ -646,11 +646,11 @@ def run(args: argparse.Namespace) -> int:
                 continue
             if old.status == new.status == "failed" and same_failure(old.failure, new.failure):
                 shared_failures.append(
-                    f"{case}: both editions fail step {old.failure[0]} under simulation with "
+                    f"{case}: both versions fail step {old.failure[0]} under simulation with "
                     f"`{short(old.failure[1], 200)}`; the steps after it are not compared"
                 )
             else:
-                for label, side in (("edition 2", old), ("current", new)):
+                for label, side in (("GQ 2", old), ("current", new)):
                     if side.status != "passed":
                         why = f"step {side.failure[0]}: {short(side.failure[1], 400)}; " if side.failure else ""
                         unrunnable.append(f"{case}: {label} {side.status}: {why}{side.message}")
@@ -661,9 +661,9 @@ def run(args: argparse.Namespace) -> int:
                     findings.append(
                         {
                             "case": case,
-                            "step": f"e2:{key[0]}",
+                            "step": f"gq2:{key[0]}",
                             "aspect": "steps",
-                            "detail": f"edition-2 step {key[0]} ({sig}) has no current counterpart",
+                            "detail": f"GQ 2 step {key[0]} ({sig}) has no current counterpart",
                         }
                     )
             names = dict(new.order)
@@ -757,7 +757,7 @@ def run(args: argparse.Namespace) -> int:
     report["by_bullet"] = dict(by_bullet)
     (work / "report.json").write_text(json.dumps(report, indent=1, sort_keys=True))
     print(
-        f"cross-edition: {len(cases)} cases, {compared_steps} steps compared, "
+        f"cross-version: {len(cases)} cases, {compared_steps} steps compared, "
         f"{len(findings)} differences, {len(findings) - len(unsanctioned)} sanctioned"
     )
     for bullet, count in sorted(by_bullet.items()):
@@ -818,21 +818,21 @@ class SelfTest(unittest.TestCase):
         renamed = [((1, ""), "Query:a"), ((2, ""), "Query:b2"), ((3, ""), "Mutate:c")]
         self.assertEqual(align(old, renamed)[(2, "")], (2, ""))
 
-    def test_an_in_tree_edition_2_case_pairs_with_its_hand_rewrite(self):
+    def test_an_in_tree_gq_2_case_pairs_with_its_hand_rewrite(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            (root / EDITION_2_DIR).mkdir(parents=True)
+            (root / GQ_2_DIR).mkdir(parents=True)
             (root / CASES_DIR).mkdir(parents=True)
-            (root / EDITION_2_DIR / "a.gqt").write_text(self.CASE)
+            (root / GQ_2_DIR / "a.gqt").write_text(self.CASE)
             (root / CASES_DIR / "a.gqt").write_text(self.CASE)
             self.assertEqual(
-                in_tree_pairs(root), {f"{EDITION_2_DIR}/a.gqt": f"{CASES_DIR}/a.gqt"}
+                in_tree_pairs(root), {f"{GQ_2_DIR}/a.gqt": f"{CASES_DIR}/a.gqt"}
             )
-            (root / EDITION_2_DIR / "b.gqt").write_text(self.CASE)
+            (root / GQ_2_DIR / "b.gqt").write_text(self.CASE)
             with self.assertRaises(SystemExit):
                 in_tree_pairs(root)
 
-    def test_every_in_tree_edition_2_case_has_its_hand_rewrite(self):
+    def test_every_in_tree_gq_2_case_has_its_hand_rewrite(self):
         in_tree_pairs(ROOT)
 
     def test_signature_names_the_declaration(self):
@@ -914,10 +914,10 @@ class SelfTest(unittest.TestCase):
     def test_checked_in_table_reads(self):
         read_table(TABLE)
 
-    def test_every_workflow_pins_one_edition_2_commit(self):
+    def test_every_workflow_pins_one_gq_2_commit(self):
         pins = {}
         for workflow in sorted((ROOT / ".github/workflows").glob("*.yml")):
-            for found in re.findall(r"EDITION_2_SOURCE_COMMIT: ([0-9a-f]{40})", workflow.read_text()):
+            for found in re.findall(r"GQ_2_SOURCE_COMMIT: ([0-9a-f]{40})", workflow.read_text()):
                 pins.setdefault(found, []).append(workflow.name)
         self.assertEqual(len(pins), 1, pins)
         self.assertIn("ci.yml", next(iter(pins.values())))
@@ -930,7 +930,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     r = sub.add_parser("run")
-    r.add_argument("--edition-2-runner", required=True)
+    r.add_argument("--gq-2-runner", required=True)
     r.add_argument("--current-runner", required=True)
     r.add_argument("--base-ref", required=True)
     r.add_argument("--work", required=True)

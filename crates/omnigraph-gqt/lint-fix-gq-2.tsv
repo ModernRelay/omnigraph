@@ -1,5 +1,5 @@
-# Edition-2 declarations whose text `lint --fix` respells into a typed IR other than the hand rewrite's in this tree.
-# case<TAB>declaration<TAB>occurrence<TAB>aspect<TAB>reason<TAB>why; see crates/omnigraph-gqt/tests/integration/fix_edition_2.rs.
+# GQ 2 declarations whose text `lint --fix` respells into a typed IR other than the hand rewrite's in this tree.
+# case<TAB>declaration<TAB>occurrence<TAB>aspect<TAB>reason<TAB>why; see crates/omnigraph-gqt/tests/integration/fix_gq_2.rs.
 # A reason starting with `open:` names a difference no RFC rule sanctions; the test prints it as a warning.
 # A keyed `insert` left as written, where the hand rewrite wrote section 6's `replace`, is recognized by the test and not listed.
 crates/omnigraph-gqt/cases/anti_join_negation_forms_agree.gqt	no_nonacme_employer	1	ir	map.not-coalesce	The fix writes `not coalesce($c.name = "Acme", false)`; the hand rewrite `not ($c.name = "Acme")`, the key `name` being non-null.
@@ -8,7 +8,7 @@ crates/omnigraph-gqt/cases/detached_sibling_snapshots_stay_distinct.gqt	left_aga
 crates/omnigraph-gqt/cases/detached_sibling_snapshots_stay_distinct.gqt	left_changes	1	ir	map.statement-ahead-of-the-group	The fix writes `insert Knows { … }` ahead of `match { $x: Person } where $x.name = "a"  update $x …`; the hand rewrite writes `replace Knows { … }` inside that group, which the key `name` pins to one row.
 crates/omnigraph-gqt/cases/detached_sibling_snapshots_stay_distinct.gqt	right_changes	1	ir	map.statement-ahead-of-the-group	The fix writes `insert Knows { … }` ahead of `match { $x: Person } where $x.name = "a"  update $x …`; the hand rewrite writes `replace Knows { … }` inside that group, which the key `name` pins to one row.
 crates/omnigraph-gqt/cases/issue_603_negation_string_predicate_outer_var.gqt	not_prefixed	1	ir	map.not-coalesce	The fix writes `not coalesce(starts_with($p.name, "a"), false)`; the hand rewrite `not (starts_with($p.name, "a"))` over the non-null key.
-crates/omnigraph-gqt/cases/issue_640_search_score_projection.gqt	rrf_projected	1	ir	map.ranking-normalized	Edition 2 orders by the fused rank twice; the fix writes `$score desc` for both bare rank keys (N5), the hand rewrite `$score desc, $score`, whose second key never decides.
+crates/omnigraph-gqt/cases/issue_640_search_score_projection.gqt	rrf_projected	1	ir	map.ranking-normalized	GQ 2 orders by the fused rank twice; the fix writes `$score desc` for both bare rank keys (N5), the hand rewrite `$score desc, $score`, whose second key never decides.
 crates/omnigraph-gqt/cases/issue_659_compiler_scopes.gqt	future_outer_name_is_not_correlated	1	ir	hand.block-kept-as-a-let	The fix writes `let $block = exists { … }`, the hand rewrite `let $knows = exists { … }`; the `where` reads each by its name.
 crates/omnigraph-gqt/cases/issue_659_compiler_scopes.gqt	future_outer_name_not_block	1	ir	hand.block-kept-as-a-let	The fix writes `let $block = not exists { … }` and `where $block`, the hand rewrite `let $knows = exists { … }` and `where not $knows`.
 crates/omnigraph-gqt/cases/issue_659_compiler_scopes.gqt	nested_local_names_remain_independent	1	ir	hand.block-kept-as-a-let	The fix keeps the `count` block and its inner `exists` in place as `let`s; the hand rewrite moved the block to the `where` with its own names renamed (`$c`, `$k`), which the scope rule then needs no `let` for.

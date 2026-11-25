@@ -13,13 +13,13 @@ printed fixes and repairs are rows of one table, the refusal law
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
-## Edition-2 cases
+## GQ 2 cases
 
-`edition-2/` holds edition-2 text written after the break, a repro of a
-respelling defect, never run by the corpus: each case is the edition-2 side of
+`gq-2/` holds GQ 2 text written after the break, a repro of a
+respelling defect, never run by the corpus: each case is the GQ 2 side of
 the case of the same path under `cases/`, its hand rewrite, which the
-Cross-Edition Comparison and the lint-fix edition-2 proof pair with it
-([test ownership](../../docs/dev/test-ownership.md#cross-edition-comparison)).
+Cross-Version Comparison and the lint-fix GQ 2 proof pair with it
+([test ownership](../../docs/dev/test-ownership.md#cross-version-comparison)).
 
 ## Slow cases
 

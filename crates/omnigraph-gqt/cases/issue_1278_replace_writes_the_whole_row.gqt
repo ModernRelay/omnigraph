@@ -1,5 +1,5 @@
 # issue: 1278
-# red_on: none; guard case pinning whole-row replacement, edition 2's keyed insert, which `replace` keeps
+# red_on: none; guard case pinning whole-row replacement, GQ 2's keyed insert, which `replace` keeps
 # notes: `replace` on an existing key writes the whole row: every nullable property the statement omits becomes null (scalar, list and vector here; Blob in writes.rs), an explicit `null` clears too, and a missing required property is refused on an existing key as on a new one. `upsert` and `update` set only named properties (issue_1278_upsert_keeps_omitted_properties.gqt).
 # notes: The same holds on a branch, leaves main untouched, and survives a restart.
 

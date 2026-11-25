@@ -961,7 +961,7 @@ const NOT_GENERATED: &[(&str, &[&str])] = &[
             "prop_method_head",
             // A keyword or reserved word written as a call's name.
             "call_keyword_word",
-            // Edition 2's statement `where`, refused with the group form.
+            // GQ 2's statement `where`, refused with the group form.
             "where_stmt",
             "binding_brace_filter",
             "prop_match_list",

@@ -1815,7 +1815,7 @@ fn test_reject_edge_key_column_rules() {
 
 /// `@index(fulltext, analyzer = ..., scorer = ...)` declares the property's
 /// full-text index with its analysis; `@index(fulltext)` and a bare `@index`
-/// declare the same index with edition 2's analysis (the GQ 3 RFC
+/// declare the same index with GQ 2's analysis (the GQ 3 RFC
 /// section 4, Schema: Text).
 #[test]
 fn full_text_index_declares_its_analyzer_and_scorer() {

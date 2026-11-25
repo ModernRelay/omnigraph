@@ -43,7 +43,7 @@ JOBS = {
     "lint": PR_QUEUE_MAIN_PUSH_FULL_CI,
     "test": FULL_CI,
     "storage_upgrade_compatibility": ALWAYS,
-    "cross_edition": GQT,
+    "cross_version": GQT,
     "test_aws_feature": ALWAYS,
 }
 EVENTS = ("pull_request", "merge_group", "push", "workflow_dispatch")
@@ -142,9 +142,9 @@ def self_test() -> None:
         "fmt": "skipped",
         "lint": "skipped",
         "test": "skipped",
-        "cross_edition": "skipped",
+        "cross_version": "skipped",
     }
-    cases_only = {k: v for k, v in docs.items() if k != "cross_edition"}
+    cases_only = {k: v for k, v in docs.items() if k != "cross_version"}
 
     ok(results(graph_vocabulary_guard="skipped"), *pr, "true")
     ok(results(), *pr, "true")
@@ -168,9 +168,9 @@ def self_test() -> None:
             red(f"{job}: skipped", results(graph_vocabulary_guard="skipped", **{job: "skipped"}), *pr, "true")
             red(f"{job}: skipped", results(**docs, **{job: "skipped"}), *pr, "false")
     ok(results(**cases_only), *pr, "false", "true")
-    red("cross_edition: skipped", results(**docs), *pr, "false", "true")
-    red("cross_edition: skipped", results(**cases_only, cross_edition="skipped"), *queue, "false", "true")
-    red("cross_edition: skipped", results(graph_vocabulary_guard="skipped", cross_edition="skipped"), *pr, "true")
+    red("cross_version: skipped", results(**docs), *pr, "false", "true")
+    red("cross_version: skipped", results(**cases_only, cross_version="skipped"), *queue, "false", "true")
+    red("cross_version: skipped", results(graph_vocabulary_guard="skipped", cross_version="skipped"), *pr, "true")
     red("run_gqt is 'maybe'", results(graph_vocabulary_guard="skipped"), *pr, "true", "maybe")
     red("run_gqt is 'false' where run_full_ci", results(graph_vocabulary_guard="skipped"), *pr, "true", "false")
     assert expected(GQT, "push", "refs/heads/main", "false", "true")

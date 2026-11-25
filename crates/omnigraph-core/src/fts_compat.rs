@@ -26,7 +26,7 @@ use crate::error::{OmniError, Result};
 use crate::fts_analysis::{self, MeasuredAnalysis};
 
 pub const CERTIFICATE_FILE: &str = "omnigraph_fts_compat.json";
-/// A certificate of edition 2's analysis, Lance's default, written before
+/// A certificate of GQ 2's analysis, Lance's default, written before
 /// every full-text field had a profile. It names an analyzer generation and
 /// nothing a profile can be checked against, so it never qualifies an index
 /// for a profile; only its version is read.
@@ -190,7 +190,7 @@ pub async fn write_certificate(
 /// 2. this binary's native fingerprint for `profile` equals its profile
 ///    analyzer's (parity between the index and the exact scan).
 ///
-/// A certificate of edition 2's analysis (format 1) never qualifies. Every
+/// A certificate of GQ 2's analysis (format 1) never qualifies. Every
 /// refusal is [`OmniError::FullTextIndexRebuildRequired`], its reason naming
 /// the check; a refusal is never cached.
 pub async fn verify_index(
@@ -383,7 +383,7 @@ fn verify_payload(
         FORMAT_VERSION_DEFAULT_ANALYSIS => {
             return Err(rebuild_required(
                 index,
-                "index was built with edition 2's analysis, which is not an analyzer profile; \
+                "index was built with GQ 2's analysis, which is not an analyzer profile; \
                  rebuild it with the field's profile",
             ));
         }
@@ -830,7 +830,7 @@ mod tests {
             reason.contains("does not emit the profile analyzer"),
             "{reason}"
         );
-        // Edition 2's analysis is not a profile, whatever its generation.
+        // GQ 2's analysis is not a profile, whatever its generation.
         let format_1 = serde_json::json!({
             "format_version": 1,
             "index_uuid": index.uuid.to_string(),
@@ -843,7 +843,7 @@ mod tests {
             "sha256:english",
             &running("sha256:native"),
         ));
-        assert!(reason.contains("edition 2's analysis"), "{reason}");
+        assert!(reason.contains("GQ 2's analysis"), "{reason}");
     }
 
     /// The certificate this binary writes records its own measured native

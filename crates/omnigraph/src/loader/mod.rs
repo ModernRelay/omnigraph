@@ -187,7 +187,7 @@ impl LoadMode {
     /// Every mode's name, in the order a refusal lists them.
     pub const NAMES: [&'static str; 4] = ["insert", "upsert", "replace", "overwrite"];
 
-    /// The mode a name spells. Edition 2's `append` and `merge` are refused
+    /// The mode a name spells. GQ 2's `append` and `merge` are refused
     /// with the name that now means what they meant.
     pub fn parse(name: &str) -> std::result::Result<Self, String> {
         match name {
@@ -204,7 +204,7 @@ impl LoadMode {
     }
 }
 
-/// The refusal of an edition-2 load mode name, naming its replacement.
+/// The refusal of a GQ 2 load mode name, naming its replacement.
 pub fn removed_mode_message(old: &str, new: &str) -> String {
     format!(
         "the load mode `{old}` was removed; write `{new}`, which means what `{old}` meant \

@@ -1136,21 +1136,21 @@ are lowered only at execution ([explain-load.md](../user/queries/explain-load.md
 Destination hydration uses the planned projection; edge-property attach
 retains its complete property projection.
 
-### Store requests edition 3 adds over edition 2
+### Store requests GQ 3 adds over GQ 2
 
-The cross-edition job measures every step both editions run under the
-simulation (`scripts/cross-edition.py --measure`). After the dropped end scans
+The cross-version job measures every step both versions run under the
+simulation (`scripts/cross-version.py --measure`). After the dropped end scans
 above, three mechanisms still make some steps issue more store requests than
-edition 2's text did, all on the simulation's one-fragment tables, where a
+GQ 2's text did, all on the simulation's one-fragment tables, where a
 fixed per-read cost is not repaid; none adds stored state, and fixing any of
 them would choose an access path by table size, a statistic the planner does
 not read (invariants deny-list), or change Lance:
 
-- An index probe where edition 2 scanned. A key equality, `in` list or
+- An index probe where GQ 2 scanned. A key equality, `in` list or
   String `@index` predicate probes its BTREE (or NGRAM) whatever the table's
-  size, a fixed rule; edition 2 could not use a String key's index there. The
+  size, a fixed rule; GQ 2 could not use a String key's index there. The
   probe reads the index's root and one page (two requests), which exceeds the
-  one data file edition 2's scan read. At more than a few fragments the probe
+  one data file GQ 2's scan read. At more than a few fragments the probe
   reads fewer objects than the scan, and its cost grows with the index depth,
   not the table.
 - A page reread by concurrent index searches. Several searches of one filter
@@ -1158,14 +1158,14 @@ not read (invariants deny-list), or change Lance:
   once and each misses the same uncached page, since Lance 13's
   `search_missing_pages` reads outside its cache's loader; each search reads
   it once. The rereads are bounded by the number of searches, not by rows.
-- A filter pushed where edition 2 filtered in memory. A respelled read that
+- A filter pushed where GQ 2 filtered in memory. A respelled read that
   tests a key equality at the top level pushes it into the scan, and Lance's
   heuristic late materialization reads the filter column, then fetches the
   other projected columns (`__id`) of the matching rows: on a one-fragment
   file that is a second request for it.
 
 Writes respelled for the one-snapshot rule (a group selecting on another
-type) read that type's table too, which edition 2's sequential text did not.
+type) read that type's table too, which GQ 2's sequential text did not.
 
 ### A `limit` without `order`
 
@@ -1173,20 +1173,20 @@ A `limit` with no `order` cuts the tie rule's order (`read:1`), so it plans
 the `Sort` with no written key and the limit as its `fetch`: a streaming
 top-k over every qualifying row, keyed by identity, holding `fetch` rows, with
 the other return columns hydrated for those rows alone. It reads every row
-below it, where edition 2 stopped its scan at the first rows; its cost is a
+below it, where GQ 2 stopped its scan at the first rows; its cost is a
 sorted `limit`'s, and it grows with the qualifying rows, not with `fetch`.
 Measured 2026-11-21 with release CLIs and `--stats` on the migration matrix's
 100,000-document corpus (median of five runs, local filesystem, 2 CPUs),
 `limit 10` returning two columns:
 
-| Read | Edition 2 | GQ 3 |
+| Read | GQ 2 | GQ 3 |
 |---|---|---|
 | scan, no `order` | 24.3 ms | 72.5 ms |
 | scan, `order { $d.year desc }` | 75.5 ms | 81.9 ms |
 | `where $d.year > 2005`, no `order` | 26.6 ms | 88.1 ms |
 | `where $d.year > 2005`, `order { $d.year desc }` | 77.4 ms | 89.9 ms |
 
-Peak RSS was 269 to 276 MB for edition 2 and 282 to 283 MB for GQ 3 in every
+Peak RSS was 269 to 276 MB for GQ 2 and 282 to 283 MB for GQ 3 in every
 row: the top-k holds ten rows. A read that wants the first rows cheaply and
 can name them orders by an indexed key or narrows them in `where`.
 

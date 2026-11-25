@@ -175,7 +175,7 @@ pub(crate) enum CliLoadMode {
     Replace,
 }
 
-/// `--mode` as written: a mode, or edition 2's `append` or `merge`, which the
+/// `--mode` as written: a mode, or GQ 2's `append` or `merge`, which the
 /// load refuses as a command failure (a coded error, JSON under `--json`)
 /// rather than as a usage error.
 #[derive(Debug, Clone, Copy)]
@@ -223,7 +223,7 @@ fn parse_load_mode_arg(value: &str) -> Result<LoadModeArg, String> {
     })
 }
 
-/// `--mode`'s value, by the engine's names; edition 2's `append` and `merge`
+/// `--mode`'s value, by the engine's names; GQ 2's `append` and `merge`
 /// are refused with the mode that now means what they meant.
 fn parse_cli_load_mode(value: &str) -> Result<CliLoadMode, String> {
     Ok(match LoadMode::parse(value)? {

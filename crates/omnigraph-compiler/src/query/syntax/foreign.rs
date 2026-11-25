@@ -493,7 +493,7 @@ fn later_word(input: &str, start: usize, end: usize, prev: u8, depth: i32) -> Op
                 span: (start, semi),
                 code: Q012,
                 ..note(
-                    "a source has no edition line; delete it",
+                    "a source declares no language version; delete it",
                     Some(TextEdit {
                         start,
                         end: semi,

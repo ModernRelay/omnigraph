@@ -30,7 +30,7 @@ pub mod write;
 /// construct with its stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgrammeStage {
-    /// The break: edition 3 as sections 1 to 7 state it. A construct of the
+    /// The break: GQ 3 as sections 1 to 7 state it. A construct of the
     /// break the planner does not lower would be a defect that blocks B,
     /// reached by lowering the core term directly; the lowering tests hold
     /// that none is.

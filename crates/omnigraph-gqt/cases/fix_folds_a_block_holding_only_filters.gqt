@@ -1,12 +1,12 @@
 # issue: none
-# notes: Edition-2 text whose blocks hold only filters, or only re-mention the outer binding: each block tests the
+# notes: GQ 2 text whose blocks hold only filters, or only re-mention the outer binding: each block tests the
 # notes: row it is written on. `lint --fix` writes the scalar the block folds to (`exists` to `coalesce(φ, false)`,
-# notes: `count` to `if(…, 1, 0)`, `sum` to the value as `F64`), and its rewrite answers as edition 2 did. The hand
+# notes: `count` to `if(…, 1, 0)`, `sum` to the value as `F64`), and its rewrite answers as GQ 2 did. The hand
 # notes: rewrite is crates/omnigraph-gqt/cases/fix_folds_a_block_holding_only_filters.gqt.
 
-# notes: The hand rewrite of crates/omnigraph-gqt/edition-2/fix_folds_a_block_holding_only_filters.gqt, each step the text `lint --fix
-# notes: --review-fixes` writes for the edition-2 step: the same rows, which the Cross-Edition Comparison
-# notes: checks against edition 2, and the same typed IR, which the lint-fix edition-2 proof checks.
+# notes: The hand rewrite of crates/omnigraph-gqt/gq-2/fix_folds_a_block_holding_only_filters.gqt, each step the text `lint --fix
+# notes: --review-fixes` writes for the GQ 2 step: the same rows, which the Cross-Version Comparison
+# notes: checks against GQ 2, and the same typed IR, which the lint-fix GQ 2 proof checks.
 
 --- runner
 timeout_ms: 10000

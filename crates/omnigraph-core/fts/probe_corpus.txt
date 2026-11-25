@@ -86,7 +86,7 @@
 "\uff21\uff22\uff23 \uff41\uff42\uff43"
 "e\u0301"
 
-# Token length: no profile filters by length. Tokens of 39, 40 and 41 bytes (edition 2's
+# Token length: no profile filters by length. Tokens of 39, 40 and 41 bytes (GQ 2's
 # analysis dropped 40 or more), 40 bytes of two-byte letters, and one of 300 bytes.
 "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx short"
 "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx short"

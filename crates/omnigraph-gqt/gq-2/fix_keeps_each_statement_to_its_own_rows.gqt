@@ -1,5 +1,5 @@
 # issue: none
-# notes: Edition-2 write bodies whose `update … where` or `delete … where` is followed by an `insert`: each statement
+# notes: GQ 2 write bodies whose `update … where` or `delete … where` is followed by an `insert`: each statement
 # notes: ran once, the insert inserting one row whether the selection matched two rows or none. `lint --fix` opens a
 # notes: group for the selecting statement and keeps the insert out of it, so the rewrite inserts one row. The hand
 # notes: rewrite is crates/omnigraph-gqt/cases/fix_keeps_each_statement_to_its_own_rows.gqt.

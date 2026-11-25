@@ -138,13 +138,13 @@ pub struct PropertyShape {
     pub annotations: Vec<Annotation>,
     pub property_constraints: Vec<PropertyConstraintShape>,
     pub embed_source: Option<EmbedSourceShape>,
-    /// The analysis its `@index(fulltext, ...)` declares beyond edition 2's.
-    /// Absent from the serialized shape when edition 2's, so an edition 2
+    /// The analysis its `@index(fulltext, ...)` declares beyond GQ 2's.
+    /// Absent from the serialized shape when GQ 2's, so a GQ 2
     /// schema keeps its shape hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text: Option<FullTextAnalysis>,
     /// The distance a vector declares beyond `l2`. Absent from the
-    /// serialized shape for `l2`, written or omitted, so an edition 2 schema
+    /// serialized shape for `l2`, written or omitted, so a GQ 2 schema
     /// keeps its shape hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distance: Option<VectorDistance>,

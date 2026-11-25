@@ -586,7 +586,7 @@ fn infix_string(op: InfixStringOp, at: &SourceSpan, list: bool) -> QueryDiagnost
 fn removed_lexical_call(c: &Call) -> QueryDiagnostic {
     use crate::query::syntax::print;
     let name = c.name.as_str();
-    // The edit budget, written as edition 2's positional third argument of
+    // The edit budget, written as GQ 2's positional third argument of
     // `fuzzy` or as its option; a budget of 0 is exact membership.
     let budget_of = |v: &Expr| match v {
         Expr::Literal(Literal::Integer(0)) => None,
@@ -1050,7 +1050,7 @@ fn ranking_edits(
             let all = fresh("all");
             let mut arms = Vec::new();
             let mut ranked: Option<String> = None;
-            // Edition 2 wrote the fusion constant as a third positional
+            // GQ 2 wrote the fusion constant as a third positional
             // argument, `rrf(a, b, 60)`; it is the `k` option.
             let mut positional_k = None;
             for (i, a) in call.args.iter().enumerate() {
@@ -5186,8 +5186,8 @@ impl Ctx<'_> {
     /// Whether `insert T { … }` writes the edge type `T` rather than the node
     /// type `T`. A node type and an edge type may share a name, and the
     /// statement's form decides between them: an edge write assigns its
-    /// endpoints as `@src` and `@dst`, which no node type declares. Edition
-    /// 2's `from` and `to` select the edge too where the node type declares
+    /// endpoints as `@src` and `@dst`, which no node type declares. GQ 2's
+    /// `from` and `to` select the edge too where the node type declares
     /// no such property, so the edge's refusal prints the `@src`/`@dst` fix.
     fn insert_targets_edge(&self, type_name: &str, assignments: &[Assignment]) -> bool {
         let node = self.catalog.node_types.get(type_name);
@@ -6560,7 +6560,7 @@ impl Ctx<'_> {
                 .with_fix(format!(
                     "draw it with `from {name}(…)`, or aggregate over it in a block"
                 ));
-                // Edition 2's lexical calls are not registry rows: a read
+                // GQ 2's lexical calls are not registry rows: a read
                 // named after one shadows it, so its own call reads the
                 // read. Renaming the read lets the call mean the function.
                 if matches!(name, "search" | "match_text" | "fuzzy")
@@ -8133,16 +8133,16 @@ fn class_word(c: WriteClass) -> &'static str {
     }
 }
 
-/// Edition 2's `from:` or `to:` in an edge write: an edge's endpoints are
+/// GQ 2's `from:` or `to:` in an edge write: an edge's endpoints are
 /// assigned as `@src` and `@dst`, the names a read and a `where` use, so
-/// `from` has one meaning in edition 3. A node type may declare a property
+/// `from` has one meaning in GQ 3. A node type may declare a property
 /// named `from`, so only the type checker, which knows the target is an
 /// edge, can refuse the spelling.
 fn endpoint_respelling(end: &str, at: &SourceSpan) -> E {
     let fixed = if end == "from" { "@src" } else { "@dst" };
     let mut d = QueryDiagnostic::typecheck(
         T11,
-        format!("an edge's endpoints are assigned as `@src` and `@dst`; `{end}:` is edition 2's spelling of `{fixed}:`"),
+        format!("an edge's endpoints are assigned as `@src` and `@dst`; `{end}:` is GQ 2's spelling of `{fixed}:`"),
     )
     .with_fix(format!("{fixed}: <endpoint>"));
     if at.end > at.start {
@@ -8952,7 +8952,7 @@ fn untyped_null_refusal() -> E {
 }
 
 /// `T7` for a list compared with `=` or `!=` to a value of its element type,
-/// which edition 2's property brace on a list meant as membership
+/// which GQ 2's property brace on a list meant as membership
 /// (`$p: Person { tags: "rust" }`, whose brace fix writes `$p.tags =
 /// "rust"`): the fix is the membership test, `"rust" in $p.tags`, negated
 /// under `!=`.

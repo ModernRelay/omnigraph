@@ -722,7 +722,7 @@ fn every_refusal_reaches_a_fixed_point_within_three_passes() {
 /// The block contexts a pattern can be written in: each `⟨⟩` is the
 /// block's content. A `where` operand (`exists`, `count` and every
 /// aggregate's block, negated or compared), or an element of the `match`
-/// written the way edition 2 wrote one (a block compared among the elements,
+/// written the way GQ 2 wrote one (a block compared among the elements,
 /// `not { }`, `optional { }`).
 const BLOCK_CONTEXTS: &[&str] = &[
     "match { $p: Person } where exists { ⟨⟩ }",
@@ -742,7 +742,7 @@ const BLOCK_CONTEXTS: &[&str] = &[
     "match { $p: Person, exists { ⟨⟩ }, $q: Company }",
 ];
 
-/// The contents a block holds in edition-2 text and in edition 3, refused
+/// The contents a block holds in GQ 2 text and in GQ 3, refused
 /// or not: filters alone, a re-mention of the outer binding, triples that
 /// introduce a name, a block's own `where`, nested blocks.
 const BLOCK_CONTENTS: &[&str] = &[

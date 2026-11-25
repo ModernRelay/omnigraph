@@ -3778,16 +3778,16 @@ fn run_current(args: &[&str]) -> std::process::Output {
 }
 
 /// Every row of the one-way table, applied by the current binary over a
-/// graph the edition-2 binary created, is named by `schema plan` and
-/// `schema apply`, and the edition-2 binary then refuses the whole graph.
+/// graph the GQ 2 binary created, is named by `schema plan` and
+/// `schema apply`, and the GQ 2 binary then refuses the whole graph.
 /// A change outside the table (plain `@index` on a String, an added
 /// property, a body-level `@index` over a list) leaves a graph it still
 /// reads, and so does an explicit `l2`, which plans no step and publishes
 /// nothing.
 #[test]
-fn genuine_edition_2_storage_upgrade_names_every_one_way_schema_construct() {
+fn genuine_gq_2_storage_upgrade_names_every_one_way_schema_construct() {
     use omnigraph_compiler::schema::one_way::{ONE_WAY_CONSTRUCTS, one_way_note};
-    let Some(old) = predecessor("edition-2") else {
+    let Some(old) = predecessor("gq-2") else {
         return;
     };
     let old = old.omnigraph();
@@ -3857,7 +3857,7 @@ fn genuine_edition_2_storage_upgrade_names_every_one_way_schema_construct() {
         );
         assert!(
             !refused.status.success(),
-            "{}: the edition-2 binary still opens the graph:\n{}",
+            "{}: the GQ 2 binary still opens the graph:\n{}",
             row.id,
             String::from_utf8_lossy(&refused.stdout)
         );
@@ -3902,15 +3902,15 @@ fn genuine_edition_2_storage_upgrade_names_every_one_way_schema_construct() {
     );
 }
 
-/// The full-text rebuild is the one maintenance step the edition-2 binary
+/// The full-text rebuild is the one maintenance step the GQ 2 binary
 /// cannot read back, and its own rebuild undoes it. On a graph it indexed
 /// and then wrote past, the current `index build` recommends no full-text
-/// rebuild; the current rebuild names its one-way effect; the edition-2
+/// rebuild; the current rebuild names its one-way effect; the GQ 2
 /// binary then refuses full-text reads until its own `index rebuild --kind
 /// full-text` restores them with the same rows.
 #[test]
-fn genuine_edition_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor() {
-    let Some(old) = predecessor("edition-2") else {
+fn genuine_gq_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor() {
+    let Some(old) = predecessor("gq-2") else {
         return;
     };
     let old = old.omnigraph();
@@ -4018,7 +4018,7 @@ fn genuine_edition_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predeces
     let refused = search();
     assert!(
         !refused.status.success(),
-        "the edition-2 binary reads the rebuilt index"
+        "the GQ 2 binary reads the rebuilt index"
     );
     assert!(
         String::from_utf8_lossy(&refused.stdout).contains("requires rebuild")
@@ -4027,14 +4027,14 @@ fn genuine_edition_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predeces
         String::from_utf8_lossy(&refused.stdout)
     );
     assert_ok(
-        "the edition-2 full-text rebuild",
+        "the GQ 2 full-text rebuild",
         &run_old(
             &old,
             &["index", "rebuild", "--kind", "full-text", "--target", g],
         ),
     );
     let restored = search();
-    assert_ok("search after the edition-2 rebuild", &restored);
+    assert_ok("search after the GQ 2 rebuild", &restored);
     let rows = |out: &std::process::Output| -> serde_json::Value {
         serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["rows"].clone()
     };

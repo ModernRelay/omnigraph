@@ -31,7 +31,7 @@ load_target    = { load_kind ~ ":" ~ type_name }
 load_kind      = @{ (^"node" | ^"edge") ~ !(ASCII_ALPHANUMERIC | "_") }
 load_option    = { load_mode | load_delimiter | load_header | load_columns }
 load_mode      = { kw_mode ~ load_mode_name }
-// `append` and `merge` are edition 2's names, recognised to print their fix.
+// `append` and `merge` are GQ 2's names, recognised to print their fix.
 load_mode_name = @{ (^"overwrite" | ^"insert" | ^"upsert" | ^"replace" | ^"append" | ^"merge") ~ !(ASCII_ALPHANUMERIC | "_") }
 load_delimiter = { kw_delimiter ~ string_lit }
 load_header    = { kw_header }
@@ -376,7 +376,7 @@ assignments   = { assignment ~ (("," | missing_comma_rec) ~ assignment)* ~ ","? 
 assignment    = { (ident | endpoint_field) ~ ":" ~ (null_value | expr) | eq_assign_rec | qualified_assign_rec | meta_assign_rec }
 endpoint_field = @{ ("@src" | "@dst") ~ !(ASCII_ALPHANUMERIC | "_") }
 null_value     = { kw_null ~ &("," | "}" | ident ~ ":") }
-// Edition 2's statement `where`, recognised to print the group form. The
+// GQ 2's statement `where`, recognised to print the group form. The
 // predicate admits bare names (section 7: "where_expr admits bare names"),
 // which the fix qualifies; `operand` carries them as a recognizer.
 where_stmt     = { (kw_update ~ (variable | type_name) ~ kw_set ~ "{" ~ assignments ~ "}" | kw_delete ~ (variable | type_name)) ~ kw_where ~ expr }

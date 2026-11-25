@@ -259,7 +259,7 @@ no profile has parity: every native configuration differs from its analyzer
 on the corpus's NFC-sensitive probes and nowhere else
 (`fts_analysis::tests::native_configurations_differ_from_their_analyzers_only_by_nfc`),
 and no segment qualifies until stage L shares one analyzer between index and
-scan. A format-1 certificate, edition 2's analysis, never qualifies for a
+scan. A format-1 certificate, GQ 2's analysis, never qualifies for a
 profile. A raw `contains_tokens` scan filter names no field analysis, so it
 refuses over any column holding a segment. Every refusal is
 `FullTextIndexRebuildRequired` with a reason naming the check, raised before

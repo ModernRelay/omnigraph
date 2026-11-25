@@ -1782,7 +1782,7 @@ fn load_mode_schema_has_the_four_write_intents() {
     assert_eq!(
         values,
         HashSet::from(["insert", "upsert", "replace", "overwrite"]),
-        "edition 2's `append` and `merge` are refused, not documented"
+        "GQ 2's `append` and `merge` are refused, not documented"
     );
 }
 

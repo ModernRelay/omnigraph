@@ -4,7 +4,7 @@
 //! `tests/integration/law_refusal_soundness.rs`).
 //!
 //! With a refusal let through, the checker types the term as the claim
-//! reads it, never as an edition-2 reading would: a comparison with `null`
+//! reads it, never as a GQ 2 reading would: a comparison with `null`
 //! compares with a null of the other operand's type; a literal outside its
 //! property's domain is compared as written; a reversed triple traverses in
 //! its written order; a hop range past one hop over an edge between two

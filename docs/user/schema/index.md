@@ -73,7 +73,7 @@ search output carries those columns. A graph whose schema already declared
 either name before this reservation keeps opening; only new schemas are
 refused.
 
-On edge types the names `from` and `to` are also reserved, since edition 2
+On edge types the names `from` and `to` are also reserved, since GQ 2
 assigned endpoints with them; a write assigns them as `@src` and `@dst`. A node type and an edge type may share a name; a write's `@src`/`@dst` assignments then select the edge type ([mutations](../mutations/index.md)).
 
 ## Constraints

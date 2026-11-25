@@ -35,7 +35,7 @@ the context. The jobs it needs, and so the jobs that block `main`:
 - `lint` (`Lint (clippy)`)
 - `test` (`Test Workspace`)
 - `storage_upgrade_compatibility` (`Storage Upgrade Compatibility`)
-- `cross_edition` (`Cross-Edition Comparison`)
+- `cross_version` (`Cross-Version Comparison`)
 - `test_aws_feature` (`Test omnigraph-server --features aws`)
 
 The verdict: `success` passes; `failure` and `cancelled` fail, whether or not
@@ -43,7 +43,7 @@ the job could have skipped; `skipped` passes exactly when the job's own `if:`
 in `ci.yml` was false on this event, as the script's table restates it
 (`fmt` on a pull request or queue entry with `run_full_ci` true, `lint` there
 or on a push to `main` with `run_full_ci` true, `test` with `run_full_ci`
-true, `cross_edition` with `run_gqt` true, `graph_vocabulary_guard` off pull
+true, `cross_version` with `run_gqt` true, `graph_vocabulary_guard` off pull
 requests and queue entries; the other six never skip); a result set that is
 not exactly the table's jobs, an unsupported event, a classifier output other
 than `true`/`false`, or `run_gqt` false where `run_full_ci` is true fails.

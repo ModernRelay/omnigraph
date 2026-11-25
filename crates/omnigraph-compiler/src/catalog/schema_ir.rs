@@ -58,7 +58,7 @@ pub const FEATURE_EDGE_KEYS: &str = "edge-keys";
 /// a scorer (`@index(fulltext, analyzer = ..., scorer = ...)`,
 /// the GQ 3 RFC, section 4). Derived from the declarations at
 /// every accept; a binary that does not know it would build and certify the
-/// field's index with edition 2's analysis and rank a `scorer = "none"` field,
+/// field's index with GQ 2's analysis and rank a `scorer = "none"` field,
 /// so it refuses the IR instead.
 pub const FEATURE_FULL_TEXT_ANALYSIS: &str = "full-text-analysis";
 
@@ -2206,7 +2206,7 @@ mod tests {
             fingerprint
         );
         // A plain `@index` declares no full-text index: the feature and the
-        // field are absent, so an edition 2 schema keeps its bytes. It is
+        // field are absent, so a GQ 2 schema keeps its bytes. It is
         // still a lexical field, with the default profile's fingerprint.
         let plain = evolve(r#"node Doc { slug: String @key body: String @index }"#);
         assert!(!plain.features.contains(FEATURE_FULL_TEXT_ANALYSIS));
@@ -2237,7 +2237,7 @@ mod tests {
 
     /// A declared distance is persisted on the property and stamps the
     /// `vector-distance` feature an older binary refuses; `l2`, written or
-    /// omitted, is recorded absent, so an edition 2 schema keeps its bytes.
+    /// omitted, is recorded absent, so a GQ 2 schema keeps its bytes.
     /// A rename keeps the distance.
     #[test]
     fn vector_distance_is_persisted_and_l2_is_recorded_absent() {

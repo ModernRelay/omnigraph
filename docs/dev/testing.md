@@ -44,7 +44,7 @@ in [lance.md](lance.md).
 | A bound plan reproducing its run | `integration/plan_replay.rs`, `scrubbed_replay.rs` | [Plan replay](test-ownership.md#plan-replay) |
 | The core IR's semantics: an operator, a lowered form, a lexical rule | `crates/omnigraph-reference`, updated in the same change; GQT compares every read step on the direct engine with it | [Test layout](test-ownership.md#test-layout), [GQT README](../../crates/omnigraph-gqt/README.md#reference-comparison) |
 | A law over generated schemas, graphs and reads | The law's owner, with its nightly twin | [Generated laws](test-ownership.md#generated-laws) |
-| How the respelled corpus answers against edition 2 | `scripts/cross-edition.py` and `crates/omnigraph-gqt/cross-edition.tsv` | [Cross-edition comparison](test-ownership.md#cross-edition-comparison) |
+| How the respelled corpus answers against GQ 2 | `scripts/cross-version.py` and `crates/omnigraph-gqt/cross-version.tsv` | [Cross-version comparison](test-ownership.md#cross-version-comparison) |
 | What an operation reads or writes in storage | The DST golden and the engine `integration/*_cost.rs` curve tests | [DST storage-cost golden](#dst-storage-cost-golden) |
 | The tokens an analyzer profile emits | The full-text fingerprint golden, never refreshed alone | [Full-text fingerprint golden](test-ownership.md#full-text-fingerprint-golden) |
 | Wall time or memory | `omnigraph-bench`; evidence, never a pass/fail assertion | [Benchmark harness](test-ownership.md#benchmark-harness) |

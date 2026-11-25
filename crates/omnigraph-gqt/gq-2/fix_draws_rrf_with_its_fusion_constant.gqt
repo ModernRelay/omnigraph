@@ -1,7 +1,7 @@
 # issue: none
-# notes: Edition-2 `rrf` with its fusion constant written as a third argument, and `rrf` over a binding only a triple
+# notes: GQ 2 `rrf` with its fusion constant written as a third argument, and `rrf` over a binding only a triple
 # notes: introduces: `lint --fix` draws each with `from rrf(…, k: <constant>)` over the ranked type, the binding's type
-# notes: read from the edge's end, and the rewrite answers as edition 2 did. The hand rewrite is
+# notes: read from the edge's end, and the rewrite answers as GQ 2 did. The hand rewrite is
 # notes: crates/omnigraph-gqt/cases/fix_draws_rrf_with_its_fusion_constant.gqt.
 
 --- runner

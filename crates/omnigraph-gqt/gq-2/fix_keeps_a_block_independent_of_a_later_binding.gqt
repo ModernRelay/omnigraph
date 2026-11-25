@@ -1,7 +1,7 @@
 # issue: none
-# notes: Edition-2 blocks among the elements that name a variable a later element binds: edition 2 correlated a
+# notes: GQ 2 blocks among the elements that name a variable a later element binds: GQ 2 correlated a
 # notes: block only on the names bound before it, so the block's name was its own. `lint --fix` keeps the block at
-# notes: its place as `let $block = …`, which correlates the same way, and the rewrite answers as edition 2 did.
+# notes: its place as `let $block = …`, which correlates the same way, and the rewrite answers as GQ 2 did.
 # notes: The hand rewrite is crates/omnigraph-gqt/cases/fix_keeps_a_block_independent_of_a_later_binding.gqt.
 
 --- runner

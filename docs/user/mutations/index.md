@@ -12,7 +12,7 @@ query hire($person_id: String, $company_id: String, $role: String) {
 }
 ```
 
-An edge write assigns its endpoints as `@src` and `@dst`, the logical ids of existing nodes or bound references; edition 2's `from:` and `to:` are refused (`T11`) with that fix. Where a node type and an edge type share a name, a statement assigning `@src` or `@dst` writes the edge type and one assigning neither the node type.
+An edge write assigns its endpoints as `@src` and `@dst`, the logical ids of existing nodes or bound references; GQ 2's `from:` and `to:` are refused (`T11`) with that fix. Where a node type and an edge type share a name, a statement assigning `@src` or `@dst` writes the edge type and one assigning neither the node type.
 
 ## Statements
 

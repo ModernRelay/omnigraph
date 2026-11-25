@@ -1,7 +1,7 @@
 # issue: none
-# notes: Edition-2 text whose blocks hold only filters, or only re-mention the outer binding: each block tests the
+# notes: GQ 2 text whose blocks hold only filters, or only re-mention the outer binding: each block tests the
 # notes: row it is written on. `lint --fix` writes the scalar the block folds to (`exists` to `coalesce(φ, false)`,
-# notes: `count` to `if(…, 1, 0)`, `sum` to the value as `F64`), and its rewrite answers as edition 2 did. The hand
+# notes: `count` to `if(…, 1, 0)`, `sum` to the value as `F64`), and its rewrite answers as GQ 2 did. The hand
 # notes: rewrite is crates/omnigraph-gqt/cases/fix_folds_a_block_holding_only_filters.gqt.
 
 --- runner

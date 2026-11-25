@@ -772,7 +772,7 @@ query none() {
 }
 
 /// Every diagnostic `lint` reports carries its fix and, where the fix is
-/// machine-applicable, its byte-range edits: a parse refusal of an edition-2
+/// machine-applicable, its byte-range edits: a parse refusal of a GQ 2
 /// form, a type refusal of a removed call and a canonical form alike. The
 /// edits are exactly what `lint --fix` (`fix_source`) applies: applying the
 /// reported edits gives the text `fix_source` writes.
@@ -783,7 +783,7 @@ fn every_reported_fix_carries_the_edits_lint_fix_applies() {
     let catalog = catalog("node Person { name: String @key\n age: I32? }\n");
     for (label, source, code) in [
         (
-            "an edition-2 filter in match",
+            "a GQ 2 filter in match",
             "query q() { match { $p: Person  $p.age > 30 } return { $p.name } }",
             "Q017",
         ),

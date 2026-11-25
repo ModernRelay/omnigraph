@@ -308,7 +308,7 @@ mod tests {
     /// node kinds and checks: it asks for the query again, never decodes as
     /// invalid evidence.
     #[test]
-    fn an_edition_2_envelope_asks_for_the_query_again() {
+    fn a_gq_2_envelope_asks_for_the_query_again() {
         let mut value = serde_json::to_value(envelope()).unwrap();
         value["rules_version"] = serde_json::json!(2);
         value["semantics_version"] = serde_json::json!(2);

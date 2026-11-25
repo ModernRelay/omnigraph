@@ -866,7 +866,7 @@ fn cluster_e2e_apply_schema_query_and_noop_each_have_exact_receipts() {
     );
 }
 
-/// A stored query in edition-2 text is refused at deployment; `lint --fix
+/// A stored query in GQ 2 text is refused at deployment; `lint --fix
 /// --config` respells the configuration directory's query files against
 /// each graph's schema, and `cluster apply` through the running server, the
 /// route a user registers a stored query by, registers and serves it.
@@ -916,9 +916,9 @@ fn cluster_e2e_lint_fix_respells_a_stored_query_that_apply_then_serves() {
             ]),
     );
 
-    // The stored query as edition 2 wrote it: refused before deployment.
-    let edition_2 = "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name $p.age }\n}\n";
-    fs::write(temp.path().join("people.gq"), edition_2).unwrap();
+    // The stored query as GQ 2 wrote it: refused before deployment.
+    let gq_2 = "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name $p.age }\n}\n";
+    fs::write(temp.path().join("people.gq"), gq_2).unwrap();
     let refused = parse_stdout_json(&output_failure(
         cli()
             .args(["cluster", "validate", "--config"])

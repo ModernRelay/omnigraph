@@ -2046,9 +2046,9 @@ fn lint_fix_rewrites_the_files_of_a_directory_in_place() {
     let dir = temp.path().join("queries");
     fs::create_dir_all(dir.join("nested")).unwrap();
     let respelled = dir.join("respelled.gq");
-    let edition_2 = "mutation add($n: String) { insert Person { name: $n } }\n\
+    let gq_2 = "mutation add($n: String) { insert Person { name: $n } }\n\
                      query older() { match { $p: Person  $p.age > 30 } return { $p.name  $p.age } order { $p.age asc } }\n";
-    write_query_file(&respelled, edition_2);
+    write_query_file(&respelled, gq_2);
     let current = dir.join("nested/current.gq");
     let compiles = "query names() { match { $p: Person } return { $p.name } }\n";
     write_query_file(&current, compiles);
@@ -2108,7 +2108,7 @@ fn lint_fix_rewrites_the_files_of_a_directory_in_place() {
         ),
         "{stdout}"
     );
-    assert_eq!(fs::read_to_string(&respelled).unwrap(), edition_2);
+    assert_eq!(fs::read_to_string(&respelled).unwrap(), gq_2);
 
     let output = output_failure(&mut lint_fix(&["--json"]));
     assert_eq!(output.status.code(), Some(1));
@@ -2212,9 +2212,8 @@ fn lint_fix_over_one_file_adds_the_fix_to_the_lint_report() {
     let schema_path = temp.path().join("schema.pg");
     write_file(&schema_path, "node Person {\n    name: String @key\n}\n");
     let query_path = temp.path().join("queries.gq");
-    let edition_2 =
-        "query named($n: String) { match { $p: Person { name: $n } } return { $p.name } }\n";
-    write_query_file(&query_path, edition_2);
+    let gq_2 = "query named($n: String) { match { $p: Person { name: $n } } return { $p.name } }\n";
+    write_query_file(&query_path, gq_2);
 
     let unfixed = output_failure(
         cli()
@@ -2228,7 +2227,7 @@ fn lint_fix_over_one_file_adds_the_fix_to_the_lint_report() {
     let report: Value = serde_json::from_slice(&unfixed.stdout).unwrap();
     assert_eq!(report["status"], "error");
     assert!(report.get("fix").is_none(), "{report}");
-    assert_eq!(fs::read_to_string(&query_path).unwrap(), edition_2);
+    assert_eq!(fs::read_to_string(&query_path).unwrap(), gq_2);
 
     let output = output_success(
         cli()
@@ -2424,7 +2423,7 @@ fn load_into_feature_branch_with_replace_mode_succeeds() {
 
 /// `--mode upsert` keeps the properties a record omits, `--mode replace`
 /// writes the whole entity and `--mode insert` fails on an existing key with
-/// nothing published; edition 2's `append` and `merge` are refused at
+/// nothing published; GQ 2's `append` and `merge` are refused at
 /// argument parsing with the mode that now means what they meant.
 #[test]
 fn load_modes_are_the_write_statements_issue_1278() {

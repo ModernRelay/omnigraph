@@ -27,8 +27,8 @@ CASES = (
     "genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup",
     "genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history",
     "genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history",
-    "genuine_edition_2_storage_upgrade_names_every_one_way_schema_construct",
-    "genuine_edition_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor",
+    "genuine_gq_2_storage_upgrade_names_every_one_way_schema_construct",
+    "genuine_gq_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor",
 )
 ENGINE_CASES = (
     "a_fresh_graph_is_already_current_and_nothing_is_written",
@@ -423,7 +423,7 @@ class GuardTests(unittest.TestCase):
         job = self.storage_job()
         step = PREDECESSOR_STEP.search(job)
         self.assertIsNotNone(step)
-        self.assertEqual(required_rows(), {"stamp-13", "lance-11", "release-0.10.0", "release-0.11.0", "edition-2"})
+        self.assertEqual(required_rows(), {"stamp-13", "lance-11", "release-0.10.0", "release-0.11.0", "gq-2"})
         for before, after in (
             (step.group(0), ""),
             ("          require: true\n", "          require: false\n"),

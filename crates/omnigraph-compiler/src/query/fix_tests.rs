@@ -17,7 +17,7 @@ fn codes(report: &FixReport) -> Vec<(&str, usize)> {
         .collect()
 }
 
-/// An edition-2 source respelled over two passes: the refusals' fixes
+/// A GQ 2 source respelled over two passes: the refusals' fixes
 /// first (one pass, several codes), then the canonical form the compiling
 /// text names; the result compiles and names no canonical form.
 #[test]
@@ -250,11 +250,11 @@ fn a_suggestion_without_edits_is_no_fix() {
     assert_eq!(out.report.unfixed.len(), 1);
 }
 
-/// Edition-2 texts whose printed fixes once looped, multiplied a statement
+/// GQ 2 texts whose printed fixes once looped, multiplied a statement
 /// or stopped: each converges to a compiling text, and the fixed text is a
 /// fixed point (`lint --fix` on its own output changes nothing).
 #[test]
-fn edition_2_shapes_converge_to_a_fixed_point() {
+fn gq_2_shapes_converge_to_a_fixed_point() {
     let schema = "node Doc { name: String @key\n n: I32? }\nnode Note { text: String }\nedge Cites: Doc -> Note\n";
     let catalog = build_catalog(&parse_schema(schema).unwrap()).unwrap();
     for (source, fixed) in [

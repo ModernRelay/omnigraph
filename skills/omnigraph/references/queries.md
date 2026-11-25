@@ -631,7 +631,7 @@ query link_signal_forms_pattern($signal: String, $pattern: String) {
 ```
 
 A propertyless edge needs only `@src` and `@dst`, the logical endpoint IDs or
-bound references; edition 2's `from:` and `to:` are refused (`T11`) with that
+bound references; GQ 2's `from:` and `to:` are refused (`T11`) with that
 fix. GQ has no nested `data {}` block. A `where` reads the same names:
 `match { $x: FormsPattern } where $x.@src = $signal  delete $x`.
 

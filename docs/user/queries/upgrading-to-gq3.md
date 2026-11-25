@@ -1,10 +1,10 @@
 # Upgrading queries to GQ 3
 
-GQ 3 replaces the query language. This release parses GQ 3 only: there is no
-edition line and no older parser. A source written for an earlier release
-fails to compile like any other invalid source, and every older form that GQ 3
-refuses prints its fix, as text and as byte-range edits
-([Diagnostics](diagnostics.md)). `omnigraph lint --fix` applies those fixes
+GQ 3 replaces the query language. This release parses GQ 3 only: a source
+declares no language version, and there is no older parser. A source written
+for an earlier release fails to compile like any other invalid source, and
+every older form that GQ 3 refuses prints its fix, as text and as byte-range
+edits ([Diagnostics](diagnostics.md)). `omnigraph lint --fix` applies those fixes
 to a file, a directory or a cluster configuration's stored queries
 ([Lint](lint.md#fix)):
 

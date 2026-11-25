@@ -1,11 +1,11 @@
-//! Fix coverage over edition-2 text: how many queries the printed fixes
-//! alone respell into edition 3, and which refusal shapes still stop them
+//! Fix coverage over GQ 2 text: how many queries the printed fixes
+//! alone respell into GQ 3, and which refusal shapes still stop them
 //! (the GQ 3 RFC, section 6, "Stored sources at upgrade": every refused
-//! edition-2 form prints its fix).
+//! GQ 2 form prints its fix).
 //!
 //! An instrument, not a gate: it reads every `.gqt` case under
-//! `OMNIGRAPH_FIX_COVERAGE_DIR` (the corpus of the edition-2 merge base,
-//! less the steps edition 2 refused itself; or a
+//! `OMNIGRAPH_FIX_COVERAGE_DIR` (the corpus of the GQ 2 merge base,
+//! less the steps GQ 2 refused itself; or a
 //! directory of stored queries exported beside their schema as
 //! `<name>.pg` and `<name>.gq`, or both) and prints counts only, never query
 //! text, so it can run over a private registry. Each query goes through the
@@ -57,9 +57,9 @@ fn inputs(dir: &Path) -> Vec<(String, Vec<String>)> {
         let Some((_, schema)) = sections.iter().find(|(h, _)| h == "schema").cloned() else {
             continue;
         };
-        // A step edition 2 refused (`--- expect error`) is not a query to
-        // respell: it stays refused in both editions.
-        let refused_by_edition_2 = |i: usize| {
+        // A step GQ 2 refused (`--- expect error`) is not a query to
+        // respell: it stays refused in both versions.
+        let refused_by_gq_2 = |i: usize| {
             sections[i + 1..]
                 .iter()
                 .find(|(h, _)| h != "params")
@@ -73,7 +73,7 @@ fn inputs(dir: &Path) -> Vec<(String, Vec<String>)> {
                     || h == "mutate"
                     || h.starts_with("mutate "))
                     && b.trim_start().starts_with("query ")
-                    && !refused_by_edition_2(i)
+                    && !refused_by_gq_2(i)
             })
             .map(|i| sections[i].1.clone())
             .collect();
@@ -117,11 +117,11 @@ struct Coverage {
 }
 
 #[test]
-#[ignore = "instrument: fix coverage over the edition-2 text under OMNIGRAPH_FIX_COVERAGE_DIR"]
-fn fix_coverage_over_edition_2_text() {
+#[ignore = "instrument: fix coverage over the GQ 2 text under OMNIGRAPH_FIX_COVERAGE_DIR"]
+fn fix_coverage_over_gq_2_text() {
     let dir = std::env::var_os("OMNIGRAPH_FIX_COVERAGE_DIR")
         .map(PathBuf::from)
-        .expect("OMNIGRAPH_FIX_COVERAGE_DIR names the edition-2 text");
+        .expect("OMNIGRAPH_FIX_COVERAGE_DIR names the GQ 2 text");
     let mut coverage = Coverage::default();
     for (schema, queries) in inputs(&dir) {
         let Ok(catalog) = parse_schema(&schema)

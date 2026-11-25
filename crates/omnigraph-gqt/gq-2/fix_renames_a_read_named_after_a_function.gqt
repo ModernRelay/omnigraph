@@ -1,7 +1,7 @@
 # issue: none
-# notes: Edition-2 reads named after a registry row (`count`) or after a lexical call the body makes (`search`):
+# notes: GQ 2 reads named after a registry row (`count`) or after a lexical call the body makes (`search`):
 # notes: `lint --fix --review-fixes` renames each read (`count_2`, `search_2`), printed for review since callers
-# notes: invoke a read by its name, and the rewrite answers as edition 2 did. The hand rewrite is
+# notes: invoke a read by its name, and the rewrite answers as GQ 2 did. The hand rewrite is
 # notes: crates/omnigraph-gqt/cases/fix_renames_a_read_named_after_a_function.gqt.
 
 --- runner

@@ -1901,6 +1901,24 @@ fn a_sql_union_between_reads_prints_the_relation_function() {
     assert_eq!(d.position.map(|p| p.column), Some(53));
 }
 
+/// A leading `gq N;` line is refused as a language-version declaration a
+/// source does not make, with its deletion as the fix.
+#[test]
+fn a_language_version_line_prints_its_deletion() {
+    let body = "query q() { match { $p: Person } return { $p.name } }";
+    for line in ["gq 2;\n", "gq 3;\n"] {
+        let src = format!("{line}{body}");
+        let d = refusal_of(&src);
+        assert_eq!(d.code.as_str(), "Q012", "{d}");
+        assert_eq!(
+            d.message, "a source declares no language version; delete it",
+            "{d}"
+        );
+        let fixed = super::parse::apply_edits(&src, &d.suggestion.as_ref().unwrap().edits);
+        assert_eq!(fixed, body);
+    }
+}
+
 #[test]
 fn an_integer_literal_reads_the_whole_integer_range_issue_1279() {
     use crate::query::value::Literal;

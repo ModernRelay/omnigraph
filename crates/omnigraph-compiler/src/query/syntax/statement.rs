@@ -80,7 +80,7 @@ fn delete_removed_setting(
         })
 }
 
-/// Edition 2's load mode `append` or `merge`, refused with the mode that now
+/// GQ 2's load mode `append` or `merge`, refused with the mode that now
 /// means what it meant, as a machine-applicable rename of the word.
 fn removed_load_mode(old: &str, word: &pest::iterators::Pair<Rule>) -> QueryDiagnostic {
     let new = if old == "append" { "insert" } else { "replace" };

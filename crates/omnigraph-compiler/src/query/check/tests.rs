@@ -283,7 +283,7 @@ fn an_inner_scope_binds_a_name_new_to_it_and_reads_an_outer_one() {
         "T68",
         "query q() { match { $p: Person } where exists { $q: Person, $p knows $q } return { $p } }",
     );
-    // Edition 2's re-mention filtered the outer row; the fix is the filter.
+    // GQ 2's re-mention filtered the outer row; the fix is the filter.
     repaired(
         "query q() { match { $p: Person } where not exists { $p: Person where $p.handle = \"bob\" } return { $p } }",
         "T68",
@@ -1729,7 +1729,7 @@ fn write_groups_type_their_sinks() {
 /// are one sink with a mode; `upsert` and `replace` need a `@key` (`T92`,
 /// whose fix writes `insert`); an `update` of a key property or an edge's
 /// endpoint is `T93`; an edge's endpoints are `@src` and `@dst`, and
-/// edition 2's `from:` is refused with the fix.
+/// GQ 2's `from:` is refused with the fix.
 #[test]
 fn keyed_writes_carry_their_mode_and_refuse_identity_changes() {
     use crate::query::syntax::InsertMode;
@@ -2339,7 +2339,7 @@ fn t65_suggests_an_applicable_edit() {
             "query q($s: String, $v: Vector(3)) { match { $d: Doc } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s)) } limit 3 }",
             "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score, $d: Doc } return { $d.title } order { $score desc } limit 3 }",
         ),
-        // Edition 2's third positional argument is the fusion constant.
+        // GQ 2's third positional argument is the fusion constant.
         (
             "query q($s: String, $v: Vector(3)) { match { $d: Doc } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s), 60) } limit 3 }",
             "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score, $d: Doc } return { $d.title } order { $score desc } limit 3 }",
@@ -2396,7 +2396,7 @@ fn a_grouped_order_key_after_a_refused_item_is_refused_with_its_code() {
 }
 
 /// A read named after a registry row or an element keyword is refused
-/// (`T74`), and so is a read named after an edition-2 lexical call that
+/// (`T74`), and so is a read named after a GQ 2 lexical call that
 /// calls it in its body (`T69`: the call reads the read). The fix renames
 /// the read, printed for review since callers select a read by its name;
 /// applied, the text compiles or meets the call's own refusal.
@@ -2426,7 +2426,7 @@ fn a_read_named_after_a_function_is_renamed_for_review() {
         assert_eq!(suggestion.applicability, Applicability::NeedsReview);
         assert_eq!(apply_edits(written, &suggestion.edits), renamed);
     }
-    // Renamed, `search(…)` is edition 2's lexical call, which prints its own
+    // Renamed, `search(…)` is GQ 2's lexical call, which prints its own
     // fix.
     refused_with(
         "query search_2($s: String) { match { $d: Doc } where search($d.body, $s) return { $d.title } }",
@@ -2948,7 +2948,7 @@ fn a_null_literal_takes_the_type_its_context_fixes() {
     assert_eq!(d.fix.as_deref(), Some("$p.city is null"), "{d}");
 }
 
-/// Edition 2's property brace on a list property tested membership; its
+/// GQ 2's property brace on a list property tested membership; its
 /// brace fix writes an equality, which `T7` refuses with the membership test
 /// as its suggestion, negated under `!=`.
 #[test]
@@ -3017,7 +3017,7 @@ fn an_insert_targets_the_edge_type_sharing_a_node_types_name_by_its_endpoints_is
         missing.starts_with("T12") && missing.contains("`@dst`"),
         "{missing}"
     );
-    // Edition 2's `from:` against the shared name selects the edge, whose
+    // GQ 2's `from:` against the shared name selects the edge, whose
     // refusal prints `@src:`.
     let respelled = target(
         shared,

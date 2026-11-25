@@ -4991,7 +4991,7 @@ async fn write_max_bytes_request_override_reset_and_load_process_default() {
 
 /// The HTTP load routes take the keyed write statements' names: `upsert`
 /// keeps what a record omits, `replace` writes the whole entity and `insert`
-/// refuses an existing key with nothing published; edition 2's `append` and
+/// refuses an existing key with nothing published; GQ 2's `append` and
 /// `merge` are a 400 naming the mode that now means what they meant, before
 /// anything is read.
 #[tokio::test(flavor = "multi_thread")]

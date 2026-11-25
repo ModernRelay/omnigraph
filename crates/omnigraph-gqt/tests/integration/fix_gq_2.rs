@@ -1,14 +1,14 @@
-//! `omnigraph lint --fix` over the edition-2 corpus: the printed fixes alone
-//! respell edition-2 text into edition 3 (the GQ 3 RFC, section 6, "The
+//! `omnigraph lint --fix` over the GQ 2 corpus: the printed fixes alone
+//! respell GQ 2 text into GQ 3 (the GQ 3 RFC, section 6, "The
 //! respelling map" and "Stored sources at upgrade"), and the respelled text
 //! means what the hand rewrite in this tree means.
 //!
-//! It reads the tree of the pinned edition-2 commit
-//! (`EDITION_2_SOURCE_COMMIT` in `ci.yml`) under `OMNIGRAPH_EDITION_2_TREE`:
+//! It reads the tree of the pinned GQ 2 commit
+//! (`GQ_2_SOURCE_COMMIT` in `ci.yml`) under `OMNIGRAPH_GQ_2_TREE`:
 //! every `.gqt` case of the GQT corpus and of the benchmark catalog (a
 //! workload with the schema of the fixture `benchmarks.yaml` pairs it with)
 //! and every `.gq` file beside a `.pg` of the same stem. Each query step
-//! edition 2 ran (not one it refused) is one text, given to
+//! GQ 2 ran (not one it refused) is one text, given to
 //! [`fix_source`] with its case's schema and review fixes applied, as
 //! `lint --fix --review-fixes` would. A text whose refusals all print fixes
 //! must converge to a compiling text; one stuck at a refusal with no fix is
@@ -20,15 +20,15 @@
 //! folded into `cases/`), and the step declaring the same name at the same
 //! occurrence, counting the steps each side ran. Their typed IR, each
 //! compiled against its own case's schema, must be equal, or the difference
-//! must be a row of `lint-fix-edition-2.tsv` naming one of [`REASONS`]; a
+//! must be a row of `lint-fix-gq-2.tsv` naming one of [`REASONS`]; a
 //! row that matches no difference fails too.
 //!
-//! Edition-2 text written after the pinned commit lives in this tree under
-//! [`EDITION_2_DIR`] (a repro of a respelling defect), each case paired with
+//! GQ 2 text written after the pinned commit lives in this tree under
+//! [`GQ_2_DIR`] (a repro of a respelling defect), each case paired with
 //! the case of the same path under `cases/`, its hand rewrite. Those cases
 //! run on every run. Without the pinned tree the test skips the pinned
-//! corpus and says so; with `OMNIGRAPH_REQUIRE_EDITION_2=1`, as the
-//! `Cross-Edition Comparison` job sets, it fails instead.
+//! corpus and says so; with `OMNIGRAPH_REQUIRE_GQ_2=1`, as the
+//! `Cross-Version Comparison` job sets, it fails instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -71,11 +71,11 @@ const REASONS: &[(&str, &str)] = &[
     ),
 ];
 
-const TABLE: &str = "lint-fix-edition-2.tsv";
+const TABLE: &str = "lint-fix-gq-2.tsv";
 
-/// Edition-2 text kept in this tree, each case the edition-2 side of the
+/// GQ 2 text kept in this tree, each case the GQ 2 side of the
 /// case of the same path under `cases/`.
-const EDITION_2_DIR: &str = "crates/omnigraph-gqt/edition-2";
+const GQ_2_DIR: &str = "crates/omnigraph-gqt/gq-2";
 
 fn files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -299,8 +299,8 @@ fn catalog_of(schema: &str) -> Option<Catalog> {
 
 /// `source` with section 6's keyed-insert row applied: each `insert T { … }`
 /// over a type with `@key` written `replace T { … }`, which means what
-/// edition 2's keyed `insert` meant. No refusal prints this fix, since
-/// `insert` is edition-3 text too (a strict insert that fails with
+/// GQ 2's keyed `insert` meant. No refusal prints this fix, since
+/// `insert` is GQ 3 text too (a strict insert that fails with
 /// `key_conflict` on an existing key), so `lint --fix` leaves it; the test
 /// applies the row to tell that difference from any other.
 fn keyed_insert_as_replace(catalog: &Catalog, source: &str) -> Option<String> {
@@ -409,10 +409,10 @@ fn declarations(catalog: &Catalog, steps: &[(String, String)]) -> Declarations {
     out
 }
 
-/// The cases under [`EDITION_2_DIR`] of the tree at `root`.
-fn in_tree_edition_2(root: &Path) -> Vec<Unit> {
+/// The cases under [`GQ_2_DIR`] of the tree at `root`.
+fn in_tree_gq_2(root: &Path) -> Vec<Unit> {
     let mut cases = Vec::new();
-    files(&root.join(EDITION_2_DIR), "gqt", &mut cases);
+    files(&root.join(GQ_2_DIR), "gqt", &mut cases);
     cases.sort();
     cases
         .into_iter()
@@ -432,12 +432,12 @@ fn in_tree_edition_2(root: &Path) -> Vec<Unit> {
         .collect()
 }
 
-/// The counterpart in this tree of an edition-2 path: for a case under
-/// [`EDITION_2_DIR`], the case of the same path under `cases/`; else the same
+/// The counterpart in this tree of a GQ 2 path: for a case under
+/// [`GQ_2_DIR`], the case of the same path under `cases/`; else the same
 /// path, else the one file of the same name (preferring the path less a
 /// `v2/` part).
 fn counterpart<'a>(path: &str, current: &'a BTreeMap<String, Unit>) -> Option<&'a Unit> {
-    if let Some(rest) = path.strip_prefix(EDITION_2_DIR) {
+    if let Some(rest) = path.strip_prefix(GQ_2_DIR) {
         return current.get(&format!("crates/omnigraph-gqt/cases{rest}"));
     }
     if let Some(unit) = current.get(path) {
@@ -516,37 +516,34 @@ struct Counts {
 }
 
 #[test]
-fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
+fn printed_fixes_respell_the_gq_2_corpus_into_its_hand_rewrite() {
     let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let current: BTreeMap<String, Unit> = units(&here)
         .into_iter()
         .map(|u| (u.path.clone(), u))
         .collect();
-    let mut edition_2 = in_tree_edition_2(&here);
-    assert!(
-        !edition_2.is_empty(),
-        "{EDITION_2_DIR} holds no edition-2 case"
-    );
-    let pinned = std::env::var_os("OMNIGRAPH_EDITION_2_TREE").map(PathBuf::from);
+    let mut gq_2 = in_tree_gq_2(&here);
+    assert!(!gq_2.is_empty(), "{GQ_2_DIR} holds no GQ 2 case");
+    let pinned = std::env::var_os("OMNIGRAPH_GQ_2_TREE").map(PathBuf::from);
     match &pinned {
         Some(tree) => {
             let pinned = units(tree);
             assert!(
                 pinned.len() > 100,
-                "{} holds {} units: not the edition-2 tree",
+                "{} holds {} units: not the GQ 2 tree",
                 tree.display(),
                 pinned.len()
             );
-            edition_2.extend(pinned);
+            gq_2.extend(pinned);
         }
         None => {
             assert!(
-                std::env::var("OMNIGRAPH_REQUIRE_EDITION_2").as_deref() != Ok("1"),
-                "OMNIGRAPH_REQUIRE_EDITION_2=1 needs OMNIGRAPH_EDITION_2_TREE, the edition-2 checkout"
+                std::env::var("OMNIGRAPH_REQUIRE_GQ_2").as_deref() != Ok("1"),
+                "OMNIGRAPH_REQUIRE_GQ_2=1 needs OMNIGRAPH_GQ_2_TREE, the GQ 2 checkout"
             );
             println!(
-                "skipped the pinned corpus: OMNIGRAPH_EDITION_2_TREE names no edition-2 tree; {} in-tree cases run",
-                edition_2.len()
+                "skipped the pinned corpus: OMNIGRAPH_GQ_2_TREE names no GQ 2 tree; {} in-tree cases run",
+                gq_2.len()
             );
         }
     }
@@ -557,7 +554,7 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
     let mut counts = Counts::default();
     let mut paired_in_tree = 0;
     let mut comment_violations: Vec<String> = Vec::new();
-    for unit in edition_2 {
+    for unit in gq_2 {
         let catalog = unit.schema.as_deref().and_then(catalog_of);
         let Some(catalog) = catalog else {
             counts.no_schema += unit.steps.len();
@@ -601,7 +598,7 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
                 }
                 FixStatus::Unfixed => {
                     let code = out.report.unfixed[0].code.to_string();
-                    if std::env::var("OMNIGRAPH_FIX_EDITION_2_SHOW").as_deref() == Ok("1") {
+                    if std::env::var("OMNIGRAPH_FIX_GQ_2_SHOW").as_deref() == Ok("1") {
                         println!(
                             "--- stuck {} at {code}: {}",
                             unit.path, out.report.unfixed[0].message
@@ -620,7 +617,7 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
                 }
             }
         }
-        let in_tree = unit.path.starts_with(EDITION_2_DIR);
+        let in_tree = unit.path.starts_with(GQ_2_DIR);
         let Some(other) = counterpart(&unit.path, &current) else {
             assert!(!in_tree, "{}: no hand rewrite under cases/", unit.path);
             counts.no_counterpart += respelled.iter().filter(|s| !s.is_empty()).count();
@@ -690,8 +687,8 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
                 }
                 matched.insert(key);
             } else {
-                // `OMNIGRAPH_FIX_EDITION_2_SHOW=1` prints both texts.
-                if std::env::var("OMNIGRAPH_FIX_EDITION_2_SHOW").as_deref() == Ok("1") {
+                // `OMNIGRAPH_FIX_GQ_2_SHOW=1` prints both texts.
+                if std::env::var("OMNIGRAPH_FIX_GQ_2_SHOW").as_deref() == Ok("1") {
                     println!(
                         "--- {}\t{name}\t{occurrence}\t{aspect}\n{text}\n--- hand rewrite\n{hand_text}",
                         unit.path
@@ -705,13 +702,13 @@ fn printed_fixes_respell_the_edition_2_corpus_into_its_hand_rewrite() {
     let stale: Vec<&Key> = rows
         .keys()
         .filter(|k| !matched.contains(k))
-        .filter(|k| pinned.is_some() || k.case.starts_with(EDITION_2_DIR))
+        .filter(|k| pinned.is_some() || k.case.starts_with(GQ_2_DIR))
         .collect();
-    println!("in-tree edition-2 cases paired with their hand rewrite: {paired_in_tree}");
+    println!("in-tree GQ 2 cases paired with their hand rewrite: {paired_in_tree}");
     let stuck: usize = counts.stuck.values().sum();
     let stuck_without_review: usize = counts.stuck_without_review.values().sum();
     println!(
-        "edition-2 texts: {}; schema refused: {}; compiled as written: {} (of which canonical forms respelled: {}); fixed and compiled: {} ({} without review fixes); stuck: {stuck} {:?} (without review fixes: {stuck_without_review} {:?}); does not converge: {}",
+        "GQ 2 texts: {}; schema refused: {}; compiled as written: {} (of which canonical forms respelled: {}); fixed and compiled: {} ({} without review fixes); stuck: {stuck} {:?} (without review fixes: {stuck_without_review} {:?}); does not converge: {}",
         counts.texts,
         counts.no_schema,
         counts.compiled_as_written,

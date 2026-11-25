@@ -235,7 +235,7 @@ addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-u
 | `replace` | Replaced whole by ID; a property a record omits becomes null | Idempotent synchronization of complete records |
 | `overwrite` | Each node or edge type represented in the batch is replaced; other types remain | Initial load or import of a complete export |
 
-Edition 2's `append` and `merge` are refused before anything is read with `Q004`
+GQ 2's `append` and `merge` are refused before anything is read with `Q004`
 and the fix `--mode insert` or `--mode replace`, as [`load csv`](../mutations/index.md#csv-loading)
 and HTTP refuse them. A load retried after an uncertain outcome uses `upsert` or `replace`.
 

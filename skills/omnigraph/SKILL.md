@@ -187,7 +187,7 @@ The non-obvious facts that bite, then the full grammar:
 - **Result column names must be distinct** (`T25`): alias projections that would collide.
 - **Stored-query metadata**: `@description("…")` / `@instruction("…")` may follow the param list.
 - **Casing**: type names uppercase-initial (`Signal`); idents/edges lowercase-initial (`formsPattern`); variables `$`-prefixed. `//` and `/* */` comments only.
-- **Write the canonical spelling**: lowercase keywords and function names, double-quoted strings, `!=`, `concat(a, b)`, `if(c, a, b)`. `WHERE`, `'x'`, `<>`, `a || b` and `case when … end` also parse, as the same query; `lint` names each (`L212`–`L216`), and `omnigraph lint --fix` rewrites them, and edition-2 text, from the printed fixes. `==`, `&&` and `!` are refused with the fix.
+- **Write the canonical spelling**: lowercase keywords and function names, double-quoted strings, `!=`, `concat(a, b)`, `if(c, a, b)`. `WHERE`, `'x'`, `<>`, `a || b` and `case when … end` also parse, as the same query; `lint` names each (`L212`–`L216`), and `omnigraph lint --fix` rewrites them, and GQ 2 text, from the printed fixes. `==`, `&&` and `!` are refused with the fix.
 
 The compiler grammar in `crates/omnigraph-compiler/src/query/syntax/grammar.pest` is the
 single source of truth.
