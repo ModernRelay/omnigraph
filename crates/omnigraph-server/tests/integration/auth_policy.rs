@@ -128,17 +128,6 @@ async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
         let (status, _) = json_response(&app, get_request("/graphs/discovery", token)).await;
         assert_eq!(status, expected, "an unauthenticated listing is refused");
     }
-    for (path, expected) in [
-        ("/graphs", StatusCode::FORBIDDEN),
-        ("/graphs/default/schema", StatusCode::NOT_FOUND),
-        ("/graphs/default/snapshot", StatusCode::NOT_FOUND),
-    ] {
-        let (status, _) = json_response(&app, get_request(path, &identity)).await;
-        assert_eq!(
-            status, expected,
-            "default deny reads nothing, so it sees no graph: {path}"
-        );
-    }
 
     // Per-graph policies. `alpha` and `gamma` let `reader` and the identity
     // read; `alpha` protects `main` and lets `feature-reader` read only its
@@ -375,6 +364,20 @@ async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
                 StatusCode::NOT_FOUND
             },
             "the same token follows activated policy, and an unreadable graph is not found"
+        );
+    }
+    // Default deny grants an identity nothing, so it sees no graph on any
+    // route; the catalog still needs `graph_list`.
+    let app = build_app(no_policy(false));
+    for (path, expected) in [
+        ("/graphs", StatusCode::FORBIDDEN),
+        ("/graphs/default/schema", StatusCode::NOT_FOUND),
+        ("/graphs/default/snapshot", StatusCode::NOT_FOUND),
+    ] {
+        let (status, _) = json_response(&app, get_request(path, &identity)).await;
+        assert_eq!(
+            status, expected,
+            "default deny reads nothing, so it sees no graph: {path}"
         );
     }
 }
