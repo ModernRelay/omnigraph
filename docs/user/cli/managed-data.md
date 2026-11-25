@@ -99,7 +99,10 @@ universal control-plane independence. Missing or expired access uses only the
 selected provider; auth never falls back or replays an uncertain write.
 
 Managed JSON requests refuse redirects and accept at most 8 MiB of response data,
-with a 30-second deadline and at most 10 seconds to connect.
+with a 30-second deadline and at most 10 seconds to connect. A branch merge
+has a 300-second deadline instead, whether it publishes or is a dry run, and
+whether it is sent as `branch merge` or as a GQ `branch merge` statement,
+because its time grows with what both branches changed.
 A lost write response never triggers an automatic retry. Managed loads
 have the bounds below; Blob and streaming operations keep their own bounds.
 

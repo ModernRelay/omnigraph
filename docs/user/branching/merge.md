@@ -57,9 +57,14 @@ merge publishes nothing and returns `commit: null`.
 If a remote response is lost or incomplete, the merge may have committed. The
 CLI does not resubmit it automatically. Inspect the intended target changes and
 relevant history before deciding what to do next; a later head alone cannot
-identify the missing merge receipt. Against a managed target, branch merges use
-a 300-second request deadline rather than the 30-second query deadline, giving
-large merges the same allowance as bulk loads.
+identify the missing merge receipt.
+
+Against a managed target, every merge request has a 300-second deadline, the
+same as a bulk load, rather than the 30-second deadline of other requests:
+`branch merge` and the GQ `branch merge` statement, published or `as commit`,
+and the dry run of each (`branch merge --dry-run`, `branch merge … dry run`).
+A merge whose response does not arrive within that time may still have
+committed, as above; a dry run that times out changed nothing.
 
 When only the source changed a table since the merge base, a merge into a
 named branch can adopt that exact table snapshot without copying its rows.
