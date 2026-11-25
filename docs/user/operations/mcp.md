@@ -176,7 +176,6 @@ including JSON-RPC tool errors, never expose a reflected resource credential.
 | Flag | Environment | Default | Effect |
 |---|---|---|---|
 | `--mcp-allowed-host <host[:port]>`, repeatable | `OMNIGRAPH_MCP_ALLOWED_HOSTS=a,b` | none | Adds allowed `Host` values |
-| `--mcp-max-result-bytes <bytes>` | `OMNIGRAPH_MCP_MAX_RESULT_BYTES` | `1048576` (1 MiB) | Lowers the bound on successful read results and graph-backed resources (1 to 1048576; never raises it), so a broad read is refused with `result_too_large`, naming the limit, before a client that accepts less truncates it. Refusals and write results keep 1 MiB, and the best-practices references are not bounded. The bound counts the structured result and its text copy, so data gets about half of it (Claude accepts about 150,000 characters). The instructions state the limit |
 | `--mcp-setup-url <url>` | `OMNIGRAPH_MCP_SETUP_URL` | none | An `https` page (no userinfo, query or fragment; sent percent-encoded) returned as `setup` only with a successful, empty `graphs` list or `omnigraph://graphs` read, never with a refusal; the instructions tell the client to offer it. It is public operator guidance, not graph data. HTTP discovery is unchanged |
 
 Settings are read once at boot. `/mcp` lists every tool below, and each call
@@ -325,7 +324,9 @@ unknown or hidden graph, 503 for a graph that is not available. The MCP layer's
 own refusals use the same body: `unauthorized` without a verified credential,
 `too_many_requests` beyond the concurrent limit, and `cancelled`,
 `deadline_exceeded` or `result_too_large`, which only MCP sends and which carry
-no `status`. A write that may have happened, one whose call was cancelled or
+no `status`. A read over the [read budget](#limits) sends nothing: its
+`result_too_large` names the budget, and filters, a lower `limit` or fewer
+returned properties narrow it. A write that may have happened, one whose call was cancelled or
 passed its wait included, answers `outcome_unknown` with `effects: unknown`.
 
 ## Limits
@@ -333,7 +334,8 @@ passed its wait included, answers `outcome_unknown` with `effects: unknown`.
 | Limit | Value |
 |---|---|
 | Request body | 64 KiB |
-| Complete tool result, including the text copy | 1 MiB; a successful read may be bounded lower with `--mcp-max-result-bytes` |
+| Successful read, tool or graph resource, including the text copy | 96 KiB, the fixed read budget: the text copy stays under the 50,000 characters after which [Claude Code moves a result to a file](https://code.claude.com/docs/en/mcp#mcp-output-limits-and-warnings), the smallest limit a common client documents |
+| Any other result: a write's result or a refusal | 1 MiB |
 | Wait for one read | 30 seconds |
 | Wait for one write | 30 seconds; the write continues past it |
 | Concurrent tool executions | 16 |

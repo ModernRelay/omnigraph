@@ -1,6 +1,6 @@
 //! MCP tool descriptions, annotations and JSON schemas.
 
-use crate::{McpSettings, RESULT_BYTES, format_bytes};
+use crate::McpSettings;
 use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -15,6 +15,24 @@ enum Effect {
         idempotent: bool,
     },
 }
+
+/// A page of the user guide at this binary's release tag, never at `main`,
+/// so a description links the documentation of the language it accepts.
+macro_rules! guide {
+    ($path:literal) => {
+        concat!(
+            "https://github.com/ModernRelay/omnigraph/blob/v",
+            env!("CARGO_PKG_VERSION"),
+            "/",
+            $path
+        )
+    };
+}
+
+/// Every guide page a description links, for the test that each exists.
+#[cfg(test)]
+pub(super) const GUIDE_PAGES: [&str; 2] =
+    ["docs/user/queries/index.md", "docs/user/mutations/index.md"];
 
 pub(super) struct ToolSpec {
     pub(super) name: &'static str,
@@ -74,7 +92,11 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "query",
         title: "Run a read",
-        description: "Run a read: source you write in `query` in GQ, the Omnigraph query language (https://github.com/ModernRelay/omnigraph/blob/main/docs/user/queries/index.md), or a stored read by `name` (see `queries`), with `params` keyed by the declared parameter names. Call `schema` before writing source. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; with source, `name` picks one declared query when it declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Source may also be `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` or `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; or `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations, stored mutations and branch writes are refused here; `mutate` runs them. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist.",
+        description: concat!(
+            "Run a read: source you write in `query` in GQ, the Omnigraph query language (",
+            guide!("docs/user/queries/index.md"),
+            "), or a stored read by `name` (see `queries`), with `params` keyed by the declared parameter names. Call `schema` before writing source. Declare every value as a typed parameter (`query people($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } }`) and pass the values in `params`; with source, `name` picks one declared query when it declares several. Reads `branch` (default `main`) or a `snapshot`, never both. Search operators (`nearest`, `bm25`, `rrf`) need a trailing `limit`. Source may also be `branch list`, `branch diff <source> [into <target>]`, `branch merge-base …`, `branch merge … dry run` or `explain query …`, sent without `branch`, `snapshot`, `name` or `params`; or `explain load csv …`, which requires `change` permission before probing source metadata and answers the accepted load plan without reading payload bytes or publishing (`branch` allowed, never `snapshot`). Mutations, stored mutations and branch writes are refused here; `mutate` runs them. Returns `rows`, `row_count` and `graph_commit_id`, plus `ranking` for a search order: `exhaustive: false` means the vector search left index partitions unsearched, so a nearer row may exist."
+        ),
         input: query_schema,
         output: None,
         effect: Effect::Read,
@@ -170,7 +192,11 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "mutate",
         title: "Run a GQ mutation",
-        description: "Run a mutation in GQ, the Omnigraph query language (https://github.com/ModernRelay/omnigraph/blob/main/docs/user/mutations/index.md): `insert`, `update` or `delete` on `branch` (default `main`) as one atomic commit, with every value passed as a declared, typed parameter in `params`. To run a stored mutation from `queries` instead, pass its `name` and `params` without `query`. For read-modify-write, pass the `graph_commit_id` of your read as `if_graph_commit`: if the branch moved, the call fails with 412 and nothing is written; read again and reconsider, never retry without it. Returns affected counts and the exact `commit` (null for a successful no-op). Also runs `branch create`, `branch delete` and `branch merge` statements, sent without `branch`, `name` or `params`.",
+        description: concat!(
+            "Run a mutation in GQ, the Omnigraph query language (",
+            guide!("docs/user/mutations/index.md"),
+            "): `insert`, `update` or `delete` on `branch` (default `main`) as one atomic commit, with every value passed as a declared, typed parameter in `params`. To run a stored mutation from `queries` instead, pass its `name` and `params` without `query`. For read-modify-write, pass the `graph_commit_id` of your read as `if_graph_commit`: if the branch moved, the call fails with 412 and nothing is written; read again and reconsider, never retry without it. Returns affected counts and the exact `commit` (null for a successful no-op). Also runs `branch create`, `branch delete` and `branch merge` statements, sent without `branch`, `name` or `params`."
+        ),
         input: mutate_schema,
         output: None,
         effect: Effect::Destructive { idempotent: false },
@@ -248,13 +274,13 @@ const INSTRUCTIONS_HEAD: &str = concat!(
 );
 
 /// The instructions every MCP session receives, built once at boot from the
-/// settings: the configured result bound and, with a setup URL, what to do
-/// when `graphs` is empty.
+/// settings: the read budget and, with a setup URL, what to do when `graphs`
+/// is empty.
 pub(super) fn instructions(settings: &McpSettings) -> String {
     let mut text = String::from(INSTRUCTIONS_HEAD);
     text.push_str(&format!(
-        "Reads carry their `graph_commit_id`. A read's result is limited to {} and a read to 30 seconds; narrow the query with filters or `limit` when a result is too large. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
-        format_bytes(settings.result_bytes.min(RESULT_BYTES)),
+        "Reads carry their `graph_commit_id`. A read's result is limited to {}, its text copy included, and a read to 30 seconds. A broader read is refused with `result_too_large`, never cut short: narrow it with filters, a lower `limit` or fewer returned properties. A refused call returns `isError` with the HTTP `status` and the server's `error` body, or an MCP `code` and `message`.",
+        settings.read_budget,
     ));
     if settings.setup_url.is_some() {
         text.push_str("\nIf `graphs` succeeds with no graphs and returns a `setup` link, tell the user they have no graph yet and offer that link to create one. Creation happens on that page, not through these tools. Don't say a graph exists until `graphs` lists it; when the user says they created one, call `graphs` again.");

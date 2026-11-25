@@ -19,17 +19,15 @@ pub use arguments::{
     MergeBaseArguments, MutateArguments, QueryArguments, ToolCall, ToolRequest, change_query,
 };
 pub use resources::{ResourceOutput, ResourceRequest};
-pub use result::{HostError, bounded_result, bounded_result_within};
+pub use result::{HostError, ReadBudget, bounded_result};
 pub use rmcp::model::CallToolResult as ToolResult;
-pub use settings::{
-    MCP_ALLOWED_HOSTS_ENV, MCP_MAX_RESULT_BYTES_ENV, MCP_SETUP_URL_ENV, McpSettings, format_bytes,
-};
+pub use settings::{MCP_ALLOWED_HOSTS_ENV, MCP_SETUP_URL_ENV, McpSettings, format_bytes};
 
 use axum::Router;
 use axum::http::{StatusCode, request::Parts};
 use catalog::*;
 use resources::*;
-use result::{check_result, encodes_within};
+use result::encodes_within;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
     ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
@@ -40,6 +38,7 @@ use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
+use serde::Serialize;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -78,10 +77,10 @@ pub enum ProtocolError {
     Capacity,
     Cancelled,
     Deadline,
-    /// The encoded result exceeded `limit` bytes, the configured bound.
-    ResultTooLarge {
-        limit: usize,
-    },
+    /// The encoded result exceeded [`RESULT_BYTES`], the memory cap.
+    ResultTooLarge,
+    /// A successful read's encoded result exceeded the read budget.
+    ReadOverBudget(ReadBudget),
     InvalidResult,
 }
 
@@ -146,7 +145,7 @@ where
         host,
         version,
         slots: Arc::new(Semaphore::new(16)),
-        result_bytes: settings.result_bytes.min(RESULT_BYTES),
+        read_budget: settings.read_budget,
         instructions: Arc::from(instructions(&settings)),
     };
     let service = StreamableHttpService::new(
@@ -162,11 +161,8 @@ struct GraphTools<H> {
     host: H,
     version: String,
     slots: Arc<Semaphore>,
-    /// [`McpSettings::result_bytes`], applied to successful read results and
-    /// graph-backed resource reads. Refusals and write results keep
-    /// [`RESULT_BYTES`], so a low bound never hides what a call did; the
-    /// compiled-in references are fixed text and are not bounded.
-    result_bytes: usize,
+    /// [`McpSettings::read_budget`], which [`GraphTools::fit`] applies.
+    read_budget: ReadBudget,
     /// Built once at boot from the settings.
     instructions: Arc<str>,
 }
@@ -207,8 +203,9 @@ impl Refusal {
             }
             Self::Protocol(ProtocolError::Cancelled) => "the read was cancelled",
             Self::Protocol(ProtocolError::Deadline) => "the read exceeded its 30 second deadline",
-            Self::Protocol(ProtocolError::ResultTooLarge { .. }) => {
-                "the resource exceeds the result bound"
+            Self::Protocol(ProtocolError::ResultTooLarge) => "the resource exceeds 1 MiB",
+            Self::Protocol(ProtocolError::ReadOverBudget(_)) => {
+                "the resource exceeds the read budget"
             }
             Self::Protocol(ProtocolError::InvalidResult) => "could not encode MCP resource",
         };
@@ -250,14 +247,35 @@ where
 }
 
 impl<H: Host> GraphTools<H> {
-    fn fit_result(&self, result: ToolResult, write: bool) -> ToolResult {
-        let limit = if write || result.is_error == Some(true) {
-            RESULT_BYTES
+    /// The one judgement of a complete result's size, text copy included,
+    /// chosen by what the call does. A successful read must fit the read
+    /// budget, so a client takes it in whole and the model is told to narrow
+    /// a broad read rather than handed a truncated one. A write's result and
+    /// every refusal keep the memory cap, so the budget never hides what a
+    /// call did. The compiled-in references are fixed text and never reach
+    /// it.
+    fn fit<T: Serialize>(
+        &self,
+        result: &T,
+        write: bool,
+        refused: bool,
+    ) -> Result<(), ProtocolError> {
+        if write || refused {
+            encodes_within(result, RESULT_BYTES)
+                .then_some(())
+                .ok_or(ProtocolError::ResultTooLarge)
         } else {
-            self.result_bytes
-        };
-        check_result(result, limit)
-            .unwrap_or_else(|error| self.host.error(error, write).into_tool_result())
+            encodes_within(result, self.read_budget.bytes())
+                .then_some(())
+                .ok_or(ProtocolError::ReadOverBudget(self.read_budget))
+        }
+    }
+
+    fn fit_result(&self, result: ToolResult, write: bool) -> ToolResult {
+        match self.fit(&result, write, result.is_error == Some(true)) {
+            Ok(()) => result,
+            Err(error) => self.host.error(error, write).into_tool_result(),
+        }
     }
 
     async fn run_tool<C>(
@@ -422,13 +440,10 @@ impl<H: Host> ServerHandler for GraphTools<H> {
                 let result = ReadResourceResult::new(vec![
                     ResourceContents::text(text, uri).with_mime_type(mime_type),
                 ]);
-                if !encodes_within(&result, self.result_bytes) {
-                    return Err(Refusal::Protocol(ProtocolError::ResultTooLarge {
-                        limit: self.result_bytes.min(RESULT_BYTES),
-                    })
-                    .resource_error(&self.host));
+                match self.fit(&result, false, false) {
+                    Ok(()) => Ok(result.into()),
+                    Err(error) => Err(Refusal::Protocol(error).resource_error(&self.host)),
                 }
-                Ok(result.into())
             }
             Err(refusal) => Err(refusal.resource_error(&self.host)),
         }

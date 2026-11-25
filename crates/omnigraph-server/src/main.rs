@@ -71,12 +71,6 @@ struct Cli {
     /// comma-separated from `OMNIGRAPH_MCP_ALLOWED_HOSTS`.
     #[arg(long = "mcp-allowed-host", value_name = "HOST")]
     mcp_allowed_hosts: Vec<String>,
-    /// Lower the bound on one encoded MCP tool result, in bytes, from the
-    /// default 1 MiB (1048576), so a broad read is refused with
-    /// `result_too_large` before a client truncates it. Accepts 1 to 1048576;
-    /// also read from `OMNIGRAPH_MCP_MAX_RESULT_BYTES`.
-    #[arg(long = "mcp-max-result-bytes", value_name = "BYTES")]
-    mcp_max_result_bytes: Option<usize>,
     /// An `https` page where a user can create a graph. When a caller's
     /// `graphs` list is successful and empty, MCP returns it as a `setup`
     /// link. No userinfo, query or fragment; also read from
@@ -96,11 +90,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let mcp = McpSettings::resolve(
-        cli.mcp_allowed_hosts,
-        cli.mcp_max_result_bytes,
-        cli.mcp_setup_url,
-    )?;
+    let mcp = McpSettings::resolve(cli.mcp_allowed_hosts, cli.mcp_setup_url)?;
     if let Some(receipt_path) = cli.bootstrap_handoff.as_deref() {
         let shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
         let settings = load_server_settings_with_bootstrap_handoff(

@@ -1,7 +1,5 @@
 use super::*;
-use crate::settings::{
-    SETUP_URL_BYTES, validate_allowed_host, validate_result_bytes, validate_setup_url,
-};
+use crate::settings::{SETUP_URL_BYTES, validate_allowed_host, validate_setup_url};
 use serde_json::json;
 
 #[test]
@@ -17,9 +15,8 @@ fn refusals_delegate_write_context_and_preserve_resource_error_data() {
         ProtocolError::Capacity,
         ProtocolError::Cancelled,
         ProtocolError::Deadline,
-        ProtocolError::ResultTooLarge {
-            limit: RESULT_BYTES,
-        },
+        ProtocolError::ResultTooLarge,
+        ProtocolError::ReadOverBudget(ReadBudget::DEFAULT),
         ProtocolError::InvalidResult,
     ] {
         for write in [false, true] {
@@ -146,7 +143,7 @@ fn complete_tool_result_including_legacy_text_has_one_byte_bound() {
     let result = bounded_result(&small).unwrap();
     assert_eq!(result.is_error, Some(false));
     assert_eq!(result.structured_content, Some(small));
-    let service = test_service(RESULT_BYTES);
+    let service = test_service(ReadBudget::new(RESULT_BYTES).unwrap());
     // The first source fits but its structured + legacy text envelope does
     // not. Both limits must return an error, not disguise a completed write
     // as an ordinary successful handler return.
@@ -156,111 +153,105 @@ fn complete_tool_result_including_legacy_text_has_one_byte_bound() {
     ] {
         assert_eq!(
             bounded_result(&value).unwrap_err(),
-            ProtocolError::ResultTooLarge {
-                limit: RESULT_BYTES
-            }
+            ProtocolError::ResultTooLarge
         );
         assert!(matches!(
             HostError::from_output(None, &value),
-            Err(ProtocolError::ResultTooLarge {
-                limit: RESULT_BYTES
-            })
+            Err(ProtocolError::ResultTooLarge)
         ));
-        for write in [false, true] {
-            let result = service.fit_result(CallToolResult::structured(value.clone()), write);
-            assert_eq!(
-                result.structured_content,
-                Some(json!({
-                    "error": {
-                        "event": format!("ResultTooLarge {{ limit: {RESULT_BYTES} }}"),
-                        "write": write
-                    }
-                }))
-            );
-            assert!(serde_json::to_vec(&result).unwrap().len() <= RESULT_BYTES);
-        }
+        let write = service.fit_result(CallToolResult::structured(value.clone()), true);
+        assert_eq!(
+            write.structured_content,
+            Some(json!({"error": {"event": "ResultTooLarge", "write": true}}))
+        );
+        assert!(serde_json::to_vec(&write).unwrap().len() <= RESULT_BYTES);
+        // A read is judged by its budget, here the whole cap.
+        let read = service.fit_result(CallToolResult::structured(value.clone()), false);
+        assert_eq!(
+            read.structured_content,
+            Some(json!({
+                "error": {"event": format!("ReadOverBudget({:?})", service.read_budget), "write": false}
+            }))
+        );
     }
 }
 
-fn test_service(result_bytes: usize) -> GraphTools<HeldHost> {
+fn test_service(read_budget: ReadBudget) -> GraphTools<HeldHost> {
     let settings = McpSettings {
-        result_bytes,
+        read_budget,
         ..McpSettings::default()
     };
     GraphTools {
         host: HeldHost::default(),
         version: "test".into(),
         slots: Arc::new(Semaphore::new(1)),
-        result_bytes,
+        read_budget,
         instructions: Arc::from(instructions(&settings)),
     }
 }
 
+/// The budget holds 1 byte to the memory cap and nothing else, and the
+/// default is the documented smallest client limit: a text copy of at most
+/// 50,000 characters.
 #[test]
-fn a_configured_result_bound_lowers_the_limit_and_names_it() {
-    let limit = 128 * 1024;
-    let value = json!({"text": "x".repeat(limit)});
-    assert!(bounded_result(&value).is_ok());
-    assert_eq!(
-        bounded_result_within(&value, limit).unwrap_err(),
-        ProtocolError::ResultTooLarge { limit }
-    );
-    // A bound above the built-in one never raises it.
-    let large = json!({"text": "x".repeat(RESULT_BYTES)});
-    assert_eq!(
-        bounded_result_within(&large, RESULT_BYTES * 2).unwrap_err(),
-        ProtocolError::ResultTooLarge {
-            limit: RESULT_BYTES
-        }
-    );
-    let service = test_service(limit);
-    let result = service.fit_result(CallToolResult::structured(value), false);
-    assert_eq!(
-        result.structured_content,
-        Some(json!({
-            "error": {"event": format!("ResultTooLarge {{ limit: {limit} }}"), "write": false}
-        }))
-    );
-    // A refusal keeps the built-in bound, so it is never itself refused.
-    assert!(serde_json::to_vec(&result).unwrap().len() <= RESULT_BYTES);
+fn a_read_budget_is_never_zero_or_above_the_cap() {
+    assert_eq!(ReadBudget::new(0), None);
+    assert_eq!(ReadBudget::new(RESULT_BYTES + 1), None);
+    assert_eq!(ReadBudget::new(1).unwrap().bytes(), 1);
+    assert_eq!(ReadBudget::new(RESULT_BYTES).unwrap().bytes(), RESULT_BYTES);
+    assert_eq!(ReadBudget::default(), ReadBudget::DEFAULT);
+    assert_eq!(ReadBudget::DEFAULT.to_string(), "96 KiB");
+    assert!(ReadBudget::DEFAULT.bytes() / 2 <= 50_000);
+    assert_eq!(McpSettings::default().read_budget, ReadBudget::DEFAULT);
 }
 
-/// A low bound applies only to successful reads: a refusal larger than the
-/// bound, on a read or a write, and a write receipt larger than the bound
-/// both arrive unchanged, so the caller still learns what the call did.
+/// The budget applies to successful reads only, tool results and graph
+/// resources alike: a refusal larger than it, on a read or a write, and a
+/// write receipt larger than it arrive unchanged, so the caller still learns
+/// what the call did. A read over it is refused, naming it.
 #[test]
-fn a_low_result_bound_never_replaces_a_refusal_or_a_write_result() {
-    let limit = 256;
-    let service = test_service(limit);
+fn the_read_budget_bounds_successful_reads_and_nothing_else() {
+    let budget = ReadBudget::new(256).unwrap();
+    let service = test_service(budget);
+    let over = ProtocolError::ReadOverBudget(budget);
     let refusal = HostError::from_output(
         Some(StatusCode::PRECONDITION_FAILED),
-        &json!({"code": "precondition_failed", "error": "x".repeat(limit)}),
+        &json!({"code": "precondition_failed", "error": "x".repeat(256)}),
     )
     .unwrap()
     .into_tool_result();
-    assert!(serde_json::to_vec(&refusal).unwrap().len() > limit);
+    assert!(serde_json::to_vec(&refusal).unwrap().len() > 256);
     for write in [false, true] {
-        let result = service.fit_result(refusal.clone(), write);
-        assert_eq!(result, refusal, "write: {write}");
+        assert_eq!(service.fit_result(refusal.clone(), write), refusal);
     }
-    let receipt = CallToolResult::structured(json!({"receipt": "x".repeat(limit)}));
+    let receipt = CallToolResult::structured(json!({"receipt": "x".repeat(256)}));
     assert_eq!(service.fit_result(receipt.clone(), true), receipt);
     let read = service.fit_result(receipt, false);
-    assert_eq!(read.is_error, Some(true));
+    assert_eq!(
+        read.structured_content,
+        Some(json!({"error": {"event": format!("{over:?}"), "write": false}}))
+    );
+    let fits = CallToolResult::structured(json!({"rows": []}));
+    assert_eq!(service.fit_result(fits.clone(), false), fits);
+    let resource = ReadResourceResult::new(vec![ResourceContents::text(
+        "x".repeat(256),
+        "omnigraph://graphs/g/schema",
+    )]);
+    assert_eq!(service.fit(&resource, false, false), Err(over));
+    // The same bytes within budget pass, and a larger budget admits them.
+    let small = ReadResourceResult::new(vec![ResourceContents::text(
+        "x",
+        "omnigraph://graphs/g/schema",
+    )]);
+    assert_eq!(service.fit(&small, false, false), Ok(()));
+    assert_eq!(
+        test_service(ReadBudget::DEFAULT).fit(&resource, false, false),
+        Ok(())
+    );
 }
 
 #[test]
-fn result_bound_and_setup_url_settings_are_validated() {
-    for bytes in [1, 128 * 1024, RESULT_BYTES] {
-        assert!(validate_result_bytes(bytes, "--flag").is_ok(), "{bytes}");
-    }
-    for bytes in [0, RESULT_BYTES + 1] {
-        let error = validate_result_bytes(bytes, MCP_MAX_RESULT_BYTES_ENV).unwrap_err();
-        assert!(
-            error.to_string().starts_with(MCP_MAX_RESULT_BYTES_ENV),
-            "{error}"
-        );
-    }
+fn setup_urls_are_validated() {
     for (url, sent) in [
         (
             "https://platform.example.com/setup",
@@ -302,63 +293,52 @@ fn result_bound_and_setup_url_settings_are_validated() {
 
 /// Each flag wins over its environment variable, which wins over the
 /// default; allowed hosts come from both. An invalid value names its source.
+/// Nothing in either sets the read budget.
 #[test]
 fn settings_resolve_flags_over_environment() {
     let env = |name: &str| match name {
         MCP_ALLOWED_HOSTS_ENV => Some("b.example, ,c.example:8080".to_owned()),
-        MCP_MAX_RESULT_BYTES_ENV => Some(" 65536 ".to_owned()),
         MCP_SETUP_URL_ENV => Some(" https://env.example.com/setup ".to_owned()),
+        "OMNIGRAPH_MCP_MAX_RESULT_BYTES" => Some("256".to_owned()),
         _ => None,
     };
-    let from_env = McpSettings::resolve_with(vec!["a.example".into()], None, None, env).unwrap();
+    let from_env = McpSettings::resolve_with(vec!["a.example".into()], None, env).unwrap();
     assert_eq!(
         from_env.allowed_hosts,
         ["a.example", "b.example", "c.example:8080"]
     );
-    assert_eq!(from_env.result_bytes, 65536);
     assert_eq!(
         from_env.setup_url.as_deref(),
         Some("https://env.example.com/setup")
     );
+    assert_eq!(from_env.read_budget, ReadBudget::DEFAULT);
     let from_flags = McpSettings::resolve_with(
         Vec::new(),
-        Some(4096),
         Some(" https://flag.example.com/créer ".into()),
         env,
     )
     .unwrap();
-    assert_eq!(from_flags.result_bytes, 4096);
     assert_eq!(
         from_flags.setup_url.as_deref(),
         Some("https://flag.example.com/cr%C3%A9er")
     );
-    let defaults = McpSettings::resolve_with(Vec::new(), None, None, |_| None).unwrap();
+    let defaults = McpSettings::resolve_with(Vec::new(), None, |_| None).unwrap();
     assert_eq!(defaults, McpSettings::default());
-    for (name, value) in [
-        (MCP_MAX_RESULT_BYTES_ENV, "lots"),
-        (MCP_MAX_RESULT_BYTES_ENV, "0"),
-        (MCP_SETUP_URL_ENV, "http://example.com"),
-    ] {
-        let error = McpSettings::resolve_with(Vec::new(), None, None, |asked| {
-            (asked == name).then(|| value.to_owned())
-        })
-        .unwrap_err();
-        assert!(error.to_string().starts_with(name), "{error}");
-    }
-    let error = McpSettings::resolve_with(Vec::new(), Some(0), None, |_| None).unwrap_err();
-    assert!(
-        error.to_string().starts_with("--mcp-max-result-bytes"),
-        "{error}"
-    );
+    let error = McpSettings::resolve_with(Vec::new(), None, |asked| {
+        (asked == MCP_SETUP_URL_ENV).then(|| "http://example.com".to_owned())
+    })
+    .unwrap_err();
+    assert!(error.to_string().starts_with(MCP_SETUP_URL_ENV), "{error}");
 }
 
 #[test]
-fn instructions_name_the_configured_bound_and_the_setup_step_only_when_configured() {
+fn instructions_name_the_read_budget_and_the_setup_step_only_when_configured() {
     let defaults = instructions(&McpSettings::default());
-    assert!(defaults.contains("A read's result is limited to 1 MiB"));
+    assert!(defaults.contains("A read's result is limited to 96 KiB"));
+    assert!(defaults.contains("narrow it with filters"));
     assert!(!defaults.contains("`setup`"));
     let settings = McpSettings {
-        result_bytes: 128 * 1024,
+        read_budget: ReadBudget::new(128 * 1024).unwrap(),
         setup_url: Some("https://example.com/setup".into()),
         ..McpSettings::default()
     };
@@ -367,6 +347,29 @@ fn instructions_name_the_configured_bound_and_the_setup_step_only_when_configure
     assert!(configured.contains("returns a `setup` link"));
     // The URL itself is never in the session instructions.
     assert!(!configured.contains("https://example.com/setup"));
+}
+
+/// The GQ guide links name this binary's release tag, never `main`, and
+/// every page they link exists in the tree that tag is cut from.
+#[test]
+fn guide_links_pin_the_release_tag_and_name_pages_that_exist() {
+    let tag = concat!("/blob/v", env!("CARGO_PKG_VERSION"), "/");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for page in GUIDE_PAGES {
+        assert!(root.join(page).is_file(), "{page}");
+    }
+    for (name, page) in [("query", GUIDE_PAGES[0]), ("mutate", GUIDE_PAGES[1])] {
+        let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
+        let description = tool.description.unwrap();
+        assert!(
+            description.contains(&format!("{tag}{page}")),
+            "{description}"
+        );
+    }
+    for tool in tools() {
+        let description = tool.description.unwrap_or_default();
+        assert!(!description.contains("/blob/main/"), "{}", tool.name);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -430,7 +433,7 @@ async fn cancellation_and_deadline_keep_the_host_owned_permit_until_completion()
             let host = HeldHost::default();
             let service = GraphTools {
                 host: host.clone(),
-                ..test_service(RESULT_BYTES)
+                ..test_service(ReadBudget::DEFAULT)
             };
             let result = service
                 .run_tool(

@@ -1,11 +1,9 @@
 //! Process boot settings for the MCP transport.
 
-use crate::RESULT_BYTES;
+use crate::ReadBudget;
 
 /// Comma-separated environment equivalent of repeated `--mcp-allowed-host`.
 pub const MCP_ALLOWED_HOSTS_ENV: &str = "OMNIGRAPH_MCP_ALLOWED_HOSTS";
-/// Environment equivalent of `--mcp-max-result-bytes`.
-pub const MCP_MAX_RESULT_BYTES_ENV: &str = "OMNIGRAPH_MCP_MAX_RESULT_BYTES";
 /// Environment equivalent of `--mcp-setup-url`.
 pub const MCP_SETUP_URL_ENV: &str = "OMNIGRAPH_MCP_SETUP_URL";
 
@@ -17,10 +15,10 @@ pub struct McpSettings {
     /// `Host` values admitted besides the SDK's loopback names and the OIDC
     /// resource authority, as `host` or `host:port`.
     pub allowed_hosts: Vec<String>,
-    /// The bound on one encoded tool result, including the SDK text copy.
-    /// It may only lower [`RESULT_BYTES`]: raising it would change the
-    /// server's memory contract.
-    pub result_bytes: usize,
+    /// The read budget, [`ReadBudget::DEFAULT`] unless an embedder sets
+    /// another. No flag or environment variable sets it: the budget is what
+    /// a client takes in whole, not a deployment choice.
+    pub read_budget: ReadBudget,
     /// Operator guidance returned with a successful, empty `graphs` list, so
     /// a client that can see no graph has a next step. Never a credential.
     pub setup_url: Option<String>,
@@ -30,7 +28,7 @@ impl Default for McpSettings {
     fn default() -> Self {
         Self {
             allowed_hosts: Vec::new(),
-            result_bytes: RESULT_BYTES,
+            read_budget: ReadBudget::DEFAULT,
             setup_url: None,
         }
     }
@@ -38,28 +36,23 @@ impl Default for McpSettings {
 
 impl McpSettings {
     /// The settings from their flags, each combined with or defaulted from
-    /// its environment variable: allowed hosts from both sources, the result
-    /// bound and setup URL from the flag, else the environment.
+    /// its environment variable: allowed hosts from both sources, the setup
+    /// URL from the flag, else the environment.
     ///
     /// # Errors
     ///
-    /// An allowed host that is not a bare `host` or `host:port`, a result
-    /// bound outside `1..=`[`RESULT_BYTES`], or a setup URL that is not a
-    /// plain `https` URL.
+    /// An allowed host that is not a bare `host` or `host:port`, or a setup
+    /// URL that is not a plain `https` URL.
     pub fn resolve(
         allowed_hosts: Vec<String>,
-        max_result_bytes: Option<usize>,
         setup_url: Option<String>,
     ) -> color_eyre::eyre::Result<Self> {
-        Self::resolve_with(allowed_hosts, max_result_bytes, setup_url, |name| {
-            std::env::var(name).ok()
-        })
+        Self::resolve_with(allowed_hosts, setup_url, |name| std::env::var(name).ok())
     }
 
     /// [`Self::resolve`] with the environment read through `env`.
     pub(crate) fn resolve_with(
         allowed_hosts: Vec<String>,
-        max_result_bytes: Option<usize>,
         setup_url: Option<String>,
         env: impl Fn(&str) -> Option<String>,
     ) -> color_eyre::eyre::Result<Self> {
@@ -76,24 +69,6 @@ impl McpSettings {
         for host in &hosts {
             validate_allowed_host(host)?;
         }
-        let result_bytes = match max_result_bytes {
-            Some(bytes) => {
-                validate_result_bytes(bytes, "--mcp-max-result-bytes")?;
-                bytes
-            }
-            None => match env(MCP_MAX_RESULT_BYTES_ENV) {
-                Some(value) if !value.trim().is_empty() => {
-                    let bytes = value.trim().parse::<usize>().map_err(|_| {
-                        color_eyre::eyre::eyre!(
-                            "{MCP_MAX_RESULT_BYTES_ENV} must be a whole number of bytes, got `{value}`"
-                        )
-                    })?;
-                    validate_result_bytes(bytes, MCP_MAX_RESULT_BYTES_ENV)?;
-                    bytes
-                }
-                _ => RESULT_BYTES,
-            },
-        };
         let setup_url = match setup_url {
             Some(url) => Some(validate_setup_url(url.trim(), "--mcp-setup-url")?),
             None => match env(MCP_SETUP_URL_ENV) {
@@ -105,7 +80,7 @@ impl McpSettings {
         };
         Ok(Self {
             allowed_hosts: hosts,
-            result_bytes,
+            read_budget: ReadBudget::DEFAULT,
             setup_url,
         })
     }
@@ -128,18 +103,6 @@ pub(crate) fn validate_allowed_host(host: &str) -> color_eyre::eyre::Result<()> 
     } else {
         Err(color_eyre::eyre::eyre!(
             "--mcp-allowed-host must be a host or host:port, got `{host}`"
-        ))
-    }
-}
-
-/// The result bound may only lower the built-in one. `source` names the
-/// flag or environment variable the value came from.
-pub(crate) fn validate_result_bytes(bytes: usize, source: &str) -> color_eyre::eyre::Result<()> {
-    if (1..=RESULT_BYTES).contains(&bytes) {
-        Ok(())
-    } else {
-        Err(color_eyre::eyre::eyre!(
-            "{source} must be between 1 and {RESULT_BYTES}, got {bytes}"
         ))
     }
 }
