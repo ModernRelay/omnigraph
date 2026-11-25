@@ -27,7 +27,7 @@ pub(crate) use omnigraph_core::handle_cache::TableHandleCache;
 /// instead of rebuilding it from a cold scan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GraphIndexCacheKey {
-    edge_tables: Vec<GraphIndexTableState>,
+    edge_tables: Vec<(String, Option<GraphIndexTableState>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -36,7 +36,6 @@ struct GraphIndexTableState {
     /// reincarnation ABA even when Lance version and e_tag are unavailable or
     /// repeat after drop/re-add.
     identity: crate::db::manifest::TableIdentity,
-    table_key: String,
     table_version: u64,
     /// The detached pin the version resolves to: `table_version` is a
     /// per-lineage counter, so two branches share it with different pins.
@@ -285,24 +284,26 @@ fn graph_index_cache_key(
     snapshot: &Snapshot,
     edge_types: &HashMap<String, (String, String)>,
 ) -> GraphIndexCacheKey {
-    let mut edge_tables: Vec<GraphIndexTableState> = edge_types
+    // Every requested name contributes to the key. A shelf entry may hold
+    // other live edges that did not exist in a historical snapshot.
+    let mut edge_tables: Vec<_> = edge_types
         .iter()
-        .filter_map(|(edge_name, endpoints)| {
-            let table_key = format!("edge:{}", edge_name);
-            snapshot
-                .dataset(&table_key)
-                .map(|entry| GraphIndexTableState {
-                    identity: entry.identity,
-                    table_key,
-                    table_version: entry.published_dataset_version,
-                    staged_version: entry.version_metadata.staged_version(),
-                    table_branch: entry.native_dataset_branch.clone(),
-                    e_tag: entry.version_metadata.e_tag().map(str::to_string),
-                    endpoints: endpoints.clone(),
-                })
+        .map(|(edge_name, endpoints)| {
+            let state =
+                snapshot
+                    .dataset(&format!("edge:{edge_name}"))
+                    .map(|entry| GraphIndexTableState {
+                        identity: entry.identity,
+                        table_version: entry.published_dataset_version,
+                        staged_version: entry.version_metadata.staged_version(),
+                        table_branch: entry.native_dataset_branch.clone(),
+                        e_tag: entry.version_metadata.e_tag().map(str::to_string),
+                        endpoints: endpoints.clone(),
+                    });
+            (edge_name.clone(), state)
         })
         .collect();
-    edge_tables.sort_by(|a, b| a.table_key.cmp(&b.table_key));
+    edge_tables.sort_by(|a, b| a.0.cmp(&b.0));
 
     GraphIndexCacheKey { edge_tables }
 }
@@ -499,15 +500,17 @@ mod tests {
         // Distinct keys via a distinct edge table per id (the key no longer carries
         // a snapshot id — it is the physical edge-table identity set, A1).
         GraphIndexCacheKey {
-            edge_tables: vec![GraphIndexTableState {
-                identity: crate::db::manifest::TableIdentity::new(id as u64 + 1, 1).unwrap(),
-                table_key: format!("edge:t{id}"),
-                table_version: 1,
-                staged_version: None,
-                table_branch: None,
-                e_tag: None,
-                endpoints: ("A".to_string(), "B".to_string()),
-            }],
+            edge_tables: vec![(
+                format!("t{id}"),
+                Some(GraphIndexTableState {
+                    identity: crate::db::manifest::TableIdentity::new(id as u64 + 1, 1).unwrap(),
+                    table_version: 1,
+                    staged_version: None,
+                    table_branch: None,
+                    e_tag: None,
+                    endpoints: ("A".to_string(), "B".to_string()),
+                }),
+            )],
         }
     }
 
@@ -518,7 +521,6 @@ mod tests {
     fn same_counter_different_pin_splits_both_keys_without_etag() {
         let on_main = GraphIndexTableState {
             identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
-            table_key: "edge:Knows".to_string(),
             table_version: 3,
             staged_version: Some(1 << 63 | 3),
             table_branch: None,
@@ -531,10 +533,10 @@ mod tests {
         };
         assert_ne!(
             GraphIndexCacheKey {
-                edge_tables: vec![on_main]
+                edge_tables: vec![("Knows".to_string(), Some(on_main))]
             },
             GraphIndexCacheKey {
-                edge_tables: vec![on_branch]
+                edge_tables: vec![("Knows".to_string(), Some(on_branch))]
             }
         );
 
@@ -563,7 +565,6 @@ mod tests {
     fn endpoint_remap_at_same_physical_identity_splits_cache_key() {
         let base = GraphIndexTableState {
             identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
-            table_key: "edge:Knows".to_string(),
             table_version: 7,
             staged_version: None,
             table_branch: None,
@@ -575,10 +576,10 @@ mod tests {
             ..base.clone()
         };
         let k_old = GraphIndexCacheKey {
-            edge_tables: vec![base],
+            edge_tables: vec![("Knows".to_string(), Some(base))],
         };
         let k_new = GraphIndexCacheKey {
-            edge_tables: vec![repointed],
+            edge_tables: vec![("Knows".to_string(), Some(repointed))],
         };
         assert_ne!(
             k_old, k_new,
@@ -590,7 +591,6 @@ mod tests {
     fn table_reincarnation_splits_graph_index_cache_key_without_etag_help() {
         let old_lifetime = GraphIndexTableState {
             identity: crate::db::manifest::TableIdentity::new(1, 2).unwrap(),
-            table_key: "edge:Knows".to_string(),
             table_version: 1,
             staged_version: None,
             table_branch: None,
@@ -602,10 +602,10 @@ mod tests {
             ..old_lifetime.clone()
         };
         let old_key = GraphIndexCacheKey {
-            edge_tables: vec![old_lifetime],
+            edge_tables: vec![("Knows".to_string(), Some(old_lifetime))],
         };
         let new_key = GraphIndexCacheKey {
-            edge_tables: vec![new_lifetime],
+            edge_tables: vec![("Knows".to_string(), Some(new_lifetime))],
         };
 
         let mut cache = GraphIndexCache::default();

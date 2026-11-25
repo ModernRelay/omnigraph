@@ -596,6 +596,42 @@ async fn run_query_at_traversal_uses_historical_graph_index() {
     assert!(cur_names.contains(&"Alice".to_string()));
 }
 
+#[tokio::test]
+async fn historical_exists_never_sees_an_edge_from_a_warm_live_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let before = version_main(&db).await.unwrap();
+    db.apply_schema(&format!("{TEST_SCHEMA}\nedge Likes: Person -> Person\n"))
+        .await
+        .unwrap();
+    db.load_jsonl(
+        r#"{"edge":"Likes","from":"Alice","to":"Charlie"}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    db.optimize_as(
+        None,
+        omnigraph::db::OptimizeRequest::default().with_datasets(["node:Person"]),
+    )
+    .await
+    .unwrap();
+    let csr = with_traversal(&db, Traversal::Csr);
+    let alice = params(&[("$name", "Alice")]);
+    query_main(&csr, FRIENDS_QUERY, "friends_of", &alice)
+        .await
+        .unwrap();
+    let both = r#"query both() {
+        match { $p: Person exists { $p knows $_ } exists { $p likes $_ } }
+        return { $p.name }
+    }"#;
+    let error = csr
+        .run_query_at(before, both, "both", &ParamMap::new())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Likes"), "{error}");
+}
+
 /// A historical traversal takes its graph index from the handle's cache, as a
 /// live read does: a second read of the version builds nothing, and the live
 /// head, whose edge tables are that version's, reuses the same index. Before
