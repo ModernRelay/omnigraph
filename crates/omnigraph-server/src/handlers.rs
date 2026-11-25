@@ -591,9 +591,9 @@ pub(crate) fn resolve_registered_graph(
     let message = match captured {
         RegistryCapture::Ready(handle) => return Ok(handle),
         RegistryCapture::Gone | RegistryCapture::Hidden => return Err(graph_not_found()),
-        RegistryCapture::Loading(_) => "graph is loading; wait for its startup attempt to complete",
-        RegistryCapture::Transitioning(_) => "graph admission is closed for a serving transition",
-        RegistryCapture::Blocked(_) => {
+        RegistryCapture::Loading => "graph is loading; wait for its startup attempt to complete",
+        RegistryCapture::Transitioning => "graph admission is closed for a serving transition",
+        RegistryCapture::Blocked => {
             "graph is unavailable; an operator must apply an explicit correction or restart after fixing startup configuration"
         }
     };

@@ -180,13 +180,13 @@ pub enum RegistryLookup {
     Gone,
 }
 
-/// Coherent request capture, including the effective bindings required to
-/// authorize disclosure of an unavailable graph.
+/// Coherent request capture for a caller: the graph's state, judged visible
+/// on the same snapshot before any request ownership is taken.
 pub(crate) enum RegistryCapture {
-    Loading(Arc<LoadingGraph>),
+    Loading,
     Ready(GraphRequest),
-    Transitioning(Arc<ServingView>),
-    Blocked(Arc<BlockedGraph>),
+    Transitioning,
+    Blocked,
     Gone,
     /// Registered, but not visible to the caller: answered as `Gone`.
     Hidden,
@@ -360,10 +360,10 @@ impl GraphRegistry {
                 return Ok(RegistryCapture::Hidden);
             }
             Ok(match entry {
-                GraphEntry::Loading(graph) => RegistryCapture::Loading(Arc::clone(graph)),
+                GraphEntry::Loading(_) => RegistryCapture::Loading,
                 GraphEntry::Ready(view) => RegistryCapture::Ready(view.capture()?),
-                GraphEntry::Transitioning(view) => RegistryCapture::Transitioning(Arc::clone(view)),
-                GraphEntry::Blocked(graph) => RegistryCapture::Blocked(Arc::clone(graph)),
+                GraphEntry::Transitioning(_) => RegistryCapture::Transitioning,
+                GraphEntry::Blocked(_) => RegistryCapture::Blocked,
             })
         })
     }
@@ -1166,7 +1166,7 @@ mod tests {
             pending_registry
                 .capture(&operations, &handles[0].key)
                 .unwrap(),
-            RegistryCapture::Loading(_)
+            RegistryCapture::Loading
         ));
         assert!(pending_registry.list().is_empty());
         let foreign = Arc::new(LoadingGraph {
@@ -1436,7 +1436,7 @@ mod tests {
         let transition = prepared.close().unwrap();
         assert!(matches!(
             registry.capture(&operations, &alpha.key).unwrap(),
-            RegistryCapture::Transitioning(_)
+            RegistryCapture::Transitioning
         ));
         assert!(matches!(
             registry.get(&alpha.key),
@@ -1532,7 +1532,7 @@ mod tests {
         for key in [&alpha.key, &beta.key] {
             assert!(matches!(
                 registry.capture(&operations, key).unwrap(),
-                RegistryCapture::Transitioning(_)
+                RegistryCapture::Transitioning
             ));
         }
         let peer_epoch = captured(&registry, &operations, &peer.key).epoch();
@@ -2120,7 +2120,7 @@ mod tests {
         drop(transition);
         assert!(matches!(
             registry.capture(&operations, &handle.key).unwrap(),
-            RegistryCapture::Transitioning(_)
+            RegistryCapture::Transitioning
         ));
         assert!(matches!(
             registry.prepare_same_view(&operations, &handle.key, transition_deadline()),
@@ -2212,7 +2212,7 @@ mod tests {
                 drop(request);
                 waiting.await.unwrap();
             }
-            RegistryCapture::Transitioning(_) => transition.wait_requests().await.unwrap(),
+            RegistryCapture::Transitioning => transition.wait_requests().await.unwrap(),
             _ => panic!("close/capture changed graph identity or startup state"),
         }
         transition.resume_same_view().unwrap();
