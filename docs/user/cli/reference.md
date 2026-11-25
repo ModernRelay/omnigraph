@@ -26,7 +26,7 @@ request discovers a graph to select automatically. Inline addresses are local pa
 [S3 cluster roots](../operations/s3-cluster-roots.md) for deployment, recovery and maintenance commands. Register remote
 endpoints; other cloud-direct and catalogue targets are unsupported. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
-`init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
+`init --schema graph.pg` takes the graph URI positionally (`./graph.omni`) or with `--target`.
 
 `--base URI` opens a direct graph target as a graph shallow clone of the graph
 at `URI`: a read falls through to the base where the target has no object of its
@@ -34,7 +34,12 @@ own, every write lands in the target, and the base is never written. Both are
 local directories or `s3://` prefixes of one endpoint (an S3 pair reads the
 standard `AWS_*` environment, and the clone's `s3://` prefix is named inline as
 the target, the one inline `s3://` graph the CLI admits); a target that contains
-its base, or lies inside it, is refused. The option applies to `query`, `mutate`, `load`, `branch`,
+its base, or lies inside it, is refused, also when the two `s3://` bucket names
+address one bucket or the target's bucket holds a copy of the base under the
+base's key. An `s3://` target or base is refused as well when its path holds an
+empty inner segment, a percent escape or a character a URL writes as one, the
+caret aside (`%41`, a space, a non-ASCII letter), since such a path does not
+name one object key. The option applies to `query`, `mutate`, `load`, `branch`,
 `commit`, `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`;
 maintenance and schema changes keep the one root they are given. A fresh target
 directory or prefix is a new clone; the same target again shows the clone's own
@@ -59,7 +64,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `init` | Create an empty graph from a `.pg` schema | direct |
 | `catalogue` | Query this binary's engine registries with `-e` or `--query`; optional `--json` | local, no operator config or graph storage |
 | `query` | Run a read query, or a branch read (`branch list`, `diff`, `merge-base`, `merge … dry run`), `show`, or `explain` statement | direct or served |
-| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
+| `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create` (refused with `branch_exists` when a branch holds the name), `branch delete` (also removes a [not-ready branch](../branching/index.md#branch-workflow) and finishes a pending retirement), `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `list --detailed` adds each branch's head, start and times, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
@@ -78,7 +83,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `index build` | Build a branch's missing declared indexes and refresh lagging BTREE and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
 | `index rebuild --kind full-text` | Replace full-text indexes on one branch; `rebuild-full-text-indexes` is its deprecated spelling | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
-| `graphs list` | List graph metadata or minimal identity discovery | served |
+| `graphs list` | Name your actor and list the graphs the credential holds any permission on; `--catalog` lists every graph with its state and root (`graph_list`) | served |
 | `queries list` | List stored queries: a cluster root's registry (`--graph` narrows it to one graph), or one served graph's catalog, whose `--json` is the body of `GET /graphs/{id}/queries` | cluster or served |
 | `queries validate` | Type-check a cluster's applied query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
@@ -91,12 +96,13 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `config validate` | Validate the whole operator file offline | local |
 | `config rename-profile/rename-target/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
 | `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
-| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct, server or managed |
+| `access` | Say which actions a graph's policy grants you, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)); on a served graph you hold no permission on it answers not found, and `graphs list --json` names who you are | direct, server or managed |
 | `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its resource credential, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server or managed |
 | `studio` | Open Omnigraph Studio on a server target through an `omnigraph-studio://open` link and print it; no request or credential; `--json` adds the `binding` and `home` digests ([Open Studio](studio.md)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |
 | `organization list` | List the organizations you are an active member of, marking the profile's ([your organizations](managed-team.md#find-your-organizations)) | profile |
 | `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
+| `organization m2m-applications list/create/secret rotate/delete` | List, create and delete M2M applications; deliver and rotate their client secrets only to a file ([M2M applications](managed-m2m-applications.md)) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
 | `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
@@ -207,13 +213,14 @@ omnigraph schema upgrade-system-columns --target ./graph.omni --check --json
 ```
 
 `omnigraph upgrade --target ADDRESS`
-converts a standalone v8, v9 (release 0.11.x) or v13 graph to v17, offline and
-in place, keeping branches and commit history, and stamps a v14, v15 or v16 graph
-to v17 with one metadata-only commit per live branch; stop every process using
-the graph and retain a verified whole-root backup first. `--check` writes
-nothing; `--to-format` accepts 17 only. `check_passed`, `already_current` (a
-v17 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
-other format below 14, `newer_than_binary` above 17, `unsupported_target`)
+converts a standalone v8, v9 (release 0.11.x) or v13 graph to v18, offline and
+in place, keeping branches and commit history, and stamps a v14 to v17 graph
+to v18 with one metadata-only commit per live branch, `main`'s recording every
+branch in the catalog, then removes the branch ref files; stop every process
+using the graph and retain a verified whole-root backup first. `--check` writes
+nothing; `--to-format` accepts 18 only. `check_passed`, `already_current` (a
+v18 graph with no ref file left) and `completed` exit 0; `check_failed` (`unsupported_source` for any
+other format below 14, `newer_than_binary` above 18, `unsupported_target`)
 and `recovery_required` (a pending attempt, finished as `recovery.action` says,
 or leftover recovery files) exit 1. The report names the formats, the route,
 the `work` counts, findings and the recovery action. Server and cluster

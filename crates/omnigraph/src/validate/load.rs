@@ -1999,7 +1999,7 @@ mod tests {
             .unwrap_err();
             assert_eq!(
                 refused,
-                format!("{} 'Nobody' not found in Person", sc.dst),
+                format!("edge type 'Knows': {} 'Nobody' not found in Person", sc.dst),
                 "{access:?}"
             );
 
@@ -2133,7 +2133,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             refused.to_string(),
-            format!("{} 'Carol' not found in Person", sc.dst)
+            format!(
+                "edge type 'Knows': {} 'Carol' not found in Person; the write removes that \
+                 node and keeps this committed edge",
+                sc.dst
+            )
         );
         assert_eq!(admitted, ["Carol"]);
 

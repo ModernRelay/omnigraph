@@ -1,0 +1,1 @@
+- The MCP `query` and `mutate` descriptions name GQ, the Omnigraph query language, and link its guide at the server's own revision: a stable release's tag or an edge build's commit.

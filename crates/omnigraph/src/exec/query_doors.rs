@@ -20,14 +20,6 @@ use crate::runtime_cache::{CompiledQuery, CompiledRead};
 use crate::session::Session;
 use crate::storage_layer::WriteBudget;
 
-/// Where a route builds its CSR graph index when the query traverses:
-/// the cross-query `RuntimeCache` entry of a live target, or a build against
-/// a historical snapshot.
-enum IndexSource<'a> {
-    Cached(&'a crate::db::ResolvedTarget),
-    Direct,
-}
-
 fn admit_wildcard_target(historical: bool, has_wildcard: bool) -> Result<()> {
     if historical && has_wildcard {
         return Err(CompilerError::Plan(
@@ -88,7 +80,6 @@ impl Session {
                 compiled.query(),
                 params,
                 &resolved.snapshot,
-                IndexSource::Cached(&resolved),
                 &catalog,
             )
             .await?;
@@ -97,8 +88,9 @@ impl Session {
 
     /// Run a named query against the graph at a historical snapshot version.
     ///
-    /// Compiles the query normally, builds a temporary (non-cached) graph index
-    /// if traversal is needed, and executes against the historical snapshot.
+    /// Compiles the query normally and executes against the historical
+    /// snapshot. A traversal takes its graph index from the handle's cache,
+    /// as a live read does: versions whose edge tables are the same share one.
     pub async fn run_query_at(
         &self,
         version: u64,
@@ -114,15 +106,8 @@ impl Session {
         if let CompiledRead::Explain(query) = &compiled {
             return engine::explain_rows(query, params, Some(&snapshot), &catalog, &settings).await;
         }
-        self.execute_on_route(
-            &settings,
-            compiled.query(),
-            params,
-            &snapshot,
-            IndexSource::Direct,
-            &catalog,
-        )
-        .await
+        self.execute_on_route(&settings, compiled.query(), params, &snapshot, &catalog)
+            .await
     }
 
     /// Return a named query's v2 planner document without executing the query.
@@ -248,7 +233,7 @@ impl Session {
         let graph_index = if traverses {
             engine::GraphIndexHandle::cached(
                 Arc::clone(&**self),
-                resolved.clone(),
+                resolved.snapshot.clone(),
                 engine::referenced_edge_types(&ir.pipeline, &catalog),
                 catalog.system_columns,
             )
@@ -321,7 +306,7 @@ impl Session {
         let graph_index = if engine::plan_traverses(plan) {
             engine::GraphIndexHandle::cached(
                 Arc::clone(&**self),
-                resolved.clone(),
+                resolved.snapshot.clone(),
                 engine::plan_edge_types(plan, &catalog),
                 catalog.system_columns,
             )
@@ -346,7 +331,6 @@ impl Session {
         query: &CompiledQuery,
         params: &ParamMap,
         snapshot: &Snapshot,
-        index_source: IndexSource<'_>,
         catalog: &Arc<Catalog>,
     ) -> Result<QueryResult> {
         let ir: &QueryIR = &query.ir;
@@ -366,20 +350,15 @@ impl Session {
             .pipeline
             .iter()
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
-        let graph_index = match (&index_source, needs_graph) {
-            (_, false) => engine::GraphIndexHandle::none(),
-            (IndexSource::Cached(resolved), true) => engine::GraphIndexHandle::cached(
-                Arc::clone(&**self),
-                (*resolved).clone(),
-                engine::referenced_edge_types(&ir.pipeline, catalog),
-                catalog.system_columns,
-            ),
-            (IndexSource::Direct, true) => engine::GraphIndexHandle::direct(
+        let graph_index = if needs_graph {
+            engine::GraphIndexHandle::cached(
                 Arc::clone(&**self),
                 snapshot.clone(),
                 engine::referenced_edge_types(&ir.pipeline, catalog),
                 catalog.system_columns,
-            ),
+            )
+        } else {
+            engine::GraphIndexHandle::none()
         };
         engine::execute_query(
             query,

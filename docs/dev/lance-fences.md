@@ -529,16 +529,16 @@ semantics);
 ### Branches/tags
 
 Each graph-branch lifetime is `{logical}.{ULID}`; bare names identify legacy
-lifetimes. Unretired native `__manifest/_refs/branches/` entries define logical
-branches. Deletion writes identity-bound retirement metadata, archives the exact
+lifetimes. Below storage format 18, unretired native
+`__manifest/_refs/branches/` entries define logical branches. Deletion writes identity-bound retirement metadata, archives the exact
 `BranchContents` inside its native tree, then unlinks the active ref. Needed
 native ancestry and historical merge-base providers remain readable through the
 archive. User `__manifest` tags block logical deletion; valid engine merge-input
 tags instead protect their exact snapshots until the target publication witness
 expires.
 
-Stock `Branches::get` and `list` include every physical ref. Omnigraph's logical
-manifest helpers validate and filter `omnigraph.retired_manifest_branch`, a
+Stock `Branches::get` and `list` include every physical ref. Below format 18,
+Omnigraph's logical manifest helpers validate and filter `omnigraph.retired_manifest_branch`, a
 version-1 JSON value binding the exact native name and identifier. An absent
 marker means live; malformed, unsupported, or mismatched metadata fails closed.
 The metadata update publishes retirement and preserves unrelated metadata.
@@ -551,6 +551,20 @@ historical resolution read archives. Cleanup retains required native ancestors
 and exact merge-base providers, then reclaims unneeded trees with their
 archives. Delayed staging is judged from the complete post-list identity cut and
 final capture validation, so its retirement history need not remain forever.
+
+At or above format 18 the branch set is `main`'s catalog: one config entry of
+`main`'s `__manifest` per branch, keyed `omnigraph.branch.<native name>` and
+decoded by `BranchRows`; a retired branch keeps its key with the value `-`.
+Logical enumeration (`live_named_branches`) reads `main`'s live entries with no
+ref listing. Deletion publishes an `omnigraph.tombstone` entry on the branch's
+own `__manifest`, whose readers `refuse_tombstoned` then refuses with
+`branch_deleted`, then rewrites the branch's entry on `main` as retired;
+nothing is archived and no ref is unlinked. Cleanup removes the tree of a
+retired branch that no live entry names, no tag names and no kept tree's
+`base_paths` reach, then removes the retired entry from `main`'s config,
+deferring it to a later run when that publication fails, and unlinks any ref
+file the upgrade left under `_refs/branches/`. Lance tags still pin a branch's
+tree: cleanup keeps a tagged tree and its retired entry.
 
 **Owners:** `integration/branching.rs`, `branch_control.rs` tests,
 `integration/merge_cleanup.rs`
@@ -574,9 +588,12 @@ lists `_refs/branches/` once and reads only that branch's own incarnations, so
 another branch's retirement rewrite, or its malformed retirement record, no
 longer fails a branch open or a held-ref re-resolve; fresh creation narrows content reads to its source and the target's equal,
 ancestor and descendant names.
-Operations that require a complete inventory, including logical enumeration and
-cleanup, still read every active ref; maintenance and historical resolution also
-read retirement archives. Delete the retry arm and un-ignore the guard at the
+Below format 18, operations that require a complete inventory, including
+logical enumeration and cleanup, still read every active ref; maintenance and
+historical resolution also read retirement archives. At or above format 18 no
+branch resolution or enumeration reads a ref: a branch opens by its entry's
+native name on `main`, and cleanup's only ref operation unlinks the ref files
+the upgrade left. Delete the retry arm and un-ignore the guard at the
 bump whose `from_path` reads a ref in one `get`.
 
 **Owners:** `branch_control.rs` stale-head tests (they go red at that bump),
@@ -639,18 +656,33 @@ policy.
 
 ### Bound branch create
 
-Lance 13 `Dataset::create_branch` hands its `CommitBuilder` the dataset's object
-store and store parameters but not its session. The commit writes through that
-store, but its existence probe of the new branch location
-(`DatasetBuilder::load`, a `_versions/` listing) opens on a default session,
-whose registry builds a client from the store parameters alone. A bound handle's
+A Lance 13 `CommitBuilder` handed no session runs on `Session::default()`, a
+fresh registry of Lance's own providers: for a URI destination, the existence
+probe of the new location (`DatasetBuilder::load`, a `_versions/` listing) and
+the dataset the commit returns build their clients there. That registry knows
+nothing of the graph's captured binding, its storage IO scope or, in a test or
+DST build, a simulated S3 bucket, whose name it would build a real client for
+(issue 1541). Every commit the engine makes therefore starts from
+`lance_commit::commit_builder`, whose `CommitDestination` carries the session:
+an opened dataset's own, or one named beside a URI. A branch's tree at or above
+format 18 (`lance_clone::create_branch_tree`) commits on its source's session.
+
+Lance 13 `Dataset::create_branch`, which the ref protocol below format 18 still
+calls (`lance_clone::create_branch`), hands its `CommitBuilder` the dataset's
+object store and store parameters but not its session, and the ref it writes
+next (`Branches::create`) is not public. Its commit writes through the
+dataset's store, but its probe opens on the default session. A bound handle's
 datasets carry no provider options (its registry supplies them), so
 `lance_clone::create_branch` passes the captured binding's options as those
 parameters; without them the probe reaches the ambient provider configuration.
-Drop the parameters at the bump whose `create_branch` passes the dataset's
-session.
+The probe still runs outside the storage IO scope, and a graph below format 18
+on a simulated bucket cannot create a branch. Drop the parameters, and close
+both gaps, at the bump whose `create_branch` passes the dataset's session.
 
-**Owners:** `bound_storage.rs` (S3-configured decoy)
+**Owners:**
+`lance_surface_guards.rs::create_branch_commits_its_tree_on_a_default_session_lance_13`
+(goes red at that bump), `bound_storage.rs` (S3-configured decoy),
+`issue_1541_branch_operations_on_a_simulated_bucket.gqt`
 
 ### Table forks
 
@@ -712,8 +744,10 @@ mapping)
 ### Manifest request resolution
 
 Lance 13 writes a version's manifest with one put-if-absent through the
-dataset's `CommitHandler` (`ConditionalPutCommitHandler` on local Unix, S3 and
-Azure roots). It writes the transaction file first and propagates that put's
+dataset's `CommitHandler` (`ConditionalPutCommitHandler` on local Unix, S3,
+Azure and Google Cloud Storage roots; on GCS the put-if-absent is
+`x-goog-if-generation-match: 0`, whose 412 `object_store` reports as "already
+exists"). It writes the transaction file first and propagates that put's
 failure through a plain `?`, so no manifest request was sent. On a failed
 manifest put it reads the version back (`verify_commit_outcome`), and because
 that handler calls a missing version definitive

@@ -64,13 +64,26 @@ without reloading manifest history; the publish wraps the nonce into the
 addressable commit id `hb1.<block>.<slot>.<nonce>`. The schema and branch gates serialize
 conflicting control operations. A merge holds its target's branch gate and
 per-table queues through publication, and its source's branch gate only until
-the source snapshot is captured, tagged and proved still current; it takes no
+the source snapshot is captured, tagged and proved unchanged; it takes no
 per-table queue on the source. Both gates are taken in sorted branch order, so
 a merge whose source sorts first (`main` always does) holds the source gate
 while it waits for a target another merge holds. Once the source is captured,
 writes, index builds and deletes on the source do not wait for the merge, and
 the merge's final re-read still refuses a source whose incarnation or schema
-changed.
+changed. The target's re-read refuses a moved head, incarnation, schema or
+table pin, and nothing else: a publication that changed none of them, such as
+the branch row a create or delete adds to `main`'s catalog, moves `main`'s
+manifest version and does not refuse a merge into `main`
+(`ensure_merge_input_unchanged` in `exec/merge.rs`).
+
+The input proof is a probe taken after the merge-input tags exist: a current
+probe shows that each tagged `__manifest` version is still the head. A stale
+probe re-reads both inputs and requires the same head, schema and table pins
+(`ensure_merge_input_unchanged`), so a tag can name a version that is no longer
+the head. A `cleanup` that runs in another process at that moment (`G2`) can
+remove that version. A later cleanup then fails on the tag until the merge
+releases it, and a merge `as commit` whose held source version was removed
+cannot be published. Both results fail closed.
 
 Native branch creation uses an operation-local capture of the bound coordinator
 or that same one-entry cache after the control gates. Reuse
@@ -109,12 +122,19 @@ it the commit's pins, while the branch lives.
 An unpublished commit and an unattached snapshot are detached `__manifest`
 versions that no branch history holds, and are refused.
 
-Create admission lists native ref names and reads bodies only for the source,
-the target's incarnations and logical ancestors or descendants. Physical path
-checks include retired ref names. The
-exact target ref must be absent; an empty listing of its exact native tree
-allows creation without forced reclamation. A nonempty tree and clone-only
-recovery keep Lance's full dependency and tag checks.
+At or above format 18 create admission reads `main`'s branch rows, held with
+no request: a live row whose logical name is the target, or an ancestor or
+descendant of it, refuses `branch_exists`; the row's publication on `main`'s
+version decides between two creates of one name, and the loser reloads and
+refuses before it has written a tree. The tree is then written as a shallow
+clone of the fork point (`create_branch_tree`), and a tree no row names is the
+collector's (RFC 2026-11-19, "Branch existence in the catalog"). Below the
+stamp admission lists native ref names and reads bodies only for the source,
+the target's incarnations and logical ancestors or descendants; physical path
+checks include retired ref names; the exact target ref must be absent, and an
+empty listing of its exact native tree allows creation without forced
+reclamation; a nonempty tree and clone-only recovery keep Lance's full
+dependency and tag checks.
 
 For a captured main source at a canonical attached V2 manifest, the clone
 handler reuses the known location, size and ETag while the clone call is
@@ -188,9 +208,10 @@ A branch's writer epoch is the `writer_epoch` control-fact row of its own
 row, or with a row its fork source wrote, is at epoch 0. A process holds an
 epoch for a branch only after a claim it published landed there. The holder
 registry (`omnigraph-catalog/src/writer_epoch.rs`) is process-wide, keyed by
-root identity and branch name, and records the native ref of the claim; no
-reload raises an entry, a refusal clears it, the process's own delete of the
-branch drops it, and otherwise it ends with the process.
+root identity and branch name, and records the native branch name of the
+claim (the row's at or above format 18, the ref's below); no reload raises an
+entry, a refusal clears it, the process's own delete of the branch drops it,
+and otherwise it ends with the process.
 
 Every publication that moves a branch's head asserts the epoch.
 `publish_attempts` runs the check on each attempt over the rows that attempt
@@ -203,9 +224,9 @@ proceeds on rows at `E`. Any other pair
 is refused as `WriterFenced { held, read, current }`, which is not retried
 and clears the refused entry. The check issues no request: it compares the
 loaded rows with the registry, and a process that holds no branch resolves
-no key. An entry whose native ref is not the loaded chain's is dropped, so
+no key. An entry whose native name is not the loaded chain's is dropped, so
 what a process held on a deleted branch never counts on a branch created
-again under its name. `main` has no native ref: after a root is created
+again under its name. `main` has no native name: after a root is created
 again or restored while a process still holds its `main`, that entry is
 cleared by the first refusal it meets, and until then it counts whenever
 the root's epoch equals it.
@@ -220,8 +241,9 @@ that version reads and writes from the installed head with no request; a
 handle below it, one that did not run that publication, reloads first, also
 with no probe. The sites are a read that targets the branch
 (`ReadTarget::Branch`), `resolve_snapshot`, a write's open and its
-revalidation, which ask `GraphCoordinator::head_is_current`, and its probe
-beside staging, which asks `held_head`. A merge's authority capture and
+revalidation, which ask `GraphCoordinator::head_is_current`, its probe
+beside staging, which asks `held_head`, and a plain branch listing on a
+`main`-bound handle at or above format 18, which lists the held rows. A merge's authority capture and
 revalidation, a branch create's capture of its source and the change-feed
 poll still probe the bound branch. A publish attempt that returns an error,
 or whose future is dropped, withdraws the recorded version, and a claim
@@ -239,12 +261,14 @@ its handle serves reads from its installed snapshot until a publish of its
 own loads the branch. After another process claims the branch, that publish
 is refused, which clears the holder; a write of the replaced owner that
 stages nothing probes and is prepared again on a fresh view. After another
-process deletes the branch, a ref delete that asserts no epoch, that publish
-finds the branch gone, or finds the branch created again under its name:
-there the entry's native ref is not the loaded chain's, so the entry is
-dropped and the publish proceeds at epoch 0. The process's own delete of a
-branch withdraws the recorded version before it retires the ref and drops the
-entry once the retire has landed, so its handles probe.
+process deletes the branch (a tombstone that asserts no epoch at or above
+format 18, a ref delete below it), that publish is refused `branch_deleted` by
+the tombstone its load meets, finds the branch gone, or finds the branch
+created again under its name: there the entry's native name is not the loaded
+chain's, so the entry is dropped and the publish proceeds at epoch 0. The
+process's own delete of a branch withdraws the recorded version before it
+tombstones the chain (retires the ref below the stamp) and drops the entry
+once the retirement has landed, so its handles probe.
 
 `Omnigraph::claim_branch_writer_as` claims under `branch_claim` on the branch
 it names, the shared schema permit and the branch gate, through a
@@ -268,8 +292,18 @@ nothing; the next claim settles it by landing above it.
 
 Detached candidate versions (an unpublished commit or an unattached snapshot
 before publication) carry the row and assert nothing. Writes outside the
-publisher are not fenced: Lance ref metadata and ref deletes, the collector's
-deletes, `optimize`'s configuration commit and the stamp-only upgrade route.
+publisher are not fenced: the collector's deletes and its removal of a
+retired branch's entry from `main`'s config map, `optimize`'s configuration
+commit, the stamp-only upgrade route (whose stamp commit on `main` carries
+the branch rows), and below format 18 Lance ref metadata and ref deletes.
+Branch control at or above format 18 is three publications (RFC 2026-11-19,
+"Branch existence in the catalog"): the branch row a create publishes on
+`main` and the retired row a delete publishes there assert `main`'s epoch, so
+`branch create` and `branch delete` are refused `writer_fenced` beside a
+process that claimed `main`; the tombstone a delete publishes on the branch's
+own chain asserts no epoch, since it ends the chain, so a delete of a branch
+another process holds proceeds, the holder's next publish is refused
+`branch_deleted`, and the chain keeps its last `writer_epoch` row.
 
 ## Writer adapters
 
@@ -286,14 +320,19 @@ physical-effect proofs:
 | Mutation or BranchMerge `as commit` | The writer's own physical adapter, unchanged | One unpublished commit ([RFC](../rfcs/2026-10-10-unpublished-graph-commits.md)): the complete result rows written as a detached version `D` of the target's `__manifest` with the recipe of their publication in the transaction property `omnigraph.unpublished_graph_commit`, addressed by the reserved root tag `unpublished_<id>` created put-if-absent at `D` under the same `ExactGraphHead` authority; the branch head is unchanged, a merge keeps its merge-input tags, and `commit publish "<id>"` later replays the recipe through this same door under the captured authority, required to allocate the same id |
 | Mutation `as unattached branch [on <id>]` | The writer's own physical adapter over the base's table pins: a root stages against the recorded target's live head, a child against its base snapshot's detached pins (`WriteTxn.unattached_base`, `revalidate_unattached_base`) | One unattached snapshot ([RFC](../rfcs/2026-10-11-unattached-graph-branches.md)): the complete result rows written as a detached version `D` of the recorded target's `__manifest` with the version 2 candidate property (`UnattachedCommitProperty`: id, root, parent, no row clock), addressed by the reserved tag `unattached_<root>_<C>` created put-if-absent at `D` and acknowledged only after the root authority is revalidated (`stage_unattached` + `confirm_unattached`); the branch head is unchanged, a child's `parent_commit_id` is its base, `commit publish` answers `unattached_cannot_publish` (409), `commit drop` cascades descendants-first, and every tag of a root expires with the captured target authority; never published |
 
-Native graph-branch create/delete is a control exception. `BranchContents` is
-the logical authority; clone/delete residue is derived physical state and is
-reclaimed only when its target is provable from that authority. It does not
-invent an alternate graph-content publisher. Each branch life owns a native ref
-named `{logical}.{ULID}` (see [RFC 0042](../rfcs/0042-incarnation-suffixed-branch-refs.md));
-a recreated branch therefore never shares a path with its dead predecessor, and
-what the predecessor left (its unpublished stagings, and the table forks a
-pre-v11 branch owned) is reclaimed by `cleanup`.
+Native graph-branch create/delete is a control exception. At or above format
+18 the `branch` row of `main`'s catalog is the logical authority (RFC
+2026-11-19, "Branch existence in the catalog"): a tree no live row names is
+derived physical state the collector reclaims, and the row, the tombstone and
+the retired row are control facts that go through the publisher. Below the
+stamp `BranchContents` is that authority, and clone/delete residue is
+reclaimed only when its target is provable from it. Neither invents an
+alternate graph-content publisher. Each branch life owns a native name
+`{logical}.{ULID}` (see [RFC 0042](../rfcs/0042-incarnation-suffixed-branch-refs.md)),
+the key of its row and the path of its tree; a recreated branch therefore
+never shares a path with its dead predecessor, and what the predecessor left
+(its tree, its unpublished stagings, and the table forks a pre-v11 branch
+owned) is reclaimed by `cleanup`.
 
 ## Mutation and Load
 
@@ -911,25 +950,36 @@ branch stages detached on the fork, and
 reclaims a fork no registration references once the graph branch incarnation
 in its name is gone, and keeps a generated name it cannot parse.
 
-Branch deletion starts no background table reclamation. It records retirement
-metadata on the exact native `__manifest` ref, archives its `BranchContents`
-inside the native tree, then unlinks the active ref. Required physical parent
-history and imported merge-base records remain readable through the archive.
-Cleanup reclaims unneeded trees and archives after checking their dependencies.
-Delayed staging is judged by a complete live-identity inventory after the table
-listing, with final validation of the graph and tag capture before deletion.
-Cached write admission checks the ref's identifier and retirement metadata
-through the existing lookup, with no additional storage request. Cold branch
-enumeration reads active refs; creation does not scan retired histories.
+Branch deletion starts no background table reclamation. At or above format
+18 it publishes a tombstone on the branch's own chain, settles the branch's
+history, and retires the row on `main`; the tree stays for `cleanup`, which
+reclaims every tree no live row names and keeps what a kept tree's
+`base_paths` reach, so required physical parent history and imported
+merge-base records stay readable while a live branch needs them. Below the
+stamp it records retirement metadata on the exact native `__manifest` ref,
+archives its `BranchContents` inside the native tree, then unlinks the active
+ref, and the archive keeps that history readable; cleanup reclaims unneeded
+trees and archives after checking their dependencies. Delayed staging is
+judged by a complete live-identity inventory after the table listing, with
+final validation of the graph and tag capture before deletion. Cached write
+admission checks the branch's identifier (the row's, or the ref's with its
+retirement metadata) through the existing lookup, with no additional storage
+request. Branch enumeration reads `main`'s rows, no request on a held `main`
+and otherwise a probe of `main`'s head and a read of its latest version when
+the head moved; below the stamp it reads active refs. Creation does not scan retired
+histories.
 
 A detailed listing (`list_graph_branches_detailed` in `omnigraph-catalog`)
 derives every field from the same authority and writes nothing: each live
-ref's `BranchContents` (`parent_branch`, `parent_version`, `create_at`), the
-head row of the branch's latest `__manifest` version and, once the branch has
-written a commit, the head row of its clone at `parent_version`, the commit it
-started at (a start at a past commit clones that commit's version, so the
-same read answers it). It reads no lineage, so its cost per branch is flat in
-history (`branch_control_cost.rs`). The collector keeps each live branch's
+row (`parent`, `parent_version`, `created_at`; below the stamp the ref's
+`BranchContents`), the head row of the branch's latest `__manifest` version
+and, once the branch has written a commit, the head row of its clone at
+`parent_version`, the commit it started at (a start at a past commit clones
+that commit's version, so the same read answers it). A row whose tree is
+absent lists its branch as not ready, with no head; a tree whose head carries
+a tombstone lists its branch as retirement pending. It reads no lineage, so
+its cost per branch is flat in history (`branch_control_cost.rs`). The
+collector keeps each live branch's
 oldest own `__manifest` version (`retained_versions` with `keep_base`), which
 is that clone; a reclamation that dropped it would lose the start.
 

@@ -4,7 +4,7 @@ The rest of this skill describes the current CLI and HTTP contract. This page
 covers moving a 0.13 deployment to it and the offline conversion this binary
 performs. A graph in any other storage format is rebuilt by export and load
 with the binary that wrote it; the
-[upgrade guide](../../../docs/user/operations/upgrade.md) owns that procedure.
+[upgrade guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/upgrade.md) owns that procedure.
 
 Current HTTP integrations must use exactly `Omnigraph-Http-Api: 0.14`, including
 the current routes, shapes and credentials. A `0.13` peer is refused before data
@@ -44,12 +44,13 @@ refuse a branch at 14, and `as unattached branch` refuses one at 14 or 15. To
 stamp a standalone graph first, stop every process using it, back up the
 whole root and run `omnigraph upgrade --target ./graph.omni --check --json`,
 then without `--check`: the stamp-only route (`stamp-v14-to-v16` in 0.14,
-`stamp-v14-to-v17` in the current binary, which stamps 17) writes one
-metadata-only commit per live branch, main first, and a run that stops is
-finished by running it again. `upgrade` refuses cluster graphs; publish ordinarily on the
+`stamp-v14-to-v18` in the current binary, which stamps 18) writes one
+metadata-only commit per live branch, main first, with `main`'s commit
+recording every branch in the catalog, then removes the branch ref files; a
+run that stops is finished by running it again. `upgrade` refuses cluster graphs; publish ordinarily on the
 branch instead. A binary refuses a graph stamped above the formats it
 serves, so upgrade every binary first.
-See the [0.13 to 0.14 checklist](../../../docs/user/operations/upgrade-0.14.md).
+See the [0.13 to 0.14 checklist](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/upgrade-0.14.md).
 
 ## Operator configuration rewrite
 
@@ -65,17 +66,23 @@ Bare login uses the existing default profile.
 `config recover-operations --source DIR --profile NAME` preserves matching
 folder lifecycle evidence; keep the old operator home and reconcile unresolved
 operations under the original identity and key. See the primary
-[operator reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
+[operator reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#upgrade-from-the-old-format).
 
 ## Convert a v8, v9 or v13 graph
 
-The current binary serves storage formats 14 to 17 and refuses a v8 or v9
+The current binary serves storage formats 14 to 18 and refuses a v8 or v9
 graph on open, naming `omnigraph upgrade`. Its `upgrade` converts a
-standalone v8, v9 or v13 graph straight to 17 in place and keeps branches,
-commit ids and commit history; no table row is rewritten. `--to-format`
-accepts 17 only. The same command is the only way a v14, v15 or v16 graph
-reaches 17: no publication stamps a branch 17, and a graph the current
-binary creates is born there. The upgrade is offline and cannot verify that itself: stop
+standalone v8, v9 or v13 graph straight to 18 in place and keeps branches,
+commit ids and commit history; no table row is rewritten. Each branch moves
+from its ref file into `main`'s catalog: `main`'s commit records a row for
+every branch and one for each retired ref (a deleted branch whose commits are
+kept, or a 0.11.x schema-apply lock that a finished apply or the upgrade
+retired), so `work.rows_written` can be larger than the branch count. The
+run then removes the files under `_refs/branches/` (`work.refs_unlinked`), so
+an empty `_refs/branches/` after the run is expected and no branch is lost. `--to-format`
+accepts 18 only. The same command is the only way a v14 to v17 graph
+reaches 18: no publication stamps a branch 17 or 18, and a graph the current
+binary creates is born at 18. The upgrade is offline and cannot verify that itself: stop
 every server, reader, writer and maintenance process, take and verify a
 backup of the whole graph root (rollback is restoring that backup), then
 with the current binary:
@@ -89,7 +96,7 @@ omnigraph commit list --target ./graph.omni --json
 `--check` writes nothing. A run without `--check` marks the graph as pending,
 which every normal open refuses, and a run that stops is resumed by the same
 command with the same executable. Never delete the marker or anything under
-`__history/`. The result is stamped 17, which binaries serving only up to 16
+`__history/`. The result is stamped 18, which binaries serving only up to 17
 refuse: upgrade every binary first. The refusal message on open still shows
 positional `<graph>` examples; pass the graph with `--target`. A v8 or v9
 source brings these with it:
@@ -97,7 +104,7 @@ source brings these with it:
 - Its schema is read from `_schema.pg`, `_schema.ir.json` and
   `__schema_state.json` at the graph root, which must be present, consistent
   and match the tables' columns. The upgrade leaves them in place; formats 14
-  to 17 never read them, and they go stale at the next schema apply. Every
+  to 18 never read them, and they go stale at the next schema apply. Every
   pre-upgrade commit is recorded under the one schema live at the upgrade,
   since that format kept only the latest schema.
 - A `.staging` schema object or a recovery file is refused until a
@@ -122,7 +129,7 @@ source brings these with it:
   full-text --target ./graph.omni --branch <branch>` on each live branch that
   searches text.
 
-The [upgrade guide](../../../docs/user/operations/upgrade.md#storage-upgrade)
+The [upgrade guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/upgrade.md#storage-upgrade)
 owns the findings table, the limits and the recovery actions. Upgrade the CLI,
 server and HTTP integrations together: every protected request needs the
 `Omnigraph-Http-Api: 0.14` header described at the top of this page.

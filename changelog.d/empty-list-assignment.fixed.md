@@ -1,0 +1,1 @@
+- Insert and update statements accept an empty list for a typed list property such as `[I64]`.

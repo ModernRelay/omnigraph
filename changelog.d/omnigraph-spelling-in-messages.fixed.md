@@ -1,0 +1,1 @@
+- Error messages, command help, MCP instructions and the OpenAPI document spell the product `Omnigraph`.

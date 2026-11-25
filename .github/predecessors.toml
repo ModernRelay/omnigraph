@@ -1,0 +1,97 @@
+# Predecessors: older Omnigraph binaries the cross-version tests run beside
+# the current tree. One row per predecessor; adding one is a row here, never
+# workflow YAML. `scripts/predecessors.py` provisions the rows a job names and
+# writes one manifest; a test asks for a row with `predecessor("<name>")`
+# (docs/dev/testing.md, Predecessor binaries).
+#
+# A row is named by what it is, and holds:
+#   about        what the binary is and what it writes
+#   release      a published release tag, installed by `scripts/install.sh`,
+#   sha256       with the archive digest pinned per platform asset; or
+#   commit       a commit of this repository, built from source in its own
+#   toolchain    checkout with this Rust toolchain
+#   binaries     the executables it provides (keys of [packages])
+#   reports      what `omnigraph --version` prints; checked when provisioned
+#                and again when a test asks for the row
+#   retire_when  the condition under which the row and its tests go
+#
+# Every row must be asked for by a test, and every name a test asks for must
+# be a row (`scripts/predecessors.py check`).
+
+# The package that builds each binary a source row can provide.
+[packages]
+omnigraph = "omnigraph-cli"
+omnigraph-server = "omnigraph-server"
+omnigraph-gqt = "omnigraph-gqt"
+
+[predecessors."release-0.7.2"]
+about = "Release 0.7.2, which writes internal schema v3: lineage in `_graph_commits.lance` and a lineage-free `__manifest`"
+release = "v0.7.2"
+sha256 = { linux-x86_64 = "1f3f4e13a3f7f43267c944d208194a01fc2e357fe97f2d2c50af4bef23db332c", macos-arm64 = "99acb216210591c718f9bdd5d2d1ca9922789c710f324d7fd8e54029d418edb3" }
+binaries = ["omnigraph"]
+reports = "omnigraph 0.7.2"
+retire_when = "The current binary no longer refuses and rebuilds a v3 graph"
+
+[predecessors."release-0.8.1"]
+about = "Release 0.8.1, which writes internal schema v4"
+release = "v0.8.1"
+sha256 = { linux-x86_64 = "c25e2bb5358887e64e33d3135370e80ea215a54608df723d97d9cac67b7f9e3e", linux-arm64 = "903750141ca449a386d6bc44949d6cb19e0965e6ebcbf6def2961d4841359a41", macos-arm64 = "866e92eda453ee30acbfcaaed4f5a59accf2ad602964d6076c01c8da2637e282" }
+binaries = ["omnigraph"]
+reports = "omnigraph 0.8.1"
+retire_when = "The current binary no longer refuses and rebuilds a v4 graph"
+
+[predecessors."stamp-5"]
+about = "The last main commit that writes internal schema v5, immediately before RFC 0023 made the non-null `id` primary key exact in v6"
+commit = "46b6d9084fb629b88d4ac9e8c546e0a30d213d19"
+toolchain = "1.97.1"
+binaries = ["omnigraph"]
+reports = "omnigraph 0.8.1"
+retire_when = "The v5 and current format fence (each refuses the other's graph) is dropped"
+
+[predecessors."release-0.9.0"]
+about = "Release 0.9.0, which writes internal schema v6 with branches, edges, vectors, full-text and Blobs"
+release = "v0.9.0"
+sha256 = { linux-x86_64 = "507a36f385bea073e7f284fe476befbb4cd788b32bfa85d6f4cd5e943b663197", linux-arm64 = "6742a7fcf2761cb5841a38990c38383d7a884da2c65e3e7cc884afbbf2b2d881", macos-arm64 = "69f78c93e661e8ea2b92deafe6330650a0921a003c2099b75b226482a90dc03e" }
+binaries = ["omnigraph"]
+reports = "omnigraph 0.9.0"
+retire_when = "A 0.9 export is no longer a supported rebuild source"
+
+[predecessors."release-0.10.0"]
+about = "Release 0.10.0, the last release that writes internal schema v6"
+release = "v0.10.0"
+sha256 = { linux-x86_64 = "05d3ce4ec0ab51a876befd89b643c3e7f2d5489be0398a38cef6fb3a0d257fc1", linux-arm64 = "dd3ac09123a68882454db7e689da4c306c41677826237098df4e76b0f73d8d5e", macos-arm64 = "7c3b8fadbe590486a192c734d8c3d38cce0e4da1f02940e6ac306c1ada67f171" }
+binaries = ["omnigraph"]
+reports = "omnigraph 0.10.0"
+retire_when = "The v6 and current format fence is dropped and `omnigraph upgrade` no longer converts a stamp-8 or stamp-9 graph that started at v6"
+
+[predecessors."release-0.11.0"]
+about = "Release 0.11.0, which writes storage format 9 and converts a 0.10.x graph to format 8 or 9"
+release = "v0.11.0"
+sha256 = { linux-x86_64 = "da192e1a050875a93ee642b9df485203a00d8c0d44ca39204439463ad41a766d", linux-arm64 = "af6be5f1069d7591985285871450bc0d68d4dc363bf7c2c0a7cca33915a8f4bb", macos-arm64 = "64ed446169e01d2aceb9e8635b73a593681d71414e73dc0d67b0f6700048e4c0" }
+binaries = ["omnigraph"]
+reports = "omnigraph 0.11.0"
+retire_when = "`omnigraph upgrade` no longer converts a stamp-8 or stamp-9 graph"
+
+[predecessors."stamp-13"]
+about = "The last main commit that writes storage format 13"
+commit = "c0a4519f38d65dc1356728981983da8b096cfbef"
+toolchain = "1.97.1"
+binaries = ["omnigraph"]
+reports = "omnigraph 0.11.0"
+retire_when = "`omnigraph upgrade` no longer converts a stamp-13 graph"
+
+[predecessors."release-0.12.0"]
+about = "Release 0.12.0, which serves storage format 14 under the cluster ledger the current server upgrades"
+release = "v0.12.0"
+sha256 = { linux-x86_64 = "ef0e0772c9a74ea8979bb459d2f5b8ed00dbd1f2e06cc70eed91069ba87c9189", linux-arm64 = "2f54cd9d7520f10a9b4b0c7e8974fa2d5175c87170f149749d471e96250e1a67", macos-arm64 = "72b9ac379139c4dfe32fb75af5d976187a5e108c2c15169cf34231ab8cc34f5f" }
+binaries = ["omnigraph", "omnigraph-server"]
+reports = "omnigraph 0.12.0"
+retire_when = "A 0.12.0 cluster ledger is no longer upgraded in place by a live server"
+
+[predecessors."lance-11"]
+about = "A main commit on Lance 11, which writes graph format 16 with a Lance 11.0.0 manifest writer"
+commit = "0a62bb7b2aa5b99b012f413807c216277f7f9596"
+toolchain = "1.97.1"
+binaries = ["omnigraph"]
+reports = "omnigraph 0.14.0"
+retire_when = "Graphs a Lance 11 writer stored are no longer read and written without conversion"

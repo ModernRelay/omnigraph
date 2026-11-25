@@ -1,0 +1,1 @@
+- An `s3://` clone root with `^`, `~` or a bracket now reads through its base. A root or base that does not name one key (a percent escape, a space, a query, an empty segment) is refused at open.

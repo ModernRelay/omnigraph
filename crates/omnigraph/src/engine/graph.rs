@@ -286,54 +286,33 @@ fn build_fused_batch(
 /// Lazily provides the in-memory CSR graph index, building it on first use and
 /// memoizing for the rest of the query. Indexed-mode Expand never asks for it,
 /// so a query that is entirely index-served and has no AntiJoin never pays the
-/// O(|E|) CSR build (the whole point of the indexed path). The `Cached` builder
-/// also reuses the cross-query `RuntimeCache` entry; `Direct` builds against an
-/// arbitrary snapshot (time-travel reads) through its graph's storage; `None`
-/// is for queries with no traversal at all.
+/// O(|E|) CSR build (the whole point of the indexed path). A traversing query
+/// takes the index from its handle's cross-query `RuntimeCache`, for a live
+/// target and for a historical snapshot alike, so concurrent queries over the
+/// same edge tables share one index; a query with no traversal has no source.
 pub struct GraphIndexHandle {
     cell: tokio::sync::OnceCell<Option<Arc<GraphIndex>>>,
-    builder: GraphIndexBuilder,
+    source: Option<GraphIndexSource>,
 }
 
 /// Owned by the handle: the lowered plan's graph operators hold the handle
 /// for the query, so nothing in it borrows from the doors.
-enum GraphIndexBuilder {
-    None,
-    Cached(
-        Arc<Omnigraph>,
-        crate::db::ResolvedTarget,
-        HashMap<String, (String, String)>,
-        SystemColumns,
-    ),
-    Direct(
-        Arc<Omnigraph>,
-        Snapshot,
-        HashMap<String, (String, String)>,
-        SystemColumns,
-    ),
+struct GraphIndexSource {
+    db: Arc<Omnigraph>,
+    snapshot: Snapshot,
+    edge_types: HashMap<String, (String, String)>,
+    system_columns: SystemColumns,
 }
 
 impl GraphIndexHandle {
     pub(crate) fn none() -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::None,
+            source: None,
         }
     }
 
     pub(crate) fn cached(
-        db: Arc<Omnigraph>,
-        resolved: crate::db::ResolvedTarget,
-        edge_types: HashMap<String, (String, String)>,
-        system_columns: SystemColumns,
-    ) -> Self {
-        Self {
-            cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Cached(db, resolved, edge_types, system_columns),
-        }
-    }
-
-    pub(crate) fn direct(
         db: Arc<Omnigraph>,
         snapshot: Snapshot,
         edge_types: HashMap<String, (String, String)>,
@@ -341,36 +320,34 @@ impl GraphIndexHandle {
     ) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Direct(db, snapshot, edge_types, system_columns),
+            source: Some(GraphIndexSource {
+                db,
+                snapshot,
+                edge_types,
+                system_columns,
+            }),
         }
     }
 
     /// The CSR index, built on first call. `None` only when the query needs no
-    /// traversal (the `None` builder).
+    /// traversal (a handle from [`Self::none`]).
     pub(super) async fn get(&self) -> Result<Option<&GraphIndex>> {
         let built = self
             .cell
             .get_or_try_init(|| async {
-                match &self.builder {
-                    GraphIndexBuilder::None => Ok::<Option<Arc<GraphIndex>>, OmniError>(None),
-                    GraphIndexBuilder::Cached(db, resolved, edge_types, system_columns) => {
-                        Ok(Some(
-                            db.graph_index_for_resolved(resolved, edge_types, *system_columns)
-                                .await?,
-                        ))
-                    }
-                    GraphIndexBuilder::Direct(db, snapshot, edge_types, system_columns) => {
-                        Ok(Some(Arc::new(
-                            GraphIndex::load_or_build(
-                                snapshot,
-                                edge_types,
-                                db.storage_adapter(),
-                                *system_columns,
-                            )
-                            .await?,
-                        )))
-                    }
-                }
+                let Some(source) = &self.source else {
+                    return Ok::<Option<Arc<GraphIndex>>, OmniError>(None);
+                };
+                Ok(Some(
+                    source
+                        .db
+                        .graph_index_for_snapshot(
+                            &source.snapshot,
+                            &source.edge_types,
+                            source.system_columns,
+                        )
+                        .await?,
+                ))
             })
             .await?;
         Ok(built.as_deref())

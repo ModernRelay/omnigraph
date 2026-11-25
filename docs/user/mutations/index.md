@@ -44,9 +44,9 @@ where; a where compares the row's own properties, parameters and now()``. A
 compound `where` runs under either `engine` setting. A `where` that tests over
 four properties twice each with `=`, `!=` or `in` is refused.
 
-Assignment values are constants: literals, parameters, `now()`, and comparisons
-or Boolean operators over them, such as `adult: true or $flag`. A constant's
-value is fixed per invocation: parameters and `now()` are bound once before any
+Assignment values are constants: literals, parameters, `now()`, and comparisons or Boolean
+operators over them, such as `adult: true or $flag`; `[]` takes a list property's element type.
+A constant's value is fixed per invocation: parameters and `now()` are bound once before any
 retry, so a retried mutation computes the same value. It follows the read rules
 for null: with `$flag` null, `true or $flag` is `true` and `false and $flag` is
 `false`, and `$age > 30` with `$age` null is null. A null result assigned to a
@@ -194,19 +194,19 @@ written as its decimal value. The statement never forks a branch.
 
 The source is a URI the engine reads under the graph's external Blob policy
 ([External Blob references](../clusters/config.md#external-blob-references)):
-`s3://` objects beneath a configured
-base, and for an embedded run `file://` paths beneath an `embedded_only`
-base. A graph with no policy denies every source; a URI outside every base,
-an unsupported scheme, and an object over the
-[`load_source_max_bytes`](../queries/settings.md) setting (default 32 MiB)
-are refused before any byte is read, and every read of the object (each
-range an overwrite's partition reads, or the one read of an append or merge)
-is bounded by a 120-second deadline. A refused source names `csv_source_bytes`; raising the setting in
-the statement's `set` prefix (or the request's `settings` field) admits a
-larger object. A direct `omnigraph mutate`
-run installs an embedded-only base over a `file://` source's directory for
-that statement, so the file is admitted by the same rule; a served run
-refuses a `file://` source, since the server reads only what it may reach.
+`s3://` objects beneath a configured base, and for an embedded run `file://`
+paths beneath an `embedded_only` base. A graph with no policy denies every
+source; a URI outside every base, an unsupported scheme, and an object over the
+[`load_source_max_bytes`](../queries/settings.md) setting (default 32 MiB) are
+refused before any byte is read, and every read of the object (each range an
+overwrite's partition reads, or the one read of an append or merge) is bounded
+by a 120-second deadline. A refused source names `csv_source_bytes`; raising
+the setting in the statement's `set` prefix (or the request's `settings` field)
+admits a larger object. A direct `omnigraph mutate` run installs an
+embedded-only base over a `file://` source's directory for that statement, so
+the file is admitted by the same rule, unless it overlaps the cluster's storage
+root (by default its config directory; a standalone graph's own root); a served
+run refuses a `file://` source. A refusal has `effects: none`, `action: fix`.
 
 `explain` before a `load csv` statement prints the load's plan, the same
 document a query's explain prints: the source, the one validation with each
@@ -315,7 +315,7 @@ Independent existing constructive datasets stage concurrently. The
 controls that width for both Load and insert/update mutations (default 8,
 range `1..=64`); it is `process` scope, so the server takes it from
 `OMNIGRAPH_LOAD_CONCURRENCY` and a direct CLI run from that variable or from
-`--set` on `load`, `ingest` or `mutate` (a JSONL input carries no `set` line),
+`--set` on `load` or `mutate` (a JSONL input carries no `set` line),
 and an invalid or `0` value refuses startup instead of running the default.
 The same width is the number of Lance writers a `load csv` overwrite runs at
 once: its batches are cut into runs of at most one Lance file (1 M rows), each

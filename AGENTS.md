@@ -8,20 +8,25 @@ open work in issues.
 
 Before every task and every change:
 
-1. Read [architectural invariants](docs/dev/invariants.md). Apply the hard
+1. Read [the contract](docs/dev/contract.md): what each kind of operation
+   promises its caller, where the engine differs today, and the direction the
+   work asks for. For a non-trivial change, name the statements it keeps,
+   closes, decides or changes.
+2. Read [architectural invariants](docs/dev/invariants.md). Apply the hard
    invariants and deny-list to implementation and review work.
-2. Consult the domain map in [Lance alignment](docs/dev/lance.md). Fetch and
+3. Consult the domain map in [Lance alignment](docs/dev/lance.md). Fetch and
    read the **complete content** of every page in the matching domain plus every
    page that is even slightly relevant. The index and summaries are not
    substitutes for the upstream pages. Then read the matching entries in
    [Lance compatibility fences](docs/dev/lance-fences.md).
-3. Read [testing](docs/dev/testing.md). Find the existing owner, in
+4. Read [testing](docs/dev/testing.md). Find the existing owner, in
    [test ownership](docs/dev/test-ownership.md) when the map does not name it,
    and run a clean focused baseline before changing tests. Extend an existing
    assertion, fixture, or parameterization before creating a parallel setup.
 
 Tools that support `@` imports include these automatically:
 
+@docs/dev/contract.md
 @docs/dev/invariants.md
 @docs/dev/lance.md
 @docs/dev/testing.md
@@ -50,7 +55,7 @@ compiler: parse, typecheck, IR, lowering
 engine: snapshots, execution, graph publication, recovery
         |
         v
-Lance datasets on file, S3-compatible, or Azure Blob storage
+Lance datasets on file, S3-compatible, Azure Blob, or Google Cloud Storage
 ```
 
 Workspace members live under `crates/`, plus `skills/` and
@@ -88,6 +93,8 @@ authority model.
 |---|---|
 | Use Omnigraph | [User guide](docs/user/index.md) |
 | Change Omnigraph | [Developer guide](docs/dev/index.md) |
+| See what each operation promises | [The contract](docs/dev/contract.md) |
+| See the work Omnigraph is built for | [The work](docs/dev/workload.md) |
 | Review architectural rules | [Invariants](docs/dev/invariants.md) |
 | Align with Lance | [Lance guide](docs/dev/lance.md) and [compatibility fences](docs/dev/lance-fences.md) |
 | Find test ownership | [Testing guide](docs/dev/testing.md) and [test ownership](docs/dev/test-ownership.md) |
@@ -107,14 +114,49 @@ more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
 
+Applied to the shape of a design, that lens is **conceptual integrity**
+(Brooks): few ideas, applied everywhere. Always weigh it. The lenses are the
+default; where one conflicts with the counterweight, the test that closes this
+section decides.
+
+- **Correct by construction.** Make the illegal state unrepresentable; fix the
+  class, not the reported instance.
+- **Generality.** The prompting case is an instance of the mechanism, with no
+  branch, flag or constant of its own (zero-one-infinity: none, one or any
+  number, never a fixed few).
+- **Orthogonality and composability.** Primitives vary independently and close
+  under composition (a composition composes again); extend or compose one
+  before adding one.
+- **Information hiding** (Parnas). A module owns one decision and hides more
+  than it shows (a deep module, Ousterhout); code outside it never works on
+  its representation.
+- **Intrinsic naming.** Name a thing by what it is or selects, never by the
+  caller, scenario or change that prompted it. The `issue_N` in a regression
+  test's name is a cross-reference the gate reads, and stays.
+- **Cases as data.** Real variation is a parameter or a table row, not new
+  code.
+
+The counterweight is **speculative generality** (Fowler) and **the wrong
+abstraction** (Metz): YAGNI. For a design choice, state the specific form and
+the general form, argue for and against each, and name what the choice trades
+away. Decide by the same lens, on evidence: the general form
+wins only when the tree has the cases it serves today and it leaves fewer
+concepts than the specific one (parsimony).
+
 Validate every assumption. Do not assume how a function, module or symbol
 behaves: read it. For Lance internals, read the upstream implementation.
+
+Before every design, review the Lance primitives that bear on it and use them
+fully: build beside one only where its upstream source shows it cannot serve
+or a [compatibility fence](docs/dev/lance-fences.md) forbids it.
 
 Reason about Omnigraph from first principles, not from database categories. A
 database is **an observable contract, implemented by physical mechanisms
 optimized for an expected distribution of work**. State which contract and
 which distribution of work a change serves, and what it trades away. Read
-[first principles of data systems](docs/dev/systems.md).
+[first principles of data systems](docs/dev/systems.md) for the method,
+[the contract](docs/dev/contract.md) for what each operation promises, and
+[the work](docs/dev/workload.md) for the workload hypothesis.
 
 The full rules live in [invariants](docs/dev/invariants.md). Keep these in
 working memory:
@@ -203,8 +245,17 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 
 ## Change discipline
 
+- Give every design, RFC and non-trivial change its
+  [contract line](docs/dev/contract.md#citing): the statements it keeps, the
+  gaps it closes, the decisions it settles and the statements it changes. The
+  contract is the target and the code is today's behavior: to change what
+  Omnigraph does, change the contract statement in the same pull request. A change tuned for a different
+  workload revises [the work](docs/dev/workload.md) in the same pull request.
 - Preserve unrelated work in a dirty tree. Never discard user changes.
 - Make the smallest coherent change that closes the behavior and test surface.
+- Never weaken, skip or delete a check to make a change pass. A test, guard,
+  golden or pin changes only when what it guards changes, and the pull request
+  says so.
 - For a bug, reproduce the predicted failure at the tier the regression rule
   below names, then fix the root cause and prove the regression turns green.
 - Query-behavior tests default to `.gqt` logic tests under
@@ -262,4 +313,6 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   published release documents and the bytes they are verified against.
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
-- Keep this file a map. New deep content goes in its audience-owned guide.
+- Keep this file a map. New deep content goes in its audience-owned guide. A
+  rule belongs here only when a violation is hard to detect or hard to
+  reverse; where a check can catch it, add the check instead.

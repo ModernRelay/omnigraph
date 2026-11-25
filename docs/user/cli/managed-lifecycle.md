@@ -36,7 +36,7 @@ paths and a 64 MiB JSON response (allowing JSON escaping). Its HTTP deadline is
 are refused. `.git`, credentials and server-side control records are not
 downloaded, and no local routing context is created.
 The service requires active membership and organization-wide `source_read`
-permission from WorkOS. An external repository binding must be checked out
+permission from the identity provider. An external repository binding must be checked out
 through its own Git provider instead.
 
 ## List cluster members
@@ -60,7 +60,7 @@ provider memberships. An overflow or incomplete provider read refuses instead
 of truncating. This read-only command does not calculate effective graph
 permissions: applied Cedar policy authorizes those separately. Organization
 administrators use [team administration](managed-team.md) to invite and remove
-people and WorkOS to assign service roles.
+people and the identity provider to assign service roles.
 
 ## Create an empty cluster
 
@@ -118,7 +118,7 @@ against the exact revision downloaded:
 
 ```sh
 omnigraph cluster push --target production --config customer-config --expected-revision COMMIT \
-  --message "Add the knowledge graph" --json
+  --message "Add the catalog graph" --json
 # Use data.revision returned by push.
 omnigraph cluster plan --target production --rev NEW_COMMIT --json
 # Use data.preview_id from the ready preview.

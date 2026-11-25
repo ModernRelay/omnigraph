@@ -37,6 +37,7 @@ pub(crate) struct Evidence {
     kind: CommandKind,
     dispatched: usize,
     writable_open: bool,
+    storage_wrote: bool,
     last_request_effectful: bool,
     http_status: Option<u16>,
     retry_after: Option<String>,
@@ -228,6 +229,14 @@ pub(crate) fn writable_open() {
     update(|state| state.writable_open = true);
 }
 
+/// Building the command's storage wrote before the engine ran, as read-through
+/// storage under `--base` writes a new clone root's `__clone/created` marker.
+/// An engine error then covers only the engine's part, so it no longer says
+/// that the command took no effect.
+pub(crate) fn storage_wrote() {
+    update(|state| state.storage_wrote = true);
+}
+
 /// An embedded engine write's own error. The engine refuses with a typed,
 /// settled error before it publishes and marks a publication in doubt, so
 /// this error carries what the write did, unlike any error after it.
@@ -363,7 +372,11 @@ impl Failure {
                 },
             }
         };
-        let served = served.or_else(|| output.disposition.filter(|_| engine_write && embedded));
+        let served = served.or_else(|| {
+            output
+                .disposition
+                .filter(|_| engine_write && embedded && !evidence.storage_wrote)
+        });
         let not_started = !contradicted
             && (read
                 || admission.is_some()
@@ -393,8 +406,14 @@ impl Failure {
         {
             // A refusal keeps its code's action when that action is to fix
             // the request or, when nothing ran, to repeat it, as a server's
-            // own disposition does; any other is read again first.
-            match output.code.map(ErrorCode::action) {
+            // own disposition does; any other is read again first. An
+            // embedded query refusal carries its diagnostic without a code,
+            // and the same refusal served is `bad_request`: fix the query.
+            let own = output
+                .code
+                .map(ErrorCode::action)
+                .or(output.diagnostic.as_ref().map(|_| Action::Fix));
+            match own {
                 Some(Action::Fix) => Action::Fix,
                 Some(Action::Retry) if not_started => Action::Retry,
                 _ => Action::Refresh,
@@ -513,7 +532,7 @@ mod tests {
     /// An embedded load's policy refusal ran nothing, its fork included: the
     /// engine checks policy before any publication. A refusal the engine marks
     /// as following an earlier publication, as a load's refusal after its
-    /// fork is, left that publication standing, and an untyped error after it
+    /// fork is, left that publication standing, and an opaque error after it
     /// may have done more.
     #[test]
     fn an_embedded_compound_write_reports_what_the_engine_did() {
@@ -533,13 +552,18 @@ mod tests {
         );
         assert_eq!(disposition(&alone)["effects"], "none");
         assert_eq!(alone.exit, 1);
-        // A refusal says what to read again; an untyped error must be
+        // A refusal says what to fix or read again; an opaque error must be
         // reconciled against the graph.
         for (after_fork, effects, action) in [
             (
-                OmniError::manifest("not valid graph NDJSON"),
+                OmniError::manifest_internal("staged table commit lost"),
                 "unknown",
                 "reconcile",
+            ),
+            (
+                OmniError::manifest("not valid graph NDJSON"),
+                "partial",
+                "fix",
             ),
             (
                 OmniError::key_conflict("node:Person", "Bob"),
@@ -597,6 +621,38 @@ mod tests {
         assert_ne!(failure.output.code, Some(ErrorCode::OutcomeUnknown));
         assert_eq!(disposition(&failure)["effects"], "none");
         assert_eq!(failure.exit, 1);
+    }
+
+    /// An embedded query refusal carries its diagnostic and no code; it asks
+    /// for the `fix` the same refusal answered as `bad_request` by a server
+    /// asks for, since the same source fails the same way again.
+    #[test]
+    fn an_embedded_query_diagnostic_asks_for_a_fix() {
+        let refused = "query name { match { $p: Person } return { $p.name } }";
+        for kind in [CommandKind::Read, CommandKind::Write] {
+            let error = omnigraph_compiler::query::parser::parse_query(refused).unwrap_err();
+            let failure = Failure::classify(
+                error.into(),
+                Evidence {
+                    kind,
+                    ..Evidence::default()
+                },
+            );
+            assert_eq!(failure.output.code, None);
+            assert_eq!(
+                failure
+                    .output
+                    .diagnostic
+                    .as_ref()
+                    .map(|value| value.code.as_str()),
+                Some("Q002")
+            );
+            assert_eq!(
+                disposition(&failure),
+                serde_json::json!({"effects": "none", "action": "fix"}),
+            );
+            assert_eq!(failure.exit, 1);
+        }
     }
 
     /// A refusal the CLI decides itself takes its code's action, as the same

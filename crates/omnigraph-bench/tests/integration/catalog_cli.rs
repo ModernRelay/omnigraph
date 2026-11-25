@@ -200,6 +200,38 @@ fn human_and_machine_help_need_no_catalog_or_cache() {
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 #[test]
+fn long_version_names_the_source_commit_and_tree_state_the_build_was_stamped_with() {
+    let directory = tempfile::tempdir().unwrap();
+    let version = |flag: &str| {
+        let output = Command::cargo_bin("omnigraph-bench")
+            .unwrap()
+            .current_dir(directory.path())
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{flag}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let name = format!("omnigraph-bench {}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(version("-V"), format!("{name}\n"));
+
+    let long = version("--version");
+    let lines: Vec<&str> = long.lines().collect();
+    assert_eq!(lines.len(), 3, "{long}");
+    assert_eq!(lines[0], name);
+    let commit = lines[1].strip_prefix("source commit: ").expect(&long);
+    assert!(
+        commit == "unknown"
+            || ([40, 64].contains(&commit.len())
+                && commit
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+        "{long}"
+    );
+    let dirty = lines[2].strip_prefix("source tree dirty: ").expect(&long);
+    assert!(["true", "false", "unknown"].contains(&dirty), "{long}");
+}
+#[test]
 fn argument_and_domain_errors_have_versioned_json() {
     for args in [
         vec!["list", "nonsense", "--json"],

@@ -576,7 +576,9 @@ pub(crate) fn supervise_repetition(input: SupervisionInput) -> RunnerResult<Supe
         RepetitionInputV2::Embedded { .. } => {
             sample.peak_rss_bytes = Some(child_exit.peak_rss_bytes)
         }
-        RepetitionInputV2::Served { .. } | RepetitionInputV2::Clone { .. } => {
+        RepetitionInputV2::Served { .. }
+        | RepetitionInputV2::Clone { .. }
+        | RepetitionInputV2::OwnedServer { .. } => {
             sample.client_peak_rss_bytes = Some(child_exit.peak_rss_bytes)
         }
     }
@@ -649,9 +651,9 @@ struct WorkerProcess {
 
 #[cfg(unix)]
 #[derive(Debug, Clone)]
-struct ReapedChild {
-    status: ExitStatus,
-    peak_rss_bytes: u64,
+pub(crate) struct ReapedChild {
+    pub(crate) status: ExitStatus,
+    pub(crate) peak_rss_bytes: u64,
 }
 
 #[cfg(unix)]
@@ -1174,7 +1176,7 @@ fn process_evidence(
 }
 
 #[cfg(unix)]
-fn wait4_nonblocking(pid: i32) -> Result<Option<ReapedChild>, String> {
+pub(crate) fn wait4_nonblocking(pid: i32) -> Result<Option<ReapedChild>, String> {
     use std::os::unix::process::ExitStatusExt;
 
     let mut status = 0;

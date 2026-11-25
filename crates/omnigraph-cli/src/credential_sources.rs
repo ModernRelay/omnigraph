@@ -13,7 +13,10 @@ mod store;
 
 pub(crate) use binding::{CredentialRequest, OwnerBinding, OwnerKind, Purpose, ResourceIdentity};
 pub(crate) use exec::{ExecSource, acquire_exec};
-pub(crate) use oauth::{acquire_client_credentials, validate_client_credentials};
+pub(crate) use oauth::{
+    acquire_client_credentials, exchange_client_credentials, read_client_secret,
+    validate_client_credentials,
+};
 pub(crate) use store::{OsSecretStore, SecretStore, acquire_stored};
 
 #[cfg(test)]

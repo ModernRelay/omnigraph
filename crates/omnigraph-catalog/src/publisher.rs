@@ -22,7 +22,7 @@ use arrow_array::RecordBatch;
 use lance_core::deepsize::DeepSizeOf;
 use lance_table::format::Manifest;
 use lance_table::io::commit::ManifestLocation;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -35,6 +35,7 @@ use omnigraph_core::graph_commit_id::{
     HISTORY_BLOCK_SLOTS, HistoryBlockId, canonical_ulid, parse_history_block_id,
 };
 
+use crate::branch_rows::{BranchRow, TombstoneRow, retired_entry};
 use crate::error::{CompletionEvidence, OmniError, Result};
 use crate::manifest_request::{FailedRequest, classify_failed_request};
 
@@ -42,10 +43,10 @@ use crate::manifest_request::{FailedRequest, classify_failed_request};
 use super::DatasetUpdate;
 use super::commit;
 use super::history;
-use super::layout::open_manifest_dataset_with_session;
 use super::metadata::parse_namespace_version_request;
 use super::migrations::{
-    guard_stamp, is_served_stamp, read_stamp, require_control_facts, require_unpublished_commits,
+    guard_stamp, is_served_stamp, read_stamp, require_branch_rows, require_control_facts,
+    require_unpublished_commits,
 };
 use super::state::{
     BranchRecords, CommitBuffer, GraphLineageRow, HeldRecord, ManifestRows, ManifestState,
@@ -53,8 +54,8 @@ use super::state::{
     manifest_state, read_manifest_rows,
 };
 use super::writer_epoch::{
-    EpochAssertion, EpochVerdict, HolderKey, UnansweredClaim, WriterEpochHolders,
-    check_writer_epoch, settle_unanswered_claim,
+    EpochAssertion, EpochVerdict, HolderKey, UnansweredPublication, WriterEpochHolders,
+    check_writer_epoch, settle_unanswered, settle_unanswered_claim,
 };
 use super::{
     ExpectedTableVersions, HistoryReleaseBytes, MAIN_BRANCH_HEAD_KEY, ManifestChange, NativeRefPin,
@@ -288,6 +289,9 @@ pub struct PublishOutcome {
     /// The `writer_epoch` row of `dataset`'s version: as a publish read it, or
     /// as the claim that put the version wrote it.
     pub writer_epoch: Option<crate::state::WriterEpochRow>,
+    /// The branch rows of `dataset`'s version: as the publish read them, since
+    /// a strict overwrite carries the loaded version's config map.
+    pub branch_rows: Arc<crate::BranchRows>,
 }
 
 /// What a writer epoch claim established.
@@ -304,6 +308,31 @@ pub struct WriterEpochClaim {
 pub trait ManifestBatchPublisher: Send + Sync {
     fn cached_rows(&self, _dataset: &Dataset) -> Option<RecordBatch> {
         None
+    }
+
+    /// Hold `batch`, the hot fragment's rows the coordinator read from
+    /// `dataset` at its open or refresh, as the acknowledged image, so the
+    /// first publish after an open rereads nothing it already read.
+    async fn adopt_image(&self, _dataset: &Dataset, _batch: RecordBatch) {}
+
+    /// Carry the held image over to `dataset` when its hot fragment is the
+    /// one the image was read from: a metadata-only refresh changed the
+    /// version file and no row, so the next publish rereads nothing.
+    async fn rekey_image(&self, _dataset: &Dataset) {}
+
+    /// The publisher of main on `root_uri` a branch-bound coordinator writes
+    /// its control facts through (RFC "Branch existence in the catalog"
+    /// §Readers), holding the writer epochs this publisher's process holds.
+    fn main_publisher(
+        &self,
+        root_uri: &str,
+        control_session: Arc<lance::session::Session>,
+    ) -> Arc<dyn ManifestBatchPublisher> {
+        Arc::new(GraphNamespacePublisher::new_with_session(
+            root_uri,
+            None,
+            control_session,
+        ))
     }
 
     /// Publish without a graph-head precondition. Every production writer
@@ -375,6 +404,22 @@ pub trait ManifestBatchPublisher: Send + Sync {
         Err(OmniError::manifest_internal(
             "this manifest publisher claims no writer epoch",
         ))
+    }
+
+    /// Publish `intent` as a control fact on the bound branch: one version
+    /// whose only change is the intent's entries in the config map, or none
+    /// when the loaded version already settles it.
+    async fn publish_rows(&self, _intent: &RowIntent) -> Result<PublishOutcome> {
+        Err(OmniError::manifest_internal(
+            "this manifest publisher publishes no branch rows",
+        ))
+    }
+
+    /// Refuse `writer_fenced` when the bound branch's rows stand at a writer
+    /// epoch this process does not hold: a publish's check, with nothing
+    /// published.
+    async fn refuse_if_fenced(&self) -> Result<()> {
+        Ok(())
     }
 
     /// The `__manifest` version of this process's last publication on the
@@ -466,10 +511,12 @@ pub(crate) fn manifest_image_matches(
 }
 
 /// Everything one CAS attempt needs, from one `__manifest` scan: the open
-/// dataset, its `table` rows and its head commit's record.
+/// dataset, its rows, and the main a branch was resolved through, whose rows
+/// hold its identifier (`None` on main and under the acknowledged image).
 struct LoadedPublishState {
     dataset: Dataset,
     rows: ManifestRows,
+    main: Option<Dataset>,
 }
 
 type TableRows = BTreeMap<TableIdentity, TableRow>;
@@ -601,7 +648,18 @@ impl GraphNamespacePublisher {
         }
     }
 
-    async fn dataset(&self) -> Result<Dataset> {
+    /// A publisher of main on this root with this publisher's holders.
+    fn main_sibling(&self, control_session: Arc<lance::session::Session>) -> Self {
+        Self {
+            holders: Arc::clone(&self.holders),
+            ..Self::new_with_session(&self.root_uri, None, control_session)
+        }
+    }
+
+    /// The bound branch at its latest version and the main it was resolved
+    /// through: the acknowledged image when this publisher holds one on
+    /// main, else one open.
+    async fn dataset(&self) -> Result<(Dataset, Option<Dataset>)> {
         if self.branch.is_none() {
             let held = self
                 .published_rows
@@ -616,10 +674,10 @@ impl GraphNamespacePublisher {
                 )
                 .await?
             {
-                return Ok(current);
+                return Ok((current, None));
             }
         }
-        open_manifest_dataset_with_session(
+        crate::layout::open_manifest_dataset_through_main(
             &self.root_uri,
             self.branch.as_deref(),
             &self.control_session,
@@ -632,13 +690,61 @@ impl GraphNamespacePublisher {
         // retry loop's re-run-on-retryable-load-error path (no-op without the
         // `failpoints` feature). The migration surfaces the same typed error.
         contention(&PUBLISH_LOAD_STATE)?;
-        let dataset = self.dataset().await?;
+        let (dataset, main) = self.dataset().await?;
         guard_stamp(&dataset)?;
         let rows = match self.cached_rows(&dataset) {
-            Some(batch) => super::state::rows_of_batch(&batch)?,
-            None => read_manifest_rows(&dataset).await?,
+            Some(batch) => {
+                let mut rows = super::state::rows_of_batch(&batch)?;
+                rows.branch_rows = Arc::new(crate::BranchRows::decode(dataset.manifest())?);
+                rows
+            }
+            None => {
+                let (rows, batch) = super::state::read_manifest_rows_and_batch(&dataset).await?;
+                self.remember(&dataset, batch).await;
+                rows
+            }
         };
-        Ok(LoadedPublishState { dataset, rows })
+        Ok(LoadedPublishState {
+            dataset,
+            rows,
+            main,
+        })
+    }
+
+    /// Hold `batch`, the hot fragment's rows read from `dataset`, as the
+    /// acknowledged image, so the next load of this image serves from it: one
+    /// hot-fragment read per foreign version (RFC "Branch existence in the catalog" §Readers).
+    async fn remember(&self, dataset: &Dataset, batch: RecordBatch) {
+        let cached = PublishedRows::new(dataset, batch).await;
+        if cached.is_some() {
+            *self
+                .published_rows
+                .lock()
+                .expect("published rows cache lock poisoned") = cached;
+        }
+    }
+
+    /// RFC "Branch existence in the catalog" §Readers: an ordinary publication
+    /// on a chain whose loaded head carries a tombstone is refused
+    /// `branch_deleted`; a tombstone intent settles on it instead.
+    fn refuse_tombstoned_chain(&self, branch_rows: &crate::BranchRows) -> Result<()> {
+        match (&self.branch, branch_rows.tombstone()) {
+            (Some(branch), Some(_)) => Err(OmniError::BranchDeleted {
+                branch: branch.clone(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// A publish's writer epoch check on the bound branch with no
+    /// publication: `writer_fenced` when another process claimed it (RFC
+    /// "Branch existence in the catalog" §Delete step 1).
+    async fn refuse_if_fenced_inner(&self) -> Result<()> {
+        let LoadedPublishState { dataset, rows, .. } = self.load_publish_state().await?;
+        let native = dataset.manifest().branch.clone();
+        let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());
+        self.assert_writer_epoch(current, native.as_deref(), EpochAssertion::Publish)?;
+        Ok(())
     }
 
     /// This publisher's branch in the holder registry, resolved once.
@@ -660,15 +766,15 @@ impl GraphNamespacePublisher {
     }
 
     /// The writer epoch check of one attempt whose load read `current` on the
-    /// chain `native` names. A refusal clears what the process held there. A
-    /// process that holds nothing anywhere resolves no key and reads no path.
+    /// chain `native` names; a refusal clears what the process held there, and
+    /// a process holding nothing, or an assertion checking nothing, reads none.
     fn assert_writer_epoch(
         &self,
         current: u64,
         native: Option<&str>,
         assertion: EpochAssertion,
     ) -> Result<EpochVerdict> {
-        let held = match self.holders.holds_nothing() {
+        let held = match self.holders.holds_nothing() || assertion == EpochAssertion::None {
             true => None,
             false => self.holders.held(self.holder_key()?, native),
         };
@@ -1122,12 +1228,13 @@ impl GraphNamespacePublisher {
         Ok(())
     }
 
-    /// Check authority against this attempt's own scan (graph head) and ref
-    /// (native branch id) before the next rows are built, so a CAS loser with an
-    /// exact expectation cannot silently re-parent on its next attempt.
+    /// Check authority against this attempt's own scan (graph head) and the
+    /// branch's lifetime (its row on `main` at or above the branch-row stamp,
+    /// its ref below it), so a CAS loser cannot re-parent on its next attempt.
     async fn check_publish_precondition(
         &self,
         dataset: &Dataset,
+        main: Option<&Dataset>,
         head: &GraphLineageRow,
         precondition: &PublishPrecondition,
     ) -> Result<()> {
@@ -1178,13 +1285,22 @@ impl GraphNamespacePublisher {
                 "failed to encode expected Lance branch identifier: {e}"
             ))
         })?;
-        let observed_identifier = match dataset.manifest().branch.as_deref() {
-            Some(native) => {
+        let observed_identifier = match (dataset.manifest().branch.as_deref(), main) {
+            (Some(native), Some(main)) if crate::layout::has_branch_rows(main) => {
+                crate::BranchRows::decode(main.manifest()).and_then(|rows| {
+                    rows.branch(native)
+                        .map(|row| row.identifier.clone())
+                        .ok_or_else(|| OmniError::BranchNotFound {
+                            branch: crate::branch_names::logical_branch_name(native).to_string(),
+                        })
+                })
+            }
+            (Some(native), _) => {
                 crate::branch_control::get_live_manifest_branch_contents(dataset, native)
                     .await
                     .map(|contents| contents.identifier)
             }
-            None => Ok(lance::dataset::refs::BranchIdentifier::main()),
+            (None, _) => Ok(lance::dataset::refs::BranchIdentifier::main()),
         };
         let actual_branch_identifier = match observed_identifier {
             Ok(identifier) => identifier,
@@ -1231,10 +1347,31 @@ impl GraphNamespacePublisher {
         rows: &ManifestRows,
         cold: Option<&crate::state::LineageRegistry>,
     ) -> std::result::Result<Dataset, PublishAttemptFailure> {
-        fail(&PUBLISH_PRE_MERGE).map_err(PublishAttemptFailure::BeforeAck)?;
-        let (new_dataset, batch) = commit::overwrite(dataset, rows, cold)
+        self.merge_through(commit::overwrite(dataset, rows, cold))
             .await
-            .map_err(PublishAttemptFailure::BeforeAck)?;
+    }
+
+    /// The config-only sibling of `merge_rows`: `entries` over `rows`, which
+    /// the new version keeps.
+    async fn merge_config(
+        &self,
+        dataset: Dataset,
+        rows: &ManifestRows,
+        entries: HashMap<String, String>,
+    ) -> std::result::Result<Dataset, PublishAttemptFailure> {
+        self.merge_through(commit::overwrite_config(dataset, rows, entries))
+            .await
+    }
+
+    /// Run `commit`, the one `__manifest` version CAS of an attempt, between
+    /// the two seams of the lost-acknowledgement window, and cache what it
+    /// landed.
+    async fn merge_through(
+        &self,
+        commit: impl std::future::Future<Output = Result<(Dataset, RecordBatch)>>,
+    ) -> std::result::Result<Dataset, PublishAttemptFailure> {
+        fail(&PUBLISH_PRE_MERGE).map_err(PublishAttemptFailure::BeforeAck)?;
+        let (new_dataset, batch) = commit.await.map_err(PublishAttemptFailure::BeforeAck)?;
         // The commit is durable and the graph is published; a failure here
         // models the acknowledgement being lost after that (RFC 0067), so
         // the publish loop's ambiguity arm reads the manifest back rather
@@ -1368,6 +1505,41 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
             .map(|rows| rows.batch.clone())
     }
 
+    async fn adopt_image(&self, dataset: &Dataset, batch: RecordBatch) {
+        self.remember(dataset, batch).await;
+    }
+
+    async fn rekey_image(&self, dataset: &Dataset) {
+        let batch = self
+            .published_rows
+            .lock()
+            .expect("published rows cache lock poisoned")
+            .as_ref()
+            .filter(|rows| {
+                !rows.matches(dataset)
+                    && crate::ManifestCoordinator::same_rows_image(
+                        &rows.manifest,
+                        dataset.manifest(),
+                    )
+            })
+            .map(|rows| rows.batch.clone());
+        if let Some(batch) = batch {
+            self.remember(dataset, batch).await;
+        }
+    }
+
+    fn main_publisher(
+        &self,
+        root_uri: &str,
+        control_session: Arc<lance::session::Session>,
+    ) -> Arc<dyn ManifestBatchPublisher> {
+        assert_eq!(
+            root_uri, self.root_uri,
+            "a branch publisher's main publisher serves the same root"
+        );
+        Arc::new(self.main_sibling(control_session))
+    }
+
     /// Every failure carries what it establishes about the publication. A
     /// failure that may have published is marked in doubt, or uncertain, by
     /// the attempt that knows it; everything else, the reads, preparation,
@@ -1462,6 +1634,29 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         self.claim_attempts(&mut self.claim_intent(branch_identifier))
             .await
             .map_err(OmniError::unpublished)
+    }
+
+    /// A row's one durable effect is its version, as a claim's: an opaque
+    /// failure is marked `Unpublished` unless the attempt that put it marked
+    /// it in doubt; a typed refusal is returned as it is.
+    async fn publish_rows(&self, intent: &RowIntent) -> Result<PublishOutcome> {
+        self.row_attempts(intent)
+            .await
+            .map_err(OmniError::unpublished)
+    }
+
+    async fn refuse_if_fenced(&self) -> Result<()> {
+        let mut attempt = 0;
+        loop {
+            match self.refuse_if_fenced_inner().await {
+                Err(err)
+                    if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) =>
+                {
+                    attempt += 1;
+                }
+                checked => return checked,
+            }
+        }
     }
 }
 
@@ -1589,16 +1784,19 @@ impl GraphNamespacePublisher {
                     schema_contract,
                     registry,
                     writer_epoch,
+                    branch_rows,
                     ..
                 },
+            main,
         } = self.load_publish_state().await?;
+        self.refuse_tombstoned_chain(&branch_rows)?;
         let stamp = read_stamp(&dataset).ok_or_else(|| {
             OmniError::manifest_internal("the loaded `__manifest` carries no stamp")
         })?;
         require_unpublished_commits(stamp)?;
         let native_branch = dataset.manifest().branch.clone();
         let precondition = PublishPrecondition::ExactGraphHead(authority.clone());
-        self.check_publish_precondition(&dataset, &head, &precondition)
+        self.check_publish_precondition(&dataset, main.as_ref(), &head, &precondition)
             .await?;
         let tables: TableRows = tables
             .into_iter()
@@ -1648,6 +1846,7 @@ impl GraphNamespacePublisher {
             schema_contract,
             registry,
             writer_epoch,
+            branch_rows,
         };
         let (detached, _) =
             commit::overwrite_detached(dataset.clone(), &rows, property.encode()?).await?;
@@ -1666,7 +1865,8 @@ impl GraphNamespacePublisher {
         .await?;
         let probe = async {
             fail(&PROPOSE_POST_TAG_PRE_PROBE)?;
-            super::probe_dataset_latest_incarnation(&dataset, self.branch.as_deref()).await
+            super::probe_dataset_latest_incarnation(&dataset, self.branch.as_deref(), main.as_ref())
+                .await
         }
         .await;
         let latest = match probe {
@@ -1744,17 +1944,20 @@ impl GraphNamespacePublisher {
                         schema_contract,
                         registry,
                         writer_epoch,
+                        branch_rows,
                         ..
                     },
+                main,
             } = loaded;
             let native_branch = dataset.manifest().branch.clone();
+            self.refuse_tombstoned_chain(&branch_rows)?;
 
             self.assert_writer_epoch(
                 WriterEpochRow::resolved(writer_epoch.as_ref(), native_branch.as_deref()),
                 native_branch.as_deref(),
                 EpochAssertion::Publish,
             )?;
-            self.check_publish_precondition(&dataset, &head, precondition)
+            self.check_publish_precondition(&dataset, main.as_ref(), &head, precondition)
                 .await?;
 
             let tables: TableRows = tables
@@ -1807,6 +2010,7 @@ impl GraphNamespacePublisher {
                     schema_contract: next_contract,
                     registry,
                     writer_epoch,
+                    branch_rows,
                 };
                 let known_state =
                     rows.state(dataset.version().version, native_branch.as_deref())?;
@@ -1821,6 +2025,7 @@ impl GraphNamespacePublisher {
                     schema_contract: rows.schema_contract,
                     registry: rows.registry,
                     writer_epoch: rows.writer_epoch,
+                    branch_rows: rows.branch_rows,
                 });
             };
             if lineage.is_none() && !cfg!(any(test, feature = "test-util")) {
@@ -1870,6 +2075,7 @@ impl GraphNamespacePublisher {
                 &next_tables,
                 &next_head,
                 writer_epoch.as_ref(),
+                &branch_rows,
                 new_manifest_version,
                 native_branch.as_deref(),
             )?;
@@ -1920,6 +2126,7 @@ impl GraphNamespacePublisher {
                 schema_contract: next_contract,
                 registry,
                 writer_epoch,
+                branch_rows,
             };
             let cold = next.registry.cold_push();
 
@@ -1946,6 +2153,7 @@ impl GraphNamespacePublisher {
                         schema_contract: next.schema_contract,
                         registry: next.registry,
                         writer_epoch: next.writer_epoch,
+                        branch_rows: next.branch_rows,
                     });
                 }
                 Err(failure) => {
@@ -2009,6 +2217,7 @@ impl GraphNamespacePublisher {
                                         schema_contract: next.schema_contract,
                                         registry: next.registry,
                                         writer_epoch: next.writer_epoch,
+                                        branch_rows: next.branch_rows,
                                     });
                                 }
                                 if rows.head.graph_commit_id == next.head.graph_commit_id {
@@ -2113,6 +2322,7 @@ impl GraphNamespacePublisher {
             schema_contract: rows.schema_contract,
             registry: rows.registry,
             writer_epoch: rows.writer_epoch,
+            branch_rows: rows.branch_rows,
         }
     }
 
@@ -2120,14 +2330,18 @@ impl GraphNamespacePublisher {
     /// writer epoch against what the claim first read, and the incarnation.
     async fn prepare_claim(&self, claim: &mut ClaimIntent) -> Result<PreparedClaim> {
         self.holder_key()?;
-        let LoadedPublishState { dataset, mut rows } = self.load_publish_state().await?;
+        let LoadedPublishState {
+            dataset,
+            mut rows,
+            main,
+        } = self.load_publish_state().await?;
         require_control_facts(guard_stamp(&dataset)?)?;
         let native = dataset.manifest().branch.clone();
         let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());
         let read = *claim.read.get_or_insert(current);
         let verdict =
             self.assert_writer_epoch(current, native.as_deref(), EpochAssertion::Claim { read })?;
-        self.check_publish_precondition(&dataset, &rows.head, &claim.identity)
+        self.check_publish_precondition(&dataset, main.as_ref(), &rows.head, &claim.identity)
             .await?;
         let version = dataset.version().version;
         if verdict == EpochVerdict::AlreadyHeld {
@@ -2220,11 +2434,11 @@ impl GraphNamespacePublisher {
             Err(scan_err) => return in_doubt(&scan_err),
         };
         match settle_unanswered_claim(rows.writer_epoch.as_ref(), &claim.attempt_id, after_ack) {
-            UnansweredClaim::Landed => Ok(attempted),
-            UnansweredClaim::InDoubt => {
+            UnansweredPublication::Landed => Ok(attempted),
+            UnansweredPublication::InDoubt => {
                 in_doubt(&"the acknowledged version holds another publication")
             }
-            UnansweredClaim::Lost => {
+            UnansweredPublication::Lost => {
                 let native = dataset.manifest().branch.as_deref();
                 let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native);
                 self.assert_writer_epoch(current, native, EpochAssertion::Claim { read })?;
@@ -2296,10 +2510,348 @@ impl GraphNamespacePublisher {
     }
 }
 
+/// What a branch-row publication carries across its attempts (RFC "Branch
+/// existence in the catalog" §The publication): the identity of its control
+/// fact, the entries it writes, built from the loaded version on every attempt
+/// so a create's row forks from the version it lands beside and its name
+/// checks run on every attempt, and the epoch assertion of its kind: a branch
+/// row and a retired row assert main's epoch as a publish does, with no bump;
+/// the tombstone asserts none.
+pub struct RowIntent {
+    attempt_id: String,
+    kind: RowKind,
+    entries: RowEntries,
+    /// The native chain a tombstone ends, the lifetime its delete resolved.
+    chain: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Branch,
+    Retired,
+    Tombstone,
+}
+
+/// What one attempt of a branch row's publication loaded from main, for the
+/// create's checks and its row (RFC "Branch existence in the catalog" §Create).
+pub struct RowAttempt<'a> {
+    /// The branch rows of the loaded version.
+    pub branch_rows: &'a crate::BranchRows,
+    /// The schema contract the loaded version pins.
+    pub schema_contract: Option<&'a crate::state::SchemaContractHead>,
+    /// The `__manifest` version main is loaded at: the fork point of a branch
+    /// created from main.
+    pub version: u64,
+}
+
+type EntriesOf = Box<dyn Fn(&RowAttempt<'_>) -> Result<Vec<(String, String)>> + Send + Sync>;
+
+enum RowEntries {
+    Fixed(Vec<(String, String)>),
+    PerAttempt(EntriesOf),
+}
+
+impl RowIntent {
+    /// The row of a branch being created, on main: `row_of` builds it from
+    /// what the attempt loaded, on every attempt, and refuses the attempt with
+    /// the create's own error.
+    pub fn branch_row<RowOf>(attempt_id: String, row_of: RowOf) -> Self
+    where
+        RowOf: Fn(&RowAttempt<'_>) -> Result<BranchRow> + Send + Sync + 'static,
+    {
+        Self {
+            attempt_id,
+            kind: RowKind::Branch,
+            entries: RowEntries::PerAttempt(Box::new(move |attempt| {
+                Ok(vec![row_of(attempt)?.entry()])
+            })),
+            chain: None,
+        }
+    }
+
+    /// The retired row of `native`, on main, by the delete that minted
+    /// `attempt_id`.
+    pub fn retired_row(native: &str, attempt_id: String) -> Self {
+        Self {
+            attempt_id,
+            kind: RowKind::Retired,
+            entries: RowEntries::Fixed(vec![retired_entry(native)]),
+            chain: None,
+        }
+    }
+
+    /// The tombstone that ends the chain of `native`, the lifetime its delete
+    /// resolved: an attempt that loads another chain under the name is refused.
+    pub fn tombstone(native: &str, row: &TombstoneRow) -> Self {
+        Self {
+            attempt_id: row.attempt_id.clone(),
+            kind: RowKind::Tombstone,
+            entries: RowEntries::Fixed(vec![row.entry()]),
+            chain: Some(native.to_string()),
+        }
+    }
+
+    /// Refuse an attempt that loaded the chain `loaded` when this intent names
+    /// another: the name was deleted and created again since the delete
+    /// resolved its row, and nothing was written.
+    fn refuse_replaced_lifetime(&self, loaded: Option<&str>) -> Result<()> {
+        match self.chain.as_deref() {
+            Some(chain) if loaded != Some(chain) => Err(OmniError::manifest_conflict(format!(
+                "branch '{}' changed before retirement",
+                crate::branch_names::logical_branch_name(chain)
+            ))
+            .before_effect()),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    fn assertion(&self) -> EpochAssertion {
+        match self.kind {
+            RowKind::Branch | RowKind::Retired => EpochAssertion::Publish,
+            RowKind::Tombstone => EpochAssertion::None,
+        }
+    }
+
+    /// The entries of one attempt over the rows it loaded at `version`.
+    fn entries_for(&self, rows: &ManifestRows, version: u64) -> Result<Vec<(String, String)>> {
+        match &self.entries {
+            RowEntries::Fixed(entries) => Ok(entries.clone()),
+            RowEntries::PerAttempt(build) => build(&RowAttempt {
+                branch_rows: &rows.branch_rows,
+                schema_contract: rows.schema_contract_head.as_ref(),
+                version,
+            }),
+        }
+    }
+
+    /// Whether `config`, the map of a loaded version, already settles this
+    /// intent so nothing is put: every entry holds its value, or any tombstone
+    /// for a tombstone, since two deletes converge.
+    fn settled_by(&self, entries: &[(String, String)], config: &HashMap<String, String>) -> bool {
+        entries.iter().all(|(key, value)| match self.kind {
+            RowKind::Tombstone => config.contains_key(key),
+            RowKind::Branch | RowKind::Retired => config.get(key) == Some(value),
+        })
+    }
+}
+
+/// Whether the version an attempt put holds its `entries`: the read-back of
+/// a lost acknowledgement.
+fn entries_landed_in(entries: &[(String, String)], config: &HashMap<String, String>) -> bool {
+    entries
+        .iter()
+        .all(|(key, value)| config.get(key) == Some(value))
+}
+
+/// One row attempt after its load and its checks.
+enum PreparedRow {
+    /// The loaded version already settles the intent, so nothing is put.
+    Settled(PublishOutcome),
+    /// `entries` go in as the version after `dataset`, over `rows` unchanged.
+    Put {
+        dataset: Dataset,
+        rows: ManifestRows,
+        entries: Vec<(String, String)>,
+        known_state: ManifestState,
+    },
+}
+
+/// The in-doubt outcome of a row publication, which records no graph commit:
+/// keyed by the attempt id its entry carries. A reload of the chain settles
+/// it by the entry under the key.
+fn row_outcome_in_doubt(
+    original: &OmniError,
+    attempt_id: &str,
+    cause: &dyn std::fmt::Display,
+) -> OmniError {
+    OmniError::manifest_publish_in_doubt(
+        attempt_id,
+        format!(
+            "branch row publication outcome is in doubt: the row with attempt id {attempt_id} \
+             may be durable but it could not be confirmed ({cause}); reload the graph and look \
+             the entry up before retrying. original error: {original}"
+        ),
+    )
+}
+
+impl GraphNamespacePublisher {
+    /// Load the bound branch and run one row attempt's checks: the stamp for
+    /// a row on main (a tombstone's chain carries its fork point's), the
+    /// writer epoch under the intent's assertion, the intent's own entries.
+    async fn prepare_row(&self, intent: &RowIntent) -> Result<PreparedRow> {
+        self.holder_key()?;
+        let LoadedPublishState { dataset, rows, .. } = self.load_publish_state().await?;
+        let stamp = guard_stamp(&dataset)?;
+        if intent.chain.is_none() {
+            require_branch_rows(stamp)?;
+        }
+        let native = dataset.manifest().branch.clone();
+        intent.refuse_replaced_lifetime(native.as_deref())?;
+        let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());
+        self.assert_writer_epoch(current, native.as_deref(), intent.assertion())?;
+        let version = dataset.version().version;
+        let entries = intent.entries_for(&rows, version)?;
+        if intent.settled_by(&entries, &dataset.manifest().config) {
+            let known_state = rows.state(version, native.as_deref())?;
+            return Ok(PreparedRow::Settled(Self::control_fact_outcome(
+                dataset,
+                rows,
+                known_state,
+            )));
+        }
+        let known_state = rows.state(version + 1, native.as_deref())?;
+        Ok(PreparedRow::Put {
+            dataset,
+            rows,
+            entries,
+            known_state,
+        })
+    }
+
+    /// Put a prepared row, the held version withdrawn first as a claim's is;
+    /// a row or a retired row that lands raises what the process holds on
+    /// main, a tombstone records nothing, since it ends the chain.
+    async fn put_row(
+        &self,
+        intent: &RowIntent,
+        dataset: Dataset,
+        mut rows: ManifestRows,
+        entries: Vec<(String, String)>,
+        mut known_state: ManifestState,
+    ) -> Result<PublishOutcome> {
+        let key = self.holder_key()?;
+        let native = dataset.manifest().branch.clone();
+        self.holders.withdraw_version(key);
+        let upserts = entries.iter().cloned().collect();
+        let landed = match self.merge_config(dataset.clone(), &rows, upserts).await {
+            Ok(landed) => landed,
+            Err(failure) => {
+                self.read_back_row(intent, &entries, &dataset, failure)
+                    .await?
+            }
+        };
+        known_state.version = landed.version().version;
+        if intent.assertion() == EpochAssertion::Publish {
+            self.holders
+                .record_publication(key, native.as_deref(), known_state.version);
+        }
+        rows.branch_rows = Arc::new(crate::BranchRows::decode(landed.manifest())?);
+        known_state.branch_rows = Arc::clone(&rows.branch_rows);
+        Ok(Self::control_fact_outcome(landed, rows, known_state))
+    }
+
+    /// Settle a row whose put returned no answer from the version it
+    /// attempted: the entries there are the row landed, answered with that
+    /// version; another publication there is the version lost.
+    async fn read_back_row(
+        &self,
+        intent: &RowIntent,
+        entries: &[(String, String)],
+        dataset: &Dataset,
+        failure: PublishAttemptFailure,
+    ) -> Result<Dataset> {
+        let after_ack = matches!(failure, PublishAttemptFailure::AfterAck(_));
+        let err = match failure {
+            PublishAttemptFailure::BeforeAck(err)
+                if err.completion_evidence().is_some() || !err.outcome_opaque() =>
+            {
+                return Err(err);
+            }
+            PublishAttemptFailure::BeforeAck(err) | PublishAttemptFailure::AfterAck(err) => err,
+        };
+        let in_doubt = |cause: &dyn std::fmt::Display| {
+            Err(row_outcome_in_doubt(&err, intent.attempt_id(), cause))
+        };
+        if let Err(readback_err) = fail(&PUBLISH_READ_BACK) {
+            return in_doubt(&readback_err);
+        }
+        let attempted = match dataset
+            .checkout_version(dataset.version().version + 1)
+            .await
+        {
+            Ok(attempted) => attempted,
+            Err(readback_err) => return in_doubt(&readback_err),
+        };
+        let landed = entries_landed_in(entries, &attempted.manifest().config);
+        match settle_unanswered(landed, after_ack) {
+            UnansweredPublication::Landed => Ok(attempted),
+            UnansweredPublication::InDoubt => {
+                in_doubt(&"the acknowledged version holds another publication")
+            }
+            UnansweredPublication::Lost => Err(err),
+        }
+    }
+
+    /// The row's attempts: a put that lost its version to another publication
+    /// loads again and runs every check again, the intent's own among them.
+    async fn row_attempts(&self, intent: &RowIntent) -> Result<PublishOutcome> {
+        let mut attempt = 0;
+        loop {
+            let attempted = match self.prepare_row(intent).await {
+                Ok(PreparedRow::Settled(outcome)) => return Ok(outcome),
+                Ok(PreparedRow::Put {
+                    dataset,
+                    rows,
+                    entries,
+                    known_state,
+                }) => {
+                    self.put_row(intent, dataset, rows, entries, known_state)
+                        .await
+                }
+                Err(err) => Err(err),
+            };
+            match attempted {
+                Err(err)
+                    if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) =>
+                {
+                    attempt += 1;
+                }
+                attempted => return attempted,
+            }
+        }
+    }
+
+    /// The row with `between` run after its first attempt's load and checks
+    /// and before its put, so a test lands a racing publication there.
+    #[cfg(test)]
+    pub(crate) async fn publish_rows_interleaved<Between>(
+        &self,
+        intent: &RowIntent,
+        between: Between,
+    ) -> Result<PublishOutcome>
+    where
+        Between: std::future::Future<Output = ()>,
+    {
+        let first = match self.prepare_row(intent).await? {
+            PreparedRow::Settled(outcome) => return Ok(outcome),
+            PreparedRow::Put {
+                dataset,
+                rows,
+                entries,
+                known_state,
+            } => {
+                between.await;
+                self.put_row(intent, dataset, rows, entries, known_state)
+                    .await
+            }
+        };
+        match first {
+            Err(err) if is_retryable_publish_conflict(&err) => self.row_attempts(intent).await,
+            first => first,
+        }
+    }
+}
+
 /// An unattached snapshot written and tagged, awaiting the revalidation of
 /// its root's authority that acknowledges it.
 struct StagedUnattached {
     dataset: Dataset,
+    /// The main the load resolved the branch through, for the probe.
+    main: Option<Dataset>,
     property: super::unattached::UnattachedCommitProperty,
     rows: ManifestRows,
     detached_version: u64,
@@ -2327,14 +2879,16 @@ impl GraphNamespacePublisher {
         let LoadedPublishState {
             dataset,
             rows: live,
+            main,
         } = self.load_publish_state().await?;
+        self.refuse_tombstoned_chain(&live.branch_rows)?;
         let stamp = read_stamp(&dataset).ok_or_else(|| {
             OmniError::manifest_internal("the loaded `__manifest` carries no stamp")
         })?;
         require_unattached_branches(stamp)?;
         let native_branch = dataset.manifest().branch.clone();
         let precondition = PublishPrecondition::ExactGraphHead(authority.clone());
-        self.check_publish_precondition(&dataset, &live.head, &precondition)
+        self.check_publish_precondition(&dataset, main.as_ref(), &live.head, &precondition)
             .await?;
         let branch = intent.branch.as_deref().filter(|branch| *branch != "main");
         if branch != self.branch.as_deref() {
@@ -2392,6 +2946,7 @@ impl GraphNamespacePublisher {
             schema_contract,
             registry,
             writer_epoch,
+            branch_rows,
             ..
         } = source;
         let tables: TableRows = tables
@@ -2446,6 +3001,7 @@ impl GraphNamespacePublisher {
             schema_contract,
             registry,
             writer_epoch,
+            branch_rows,
         };
         let (detached, _) =
             commit::overwrite_detached(dataset.clone(), &rows, property.encode()?).await?;
@@ -2463,6 +3019,7 @@ impl GraphNamespacePublisher {
         .await?;
         Ok(StagedUnattached {
             dataset,
+            main,
             property,
             rows,
             detached_version,
@@ -2481,6 +3038,7 @@ impl GraphNamespacePublisher {
 
         let StagedUnattached {
             dataset,
+            main,
             property,
             rows,
             detached_version,
@@ -2491,8 +3049,12 @@ impl GraphNamespacePublisher {
         let authority = property.authority();
         let probe = async {
             fail(&PROPOSE_POST_TAG_PRE_PROBE)?;
-            let latest =
-                super::probe_dataset_latest_incarnation(&dataset, self.branch.as_deref()).await?;
+            let latest = super::probe_dataset_latest_incarnation(
+                &dataset,
+                self.branch.as_deref(),
+                main.as_ref(),
+            )
+            .await?;
             if latest.branch_identifier != authority.branch_identifier {
                 return Err(OmniError::manifest_read_set_changed(
                     format!(

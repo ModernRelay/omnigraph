@@ -8,8 +8,9 @@ use futures::FutureExt as _;
 use omnigraph::db::MergeOutcome;
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{
-    BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, HTTP_API_CONTRACT,
-    HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput, SchemaOutput,
+    BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, EntityKind,
+    HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput,
+    SchemaOutput, SnapshotOutput,
 };
 use omnigraph_compiler::query::ast::{BranchCreateFrom, show_statement_name};
 use serde::de::DeserializeOwned;
@@ -17,13 +18,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
+use crate::concurrent::MAX_HOST_RETRIES;
 use crate::{
     Bindings, BranchReadStep, Case, ControlStep, ControlWrite, ExecutionHost, Fixture, Item,
-    ListStep, LoadStep, MAIN_BRANCH, MergeExpect, MutateExpect, MutateStep, ParamsInput,
-    QueryExpect, QueryStep, Seed, ShowStep, Step, StepFail, WriteExpect, bound_snapshot,
-    bound_source, check_error_expect, check_rows_json, expectation_evidence, merge_outcome_word,
-    operation, record_binding, resolve_operand, step_kind, step_label, substitute_all,
-    substitute_bound,
+    ListStep, LoadStep, MAIN_BRANCH, MergeExpect, MutateExpect, MutateStep, Observer, ParamsInput,
+    PlainHost, QueryExpect, QueryStep, ReadDoor, Seed, SessionExpect, SessionKind, SessionOp,
+    SessionReport, ShowStep, Step, StepFail, WriteExpect, bound_snapshot, bound_source,
+    check_error_expect, check_rows_json, expectation_evidence, merge_outcome_word, operation,
+    record_binding, resolve_operand, step_kind, step_label, substitute_all, substitute_bound,
 };
 
 /// The server a `--server` run addresses: its base URL, the graph id under
@@ -57,7 +59,9 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
 /// [`admit_served`] for a measured workload: a `--- restart` after the
 /// measured step at `measured` is admitted as the long-running lifecycle's
 /// no-op, since the verification it precedes reads the same server; one
-/// before it stays refused, as it would claim a reopened engine.
+/// before it stays refused, as it would claim a reopened engine. A
+/// `--- concurrent measured` block is admitted as the measured step itself,
+/// which the host runs through [`ExecutionHost::served_block`].
 pub fn admit_served_workload(case: &Case, measured: usize) -> Result<(), String> {
     served_refusals(case, Some(measured))
 }
@@ -102,6 +106,7 @@ fn served_refusals(case: &Case, measured: Option<usize>) -> Result<(), String> {
         let ordinal = step.ordinal();
         match step {
             Step::Restart { .. } if no_op_restart(step, measured) => {}
+            Step::Concurrent(block) if block.measured && measured == Some(ordinal) => {}
             Step::Restart { .. } | Step::Settings(_) | Step::Concurrent(_) => {
                 refused.push(format!("step {ordinal} ({})", step_kind(step)));
             }
@@ -153,36 +158,39 @@ fn served_refusals(case: &Case, measured: Option<usize>) -> Result<(), String> {
 
 /// Executes the case against the server: the schema check and the seed
 /// when the case carries a fixture, then every step through its route.
-pub fn execute_steps_served<'a, H: ExecutionHost>(
+pub fn execute_steps_served<'a, H: ExecutionHost, O: Observer>(
     case: &'a Case,
     target: &'a ServerTarget,
     host: &'a H,
+    observer: &'a O,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_served_inner(case, target, host, None).boxed()
+    execute_served_inner(case, target, host, observer, None).boxed()
 }
 
 /// [`execute_steps_served`] for a measured workload, admitted by
 /// [`admit_served_workload`]: a restart after the measured step runs as
 /// the lifecycle's no-op and is reported like every other step.
-pub fn execute_measured_served<'a, H: ExecutionHost>(
+pub fn execute_measured_served<'a, H: ExecutionHost, O: Observer>(
     case: &'a Case,
     target: &'a ServerTarget,
     host: &'a H,
+    observer: &'a O,
     measured: usize,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_served_inner(case, target, host, Some(measured)).boxed()
+    execute_served_inner(case, target, host, observer, Some(measured)).boxed()
 }
 
-async fn execute_served_inner<H: ExecutionHost>(
+async fn execute_served_inner<H: ExecutionHost, O: Observer>(
     case: &Case,
     target: &ServerTarget,
     host: &H,
+    observer: &O,
     measured: Option<usize>,
 ) -> Result<(), String> {
     host.admit_case(case)?;
     served_refusals(case, measured)?;
     let client = ServerClient::new(target, Duration::from_millis(case.runner.timeout_ms))?;
-    host.observe(|| format!("lifetime: served by {} graph {}", target.url, target.graph));
+    observer.observe(|| format!("lifetime: served by {} graph {}", target.url, target.graph));
     if let Some(fixture) = &case.fixture {
         check_schema(&client, &fixture.schema).await?;
         seed(&client, fixture).await?;
@@ -201,37 +209,35 @@ async fn execute_served_inner<H: ExecutionHost>(
             let binding = var.zip(value);
             for step in &steps {
                 let ordinal = step.ordinal();
-                host.begin_operation(|| {
+                observer.begin_operation(|| {
                     serde_json::json!({"ordinal": ordinal, "source_line": case.source_lines.get(&ordinal), "loop_binding": binding, "generation": 0})
                 });
-                host.observe(|| {
+                observer.observe(|| {
                     format!(
                         "operation: ordinal={ordinal} line={:?} binding={binding:?} served expected={step:?}",
                         case.source_lines.get(&ordinal)
                     )
                 });
-                host.record("expectation", || expectation_evidence(step));
-                host.measure_step_begin(
+                observer.record("expectation", || expectation_evidence(step));
+                observer.measure_step_begin(
                     ordinal as u64,
                     case.source_lines.get(&ordinal).map(|line| *line as u64),
                     step_kind(step),
                 );
                 let outcome = match step {
-                    Step::Query(q) => query(host, &client, q, binding, &bindings).await,
-                    Step::Mutate(m) => {
-                        mutate(host, &client, m, binding, &bindings)
-                            .await
-                            .and_then(|commit| {
-                                record_binding(
-                                    &mut bindings,
-                                    m.bind.as_deref(),
-                                    commit,
-                                    &step_label(ordinal, "mutate", binding),
-                                )
-                            })
-                    }
-                    Step::Load(l) => load(host, &client, l, binding).await,
-                    Step::Control(c) => control(host, &client, c, binding, &bindings)
+                    Step::Query(q) => query(observer, &client, q, binding, &bindings).await,
+                    Step::Mutate(m) => mutate(observer, &client, m, binding, &bindings)
+                        .await
+                        .and_then(|commit| {
+                            record_binding(
+                                &mut bindings,
+                                m.bind.as_deref(),
+                                commit,
+                                &step_label(ordinal, "mutate", binding),
+                            )
+                        }),
+                    Step::Load(l) => load(observer, &client, l, binding).await,
+                    Step::Control(c) => control(observer, &client, c, binding, &bindings)
                         .await
                         .and_then(|commit| {
                             record_binding(
@@ -241,15 +247,20 @@ async fn execute_served_inner<H: ExecutionHost>(
                                 &step_label(ordinal, c.name, binding),
                             )
                         }),
-                    Step::List(l) => list(host, &client, l, binding).await,
-                    Step::Show(s) => show(host, &client, s, binding).await,
-                    Step::BranchRead(r) => branch_read(host, &client, r, binding, &bindings).await,
+                    Step::List(l) => list(observer, &client, l, binding).await,
+                    Step::Show(s) => show(observer, &client, s, binding).await,
+                    Step::BranchRead(r) => {
+                        branch_read(observer, &client, r, binding, &bindings).await
+                    }
                     Step::Restart { .. } if no_op_restart(step, measured) => {
-                        host.observe(|| {
+                        observer.observe(|| {
                             "restart: the server's lifecycle is long-running; no door opened"
                                 .to_string()
                         });
                         Ok(())
+                    }
+                    Step::Concurrent(block) if block.measured && measured == Some(ordinal) => {
+                        host.served_block(target, case, block).await
                     }
                     Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {
                         Err(StepFail::new(
@@ -258,14 +269,14 @@ async fn execute_served_inner<H: ExecutionHost>(
                         ))
                     }
                 };
-                host.measure_step_end(ordinal as u64);
-                host.record("assertion", || match &outcome {
+                observer.measure_step_end(ordinal as u64);
+                observer.record("assertion", || match &outcome {
                     Ok(()) => serde_json::json!({"status": "passed"}),
                     Err(error) => {
                         serde_json::json!({"status": "failed", "code": "assertion_failed", "message": error.message})
                     }
                 });
-                host.observe(|| {
+                observer.observe(|| {
                     format!(
                         "operation result: {:?}",
                         outcome.as_ref().map_err(|f| (&f.label, &f.message))
@@ -296,11 +307,25 @@ struct ServerClient {
     http: reqwest::Client,
 }
 
-/// The server's error body as the step judges it: the `error` line of an
-/// `ErrorOutput`; every typed detail beside it is the client's business.
+/// The server's error body: its `error` line, a read-set conflict it names
+/// and what its `disposition` says the request did. Lenient, as the server
+/// may be another commit: a field it lacks is absent, one it adds ignored.
 #[derive(Deserialize)]
-struct ErrorText {
+struct ErrorDetail {
     error: String,
+    #[serde(default)]
+    read_set_conflict: Option<Value>,
+    #[serde(default)]
+    disposition: Option<Value>,
+}
+
+/// A request the server answered with an error status.
+struct Refusal {
+    status: reqwest::StatusCode,
+    error: String,
+    /// HTTP 409 naming a read-set conflict, with no disposition or one of
+    /// `effects: none`: the request applied nothing and may be run again.
+    lost_read_set: bool,
 }
 
 impl ServerClient {
@@ -330,6 +355,17 @@ impl ServerClient {
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<Result<Res, String>, String> {
+        Ok(self
+            .send_typed(builder)
+            .await?
+            .map_err(|refusal| refusal.error))
+    }
+
+    /// [`send`](Self::send) with the refusal's status and detail kept.
+    async fn send_typed<Res: DeserializeOwned>(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<Result<Res, Refusal>, String> {
         let builder = builder.header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT);
         let builder = match &self.token {
             Some(token) => builder.bearer_auth(token),
@@ -368,13 +404,23 @@ impl ServerClient {
                 )
             });
         }
-        let error: ErrorText = serde_json::from_slice(&body).map_err(|e| {
+        let detail: ErrorDetail = serde_json::from_slice(&body).map_err(|e| {
             format!(
                 "server answered {status} without an error body: {e}: {}",
                 self.echo(&body)
             )
         })?;
-        Ok(Err(error.error))
+        let applied_nothing = detail
+            .disposition
+            .as_ref()
+            .is_none_or(|disposition| disposition["effects"] == "none");
+        Ok(Err(Refusal {
+            status,
+            error: detail.error,
+            lost_read_set: status == reqwest::StatusCode::CONFLICT
+                && detail.read_set_conflict.is_some()
+                && applied_nothing,
+        }))
     }
 
     /// An undecodable body as diagnostic text: the bearer token's raw and
@@ -410,6 +456,19 @@ impl ServerClient {
         .await
     }
 
+    async fn post_typed<Req: Serialize, Res: DeserializeOwned>(
+        &self,
+        route: &str,
+        body: &Req,
+    ) -> Result<Result<Res, Refusal>, String> {
+        self.send_typed(
+            self.http
+                .post(format!("{}{route}", self.graph_base))
+                .json(body),
+        )
+        .await
+    }
+
     /// Resolve after row materialization so the operation timer includes decoding.
     async fn read(&self, request: &QueryRequest) -> Result<Result<Vec<Value>, String>, String> {
         match self.post::<_, ReadOutput>("/query", request).await? {
@@ -421,6 +480,16 @@ impl ServerClient {
     async fn get<Res: DeserializeOwned>(&self, route: &str) -> Result<Result<Res, String>, String> {
         self.send(self.http.get(format!("{}{route}", self.graph_base)))
             .await
+    }
+
+    /// The branch's snapshot: every table with the rows its manifest counts.
+    async fn snapshot(&self, branch: &str) -> Result<Result<SnapshotOutput, String>, String> {
+        self.send(
+            self.http
+                .get(format!("{}/snapshot", self.graph_base))
+                .query(&[("branch", branch)]),
+        )
+        .await
     }
 
     async fn load(&self, branch: &str, mode: LoadMode, data: String) -> Result<(), String> {
@@ -528,6 +597,281 @@ async fn seed(client: &ServerClient, fixture: &Fixture) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the server at `url` answers `GET /readyz` with success and no
+/// graph still loading; a server that cannot be reached yet is not ready.
+pub async fn server_ready(url: &str, timeout: Duration) -> Result<bool, String> {
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("server client: {e}"))?;
+    let request = http.get(format!("{}/readyz", url.trim_end_matches('/')));
+    let Ok(response) = request.send().await else {
+        return Ok(false);
+    };
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    Ok(response
+        .json::<Value>()
+        .await
+        .is_ok_and(|body| body["loading_graph_count"] == 0))
+}
+
+/// The commit the server at `url` says it was built from, at the
+/// unauthenticated `GET /healthz`; `None` for a build that names none. The
+/// answer is read leniently, as the server may be another commit than this
+/// harness: only its `source_version` is looked at.
+pub async fn server_source_commit(url: &str, timeout: Duration) -> Result<Option<String>, String> {
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("server client: {e}"))?;
+    let health: Value = http
+        .get(format!("{}/healthz", url.trim_end_matches('/')))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| format!("GET /healthz failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("GET /healthz answered a body this runner cannot decode: {e}"))?;
+    Ok(health["source_version"].as_str().map(str::to_string))
+}
+
+/// A table of a branch and the rows a provisioned graph holds in it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeededTable {
+    pub branch: String,
+    pub table: String,
+    pub rows: u64,
+}
+
+/// Makes an empty served graph the dataset's own, for a host that starts its
+/// server per run: `dataset` executed as [`execute_steps_served`] executes a
+/// case (the schema the graph already carries held against the fixture's, the
+/// seed, the declared branches, then every step with its expectation), then
+/// every node table of `tables` counted through `/query` and every edge table
+/// of `edge_tables` read from its branch's snapshot, each held against its
+/// rows. A dataset without a fixture is refused: it would provision nothing.
+pub async fn provision_served(
+    target: &ServerTarget,
+    dataset: &Case,
+    tables: &[SeededTable],
+    edge_tables: &[SeededTable],
+) -> Result<(), String> {
+    if dataset.fixture.is_none() {
+        return Err("a dataset provisions a graph from its `--- schema` and seed".into());
+    }
+    execute_served_inner(dataset, target, &PlainHost, &(), None).await?;
+    let client = ServerClient::new(target, Duration::from_millis(dataset.runner.timeout_ms))?;
+    for seeded in tables {
+        let SeededTable {
+            branch,
+            table,
+            rows,
+        } = seeded;
+        let request = QueryRequest {
+            query: format!(
+                "query seeded_rows() {{ match {{ $r: {table} }} return {{ count($r) as n }} }}"
+            ),
+            name: Some("seeded_rows".into()),
+            params: None,
+            branch: Some(branch.clone()),
+            snapshot: None,
+            settings: None,
+        };
+        let answer = client
+            .read(&request)
+            .await?
+            .map_err(|error| format!("count of {table} on {branch} failed: {error}"))?;
+        let counted = match answer.as_slice() {
+            [] => Some(0),
+            [row] => row.get("n").and_then(Value::as_u64),
+            _ => None,
+        };
+        if counted != Some(*rows) {
+            return Err(format!(
+                "the seeded graph holds {} rows of {table} on {branch} and the fixture holds {rows}",
+                counted.map_or_else(|| format!("{answer:?}"), |count| count.to_string())
+            ));
+        }
+    }
+    let mut snapshots = std::collections::BTreeMap::new();
+    for seeded in edge_tables {
+        let SeededTable {
+            branch,
+            table,
+            rows,
+        } = seeded;
+        if !snapshots.contains_key(branch) {
+            let snapshot = client
+                .snapshot(branch)
+                .await?
+                .map_err(|error| format!("snapshot of {branch} failed: {error}"))?;
+            snapshots.insert(branch, snapshot);
+        }
+        let counted = snapshots[branch]
+            .datasets
+            .iter()
+            .find(|dataset| dataset.entity_kind == EntityKind::Edge && dataset.type_name == *table)
+            .map_or(0, |dataset| dataset.entity_count);
+        if counted != *rows {
+            return Err(format!(
+                "the seeded graph holds {counted} rows of edge {table} on {branch} and the fixture holds {rows}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One session of a block against a server: a client of its own, so every
+/// worker holds its own connections and its own actor's token.
+pub struct ServedSession {
+    client: ServerClient,
+}
+
+impl ServedSession {
+    /// `timeout` bounds every request, as the step client's does.
+    pub fn open(target: &ServerTarget, timeout: Duration) -> Result<Self, String> {
+        ServerClient::new(target, timeout).map(|client| Self { client })
+    }
+
+    /// One run of the session's statement; `seq` is the ordinal of this run on
+    /// the worker. An HTTP 409 that names a read-set conflict and applied
+    /// nothing is run again, up to [`MAX_HOST_RETRIES`] times, each counted,
+    /// and the session's expect holds against the final answer. A conflict
+    /// whose disposition says an earlier publication of the request applied
+    /// is that final answer: sent again, the publication would apply twice.
+    /// The server's own reprepares behind an acknowledged write are not on
+    /// the wire, so the count is the host's runs alone. A request refused at
+    /// a workload limit (HTTP 429) fails the run: waiting a limit out would
+    /// put the wait inside a service time.
+    pub async fn run(&self, op: &SessionOp, seq: u64) -> Result<SessionReport, String> {
+        let what = op.kind.name();
+        let mut host_retries = 0u32;
+        loop {
+            let outcome = self.attempt(op, seq).await?;
+            if let Err(refusal) = &outcome {
+                if refusal.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    return Err(format!(
+                        "the server refused the {what} at a workload limit (HTTP 429), which a block never waits out: {}",
+                        refusal.error
+                    ));
+                }
+                if refusal.lost_read_set && host_retries < MAX_HOST_RETRIES {
+                    host_retries += 1;
+                    continue;
+                }
+            }
+            let report = SessionReport {
+                conflicts: host_retries,
+            };
+            let outcome = outcome.map_err(|refusal| refusal.error);
+            return match &op.expect {
+                SessionExpect::Ok => outcome
+                    .map(|()| report)
+                    .map_err(|e| format!("{what} failed: {e}")),
+                SessionExpect::Error { needle } => {
+                    check_error_expect(&(), needle, outcome, &format!("the {what} succeeded"))
+                        .map(|()| report)
+                }
+            };
+        }
+    }
+
+    /// One attempt: `Err` is the request not reaching a verdict or the
+    /// harness's own refusal, `Ok` the server's answer.
+    async fn attempt(&self, op: &SessionOp, seq: u64) -> Result<Result<(), Refusal>, String> {
+        let change = |query: String, name: Option<String>, branch: Option<String>| ChangeRequest {
+            query,
+            name,
+            params: None,
+            branch,
+            settings: None,
+        };
+        match &op.kind {
+            SessionKind::Query => {
+                let request = QueryRequest {
+                    query: op.source.clone(),
+                    name: Some(op.name.clone()),
+                    params: None,
+                    branch: Some(op.branch.clone()),
+                    snapshot: None,
+                    settings: None,
+                };
+                match self
+                    .client
+                    .post_typed::<_, ReadOutput>("/query", &request)
+                    .await?
+                {
+                    Ok(output) => rows_of(&output).map(|_| Ok(())),
+                    Err(refusal) => Ok(Err(refusal)),
+                }
+            }
+            SessionKind::Mutation => {
+                let request = change(
+                    op.source.clone(),
+                    Some(op.name.clone()),
+                    Some(op.branch.clone()),
+                );
+                Ok(self
+                    .client
+                    .post_typed::<_, ChangeOutput>("/mutate", &request)
+                    .await?
+                    .map(|_| ()))
+            }
+            SessionKind::Load(recipe) => {
+                let request = IngestRequest {
+                    branch: Some(op.branch.clone()),
+                    from: None,
+                    mode: Some(recipe.mode),
+                    data: recipe.generated.dealt_row(op.dealt_index(seq))?,
+                };
+                Ok(self
+                    .client
+                    .post_typed::<_, Value>("/load", &request)
+                    .await?
+                    .map(|_| ()))
+            }
+            SessionKind::Merge(merge) => {
+                let statement =
+                    merge_statement(&merge.source, merge.into.as_deref(), merge.as_commit);
+                let request = change(statement, None, None);
+                Ok(self
+                    .client
+                    .post_typed::<_, ChangeOutput>("/mutate", &request)
+                    .await?
+                    .map(|_| ()))
+            }
+        }
+    }
+}
+
+impl ReadDoor for ServedSession {
+    fn rows<'a>(
+        &'a self,
+        branch: &'a str,
+        source: &'a str,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>> {
+        async move {
+            let request = QueryRequest {
+                query: source.to_string(),
+                name: Some(name.to_string()),
+                params: None,
+                branch: Some(branch.to_string()),
+                snapshot: None,
+                settings: None,
+            };
+            self.client.read(&request).await?
+        }
+        .boxed()
+    }
+}
+
 /// The `--- params` as they go on the wire: the JSON the case spells,
 /// bindings substituted, or a recipe's generated values; the server holds them
 /// against the declaration, so a parameter error is the server's answer, never
@@ -561,7 +905,7 @@ fn rows_of(output: &ReadOutput) -> Result<Vec<Value>, String> {
 /// section is the executor's Arrow schema against the compiler's, which
 /// no wire answer carries, so it is not judged here.
 pub(crate) fn check_read_expect(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     label: &str,
     expect: &QueryExpect,
     outcome: Result<Vec<Value>, String>,
@@ -578,22 +922,22 @@ pub(crate) fn check_read_expect(
             shape,
         } => {
             let actual = outcome.map_err(|e| fail(format!("{failed}: {e}")))?;
-            host.observe(|| {
+            observer.observe(|| {
                 format!(
                     "shape: {} line(s) not judged under a server target",
                     shape.lines.len()
                 )
             });
-            check_rows_json(host, label, &actual, *ordered, body_raw, *span, binding)
+            check_rows_json(observer, label, &actual, *ordered, body_raw, *span, binding)
         }
         QueryExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, succeeded).map_err(fail)
+            check_error_expect(observer, needle, outcome, succeeded).map_err(fail)
         }
     }
 }
 
 async fn query(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ServerClient,
     step: &QueryStep,
     binding: Option<(&str, &str)>,
@@ -606,7 +950,7 @@ async fn query(
         Err(e) => {
             return match &step.expect {
                 QueryExpect::Error { needle } if e.contains(needle) => {
-                    host.record("parameter_error", || serde_json::json!({"message": e}));
+                    observer.record("parameter_error", || serde_json::json!({"message": e}));
                     Ok(())
                 }
                 QueryExpect::Error { needle } => {
@@ -625,12 +969,12 @@ async fn query(
         snapshot,
         settings: None,
     };
-    let outcome = operation(host, step.ordinal, client.read(&request))
+    let outcome = operation(observer, step.ordinal, client.read(&request))
         .await
         .map_err(&fail)?
         .map_err(&fail)?;
     check_read_expect(
-        host,
+        observer,
         &label,
         &step.expect,
         outcome,
@@ -641,7 +985,7 @@ async fn query(
 }
 
 async fn mutate(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ServerClient,
     step: &MutateStep,
     binding: Option<(&str, &str)>,
@@ -655,7 +999,7 @@ async fn mutate(
         Err(e) => {
             return match &step.expect {
                 MutateExpect::Error { needle } if e.contains(needle) => {
-                    host.record("parameter_error", || serde_json::json!({"message": e}));
+                    observer.record("parameter_error", || serde_json::json!({"message": e}));
                     Ok(None)
                 }
                 MutateExpect::Error { needle } => {
@@ -673,14 +1017,14 @@ async fn mutate(
         settings: None,
     };
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
         client.post::<_, ChangeOutput>("/mutate", &request),
     )
     .await
     .map_err(&fail)?
     .map_err(&fail)?;
-    host.record("mutation_result", || match &outcome {
+    observer.record("mutation_result", || match &outcome {
         Ok(result) => {
             serde_json::json!({"nodes": result.affected_nodes, "edges": result.affected_edges})
         }
@@ -691,9 +1035,9 @@ async fn mutate(
         ..
     }) = &outcome
     {
-        host.record("commit", || crate::commit_evidence(commit.published));
+        observer.record("commit", || crate::commit_evidence(commit.published));
     }
-    host.observe(|| match &outcome {
+    observer.observe(|| match &outcome {
         Ok(result) => format!(
             "actual affected: nodes={} edges={}",
             result.affected_nodes, result.affected_edges
@@ -718,7 +1062,7 @@ async fn mutate(
             }
         }
         MutateExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "the mutation succeeded")
+            check_error_expect(observer, needle, outcome, "the mutation succeeded")
                 .map(|()| None)
                 .map_err(fail)
         }
@@ -726,7 +1070,7 @@ async fn mutate(
 }
 
 async fn load(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ServerClient,
     step: &LoadStep,
     binding: Option<(&str, &str)>,
@@ -734,7 +1078,7 @@ async fn load(
     let label = step_label(step.ordinal, "load", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
         client.load_generated(&step.generated, &step.branch, step.mode),
     )
@@ -743,13 +1087,13 @@ async fn load(
     match &step.expect {
         WriteExpect::Ok => outcome.map_err(fail),
         WriteExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "load succeeded").map_err(fail)
+            check_error_expect(observer, needle, outcome, "load succeeded").map_err(fail)
         }
     }
 }
 
 fn check_write_expect(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     name: &str,
     expect: &WriteExpect,
     outcome: Result<ChangeOutput, String>,
@@ -759,7 +1103,7 @@ fn check_write_expect(
             .map(|_| ())
             .map_err(|e| format!("`{name}` failed: {e}")),
         WriteExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, &format!("`{name}` succeeded"))
+            check_error_expect(observer, needle, outcome, &format!("`{name}` succeeded"))
         }
     }
 }
@@ -791,6 +1135,18 @@ fn branch_name(name: &str) -> String {
 /// `text` as the grammar's `string_lit`.
 fn string_literal(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// A `branch merge` as the corpus spells it.
+fn merge_statement(source: &str, into: Option<&str>, as_commit: bool) -> String {
+    let mut statement = format!("branch merge {}", branch_name(source));
+    if let Some(target) = into {
+        statement.push_str(&format!(" into {}", branch_name(target)));
+    }
+    if as_commit {
+        statement.push_str(" as commit");
+    }
+    statement
 }
 
 /// The control write as the corpus spells it, a bound commit id resolved, so
@@ -826,16 +1182,7 @@ pub(crate) fn control_statement(
             into,
             as_commit,
             ..
-        } => {
-            let mut statement = format!("branch merge {}", branch_name(source));
-            if let Some(target) = into {
-                statement.push_str(&format!(" into {}", branch_name(target)));
-            }
-            if *as_commit {
-                statement.push_str(" as commit");
-            }
-            statement
-        }
+        } => merge_statement(source, into.as_deref(), *as_commit),
         ControlWrite::Publish {
             graph_commit_id, ..
         } => format!(
@@ -861,7 +1208,7 @@ pub(crate) fn control_statement(
 }
 
 async fn control(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ServerClient,
     step: &ControlStep,
     binding: Option<(&str, &str)>,
@@ -881,17 +1228,17 @@ async fn control(
         settings: None,
     };
     let outcome = operation(
-        host,
+        observer,
         step.ordinal,
         client.post::<_, ChangeOutput>("/mutate", &request),
     )
     .await
     .map_err(&fail)?
     .map_err(&fail)?;
-    host.observe(|| format!("actual control: {:?}", outcome.as_ref().map(|o| &o.outcome)));
+    observer.observe(|| format!("actual control: {:?}", outcome.as_ref().map(|o| &o.outcome)));
     let commit = outcome.as_ref().ok().and_then(|output| {
         output.commit.as_ref().map(|c| {
-            host.record("commit", || crate::commit_evidence(c.published));
+            observer.record("commit", || crate::commit_evidence(c.published));
             c.graph_commit_id.clone()
         })
     });
@@ -924,7 +1271,7 @@ async fn control(
                     )));
                 }
             }
-            check_write_expect(host, name, expect, outcome)
+            check_write_expect(observer, name, expect, outcome)
                 .map(|()| commit)
                 .map_err(fail)
         }
@@ -937,14 +1284,14 @@ async fn control(
                     output.outcome
                 )));
             }
-            check_write_expect(host, name, expect, outcome)
+            check_write_expect(observer, name, expect, outcome)
                 .map(|()| commit)
                 .map_err(fail)
         }
         ControlWrite::Merge {
             expect: MergeExpect::Write(expect),
             ..
-        } => check_write_expect(host, name, expect, outcome)
+        } => check_write_expect(observer, name, expect, outcome)
             .map(|()| commit)
             .map_err(fail),
         ControlWrite::Merge {
@@ -972,19 +1319,19 @@ async fn control(
 }
 
 async fn list(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ServerClient,
     step: &ListStep,
     binding: Option<(&str, &str)>,
 ) -> Result<(), StepFail> {
     let label = step_label(step.ordinal, "branch list", binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
-    let outcome = operation(host, step.ordinal, statement(client, "branch list"))
+    let outcome = operation(observer, step.ordinal, statement(client, "branch list"))
         .await
         .map_err(&fail)?
         .map_err(&fail)?;
     check_read_expect(
-        host,
+        observer,
         &label,
         &step.expect,
         outcome,
@@ -995,7 +1342,7 @@ async fn list(
 }
 
 async fn show(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ServerClient,
     step: &ShowStep,
     binding: Option<(&str, &str)>,
@@ -1003,12 +1350,16 @@ async fn show(
     let name = show_statement_name(step.id);
     let label = step_label(step.ordinal, &name, binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
-    let outcome = operation(host, step.ordinal, statement(client, &format!("{name};")))
-        .await
-        .map_err(&fail)?
-        .map_err(&fail)?;
+    let outcome = operation(
+        observer,
+        step.ordinal,
+        statement(client, &format!("{name};")),
+    )
+    .await
+    .map_err(&fail)?
+    .map_err(&fail)?;
     check_read_expect(
-        host,
+        observer,
         &label,
         &step.expect,
         outcome,
@@ -1022,7 +1373,7 @@ async fn show(
 /// bound names replaced, its rows held against the expect with the same
 /// names replaced in the expected rows.
 async fn branch_read(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     client: &ServerClient,
     step: &BranchReadStep,
     binding: Option<(&str, &str)>,
@@ -1032,7 +1383,7 @@ async fn branch_read(
     let label = step_label(step.ordinal, name, binding);
     let fail = |message: String| StepFail::new(label.clone(), message);
     let text = substitute_bound(&step.source, bindings);
-    let outcome = operation(host, step.ordinal, statement(client, &text))
+    let outcome = operation(observer, step.ordinal, statement(client, &text))
         .await
         .map_err(&fail)?
         .map_err(&fail)?;
@@ -1045,7 +1396,7 @@ async fn branch_read(
         } => {
             let actual = outcome.map_err(|e| fail(format!("`{name}` failed: {e}")))?;
             check_rows_json(
-                host,
+                observer,
                 &label,
                 &actual,
                 *ordered,
@@ -1055,7 +1406,8 @@ async fn branch_read(
             )
         }
         QueryExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, &format!("`{name}` succeeded")).map_err(fail)
+            check_error_expect(observer, needle, outcome, &format!("`{name}` succeeded"))
+                .map_err(fail)
         }
     }
 }

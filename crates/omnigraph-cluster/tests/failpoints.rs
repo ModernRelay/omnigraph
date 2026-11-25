@@ -7,6 +7,8 @@
 //! same reason the engine keeps its failpoint suite in `tests/failpoints.rs`.
 
 #![cfg(feature = "failpoints")]
+// Match the cluster test harness budget for composed deployment/recovery futures.
+#![recursion_limit = "256"]
 
 use std::fs;
 use std::path::{Path, PathBuf};

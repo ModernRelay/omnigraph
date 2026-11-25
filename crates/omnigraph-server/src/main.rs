@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use clap::Parser;
 use color_eyre::eyre::Result;
@@ -8,9 +9,18 @@ use omnigraph_server::{
     serve_with_mcp_settings,
 };
 
+/// `-V`: the version this binary reports, as `/healthz` reports it.
+static VERSION: LazyLock<String> =
+    LazyLock::new(|| omnigraph_server::api::build::reported_version(env!("CARGO_PKG_VERSION")));
+/// `--version`: the report `omnigraph version` prints, so the server can be
+/// checked against a CLI before it boots.
+static LONG_VERSION: LazyLock<String> =
+    LazyLock::new(|| omnigraph_server::api::build::version_report(env!("CARGO_PKG_VERSION")));
+
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph-server")]
 #[command(about = "HTTP server for the Omnigraph graph database")]
+#[command(version = VERSION.as_str(), long_version = LONG_VERSION.as_str())]
 struct Cli {
     /// Boot from a cluster: either a config directory (storage resolved
     /// through cluster.yaml) or a storage-root URI directly
@@ -61,6 +71,12 @@ struct Cli {
     /// comma-separated from `OMNIGRAPH_MCP_ALLOWED_HOSTS`.
     #[arg(long = "mcp-allowed-host", value_name = "HOST")]
     mcp_allowed_hosts: Vec<String>,
+    /// An `https` page where a user can create a graph. When a caller's
+    /// `graphs` list is successful and empty, MCP returns it as a `setup`
+    /// link. No userinfo, query or fragment; also read from
+    /// `OMNIGRAPH_MCP_SETUP_URL`.
+    #[arg(long = "mcp-setup-url", value_name = "URL")]
+    mcp_setup_url: Option<String>,
 }
 
 #[tokio::main]
@@ -74,7 +90,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let mcp = McpSettings::resolve(cli.mcp_allowed_hosts)?;
+    let mcp = McpSettings::resolve(cli.mcp_allowed_hosts, cli.mcp_setup_url)?;
     if let Some(receipt_path) = cli.bootstrap_handoff.as_deref() {
         let shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
         let settings = load_server_settings_with_bootstrap_handoff(
@@ -123,6 +139,35 @@ async fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--version` prints what `omnigraph version` prints after the binary
+    /// name, so a person or an agent can tell whether a server matches a CLI;
+    /// `-V` prints the version alone. Neither needs a boot source.
+    #[test]
+    fn version_flags_report_the_build_without_a_cluster() {
+        use omnigraph_server::api::build;
+        let long = Cli::try_parse_from(["omnigraph-server", "--version"]).unwrap_err();
+        assert_eq!(long.kind(), clap::error::ErrorKind::DisplayVersion);
+        let [lowest, highest] = build::INTERNAL_SCHEMA_SERVES;
+        let mut expected = vec![
+            format!(
+                "omnigraph-server {}",
+                build::reported_version(env!("CARGO_PKG_VERSION"))
+            ),
+            format!(
+                "internal-schema {} (serves v{lowest} to v{highest})",
+                build::INTERNAL_SCHEMA_WRITES
+            ),
+            format!("http-contract {}", omnigraph_server::api::HTTP_API_CONTRACT),
+        ];
+        expected.extend(build::SOURCE_COMMIT.map(|commit| format!("commit {commit}")));
+        let rendered = long.to_string();
+        assert_eq!(rendered.lines().collect::<Vec<_>>(), expected);
+
+        let short = Cli::try_parse_from(["omnigraph-server", "-V"]).unwrap_err();
+        assert_eq!(short.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert_eq!(short.to_string().trim_end(), expected[0]);
+    }
 
     #[test]
     fn bootstrap_handoff_requires_an_explicit_cluster() {

@@ -1,0 +1,1 @@
+- `cleanup --help` says a run without `--confirm` lists no candidates, `cluster members --help` that it lists active organization members, and `init --help` that the URI is local.

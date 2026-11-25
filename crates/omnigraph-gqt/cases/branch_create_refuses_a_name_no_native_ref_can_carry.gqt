@@ -1,0 +1,62 @@
+# issue: none
+# notes: `branch create` refuses, by the name as written and before any effect, a name that no native ref
+# notes: `{name}.{ULID}` can carry: a character other than letters, digits, '.', '-', '_' and '/'; an empty
+# notes: segment, such as a trailing '/'; '..'; and a trailing '.'. Before the fix the first was refused by Lance's
+# notes: error naming the internal `sp ace.<ULID>` ref, and `a/` was accepted as a branch that listed as
+# notes: `a/.<ULID>` and resolved by no name. A name of letters from any script is still created.
+# notes: The Rust owner test branching::branch_create_refuses_names_no_native_ref_can_carry also covers the
+# notes: create-from and create-at-a-commit routes and the before-effect disposition.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- mutate
+branch create "sp ace"
+
+--- expect error: branch name 'sp ace' contains ' '
+
+--- mutate
+branch create "a/"
+
+--- expect error: branch name 'a/' has an empty segment
+
+--- mutate
+branch create "a..b"
+
+--- expect error: branch name 'a..b' contains '..'
+
+--- mutate
+branch create "end."
+
+--- expect error: branch name 'end.' ends in '.'
+
+--- mutate
+branch create "é/ü"
+
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "main"}
+{"name": "é/ü"}
+
+--- expect shape
+name: String

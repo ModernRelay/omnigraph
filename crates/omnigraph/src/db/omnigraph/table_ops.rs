@@ -18,7 +18,7 @@ pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index
         .collect();
     db.runtime_cache
         .graph_index(
-            &resolved,
+            &resolved.snapshot,
             &edge_types,
             db.storage_adapter(),
             catalog.system_columns,
@@ -26,14 +26,14 @@ pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index
         .await
 }
 
-pub(super) async fn graph_index_for_resolved(
+pub(super) async fn graph_index_for_snapshot(
     db: &Omnigraph,
-    resolved: &ResolvedTarget,
+    snapshot: &Snapshot,
     edge_types: &std::collections::HashMap<String, (String, String)>,
     system_columns: SystemColumns,
 ) -> Result<Arc<crate::graph_index::GraphIndex>> {
     db.runtime_cache
-        .graph_index(resolved, edge_types, db.storage_adapter(), system_columns)
+        .graph_index(snapshot, edge_types, db.storage_adapter(), system_columns)
         .await
 }
 

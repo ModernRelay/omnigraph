@@ -1,0 +1,63 @@
+name: Provision predecessors
+description: >-
+  Install or build the named rows of .github/predecessors.toml, cached by what
+  they are made from, and export OMNIGRAPH_PREDECESSORS naming their manifest
+  (docs/dev/testing.md, Predecessor binaries).
+inputs:
+  rows:
+    description: Space-separated registry row names.
+    required: true
+  require:
+    description: >-
+      'true' makes a test that asks for a row the manifest lacks fail instead
+      of skipping.
+    required: false
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Key the predecessor cache
+      id: key
+      shell: bash
+      env:
+        ROWS: ${{ inputs.rows }}
+      run: |
+        set -euo pipefail
+        read -ra rows <<< "$ROWS"
+        echo "key=$(python3 scripts/predecessors.py cache-key "${rows[@]}")" >> "$GITHUB_OUTPUT"
+
+    - name: Restore provisioned predecessors
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/predecessors/rows
+        key: ${{ steps.key.outputs.key }}
+
+    # Rows the cache restored are reused once their registry entry and
+    # version still match; the rest are installed or built here.
+    - name: Provision the rows
+      shell: bash
+      env:
+        ROWS: ${{ inputs.rows }}
+        REQUIRE: ${{ inputs.require }}
+      run: |
+        set -euo pipefail
+        read -ra rows <<< "$ROWS"
+        flags=()
+        case "$REQUIRE" in
+          true) flags+=(--require) ;;
+          false) ;;
+          *) echo "::error::require must be 'true' or 'false', got '$REQUIRE'"; exit 1 ;;
+        esac
+        manifest="$(python3 scripts/predecessors.py provision --store "$RUNNER_TEMP/predecessors" ${flags[@]+"${flags[@]}"} "${rows[@]}")"
+        cat "$manifest"
+        echo "OMNIGRAPH_PREDECESSORS=$manifest" >> "$GITHUB_ENV"
+
+    # Saved at once, not after the job: a later red test still keeps the
+    # provisioned rows for the next run.
+    - name: Save provisioned predecessors
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/predecessors/rows
+        key: ${{ steps.key.outputs.key }}

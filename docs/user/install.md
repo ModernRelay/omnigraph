@@ -110,16 +110,19 @@ refuses a format newer than its own, so test on a copy of the graph or back it
 up first ([upgrades](operations/upgrade.md)). A client and a server must speak
 the same HTTP contract.
 
-Install a specific stable tag with `VERSION=v0.14.0` on macOS/Linux or
-`-Version v0.14.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
-different destination.
+Install a specific stable tag with `VERSION=v0.16.0` on macOS/Linux or
+`-Version v0.16.0` on Windows. Set `INSTALL_DIR` or `-InstallDir` to choose a
+different destination. On macOS/Linux, `ARCHIVE_SHA256=<digest>` also
+requires the downloaded archive to have that SHA256, in addition to the
+`.sha256` published beside it, so a pinned install refuses an asset replaced
+under its tag.
 
 Documentation on `main` may describe behavior newer than the latest stable
 binary. Check `omnigraph version` and the [release notes](../releases/).
 
 ## Client compatibility
 
-Upgrade the CLI, server, and HTTP integrations together. OmniGraph 0.14 requires
+Upgrade the CLI, server, and HTTP integrations together. Omnigraph 0.14 requires
 HTTP contract `0.14`; the npm `0.13.0` clients are not compatible with it.
 Both `@modernrelay/omnigraph@0.14.0` and
 `@modernrelay/omnigraph-mcp@0.14.0` are published on npm. Install the 0.14.0
@@ -129,9 +132,15 @@ For an existing deployment, follow the
 [0.13 → 0.14 checklist](operations/upgrade-0.14.md), including configuration
 and command replacements.
 
+The Python client is [`omnigraph`](https://pypi.org/project/omnigraph/) on
+PyPI ([source](https://github.com/ModernRelay/omnigraph-python)). Its
+major.minor is the HTTP contract it speaks, and it refuses any other; its patch
+number is its own and does not track the server's. For the 0.14 server, install
+it with `pip install "omnigraph>=0.14,<0.15"`.
+
 You can use the released CLI, the [HTTP API](operations/server.md), or the
 server's built-in [MCP endpoint and CLI stdio bridge](operations/mcp.md)
-without either npm package. The MCP protocol has its own negotiation; refresh
+without any of these client packages. The MCP protocol has its own negotiation; refresh
 cached tool schemas when upgrading a client.
 
 ## Build from source
@@ -172,32 +181,37 @@ deployment images used for the Azure reference topology.
 
 ```bash
 omnigraph version
+omnigraph-server --version
 omnigraph-server --help
 omnigraph-azure-admission --help
 ```
 
 `omnigraph version` reports what the binary itself speaks, without opening a
-graph or contacting a server. For example, building the `v0.14.0` source tag
-without release metadata prints:
+graph or contacting a server. For example, the `v0.16.0` release archive
+prints:
 
 ```text
-omnigraph 0.14.0
-internal-schema 16 (serves v14 to v16)
+omnigraph 0.16.0
+internal-schema 17 (serves v14 to v17)
 http-contract 0.14
+commit 00b8cca842f2bf009bebeefcf765672b5ff64b26
 ```
+
+`omnigraph-server --version` prints the same report under its own name, so a
+CLI and a server can be compared before either connects to the other.
 
 `omnigraph version --json` also reports the machine-readable CLI protocols:
 
 ```json
 {
-  "version": "0.14.0",
-  "channel": null,
-  "commit": null,
+  "version": "0.16.0",
+  "channel": "stable",
+  "commit": "00b8cca842f2bf009bebeefcf765672b5ff64b26",
   "http_contract": "0.14",
   "protocols": { "studio": 1, "target": 2, "credential": 2, "access": 2 },
   "internal_schema": {
-    "writes": 16,
-    "serves": [14, 16]
+    "writes": 17,
+    "serves": [14, 17]
   }
 }
 ```
@@ -208,13 +222,20 @@ is above the latest stable release, so an edge version sorts after every
 published stable release and before the release it precedes. `channel` is `stable`
 or `edge` for a GitHub release archive and null for any other build. `commit`
 is the commit a packaged build was compiled from; a plain source build reports
-it as null and prints no `commit` line. The server reports the same commit as
-`source_version` on `GET /healthz`.
+it as null and prints no `commit` line. `omnigraph --version` (`-v`) prints
+only the first line.
 
-`internal_schema.writes` is the storage format of a graph this binary
-creates, and the one `omnigraph upgrade` converts a graph to; `serves` is the
-range of formats it opens. A graph it opens keeps its own format, apart from
-the v14 and v15 stamps described in [upgrading](operations/upgrade.md).
+A server older than 0.16.1 has no `--version` flag. A running server of any
+release reports its package version as `version`, its commit as
+`source_version` and the storage format it writes as `internal_schema_version`
+on `GET /healthz`.
+
+`internal_schema.writes` is the storage-format stamp of a graph this binary
+creates, the highest it writes, and the one `omnigraph upgrade` converts a
+graph to; `serves` is the inclusive range, lowest first, that normal open
+accepts. A graph it opens keeps its own format, apart from the v14 and v15
+stamps described in [upgrading](operations/upgrade.md). `snapshot --json`
+reports a graph's own stamp as `internal_schema_version`.
 
 `http_contract` is the `Omnigraph-Http-Api` value the CLI sends. A server
 accepts only an exact match and returns its own value on every response,
@@ -233,11 +254,6 @@ An incompatible change to either contract requires its discovery number to chang
 uses `actor_id` in place of protocol 1's `actor`. `protocols.studio` identifies
 the [Studio link](cli/studio.md#the-link), `studio --json`, and the `home` and
 `binding` digests `target inspect --json` reports for checking a link.
-`internal_schema.writes` is the storage-format stamp of a graph this binary
-creates, the highest it writes, and `internal_schema.serves` is the inclusive range, lowest first, that
-normal open accepts; `snapshot --json` reports a graph's own stamp as
-`internal_schema_version`. `omnigraph --version` (`-v`) prints only the first
-line.
 
 Release archives from v0.14.0 on, and every `edge-<date>-<commit>` build, carry
 a build provenance attestation. When the GitHub CLI (2.49 or later) is installed

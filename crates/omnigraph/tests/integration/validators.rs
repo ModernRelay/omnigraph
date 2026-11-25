@@ -788,6 +788,46 @@ async fn overwrite_node_removal_rejects_retained_orphan_edge() {
     );
 }
 
+/// A load refused for an orphan edge names the edge type, and an overwrite's
+/// refusal for a retained edge says the edge is a committed one the batch
+/// does not hold. Before, both said only `__dst 'Bob' not found in Person`:
+/// an overwrite of `Person` alone gave no hint that a committed `Knows` edge
+/// was the problem.
+#[tokio::test]
+async fn orphan_edge_refusal_names_the_edge_type() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"edge":"Knows","from":"Alice","to":"Bob"}"#;
+    let (_dir, db) = init_with(RI_SCHEMA, seed).await;
+
+    let retained = db
+        .load_jsonl(
+            r#"{"type":"Person","data":{"name":"Alice"}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .expect_err("the overwrite removes Bob and keeps Knows(Alice->Bob)")
+        .to_string();
+    assert_eq!(
+        retained,
+        "edge type 'Knows': __dst 'Bob' not found in Person; the write removes that node \
+         and keeps this committed edge"
+    );
+
+    let delta = db
+        .load_jsonl(
+            r#"{"edge":"Knows","from":"Ghost","to":"Alice"}"#,
+            LoadMode::Append,
+        )
+        .await
+        .expect_err("the loaded edge's source does not exist")
+        .to_string();
+    assert_eq!(
+        delta,
+        "edge type 'Knows': __src 'Ghost' not found in Person"
+    );
+}
+
 /// The retained-edge check of a node overwrite reads the edge table through
 /// `validate::RemovalEdgeReads`, never with one filter over every removed id,
 /// whose memory grew with removed ids times edge fragments (#1442): the

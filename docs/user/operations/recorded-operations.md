@@ -9,8 +9,8 @@ record, so a caller that lost a response learns what happened instead of
 guessing. `optimize` is the first recorded kind; lookup and cancel serve every
 kind.
 
-The routes are off by default. A standalone server, which has no cluster
-record, refuses them; direct `omnigraph optimize` stays available there.
+The routes are off by default. Without them, stop the server and run
+`omnigraph optimize` on the cluster root directly.
 
 ## Enable it
 
@@ -70,12 +70,13 @@ starts again.
 
 ```bash
 curl -X POST "$SERVER/graphs/knowledge/operations/optimize" \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" -H 'Omnigraph-Http-Api: 0.14' \
+  -H 'Content-Type: application/json' \
   -d '{"operation_id": "01JC0000000000000000000000", "max_gate_hold_ms": 30000}'
 curl "$SERVER/graphs/knowledge/operations/01JC0000000000000000000000" \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $TOKEN" -H 'Omnigraph-Http-Api: 0.14'
 curl -X POST "$SERVER/graphs/knowledge/operations/01JC0000000000000000000000/cancel" \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $TOKEN" -H 'Omnigraph-Http-Api: 0.14'
 ```
 
 `operation_id` is a canonical ULID the caller generates. The body also takes

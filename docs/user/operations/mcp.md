@@ -38,10 +38,10 @@ later unauthenticated request.
 ### Upgrade tool schemas
 
 After upgrading the server, reconnect clients and refresh cached tool schemas
-with `tools/list`. The `access` tool now returns `actor_id` instead of `actor`;
-clients with fixed response types must update those types before reconnecting.
-Its output matches the [HTTP access report](policy.md#learn-your-access).
-`queries` now lists stored mutations too, marked `mutation: true`, and
+with `tools/list`. Since 0.14 the `access` tool returns `actor_id` instead of
+`actor`; clients with fixed response types must update those types before
+reconnecting. Its output matches the [HTTP access report](policy.md#learn-your-access).
+Since 0.15 `queries` lists stored mutations too, marked `mutation: true`, and
 `mutate` no longer requires `query`.
 
 MCP does not use the `Omnigraph-Http-Api` header, so an old MCP client is not
@@ -176,6 +176,7 @@ including JSON-RPC tool errors, never expose a reflected resource credential.
 | Flag | Environment | Default | Effect |
 |---|---|---|---|
 | `--mcp-allowed-host <host[:port]>`, repeatable | `OMNIGRAPH_MCP_ALLOWED_HOSTS=a,b` | none | Adds allowed `Host` values |
+| `--mcp-setup-url <url>` | `OMNIGRAPH_MCP_SETUP_URL` | none | An `https` page (no userinfo, query or fragment; sent percent-encoded) returned as `setup` only with a successful, empty `graphs` list or `omnigraph://graphs` read, never with a refusal; the instructions tell the client to offer it. It is public operator guidance, not graph data. HTTP discovery is unchanged |
 
 Settings are read once at boot. `/mcp` lists every tool below, and each call
 runs under the same policy action as its HTTP route, so a caller can do over
@@ -194,7 +195,7 @@ policy still only reads: `query` answers, and a write tool returns 403.
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
 | `health` | none | `GET /healthz` | none |
-| `graphs` | none | `GET /graphs/discovery` for an identity credential; otherwise `GET /graphs`, narrowed to ids and names | identity, or `graph_list` |
+| `graphs` | none | `GET /graphs/discovery`: the caller's actor and the graphs it holds any permission on | none |
 | `schema` | `graph` | `GET /graphs/{graph_id}/schema` | `read` |
 | `queries` | `graph` | `GET /graphs/{graph_id}/queries` | `read` |
 | `query` | `graph`, `query` (source) or `name` (stored), optional `params`, `branch`, `snapshot` | source: `POST /graphs/{graph_id}/query`; name: `POST /graphs/{graph_id}/queries/{query_name}` as a read | source: `read`, and `change` for `explain load csv`; name: `invoke_query`, then `read` |
@@ -210,10 +211,8 @@ policy still only reads: `query` answers, and a write tool returns 403.
 | `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/changes` | `read` |
 | `blobs_stat` | `graph`, `entity`, `type`, `id`, `property`, optional `branch`, `snapshot` | `HEAD /graphs/{graph_id}/blob` | `read` |
 
-`graph_list` is a server-scoped action, and a server without an applied cluster
-policy denies every server-scoped action. So with a static or other non-identity
-token, `graphs` returns 403 until the cluster policy permits `graph_list`; the
-other tools still work with a graph id the user supplies.
+`graphs` needs no permit: it returns `visibility: granted`, the caller's `actor_id` (and `client_id`) and the registered graphs it holds any permission on, available or not, or every one for a `graph_list` holder.
+Every tool answers any other registered graph as `graph not found`, as HTTP does; `access` says what the caller may do on a listed one. `og_catalog` is never listed and keeps its own authorization.
 
 The server's `initialize` instructions tell a model to call `graphs`, then
 `schema`, then `query` with a stored read's `name` or its own GQ source.
@@ -312,8 +311,7 @@ an unknown resource or graph is error `-32002`.
 ## Results and errors
 
 A successful call returns the route's JSON response body as structured content,
-plus a text copy for older clients. Three tools answer otherwise: `graphs`
-narrows `GET /graphs` for a credential that is not an identity, `blobs_stat`
+plus a text copy for older clients. Two tools answer otherwise: `blobs_stat`
 answers the `HEAD /blob` headers as `blob stat` JSON, and `commits_drop`
 answers an empty object for the route's 204. `health`, `graphs`, `schema`,
 `queries`, `access` and `branches_list` declare an output schema.
@@ -326,7 +324,9 @@ unknown or hidden graph, 503 for a graph that is not available. The MCP layer's
 own refusals use the same body: `unauthorized` without a verified credential,
 `too_many_requests` beyond the concurrent limit, and `cancelled`,
 `deadline_exceeded` or `result_too_large`, which only MCP sends and which carry
-no `status`. A write that may have happened, one whose call was cancelled or
+no `status`. A read over the [read budget](#limits) sends nothing: its
+`result_too_large` names the budget, and filters, a lower `limit` or fewer
+returned properties narrow it. A write that may have happened, one whose call was cancelled or
 passed its wait included, answers `outcome_unknown` with `effects: unknown`.
 
 ## Limits
@@ -334,7 +334,8 @@ passed its wait included, answers `outcome_unknown` with `effects: unknown`.
 | Limit | Value |
 |---|---|
 | Request body | 64 KiB |
-| Complete tool result, including the text copy | 1 MiB |
+| Successful read, tool or graph resource, including the text copy | 96 KiB, the fixed read budget. A tool result carries its data twice, so its text copy stays under 49,152 characters, below the 50,000 after which [Claude Code moves a result to a file](https://code.claude.com/docs/en/mcp#mcp-output-limits-and-warnings); a resource carries one copy. No token count is promised |
+| Any other result: a write's result or a refusal | 1 MiB |
 | Wait for one read | 30 seconds |
 | Wait for one write | 30 seconds; the write continues past it |
 | Concurrent tool executions | 16 |
