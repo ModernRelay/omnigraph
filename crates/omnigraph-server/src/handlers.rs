@@ -7,7 +7,7 @@ use crate::api::{GraphAvailability, GraphAvailabilityAction};
 use crate::challenge::Unauthenticated;
 use crate::operations::OwnedResult;
 use crate::redacted_cause::RedactedCause;
-use crate::registry::{GraphEntry, RegistryCapture, StartupFailure};
+use crate::registry::{GraphEntry, RegistryCapture};
 use crate::serving::GraphRequest;
 use crate::workload::{AdmissionGuard, IngressLease};
 use futures::StreamExt;
@@ -150,17 +150,19 @@ pub(crate) async fn server_ready(
     tag = "management",
     operation_id = "listGraphs",
     responses(
-        (status = 200, description = "List of registered graphs", body = GraphListOutput),
+        (status = 200, description = "The catalog: every registered graph, with its root and availability", body = GraphListOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// List every graph currently registered with this server.
+/// The catalog: every graph currently registered with this server, with its
+/// root and availability, including graphs the caller cannot read.
 ///
 /// Cedar-gated by the server-level policy via the `graph_list` action
-/// against `Omnigraph::Server::"root"`.
+/// against `Omnigraph::Server::"root"`. The graphs a caller can read are
+/// listed without a permit by `GET /graphs/discovery`.
 ///
 /// Order: alphabetical by `graph_id` (server-sorted so clients see
 /// deterministic output across requests).
@@ -239,33 +241,34 @@ pub(crate) async fn server_graphs_list(
     tag = "management",
     operation_id = "discoverGraphs",
     responses(
-        (status = 200, description = "Authenticated minimal graph inventory", body = GraphDiscoveryOutput),
+        (status = 200, description = "The graphs the caller can read, or every graph for a `graph_list` holder", body = GraphDiscoveryOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Identity credential required", body = ErrorOutput),
+        (status = 403, description = "Credential not admitted", body = ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
+/// List the graphs the caller can read: each graph on which its `read` of
+/// `main` is allowed, whatever the graph's availability. A `graph_list`
+/// holder sees every registered graph. Any credential may ask, and one that
+/// can read no graph gets an empty list.
+///
+/// Returns ids and display names only, from the server's current registry:
+/// no roots, availability, schema or policy. The catalog (`GET /graphs`)
+/// holds availability and roots.
 pub(crate) async fn server_graphs_discovery(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<GraphDiscoveryOutput>, ApiError> {
-    let actor = actor.ok_or_else(|| {
-        ApiError::unauthorized(Unauthenticated::NoCredential, "missing bearer token")
-    })?;
-    if !actor.is_identity() {
-        return Err(ApiError::forbidden(
-            "graph discovery requires an admitted identity credential",
-        ));
+    let actor = actor.as_ref().map(|Extension(actor)| actor);
+    let snapshot = state.routing().registry.snapshot_ref();
+    let visibility = GraphVisibility::new(actor, snapshot.server_policy.as_deref())?;
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in snapshot.graphs.values() {
+        if visibility.admits(entry.policy().map(Arc::as_ref), entry.binding_refused())? {
+            ids.insert(entry.key().graph_id.as_str().to_owned());
+        }
     }
-    // Identity comes from the complete startup registry. Never scan storage or
-    // include per-graph status, roots, diagnostics, schema, or policy contents.
-    let ids: std::collections::BTreeSet<String> = state
-        .routing()
-        .registry
-        .entries()
-        .into_iter()
-        .map(|entry| entry.key().graph_id.as_str().to_owned())
-        .collect();
     Ok(Json(GraphDiscoveryOutput {
         graphs: ids
             .into_iter()
@@ -566,46 +569,80 @@ pub(crate) fn resolve_registered_graph(
         ),
         RegistryCapture::Blocked(graph) => (
             graph.policy.clone(),
-            matches!(
-                graph.failure,
-                StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
-            ),
+            graph.binding_refused(),
             "graph is unavailable; an operator must apply an explicit correction or restart after fixing startup configuration",
         ),
     };
     // Invalid policy is not equivalent to the operator choosing no policy.
     // Both startup failures and transitions preserve authorization before
     // disclosing a known graph's unavailability.
-    let readable = !invalid_policy
-        && matches!(
+    if !GraphVisibility::new(actor, server_policy.as_deref())?
+        .admits(policy.as_deref(), invalid_policy)?
+    {
+        return Err(ApiError::not_found("graph not found"));
+    }
+    Err(ApiError::new(ErrorCode::GraphUnavailable, message))
+}
+
+/// Which graphs an actor may know exist. One rule serves every surface that
+/// names a graph: the listing (`GET /graphs/discovery`, MCP `graphs`) and the
+/// choice between 404 and 503 for an unavailable graph. A graph is visible to
+/// an actor that may `read` it, decided by [`authorize`] exactly as a read of
+/// `main` (the branch every graph has) is, or to an actor that holds
+/// `graph_list`, the permit to see the whole catalog. Naming a graph the actor
+/// may read discloses nothing that a read would not.
+pub(crate) struct GraphVisibility<'a> {
+    actor: Option<&'a AuthenticatedActor>,
+    catalog: bool,
+}
+
+impl<'a> GraphVisibility<'a> {
+    pub(crate) fn new(
+        actor: Option<&'a AuthenticatedActor>,
+        server_policy: Option<&PolicyEngine>,
+    ) -> std::result::Result<Self, ApiError> {
+        let catalog = matches!(
             authorize(
                 actor,
-                policy.as_deref(),
-                PolicyRequest {
-                    action: PolicyAction::Read,
-                    branch: Some("main".into()),
-                    target_branch: None,
-                }
-            )?,
-            Authz::Allowed
-        );
-    let listable = readable
-        || matches!(
-            authorize(
-                actor,
-                server_policy.as_deref(),
+                server_policy,
                 PolicyRequest {
                     action: PolicyAction::GraphList,
                     branch: None,
                     target_branch: None,
-                }
+                },
             )?,
             Authz::Allowed
         );
-    if !listable {
-        return Err(ApiError::not_found("graph not found"));
+        Ok(Self { actor, catalog })
     }
-    Err(ApiError::new(ErrorCode::GraphUnavailable, message))
+
+    /// Whether a graph bound to `policy` is visible. A policy or configuration
+    /// refused at startup (`binding_refused`) is not the absence of a policy,
+    /// so it grants no read.
+    pub(crate) fn admits(
+        &self,
+        policy: Option<&PolicyEngine>,
+        binding_refused: bool,
+    ) -> std::result::Result<bool, ApiError> {
+        if self.catalog {
+            return Ok(true);
+        }
+        if binding_refused {
+            return Ok(false);
+        }
+        Ok(matches!(
+            authorize(
+                self.actor,
+                policy,
+                PolicyRequest {
+                    action: PolicyAction::Read,
+                    branch: Some("main".into()),
+                    target_branch: None,
+                },
+            )?,
+            Authz::Allowed
+        ))
+    }
 }
 
 pub(crate) fn log_policy_decision(

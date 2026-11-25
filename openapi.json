@@ -1415,8 +1415,8 @@
         "tags": [
           "management"
         ],
-        "summary": "List every graph currently registered with this server.",
-        "description": "Cedar-gated by the server-level policy via the `graph_list` action\nagainst `Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
+        "summary": "The catalog: every graph currently registered with this server, with its\nroot and availability, including graphs the caller cannot read.",
+        "description": "Cedar-gated by the server-level policy via the `graph_list` action\nagainst `Omnigraph::Server::\"root\"`. The graphs a caller can read are\nlisted without a permit by `GET /graphs/discovery`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
         "operationId": "listGraphs",
         "parameters": [
           {
@@ -1443,7 +1443,7 @@
         ],
         "responses": {
           "200": {
-            "description": "List of registered graphs",
+            "description": "The catalog: every registered graph, with its root and availability",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1635,6 +1635,8 @@
         "tags": [
           "management"
         ],
+        "summary": "List the graphs the caller can read: each graph on which its `read` of\n`main` is allowed, whatever the graph's availability. A `graph_list`\nholder sees every registered graph. Any credential may ask, and one that\ncan read no graph gets an empty list.",
+        "description": "Returns ids and display names only, from the server's current registry:\nno roots, availability, schema or policy. The catalog (`GET /graphs`)\nholds availability and roots.",
         "operationId": "discoverGraphs",
         "parameters": [
           {
@@ -1661,7 +1663,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Authenticated minimal graph inventory",
+            "description": "The graphs the caller can read, or every graph for a `graph_list` holder",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1730,7 +1732,7 @@
             }
           },
           "403": {
-            "description": "Identity credential required",
+            "description": "Credential not admitted",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1800,6 +1802,27 @@
           },
           "412": {
             "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported Omnigraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal failure (code `internal`) before a successful response",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {

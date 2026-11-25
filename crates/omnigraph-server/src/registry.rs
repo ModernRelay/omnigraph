@@ -71,6 +71,17 @@ pub enum GraphEntry {
     Blocked(Arc<BlockedGraph>),
 }
 
+impl BlockedGraph {
+    /// Startup refused the graph's policy or configuration. That is not the
+    /// absence of a policy, so it authorizes nothing.
+    pub(crate) fn binding_refused(&self) -> bool {
+        matches!(
+            self.failure,
+            StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
+        )
+    }
+}
+
 impl GraphEntry {
     /// Startup input; the view grants no request admission on its own.
     pub fn ready(handle: Arc<GraphHandle>) -> Self {
@@ -99,6 +110,11 @@ impl GraphEntry {
             Self::Ready(view) | Self::Transitioning(view) => view.policy.as_ref(),
             Self::Blocked(graph) => graph.policy.as_ref(),
         }
+    }
+
+    /// See [`BlockedGraph::binding_refused`].
+    pub(crate) fn binding_refused(&self) -> bool {
+        matches!(self, Self::Blocked(graph) if graph.binding_refused())
     }
 
     fn requires_policy_auth(&self) -> bool {

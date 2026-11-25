@@ -55,7 +55,6 @@ fn identity_is_local_stable_admission_without_token_permissions() {
     let actor = trust.verify_at(&sign(&c), NOW).unwrap();
     assert_eq!(actor.actor_id_str(), "principal:stable_1");
     assert_eq!(actor.client_id(), Some("oauth-client"));
-    assert!(actor.is_identity());
     assert!(
         actor.identity_claims().is_none(),
         "OIDC is a distinct authenticated profile"

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-10-29
+updated: 2026-11-24
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -74,9 +74,11 @@ Permission denial never switches credentials or storage addressing.
 
 `GET /graphs/discovery` returns only
 `{"graphs":[{"graph_id":"knowledge","display_name":"knowledge"}]}`
-for a valid version 2 identity. It uses the effective inventory, including
-unavailable graphs. No policy group or `graph_list` permit is required. Graph
-data, schema, query bodies, roots, diagnostics and topology are absent.
+for a valid version 2 identity, and for every other credential. It names the
+graphs of the effective inventory, unavailable ones included, on which the
+caller's `read` of `main` is allowed, or every graph for a `graph_list`
+holder (amended 2026-11-24, see the decision log). Graph data, schema, query
+bodies, roots, diagnostics and topology are absent.
 The existing `/graphs` response and authorization retain their contract.
 Display names currently equal graph IDs. Inventory availability presumes a
 running server; an invalid cluster policy can still fail existing boot
@@ -203,8 +205,9 @@ to expire, and explicitly reverting unsupported policy configuration.
 
 Keep mandatory token grants: preserves attenuation but leaves two ordinary
 permission lists and the categorical schema exclusion. Silently ignore legacy
-grants: widens credentials and breaks delegation. Hide unauthorized graphs:
-prevents basic discovery and confuses absence with lack of data access.
+grants: widens credentials and breaks delegation. List every graph to every
+identity: the rule this RFC first chose, replaced on 2026-11-24 (see the
+decision log).
 Let a proposed policy authorize apply: lets a caller grant itself permission.
 Teach each caller to evaluate policy: duplicates semantics and permits drift.
 
@@ -252,6 +255,20 @@ of a particular deployment remain separate from the accepted library contract.
 
 ## Decision log
 
+- 2026-11-24: Discovery lists the graphs the caller can read. The first rule,
+  every graph for every identity with no policy check, contradicted graph
+  resolution, which answers 404 for an unavailable graph the caller can
+  neither read nor list, so discovery named graphs that routing hid. Static
+  and OAuth client credentials got 403 unless the cluster policy granted
+  `graph_list`. One rule now decides which graphs a caller may know exist, for
+  both: `read` of `main` through the same authorization a read uses, or
+  `graph_list`. It applies to every credential and opens discovery to static
+  tokens. An absent graph means one the caller cannot read, which is the
+  answer the caller needs. The empty list a caller with no grant receives is
+  the case the rejected alternative feared; a setup link for it belongs to the
+  MCP surface ([#1526](https://github.com/ModernRelay/omnigraph/pull/1526)).
+  `graph_list` keeps its catalog meaning. This replaces User behavior's
+  every-graph discovery sentence and Alternatives' rejection of hiding graphs.
 - 2026-10-29: New human logins receive a 30-day absolute renewal deadline;
   existing saved deadlines remain unchanged. Required provider inactivity is 14 days,
   access JWTs remain at most 15 minutes, and graph credentials retain their

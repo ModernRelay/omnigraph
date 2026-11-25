@@ -191,10 +191,18 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         .unwrap()
         .close()
         .unwrap();
+    // `graphs` names the graphs each identity can read, available or not:
+    // the ones it is told are unavailable below, never the ones it is told
+    // are not found.
+    let discovered = call(&app, &alice, "graphs", json!({})).await;
+    assert_eq!(
+        discovered["result"]["structuredContent"],
+        json!({"graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"loading","display_name":"loading"}]})
+    );
     let discovered = call(&app, &bob, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
-        json!({"graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"invalid-config","display_name":"invalid-config"},{"graph_id":"invalid-policy","display_name":"invalid-policy"},{"graph_id":"loading","display_name":"loading"}]})
+        json!({"graphs":[]})
     );
     for (credential, graph, expected) in [
         (&alice, "blocked", 503),
@@ -1003,16 +1011,19 @@ async fn static_token_server_serves_mcp_without_oauth_discovery() {
             "{origin}"
         );
     }
-    // A static token is not an identity, so `graphs` asks `GET /graphs`,
-    // whose `graph_list` action only a server-scoped policy grants.
+    // A static token lists the graphs it can read, as the native listing
+    // does, with no `graph_list` permit; the catalog still needs one.
     let graphs = call(&app, "secret", "graphs", json!({})).await;
+    assert_eq!(graphs["result"]["isError"], false, "{graphs}");
+    let (status, native) = json_response(&app, get_request("/graphs/discovery", "secret")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(graphs["result"]["structuredContent"], native);
     assert_eq!(
-        graphs["result"]["structuredContent"]["status"], 403,
-        "{graphs}"
+        native,
+        json!({"graphs":[{"graph_id":"default","display_name":"default"}]})
     );
-    let (status, native) = json_response(&app, get_request("/graphs", "secret")).await;
+    let (status, _) = json_response(&app, get_request("/graphs", "secret")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(graphs["result"]["structuredContent"]["error"], native);
     let schema = call(&app, "secret", "schema", json!({"graph":"default"})).await;
     assert_eq!(schema["result"]["isError"], false, "{schema}");
 }

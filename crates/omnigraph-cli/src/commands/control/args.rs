@@ -13,13 +13,14 @@ use omnigraph_server::PolicyAction;
 /// Use `cluster apply --target` to deploy graph additions and schema/query changes.
 #[derive(Debug, Subcommand)]
 pub(crate) enum GraphsCommand {
-    /// List every graph registered with the multi-graph server.
+    /// List the graphs your credential can read.
     List {
         #[arg(long)]
         json: bool,
-        /// Minimal authenticated graph existence; requires an identity credential.
+        /// List the catalog instead: every registered graph, with its state
+        /// and root. Requires the server's `graph_list` permit.
         #[arg(long)]
-        discovery: bool,
+        catalog: bool,
     },
 }
 

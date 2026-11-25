@@ -194,7 +194,7 @@ policy still only reads: `query` answers, and a write tool returns 403.
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
 | `health` | none | `GET /healthz` | none |
-| `graphs` | none | `GET /graphs/discovery` for an identity credential; otherwise `GET /graphs`, narrowed to ids and names | identity, or `graph_list` |
+| `graphs` | none | `GET /graphs/discovery`: the graphs the caller can read | none |
 | `schema` | `graph` | `GET /graphs/{graph_id}/schema` | `read` |
 | `queries` | `graph` | `GET /graphs/{graph_id}/queries` | `read` |
 | `query` | `graph`, `query` (source) or `name` (stored), optional `params`, `branch`, `snapshot` | source: `POST /graphs/{graph_id}/query`; name: `POST /graphs/{graph_id}/queries/{query_name}` as a read | source: `read`, and `change` for `explain load csv`; name: `invoke_query`, then `read` |
@@ -210,10 +210,9 @@ policy still only reads: `query` answers, and a write tool returns 403.
 | `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/changes` | `read` |
 | `blobs_stat` | `graph`, `entity`, `type`, `id`, `property`, optional `branch`, `snapshot` | `HEAD /graphs/{graph_id}/blob` | `read` |
 
-`graph_list` is a server-scoped action, and a server without an applied cluster
-policy denies every server-scoped action. So with a static or other non-identity
-token, `graphs` returns 403 until the cluster policy permits `graph_list`; the
-other tools still work with a graph id the user supplies.
+`graphs` needs no permit, for any credential: it lists the graphs on which the
+caller's `read` is allowed, available or not, and an empty list when there are
+none. A `graph_list` holder sees every graph.
 
 The server's `initialize` instructions tell a model to call `graphs`, then
 `schema`, then `query` with a stored read's `name` or its own GQ source.
@@ -312,8 +311,7 @@ an unknown resource or graph is error `-32002`.
 ## Results and errors
 
 A successful call returns the route's JSON response body as structured content,
-plus a text copy for older clients. Three tools answer otherwise: `graphs`
-narrows `GET /graphs` for a credential that is not an identity, `blobs_stat`
+plus a text copy for older clients. Two tools answer otherwise: `blobs_stat`
 answers the `HEAD /blob` headers as `blob stat` JSON, and `commits_drop`
 answers an empty object for the route's 204. `health`, `graphs`, `schema`,
 `queries`, `access` and `branches_list` declare an output schema.

@@ -27,11 +27,16 @@ Graph-scoped actions:
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved graph administration |
 
-`graph_list` is server-scoped and controls the metadata catalog at
-`GET /graphs`. It does not control the minimal identity-authenticated
-`GET /graphs/discovery` route: every valid cluster identity can discover all
-applied graph IDs and display names, without gaining permission to read their
-schema or contents. See [signed data credentials](server.md#signed-data-credentials).
+Listing the graphs a caller can read needs no permit. `GET /graphs/discovery`
+(the CLI's `graphs list`, MCP's `graphs`) returns, for every credential, the IDs
+and display names of the graphs on which its `read` of `main` is allowed, by
+the same check a read makes, available or not. A caller that can read no graph
+gets an empty list. Listing a graph grants nothing beyond that read.
+
+`graph_list` is server-scoped and grants the catalog: `GET /graphs`, every
+registered graph with its root and availability, and every graph in the
+listing, including graphs the holder cannot read. See
+[signed data credentials](server.md#signed-data-credentials).
 
 `config_manage` is cluster-scoped. It authorizes configuration changes through
 the identity-authorized cluster API, including stored queries, graph creation,
@@ -292,12 +297,14 @@ For static token authentication:
 | none | configured | Startup fails because no request could establish an actor |
 
 `GET /graphs` is denied unless a `cluster`-scoped policy grants `graph_list`,
-including when graph policies exist.
+including when graph policies exist. `GET /graphs/discovery` lists the graphs
+each caller can read in every row: all of them with `--unauthenticated`, none
+under default deny, and the graphs with no policy for a static token when
+`OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`.
 
 Signed-token trust also enables authenticated startup. Signed credentials
 require an explicit policy permit for protected operations even when no
-static tokens are configured. Only the minimal identity discovery route is
-independent of policy membership; it exposes existence, not graph access.
+static tokens are configured.
 
 Policy is enforced for graph writes inside the engine as well as at the HTTP
 boundary. This keeps direct and embedded writers subject to the same action

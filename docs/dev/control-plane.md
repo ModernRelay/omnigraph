@@ -545,27 +545,35 @@ reachability is outside the serving request path. The profile boundary and
 applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
-`GET /graphs/discovery` accepts only the verified identity profile and returns IDs and display names for every graph in the current
-serving registry (loading, ready, transitioning or blocked), as last installed
-by boot or a deployment activation. It neither scans storage nor discloses availability, paths, policy,
-schema, or query definitions. It needs no policy membership. The separate
-`GET /graphs` uses the same registry with a `graph_list` gate and returns one
-list containing runtime availability, sanitized failure and action. Neither inventory synthesizes graph
-entries from the boot witness. Discovery still discloses no availability.
+One rule decides which graphs a caller may know exist (`GraphVisibility` in
+`crates/omnigraph-server/src/handlers.rs`): a graph is visible to a caller
+whose `read` of `main` the graph's binding allows, through the same `authorize`
+call every read route makes, or to a holder of the server-scoped `graph_list`.
+An invalid graph policy or configuration authorizes no read. Every surface that
+names a graph derives from that rule:
 
-HTTP and MCP graph resolution atomically capture a serving view with its graph-epoch lease. A loading, blocked or
-transitioning graph yields 503 only after graph `read` authorization on `main` or
-management `graph_list` authorization; otherwise it remains undisclosed as 404.
-An invalid graph policy or configuration cannot authorize the graph-read fallback.
-Availability booleans describe the runtime, not a policy grant; route
-authorization still applies to ready graphs.
+- `GET /graphs/discovery` (CLI `graphs list`, MCP `graphs` and
+  `omnigraph://graphs`) returns the IDs and display names of the visible
+  graphs in the current serving registry (loading, ready, transitioning or
+  blocked), as last installed by boot or a deployment activation, for any
+  credential. It neither scans storage nor discloses availability, paths,
+  policy, schema, or query definitions.
+- HTTP and MCP graph resolution atomically capture a serving view with its
+  graph-epoch lease. A loading, blocked or transitioning graph yields 503 to a
+  caller it is visible to; otherwise it remains undisclosed as 404.
+
+`GET /graphs`, the catalog, uses the same registry behind a `graph_list` gate
+and returns one list containing every graph's root, runtime availability,
+sanitized failure and action. Neither inventory synthesizes graph entries from
+the boot witness. Availability booleans describe the runtime, not a policy
+grant; route authorization still applies to ready graphs.
 
 The CLI's versioned keychain cache verifies endpoint and identity bindings before
 replacement. Unsupported caches refuse without automatic replacement. The provider-native client acquires missing/expired identity
 credentials before an operation using the selected managed target.
-Both managed and standalone targets request the
-ordinary graph catalog unless `graphs list --discovery` is requested; the CLI never
-infers routing from an arbitrary bearer token's unverified shape.
+Both managed and standalone targets list the readable graphs, or the catalog
+when `graphs list --catalog` is requested; the CLI never infers routing from an
+arbitrary bearer token's unverified shape.
 
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
 applied `config_digest` as `booted_serving_digest`, the ledger revision and

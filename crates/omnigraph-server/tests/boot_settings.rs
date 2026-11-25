@@ -34,11 +34,13 @@ async fn cluster_management_policy_can_boot_beside_legacy_catalog_rules() {
     let (status, payload) = json_response(&app, get_request("/graphs", "static-token")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload, serde_json::json!({"graphs":[]}));
-    let (status, _) = json_response(&app, get_request("/graphs/discovery", "static-token")).await;
+    let (status, payload) =
+        json_response(&app, get_request("/graphs/discovery", "static-token")).await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "new cluster policies do not reclassify static credentials"
+        payload,
+        serde_json::json!({"graphs":[]}),
+        "a graph_list holder lists the whole catalog, which is empty"
     );
 }
 
