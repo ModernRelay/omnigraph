@@ -49,7 +49,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "graphs",
         title: "List graphs",
-        description: "List the graphs your credential can read on some branch: each graph's `graph_id` and display name. Every other tool takes one of these ids as `graph`. Any credential may call it; an empty list means your credential can read no graph here. A listed graph can still be unavailable, and other actions on it are checked separately.",
+        description: "Say who your credential is (`actor_id`, and `client_id` for an OAuth client) and list the graphs it holds any permission on: each graph's `graph_id` and display name. Every other tool takes one of these ids as `graph`; any other graph is not found. Any credential may call it; an empty list means your credential holds no permission on any graph here. A listed graph can still be unavailable, and `access` says what you may do on it.",
         input: no_arguments_schema,
         output: Some(graphs_output_schema),
         effect: Effect::Read,
@@ -239,7 +239,7 @@ pub(super) fn spec(name: &str) -> Option<&'static ToolSpec> {
 /// The instructions every MCP session receives.
 pub(super) const INSTRUCTIONS: &str = concat!(
     "Omnigraph serves typed property graphs. Every call runs under the applied policy for your credential; a listed tool or graph can still be refused.\n",
-    "1. Call `graphs` for the ids of the graphs your credential can read; any other graph is not found.\n",
+    "1. Call `graphs` for who you are and the ids of the graphs your credential holds any permission on; any other graph is not found. `access` says what you may do on one.\n",
     "2. Call `schema` for the graph (or read `omnigraph://graphs/{graph}/schema`) before writing a query: it declares the types, properties, keys and edges a query may name.\n",
     "3. Prefer a stored read: `queries` lists stored queries with typed parameters, and `query` runs one by `name`.\n",
     "4. Otherwise write a GQ read and pass it to `query` as `query`, with every value passed as a declared, typed parameter. `query` refuses mutations.\n",
@@ -576,11 +576,15 @@ pub(super) fn health_output_schema() -> Value {
 pub(super) fn graphs_output_schema() -> Value {
     json!({
         "type": "object",
-        "properties": {"graphs": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"graph_id": {"type": "string"}, "display_name": {"type": "string"}},
-            "required": ["graph_id", "display_name"],
-        }}},
+        "properties": {
+            "actor_id": {"type": "string"},
+            "client_id": {"type": "string"},
+            "graphs": {"type": "array", "items": {
+                "type": "object",
+                "properties": {"graph_id": {"type": "string"}, "display_name": {"type": "string"}},
+                "required": ["graph_id", "display_name"],
+            }},
+        },
         "required": ["graphs"],
     })
 }

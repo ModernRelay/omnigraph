@@ -3789,10 +3789,19 @@ pub struct GraphDiscoveryEntry {
     pub display_name: String,
 }
 
-/// Authenticated minimal inventory from `GET /graphs/discovery`.
+/// `GET /graphs/discovery`: who the caller is, and the graphs it holds any
+/// permission on.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GraphDiscoveryOutput {
+    /// The actor the credential resolves to. Absent only on a server that runs
+    /// without authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    /// The OAuth client the credential was issued to, when it is a verified
+    /// OIDC access token. Opaque text the client chose: render it escaped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub graphs: Vec<GraphDiscoveryEntry>,
 }
 

@@ -2147,9 +2147,8 @@ query insert_person($name: String, $age: I32) {
 ///   1. Build a converged cluster serving one graph `alpha` with a
 ///      server-scoped policy granting `act-admin` the `graph_list` action.
 ///   2. Spawn the server with `--target` + a bearer-token map.
-///   3. `omnigraph graphs list --catalog --target <url>` (admin token, which
-///      holds `graph_list` and reads no graph) — expect `alpha` in the catalog
-///      and nothing in the readable listing.
+///   3. `omnigraph graphs list [--catalog] --target <url>` (admin token, which
+///      holds `graph_list`) — expect `alpha` in the catalog and the listing.
 ///   4. Addressing the server via `--target <url>` with NO `--graph` errors and
 ///      lists the candidate graphs (RFC-011 D7).
 ///
@@ -2179,9 +2178,9 @@ fn graphs_list_against_multi_graph_server() {
         )],
     );
 
-    // `graphs list --catalog` lists `alpha`; the readable listing lists
-    // nothing, since `graph_list` grants no read.
-    for (catalog, expected) in [(true, vec!["alpha"]), (false, vec![])] {
+    // `graphs list --catalog` lists `alpha`, and so does the listing: a
+    // `graph_list` holder may know every graph.
+    for (catalog, expected) in [(true, vec!["alpha"]), (false, vec!["alpha"])] {
         let mut command = cli();
         command
             .envs(server.credential("admin-token"))

@@ -1416,7 +1416,7 @@
           "management"
         ],
         "summary": "The catalog: every graph currently registered with this server, with its\nroot and availability, including graphs the caller cannot read.",
-        "description": "Cedar-gated by the server-level policy via the `graph_list` action\nagainst `Omnigraph::Server::\"root\"`. The graphs a caller can read are\nlisted without a permit by `GET /graphs/discovery`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
+        "description": "Cedar-gated by the server-level policy via the `graph_list` action\nagainst `Omnigraph::Server::\"root\"`. The graphs a caller may use are\nlisted without a permit by `GET /graphs/discovery`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
         "operationId": "listGraphs",
         "parameters": [
           {
@@ -1635,8 +1635,8 @@
         "tags": [
           "management"
         ],
-        "summary": "List the graphs the caller can read: each graph whose policy lets it\n`read` some branch, whatever the graph's availability. Any credential may\nask, and one that can read no graph gets an empty list.",
-        "description": "Returns ids and display names only, from the server's current registry:\nno roots, availability, schema or policy. The catalog (`GET /graphs`,\n`graph_list`) holds every graph with its availability and root.",
+        "summary": "Who the caller is and which graphs it holds any permission on: each graph\nwhose policy grants it some action on some branch, or every graph for a\n`graph_list` holder, whatever the graph's availability. Any credential may\nask; one with no permission anywhere gets an empty list. A graph is listed\nexactly when its routes do not answer that it does not exist, and\n`GET /graphs/{graph_id}/access` says what the caller may do on it.",
+        "description": "Returns the resolved actor and OAuth client, and graph ids and display\nnames only, from the server's current registry: no roots, availability,\nschema or policy. The catalog (`GET /graphs`, `graph_list`) holds every\ngraph with its availability and root.",
         "operationId": "discoverGraphs",
         "parameters": [
           {
@@ -1663,7 +1663,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The graphs the caller can read on some branch",
+            "description": "The caller's actor and the graphs it holds any permission on",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -15895,11 +15895,25 @@
       },
       "GraphDiscoveryOutput": {
         "type": "object",
-        "description": "Authenticated minimal inventory from `GET /graphs/discovery`.",
+        "description": "`GET /graphs/discovery`: who the caller is, and the graphs it holds any\npermission on.",
         "required": [
           "graphs"
         ],
         "properties": {
+          "actor_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The actor the credential resolves to. Absent only on a server that runs\nwithout authentication."
+          },
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The OAuth client the credential was issued to, when it is a verified\nOIDC access token. Opaque text the client chose: render it escaped."
+          },
           "graphs": {
             "type": "array",
             "items": {

@@ -22,16 +22,15 @@ use tower::ServiceExt;
 
 use crate::support::*;
 
-/// Graph listing (`GET /graphs/discovery`, MCP `graphs`) names exactly the
-/// graphs the caller can read on some branch, by the rules every read obeys,
-/// whatever the credential and whatever the graph's availability. Listing
-/// needs no permit, so a caller that can read nothing gets an empty list,
-/// never a refusal. A graph on which the caller holds no grant is not found on
-/// every graph route, ready or not; `graph_list` reveals the catalog
-/// (`GET /graphs`) and lists nothing.
+/// Graph listing (`GET /graphs/discovery`, MCP `graphs`) names who the caller
+/// is and exactly the graphs it holds any permission on (or every graph, for a
+/// `graph_list` holder), by the rules every request obeys, whatever the
+/// credential and whatever the graph's availability. Listing needs no permit,
+/// so a caller with no permission gets an empty list, never a refusal. A graph
+/// is listed exactly when its routes do not answer that it does not exist.
 // contract: E6
 #[tokio::test(flavor = "multi_thread")]
-async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
+async fn graph_listing_names_exactly_the_graphs_a_caller_holds_a_permission_on() {
     let tokens = data_tokens::DataTokens::new();
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
@@ -76,6 +75,7 @@ async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
             .map(|id| json!({"graph_id": id, "display_name": id}))
             .collect::<Vec<_>>()})
     };
+    let graphs_of = |body: &Value| json!({"graphs": body["graphs"].clone()});
 
     // Open mode reads every graph with no policy, so it lists them; a refused
     // configuration grants no read, so it is neither listed nor routed. The
@@ -100,7 +100,11 @@ async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
     }
     let (status, body) = json_response(&open, get_request("/graphs/discovery", "")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, listed(&["default"]), "open mode");
+    assert_eq!(graphs_of(&body), listed(&["default"]), "open mode");
+    assert!(
+        body.get("actor_id").is_none(),
+        "open mode resolves no actor"
+    );
 
     // No applied policy: default deny reads nothing, for a static token and
     // for an identity alike, so each gets an empty list rather than a 403.
@@ -116,9 +120,16 @@ async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
         let (status, body) = json_response(&app, get_request("/graphs/discovery", token)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
-            body, expected,
+            graphs_of(&body),
+            expected,
             "reads without policy: {reads_without_policy}, token: {token}"
         );
+        let actor = if token == "static-token" {
+            "breakglass"
+        } else {
+            tokens.actor.as_str()
+        };
+        assert_eq!(body["actor_id"], actor, "the listing names the caller");
     }
     let app = build_app(no_policy(false));
     for (token, expected) in [
@@ -230,13 +241,17 @@ async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
             StatusCode::FORBIDDEN,
         ),
         ("feature-token", listed(&["alpha"]), StatusCode::FORBIDDEN),
-        ("writer-token", listed(&[]), StatusCode::FORBIDDEN),
+        ("writer-token", listed(&["alpha"]), StatusCode::FORBIDDEN),
         ("nobody-token", listed(&[]), StatusCode::FORBIDDEN),
-        ("admin-token", listed(&[]), StatusCode::OK),
+        (
+            "admin-token",
+            listed(&["alpha", "beta", "delta", "gamma"]),
+            StatusCode::OK,
+        ),
     ] {
         let (status, body) = json_response(&app, get_request("/graphs/discovery", token)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body, expected, "{token}");
+        assert_eq!(graphs_of(&body), expected, "{token}");
         let (status, body) = json_response(&app, get_request("/graphs", token)).await;
         assert_eq!(status, catalog, "the catalog needs graph_list: {body}");
         if status == StatusCode::OK {
@@ -251,9 +266,9 @@ async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
     }
     // Routing hides a graph on which the caller holds no grant, ready or not,
     // exactly like a graph that does not exist. A caller with some grant (a
-    // reader, or `writer`, which may only change and lists nothing) or with
-    // `graph_list` sees it: 503 when unavailable, and on a ready graph the
-    // route refuses an action the caller lacks with 403.
+    // reader, or `writer`, which may only change) or with `graph_list` sees
+    // it: 503 when unavailable, and on a ready graph the route refuses an
+    // action the caller lacks with 403.
     for (token, path, expected) in [
         (
             "reader-token",
@@ -328,6 +343,35 @@ async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
     )
     .await;
     assert_eq!(hidden, missing, "a hidden graph answers as a missing one");
+    // The guarantee a client relies on: a graph is listed exactly when its
+    // routes do not answer that it does not exist.
+    for token in [
+        "reader-token",
+        identity.as_str(),
+        "feature-token",
+        "writer-token",
+        "nobody-token",
+        "admin-token",
+    ] {
+        let (_, body) = json_response(&app, get_request("/graphs/discovery", token)).await;
+        for graph in ["alpha", "beta", "gamma", "delta", "missing"] {
+            let listed = body["graphs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["graph_id"] == graph);
+            let (status, _) = json_response(
+                &app,
+                get_request(&format!("/graphs/{graph}/access?branch=main"), token),
+            )
+            .await;
+            assert_eq!(
+                listed,
+                status != StatusCode::NOT_FOUND,
+                "{token} {graph}: listed {listed}, route answered {status}"
+            );
+        }
+    }
 
     // Enrollment follows the applied policy: the same identity lists the
     // graph once a policy lets it read, and not before.
@@ -347,7 +391,7 @@ async fn graph_listing_names_exactly_the_graphs_each_credential_can_read() {
         let (status, body) = json_response(&app, get_request("/graphs/discovery", &identity)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
-            body,
+            graphs_of(&body),
             if enrolled {
                 listed(&["default"])
             } else {

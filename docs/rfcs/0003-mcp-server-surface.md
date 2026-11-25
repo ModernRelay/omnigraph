@@ -175,7 +175,7 @@ request does (unknown and denied graphs are 404, an authorized unavailable graph
 
 | Tool | Phase | Handler (HTTP route) | Cedar action | Annotations |
 |---|---|---|---|---|
-| `graphs` | shipped | `server_graphs_discovery` (`GET /graphs/discovery`): the graphs the caller can read on some branch | none | read-only |
+| `graphs` | shipped | `server_graphs_discovery` (`GET /graphs/discovery`): the caller's actor and the graphs it holds any permission on | none | read-only |
 | `queries` | shipped | `server_list_queries` (`GET /graphs/{id}/queries`) | `read` | read-only |
 | `query` | shipped; source in 1 | with `name` only, `server_invoke_query` (`POST /graphs/{id}/queries/{name}`), `expect_mutation: false`; with `query`, `server_query` (`POST /graphs/{id}/query`) | `invoke_query`, then `read`; source: `read` | read-only |
 | `schema` | 1 | `server_schema_get` (`GET /graphs/{id}/schema`) | `read` | read-only |
@@ -206,10 +206,10 @@ takes the route's `listing`.
 
 Names follow the shipped tools. The package's `schema_get` is `schema`; its ad-hoc
 `query` is the shipped `query` given source, as `mutate` takes source or a
-stored name; its `graphs_list` is the shipped `graphs`. `graphs` lists the graphs
-the caller can read on some branch, for every credential, as
-`GET /graphs/discovery` does, and every graph tool answers a graph on which the
-caller holds no permission as not found. Until 2026-11-24 discovery admitted only
+stored name; its `graphs_list` is the shipped `graphs`. `graphs` names the
+caller's actor and lists the graphs it holds any permission on, for every
+credential, as `GET /graphs/discovery` does, and every graph tool answers any
+other graph as not found. Until 2026-11-24 discovery admitted only
 identity credentials and listed every graph, and `graphs` asked `GET /graphs`
 under `graph_list` for any other credential, so a default static-token server
 answered 403; the identity RFC's decision log records why one rule replaced

@@ -161,7 +161,7 @@ pub(crate) async fn server_ready(
 /// root and availability, including graphs the caller cannot read.
 ///
 /// Cedar-gated by the server-level policy via the `graph_list` action
-/// against `Omnigraph::Server::"root"`. The graphs a caller can read are
+/// against `Omnigraph::Server::"root"`. The graphs a caller may use are
 /// listed without a permit by `GET /graphs/discovery`.
 ///
 /// Order: alphabetical by `graph_id` (server-sorted so clients see
@@ -241,20 +241,24 @@ pub(crate) async fn server_graphs_list(
     tag = "management",
     operation_id = "discoverGraphs",
     responses(
-        (status = 200, description = "The graphs the caller can read on some branch", body = GraphDiscoveryOutput),
+        (status = 200, description = "The caller's actor and the graphs it holds any permission on", body = GraphDiscoveryOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Credential not admitted", body = ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// List the graphs the caller can read: each graph whose policy lets it
-/// `read` some branch, whatever the graph's availability. Any credential may
-/// ask, and one that can read no graph gets an empty list.
+/// Who the caller is and which graphs it holds any permission on: each graph
+/// whose policy grants it some action on some branch, or every graph for a
+/// `graph_list` holder, whatever the graph's availability. Any credential may
+/// ask; one with no permission anywhere gets an empty list. A graph is listed
+/// exactly when its routes do not answer that it does not exist, and
+/// `GET /graphs/{graph_id}/access` says what the caller may do on it.
 ///
-/// Returns ids and display names only, from the server's current registry:
-/// no roots, availability, schema or policy. The catalog (`GET /graphs`,
-/// `graph_list`) holds every graph with its availability and root.
+/// Returns the resolved actor and OAuth client, and graph ids and display
+/// names only, from the server's current registry: no roots, availability,
+/// schema or policy. The catalog (`GET /graphs`, `graph_list`) holds every
+/// graph with its availability and root.
 pub(crate) async fn server_graphs_discovery(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -265,9 +269,9 @@ pub(crate) async fn server_graphs_discovery(
     let mut ids = std::collections::BTreeSet::new();
     for entry in snapshot.graphs.values() {
         // A graph whose policy cannot be evaluated fails the whole listing
-        // rather than being left out: a list that silently omits a readable
+        // rather than being left out: a list that silently omits a visible
         // graph would read as complete (invariant 8, no silent partial result).
-        if visibility.readable(entry.policy().map(Arc::as_ref), entry.binding_refused())? {
+        if visibility.sees(entry.policy().map(Arc::as_ref), entry.binding_refused())? {
             ids.insert(entry.key().graph_id.as_str().to_owned());
         }
     }
@@ -280,6 +284,8 @@ pub(crate) async fn server_graphs_discovery(
         "graphs listed"
     );
     Ok(Json(GraphDiscoveryOutput {
+        actor_id: actor.map(|actor| actor.actor_id.to_string()),
+        client_id: actor.and_then(|actor| actor.client_id()).map(str::to_owned),
         graphs: ids
             .into_iter()
             .map(|graph_id| GraphDiscoveryEntry {
@@ -605,18 +611,21 @@ fn graph_not_found() -> ApiError {
     ApiError::not_found("graph not found")
 }
 
-/// Which graphs an actor may know exist.
-///
-/// A graph is *readable* to an actor whose `read` its binding allows on some
-/// branch ([`PolicyEngine::may_read_some_branch`]): the listing
-/// (`GET /graphs/discovery`, MCP `graphs`) names exactly the readable graphs.
-/// Graph routing shows a graph, ready or unavailable, to an actor that holds
-/// some grant on it, or that holds `graph_list`, whose catalog (`GET /graphs`)
-/// already names every graph; to anyone else it is not found. Naming a graph
-/// the actor may use discloses nothing its grant would not.
+/// Which graphs an actor may know exist: one predicate behind every surface
+/// that names a graph. A graph is visible to an actor that holds some grant on
+/// it ([`PolicyEngine::may_act_on_graph`]: `read`, or any other graph action,
+/// on some branch) or that holds `graph_list`, whose catalog (`GET /graphs`)
+/// names every graph. The listing (`GET /graphs/discovery`, MCP `graphs`)
+/// names exactly the visible graphs, and graph routing answers any other graph,
+/// ready or unavailable, exactly as an unknown one: a graph is listed exactly
+/// when it is not answered as not found. Naming a graph the actor may use
+/// discloses nothing its grant would not; `access` says what it may do there.
 pub(crate) struct GraphVisibility<'a> {
     actor: Option<&'a AuthenticatedActor>,
     server_policy: Option<&'a PolicyEngine>,
+    /// Whether the actor holds `graph_list`, decided once and only when a
+    /// graph grants it nothing.
+    catalog: std::cell::OnceCell<bool>,
 }
 
 impl<'a> GraphVisibility<'a> {
@@ -627,27 +636,13 @@ impl<'a> GraphVisibility<'a> {
         Self {
             actor,
             server_policy,
+            catalog: std::cell::OnceCell::new(),
         }
     }
 
-    /// Whether the actor may read some branch of a graph bound to `policy`.
-    /// A policy or configuration refused at startup (`binding_refused`) is
-    /// not the absence of a policy, so it grants no read.
-    pub(crate) fn readable(
-        &self,
-        policy: Option<&PolicyEngine>,
-        binding_refused: bool,
-    ) -> std::result::Result<bool, ApiError> {
-        Ok(!binding_refused
-            && graph_grants(self.actor, policy, PolicyEngine::may_read_some_branch)?)
-    }
-
-    /// Whether graph routing shows the graph: the actor holds some grant on
-    /// it ([`PolicyEngine::may_act_on_graph`]: `read`, or any other graph
-    /// action, on some branch), or holds `graph_list`. A writer that may not
-    /// read still reaches its writes; a caller with no grant at all finds no
-    /// graph. The catalog permit is evaluated only for a graph that grants
-    /// the actor nothing.
+    /// Whether a graph bound to `policy` is visible. A policy or configuration
+    /// refused at startup (`binding_refused`) is not the absence of a policy,
+    /// so it grants nothing.
     pub(crate) fn sees(
         &self,
         policy: Option<&PolicyEngine>,
@@ -656,7 +651,10 @@ impl<'a> GraphVisibility<'a> {
         if !binding_refused && graph_grants(self.actor, policy, PolicyEngine::may_act_on_graph)? {
             return Ok(true);
         }
-        Ok(matches!(
+        if let Some(catalog) = self.catalog.get() {
+            return Ok(*catalog);
+        }
+        let catalog = matches!(
             authorize(
                 self.actor,
                 self.server_policy,
@@ -667,7 +665,8 @@ impl<'a> GraphVisibility<'a> {
                 },
             )?,
             Authz::Allowed
-        ))
+        );
+        Ok(*self.catalog.get_or_init(|| catalog))
     }
 }
 

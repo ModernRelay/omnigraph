@@ -219,7 +219,9 @@ pub const HTTP_OPERATIONS: &[HttpOperation] = &[
         "/graphs",
         Capability::Read,
         Some("listGraphs"),
-        Surface::absent("MCP `graphs` lists the readable graphs; no tool reads the catalog."),
+        Surface::absent(
+            "MCP `graphs` lists the graphs the caller may use; no tool reads the catalog.",
+        ),
         Surface::restricted(&["graphs list"], "--catalog selects the catalog."),
     ),
     operation(

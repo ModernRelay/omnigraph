@@ -53,7 +53,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `/graphs/{graph_id}/snapshot`, `/commits` | Snapshot and paged history; `GET /commits?listing=unpublished\|unattached`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}` |
 | `/graphs/{graph_id}/commits/{commit}/changes`, `GET /graphs/{graph_id}/diff` | One first-parent commit diff; net change between two branches or commit ids |
 | `GET /graphs/{graph_id}/changes`, `POST /graphs/{graph_id}/changes/baseline` | Poll a feed or capture a baseline |
-| `GET /graphs/discovery` | Ids and names of the graphs the caller can read on any branch, for any credential; a graph it holds no permission on answers 404 |
+| `GET /graphs/discovery` | The caller's `actor_id` and the graphs it holds any permission on, for any credential; the identity check. A graph it does not list answers 404 |
 | `/mcp` | MCP endpoint; see [MCP, OIDC sign-in and logs](#mcp-oidc-sign-in-and-logs) |
 | `/graphs/{graph_id}/schema` | Read the accepted schema |
 | `/graphs/{graph_id}/export` | Stream a branch snapshot |
@@ -169,10 +169,12 @@ Graph-scoped actions are:
 | `admin` | Reserved; no current public operation |
 
 `graph_list` is cluster-scoped and grants the catalog, `GET /graphs`: every
-graph, including graphs the holder cannot read. Listing the graphs a caller
-can read on any branch (`GET /graphs/discovery`, `graphs list`, MCP `graphs`)
-needs no permit; a graph on which the caller holds no permission answers 404
-on every route. `config_manage` is
+graph, including graphs the holder cannot read; a holder also lists every
+graph. Listing the graphs a caller holds any permission on
+(`GET /graphs/discovery`, `graphs list`, MCP `graphs`) needs no permit, and a
+graph is listed exactly when its routes do not answer 404. A hidden graph's
+404 is the unknown graph's, disposition included: after a policy change, list
+again rather than retrying. `config_manage` is
 cluster-scoped too and authorizes `cluster apply --target`; put it in a rule
 of its own. A stored read needs
 `invoke_query` plus `read`; a stored mutation needs `invoke_query` plus

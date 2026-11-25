@@ -256,14 +256,26 @@ fn write_query_annotation(label: &str, value: &str, stdout: &mut dyn Write) -> R
     Ok(())
 }
 
+/// The listing: graph ids on stdout, one per line, so a script can read them;
+/// in human output the actor the credential resolves to (and its OAuth client)
+/// goes to stderr, the identity check `--json` carries in its body.
 pub(super) fn write_graphs_discovery(
     payload: &GraphDiscoveryOutput,
     json: bool,
     stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
 ) -> Result<()> {
     if json {
         write_json(payload, stdout)?;
     } else {
+        match (&payload.actor_id, &payload.client_id) {
+            (Some(actor), Some(client)) => writeln!(stderr, "as {actor} (client {client})")?,
+            (Some(actor), None) => writeln!(stderr, "as {actor}")?,
+            (None, _) => writeln!(
+                stderr,
+                "as no actor: the server runs without authentication"
+            )?,
+        }
         for entry in &payload.graphs {
             if entry.display_name == entry.graph_id {
                 writeln!(stdout, "{}", entry.graph_id)?;
@@ -501,6 +513,8 @@ mod tests {
     #[test]
     fn graph_inventory_keeps_discovery_and_operator_shapes() {
         let discovery = GraphDiscoveryOutput {
+            actor_id: Some("principal:alice".into()),
+            client_id: None,
             graphs: vec![
                 GraphDiscoveryEntry {
                     graph_id: "a".into(),
@@ -524,16 +538,19 @@ mod tests {
             }],
         };
         let mut human = Vec::new();
-        write_graphs_discovery(&discovery, false, &mut human).unwrap();
+        let mut identity = Vec::new();
+        write_graphs_discovery(&discovery, false, &mut human, &mut identity).unwrap();
         assert_eq!(human, b"a\nb\tBee\n");
+        assert_eq!(identity, b"as principal:alice\n");
         human.clear();
         write_graphs_list(&registry, false, &mut human).unwrap();
         assert_eq!(human, b"a\tready\t/graph.omni\n");
         let mut encoded = Vec::new();
-        write_graphs_discovery(&discovery, true, &mut encoded).unwrap();
+        write_graphs_discovery(&discovery, true, &mut encoded, &mut Vec::new()).unwrap();
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&encoded).unwrap(),
             json!({
+                "actor_id":"principal:alice",
                 "graphs":[{"graph_id":"a","display_name":"a"},{"graph_id":"b","display_name":"Bee"}]
             })
         );
@@ -548,7 +565,7 @@ mod tests {
         );
         for json in [false, true] {
             let mut full: &mut [u8] = &mut [];
-            assert!(write_graphs_discovery(&discovery, json, &mut full).is_err());
+            assert!(write_graphs_discovery(&discovery, json, &mut full, &mut Vec::new()).is_err());
             assert!(write_graphs_list(&registry, json, &mut full).is_err());
         }
     }

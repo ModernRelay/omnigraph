@@ -194,7 +194,7 @@ policy still only reads: `query` answers, and a write tool returns 403.
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
 | `health` | none | `GET /healthz` | none |
-| `graphs` | none | `GET /graphs/discovery`: the graphs the caller can read on any branch | none |
+| `graphs` | none | `GET /graphs/discovery`: the caller's actor and the graphs it holds any permission on | none |
 | `schema` | `graph` | `GET /graphs/{graph_id}/schema` | `read` |
 | `queries` | `graph` | `GET /graphs/{graph_id}/queries` | `read` |
 | `query` | `graph`, `query` (source) or `name` (stored), optional `params`, `branch`, `snapshot` | source: `POST /graphs/{graph_id}/query`; name: `POST /graphs/{graph_id}/queries/{query_name}` as a read | source: `read`, and `change` for `explain load csv`; name: `invoke_query`, then `read` |
@@ -210,11 +210,12 @@ policy still only reads: `query` answers, and a write tool returns 403.
 | `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/changes` | `read` |
 | `blobs_stat` | `graph`, `entity`, `type`, `id`, `property`, optional `branch`, `snapshot` | `HEAD /graphs/{graph_id}/blob` | `read` |
 
-`graphs` needs no permit, for any credential: it lists the graphs the caller
-can read on any branch, available or not, and an empty list when there are
-none. Every tool answers a graph on which the caller holds no permission as
-not found (404), as the HTTP routes do; `graph_list` adds nothing to the
-listing.
+`graphs` needs no permit, for any credential: it names the caller's
+`actor_id` (and `client_id`) and lists the graphs it holds any permission on,
+available or not, or every graph for a `graph_list` holder; an empty list when
+there are none. Every tool answers a graph the caller does not list as not
+found (404), as the HTTP routes do, and `access` says what it may do on one it
+lists.
 
 The server's `initialize` instructions tell a model to call `graphs`, then
 `schema`, then `query` with a stored read's `name` or its own GQ source.

@@ -950,7 +950,8 @@ impl ServerHost {
         }
     }
 
-    /// The graphs this caller can read, as `GET /graphs/discovery` lists them.
+    /// The caller's actor and the graphs it may use, as `GET /graphs/discovery`
+    /// lists them.
     async fn discover(
         &self,
         actor: AuthenticatedActor,

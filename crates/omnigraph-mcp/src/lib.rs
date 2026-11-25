@@ -328,7 +328,7 @@ impl<H: Host> ServerHandler for GraphTools<H> {
         let mut resources = vec![
             Resource::new(GRAPHS_RESOURCE, "graphs")
                 .with_title("Graphs")
-                .with_description("The graphs your credential can read on some branch, as `graphs` returns them.")
+                .with_description("Who your credential is and the graphs it holds any permission on, as `graphs` returns them.")
                 .with_mime_type("application/json"),
             Resource::new(BEST_PRACTICES_INDEX, "best-practices/index")
                 .with_title("Best-practices index")

@@ -41,7 +41,7 @@ prints the exact flags of the installed binary.
 | `commit` | `list` `show` `changes` `publish` `drop` | Read history; publish or drop an unpublished commit |
 | `changes` | `poll` `baseline` | Follow a branch's change feed |
 | `schema` | `show` `plan` `apply` `upgrade-system-columns` | Read, plan or apply a schema; respell legacy system columns |
-| `graphs` | `list` | List the graphs the credential can read on any branch; `--catalog` lists every graph |
+| `graphs` | `list` | Say who you are and list the graphs you hold any permission on; `--catalog` lists every graph |
 | `init` | — | Create a graph from a `.pg` schema |
 | `upgrade` | — | Convert a standalone graph's storage offline |
 | `optimize` | — | Compact data and reconcile declared indexes on `main` |
@@ -58,7 +58,7 @@ prints the exact flags of the installed binary.
 | `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
 | `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
-| `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
+| `access` | — | Say which actions a graph's policy grants you, graph-wide and on a branch |
 | `mcp` | — | Relay an agent's stdio MCP to an existing server or managed target's `/mcp`, bound to one graph; read-only tools unless `--write` |
 | `studio` | — | Open Omnigraph Studio on an existing server target through an `omnigraph-studio://open` link, and print the link |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
@@ -191,9 +191,11 @@ omnigraph graphs list --target <name> --json
 omnigraph graphs list --target <name> --catalog --json
 ```
 
-Lists the ids and names of the graphs the credential can read on any branch,
+Names your actor (on stderr; `--json` carries `actor_id` and `client_id`) and
+lists the ids and names of the graphs the credential holds any permission on,
 available or not, with any credential and no permit; an empty list means it
-can read none.
+holds none. Any other graph answers 404; `access` says what you may do on a
+listed one.
 Remote servers only (rejects local URIs). `--catalog` lists every graph with its
 `state` and root instead, and needs `graph_list` from a cluster-scoped policy
 bundle, on managed targets too. See [`server-policy.md`](server-policy.md).
@@ -439,9 +441,12 @@ omnigraph config validate --json
 omnigraph access --target production --branch main --json
 ```
 
-`access` reports the server-resolved actor and allowed graph actions; it is the
-identity check, with no separate `whoami` command. Direct targets use `--as`
-or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
+`access` reports the server-resolved actor and allowed graph actions on a graph
+you hold some permission on; a served graph you hold none on answers 404, as it
+does on every route. The identity check for any credential, with no separate
+`whoami` command, is `graphs list --json` on a served target: its `actor_id`
+(and `client_id` for an OAuth client) name who you are even when you may do
+nothing. Direct targets use `--as` or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
 update scripts that read protocol 1's `actor`. Managed targets use their issued resource identity. See
 [access scope and policy semantics](../../../docs/user/cli/targets.md#what-you-may-do-at-a-target).
 

@@ -175,7 +175,7 @@ pub(crate) async fn run_graphs(
                 return Ok(Completion::success());
             }
             let payload = client.discover_graphs().await?;
-            output::write_graphs_discovery(&payload, json, stdout)?;
+            output::write_graphs_discovery(&payload, json, stdout, stderr)?;
         }
     }
     Ok(Completion::success())

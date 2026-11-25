@@ -72,12 +72,13 @@ CLI `--actions` is removed. Unsupported caches refuse without automatic
 replacement; `cluster token --managed` explicitly requests a current identity credential.
 Permission denial never switches credentials or storage addressing.
 
-`GET /graphs/discovery` returns only
+`GET /graphs/discovery` returns only the caller's actor and
 `{"graphs":[{"graph_id":"knowledge","display_name":"knowledge"}]}`
 for a valid version 2 identity, and for every other credential. It names the
-graphs of the effective inventory, unavailable ones included, that the caller
-may `read` on some branch; a graph on which it holds no permission answers 404
-on every graph route (amended 2026-11-24, see the decision log). Graph data, schema, query
+graphs of the effective inventory, unavailable ones included, on which the
+caller holds any permission (every graph for a `graph_list` holder); every
+other graph answers 404 on every graph route (amended 2026-11-24, see the
+decision log). Graph data, schema, query
 bodies, roots, diagnostics and topology are absent.
 The existing `/graphs` response and authorization retain their contract.
 Display names currently equal graph IDs. Inventory availability presumes a
@@ -255,26 +256,27 @@ of a particular deployment remain separate from the accepted library contract.
 
 ## Decision log
 
-- 2026-11-24: Discovery lists the graphs the caller can read. The first rule,
+- 2026-11-24: Discovery lists the graphs the caller may use. The first rule,
   every graph for every identity with no policy check, contradicted graph
   resolution, which answers 404 for an unavailable graph the caller cannot
-  read, so discovery named graphs that routing hid. Static and OAuth client
-  credentials got 403 unless the cluster policy granted `graph_list`. One rule
-  now decides which graphs a caller may know exist: `read` of some branch,
-  through the same rules a read obeys (one protected and one unprotected branch
-  decide every branch scope). Discovery lists exactly those graphs for every
-  credential. Every graph route answers a graph on which the caller holds no
-  permission at all, ready or not, as unknown (404), so a probe finds nothing
-  either; a caller with some grant, such as a writer without `read`, still
-  reaches its routes and is refused only what it lacks. An absent graph means
-  one the caller cannot read, which is the answer the caller needs. The empty list a caller
-  with no grant receives is the case the rejected alternative feared; a setup
-  link for it belongs to the MCP surface
-  ([#1526](https://github.com/ModernRelay/omnigraph/pull/1526)). `graph_list`
-  means only the catalog at `GET /graphs`; its holder is still told a graph is
-  unavailable rather than unknown, since the catalog names every graph. This
-  replaces User behavior's every-graph discovery sentence and Alternatives'
-  rejection of hiding graphs.
+  use, so discovery named graphs that routing hid. Static and OAuth client
+  credentials got 403 unless the cluster policy granted `graph_list`. One
+  predicate now decides which graphs a caller may know exist, for the listing
+  and for every graph route alike: the caller holds some permission on the
+  graph, for any action on any branch, or holds `graph_list`. The policy
+  context carries only whether a branch is named and protected, so one
+  protected and one unprotected branch decide every branch scope. A graph is
+  therefore listed exactly when its routes do not answer that it does not
+  exist, and a probe finds nothing the listing hides. A grant without `read`
+  counts, because a writer or stored-query invoker must reach its routes
+  (a write needs no permission to read). Discovery also names the caller's
+  actor and OAuth client, so it is the identity check for every credential,
+  including one granted nothing, which `access` answers with 404. The empty
+  list a caller with no grant receives is the case the rejected alternative
+  feared; a setup link for it belongs to the MCP surface
+  ([#1526](https://github.com/ModernRelay/omnigraph/pull/1526)). This replaces
+  User behavior's every-graph discovery sentence and Alternatives' rejection
+  of hiding graphs.
 - 2026-10-29: New human logins receive a 30-day absolute renewal deadline;
   existing saved deadlines remain unchanged. Required provider inactivity is 14 days,
   access JWTs remain at most 15 minutes, and graph credentials retain their

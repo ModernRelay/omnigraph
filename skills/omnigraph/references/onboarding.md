@@ -310,7 +310,7 @@ graph, read it first and write back to it.
     graphs exist. Do at least this, even when the task looks unrelated.
   - Read a graph's schema before querying or writing it:
     `omnigraph schema show --target <name>`. A server target can hold several
-    graphs; `omnigraph graphs list --target <name>` lists the ones you can read
+    graphs; `omnigraph graphs list --target <name>` lists the ones you may use
     for `--graph`.
   - Pull context first: when a request touches anything a graph holds, query
     it and answer from what it returns. If it returns nothing, say so.

@@ -13,7 +13,8 @@ use omnigraph_server::PolicyAction;
 /// Use `cluster apply --target` to deploy graph additions and schema/query changes.
 #[derive(Debug, Subcommand)]
 pub(crate) enum GraphsCommand {
-    /// List the graphs your credential can read.
+    /// Name your actor and list the graphs your credential holds any
+    /// permission on.
     List {
         #[arg(long)]
         json: bool,

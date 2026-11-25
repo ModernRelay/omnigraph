@@ -39,7 +39,7 @@ async fn cluster_management_policy_can_boot_beside_legacy_catalog_rules() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         payload,
-        serde_json::json!({"graphs":[]}),
+        serde_json::json!({"actor_id":"operator","graphs":[]}),
         "a graph_list holder lists the whole catalog, which is empty"
     );
 }

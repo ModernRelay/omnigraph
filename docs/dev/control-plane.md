@@ -546,29 +546,28 @@ applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
 `GraphVisibility` in `crates/omnigraph-server/src/handlers.rs` decides which
-graphs a caller may know exist, from two policy questions evaluated over branch
-classes: `PolicyEngine::may_read_some_branch` (the caller may `read` some
-branch) and `PolicyEngine::may_act_on_graph` (it holds any graph action on
-some branch). A branch scope tests only whether a branch is protected, so one
-protected and one unprotected branch decide every branch. The server's
-no-policy states (open mode, default deny, policy-less reads, signed
-credentials) apply as they do to every read. An invalid graph policy or
-configuration authorizes nothing. Every surface that names a graph derives
-from those questions:
+graphs a caller may know exist, with one predicate: the caller holds some grant
+on the graph (`PolicyEngine::may_act_on_graph`: any graph action on some
+branch) or holds the server-scoped `graph_list`. The Cedar request context
+carries only whether a branch is named and whether it is protected, never its
+name, so one protected and one unprotected branch decide every branch exactly.
+The server's no-policy states (open mode, default deny, policy-less reads,
+signed credentials) apply as they do to every request. An invalid graph policy
+or configuration grants nothing. Every surface that names a graph applies the
+predicate, so a graph is listed exactly when it is not answered as unknown:
 
 - `GET /graphs/discovery` (CLI `graphs list`, MCP `graphs` and
-  `omnigraph://graphs`) returns the IDs and display names of the readable
-  graphs in the current serving registry (loading, ready, transitioning or
-  blocked), as last installed by boot or a deployment activation, for any
-  credential. It neither scans storage nor discloses availability, paths,
-  policy, schema, or query definitions. It logs one summary line per listing,
-  not a policy decision per graph.
+  `omnigraph://graphs`) returns the caller's `actor_id` and `client_id` and the
+  IDs and display names of the visible graphs in the current serving registry
+  (loading, ready, transitioning or blocked), as last installed by boot or a
+  deployment activation, for any credential. It neither scans storage nor
+  discloses availability, paths, policy, schema, or query definitions. It logs
+  one summary line per listing, not a policy decision per graph.
 - HTTP and MCP graph resolution atomically capture a serving view with its
-  graph-epoch lease. A graph, ready or not, on which the caller holds no grant
-  and that its `graph_list` does not cover answers exactly as an unknown
-  graph, 404. A visible loading, blocked or transitioning graph yields 503; a
-  visible ready graph reaches its route, whose own authorization decides the
-  action.
+  graph-epoch lease. A graph that is not visible, ready or not, answers exactly
+  as an unknown graph, 404. A visible loading, blocked or transitioning graph
+  yields 503; a visible ready graph reaches its route, whose own authorization
+  decides the action.
 
 `GET /graphs`, the catalog, uses the same registry behind a `graph_list` gate
 and returns one list containing every graph's root, runtime availability,
@@ -579,7 +578,7 @@ grant; route authorization still applies to ready graphs.
 The CLI's versioned keychain cache verifies endpoint and identity bindings before
 replacement. Unsupported caches refuse without automatic replacement. The provider-native client acquires missing/expired identity
 credentials before an operation using the selected managed target.
-Both managed and standalone targets list the readable graphs, or the catalog
+Both managed and standalone targets list the graphs the credential holds a permission on, or the catalog
 when `graphs list --catalog` is requested; the CLI never infers routing from an
 arbitrary bearer token's unverified shape.
 

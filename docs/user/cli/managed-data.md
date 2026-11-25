@@ -50,13 +50,14 @@ The service can shorten the requested lifetime. Issuer clock tolerance is
 
 ## Discover graphs
 
-`graphs list --target production` shows the ID and display name of every graph
-the applied policy lets your credential read on any branch, including graphs
-that failed to open. A graph on which your credential holds no permission is
-not found for it. A credential that can read no graph gets an empty list. It does not
-reveal availability, storage locations, schema, stored queries, or graph
-contents. A display name currently equals its graph ID. Listing a graph grants
-nothing beyond that read; other actions are checked separately.
+`graphs list --target production` names the actor your credential resolves to
+(on stderr; `--json` carries `actor_id` and `client_id`) and shows the ID and
+display name of every graph the applied policy grants your credential any
+permission on, including graphs that failed to open. Any other graph is not
+found for your credential. A credential with no permission anywhere gets an
+empty list. It does not reveal availability, storage locations, schema, stored
+queries, or graph contents. A display name currently equals its graph ID.
+Listing a graph grants nothing; `omnigraph access` says what you may do.
 
 The same listing works with any credential, on managed and standalone server
 targets. `graphs list --catalog` requests the catalog instead: every graph with
