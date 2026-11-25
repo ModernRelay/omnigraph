@@ -1,0 +1,40 @@
+# issue: none
+# notes: A `union` column holds one type: arms that bind different node types under one name are refused. Polymorphism starts at a text this release refuses, so adding it later changes no text that compiles now. The compiler test every_form_polymorphism_adds_is_refused_at_its_construct pins the refusal's position.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada"}}
+{"type":"Person","data":{"handle":"bob","name":"Bob"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"Knows","from":"ada","to":"bob"}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+
+--- query
+query people_or_companies() {
+    match {
+        from union(
+            { match { $x: Person } return { $x } },
+            { match { $x: Company } return { $x } })
+    }
+    return { $x.name }
+}
+
+--- expect error: type error: T73: union arm 2's column `x` is node Company, the first arm's is node Person

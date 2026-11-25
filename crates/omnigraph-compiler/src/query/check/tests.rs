@@ -3168,3 +3168,89 @@ node Task { slug: String @key  phase: enum(draft, closed) }",
         string(true)
     );
 }
+
+/// Every form polymorphism adds starts at a text this release refuses, so
+/// adding it changes no text that compiles now: a binding to an interface, a
+/// type test either way, a union binding, a type variable, `@type` on a node
+/// binding, `@type_id`, a `union` whose arms bind different node types, and
+/// an alternation whose ends are different node types. Each refusal keeps
+/// its code and names the construct at its span.
+#[test]
+fn every_form_polymorphism_adds_is_refused_at_its_construct() {
+    let rows: &[(&str, &str, (u32, &str), &str)] = &[
+        (
+            "query q() { match { $x: Named } return { $x.name } }",
+            "T1",
+            (21, "$x: Named"),
+            "`Named` is an interface; a binding names a node type",
+        ),
+        (
+            "query q() { match { $x: Person } where $x is Person return { $x.name } }",
+            "Q015",
+            (43, "is"),
+            "this release does not support a type test `$x is T` yet",
+        ),
+        (
+            "query q() { match { $x: Person } where $x is not Person return { $x.name } }",
+            "Q015",
+            (43, "is"),
+            "this release does not support a type test `$x is not T` yet",
+        ),
+        (
+            "query q() { match { $x: Person | Company } return { $x.name } }",
+            "Q015",
+            (32, "|"),
+            "this release does not support a union binding `$x: A | B` yet",
+        ),
+        (
+            "query q() { match { $x: $t } return { $x.name } }",
+            "Q015",
+            (25, "$"),
+            "this release does not support a type-variable binding `$x: $t` yet",
+        ),
+        (
+            "query q() { match { $x: Person } return { $x.@type } }",
+            "T6",
+            (43, "$x.@type"),
+            "binding `$x` has no meta-field `@type`",
+        ),
+        (
+            "query q() { match { $x: Person } return { $x.@type_id } }",
+            "T6",
+            (43, "$x.@type_id"),
+            "binding `$x` has no meta-field `@type_id`",
+        ),
+        (
+            "query q() { match { from union({ match { $x: Person } return { $x } }, { match { $x: Company } return { $x } }) } return { $x.name } }",
+            "T73",
+            (105, "$x"),
+            "union arm 2's column `x` is node Company, the first arm's is node Person",
+        ),
+        (
+            "query q() { match { $p: Person, $p (knows | worksAt) $y } return { $y.name } }",
+            "T5",
+            (33, "$p (knows | worksAt) $y"),
+            "endpoint `$y` resolves to type `Person` but edge `WorksAt` expects `Company`",
+        ),
+    ];
+    for (source, code, at, message) in rows {
+        let d = match check_source(&catalog(), source) {
+            Err(d) => d,
+            Ok(decls) => decls
+                .into_iter()
+                .find_map(|(_, r)| r.err())
+                .unwrap_or_else(|| panic!("compiles: {source}")),
+        };
+        let (Some(start), Some(end)) = (d.position, d.end) else {
+            panic!("no span: {source}: {d}");
+        };
+        assert_eq!(d.code.as_str(), *code, "{source}: {d}");
+        assert!(d.message.starts_with(message), "{source}: {d}");
+        let span = &source[start.byte as usize..end.byte as usize];
+        assert_eq!(
+            (start.line, start.column, span),
+            (1, at.0, at.1),
+            "{source}: {d}"
+        );
+    }
+}

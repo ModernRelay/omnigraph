@@ -1,0 +1,36 @@
+# issue: none
+# notes: A type test `$x is T` is refused with the form it names. Polymorphism starts at a text this release refuses, so adding it later changes no text that compiles now. The compiler test every_form_polymorphism_adds_is_refused_at_its_construct pins the refusal's position.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada"}}
+{"type":"Person","data":{"handle":"bob","name":"Bob"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"Knows","from":"ada","to":"bob"}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+
+--- query
+query typed() {
+    match { $x: Person } where $x is Person
+    return { $x.name }
+}
+
+--- expect error: parse error: Q015: this release does not support a type test `$x is T` yet; a binding `$x: T` selects one type

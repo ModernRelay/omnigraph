@@ -232,6 +232,23 @@ fn scan(input: &str) -> Vec<Habit> {
                     applicability: Applicability::NeedsReview,
                 });
             }
+            b'|' if depth > 0
+                && prev != b'|'
+                && b.get(i + 1) != Some(&b'|')
+                && union_binding_before(&input[..i])
+                && input[i + 1..]
+                    .trim_start()
+                    .starts_with(|c: char| c.is_ascii_uppercase()) =>
+            {
+                out.push(Habit {
+                    span: (i, i + 1),
+                    edit: None,
+                    message: "this release does not support a union binding `$x: A | B` yet; a binding names one type".into(),
+                    note: "$x: <Type>".into(),
+                    code: Q015,
+                    applicability: Applicability::NeedsReview,
+                });
+            }
             b'$' if b.get(i + 1).is_some_and(u8::is_ascii_uppercase) => {
                 let lower = (b[i + 1] as char).to_ascii_lowercase().to_string();
                 let mut h = habit(
@@ -352,6 +369,27 @@ fn braced_block(input: &str, from: usize) -> Option<usize> {
     })
 }
 
+/// Whether `before` ends in a binding's type, `$x: T`, so a `|` after it
+/// starts a union of types rather than an edge alternation.
+fn union_binding_before(before: &str) -> bool {
+    let before = before.trim_end();
+    let name_start = before
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(0, |k| k + 1);
+    let name = &before[name_start..];
+    if !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return false;
+    }
+    let Some(rest) = before[..name_start].trim_end().strip_suffix(':') else {
+        return false;
+    };
+    let rest = rest.trim_end();
+    let var_start = rest
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(0, |k| k + 1);
+    var_start > 0 && rest.as_bytes()[var_start - 1] == b'$' && var_start < rest.len()
+}
+
 /// A form a later stage adds, refused naming the form; the message never
 /// names the stage (section 5).
 fn later_word(input: &str, start: usize, end: usize, prev: u8, depth: i32) -> Option<Habit> {
@@ -411,6 +449,16 @@ fn later_word(input: &str, start: usize, end: usize, prev: u8, depth: i32) -> Op
             "this release does not support a type test `$x is T` yet; a binding `$x: T` selects one type",
             None,
         )),
+        "is" if after
+            .strip_prefix("not")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace)
+                && rest.trim_start().starts_with(|c: char| c.is_ascii_uppercase())) =>
+        {
+            Some(note(
+                "this release does not support a type test `$x is not T` yet; a binding `$x: T` selects one type",
+                None,
+            ))
+        }
         "Commit" | "Branch" if depth == 0 && input[..start].trim_end().ends_with(':') => {
             Some(note(
                 "the `Branch` and `Commit` parameter kinds are a later change after the break; a commit id is a `String` parameter now",

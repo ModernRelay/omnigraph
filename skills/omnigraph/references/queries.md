@@ -326,7 +326,9 @@ Use `$p.@id` for a node's identity and `$w.@id`, `$w.@src`, `$w.@dst` for a
 bound edge's identity and endpoints. These meta-fields work in filters,
 projections, and ordering on both current and legacy graphs. `$p.id` always
 means a declared user property named `id`; it is not an identity shorthand.
-`$w.@type` is a bound edge's schema type name (read-only).
+`$w.@type` is a bound edge's schema type name (read-only). On a node binding,
+which matches the one type it names, `@type` is `T6`, as `@type_id` is on any
+binding; there is no `@src_type` or `@dst_type`: bind the endpoint instead.
 
 `return { $p }` returns one column named `p` containing the node object:
 `{"@id":"alice","name":"Alice"}`. It includes declared properties except

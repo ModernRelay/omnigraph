@@ -182,7 +182,7 @@ too (`$x.@src = $who`), and a bare `@id` is `T6`. A bare `id` (`$p.id`, or
 it is the unknown-property error, which names the meta-field. Edge writes
 assign endpoints as `@src` and `@dst`. `$e.@type` returns the bound edge's
 canonical schema type name as a non-null `String`, including on ordinary named
-traversals; it is synthesized query metadata and cannot be written. `@src` and
+traversals; it is synthesized query metadata and cannot be written. On a node binding, which matches the one type it names, `@type` is `T6`, as `@type_id` is on any binding; an endpoint's type is the type its binding names, and there is no `@src_type` or `@dst_type`. `@src` and
 `@dst` preserve stored orientation, including when the query traverses in
 reverse. In type position the same prefix names an engine-owned, read-only
 type: `$o: @Operator` binds the rows of the [engine catalogue](catalogue.md).

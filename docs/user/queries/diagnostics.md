@@ -192,7 +192,7 @@ expected format instead, without an edit.
 | `Q012` | A respelling the language refuses (`not { … }`, a chained comparison, a one-name edge group `(knows)`, an annotation's empty parentheses `@name()`); the fix prints the legal form. |
 | `Q013` | A write's elements are written without `match { }`, or after a statement; the fix is the group's `match`. |
 | `Q014` | A spelling from another language (`==`, `&&`, `!`, `count(*)`, `like`, …); the fix prints the GQ form. `case`, `\|\|`, `<>`, single quotes and another letter case are accepted ([other spellings](functions.md#other-accepted-spellings)). |
-| `Q015` | A form the language does not have yet; the message names it. |
+| `Q015` | A form the language does not have yet; the message names it: a type test `$x is T` or `$x is not T`, a union binding `$x: A \| B`, a type-variable binding `$x: $t`, `offset`, `returning`, … |
 | `Q016` | Two elements, return items, order keys, call arguments or assignments are separated by whitespace alone; the fix is the comma. |
 | `Q017` | A filter, a `where` or a comparison inside the `match` braces; the fix moves it to the `where` after them, joined with `and`. A block that holds only filters binds nothing: the fix writes the scalar it folds to over the row it tests, `if(coalesce(φ, false), 1, 0)` for `count { φ }`. A block that names a variable only a later element binds stays where it was written, as `let $block = …`. |
 | `Q018` | A bare name where a value is read; a bare name is a return alias in `order` only. |
