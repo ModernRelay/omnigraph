@@ -29,14 +29,24 @@ Graph-scoped actions:
 
 Listing the graphs a caller can read needs no permit. `GET /graphs/discovery`
 (the CLI's `graphs list`, MCP's `graphs`) returns, for every credential, the IDs
-and display names of the graphs on which its `read` of `main` is allowed, by
-the same check a read makes, available or not. A caller that can read no graph
-gets an empty list. Listing a graph grants nothing beyond that read.
+and display names of the graphs it can read on any branch, by the rules every
+read obeys, available or not. A rule scoped to unprotected branches counts:
+a caller that may read only feature branches still lists the graph. A caller
+that can read no graph gets an empty list. Listing a graph grants nothing
+beyond that read.
+
+A graph on which the caller holds no permission at all, for any action on any
+branch, does not exist for it: every route under `/graphs/{graph_id}` and
+every MCP tool answers it exactly as an unknown graph, 404 `not_found`, so a
+probe does not reveal it. A caller with some permission on the graph (a writer
+without `read`, say, which the listing leaves out) reaches its routes and gets
+403 for an action it lacks.
 
 `graph_list` is server-scoped and grants the catalog: `GET /graphs`, every
-registered graph with its root and availability, and every graph in the
-listing, including graphs the holder cannot read. See
-[signed data credentials](server.md#signed-data-credentials).
+registered graph with its root and availability, including graphs the holder
+cannot read. A holder is told that such a graph is unavailable (503) or that
+an action is refused (403), rather than that it does not exist. It adds nothing
+to the listing. See [signed data credentials](server.md#signed-data-credentials).
 
 `config_manage` is cluster-scoped. It authorizes configuration changes through
 the identity-authorized cluster API, including stored queries, graph creation,
@@ -298,9 +308,11 @@ For static token authentication:
 
 `GET /graphs` is denied unless a `cluster`-scoped policy grants `graph_list`,
 including when graph policies exist. `GET /graphs/discovery` lists the graphs
-each caller can read in every row: all of them with `--unauthenticated`, none
-under default deny, and the graphs with no policy for a static token when
-`OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`.
+each caller can read in every row: with `--unauthenticated`, every graph except
+one whose configuration or policy was refused at startup; none under default
+deny; and the graphs with no policy for a static token when
+`OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`. A graph on which a caller holds no
+permission answers it 404.
 
 Signed-token trust also enables authenticated startup. Signed credentials
 require an explicit policy permit for protected operations even when no

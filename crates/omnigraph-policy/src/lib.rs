@@ -609,37 +609,109 @@ impl PolicyEngine {
         {
             ensure_canonical_branch_name(branch)?;
         }
+        self.decide(
+            actor_id,
+            request.action,
+            self.branch_class(request.branch.as_deref()),
+            self.branch_class(request.target_branch.as_deref()),
+        )
+    }
+
+    /// A named branch with whether this policy protects it.
+    fn branch_class<'a>(&self, name: Option<&'a str>) -> Option<(&'a str, bool)> {
+        name.map(|name| (name, self.protected_branches.contains(name)))
+    }
+
+    /// Whether `actor_id` may `read` some branch of this graph. A branch
+    /// scope tests only whether a request names a branch and whether that
+    /// branch is protected, never its name, so one protected branch and one
+    /// unprotected branch stand for every branch. The protected class exists
+    /// only when the policy protects a branch.
+    pub fn may_read_some_branch(&self, actor_id: &str) -> Result<bool> {
+        for protected in [true, false] {
+            if protected && self.protected_branches.is_empty() {
+                continue;
+            }
+            if self
+                .decide(actor_id, PolicyAction::Read, Some(("", protected)), None)?
+                .allowed
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `actor_id` holds any graph-scoped action on this graph for
+    /// some branch. A rule's scope is the one its action uses (validation
+    /// refuses any other), and a scope tests only whether the branch is
+    /// protected, so each action is decided by one protected and one
+    /// unprotected branch in that scope, or by no branch when it has none.
+    pub fn may_act_on_graph(&self, actor_id: &str) -> Result<bool> {
+        let classes = |scoped: bool| -> Vec<Option<(&'static str, bool)>> {
+            if !scoped {
+                return vec![None];
+            }
+            let mut classes = vec![Some(("", false))];
+            if !self.protected_branches.is_empty() {
+                classes.push(Some(("", true)));
+            }
+            classes
+        };
+        for action in PolicyAction::value_variants() {
+            if action.resource_kind() != PolicyResourceKind::Graph {
+                continue;
+            }
+            for branch in classes(action.uses_branch_scope()) {
+                for target in classes(action.uses_target_branch_scope()) {
+                    if self.decide(actor_id, *action, branch, target)?.allowed {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Evaluate `action` for `actor_id` against the branch facts a decision
+    /// may test: each named branch (`branch`, `target_branch`) with whether it
+    /// is protected.
+    fn decide(
+        &self,
+        actor_id: &str,
+        action: PolicyAction,
+        branch: Option<(&str, bool)>,
+        target_branch: Option<(&str, bool)>,
+    ) -> Result<PolicyDecision> {
         if !self.known_actors.contains(actor_id) {
             return Ok(self.deny(
                 None,
-                format!(
-                    "policy denied action '{}' for unknown actor '{}'",
-                    request.action, actor_id
-                ),
+                format!("policy denied action '{action}' for unknown actor '{actor_id}'"),
             ));
         }
 
         let principal = entity_uid("Actor", actor_id)?;
-        let action = entity_uid("Action", request.action.as_str())?;
+        let action_uid = entity_uid("Action", action.as_str())?;
         // Pick the resource entity based on the action's `resource_kind`.
         // Server-scoped actions (`graph_list`) bind to
         // `Omnigraph::Server::"root"`; per-graph actions bind to
         // `Omnigraph::Graph::"<graph_label>"`.
-        let resource = match request.action.resource_kind() {
+        let resource = match action.resource_kind() {
             PolicyResourceKind::Server => entity_uid("Server", SERVER_RESOURCE_ID)?,
             PolicyResourceKind::Graph => entity_uid("Graph", &self.graph_id)?,
             PolicyResourceKind::Cluster => entity_uid("Cluster", CLUSTER_RESOURCE_ID)?,
         };
         let context_value = json!({
-            "has_branch": request.branch.is_some(),
-            "branch": request.branch.clone().unwrap_or_default(),
-            "has_target_branch": request.target_branch.is_some(),
-            "target_branch": request.target_branch.clone().unwrap_or_default(),
-            "branch_is_protected": request.branch.as_ref().is_some_and(|branch| self.protected_branches.contains(branch)),
-            "target_branch_is_protected": request.target_branch.as_ref().is_some_and(|branch| self.protected_branches.contains(branch)),
+            "has_branch": branch.is_some(),
+            "branch": branch.map(|(name, _)| name).unwrap_or_default(),
+            "has_target_branch": target_branch.is_some(),
+            "target_branch": target_branch.map(|(name, _)| name).unwrap_or_default(),
+            "branch_is_protected": branch.is_some_and(|(_, protected)| protected),
+            "target_branch_is_protected": target_branch.is_some_and(|(_, protected)| protected),
         });
-        let context = Context::from_json_value(context_value, Some((&self.schema, &action)))?;
-        let cedar_request = Request::new(principal, action, resource, context, Some(&self.schema))?;
+        let context = Context::from_json_value(context_value, Some((&self.schema, &action_uid)))?;
+        let cedar_request =
+            Request::new(principal, action_uid, resource, context, Some(&self.schema))?;
         let response =
             Authorizer::new().is_authorized(&cedar_request, &self.policies, &self.entities);
         let errors = response
@@ -664,24 +736,17 @@ impl PolicyEngine {
             Decision::Allow => PolicyDecision {
                 allowed: true,
                 matched_rule_id: matched_rule_id.clone(),
-                message: format!(
-                    "policy allowed action '{}' for actor '{}'",
-                    request.action, actor_id
-                ),
+                message: format!("policy allowed action '{action}' for actor '{actor_id}'"),
             },
             Decision::Deny => {
                 let message = format!(
                     "policy denied action '{}'{}{} for actor '{}'",
-                    request.action,
-                    request
-                        .branch
-                        .as_deref()
-                        .map(|branch| format!(" on branch '{}'", branch))
+                    action,
+                    branch
+                        .map(|(name, _)| format!(" on branch '{name}'"))
                         .unwrap_or_default(),
-                    request
-                        .target_branch
-                        .as_deref()
-                        .map(|branch| format!(" targeting branch '{}'", branch))
+                    target_branch
+                        .map(|(name, _)| format!(" targeting branch '{name}'"))
                         .unwrap_or_default(),
                     actor_id
                 );
@@ -1602,6 +1667,56 @@ rules:
         .unwrap();
         let err = branch_scoped.validate().unwrap_err();
         assert!(err.to_string().contains("unsupported action"));
+    }
+
+    /// `may_read_some_branch` agrees with `authorize` over every branch
+    /// class, and `may_act_on_graph` also counts a grant of any other graph
+    /// action: a read scoped to unprotected branches is a read of some branch
+    /// even when `main` is protected, and a read scoped to protected branches
+    /// is none while the policy protects no branch.
+    #[test]
+    fn may_read_some_branch_covers_every_branch_class() {
+        let engine = |protected: &str, scope: &str| {
+            let policy: PolicyConfig = yaml_serde::from_str(&format!(
+                "version: 1\nprotected_branches: [{protected}]\ngroups:\n  readers: [act-reader]\n  writers: [act-writer]\nrules:\n  - id: read\n    allow: {{ actors: {{ group: readers }}, actions: [read], branch_scope: {scope} }}\n  - id: write\n    allow: {{ actors: {{ group: writers }}, actions: [change], branch_scope: any }}\n"
+            ))
+            .unwrap();
+            PolicyCompiler::compile(&policy, "knowledge").unwrap()
+        };
+        let reads = |engine: &PolicyEngine, branch: &str| {
+            engine
+                .authorize(
+                    "act-reader",
+                    &PolicyRequest {
+                        action: PolicyAction::Read,
+                        branch: Some(branch.to_string()),
+                        target_branch: None,
+                    },
+                )
+                .unwrap()
+                .allowed
+        };
+        for (protected, scope, main, feature, some) in [
+            ("main", "unprotected", false, true, true),
+            ("main", "protected", true, false, true),
+            ("main", "any", true, true, true),
+            ("", "unprotected", true, true, true),
+            ("", "protected", false, false, false),
+        ] {
+            let engine = engine(protected, scope);
+            assert_eq!(reads(&engine, "main"), main, "{protected} {scope}");
+            assert_eq!(reads(&engine, "feature"), feature, "{protected} {scope}");
+            assert_eq!(
+                engine.may_read_some_branch("act-reader").unwrap(),
+                some,
+                "{protected} {scope}"
+            );
+            assert!(!engine.may_read_some_branch("act-writer").unwrap());
+            assert!(!engine.may_read_some_branch("act-unknown").unwrap());
+            assert_eq!(engine.may_act_on_graph("act-reader").unwrap(), some);
+            assert!(engine.may_act_on_graph("act-writer").unwrap());
+            assert!(!engine.may_act_on_graph("act-unknown").unwrap());
+        }
     }
 
     // ─── MR-668 — server-scoped action (graph_list) ─

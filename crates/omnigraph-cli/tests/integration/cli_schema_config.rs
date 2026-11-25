@@ -1026,8 +1026,15 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
     // `graphs list` names the graphs the credential can read; `--catalog`
-    // asks for the full registry with each graph's state and root.
-    for (catalog, json_output) in [(false, false), (false, true), (true, false), (true, true)] {
+    // asks for the full registry with each graph's state and root. The
+    // deprecated `--discovery` is accepted and selects the default listing.
+    for (catalog, json_output, discovery) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, false),
+        (false, true, true),
+    ] {
         let reply = if catalog {
             serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"apply_correction_or_restart"}]})
         } else {
@@ -1046,6 +1053,9 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         }
         if catalog {
             command.arg("--catalog");
+        }
+        if discovery {
+            command.arg("--discovery");
         }
         let output = output_success(&mut command);
         if json_output {

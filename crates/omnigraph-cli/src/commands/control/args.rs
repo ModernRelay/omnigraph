@@ -19,8 +19,12 @@ pub(crate) enum GraphsCommand {
         json: bool,
         /// List the catalog instead: every registered graph, with its state
         /// and root. Requires the server's `graph_list` permit.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "discovery")]
         catalog: bool,
+        /// Deprecated: the readable listing is now the default. Accepted and
+        /// ignored for one release.
+        #[arg(long, hide = true)]
+        discovery: bool,
     },
 }
 

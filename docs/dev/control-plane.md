@@ -545,22 +545,30 @@ reachability is outside the serving request path. The profile boundary and
 applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
-One rule decides which graphs a caller may know exist (`GraphVisibility` in
-`crates/omnigraph-server/src/handlers.rs`): a graph is visible to a caller
-whose `read` of `main` the graph's binding allows, through the same `authorize`
-call every read route makes, or to a holder of the server-scoped `graph_list`.
-An invalid graph policy or configuration authorizes no read. Every surface that
-names a graph derives from that rule:
+`GraphVisibility` in `crates/omnigraph-server/src/handlers.rs` decides which
+graphs a caller may know exist, from two policy questions evaluated over branch
+classes: `PolicyEngine::may_read_some_branch` (the caller may `read` some
+branch) and `PolicyEngine::may_act_on_graph` (it holds any graph action on
+some branch). A branch scope tests only whether a branch is protected, so one
+protected and one unprotected branch decide every branch. The server's
+no-policy states (open mode, default deny, policy-less reads, signed
+credentials) apply as they do to every read. An invalid graph policy or
+configuration authorizes nothing. Every surface that names a graph derives
+from those questions:
 
 - `GET /graphs/discovery` (CLI `graphs list`, MCP `graphs` and
-  `omnigraph://graphs`) returns the IDs and display names of the visible
+  `omnigraph://graphs`) returns the IDs and display names of the readable
   graphs in the current serving registry (loading, ready, transitioning or
   blocked), as last installed by boot or a deployment activation, for any
   credential. It neither scans storage nor discloses availability, paths,
-  policy, schema, or query definitions.
+  policy, schema, or query definitions. It logs one summary line per listing,
+  not a policy decision per graph.
 - HTTP and MCP graph resolution atomically capture a serving view with its
-  graph-epoch lease. A loading, blocked or transitioning graph yields 503 to a
-  caller it is visible to; otherwise it remains undisclosed as 404.
+  graph-epoch lease. A graph, ready or not, on which the caller holds no grant
+  and that its `graph_list` does not cover answers exactly as an unknown
+  graph, 404. A visible loading, blocked or transitioning graph yields 503; a
+  visible ready graph reaches its route, whose own authorization decides the
+  action.
 
 `GET /graphs`, the catalog, uses the same registry behind a `graph_list` gate
 and returns one list containing every graph's root, runtime availability,

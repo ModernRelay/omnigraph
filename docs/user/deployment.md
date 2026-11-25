@@ -75,8 +75,8 @@ again. Successful apply alone is not activation, which never rewrites the durabl
 achieved result or receipt.
 
 Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to the callers
-that list them: those authorized to read `main` or to list the catalog (`graph_list`); other
-callers cannot use this response to discover them. Unknown graphs return 404. A 503 does not
+that hold some permission on them or the catalog permit (`graph_list`). Every other caller gets
+404 for the graph, ready or not, as for an unknown graph. A 503 does not
 authorize replaying a write. `omnigraph graphs list --target NAME` lists the IDs of the graphs
 the credential can read; `--catalog` displays every graph's ID, state and URI for a `graph_list`
 holder, and with `--json` preserves the full catalog fields.

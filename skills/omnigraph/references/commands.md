@@ -41,7 +41,7 @@ prints the exact flags of the installed binary.
 | `commit` | `list` `show` `changes` `publish` `drop` | Read history; publish or drop an unpublished commit |
 | `changes` | `poll` `baseline` | Follow a branch's change feed |
 | `schema` | `show` `plan` `apply` `upgrade-system-columns` | Read, plan or apply a schema; respell legacy system columns |
-| `graphs` | `list` | List the graphs the credential can read; `--catalog` lists every graph |
+| `graphs` | `list` | List the graphs the credential can read on any branch; `--catalog` lists every graph |
 | `init` | — | Create a graph from a `.pg` schema |
 | `upgrade` | — | Convert a standalone graph's storage offline |
 | `optimize` | — | Compact data and reconcile declared indexes on `main` |
@@ -191,8 +191,9 @@ omnigraph graphs list --target <name> --json
 omnigraph graphs list --target <name> --catalog --json
 ```
 
-Lists the ids and names of the graphs the credential can read, available or
-not, with any credential and no permit; an empty list means it can read none.
+Lists the ids and names of the graphs the credential can read on any branch,
+available or not, with any credential and no permit; an empty list means it
+can read none.
 Remote servers only (rejects local URIs). `--catalog` lists every graph with its
 `state` and root instead, and needs `graph_list` from a cluster-scoped policy
 bundle, on managed targets too. See [`server-policy.md`](server-policy.md).

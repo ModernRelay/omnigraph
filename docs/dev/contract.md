@@ -285,10 +285,13 @@ last chooses consistency over availability [K17, ch. 9].
 **E6. It is checked.** The server resolves the caller from its token; a client
 cannot name itself. The server checks every action against the installed
 policy. Listing graphs needs no permission and returns exactly the graphs
-whose `main` the caller may read, or every graph to a holder of `graph_list`,
-whatever their availability. Only those callers are told that a graph is
-unavailable; any other caller is told that it does not exist. The engine checks every write when a policy is installed, before the
-first lasting effect, so a denied write changes nothing. A direct CLI write to
+the caller may read on some branch, whatever their availability. A caller
+that holds no permission on a graph, for any action on any branch, is told
+that it does not exist, ready or not, unless it holds `graph_list`, which
+shows it every graph and whether each is available; any other caller is
+refused only the actions it lacks.
+The engine checks every write when a policy is installed, before the first
+lasting effect, so a denied write changes nothing. A direct CLI write to
 a cluster graph uses that cluster's policy. Reads through the engine or the
 direct CLI are not checked `D9`, and a direct or embedded caller states its
 own actor. A served graph with no policy denies every authenticated request,

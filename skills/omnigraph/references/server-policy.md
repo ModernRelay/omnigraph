@@ -53,7 +53,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `/graphs/{graph_id}/snapshot`, `/commits` | Snapshot and paged history; `GET /commits?listing=unpublished\|unattached`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}` |
 | `/graphs/{graph_id}/commits/{commit}/changes`, `GET /graphs/{graph_id}/diff` | One first-parent commit diff; net change between two branches or commit ids |
 | `GET /graphs/{graph_id}/changes`, `POST /graphs/{graph_id}/changes/baseline` | Poll a feed or capture a baseline |
-| `GET /graphs/discovery` | Ids and names of the graphs the caller can read, for any credential; every graph for a `graph_list` holder |
+| `GET /graphs/discovery` | Ids and names of the graphs the caller can read on any branch, for any credential; a graph it holds no permission on answers 404 |
 | `/mcp` | MCP endpoint; see [MCP, OIDC sign-in and logs](#mcp-oidc-sign-in-and-logs) |
 | `/graphs/{graph_id}/schema` | Read the accepted schema |
 | `/graphs/{graph_id}/export` | Stream a branch snapshot |
@@ -168,10 +168,11 @@ Graph-scoped actions are:
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved; no current public operation |
 
-`graph_list` is cluster-scoped and grants the catalog: `GET /graphs`, and
-every graph in the listing, including graphs the holder cannot read. Listing
-the graphs a caller can read (`GET /graphs/discovery`, `graphs list`, MCP
-`graphs`) needs no permit. `config_manage` is
+`graph_list` is cluster-scoped and grants the catalog, `GET /graphs`: every
+graph, including graphs the holder cannot read. Listing the graphs a caller
+can read on any branch (`GET /graphs/discovery`, `graphs list`, MCP `graphs`)
+needs no permit; a graph on which the caller holds no permission answers 404
+on every route. `config_manage` is
 cluster-scoped too and authorizes `cluster apply --target`; put it in a rule
 of its own. A stored read needs
 `invoke_query` plus `read`; a stored mutation needs `invoke_query` plus

@@ -1635,8 +1635,8 @@
         "tags": [
           "management"
         ],
-        "summary": "List the graphs the caller can read: each graph on which its `read` of\n`main` is allowed, whatever the graph's availability. A `graph_list`\nholder sees every registered graph. Any credential may ask, and one that\ncan read no graph gets an empty list.",
-        "description": "Returns ids and display names only, from the server's current registry:\nno roots, availability, schema or policy. The catalog (`GET /graphs`)\nholds availability and roots.",
+        "summary": "List the graphs the caller can read: each graph whose policy lets it\n`read` some branch, whatever the graph's availability. Any credential may\nask, and one that can read no graph gets an empty list.",
+        "description": "Returns ids and display names only, from the server's current registry:\nno roots, availability, schema or policy. The catalog (`GET /graphs`,\n`graph_list`) holds every graph with its availability and root.",
         "operationId": "discoverGraphs",
         "parameters": [
           {
@@ -1663,7 +1663,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The graphs the caller can read, or every graph for a `graph_list` holder",
+            "description": "The graphs the caller can read on some branch",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {

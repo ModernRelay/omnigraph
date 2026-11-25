@@ -241,34 +241,44 @@ pub(crate) async fn server_graphs_list(
     tag = "management",
     operation_id = "discoverGraphs",
     responses(
-        (status = 200, description = "The graphs the caller can read, or every graph for a `graph_list` holder", body = GraphDiscoveryOutput),
+        (status = 200, description = "The graphs the caller can read on some branch", body = GraphDiscoveryOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Credential not admitted", body = ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// List the graphs the caller can read: each graph on which its `read` of
-/// `main` is allowed, whatever the graph's availability. A `graph_list`
-/// holder sees every registered graph. Any credential may ask, and one that
-/// can read no graph gets an empty list.
+/// List the graphs the caller can read: each graph whose policy lets it
+/// `read` some branch, whatever the graph's availability. Any credential may
+/// ask, and one that can read no graph gets an empty list.
 ///
 /// Returns ids and display names only, from the server's current registry:
-/// no roots, availability, schema or policy. The catalog (`GET /graphs`)
-/// holds availability and roots.
+/// no roots, availability, schema or policy. The catalog (`GET /graphs`,
+/// `graph_list`) holds every graph with its availability and root.
 pub(crate) async fn server_graphs_discovery(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<GraphDiscoveryOutput>, ApiError> {
     let actor = actor.as_ref().map(|Extension(actor)| actor);
     let snapshot = state.routing().registry.snapshot_ref();
-    let visibility = GraphVisibility::new(actor, snapshot.server_policy.as_deref())?;
+    let visibility = GraphVisibility::new(actor, snapshot.server_policy.as_deref());
     let mut ids = std::collections::BTreeSet::new();
     for entry in snapshot.graphs.values() {
-        if visibility.admits(entry.policy().map(Arc::as_ref), entry.binding_refused())? {
+        // A graph whose policy cannot be evaluated fails the whole listing
+        // rather than being left out: a list that silently omits a readable
+        // graph would read as complete (invariant 8, no silent partial result).
+        if visibility.readable(entry.policy().map(Arc::as_ref), entry.binding_refused())? {
             ids.insert(entry.key().graph_id.as_str().to_owned());
         }
     }
+    // One line for the listing, not one policy decision per graph.
+    info!(
+        actor_id = actor.map(|actor| actor.actor_id.as_ref()).unwrap_or(""),
+        client_id = actor.and_then(|actor| actor.client_id()).unwrap_or(""),
+        listed = ids.len(),
+        registered = snapshot.graphs.len(),
+        "graphs listed"
+    );
     Ok(Json(GraphDiscoveryOutput {
         graphs: ids
             .into_iter()
@@ -544,7 +554,11 @@ pub(crate) async fn resolve_graph_handle(
     ingress::admit(&state, request, next).await
 }
 
-/// HTTP and MCP share identity and unavailable-graph disclosure.
+/// HTTP and MCP share identity and graph disclosure: a graph the caller cannot
+/// see ([`GraphVisibility`]) answers exactly as an unknown graph does, whether
+/// it is ready or unavailable. A visible graph that is unavailable answers 503;
+/// a visible ready graph reaches its handler, whose own authorization decides
+/// the action.
 pub(crate) fn resolve_registered_graph(
     state: &AppState,
     key: &GraphKey,
@@ -554,14 +568,20 @@ pub(crate) fn resolve_registered_graph(
         .routing()
         .registry
         .capture_with_policy(&state.operations, key)?;
+    let visibility = GraphVisibility::new(actor, server_policy.as_deref());
     let (policy, invalid_policy, message) = match captured {
         RegistryCapture::Loading(graph) => (
             graph.policy.clone(),
             false,
             "graph is loading; wait for its startup attempt to complete",
         ),
-        RegistryCapture::Ready(handle) => return Ok(handle),
-        RegistryCapture::Gone => return Err(ApiError::not_found("graph not found")),
+        RegistryCapture::Ready(handle) => {
+            if !visibility.sees(handle.policy.as_deref(), false)? {
+                return Err(graph_not_found());
+            }
+            return Ok(handle);
+        }
+        RegistryCapture::Gone => return Err(graph_not_found()),
         RegistryCapture::Transitioning(view) => (
             view.policy.clone(),
             false,
@@ -573,70 +593,76 @@ pub(crate) fn resolve_registered_graph(
             "graph is unavailable; an operator must apply an explicit correction or restart after fixing startup configuration",
         ),
     };
-    // Invalid policy is not equivalent to the operator choosing no policy.
-    // Both startup failures and transitions preserve authorization before
-    // disclosing a known graph's unavailability.
-    if !GraphVisibility::new(actor, server_policy.as_deref())?
-        .admits(policy.as_deref(), invalid_policy)?
-    {
-        return Err(ApiError::not_found("graph not found"));
+    if !visibility.sees(policy.as_deref(), invalid_policy)? {
+        return Err(graph_not_found());
     }
     Err(ApiError::new(ErrorCode::GraphUnavailable, message))
 }
 
-/// Which graphs an actor may know exist. One rule serves every surface that
-/// names a graph: the listing (`GET /graphs/discovery`, MCP `graphs`) and the
-/// choice between 404 and 503 for an unavailable graph. A graph is visible to
-/// an actor that may `read` it, decided by [`authorize`] exactly as a read of
-/// `main` (the branch every graph has) is, or to an actor that holds
-/// `graph_list`, the permit to see the whole catalog. Naming a graph the actor
-/// may read discloses nothing that a read would not.
+/// The one answer for a graph that does not exist and for one the caller
+/// cannot see, so a probe cannot tell them apart.
+fn graph_not_found() -> ApiError {
+    ApiError::not_found("graph not found")
+}
+
+/// Which graphs an actor may know exist.
+///
+/// A graph is *readable* to an actor whose `read` its binding allows on some
+/// branch ([`PolicyEngine::may_read_some_branch`]): the listing
+/// (`GET /graphs/discovery`, MCP `graphs`) names exactly the readable graphs.
+/// Graph routing shows a graph, ready or unavailable, to an actor that holds
+/// some grant on it, or that holds `graph_list`, whose catalog (`GET /graphs`)
+/// already names every graph; to anyone else it is not found. Naming a graph
+/// the actor may use discloses nothing its grant would not.
 pub(crate) struct GraphVisibility<'a> {
     actor: Option<&'a AuthenticatedActor>,
-    catalog: bool,
+    server_policy: Option<&'a PolicyEngine>,
 }
 
 impl<'a> GraphVisibility<'a> {
     pub(crate) fn new(
         actor: Option<&'a AuthenticatedActor>,
-        server_policy: Option<&PolicyEngine>,
-    ) -> std::result::Result<Self, ApiError> {
-        let catalog = matches!(
-            authorize(
-                actor,
-                server_policy,
-                PolicyRequest {
-                    action: PolicyAction::GraphList,
-                    branch: None,
-                    target_branch: None,
-                },
-            )?,
-            Authz::Allowed
-        );
-        Ok(Self { actor, catalog })
+        server_policy: Option<&'a PolicyEngine>,
+    ) -> Self {
+        Self {
+            actor,
+            server_policy,
+        }
     }
 
-    /// Whether a graph bound to `policy` is visible. A policy or configuration
-    /// refused at startup (`binding_refused`) is not the absence of a policy,
-    /// so it grants no read.
-    pub(crate) fn admits(
+    /// Whether the actor may read some branch of a graph bound to `policy`.
+    /// A policy or configuration refused at startup (`binding_refused`) is
+    /// not the absence of a policy, so it grants no read.
+    pub(crate) fn readable(
         &self,
         policy: Option<&PolicyEngine>,
         binding_refused: bool,
     ) -> std::result::Result<bool, ApiError> {
-        if self.catalog {
+        Ok(!binding_refused
+            && graph_grants(self.actor, policy, PolicyEngine::may_read_some_branch)?)
+    }
+
+    /// Whether graph routing shows the graph: the actor holds some grant on
+    /// it ([`PolicyEngine::may_act_on_graph`]: `read`, or any other graph
+    /// action, on some branch), or holds `graph_list`. A writer that may not
+    /// read still reaches its writes; a caller with no grant at all finds no
+    /// graph. The catalog permit is evaluated only for a graph that grants
+    /// the actor nothing.
+    pub(crate) fn sees(
+        &self,
+        policy: Option<&PolicyEngine>,
+        binding_refused: bool,
+    ) -> std::result::Result<bool, ApiError> {
+        if !binding_refused && graph_grants(self.actor, policy, PolicyEngine::may_act_on_graph)? {
             return Ok(true);
-        }
-        if binding_refused {
-            return Ok(false);
         }
         Ok(matches!(
             authorize(
                 self.actor,
-                policy,
+                self.server_policy,
                 PolicyRequest {
-                    action: PolicyAction::Read,
-                    branch: Some("main".into()),
+                    action: PolicyAction::GraphList,
+                    branch: None,
                     target_branch: None,
                 },
             )?,
@@ -702,6 +728,50 @@ pub(crate) fn authorize(
     request: PolicyRequest,
 ) -> std::result::Result<Authz, ApiError> {
     require_canonical_branches([request.branch.as_deref(), request.target_branch.as_deref()])?;
+    decide(actor, policy, request.action, |engine, actor| {
+        let decision = engine
+            .authorize(actor.actor_id.as_ref(), &request)
+            .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
+        log_policy_decision(actor, &request, &decision);
+        Ok(if decision.allowed {
+            Authz::Allowed
+        } else {
+            Authz::Denied(decision.message)
+        })
+    })
+}
+
+/// Whether a graph bound to `policy` grants `actor` what `held` asks of its
+/// policy engine, by the same rules as [`authorize`] (open mode, default deny,
+/// policy-less reads, signed credentials): with no policy installed, the
+/// answer is the one a `read` gets. It logs no decision: it serves graph
+/// visibility, which a listing evaluates once per graph.
+fn graph_grants(
+    actor: Option<&AuthenticatedActor>,
+    policy: Option<&PolicyEngine>,
+    held: fn(&PolicyEngine, &str) -> color_eyre::Result<bool>,
+) -> std::result::Result<bool, ApiError> {
+    let authz = decide(actor, policy, PolicyAction::Read, |engine, actor| {
+        let granted = held(engine, actor.actor_id.as_ref())
+            .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
+        Ok(if granted {
+            Authz::Allowed
+        } else {
+            Authz::Denied(String::new())
+        })
+    })?;
+    Ok(matches!(authz, Authz::Allowed))
+}
+
+/// The decision around the policy: the runtime states with no installed
+/// policy decide here, and an installed one is consulted through `evaluate`
+/// with the authenticated actor.
+fn decide(
+    actor: Option<&AuthenticatedActor>,
+    policy: Option<&PolicyEngine>,
+    action: PolicyAction,
+    evaluate: impl FnOnce(&PolicyEngine, &AuthenticatedActor) -> std::result::Result<Authz, ApiError>,
+) -> std::result::Result<Authz, ApiError> {
     if let Some(actor) = actor {
         if actor.source == AuthSource::SignedData && policy.is_none() {
             return Ok(Authz::Denied(
@@ -736,7 +806,7 @@ pub(crate) fn authorize(
         // operator explicitly authorizes it") holds uniformly; the
         // cluster must be bootstrapped with an explicit cluster-scoped
         // policy bundle.
-        if request.action.resource_kind() == PolicyResourceKind::Server {
+        if action.resource_kind() == PolicyResourceKind::Server {
             return Ok(Authz::Denied(
                 "server-scoped actions require an applied cluster policy permit; \
                  declare the cluster policy when bootstrapping. The management surface \
@@ -745,7 +815,7 @@ pub(crate) fn authorize(
             ));
         }
         if let Some(actor) = actor {
-            if request.action == PolicyAction::Read && actor.reads_without_policy() {
+            if action == PolicyAction::Read && actor.reads_without_policy() {
                 return Ok(Authz::Allowed);
             }
             return Ok(Authz::Denied(
@@ -773,16 +843,7 @@ pub(crate) fn authorize(
     // actor identity directly") and pinned by the regression test
     // `actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers`
     // in `crates/omnigraph-server/tests/server.rs`.
-    let actor_id = actor.actor_id.as_ref();
-    let decision = engine
-        .authorize(actor_id, &request)
-        .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
-    log_policy_decision(actor, &request, &decision);
-    if decision.allowed {
-        Ok(Authz::Allowed)
-    } else {
-        Ok(Authz::Denied(decision.message))
-    }
+    evaluate(engine, actor)
 }
 
 /// Refuse a request's branch names that are not canonical
