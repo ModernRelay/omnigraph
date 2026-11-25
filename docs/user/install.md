@@ -181,6 +181,7 @@ deployment images used for the Azure reference topology.
 
 ```bash
 omnigraph version
+omnigraph-server --version
 omnigraph-server --help
 omnigraph-azure-admission --help
 ```
@@ -195,6 +196,9 @@ internal-schema 17 (serves v14 to v17)
 http-contract 0.14
 commit 00b8cca842f2bf009bebeefcf765672b5ff64b26
 ```
+
+`omnigraph-server --version` prints the same report under its own name, so a
+CLI and a server can be compared before either connects to the other.
 
 `omnigraph version --json` also reports the machine-readable CLI protocols:
 
