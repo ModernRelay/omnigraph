@@ -335,7 +335,7 @@ fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
                 ProtocolError::ReadOverBudget(budget) => ApiError::new(
                     ErrorCode::ResultTooLarge,
                     format!(
-                        "The result exceeds the {budget} read budget, the most every common MCP client takes in whole, so none of it was sent. Narrow the read and run it again: add filters, lower `limit`, return fewer properties, or use a narrower stored query."
+                        "The result exceeds the {budget} read budget, so none of it was sent. Narrow the read and run it again: add filters, lower `limit`, return fewer properties, or use a narrower stored query."
                     ),
                 ),
                 _ => ApiError::internal("could not encode MCP result"),
