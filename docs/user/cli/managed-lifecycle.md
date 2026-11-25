@@ -118,7 +118,7 @@ against the exact revision downloaded:
 
 ```sh
 omnigraph cluster push --target production --config customer-config --expected-revision COMMIT \
-  --message "Add the knowledge graph" --json
+  --message "Add the catalog graph" --json
 # Use data.revision returned by push.
 omnigraph cluster plan --target production --rev NEW_COMMIT --json
 # Use data.preview_id from the ready preview.

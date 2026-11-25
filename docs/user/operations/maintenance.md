@@ -1,6 +1,6 @@
 # Maintenance
 
-OmniGraph provides four direct-storage maintenance commands:
+Omnigraph provides four maintenance commands that work on storage directly:
 
 - `optimize` compacts data and reconciles declared indexes on `main`.
 - `index build` brings one branch's declared indexes up to its rows.
@@ -8,8 +8,10 @@ OmniGraph provides four direct-storage maintenance commands:
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
 
-They do not run through the HTTP server; a cluster server runs optimize as a
-[recorded operation](recorded-operations.md). Address a graph directly, or from a cluster root:
+Only `optimize` also runs through the HTTP server: a cluster server runs it as
+a [recorded operation](recorded-operations.md), and
+`omnigraph optimize --target <server>` submits one. Otherwise, address a graph
+directly, or from a cluster root:
 
 ```bash
 omnigraph optimize --target ./graph.omni
@@ -193,7 +195,7 @@ their parent data file's reachability.
 
 `omnigraph cleanup` is the only cleanup to run against a graph root. Lance's
 own cleanup (`cleanup_old_versions`, and every vacuum or retention tool built
-on it) does not trace OmniGraph's detached table versions. On Lance 13 it can
+on it) does not trace Omnigraph's detached table versions. On Lance 13 it can
 delete files used only by detached versions once those files are older than
 seven days, leaving the manifests present but affected snapshots unreadable.
 This can affect the current graph or a recent commit that inherits an old file;

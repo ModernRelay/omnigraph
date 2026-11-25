@@ -26,7 +26,7 @@ request discovers a graph to select automatically. Inline addresses are local pa
 [S3 cluster roots](../operations/s3-cluster-roots.md) for deployment, recovery and maintenance commands. Register remote
 endpoints; other cloud-direct and catalogue targets are unsupported. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
-`init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
+`init --schema graph.pg` takes the graph URI positionally (`./graph.omni`) or with `--target`.
 
 `--base URI` opens a direct graph target as a graph shallow clone of the graph
 at `URI`: a read falls through to the base where the target has no object of its
