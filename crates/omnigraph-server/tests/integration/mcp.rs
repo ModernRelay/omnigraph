@@ -238,16 +238,20 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         discovered["result"]["structuredContent"],
         json!({"graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"invalid-config","display_name":"invalid-config"},{"graph_id":"invalid-policy","display_name":"invalid-policy"},{"graph_id":"loading","display_name":"loading"}]})
     );
+    // Discovery names each registered graph to an admitted identity, so no
+    // route answers one of them as missing: it is unavailable, whatever the
+    // identity may do on it. Only an unregistered graph is not found.
     for (credential, graph, expected) in [
         (&alice, "blocked", 503),
-        (&bob, "blocked", 404),
+        (&bob, "blocked", 503),
         (&alice, "loading", 503),
-        (&bob, "loading", 404),
+        (&bob, "loading", 503),
         (&alice, "default", 503),
-        (&bob, "default", 404),
-        (&alice, "invalid-policy", 404),
-        (&alice, "invalid-config", 404),
+        (&bob, "default", 503),
+        (&alice, "invalid-policy", 503),
+        (&bob, "invalid-config", 503),
         (&alice, "unknown", 404),
+        (&bob, "unknown", 404),
     ] {
         let result = call(&app, credential, "queries", json!({"graph":graph})).await;
         assert_eq!(result["result"]["isError"], true);

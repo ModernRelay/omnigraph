@@ -87,8 +87,9 @@ a graph is loading, when a nonempty inventory has no ready graph, and while
 draining, and includes `served_graph_count`, `ready_graph_count`,
 `loading_graph_count` and `blocked_graph_count`. Authorized `GET /graphs`
 returns one `graphs` list with each graph's `state`, availability, `action`
-and, when blocked, `failure`; an authorized request to a blocked graph answers
-`503 graph_unavailable`, not `404`. Healthy graphs keep serving unless startup
+and, when blocked, `failure`; a request to a blocked graph answers
+`503 graph_unavailable`, not `404`, to an identity credential and to a caller
+holding any permission on the graph or `graph_list`. Healthy graphs keep serving unless startup
 uses `--require-all-graphs`; an applied empty cluster can be ready, while a
 nonempty cluster with every graph failed refuses startup. A readiness request
 never activates a revision.

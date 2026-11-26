@@ -170,9 +170,10 @@ wants an agent narrower than a person grants the agent's credential less.
 ### Tool catalog
 
 Graph-scoped tools use the HTTP registry and handlers. An unknown graph returns
-404. An unavailable graph returns 503 when the caller can read `main` or holds
-the server's `graph_list` permission, and 404 otherwise. On a ready graph, the
-handler checks the requested action and can return 403.
+404. An unavailable graph returns 503 to an admitted identity and to a caller
+holding any permission on the graph or the server's `graph_list` permission,
+and 404 otherwise. On a ready graph, the handler checks the requested action
+and can return 403.
 
 | Tool | Phase | Handler (HTTP route) | Cedar action | Annotations |
 |---|---|---|---|---|

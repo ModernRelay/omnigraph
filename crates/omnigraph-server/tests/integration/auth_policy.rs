@@ -50,9 +50,29 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
             failure: omnigraph_server::api::GraphStartupFailure::InvalidConfiguration,
         },
     )));
+    let open_entries = entries.clone();
+    // `loading` lets `writer` change unprotected branches and read nothing.
+    entries.push(omnigraph_server::GraphEntry::Loading(Arc::new(
+        omnigraph_server::LoadingGraph {
+            key: omnigraph_server::GraphKey::cluster(
+                omnigraph_server::GraphId::try_from("loading").unwrap(),
+            ),
+            uri: temp.path().join("loading").to_string_lossy().into_owned(),
+            policy: Some(Arc::new(
+                omnigraph_server::PolicyEngine::load_graph_from_source(
+                    "version: 1\nprotected_branches: [main]\ngroups:\n  writers: [writer]\nrules:\n  - id: write\n    allow: {actors: {group: writers}, actions: [change], branch_scope: unprotected}\n",
+                    "loading",
+                )
+                .unwrap(),
+            )),
+        },
+    )));
     let state = AppState::new_multi_entries(
         entries,
-        vec![("breakglass".into(), "static-token".into())],
+        vec![
+            ("breakglass".into(), "static-token".into()),
+            ("writer".into(), "writer-token".into()),
+        ],
         None,
         omnigraph_server::workload::WorkloadController::with_defaults(),
         None,
@@ -63,7 +83,7 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
     // open-mode read defaults, and does not disable healthy public graphs.
     let open = build_app(
         AppState::new_multi_entries(
-            state.routing().registry.entries(),
+            open_entries,
             vec![],
             None,
             omnigraph_server::workload::WorkloadController::with_defaults(),
@@ -86,6 +106,7 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
         catalog,
         json!({"graphs":[
             {"graph_id":"default","display_name":"default"},
+            {"graph_id":"loading","display_name":"loading"},
             {"graph_id":"unavailable","display_name":"unavailable"}
         ]})
     );
@@ -110,6 +131,36 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
             StatusCode::FORBIDDEN,
             "existence is not permission: {path}"
         );
+    }
+    // A graph that is not ready answers 503 to every caller that may know it
+    // exists: an admitted identity, which discovery names it to, and a holder
+    // of any grant on it, here `change` with no read of `main`. A refused
+    // configuration grants nothing, and any other caller gets the unknown
+    // graph's answer, so discovery names no graph that a route calls missing.
+    let (_, missing) =
+        json_response(&app, get_request("/graphs/missing/snapshot", &identity)).await;
+    for (token, path, unavailable) in [
+        (&identity[..], "/graphs/unavailable/snapshot", true),
+        (&identity[..], "/graphs/unavailable/access", true),
+        (&identity[..], "/graphs/loading/snapshot", true),
+        ("writer-token", "/graphs/loading/snapshot", true),
+        ("writer-token", "/graphs/unavailable/snapshot", false),
+        ("static-token", "/graphs/loading/snapshot", false),
+        ("static-token", "/graphs/unavailable/snapshot", false),
+    ] {
+        let caller = if token == identity { "identity" } else { token };
+        let (status, body) = json_response(&app, get_request(path, token)).await;
+        if unavailable {
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{caller} {path}: {body}"
+            );
+            assert_eq!(body["code"], "graph_unavailable", "{caller} {path}");
+        } else {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{caller} {path}: {body}");
+            assert_eq!(body, missing, "{caller} {path}");
+        }
     }
     let (status, _) = json_response(
         &app,

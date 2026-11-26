@@ -580,30 +580,41 @@ impl GraphGrant {
                 Authz::Denied(_) => Err(ApiError::not_found("stored query not found")),
             };
         }
-        if let (Some(actor), Some(policy)) = (actor, policy) {
-            let allowed = policy
-                .may_act_on_graph(actor.actor_id.as_ref())
-                .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
-            return if allowed {
-                Ok(())
-            } else {
-                Err(ApiError::forbidden(
-                    "the graph policy grants no action to this credential",
-                ))
-            };
+        match holds_graph_grant(actor, policy)? {
+            Authz::Allowed => Ok(()),
+            Authz::Denied(message) => Err(ApiError::forbidden(message)),
         }
-        // With no applied policy, read is the only possible static-token
-        // grant. The ordinary decision also handles open and signed-token modes.
-        authorize_request(
-            actor,
-            policy,
-            PolicyRequest {
-                action: PolicyAction::Read,
-                branch: Some("main".into()),
-                target_branch: None,
-            },
-        )
     }
+}
+
+/// Whether `actor` holds any grant on a graph bound to `policy`. One
+/// predicate admits a data request to a ready graph and tells a caller that
+/// a graph is unavailable.
+fn holds_graph_grant(
+    actor: Option<&AuthenticatedActor>,
+    policy: Option<&PolicyEngine>,
+) -> std::result::Result<Authz, ApiError> {
+    if let (Some(actor), Some(policy)) = (actor, policy) {
+        let allowed = policy
+            .may_act_on_graph(actor.actor_id.as_ref())
+            .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
+        return Ok(if allowed {
+            Authz::Allowed
+        } else {
+            Authz::Denied("the graph policy grants no action to this credential".to_string())
+        });
+    }
+    // With no applied policy, read is the only possible static-token
+    // grant. The ordinary decision also handles open and signed-token modes.
+    authorize(
+        actor,
+        policy,
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some("main".into()),
+            target_branch: None,
+        },
+    )
 }
 
 /// A data request must have a graph grant before it can own the serving
@@ -668,23 +679,14 @@ fn ready_graph(
             "graph is unavailable; an operator must apply an explicit correction or restart after fixing startup configuration",
         ),
     };
-    // Invalid policy is not equivalent to the operator choosing no policy.
-    // Both startup failures and transitions preserve authorization before
-    // disclosing a known graph's unavailability.
-    let readable = !invalid_policy
-        && matches!(
-            authorize(
-                actor,
-                policy,
-                PolicyRequest {
-                    action: PolicyAction::Read,
-                    branch: Some("main".into()),
-                    target_branch: None,
-                }
-            )?,
-            Authz::Allowed
-        );
-    let listable = readable
+    // A caller that may know the graph exists is told it is unavailable: an
+    // admitted identity, which discovery names every registered graph to, a
+    // holder of any grant on the graph, which a ready graph would admit, and
+    // a holder of `graph_list`. Any other caller gets the unknown graph's
+    // answer. Invalid policy is not equivalent to the operator choosing no
+    // policy, so it grants nothing.
+    let known = actor.is_some_and(AuthenticatedActor::is_identity)
+        || (!invalid_policy && matches!(holds_graph_grant(actor, policy)?, Authz::Allowed))
         || matches!(
             authorize(
                 actor,
@@ -697,7 +699,7 @@ fn ready_graph(
             )?,
             Authz::Allowed
         );
-    if !listable {
+    if !known {
         return Err(ApiError::not_found("graph not found"));
     }
     Err(ApiError::new(ErrorCode::GraphUnavailable, message))

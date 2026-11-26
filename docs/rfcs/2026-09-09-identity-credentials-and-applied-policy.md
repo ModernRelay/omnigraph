@@ -255,7 +255,11 @@ of a particular deployment remain separate from the accepted library contract.
 - 2026-11-26: Restore the identity discovery contract that preceded 0.17.0.
   An admitted identity can learn the IDs and display names of every registered
   graph. Cedar authorizes each graph operation when the caller requests it.
-  This supersedes the 2026-11-24 decision below.
+  This supersedes the 2026-11-24 decision below. The contradiction that
+  decision removed stays removed another way: an unavailable graph answers 503
+  to every admitted identity and to a caller holding any permission on it, not
+  only to one that can read `main`, so discovery names no graph that routing
+  answers as not found.
 
 - 2026-11-24: Discovery lists the graphs the caller may use. The first rule,
   every graph for every identity with no policy check, contradicted graph

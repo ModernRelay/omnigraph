@@ -74,9 +74,9 @@ partial convergence and shutdown keep it false; a restart must verify its bindin
 again. Successful apply alone is not activation, which never rewrites the durable
 achieved result or receipt.
 
-Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to callers authorized to
-read `main` or list the management inventory; other callers cannot use this response to discover
-them. Unknown graphs return 404. A 503 does not authorize replaying a write.
+Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to an admitted identity
+and to a caller holding any permission on the graph or `graph_list`. Any other caller gets 404, as for
+an unknown graph, so it cannot use the response to discover them. A 503 does not authorize replaying a write.
 `omnigraph graphs list --target NAME` displays graph ID, state and URI for a
 registered server or managed target. `--json` preserves the full inventory
 fields. Minimal discovery remains IDs/names only.

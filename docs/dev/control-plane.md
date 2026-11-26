@@ -568,9 +568,12 @@ list containing runtime availability, sanitized failure and action. Neither inve
 entries from the boot witness. Discovery still discloses no availability.
 
 HTTP and MCP graph resolution atomically capture a serving view with its graph-epoch lease. A loading, blocked or
-transitioning graph yields 503 only after graph `read` authorization on `main` or
-management `graph_list` authorization; otherwise it remains undisclosed as 404.
-An invalid graph policy or configuration cannot authorize the graph-read fallback.
+transitioning graph yields 503 to a caller that may know the graph exists: an
+admitted identity, which discovery names it to, a holder of some grant on the
+graph (`PolicyEngine::may_act_on_graph`, the predicate that admits a data request
+to a ready graph), or a holder of management `graph_list`. Any other caller gets
+the unknown graph's 404. A graph policy or configuration refused at startup
+grants nothing, so it discloses the graph only to an identity or a `graph_list` holder.
 Availability booleans describe the runtime, not a policy grant; route
 authorization still applies to ready graphs.
 
