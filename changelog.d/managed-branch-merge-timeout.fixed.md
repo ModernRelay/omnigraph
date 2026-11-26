@@ -1,1 +1,1 @@
-- A managed branch merge, by `branch merge` or the GQ statement and dry run included, now waits 300 seconds instead of timing out at 30 with unknown effects.
+- A managed branch merge or its dry run, by `branch merge` or the GQ statement, gets 300 seconds instead of 30, so a slow merge that published is no longer reported with unknown effects.
