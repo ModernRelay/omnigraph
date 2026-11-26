@@ -41,7 +41,9 @@ accept local paths and `file://` URIs and, with the server stopped, an inline
 `s3://` cluster root for `cluster plan`, `apply`, `status`, `force-unlock` and
 `upgrade-ledger` and for direct maintenance with `--graph` (region from
 `AWS_REGION` or `AWS_DEFAULT_REGION`; see
-[S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)).
+[S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)); an
+inline `s3://` graph, without `--graph`, serves the direct reads and `init`,
+`schema apply` and `load` for a graph nobody serves.
 Every direct writer on the root (`cluster apply`, maintenance) takes the
 cluster's admission lock. Maintenance keeps it after it finishes; `cluster
 apply` releases it after convergence and settlement on local storage and S3.
@@ -52,9 +54,11 @@ leaves the lock unchanged. `cluster plan` and
 current holder's `lock_id`. Before the next writer or the server starts,
 establish that the holder has stopped and its I/O has settled, then release
 that exact ID with `cluster force-unlock`. Never release a lock you only
-observed. Every other command and any `az://` address refuses an inline
-cloud target: select a registered server or managed target, whose host holds
-the cloud storage settings and credentials.
+observed. Every other command (`mutate`, `branch create|delete|merge`, `commit
+publish|drop`, `blob put|clear`, `changes`, `cluster observe`, `policy`) and
+any `az://` address refuses an inline cloud target: select a registered server
+or managed target, whose host holds the cloud storage settings and
+credentials.
 
 ## Direct bootstrap
 

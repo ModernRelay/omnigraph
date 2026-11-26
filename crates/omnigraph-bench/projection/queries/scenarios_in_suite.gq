@@ -1,0 +1,15 @@
+query scenarios_in_suite($suite: String) {
+    match {
+        $u: Suite { name: $suite }
+        $u groups $s
+        $s executes $w
+        $s uses $f
+    }
+    return {
+        $s.name as scenario
+        $s.measured_step as measured_step
+        $w.path as workload
+        $f.kind as fixture_kind
+    }
+    order { scenario asc }
+}
