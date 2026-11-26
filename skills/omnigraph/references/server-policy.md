@@ -42,7 +42,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 |---|---|
 | `GET /healthz`, `/openapi.json` | Process metadata |
 | `GET /readyz` | Replica readiness, applied revision and served/ready/loading/blocked counts |
-| `GET /graphs` | The catalog: every graph with its root and availability (`graph_list`) |
+| `GET /graphs` | List graphs with their availability (`graph_list`) |
 | `POST /cluster/plan`, `POST /cluster/deployments`, `GET /cluster/deployments[/{id}]` | Plan, submit and inspect a `cluster apply --target` deployment (`config_manage`) |
 | `/graphs/{graph_id}/query`, `/mutate` | Inline GQ reads and writes |
 | `/graphs/{graph_id}/mutate/if-graph-commit` | Conditional inline mutation (header `Omnigraph-If-Graph-Commit`) |
@@ -53,7 +53,7 @@ termination grace. Check rollout readiness with `GET /readyz`, not `/healthz`.
 | `/graphs/{graph_id}/snapshot`, `/commits` | Snapshot and paged history; `GET /commits?listing=unpublished\|unattached`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}` |
 | `/graphs/{graph_id}/commits/{commit}/changes`, `GET /graphs/{graph_id}/diff` | One first-parent commit diff; net change between two branches or commit ids |
 | `GET /graphs/{graph_id}/changes`, `POST /graphs/{graph_id}/changes/baseline` | Poll a feed or capture a baseline |
-| `GET /graphs/discovery` | `visibility: granted`, the caller's `actor_id` and the registered graphs it holds any permission on, for any credential; the identity check. A registered graph it does not list answers `graph not found`; `og_catalog` keeps its own authorization |
+| `GET /graphs/discovery` | Graph ids and names for any valid identity credential |
 | `/mcp` | MCP endpoint; see [MCP, OIDC sign-in and logs](#mcp-oidc-sign-in-and-logs) |
 | `/graphs/{graph_id}/schema` | Read the accepted schema |
 | `/graphs/{graph_id}/export` | Stream a branch snapshot |
@@ -120,8 +120,9 @@ tokens select an immutable principal actor. The server accepts only
 version-2 identity credentials, which carry no permissions; version-1
 restricted credentials are not accepted.
 That actor (`principal:<immutable-id>`) must itself be permitted by the applied
-Cedar policy, or every graph request is denied and `GET /graphs/discovery`
-lists no graph. Trust changes need a restart.
+Cedar policy, or every graph request is denied; an identity credential can
+still list graph ids through `GET /graphs/discovery`. Trust changes need a
+restart.
 Control-plane login does not grant data access. See
 [managed data credentials](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/managed-data.md).
 
@@ -171,13 +172,7 @@ Graph-scoped actions are:
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved; no current public operation |
 
-`graph_list` is cluster-scoped and grants the catalog, `GET /graphs`: every
-graph, including graphs the holder cannot read; a holder also lists every
-graph. Listing the graphs a caller holds any permission on
-(`GET /graphs/discovery`, `graphs list`, MCP `graphs`) needs no permit, and a
-graph is listed exactly when its routes do not answer 404. A hidden graph's
-404 is the unknown graph's, disposition included: after a policy change, list
-again rather than retrying. `config_manage` is
+`graph_list` is cluster-scoped and controls `GET /graphs`. `config_manage` is
 cluster-scoped too and authorizes `cluster apply --target`; put it in a rule
 of its own. A stored read needs
 `invoke_query` plus `read`; a stored mutation needs `invoke_query` plus

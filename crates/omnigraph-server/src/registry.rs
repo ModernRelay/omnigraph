@@ -71,17 +71,6 @@ pub enum GraphEntry {
     Blocked(Arc<BlockedGraph>),
 }
 
-impl BlockedGraph {
-    /// Startup refused the graph's policy or configuration. That is not the
-    /// absence of a policy, so it authorizes nothing.
-    pub(crate) fn binding_refused(&self) -> bool {
-        matches!(
-            self.failure,
-            StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
-        )
-    }
-}
-
 impl GraphEntry {
     /// Startup input; the view grants no request admission on its own.
     pub fn ready(handle: Arc<GraphHandle>) -> Self {
@@ -110,11 +99,6 @@ impl GraphEntry {
             Self::Ready(view) | Self::Transitioning(view) => view.policy.as_ref(),
             Self::Blocked(graph) => graph.policy.as_ref(),
         }
-    }
-
-    /// See [`BlockedGraph::binding_refused`].
-    pub(crate) fn binding_refused(&self) -> bool {
-        matches!(self, Self::Blocked(graph) if graph.binding_refused())
     }
 
     fn requires_policy_auth(&self) -> bool {
@@ -180,16 +164,14 @@ pub enum RegistryLookup {
     Gone,
 }
 
-/// Coherent request capture for a caller: the graph's state, judged visible
-/// on the same snapshot before any request ownership is taken.
+/// Coherent request capture, including the effective bindings required to
+/// authorize disclosure of an unavailable graph.
 pub(crate) enum RegistryCapture {
-    Loading,
+    Loading(Arc<LoadingGraph>),
     Ready(GraphRequest),
-    Transitioning,
-    Blocked,
+    Transitioning(Arc<ServingView>),
+    Blocked(Arc<BlockedGraph>),
     Gone,
-    /// Registered, but not visible to the caller: answered as `Gone`.
-    Hidden,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -217,14 +199,6 @@ struct TransitionCandidate {
     closed: bool,
     completion_owned: bool,
 }
-
-/// The most visibility judgements one capture makes, the first included: a
-/// bound on the synchronous policy work a single graph request can cost. A
-/// registry that changes under every one of them (sustained activation or
-/// transition churn) makes the capture fail closed, so a graph the caller may
-/// see can answer `graph not found` until the churn stops. A hidden probe can
-/// cost up to this many judgements where a missing graph costs none.
-pub(crate) const CAPTURE_VISIBILITY_ATTEMPTS: usize = 3;
 
 pub struct GraphRegistry {
     state: Mutex<RegistryState>,
@@ -345,56 +319,28 @@ impl GraphRegistry {
         operations: &OperationRuntime,
         key: &GraphKey,
     ) -> Result<RegistryCapture, ApiError> {
-        self.capture_visible(operations, key, |_, _| Ok(true))
+        self.capture_with_policy(operations, key)
+            .map(|(capture, _)| capture)
     }
 
-    /// Capture `key` for a caller that `sees` it. Visibility is policy
-    /// evaluation, so it runs on a cloned snapshot with neither the process
-    /// admission lock nor the registry lock held. The capture then takes both
-    /// in their usual order, and only after checking that the same snapshot is
-    /// still current does it resolve absence, the judgement, or an error the
-    /// judgement raised. So a graph the caller does not see answers exactly as
-    /// an absent one in every admission state: refused alike while admission
-    /// is closed, `Gone` and `Hidden` alike while it is open. A swap in between
-    /// (activation, transition, startup completion) is judged again; the
-    /// whole capture makes at most [`CAPTURE_VISIBILITY_ATTEMPTS`] judgements,
-    /// then fails closed as `Hidden`. A hidden graph takes no request
-    /// ownership, so it counts toward no drain.
-    pub(crate) fn capture_visible(
+    pub(crate) fn capture_with_policy(
         &self,
         operations: &OperationRuntime,
         key: &GraphKey,
-        sees: impl Fn(&GraphEntry, Option<&PolicyEngine>) -> Result<bool, ApiError>,
-    ) -> Result<RegistryCapture, ApiError> {
-        for _ in 0..CAPTURE_VISIBILITY_ATTEMPTS {
-            let judged = self.snapshot_ref();
-            let judgement = judged
-                .graphs
-                .get(key)
-                .map(|entry| sees(entry, judged.server_policy.as_deref()));
-            let captured = operations.while_open(|| {
-                let state = locked(&self.state);
-                if !Arc::ptr_eq(&state.snapshot, &judged) {
-                    return Ok(None);
+    ) -> Result<(RegistryCapture, Option<Arc<PolicyEngine>>), ApiError> {
+        operations.while_open(|| {
+            let state = locked(&self.state);
+            let capture = match state.snapshot.graphs.get(key) {
+                Some(GraphEntry::Loading(graph)) => RegistryCapture::Loading(Arc::clone(graph)),
+                Some(GraphEntry::Ready(view)) => RegistryCapture::Ready(view.capture()?),
+                Some(GraphEntry::Transitioning(view)) => {
+                    RegistryCapture::Transitioning(Arc::clone(view))
                 }
-                let (Some(entry), Some(judgement)) = (judged.graphs.get(key), judgement) else {
-                    return Ok(Some(RegistryCapture::Gone));
-                };
-                if !judgement? {
-                    return Ok(Some(RegistryCapture::Hidden));
-                }
-                Ok(Some(match entry {
-                    GraphEntry::Loading(_) => RegistryCapture::Loading,
-                    GraphEntry::Ready(view) => RegistryCapture::Ready(view.capture()?),
-                    GraphEntry::Transitioning(_) => RegistryCapture::Transitioning,
-                    GraphEntry::Blocked(_) => RegistryCapture::Blocked,
-                }))
-            })?;
-            if let Some(captured) = captured {
-                return Ok(captured);
-            }
-        }
-        Ok(RegistryCapture::Hidden)
+                Some(GraphEntry::Blocked(graph)) => RegistryCapture::Blocked(Arc::clone(graph)),
+                None => RegistryCapture::Gone,
+            };
+            Ok((capture, state.snapshot.server_policy.clone()))
+        })
     }
 
     /// Install one startup result, or the complete strict-startup batch. The
@@ -1195,7 +1141,7 @@ mod tests {
             pending_registry
                 .capture(&operations, &handles[0].key)
                 .unwrap(),
-            RegistryCapture::Loading
+            RegistryCapture::Loading(_)
         ));
         assert!(pending_registry.list().is_empty());
         let foreign = Arc::new(LoadingGraph {
@@ -1465,7 +1411,7 @@ mod tests {
         let transition = prepared.close().unwrap();
         assert!(matches!(
             registry.capture(&operations, &alpha.key).unwrap(),
-            RegistryCapture::Transitioning
+            RegistryCapture::Transitioning(_)
         ));
         assert!(matches!(
             registry.get(&alpha.key),
@@ -1561,7 +1507,7 @@ mod tests {
         for key in [&alpha.key, &beta.key] {
             assert!(matches!(
                 registry.capture(&operations, key).unwrap(),
-                RegistryCapture::Transitioning
+                RegistryCapture::Transitioning(_)
             ));
         }
         let peer_epoch = captured(&registry, &operations, &peer.key).epoch();
@@ -2102,119 +2048,6 @@ mod tests {
         }
     }
 
-    /// A graph its caller may not see is refused before any request ownership
-    /// is taken: it counts toward no drain, as a missing graph does not, and a
-    /// transition never waits for it.
-    #[tokio::test]
-    async fn a_hidden_ready_graph_takes_no_request_ownership() {
-        let dir = TempDir::new().unwrap();
-        let handle = build_handle("alpha", dir.path()).await;
-        let registry = GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap();
-        let operations = OperationRuntime::new();
-        let RegistryLookup::Ready(view) = registry.get(&handle.key) else {
-            panic!("alpha is ready");
-        };
-        let hidden = registry
-            .capture_visible(&operations, &handle.key, |_, _| Ok(false))
-            .unwrap();
-        assert!(matches!(hidden, RegistryCapture::Hidden));
-        assert_eq!(view.request_count(), 0);
-        let seen = registry
-            .capture_visible(&operations, &handle.key, |_, _| Ok(true))
-            .unwrap();
-        assert!(matches!(seen, RegistryCapture::Ready(_)));
-        assert_eq!(view.request_count(), 1);
-        drop(seen);
-        assert_eq!(view.request_count(), 0);
-    }
-
-    /// Visibility is judged with neither the process admission lock nor the
-    /// registry lock held: a swap that takes both, in their usual order, lands
-    /// while a probe is being judged. The swap flips the judgement (it installs
-    /// a server policy, which the probe reads as "not visible"), so the first
-    /// judgement is stale and the capture judges again on the new snapshot,
-    /// refusing with no request owner. The wait is bounded: a judgement made
-    /// under either lock fails the test after five seconds instead of hanging.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_swap_under_both_locks_lands_while_visibility_is_judged() {
-        let dir = TempDir::new().unwrap();
-        let handle = build_handle("alpha", dir.path()).await;
-        let registry = Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap());
-        let operations = OperationRuntime::new();
-        let RegistryLookup::Ready(view) = registry.get(&handle.key) else {
-            panic!("alpha is ready");
-        };
-        let policy = Arc::new(
-            PolicyEngine::load_server_from_source(
-                "version: 1\ngroups:\n  admins: [admin]\nrules:\n  - id: list\n    allow:\n      actors: {group: admins}\n      actions: [graph_list]\n",
-            )
-            .unwrap(),
-        );
-        let (judging, judging_started) = std::sync::mpsc::channel::<()>();
-        let (swapped, swap_landed) = std::sync::mpsc::channel::<()>();
-        let swapper = {
-            let registry = Arc::clone(&registry);
-            let operations = operations.clone();
-            std::thread::spawn(move || {
-                judging_started
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .expect("a judgement started");
-                operations
-                    .while_open(|| -> Result<(), ApiError> {
-                        let mut state = locked(&registry.state);
-                        let mut next = state.snapshot.with_graphs(state.snapshot.graphs.clone());
-                        next.server_policy = Some(policy);
-                        state.snapshot = Arc::new(next);
-                        Ok(())
-                    })
-                    .unwrap();
-                swapped.send(()).unwrap();
-            })
-        };
-        let judgements = std::cell::Cell::new(0);
-        let captured = registry
-            .capture_visible(&operations, &handle.key, |_, server_policy| {
-                judgements.set(judgements.get() + 1);
-                if judgements.get() == 1 {
-                    judging.send(()).unwrap();
-                    swap_landed
-                        .recv_timeout(std::time::Duration::from_secs(5))
-                        .expect("the swap lands while visibility is judged: no lock is held");
-                }
-                Ok(server_policy.is_none())
-            })
-            .unwrap();
-        swapper.join().unwrap();
-        assert!(matches!(captured, RegistryCapture::Hidden));
-        assert_eq!(judgements.get(), 2, "the stale judgement was judged again");
-        assert_eq!(view.request_count(), 0);
-    }
-
-    /// A registry that changes under every judgement makes the capture fail
-    /// closed after [`CAPTURE_VISIBILITY_ATTEMPTS`] judgements, the first
-    /// included, without taking request ownership.
-    #[tokio::test]
-    async fn sustained_registry_churn_fails_closed_after_the_judgement_cap() {
-        let dir = TempDir::new().unwrap();
-        let handle = build_handle("alpha", dir.path()).await;
-        let registry = GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap();
-        let operations = OperationRuntime::new();
-        let RegistryLookup::Ready(view) = registry.get(&handle.key) else {
-            panic!("alpha is ready");
-        };
-        let judgements = std::cell::Cell::new(0);
-        let churned = registry
-            .capture_visible(&operations, &handle.key, |_, _| {
-                judgements.set(judgements.get() + 1);
-                registry.initialize_server_policy(None);
-                Ok(true)
-            })
-            .unwrap();
-        assert!(matches!(churned, RegistryCapture::Hidden));
-        assert_eq!(judgements.get(), CAPTURE_VISIBILITY_ATTEMPTS);
-        assert_eq!(view.request_count(), 0);
-    }
-
     #[tokio::test]
     async fn prepared_drop_releases_scheduling_capacity_and_closed_drop_stays_closed() {
         let dir = TempDir::new().unwrap();
@@ -2236,7 +2069,7 @@ mod tests {
         drop(transition);
         assert!(matches!(
             registry.capture(&operations, &handle.key).unwrap(),
-            RegistryCapture::Transitioning
+            RegistryCapture::Transitioning(_)
         ));
         assert!(matches!(
             registry.prepare_same_view(&operations, &handle.key, transition_deadline()),
@@ -2328,7 +2161,7 @@ mod tests {
                 drop(request);
                 waiting.await.unwrap();
             }
-            RegistryCapture::Transitioning => transition.wait_requests().await.unwrap(),
+            RegistryCapture::Transitioning(_) => transition.wait_requests().await.unwrap(),
             _ => panic!("close/capture changed graph identity or startup state"),
         }
         transition.resume_same_view().unwrap();

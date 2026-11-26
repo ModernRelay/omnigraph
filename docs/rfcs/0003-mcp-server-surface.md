@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-06-01
-updated: 2026-11-24
+updated: 2026-11-26
 discussion: https://github.com/ModernRelay/omnigraph/issues/991
 supersedes: []
 superseded_by: []
@@ -169,13 +169,14 @@ wants an agent narrower than a person grants the agent's credential less.
 
 ### Tool catalog
 
-Every graph-scoped tool resolves its graph through the registry exactly as an HTTP
-request does (unknown and denied graphs are 404, an authorized unavailable graph is
-503) and then calls the named handler.
+Graph-scoped tools use the HTTP registry and handlers. An unknown graph returns
+404. An unavailable graph returns 503 when the caller can read `main` or holds
+the server's `graph_list` permission, and 404 otherwise. On a ready graph, the
+handler checks the requested action and can return 403.
 
 | Tool | Phase | Handler (HTTP route) | Cedar action | Annotations |
 |---|---|---|---|---|
-| `graphs` | shipped | `server_graphs_discovery` (`GET /graphs/discovery`): the caller's actor and the graphs it holds any permission on | none | read-only |
+| `graphs` | shipped | `server_graphs_discovery` (`GET /graphs/discovery`) for an identity credential; otherwise `server_graphs_list` (`GET /graphs`) narrowed to ids and names | identity, or `graph_list` | read-only |
 | `queries` | shipped | `server_list_queries` (`GET /graphs/{id}/queries`) | `read` | read-only |
 | `query` | shipped; source in 1 | with `name` only, `server_invoke_query` (`POST /graphs/{id}/queries/{name}`), `expect_mutation: false`; with `query`, `server_query` (`POST /graphs/{id}/query`) | `invoke_query`, then `read`; source: `read` | read-only |
 | `schema` | 1 | `server_schema_get` (`GET /graphs/{id}/schema`) | `read` | read-only |
@@ -206,14 +207,14 @@ takes the route's `listing`.
 
 Names follow the shipped tools. The package's `schema_get` is `schema`; its ad-hoc
 `query` is the shipped `query` given source, as `mutate` takes source or a
-stored name; its `graphs_list` is the shipped `graphs`. `graphs` names the
-caller's actor and lists the graphs it holds any permission on, for every
-credential, as `GET /graphs/discovery` does, and every graph tool answers any
-other graph as not found. Until 2026-11-24 discovery admitted only
-identity credentials and listed every graph, and `graphs` asked `GET /graphs`
-under `graph_list` for any other credential, so a default static-token server
-answered 403; the identity RFC's decision log records why one rule replaced
-both. `query` with source also serves what
+stored name; its `graphs_list` is the shipped `graphs`. Discovery admits only identity
+credentials (OIDC or signed identity tokens), so for any other credential, such
+as a static token, `graphs` calls `GET /graphs` under `graph_list`, as the
+package did, and returns only ids and names. `graph_list` is server-scoped, and
+without an applied cluster policy every server-scoped action is denied, so on a
+default static-token server `graphs` returns 403. The tool description and the
+server instructions say so, and tell a model to ask for a `graph_list` permit or
+to use a graph id the user supplies. `query` with source also serves what
 `POST /query` serves: `branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`
 and `explain query …`. `mutate` serves the branch write statements `POST /mutate`
 serves. Stored mutations stay unavailable through `query`, which is read-only.

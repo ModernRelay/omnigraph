@@ -1134,8 +1134,7 @@ pub async fn http_change_decision(
     .await;
     match status {
         StatusCode::OK => ParityDecision::Allow,
-        // A caller granted nothing on the graph is told it does not exist.
-        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => ParityDecision::Deny,
+        StatusCode::FORBIDDEN => ParityDecision::Deny,
         other => panic!("unexpected HTTP status for change: {other}"),
     }
 }
@@ -1192,8 +1191,7 @@ pub async fn http_merge_decision(
     .await;
     match status {
         StatusCode::OK => ParityDecision::Allow,
-        // A caller granted nothing on the graph is told it does not exist.
-        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => ParityDecision::Deny,
+        StatusCode::FORBIDDEN => ParityDecision::Deny,
         other => panic!("unexpected HTTP status for branch_merge: {other}"),
     }
 }
