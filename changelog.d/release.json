@@ -1,6 +1,6 @@
 {
-  "version": "v0.17.0",
-  "base": "refs/tags/v0.16.0",
+  "version": "v0.17.1",
+  "base": "refs/tags/v0.17.0",
   "legacy": null,
   "format": 2
 }
