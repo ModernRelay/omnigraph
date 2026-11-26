@@ -1733,11 +1733,12 @@ const DOCUMENTS: &str = r#"{"type":"Document","data":{"title":"readme","content"
 {"type":"Document","data":{"title":"empty"}}"#;
 
 /// `default` may do everything the tools below need, `reader` may read and
-/// invoke stored queries but change nothing, `stranger` may do nothing.
+/// invoke stored queries, `invoker` may only invoke, and `stranger` has no graph grants.
 const OPERATIONS_POLICY: &str = r#"version: 1
 groups:
   writers: ["default"]
   readers: ["reader"]
+  invokers: ["reader", "invoker"]
 rules:
   - id: writers-data
     allow:
@@ -1758,9 +1759,9 @@ rules:
       actors: {group: readers}
       actions: [read]
       branch_scope: any
-  - id: readers-invoke
+  - id: invoke
     allow:
-      actors: {group: readers}
+      actors: {group: invokers}
       actions: [invoke_query]
 "#;
 
@@ -1795,6 +1796,7 @@ async fn operations_app(settings: omnigraph_server::McpSettings) -> (tempfile::T
     let tokens = [
         ("default", "secret"),
         ("reader", "reader-secret"),
+        ("invoker", "invoker-secret"),
         ("stranger", "stranger-secret"),
     ];
     let state = AppState::open_single_with_queries(
@@ -2179,48 +2181,57 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
     let drop_uri = format!("/graphs/default/commits/{pending}");
     let get = |uri: &str, token: &str| http_request(Method::GET, uri, token, &[], None);
     for (token, tool, arguments, request, expected) in [
+        // Graph admission refuses a caller with no graph action. A caller who
+        // can invoke queries reaches the individual routes and their read checks.
         (
             "stranger-secret",
             "diff",
             json!({"graph":"default","from":"main","to":"main"}),
             get("/graphs/default/diff?from=main&to=main", "stranger-secret"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "invoker-secret",
+            "diff",
+            json!({"graph":"default","from":"main","to":"main"}),
+            get("/graphs/default/diff?from=main&to=main", "invoker-secret"),
             StatusCode::NOT_FOUND,
         ),
         (
-            "stranger-secret",
+            "invoker-secret",
             "branches_diff",
             json!({"graph":"default","source":"main"}),
             get(
                 "/graphs/default/branches/diff?source=main",
-                "stranger-secret",
+                "invoker-secret",
             ),
             StatusCode::FORBIDDEN,
         ),
         (
-            "stranger-secret",
+            "invoker-secret",
             "branches_merge_base",
             json!({"graph":"default","source":"main"}),
             get(
                 "/graphs/default/branches/merge-base?source=main",
-                "stranger-secret",
+                "invoker-secret",
             ),
             StatusCode::FORBIDDEN,
         ),
         (
-            "stranger-secret",
+            "invoker-secret",
             "commits_list",
             json!({"graph":"default","listing":"unpublished"}),
             get(
                 "/graphs/default/commits?listing=unpublished",
-                "stranger-secret",
+                "invoker-secret",
             ),
             StatusCode::FORBIDDEN,
         ),
         (
-            "stranger-secret",
+            "invoker-secret",
             "blobs_stat",
             blob_cell("notes"),
-            get(&blob_uri("notes"), "stranger-secret"),
+            get(&blob_uri("notes"), "invoker-secret"),
             StatusCode::FORBIDDEN,
         ),
         (
