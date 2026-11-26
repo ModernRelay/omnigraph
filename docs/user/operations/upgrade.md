@@ -7,12 +7,12 @@ graph at v8 or v9 (release 0.11.x) or at v13 is converted in place by that offli
 format, and every cluster-managed graph below v14, is refused and takes the
 [export/import rebuild](#rebuild) with the binary that wrote the graph.
 
-For an upgrade from 0.16.x, check your graph format, graph listings and
-MCP integrations against the [0.17.0 upgrade actions](../../releases/v0.17.0.md#upgrade-actions).
-From 0.15.0, also check your access policies and maintenance scripts against
-the [0.16.0 upgrade actions](../../releases/v0.16.0-overview.md#upgrade-actions).
-Start with the [0.13 → 0.14 checklist](upgrade-0.14.md) for fleet,
-CLI configuration, HTTP/MCP, and client compatibility changes.
+When upgrading to 0.17.1, upgrade the CLI and server together. Check your [S3 root](#s3-roots-that-name-two-keys).
+Replace 0.17.0’s `graphs list --catalog` with `graphs list`. An admitted identity can use [`graphs list --discovery`](../cli/managed-data.md#discover-graphs) for names only.
+
+- From 0.16.x, also check your graph format and MCP integrations against the [0.17.0 upgrade actions](../../releases/v0.17.0.md#upgrade-actions).
+- From 0.15.0, also check access policies and maintenance scripts against the [0.16.0 upgrade actions](../../releases/v0.16.0-overview.md#upgrade-actions).
+- From 0.13, start with the [0.13 → 0.14 checklist](upgrade-0.14.md) for fleet, CLI configuration, HTTP/MCP, and client compatibility changes.
 
 ## Storage upgrade
 
@@ -193,11 +193,10 @@ with those binaries. It is not a downgrade path from v0.14.
 
 ## S3 roots that name two keys
 
-If this release refuses an `s3://` root and the refusal names two keys,
-Omnigraph's and Lance's, an earlier release split the root's objects between
-them: export each graph with that release and [rebuild](#rebuild) it under a
-plain prefix. If it names another spelling, the objects are whole: finish any
-outstanding deployment with the earlier release, then use that spelling.
+If the refusal names two keys for an `s3://` root, an earlier release split the root’s objects between them.
+Export each graph with that release and [rebuild](#rebuild) it under a plain prefix.
+If the refusal names another spelling, finish any outstanding deployment with the earlier release, then use that spelling.
+If it gives no replacement, choose a plain prefix.
 
 ## What an export/import rebuild preserves
 
