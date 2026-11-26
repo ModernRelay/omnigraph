@@ -73,6 +73,7 @@ jobs:
           filter=""
           owners=()
           for test_name in \
+            client::tests::managed_branch_merge_outlives_the_thirty_second_deadline_issue_1457 \
             client::tests::managed_mutations_use_thirty_second_deadline_without_retrying \
             client::tests::managed_reads_use_thirty_second_deadline_without_retrying \
             client::tests::graph_http_discovery_has_its_own_five_second_bound \
