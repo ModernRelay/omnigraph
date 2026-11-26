@@ -185,8 +185,8 @@ may do, narrow the policy for the agent's credential.
 
 The removed `--mcp-allow-adhoc` and `--mcp-allow-writes` flags make
 `omnigraph-server` refuse to start; leftover `OMNIGRAPH_MCP_ALLOW_*` variables
-are ignored, so such a deployment lists every tool. A token with no applied
-policy still only reads: `query` answers, and a write tool returns 403.
+are ignored, so such a deployment lists every tool. Without an applied policy,
+reads and writes are denied by default. `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` permits static-token reads.
 
 ## Tools
 
@@ -195,7 +195,7 @@ policy still only reads: `query` answers, and a write tool returns 403.
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
 | `health` | none | `GET /healthz` | none |
-| `graphs` | none | `GET /graphs/discovery`: the caller's actor and the graphs it holds any permission on | none |
+| `graphs` | none | `GET /graphs/discovery` for an identity credential; otherwise `GET /graphs`, narrowed to ids and names | identity, or `graph_list` |
 | `schema` | `graph` | `GET /graphs/{graph_id}/schema` | `read` |
 | `queries` | `graph` | `GET /graphs/{graph_id}/queries` | `read` |
 | `query` | `graph`, `query` (source) or `name` (stored), optional `params`, `branch`, `snapshot` | source: `POST /graphs/{graph_id}/query`; name: `POST /graphs/{graph_id}/queries/{query_name}` as a read | source: `read`, and `change` for `explain load csv`; name: `invoke_query`, then `read` |
@@ -211,11 +211,9 @@ policy still only reads: `query` answers, and a write tool returns 403.
 | `changes_poll` | `graph`, optional `branch`, `cursor`, `start`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/changes` | `read` |
 | `blobs_stat` | `graph`, `entity`, `type`, `id`, `property`, optional `branch`, `snapshot` | `HEAD /graphs/{graph_id}/blob` | `read` |
 
-`graphs` needs no permit: it returns `visibility: granted`, the caller's `actor_id` (and `client_id`) and the registered graphs it holds any permission on, available or not, or every one for a `graph_list` holder.
-Every tool answers any other registered graph as `graph not found`, as HTTP does; `access` says what the caller may do on a listed one. `og_catalog` is never listed and keeps its own authorization.
-
-The server's `initialize` instructions tell a model to call `graphs`, then
-`schema`, then `query` with a stored read's `name` or its own GQ source.
+Without a cluster policy granting the server-scoped `graph_list` action, a non-identity token gets 403 from `graphs`.
+The user can still supply a graph id for other tools. The `initialize` instructions guide the model from
+`graphs` to `schema`, then to `query` with a stored read's `name` or its own GQ source.
 
 - `queries` lists every stored query with its typed parameters (`name`,
   `kind`, `nullable`, plus `item_kind` for lists and `vector_dim` for
@@ -311,7 +309,8 @@ an unknown resource or graph is error `-32002`.
 ## Results and errors
 
 A successful call returns the route's JSON response body as structured content,
-plus a text copy for older clients. Two tools answer otherwise: `blobs_stat`
+plus a text copy for older clients. Three tools answer otherwise: `graphs`
+narrows `GET /graphs` for a credential that is not an identity, `blobs_stat`
 answers the `HEAD /blob` headers as `blob stat` JSON, and `commits_drop`
 answers an empty object for the route's 204. `health`, `graphs`, `schema`,
 `queries`, `access` and `branches_list` declare an output schema.

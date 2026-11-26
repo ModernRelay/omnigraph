@@ -468,7 +468,14 @@ impl ServerHost {
             }
             ToolCall::Query(args) => {
                 boxed(move || async move {
-                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let (handle, actor) = self.graph_with_grant(
+                        &args.graph,
+                        actor,
+                        &graph,
+                        handlers::GraphGrant::for_query(
+                            args.query.is_none() && args.name.is_some(),
+                        ),
+                    )?;
                     let Some(query) = args.query else {
                         // A stored read, as `omnigraph query NAME` runs it.
                         let name = args.name.ok_or_else(|| {
@@ -530,9 +537,13 @@ impl ServerHost {
             }
             ToolCall::Access(args) => {
                 boxed(move || async move {
-                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let access = handlers::GraphAccess::capture(
+                        &self.state,
+                        graph_key(&args.graph)?,
+                        Some(&actor),
+                    )?;
                     let output = handlers::access_body(
-                        &handle,
+                        &access,
                         Some(&actor),
                         crate::api::AccessQuery {
                             branch: args.branch,
@@ -721,8 +732,15 @@ impl ServerHost {
             }
             ToolCall::Mutate(args) => {
                 boxed(move || async move {
+                    let (handle, actor) = self.graph_with_grant(
+                        &args.graph,
+                        actor,
+                        &graph,
+                        handlers::GraphGrant::for_query(
+                            args.query.is_none() && args.name.is_some(),
+                        ),
+                    )?;
                     let ingress = write_ingress()?;
-                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                     let precondition = args
                         .if_graph_commit
                         .as_deref()
@@ -809,8 +827,8 @@ impl ServerHost {
             }
             ToolCall::Load(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let request = request_body(json!({
                         "branch": args.branch,
                         "from": args.from,
@@ -831,8 +849,8 @@ impl ServerHost {
             }
             ToolCall::BlobsClear(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let query = request_body(json!({
                         "entity": args.entity,
                         "type": args.r#type,
@@ -865,8 +883,8 @@ impl ServerHost {
             }
             ToolCall::BranchesCreate(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let output = handlers::server_branch_create(
                         state(),
                         Extension(handle),
@@ -885,8 +903,8 @@ impl ServerHost {
             }
             ToolCall::BranchesDelete(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let output = handlers::server_branch_delete(
                         state(),
                         Extension(handle),
@@ -903,8 +921,8 @@ impl ServerHost {
             }
             ToolCall::BranchesMerge(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let request = request_body(json!({
                         "source": args.source,
                         "target": args.target,
@@ -923,8 +941,8 @@ impl ServerHost {
             }
             ToolCall::CommitsPublish(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let output = handlers::server_commit_publish(
                         state(),
                         Extension(handle),
@@ -941,8 +959,8 @@ impl ServerHost {
             }
             ToolCall::CommitsDrop(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     handlers::server_commit_drop(
                         state(),
                         Extension(handle),
@@ -992,17 +1010,34 @@ impl ServerHost {
         }
     }
 
-    /// The caller's actor and the graphs it may use, as `GET /graphs/discovery`
-    /// lists them.
+    /// Graph ids and names. An identity credential uses `GET /graphs/discovery`,
+    /// which admits every identity; any other credential uses `GET /graphs`
+    /// under the `graph_list` action, narrowed to the same two fields.
     async fn discover(
         &self,
         actor: AuthenticatedActor,
     ) -> Result<crate::api::GraphDiscoveryOutput, ApiError> {
-        Ok(
-            handlers::server_graphs_discovery(State(self.state.clone()), Some(Extension(actor)))
-                .await?
-                .0,
-        )
+        let state = State(self.state.clone());
+        if actor.is_identity() {
+            return Ok(
+                handlers::server_graphs_discovery(state, Some(Extension(actor)))
+                    .await?
+                    .0,
+            );
+        }
+        let listed = handlers::server_graphs_list(state, Some(Extension(actor)))
+            .await?
+            .0;
+        Ok(crate::api::GraphDiscoveryOutput {
+            graphs: listed
+                .graphs
+                .into_iter()
+                .map(|graph| crate::api::GraphDiscoveryEntry {
+                    display_name: graph.graph_id.clone(),
+                    graph_id: graph.graph_id,
+                })
+                .collect(),
+        })
     }
 
     /// A write reserves write ingress for its argument bytes, as the write's
@@ -1021,10 +1056,22 @@ impl ServerHost {
         actor: AuthenticatedActor,
         graph: &McpGraphRequest,
     ) -> Result<(GraphRequest, AuthenticatedActor), ApiError> {
-        let id = GraphId::try_from(name.to_string())
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        let handle =
-            handlers::resolve_registered_graph(&self.state, &GraphKey::cluster(id), Some(&actor))?;
+        self.graph_with_grant(name, actor, graph, handlers::GraphGrant::AnyAction)
+    }
+
+    fn graph_with_grant(
+        &self,
+        name: &str,
+        actor: AuthenticatedActor,
+        graph: &McpGraphRequest,
+        grant: handlers::GraphGrant,
+    ) -> Result<(GraphRequest, AuthenticatedActor), ApiError> {
+        let handle = handlers::resolve_registered_graph(
+            &self.state,
+            &graph_key(name)?,
+            Some(&actor),
+            grant,
+        )?;
         if graph.set(handle.clone()).is_err() {
             return Err(ApiError::internal(
                 "MCP request selected its graph more than once",
@@ -1033,6 +1080,13 @@ impl ServerHost {
         Ok((handle, actor))
     }
 }
+
+fn graph_key(name: &str) -> Result<GraphKey, ApiError> {
+    GraphId::try_from(name)
+        .map(GraphKey::cluster)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
 fn pretty<T: Serialize>(value: &T) -> Result<String, ApiError> {
     serde_json::to_string_pretty(value)
         .map_err(|_| ApiError::internal("could not encode MCP resource"))
@@ -1253,31 +1307,22 @@ mod tests {
 
     #[test]
     fn graphs_adds_a_setup_link_only_to_a_successful_empty_list_when_configured() {
-        let discovery = |graphs| crate::api::GraphDiscoveryOutput {
-            visibility: Some(crate::api::GraphVisibility::Granted),
-            actor_id: Some("act-alice".into()),
-            client_id: None,
-            graphs,
-        };
-        let empty = || discovery(Vec::new());
-        let one = || {
-            discovery(vec![crate::api::GraphDiscoveryEntry {
+        let empty = || crate::api::GraphDiscoveryOutput { graphs: Vec::new() };
+        let one = crate::api::GraphDiscoveryOutput {
+            graphs: vec![crate::api::GraphDiscoveryEntry {
                 graph_id: "brain".into(),
                 display_name: "brain".into(),
-            }])
+            }],
         };
         let url = "https://example.com/setup";
         let with_setup = serde_json::to_value(graphs_output(empty(), Some(url))).unwrap();
         assert_eq!(with_setup["graphs"], json!([]));
         assert_eq!(with_setup["setup"]["url"], json!(url));
         assert_eq!(with_setup["setup"]["message"], json!(SETUP_MESSAGE));
-        let listed = serde_json::to_value(graphs_output(one(), Some(url))).unwrap();
+        let listed = serde_json::to_value(graphs_output(one, Some(url))).unwrap();
         assert!(listed.get("setup").is_none());
         let unconfigured = serde_json::to_value(graphs_output(empty(), None)).unwrap();
-        assert_eq!(
-            unconfigured,
-            json!({"visibility": "granted", "actor_id": "act-alice", "graphs": []})
-        );
+        assert_eq!(unconfigured, json!({"graphs": []}));
     }
 
     #[test]

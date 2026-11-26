@@ -3455,19 +3455,14 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn parse_error_precedes_policy_denial_on_every_door() {
-    // `act-writer` may change unprotected branches and read none, so its
-    // reads reach the route and are refused there; `act-nobody` holds no
-    // grant, so the graph does not exist for it and nothing is parsed.
+    // The writer may change unprotected branches, so its read reaches the
+    // route. The team member likewise reaches the route on protected main.
     let policy = POLICY_YAML.replace(
         "  admins: [act-ragnor]\n",
         "  admins: [act-ragnor]\n  writers: [act-writer]\n",
     ) + "  - id: writers-change\n    allow:\n      actors: { group: writers }\n      actions: [change]\n      branch_scope: unprotected\n";
     let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
-        &[
-            ("act-bruno", "team-token"),
-            ("act-writer", "writer-token"),
-            ("act-nobody", "nobody-token"),
-        ],
+        &[("act-bruno", "team-token"), ("act-writer", "writer-token")],
         &policy,
     )
     .await;
@@ -3492,15 +3487,8 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         "params": {"name": "Nia", "age": 20},
         "branch": "main"
     });
-    for body in [
-        read.clone(),
-        json!({"query": "not gq at all", "branch": "main"}),
-    ] {
-        let (status, out) = json_response(&app, send("/query", "nobody-token", body, false)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{out}");
-    }
     let denied = [
-        ("/query", "writer-token", read.clone(), false),
+        ("/query", "writer-token", read, false),
         ("/mutate", "team-token", write.clone(), false),
         ("/mutate/if-graph-commit", "team-token", write, true),
     ];

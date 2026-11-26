@@ -689,35 +689,22 @@ fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     finished.assert_success();
     finished.assert_never_shows(&[AGENT_TOKEN]);
 
-    // A static token without `graph_list` is answered by the server itself:
-    // it lists the graphs the token may read, and the bridge narrows that
-    // listing to its own graph, as it does for any other credential.
-    let reader = served.rpc_as(READER_TOKEN, &tool_call(8, "graphs", json!({})));
-    assert_eq!(reader["result"]["isError"], false, "{reader}");
-    assert_eq!(
-        graph_ids(&reader["result"]["structuredContent"]),
-        ["knowledge", "other"]
-    );
+    // The reader has no server-scoped graph_list permit. A bound graph does
+    // not change the server's refusal on either listing surface.
     let reader_token = [("OMNIGRAPH_TOKEN_STAGING", READER_TOKEN)];
     let mut bridge = home.bridge(&["--target", "staging"], &reader_token);
-    let listed = bridge.tool(8, "graphs", json!({}));
-    assert_eq!(listed["result"]["isError"], false, "{listed}");
+    let list = tool_call(8, "graphs", json!({}));
+    let refused = served.rpc_as(READER_TOKEN, &list);
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
     assert_eq!(
-        graph_ids(&listed["result"]["structuredContent"]),
-        ["knowledge"]
+        refused["result"]["structuredContent"]["status"], 403,
+        "{refused}"
     );
-    assert_eq!(
-        listed["result"]["structuredContent"]["visibility"], "granted",
-        "{listed}"
-    );
-    assert_eq!(
-        listed["result"]["structuredContent"]["actor_id"], "act-reader",
-        "{listed}"
-    );
-    let listing = bridge.call(resource(9, "omnigraph://graphs"));
-    let text: Value =
-        serde_json::from_str(listing["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(graph_ids(&text), ["knowledge"]);
+    assert_eq!(bridge.call(list), refused);
+    let read_listing = resource(9, "omnigraph://graphs");
+    let refused = served.rpc_as(READER_TOKEN, &read_listing);
+    assert_eq!(refused["error"]["data"]["status"], 403, "{refused}");
+    assert_eq!(bridge.call(read_listing), refused);
     let finished = bridge.finish();
     finished.assert_success();
     finished.assert_never_shows(&[READER_TOKEN]);

@@ -25,7 +25,7 @@ You need:
 
 Connectors you add in claude.ai also appear in Claude Desktop.
 
-**Team and Enterprise.** An Owner of your Claude organization can add the connector for everyone. Each member still signs in with their own Omnigraph account, and sees and changes only what your cluster's policy allows them.
+**Team and Enterprise.** An Owner of your Claude organization can add the connector for everyone. Each member signs in with their own Omnigraph account and can list the cluster's graph names. Your cluster's policy controls what each member can read or change in a graph.
 
 ### Claude Code
 
@@ -92,7 +92,7 @@ What Omnigraph collects and keeps is described in the [privacy policy](https://w
 | Sign-in works, then "not admitted" | Your account isn't a member of the cluster's organization | Ask an organization admin to invite you |
 | "Forbidden" / 403 on a request | The cluster's policy doesn't allow that action for you | Signing in again won't help. Ask an admin for the permission named in the error |
 | "Service unavailable" | Your cluster is restarting, or Claude access is being updated | Wait a minute and try again |
-| No graphs listed | The cluster has no graphs you can see | Create one (see "Create a second brain") or ask for access |
+| No graphs listed | The cluster has no registered graphs | See "Create a second brain" or ask an administrator to create a graph |
 | "Result too large" | The query returned more than the server sends in one result | Ask for fewer rows or a narrower filter, for example "only this month" |
 | Claude keeps asking you to sign in | Your Omnigraph session expired or was revoked | Sign in again. If it repeats, disconnect and reconnect the connector |
 
