@@ -59,6 +59,40 @@ Cloud suites skip unless their environment is set (`OMNIGRAPH_S3_TEST_BUCKET`,
 credentials). A configured CI backend treats a skip as failure, and a local
 file pass does not qualify S3, Azure or Google Cloud Storage.
 
+## Log capture
+
+A test that asserts on what a subscriber receives installs that subscriber
+on its own thread (`tracing::subscriber::set_default`, `with_default` or
+`with_subscriber`): the server's lib tests use `test_log_capture::Capture`,
+and the DST TRACE-diff instruments use `trace::capture_trace`. Each such
+test binary also installs, before any test runs, a global subscriber that
+enables nothing and answers every callsite `Interest::sometimes()`, the
+`keep_callsite_interest_dynamic` constructor in
+`crates/omnigraph-server/src/lib.rs` and
+`crates/omnigraph-dst/tests/scenarios.rs`.
+
+The global subscriber is needed because tracing caches whether a callsite is
+enabled once for the whole process, from the dispatchers registered at the
+time. While one scoped subscriber is the only one registered, a callsite
+first hit on another thread, one with no subscriber, is cached as never,
+and every later event from it is dropped on every thread, the capturing
+one included, until a dispatcher is next registered
+([#1560](https://github.com/ModernRelay/omnigraph/issues/1560)). With the
+global subscriber always registered, no callsite is cached as never, so
+every event asks its own thread's subscriber. A new test binary that
+captures logs adds the same constructor. Do not work around the cache in
+one test by touching a callsite before capturing.
+
+A subscriber scoped to one future also misses what the runtime does outside
+that future's polls. tracing-subscriber's registry releases a closing span's
+parent through the thread's default subscriber, so a span closed outside its
+own subscriber's scope leaves its parent open, and the parent is never
+exported. A detached task therefore carries its request's subscriber and
+closes its span inside its last poll, as `OperationRuntime`'s
+`spawn_operation` does in `crates/omnigraph-server/src/operations.rs`. The
+global subscriber ignores the release it receives otherwise, so the leak
+shows as a missing span, never as a panic.
+
 ## Lance compatibility
 
 Run this first for every Lance change:
