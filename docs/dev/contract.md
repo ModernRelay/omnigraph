@@ -284,13 +284,16 @@ last chooses consistency over availability [K17, ch. 9].
 
 **E6. It is checked.** The server resolves the caller from its token; a client
 cannot name itself. The server checks every action against the installed
-policy. The engine checks every write when a policy is installed, before the
-first lasting effect, so a denied write changes nothing. A direct CLI write to
-a cluster graph uses that cluster's policy. Reads through the engine or the
+policy. An admitted identity can discover every registered graph's ID and
+display name. Its access report describes the actions its credential may
+perform on a ready graph, including an empty set. The engine checks every
+write against the installed policy before the first lasting effect, so a
+denied write changes nothing. A direct CLI write to a cluster graph uses
+that cluster's policy. Reads through the engine or the
 direct CLI are not checked `D9`, and a direct or embedded caller states its
-own actor. A served graph with no policy denies every authenticated request,
-unless the operator lets static tokens read it. An operator can also start a
-server with no authentication. Both choices are logged at startup. A policy
+own actor. A served graph with no policy denies authenticated graph data
+operations, unless the operator lets static tokens read it. An operator can
+also start a server with no authentication. Both choices are logged at startup. A policy
 change binds the requests admitted after it; a request already admitted
 finishes under the policy it was admitted with. The CLI,
 HTTP and MCP share one list of operations, one set of error codes and one

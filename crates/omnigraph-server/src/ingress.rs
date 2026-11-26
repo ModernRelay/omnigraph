@@ -18,8 +18,7 @@ use crate::operations::ReadObserver;
 use crate::serving::GraphRequest;
 use crate::workload::IngressLease;
 use crate::{
-    ApiError, AppState, AuthenticatedActor, DEFAULT_REQUEST_BODY_LIMIT_BYTES,
-    INGEST_REQUEST_BODY_LIMIT_BYTES, PolicyAction, PolicyRequest,
+    ApiError, AppState, DEFAULT_REQUEST_BODY_LIMIT_BYTES, INGEST_REQUEST_BODY_LIMIT_BYTES,
 };
 
 #[derive(Clone, Copy)]
@@ -42,35 +41,29 @@ enum AdmissionClass {
     Write,
 }
 
+pub(crate) fn graph_grant(method: &Method, route: &str) -> crate::handlers::GraphGrant {
+    let route = route.strip_prefix("/graphs/{graph_id}").unwrap_or(route);
+    crate::handlers::GraphGrant::for_query(
+        *method == Method::POST
+            && matches!(
+                route,
+                "/queries/{query_name}" | "/queries/{query_name}/if-graph-commit"
+            ),
+    )
+}
+
 async fn classify(parts: &mut Parts, route: &str) -> Result<AdmissionClass, ApiError> {
-    if parts.method == Method::POST
-        && matches!(
-            route,
-            "/queries/{query_name}" | "/queries/{query_name}/if-graph-commit"
-        )
-    {
+    if matches!(
+        graph_grant(&parts.method, route),
+        crate::handlers::GraphGrant::InvokeQuery
+    ) {
         let handle = parts
             .extensions
             .get::<GraphRequest>()
             .ok_or_else(|| ApiError::internal("stored query admission is missing its graph"))?
             .clone();
-        // Resolve permission before kind: otherwise saturated lanes could
-        // reveal a denied query's existence through a different refusal.
-        let actor = parts.extensions.get::<AuthenticatedActor>();
-        match crate::handlers::authorize(
-            actor,
-            handle.policy.as_deref(),
-            PolicyRequest {
-                action: PolicyAction::InvokeQuery,
-                branch: None,
-                target_branch: None,
-            },
-        )? {
-            crate::handlers::Authz::Allowed => {}
-            crate::handlers::Authz::Denied(_) => {
-                return Err(ApiError::not_found("stored query not found"));
-            }
-        }
+        // Graph admission checked invoke_query against this captured view before
+        // reserving input. Only an admitted caller can learn the query's kind.
         let Path(crate::handlers::QueryNamePath { query_name: name }) =
             Path::from_request_parts(parts, &())
                 .await

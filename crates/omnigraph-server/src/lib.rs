@@ -4038,6 +4038,16 @@ pub fn build_app(state: AppState) -> Router {
             resolve_graph_handle,
         ))
     });
+    let access = guarded(
+        &state,
+        http_operations::graph_access().into_router(),
+        |routes| {
+            routes.route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                resolve_graph_access,
+            ))
+        },
+    );
 
     // Management endpoints (`GET /graphs`) live alongside the per-graph
     // router. They go through bearer auth but NOT through
@@ -4070,7 +4080,10 @@ pub fn build_app(state: AppState) -> Router {
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
     let protected: Router<AppState> = Router::new()
         .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
-        .nest(handlers::CLUSTER_PATH_PREFIX, per_graph_protected)
+        .nest(
+            handlers::CLUSTER_PATH_PREFIX,
+            per_graph_protected.merge(access),
+        )
         .merge(management)
         .merge(deployments);
 

@@ -135,7 +135,6 @@ impl HttpRoutes {
 pub(crate) fn graph() -> HttpRoutes {
     let routes = HttpRoutes::new(handlers::CLUSTER_PATH_PREFIX)
         .route("snapshot", handlers::server_snapshot)
-        .route("access", handlers::server_access)
         .route("blob get", handlers::server_blob_get)
         // A dedicated HEAD handler avoids opening the GET payload stream.
         .route("blob stat", handlers::server_blob_head)
@@ -191,6 +190,10 @@ pub(crate) fn graph() -> HttpRoutes {
     routes
 }
 
+pub(crate) fn graph_access() -> HttpRoutes {
+    HttpRoutes::new(handlers::CLUSTER_PATH_PREFIX).route("access", handlers::server_access)
+}
+
 pub(crate) fn management() -> HttpRoutes {
     HttpRoutes::new("")
         .route("list graphs", handlers::server_graphs_list)
@@ -223,6 +226,7 @@ mod tests {
     #[test]
     fn production_router_registration_matches_the_operation_inventory() {
         let mut registered = graph().registered();
+        registered.extend(graph_access().registered());
         registered.extend(management().registered());
         registered.extend(deployments().registered());
         registered.extend(probes().registered());

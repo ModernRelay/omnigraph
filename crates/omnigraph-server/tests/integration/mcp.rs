@@ -6,7 +6,7 @@ use std::task::Poll;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Method, Request, StatusCode};
-use futures::StreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use omnigraph_server::AppState;
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use serde_json::{Value, json};
@@ -183,6 +183,46 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     let key = omnigraph_server::GraphKey::cluster(
         omnigraph_server::GraphId::try_from("default").unwrap(),
     );
+    // This admitted identity has no graph grants. Its access report describes
+    // the named branch without opening it, and the response owns no graph lease.
+    let mut held = Vec::new();
+    for branch in ["main", "absent"] {
+        let expected = json!({
+            "actor_id":"principal:stable_bob","client_id":"oauth-client","graph_id":"default",
+            "graph_wide":[],"branch":branch,"target_branch":null,"actions":[]
+        });
+        for (request, mcp) in [
+            (
+                get_request(&format!("/graphs/default/access?branch={branch}"), &bob),
+                false,
+            ),
+            (
+                rpc(
+                    Some(&bob),
+                    "tools/call",
+                    json!({"name":"access","arguments":{"graph":"default","branch":branch}}),
+                ),
+                true,
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let chunks: Vec<Bytes> = response
+                .into_body()
+                .into_data_stream()
+                .try_collect()
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&chunks.concat()).unwrap();
+            let report = if mcp {
+                &body["result"]["structuredContent"]
+            } else {
+                &body
+            };
+            assert_eq!(report, &expected);
+            held.extend(chunks);
+        }
+    }
     let transition = state
         .prepare_same_view(
             &key,
@@ -191,6 +231,8 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         .unwrap()
         .close()
         .unwrap();
+    transition.wait_requests().await.unwrap();
+    drop(held);
     let discovered = call(&app, &bob, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
@@ -223,8 +265,15 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
             assert_eq!(native["code"], "graph_unavailable");
             assert_eq!(result["result"]["structuredContent"]["error"], native);
         }
+        let (status, native) = json_response(
+            &app,
+            get_request(&format!("/graphs/{graph}/access"), credential),
+        )
+        .await;
+        assert_eq!(status.as_u16(), expected);
+        let report = call(&app, credential, "access", json!({"graph":graph})).await;
+        assert_refusal(&report, status, &native);
     }
-    transition.wait_requests().await.unwrap();
     transition.resume_same_view().unwrap();
     // The whole catalog, stored mutations included, as the route lists it.
     let catalog = call(&app, &alice, "queries", json!({"graph":"default"})).await;

@@ -305,6 +305,13 @@ async fn signed_identities_obey_current_policy_and_attribute_writes() {
             "load requires change and fork authority on the same graph",
         );
     }
+    // A read-only credential is denied a load on the target before and after
+    // its creation. A caller with change still gets the missing-branch error.
+    let (status, denied_before_create) =
+        json_response(&app, signed_load_request(&read, false)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = json_response(&app, signed_load_request(&write, false)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (_, after_load_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
     let (_, after_load_commits) =
         json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
@@ -329,6 +336,10 @@ async fn signed_identities_obey_current_policy_and_attribute_writes() {
         "existing branch only needs change: {loaded_again}"
     );
     assert_eq!(loaded_again["branch_created"], false);
+    let (status, denied_after_create) =
+        json_response(&app, signed_load_request(&read, false)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(denied_before_create, denied_after_create);
 }
 
 fn signed_load_request(token: &str, fork: bool) -> Request<Body> {
@@ -416,6 +427,24 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
             body,
             "signed load cannot bypass missing Cedar permission",
         );
+
+        // The JSON collector follows graph admission. This one-chunk request
+        // must be rejected before the collector polls its first byte.
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&polled);
+        let body = Body::from_stream(futures::stream::once(async move {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{}"))
+        }));
+        let request = Request::post(g("/load"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header(AUTHORIZATION, format!("Bearer {load_token}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap();
+        let (status, _) = json_response(denied_app, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
     }
     let (_, after_load) = json_response(&app, get_request(&g("/branches"), "static-token")).await;
     assert_eq!(

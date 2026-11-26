@@ -468,7 +468,14 @@ impl ServerHost {
             }
             ToolCall::Query(args) => {
                 boxed(move || async move {
-                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let (handle, actor) = self.graph_with_grant(
+                        &args.graph,
+                        actor,
+                        &graph,
+                        handlers::GraphGrant::for_query(
+                            args.query.is_none() && args.name.is_some(),
+                        ),
+                    )?;
                     let Some(query) = args.query else {
                         // A stored read, as `omnigraph query NAME` runs it.
                         let name = args.name.ok_or_else(|| {
@@ -530,9 +537,13 @@ impl ServerHost {
             }
             ToolCall::Access(args) => {
                 boxed(move || async move {
-                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let access = handlers::GraphAccess::capture(
+                        &self.state,
+                        graph_key(&args.graph)?,
+                        Some(&actor),
+                    )?;
                     let output = handlers::access_body(
-                        &handle,
+                        &access,
                         Some(&actor),
                         crate::api::AccessQuery {
                             branch: args.branch,
@@ -721,8 +732,15 @@ impl ServerHost {
             }
             ToolCall::Mutate(args) => {
                 boxed(move || async move {
+                    let (handle, actor) = self.graph_with_grant(
+                        &args.graph,
+                        actor,
+                        &graph,
+                        handlers::GraphGrant::for_query(
+                            args.query.is_none() && args.name.is_some(),
+                        ),
+                    )?;
                     let ingress = write_ingress()?;
-                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                     let precondition = args
                         .if_graph_commit
                         .as_deref()
@@ -809,8 +827,8 @@ impl ServerHost {
             }
             ToolCall::Load(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let request = request_body(json!({
                         "branch": args.branch,
                         "from": args.from,
@@ -831,8 +849,8 @@ impl ServerHost {
             }
             ToolCall::BlobsClear(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let query = request_body(json!({
                         "entity": args.entity,
                         "type": args.r#type,
@@ -865,8 +883,8 @@ impl ServerHost {
             }
             ToolCall::BranchesCreate(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let output = handlers::server_branch_create(
                         state(),
                         Extension(handle),
@@ -885,8 +903,8 @@ impl ServerHost {
             }
             ToolCall::BranchesDelete(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let output = handlers::server_branch_delete(
                         state(),
                         Extension(handle),
@@ -903,8 +921,8 @@ impl ServerHost {
             }
             ToolCall::BranchesMerge(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let request = request_body(json!({
                         "source": args.source,
                         "target": args.target,
@@ -923,8 +941,8 @@ impl ServerHost {
             }
             ToolCall::CommitsPublish(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let output = handlers::server_commit_publish(
                         state(),
                         Extension(handle),
@@ -941,8 +959,8 @@ impl ServerHost {
             }
             ToolCall::CommitsDrop(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     handlers::server_commit_drop(
                         state(),
                         Extension(handle),
@@ -1038,10 +1056,22 @@ impl ServerHost {
         actor: AuthenticatedActor,
         graph: &McpGraphRequest,
     ) -> Result<(GraphRequest, AuthenticatedActor), ApiError> {
-        let id = GraphId::try_from(name.to_string())
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        let handle =
-            handlers::resolve_registered_graph(&self.state, &GraphKey::cluster(id), Some(&actor))?;
+        self.graph_with_grant(name, actor, graph, handlers::GraphGrant::AnyAction)
+    }
+
+    fn graph_with_grant(
+        &self,
+        name: &str,
+        actor: AuthenticatedActor,
+        graph: &McpGraphRequest,
+        grant: handlers::GraphGrant,
+    ) -> Result<(GraphRequest, AuthenticatedActor), ApiError> {
+        let handle = handlers::resolve_registered_graph(
+            &self.state,
+            &graph_key(name)?,
+            Some(&actor),
+            grant,
+        )?;
         if graph.set(handle.clone()).is_err() {
             return Err(ApiError::internal(
                 "MCP request selected its graph more than once",
@@ -1050,6 +1080,13 @@ impl ServerHost {
         Ok((handle, actor))
     }
 }
+
+fn graph_key(name: &str) -> Result<GraphKey, ApiError> {
+    GraphId::try_from(name)
+        .map(GraphKey::cluster)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
 fn pretty<T: Serialize>(value: &T) -> Result<String, ApiError> {
     serde_json::to_string_pretty(value)
         .map_err(|_| ApiError::internal("could not encode MCP resource"))
