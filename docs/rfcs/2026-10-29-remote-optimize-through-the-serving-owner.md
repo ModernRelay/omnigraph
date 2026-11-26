@@ -1674,5 +1674,6 @@ dated pending entry in its decision log:
   server's live set only under the record gate the cancel route decides and
   delivers under, so a run whose start failed cannot leave between the
   route's liveness check and its delivery. The record gains one optional
-  field, so a 0.16 server refuses a record that holds it; the recorded
+  field, so a server older than 0.17.1 refuses a record that holds it,
+  whether a 202 or an `outcome_unknown` cancel wrote it; the recorded
   operations guide gives the rollback procedure.

@@ -90,9 +90,9 @@ returns the existing record without starting work again. A lookup answers
 the id. `unknown` does not prove the operation never ran, and it is never a
 reason to resubmit the same work under the same id.
 
-A 0.16 server refuses a record in which any entry holds a
+A server older than 0.17.1 refuses a record in which any entry holds a
 `cancellation_request` (409 `operation_record_invalid`); see
-[rolling back to 0.16](#rolling-back-to-016).
+[rolling back from 0.17.1](#rolling-back-from-0171).
 
 Earlier edge builds wrote `tables` and `more_tables`. If the cluster's
 operation record contains either field, submit, lookup and cancel return
@@ -207,28 +207,35 @@ mark says. Because the mark is a caller's time, an id dated more than a minute
 ahead of the server's clock is refused before it is accepted; otherwise one
 such id, once evicted, would refuse every honest id after it.
 
-## Rolling back to 0.16
+## Rolling back from 0.17.1
 
-From 0.17.0, a cancel the server accepts is stored on the operation's entry
-in `__cluster/operations.json` as `cancellation_request`. A 0.16 server
-refuses the whole record once any entry has that field: submit, lookup and
-cancel answer 409 `operation_record_invalid`. A record with no cancellation
-request stays readable by 0.16, so a rollback before the first accepted
-cancel needs no step. An entry keeps the field until it leaves the 32 newest
-terminal operations.
+From 0.17.1, the cancel route stores the request on the operation's entry in
+`__cluster/operations.json` as `cancellation_request`. A server older than
+0.17.1 (0.17.0, 0.16 and earlier) does not know the field and refuses the
+whole record once any entry has it: every recorded-operation route answers
+409 `operation_record_invalid`, and a graph deletion leaves the record as it
+is. The rest of the server and every graph are unaffected.
 
-To roll a server back to 0.16 after it accepted a cancel:
+The field is written by a cancel answered 202, and can also be written by a
+cancel answered 500 `outcome_unknown`, whose write may have landed. So decide
+from the record, not from the answers you saw. An entry keeps the field until
+it leaves the 32 newest terminal operations, and an unresolved publication
+keeps it until it settles.
 
-1. Look up each operation that is still `accepted`, `running` or
-   `publishing`, and wait until it is terminal. A `publishing` record settles
-   once `main` has a newer commit.
-2. Stop the 0.17.0 server.
-3. Move `__cluster/operations.json` out of the cluster root. Keep the copy:
-   it is the only record of those operations' outcomes.
-4. Start the 0.16 server. Its next submission creates a new record.
+To roll a server back from 0.17.1 to an older release:
 
-This loses what the record held, as the recovery from an unreadable record
-above does: an earlier operation id answers `unknown` and is accepted as a
-new operation if it is submitted again, the eviction mark is gone, and the
-next full-catalog run starts at the first table. Do not edit the record by
-hand to remove the field.
+1. Stop sending cancels. Look up each operation that is still `accepted`,
+   `running` or `publishing`, and wait until it is terminal. A `publishing`
+   record settles once `main` has a newer commit.
+2. Stop the 0.17.1 server.
+3. Read `__cluster/operations.json`. If no entry contains
+   `cancellation_request`, start the older server: nothing else is needed.
+4. Otherwise move the file out of the cluster root and keep the copy: it is
+   the only record of those operations' outcomes. Then start the older
+   server. Its next submission creates a new record.
+
+Moving the record aside loses what it held, as the recovery from an
+unreadable record above does: an earlier operation id answers `unknown` and
+is accepted as a new operation if it is submitted again, the eviction mark is
+gone, and the next full-catalog run starts at the first table. Do not edit the
+record by hand to remove the field.
