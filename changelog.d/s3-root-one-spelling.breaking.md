@@ -1,3 +1,3 @@
-- An `s3://` root with a dot segment (also `%2e%2e`), a port or user information respells another root's key and is now refused; finish any outstanding deployment with the earlier release, then use the spelling the refusal names. A root with a query, a fragment or an empty segment names no key and is refused with no replacement: choose a plain prefix. See the [cluster storage guide][s3-root-one-spelling-storage].
+- An `s3://` root whose refusal names another spelling (a dot segment, `%2e%2e` included, a port or user information) is now refused, but its objects are whole: finish any outstanding deployment with the earlier release, then use that spelling. A refusal that names no key (a query, a fragment, an empty segment) names no replacement: choose a plain prefix. See the [upgrade guide][s3-root-one-spelling-upgrade].
 
-[s3-root-one-spelling-storage]: ../docs/user/clusters/config.md#storage
+[s3-root-one-spelling-upgrade]: ../docs/user/operations/upgrade.md#s3-roots-that-name-two-keys

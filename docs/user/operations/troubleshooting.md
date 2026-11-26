@@ -283,12 +283,12 @@ between graph roots.
   [External Blob references](../clusters/config.md#external-blob-references).
 - `invalid_storage_root` or `target_invalid` with "an s3 path must name one
   object key": the `s3://` root is refused before any request. When the
-  message names two keys (a percent escape, a space, a non-ASCII letter, a
-  brace, a quote, a trailing space), Omnigraph and Lance would split its
-  objects. When it says the root names no key (a query, a fragment, an empty
-  segment, a trailing control character), choose a plain prefix. When it names
-  another spelling (a dot segment, a port, user information, a tab or newline),
-  use that one. For a cluster an earlier release created at such a root, see
+  message names two keys (a space, a non-ASCII letter, a brace, a quote, a
+  trailing space, or an escape Lance decodes, such as `%41`), Omnigraph and
+  Lance would split its objects. When it says the root names no key (a query,
+  a fragment, an empty segment, a trailing control character), choose a plain
+  prefix. When it names another spelling (a dot segment, `%2e%2e` included, a
+  port, user information, a tab or newline), use that one. For a cluster an earlier release created at such a root, see
   [S3 roots that name two keys](upgrade.md#s3-roots-that-name-two-keys).
 - `external_blob_storage_root_uncomparable`: the cluster storage root is
   spelled with a path component an external Blob base cannot express (a

@@ -3544,9 +3544,12 @@ fn validate_gcs_bucket_name(bucket: &str, diagnostic_uri: &str) -> Result<()> {
 /// Omnigraph route derives an S3 key by. Two spellings exist: the adapter's,
 /// the URL path as written (below), and Lance's, the percent-decoded URL path
 /// (`lance-io`'s `extract_path`, which Omnigraph does not route). A URI on
-/// which they differ, one with a percent escape or a character a URL escapes
-/// (a space, a non-ASCII letter, a brace), or with a query or a fragment, is
-/// refused, so a root never splits its objects across two prefixes. A URI
+/// which they differ at it or below it (a character a URL escapes, such as a
+/// space, a non-ASCII letter or a brace; an escape Lance decodes, such as
+/// `%41`; a trailing space), or with a query or a fragment, is refused, so a
+/// root never splits its objects across two prefixes. An escaped dot segment
+/// (`%2e%2e`) is resolved by the URL parser before either key is derived, so
+/// it is a respelling, not a second key. A URI
 /// must also be the one spelling of its key, `s3://<bucket>/<key>` (trailing
 /// slashes aside), so two spellings of one key are never two identities.
 #[doc(hidden)]
@@ -3669,7 +3672,7 @@ fn s3_key_refusal(uri: &str, refusal: S3KeyRefusal<'_>) -> StorageError {
             lance,
             below,
         } => format!(
-            "Omnigraph would store {} under the key '{adapter}' and Lance under '{lance}'; a percent escape, a character a URL escapes (a space, a non-ASCII letter, a brace, a quote) or a space or control character at the end of the path has two spellings, so use a path without them",
+            "Omnigraph would store {} under the key '{adapter}' and Lance under '{lance}'; a character a URL escapes (a space, a non-ASCII letter, a brace, a quote), an escape Lance decodes (`%41`, `%20`, `%2F`) or a space at the end of the path has two spellings, so use a path without them",
             if below { "an object below it" } else { "its objects" }
         ),
         S3KeyRefusal::Respelled {
@@ -7035,8 +7038,9 @@ mod tests {
     }
 
     /// #1527: every route derives one key for an `s3://` URI or refuses it.
-    /// A spelling Lance decodes to another key (a percent escape, a space, a
-    /// non-ASCII letter, a brace) is refused by the adapter, by root
+    /// A spelling Lance decodes to another key (an escape such as `%41`, also a
+    /// dot escaped inside a segment, a space, a non-ASCII letter, a brace) is
+    /// refused as two keys by the adapter, by root
     /// normalization and by the clone open alike, so two roots that differ
     /// only in escaping are never two sets of keys.
     #[test]
@@ -7049,6 +7053,7 @@ mod tests {
             "s3://bucket/a%41b",
             "s3://bucket/{x}/root",
             "s3://bucket/50%25off",
+            "s3://bucket/a%2eb",
             "s3://bucket/root?x",
             "s3://bucket/root#f",
         ] {
@@ -7062,7 +7067,17 @@ mod tests {
                     .expect_err("adapter")
                     .to_string(),
             ] {
-                assert!(text.contains("must name one object key"), "{uri:?}: {text}");
+                // The upgrade guide keys its recovery on this: a refusal that
+                // names two keys is a split; a query or fragment names none.
+                let case = if uri.contains(['?', '#']) {
+                    "names no key"
+                } else {
+                    "and Lance under"
+                };
+                assert!(
+                    text.contains("must name one object key") && text.contains(case),
+                    "{uri:?}: {text}"
+                );
             }
         }
         // The spelling both routes agree on is accepted, unchanged.

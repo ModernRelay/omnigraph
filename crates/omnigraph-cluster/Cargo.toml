@@ -39,7 +39,7 @@ ulid = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 # `s3_bucket_keys`: the S3 suite lists the keys a cluster wrote with no URI derived.
-omnigraph-storage = { path = "../omnigraph-storage", version = "0.16.1", features = ["test-util"] }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.17.1", features = ["test-util"] }
 serial_test = "3"
 tempfile = { workspace = true }
 # Paused time for the lease tests, so the crate's own test build runs them.

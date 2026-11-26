@@ -202,23 +202,26 @@ below it, in one spelling. Any other root is refused before any request with
 `invalid_storage_root` (`target_invalid` for a `--target`), in one of three
 cases:
 
-- **Two keys.** A percent escape or a character a URL writes as one (a space,
-  a non-ASCII letter, a brace, a quote; the caret aside), or a space at the end
-  of the path, which becomes part of every key below the root. Omnigraph and
-  Lance would store its objects under two key prefixes, so removing a graph
-  would delete nothing. The message names both keys.
+- **Two keys.** A character a URL writes as an escape (a space, a non-ASCII
+  letter, a brace, a quote; the caret aside), an escape Lance decodes to
+  another character (`%41`, `%20`, `%2F`, a dot escaped inside a segment), or
+  a space at the end of the path, which becomes part of every key below the
+  root. Omnigraph and Lance would store its objects under two key prefixes, so
+  removing a graph would delete nothing. The message names both keys.
 - **No key.** A query, a fragment, an empty segment, or a control character at
   the end of the path. Such a root names no key for the objects below it, so
   the message names no replacement: choose a prefix of plain characters.
-- **Another spelling.** A dot segment (also escaped, as `%2e%2e`), a port,
-  user information, a tab or a newline, which the URL parser resolves or drops.
-  The root names the same objects as a shorter one under a second cluster
-  identity. The message names that spelling, and only when it names the same
-  keys at the root and below it.
+- **Another spelling.** A dot segment, escaped too (`%2e%2e`), a port, user
+  information, a tab or a newline, which the URL parser resolves or drops
+  before either key is derived. The root names the same objects as a shorter
+  one under a second cluster identity. The message names that spelling, and
+  only when it names the same keys at the root and below it.
 
-Two spellings of one prefix, such as `aAb` and `a%41b`, are therefore never
-two clusters. A cluster an earlier release created at such a root is refused
-too; see [the upgrade guide](../operations/upgrade.md#s3-roots-that-name-two-keys).
+An escape neither route decodes (`%zz`, a lone `%`) is an ordinary key
+character. Two spellings of one prefix, such as `aAb` and `a%41b`, are
+therefore never two clusters. A cluster an earlier release created at such a
+root is refused too, and its recovery follows the case the refusal names; see
+[the upgrade guide](../operations/upgrade.md#s3-roots-that-name-two-keys).
 
 Registered direct targets accept local files only. The storage assertion above
 describes the deployment root; it does not select a target. An inline `s3://`
