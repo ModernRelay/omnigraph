@@ -45,9 +45,8 @@ fn keep_callsite_interest_dynamic() {
 
     // No registry: a span closed outside its own subscriber's scope releases
     // its parent through this one, which must ignore an id it never issued.
-    let keeper = NoSubscriber::new().with(
-        dynamic_filter_fn(|_, _| false).with_callsite_filter(|_| Interest::sometimes()),
-    );
+    let keeper = NoSubscriber::new()
+        .with(dynamic_filter_fn(|_, _| false).with_callsite_filter(|_| Interest::sometimes()));
     // Nothing else runs before `main`, so the global default is unset; a
     // constructor must not panic, so a refusal is ignored, not unwrapped.
     let _ = tracing::subscriber::set_global_default(keeper);

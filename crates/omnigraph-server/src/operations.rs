@@ -275,63 +275,60 @@ impl OperationRuntime {
             reservation: Some(Box::new(reservation)),
         };
         let (sender, receiver) = oneshot::channel();
-        spawn_operation(
-            "write",
-            async move {
-                // The write runs as its request's submitted write: an error it
-                // translates follows it, as its waiter judges it, and logs the
-                // status it answers with.
-                let operation = SUBMITTED_WRITE.scope(
-                    std::cell::Cell::new(true),
-                    AssertUnwindSafe(operation).catch_unwind(),
+        spawn_operation("write", async move {
+            // The write runs as its request's submitted write: an error it
+            // translates follows it, as its waiter judges it, and logs the
+            // status it answers with.
+            let operation = SUBMITTED_WRITE.scope(
+                std::cell::Cell::new(true),
+                AssertUnwindSafe(operation).catch_unwind(),
+            );
+            let OwnedResult { result, uncertain } = match operation.await {
+                Ok(result) => result,
+                Err(_) => OwnedResult {
+                    result: Err(ApiError::internal(
+                        "owned write panicked; effects are unknown and require reconciliation",
+                    )),
+                    uncertain: true,
+                },
+            };
+            // Mark the error as its waiter receives it, so the log below
+            // records the status its response sends.
+            let result = result.map_err(ApiError::after_owned_write);
+            // Process containment and completion uncertainty are distinct:
+            // scoped storage uncertainty leaves admission open, but remains
+            // an uncertain outcome in telemetry.
+            let telemetry_uncertain =
+                uncertain || result.as_ref().is_err_and(ApiError::completion_uncertain);
+            crate::telemetry::operation_finished("write", result.is_ok(), telemetry_uncertain);
+            // A known result carries its reservation through pending delivery.
+            // Consumption releases admission before the handler can respond;
+            // abandonment destroys the output before releasing its ownership.
+            // Uncertainty closes admission before its result is observable.
+            // An owned write whose outcome is unknown is logged once,
+            // whether or not it contains the process. The failure's class
+            // was logged in this request's span when the engine error was
+            // mapped.
+            if let Err(error) = &result
+                && error.completion_uncertain()
+            {
+                tracing::error!(
+                    status = %error.status(),
+                    contained = uncertain,
+                    "owned write ended without a definite outcome"
                 );
-                let OwnedResult { result, uncertain } = match operation.await {
-                    Ok(result) => result,
-                    Err(_) => OwnedResult {
-                        result: Err(ApiError::internal(
-                            "owned write panicked; effects are unknown and require reconciliation",
-                        )),
-                        uncertain: true,
-                    },
-                };
-                // Mark the error as its waiter receives it, so the log below
-                // records the status its response sends.
-                let result = result.map_err(ApiError::after_owned_write);
-                // Process containment and completion uncertainty are distinct:
-                // scoped storage uncertainty leaves admission open, but remains
-                // an uncertain outcome in telemetry.
-                let telemetry_uncertain =
-                    uncertain || result.as_ref().is_err_and(ApiError::completion_uncertain);
-                crate::telemetry::operation_finished("write", result.is_ok(), telemetry_uncertain);
-                // A known result carries its reservation through pending delivery.
-                // Consumption releases admission before the handler can respond;
-                // abandonment destroys the output before releasing its ownership.
-                // Uncertainty closes admission before its result is observable.
-                // An owned write whose outcome is unknown is logged once,
-                // whether or not it contains the process. The failure's class
-                // was logged in this request's span when the engine error was
-                // mapped.
-                if let Err(error) = &result
-                    && error.completion_uncertain()
-                {
-                    tracing::error!(
-                        status = %error.status(),
-                        contained = uncertain,
-                        "owned write ended without a definite outcome"
-                    );
-                }
-                let owner = if uncertain {
-                    owner.finish(true);
-                    None
-                } else {
-                    Some(owner)
-                };
-                let _ = sender.send(WriteDelivery {
-                    result: Some(result),
-                    owner,
-                });
-            },
-        );
+            }
+            let owner = if uncertain {
+                owner.finish(true);
+                None
+            } else {
+                Some(owner)
+            };
+            let _ = sender.send(WriteDelivery {
+                result: Some(result),
+                owner,
+            });
+        });
         Ok(OwnedResponse(receiver))
     }
 }
@@ -507,35 +504,31 @@ impl ReadObserver {
         let (sender, receiver) = oneshot::channel();
         let response_observer = self.clone();
         let callers_probes = omnigraph::instrumentation::capture_query_io_probes();
-        spawn_operation(
-            "read",
-            async move {
-                let _observer = self;
-                let _reservation = reservation;
-                let operation = async move {
-                    match callers_probes {
-                        Some(probes) => {
-                            omnigraph::instrumentation::with_query_io_probes(probes, operation)
-                                .await
-                        }
-                        None => operation.await,
+        spawn_operation("read", async move {
+            let _observer = self;
+            let _reservation = reservation;
+            let operation = async move {
+                match callers_probes {
+                    Some(probes) => {
+                        omnigraph::instrumentation::with_query_io_probes(probes, operation).await
                     }
-                };
-                let result = scope_request(async move {
-                    // Catch completed future Drop panics too.
-                    #[allow(clippy::redundant_async_block)]
-                    let result = AssertUnwindSafe(async move { operation.await })
-                        .catch_unwind()
-                        .await
-                        .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
-                    result.map_err(ApiError::with_request_facts)
-                })
-                .await;
-                crate::telemetry::operation_finished("read", result.is_ok(), false);
-                // No result history: an absent waiter drops the result here.
-                let _ = sender.send(result);
-            },
-        );
+                    None => operation.await,
+                }
+            };
+            let result = scope_request(async move {
+                // Catch completed future Drop panics too.
+                #[allow(clippy::redundant_async_block)]
+                let result = AssertUnwindSafe(async move { operation.await })
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                result.map_err(ApiError::with_request_facts)
+            })
+            .await;
+            crate::telemetry::operation_finished("read", result.is_ok(), false);
+            // No result history: an absent waiter drops the result here.
+            let _ = sender.send(result);
+        });
         OwnedReadResponse {
             receiver,
             _observer: response_observer,
@@ -923,7 +916,8 @@ mod tests {
 
         let closed = Closed::default();
         // Held past the request, so the registry's teardown closes nothing.
-        let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(closed.clone()));
+        let subscriber =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(closed.clone()));
         let runtime = OperationRuntime::new();
         async {
             async {
