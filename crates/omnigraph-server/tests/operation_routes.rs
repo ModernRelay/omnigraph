@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use omnigraph::seams::{Behavior, Decide, Decision, Effect, Hold};
+use omnigraph::seams::{Behavior, Decide, DecideSeam, Decision, Effect, Hold};
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use omnigraph_server::{AppState, OperationSettings, build_app};
 use serde_json::{Value, json};
@@ -22,15 +22,12 @@ mod support;
 use support::*;
 
 const ROOT: &str = "OMNIGRAPH_OPERATIONS_TEST_ROOT";
-/// When set, the served child parks the first optimize run at the seam
-/// `HOLD_SEAM` names until this file exists.
-const HOLD_RELEASE: &str = "OMNIGRAPH_OPERATIONS_TEST_HOLD_RELEASE";
-const HOLD_SEAM: &str = "OMNIGRAPH_OPERATIONS_TEST_HOLD_SEAM";
-/// What the held crossing does once released: `pass` (the default), or
-/// `fail`, which fails it and every later crossing until a file named as the
-/// release file with the extension `stop` exists. Either way the child
-/// creates the release file's `reached` sibling when the first crossing parks.
-const HOLD_THEN: &str = "OMNIGRAPH_OPERATIONS_TEST_HOLD_THEN";
+/// The served child's holds, one per line: `seam|release file|then`. Each
+/// parks the seam's first crossing until its release file exists, creating
+/// the release file's `reached` sibling when it parks. `then` is what the
+/// crossing does once released: `pass`, or `fail`, which fails it and every
+/// later crossing until the release file's `stop` sibling exists.
+const HOLDS: &str = "OMNIGRAPH_OPERATIONS_TEST_HOLDS";
 /// After the run's `running` write, before any table work.
 const BEFORE_TABLE_WORK: &str = "optimize.post_authority_capture_pre_gates";
 /// After the run's publication, before the engine's final cancellation sample.
@@ -42,6 +39,12 @@ const AFTER_LAST_CANCELLATION_POINT: &str = "optimize.post_phase_b_pre_manifest_
 /// `__manifest` overwrite: failing every attempt here leaves the publication
 /// in doubt for the run, and main's history settles it as not committed.
 const BEFORE_MANIFEST_WRITE: &str = "publish.pre_merge";
+/// After a run's `running` write, before it acts on the answer; failing it
+/// loses that answer, so the run does not start.
+const START_ANSWER: &str = "recorded_operation.start_answer";
+/// In the cancel route, after it wrote the request, before it tells the run;
+/// failing it loses that write's answer.
+const CANCEL_ANSWER: &str = "recorded_operation.cancel_answer";
 const OPERATION_ID: &str = "01JC0000000000000000000001";
 
 const POLICY: &str = r#"
@@ -158,20 +161,23 @@ fn applied_cluster() -> tempfile::TempDir {
 /// Start the served child; `hold` parks the first optimize run at the named
 /// seam until the release file exists.
 fn spawn_server(root: &Path, hold: Option<(&str, &Path)>) -> (ContainedChild, String) {
-    spawn_server_with(root, hold, &[])
+    match hold {
+        Some((seam, release)) => spawn_server_with(root, &[(seam, release, "pass")]),
+        None => spawn_server_with(root, &[]),
+    }
 }
 
-/// [`spawn_server`] with more of the child's environment ([`HOLD_THEN`]).
-fn spawn_server_with(
-    root: &Path,
-    hold: Option<(&str, &Path)>,
-    env: &[(&str, &str)],
-) -> (ContainedChild, String) {
+/// [`spawn_server`] with any number of [`HOLDS`]: `(seam, release, then)`.
+fn spawn_server_with(root: &Path, holds: &[(&str, &Path, &str)]) -> (ContainedChild, String) {
     let mut command = Command::new(std::env::current_exe().unwrap());
-    if let Some((seam, release)) = hold {
-        command.env(HOLD_SEAM, seam).env(HOLD_RELEASE, release);
+    if !holds.is_empty() {
+        let lines = holds
+            .iter()
+            .map(|(seam, release, then)| format!("{seam}|{}|{then}", release.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        command.env(HOLDS, lines);
     }
-    command.envs(env.iter().copied());
     let mut child = ContainedChild(
         command
             .args(["--exact", "served_child", "--ignored", "--nocapture"])
@@ -213,38 +219,57 @@ async fn served_child() {
     // A parked run: the first optimize stops at the named seam until the
     // parent creates the release file.
     let _scenario = omnigraph::seams::FailScenario::setup();
-    let seam_named = |seam: &str| {
-        omnigraph::seams::catalog::decide(seam).unwrap_or_else(|| panic!("no decision seam {seam}"))
-    };
-    let _hold = std::env::var_os(HOLD_RELEASE).map(|release| {
-        let release = PathBuf::from(release);
-        let seam = std::env::var(HOLD_SEAM).unwrap();
-        let behavior = Arc::new(HoldThen {
-            hold: Hold::default(),
-            fail: match std::env::var(HOLD_THEN).as_deref() {
-                Err(_) | Ok("pass") => false,
-                Ok("fail") => true,
-                Ok(other) => panic!("{HOLD_THEN} must be pass or fail, not {other}"),
-            },
-            reached: release.with_extension("reached"),
-            stop: release.with_extension("stop"),
-        });
-        let installed = seam_named(&seam).install(behavior.clone() as Arc<dyn Decide>);
-        std::thread::spawn(move || {
-            while !release.exists() {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            behavior.hold.release();
-        });
-        installed
-    });
+    let _holds = std::env::var(HOLDS)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let [seam, release, then] = line.split('|').collect::<Vec<_>>()[..] else {
+                panic!("{HOLDS} line {line:?} is not seam|release|then");
+            };
+            let release = PathBuf::from(release);
+            let behavior = Arc::new(HoldThen {
+                hold: Hold::default(),
+                fail: match then {
+                    "pass" => false,
+                    "fail" => true,
+                    other => panic!("a hold's then must be pass or fail, not {other}"),
+                },
+                reached: release.with_extension("reached"),
+                stop: release.with_extension("stop"),
+            });
+            let installed = seam_named(seam).install(behavior.clone() as Arc<dyn Decide>);
+            std::thread::spawn(move || {
+                while !release.exists() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                behavior.hold.release();
+            });
+            installed
+        })
+        .collect::<Vec<_>>();
     let mut config = cluster_settings(&root).await.unwrap();
     config.bind = "127.0.0.1:0".into();
     omnigraph_server::serve(config).await.unwrap();
 }
 
+/// A seam by its name: the server's own recorded-operation sites, else the
+/// engine catalog's.
+fn seam_named(name: &str) -> &'static DecideSeam {
+    use omnigraph_server::seams::catalog::{
+        RECORDED_OPERATION_CANCEL_ANSWER, RECORDED_OPERATION_START_ANSWER,
+    };
+    [
+        &RECORDED_OPERATION_START_ANSWER,
+        &RECORDED_OPERATION_CANCEL_ANSWER,
+    ]
+    .into_iter()
+    .find(|seam| seam.name() == name)
+    .or_else(|| omnigraph::seams::catalog::decide(name))
+    .unwrap_or_else(|| panic!("no decision seam {name}"))
+}
+
 /// Parks the first crossing until released, marking it reached, then does
-/// what [`HOLD_THEN`] names.
+/// what its [`HOLDS`] line names.
 struct HoldThen {
     hold: Hold,
     fail: bool,
@@ -861,8 +886,7 @@ async fn a_cancel_answered_202_stays_on_a_failed_record_issue_1554() {
     let release = temp.path().join("release-the-run");
     let (mut child, address) = spawn_server_with(
         temp.path(),
-        Some((AFTER_LAST_CANCELLATION_POINT, &release)),
-        &[(HOLD_THEN, "fail")],
+        &[(AFTER_LAST_CANCELLATION_POINT, &release, "fail")],
     );
     let client = Client {
         http: reqwest::Client::new(),
@@ -899,11 +923,8 @@ async fn a_cancel_answered_202_stays_on_a_publication_settled_from_history_issue
     apply_cluster_fixture(temp.path()).await;
     two_fragments(temp.path()).await;
     let release = temp.path().join("release-the-run");
-    let (mut child, address) = spawn_server_with(
-        temp.path(),
-        Some((BEFORE_MANIFEST_WRITE, &release)),
-        &[(HOLD_THEN, "fail")],
-    );
+    let (mut child, address) =
+        spawn_server_with(temp.path(), &[(BEFORE_MANIFEST_WRITE, &release, "fail")]);
     let client = Client {
         http: reqwest::Client::new(),
         base: format!("http://{address}"),
@@ -1008,6 +1029,114 @@ async fn a_cancel_answered_202_survives_a_server_restart_issue_1554() {
     client.wait_ready(&mut child.0).await;
     let terminal = wait_terminal(&client, OPERATION_ID).await;
     assert_eq!(terminal["state"], "interrupted", "{terminal}");
+    assert!(holds_the_request(&terminal), "{terminal}");
+    drop(child);
+}
+
+/// A run whose start fails leaves the live set under the record gate its
+/// failed write held, so a cancel can never find it live and then answer 202
+/// for a run that has gone. The run parks after its `running` write, then
+/// loses that write's answer; the cancel is sent while it is parked and parks
+/// in its own gated step if it gets there, and is released only after the
+/// run let go. A cancel ordered after the run's exit finds it gone and
+/// answers the `interrupted` record; on the defect, the run left the live set
+/// outside the gate, so the cancel passed the liveness check first and
+/// answered 202 for a run it never reached (`in_progress: false`).
+// contract: E4
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_never_answers_202_for_a_run_whose_start_failed_issue_1554() {
+    let temp = applied_cluster();
+    apply_cluster_fixture(temp.path()).await;
+    let start = temp.path().join("release-the-start");
+    let cancel = temp.path().join("release-the-cancel");
+    let (mut child, address) = spawn_server_with(
+        temp.path(),
+        &[
+            (START_ANSWER, &start, "fail"),
+            (CANCEL_ANSWER, &cancel, "pass"),
+        ],
+    );
+    let client = Arc::new(Client {
+        http: reqwest::Client::new(),
+        base: format!("http://{address}"),
+    });
+    client.wait_ready(&mut child.0).await;
+
+    let (status, accepted) = client
+        .submit("op-secret", json!({ "operation_id": OPERATION_ID }))
+        .await;
+    assert_eq!(status, 202, "{accepted}");
+    wait_reached(&start).await;
+    let answer = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.cancel(OPERATION_ID).await }
+    });
+    // Give the cancel time to reach its gated step, if it can before the run
+    // lets go; then let the run's start fail, then let the cancel go on.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !cancel.with_extension("reached").exists() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fs::write(&start, b"").unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fs::write(&cancel, b"").unwrap();
+    let (status, answered) = answer.await.unwrap();
+
+    assert_eq!(
+        status, 200,
+        "a cancel after the run left is answered with its terminal record: {answered}"
+    );
+    assert_eq!(answered["operation"]["state"], "interrupted", "{answered}");
+    assert_eq!(answered["in_progress"], false, "{answered}");
+    assert!(
+        answered["operation"].get("cancellation_request").is_none(),
+        "no run received it, so nothing records it: {answered}"
+    );
+    drop(child);
+}
+
+/// A cancel whose record write has no definite answer is answered
+/// `outcome_unknown` and the run is not told: it finishes as if no cancel had
+/// come. The request did land here, so the record keeps it, with no reason
+/// saying a cancellation arrived late.
+// contract: E4
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_without_a_definite_answer_tells_the_run_nothing_issue_1554() {
+    let temp = applied_cluster();
+    apply_cluster_fixture(temp.path()).await;
+    let release = temp.path().join("release-the-run");
+    let lose = temp.path().join("lose-the-answer");
+    // Released from the start: the answer is lost without parking.
+    fs::write(&lose, b"").unwrap();
+    let (mut child, address) = spawn_server_with(
+        temp.path(),
+        &[
+            (BEFORE_TABLE_WORK, &release, "pass"),
+            (CANCEL_ANSWER, &lose, "fail"),
+        ],
+    );
+    let client = Client {
+        http: reqwest::Client::new(),
+        base: format!("http://{address}"),
+    };
+    client.wait_ready(&mut child.0).await;
+
+    let (status, accepted) = client
+        .submit("op-secret", json!({ "operation_id": OPERATION_ID }))
+        .await;
+    assert_eq!(status, 202, "{accepted}");
+    wait_reached(&release).await;
+    let (status, unknown) = client.cancel(OPERATION_ID).await;
+    assert_eq!(status, 500, "{unknown}");
+    assert_eq!(unknown["code"], "outcome_unknown", "{unknown}");
+
+    fs::write(&release, b"").unwrap();
+    let terminal = wait_terminal(&client, OPERATION_ID).await;
+    assert_eq!(
+        terminal["state"], "succeeded",
+        "the run was not told: {terminal}"
+    );
+    assert!(terminal.get("reason").is_none(), "{terminal}");
     assert!(holds_the_request(&terminal), "{terminal}");
     drop(child);
 }

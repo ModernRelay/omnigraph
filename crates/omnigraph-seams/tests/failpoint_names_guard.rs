@@ -1,5 +1,6 @@
 //! Guard: seam decisions must come from the compile-checked `catalog`
-//! (`omnigraph::seams::catalog` / `omnigraph_cluster::seams::catalog`), never
+//! (`omnigraph::seams::catalog`, `omnigraph_cluster::seams::catalog`,
+//! `omnigraph_server::seams::catalog`), never
 //! bare string literals — and the catalog itself must stay consistent.
 //!
 //! The catalog statics give compile-time typo protection at every helper
@@ -259,6 +260,10 @@ fn cluster_dir() -> PathBuf {
     seams_dir().join("../omnigraph-cluster")
 }
 
+fn server_dir() -> PathBuf {
+    seams_dir().join("../omnigraph-server")
+}
+
 fn dst_dir() -> PathBuf {
     seams_dir().join("../omnigraph-dst")
 }
@@ -281,6 +286,7 @@ fn files_to_scan() -> Vec<PathBuf> {
         catalog_dir().join("tests"),
         cluster_dir().join("src"),
         cluster_dir().join("tests"),
+        server_dir().join("src"),
     ] {
         collect_ext(&root, "rs", &mut out);
     }
@@ -1243,6 +1249,19 @@ fn cluster_arming_roots() -> ArmingRoots {
     }
 }
 
+/// The server's armers: the served-child journeys that park and fail its
+/// recorded-operation sites, and its in-source test modules.
+fn server_arming_roots() -> ArmingRoots {
+    ArmingRoots {
+        harness: vec![server_dir().join("tests")],
+        src: vec![server_dir().join("src")],
+    }
+}
+
+fn server_catalog_path() -> PathBuf {
+    server_dir().join("src/seams.rs")
+}
+
 fn engine_catalog_path() -> PathBuf {
     engine_dir().join("src/seams/catalog.rs")
 }
@@ -1280,6 +1299,8 @@ fn catalogs_are_complete_unique_and_used() {
     let cluster_catalog_path = cluster_catalog_path();
     let engine_roots = engine_src_roots();
     let cluster_roots = vec![cluster_dir().join("src")];
+    let server_catalog_path = server_catalog_path();
+    let server_roots = vec![server_dir().join("src")];
 
     let engine = parse_catalog(
         &engine_catalog_path,
@@ -1292,12 +1313,21 @@ fn catalogs_are_complete_unique_and_used() {
         "omnigraph_cluster::seams::catalog",
     );
 
+    let server = parse_catalog(
+        &server_catalog_path,
+        &server_roots,
+        "omnigraph_server::seams::catalog",
+    );
+
     let engine_source = source_halves(&engine_roots, &engine_catalog_path);
     let cluster_source = source_halves(&cluster_roots, &cluster_catalog_path);
     let mut engine_armers = armers(&engine_arming_roots(), Some(&gqt_cases_dir()));
     engine_armers.rust.absorb(engine_source.tests);
     let mut cluster_armers = armers(&cluster_arming_roots(), None);
     cluster_armers.rust.absorb(cluster_source.tests);
+    let server_source = source_halves(&server_roots, &server_catalog_path);
+    let mut server_armers = armers(&server_arming_roots(), None);
+    server_armers.rust.absorb(server_source.tests);
 
     let mut violations = Vec::new();
     check_catalog(
@@ -1312,6 +1342,12 @@ fn catalogs_are_complete_unique_and_used() {
         &cluster_armers,
         &mut violations,
     );
+    check_catalog(
+        &server,
+        &server_source.production,
+        &server_armers,
+        &mut violations,
+    );
     check_declaration_placement(
         &engine,
         &engine_catalog_path,
@@ -1324,7 +1360,17 @@ fn catalogs_are_complete_unique_and_used() {
         &cluster_roots,
         &mut violations,
     );
-    check_helper_pairing(&[&engine, &cluster], &files_to_scan(), &mut violations);
+    check_declaration_placement(
+        &server,
+        &server_catalog_path,
+        &server_roots,
+        &mut violations,
+    );
+    check_helper_pairing(
+        &[&engine, &cluster, &server],
+        &files_to_scan(),
+        &mut violations,
+    );
 
     assert!(
         violations.is_empty(),
@@ -1348,10 +1394,15 @@ fn arming_files_never_cross() {
                 .flat_map(|root| crossing_files(root, &engine_catalog_path())),
         )
         .chain(crossing_files(&cluster_src, &cluster_catalog_path()))
+        .chain(crossing_files(
+            &server_dir().join("src"),
+            &server_catalog_path(),
+        ))
         .collect();
     let arming: BTreeSet<PathBuf> = arming_files(&engine_arming_roots())
         .into_iter()
         .chain(arming_files(&cluster_arming_roots()))
+        .chain(arming_files(&server_arming_roots()))
         .collect();
     let both: Vec<String> = crossing
         .intersection(&arming)
@@ -1367,6 +1418,7 @@ fn arming_files_never_cross() {
         (engine_src.clone(), "the engine's in-source test modules"),
         (dst_dir(), "the DST harness"),
         (cluster_dir().join("tests"), "the cluster integration tests"),
+        (server_dir().join("tests"), "the server integration tests"),
     ] {
         assert!(
             arming.iter().any(|file| file.starts_with(&root)),

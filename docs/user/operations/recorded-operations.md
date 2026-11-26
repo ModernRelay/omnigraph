@@ -90,9 +90,9 @@ returns the existing record without starting work again. A lookup answers
 the id. `unknown` does not prove the operation never ran, and it is never a
 reason to resubmit the same work under the same id.
 
-A record that holds a `cancellation_request` is refused by a server older
-than the release that added the field (409 `operation_record_invalid`), so
-upgrade every server on a cluster together.
+A 0.16 server refuses a record in which any entry holds a
+`cancellation_request` (409 `operation_record_invalid`); see
+[rolling back to 0.16](#rolling-back-to-016).
 
 Earlier edge builds wrote `tables` and `more_tables`. If the cluster's
 operation record contains either field, submit, lookup and cancel return
@@ -169,10 +169,13 @@ per-table ceilings; a table over one never moves that position
 
 Cancellation stops the run at its next safe boundary. A cancel of an
 operation this server is running is written to the operation's record as
-`cancellation_request` (who asked, and when) before the run is told and
-before the answer, 202. From then on every state of that record keeps the
-request, whatever ends the run, and across a restart of the server. The
-terminal state says whether it took effect:
+`cancellation_request` (who asked, and when), then the run is told, then the
+answer is 202. A 202 therefore means both: the request is on the record, and
+the run received it. The run cannot end between the two, because a run joins
+and leaves this server's set of running operations only while it holds the
+same record gate the cancel holds. From then on every state of that record
+keeps the request, whatever ends the run, and across a restart of the server.
+The terminal state says whether it took effect:
 
 - `cancelled`: the run stopped before its publication and published nothing.
 - `succeeded`: the run had already started its publication, or had finished
@@ -190,7 +193,9 @@ unchanged. A cancel of a `publishing` operation that no run on this server
 holds, a publication in doubt, is refused with 409 and changes nothing: its
 commit may still land, so nothing can stop it, and it settles as described
 above. A cancel whose record write fails is answered as the refusal table
-says, and the run is not told. A shutdown and a deployment that affects the
+says, and the run is not told. After a 500 `outcome_unknown` the request may
+still have landed: the record then keeps it, and a run that finishes says
+nothing about a late cancellation, since it never received one. A shutdown and a deployment that affects the
 graph cancel the running operation the same way, without writing a
 `cancellation_request`, and the record names the reason.
 
@@ -201,3 +206,29 @@ never runs again. A retained id always answers its record first, whatever the
 mark says. Because the mark is a caller's time, an id dated more than a minute
 ahead of the server's clock is refused before it is accepted; otherwise one
 such id, once evicted, would refuse every honest id after it.
+
+## Rolling back to 0.16
+
+From 0.17.0, a cancel the server accepts is stored on the operation's entry
+in `__cluster/operations.json` as `cancellation_request`. A 0.16 server
+refuses the whole record once any entry has that field: submit, lookup and
+cancel answer 409 `operation_record_invalid`. A record with no cancellation
+request stays readable by 0.16, so a rollback before the first accepted
+cancel needs no step. An entry keeps the field until it leaves the 32 newest
+terminal operations.
+
+To roll a server back to 0.16 after it accepted a cancel:
+
+1. Look up each operation that is still `accepted`, `running` or
+   `publishing`, and wait until it is terminal. A `publishing` record settles
+   once `main` has a newer commit.
+2. Stop the 0.17.0 server.
+3. Move `__cluster/operations.json` out of the cluster root. Keep the copy:
+   it is the only record of those operations' outcomes.
+4. Start the 0.16 server. Its next submission creates a new record.
+
+This loses what the record held, as the recovery from an unreadable record
+above does: an earlier operation id answers `unknown` and is accepted as a
+new operation if it is submitted again, the eviction mark is gone, and the
+next full-catalog run starts at the first table. Do not edit the record by
+hand to remove the field.

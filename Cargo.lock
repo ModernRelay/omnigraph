@@ -5759,6 +5759,7 @@ dependencies = [
  "omnigraph-engine",
  "omnigraph-mcp",
  "omnigraph-policy",
+ "omnigraph-seams",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-proto",

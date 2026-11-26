@@ -16,6 +16,7 @@ pub use recorded_operations::OperationSettings;
 mod mcp;
 pub mod operations;
 mod redacted_cause;
+pub mod seams;
 mod settings;
 pub mod telemetry;
 use extract::{ApiJson, ApiPath, ApiQuery};

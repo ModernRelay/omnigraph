@@ -45,6 +45,7 @@ use omnigraph_cluster::{
     OperationsLock, OperationsUpdate, OptimizeOptions, Resolution, ResolutionProgress,
     TableOutcome, TailOutcome,
 };
+use omnigraph_seams::decide_seam;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::Instant;
@@ -234,7 +235,11 @@ pub(crate) struct RecordedOperations {
     pending: SyncMutex<BTreeMap<String, PendingEnding>>,
     /// One admission gate per scope, held by the owned operation.
     gates: BTreeMap<AdmissionScope, Arc<Mutex<()>>>,
-    /// The runs this process holds; changed only under the record gate.
+    /// The runs this process holds. A run joins and leaves only under the
+    /// record gate ([`Self::set_live`], [`Self::leave_live`]), and the cancel
+    /// route decides liveness under it ([`Self::is_live`]), so a run cannot
+    /// leave between that decision and the delivery the route makes under
+    /// the same gate.
     live: SyncMutex<Vec<LiveRun>>,
 }
 
@@ -254,6 +259,9 @@ impl RecordedOperations {
         }
     }
 
+    /// The live runs' ids as they stand. Outside the record gate this is a
+    /// hint for a response (`in_progress`, an unlocked lookup); a decision
+    /// that must hold until a later step takes the gate first.
     fn live_ids(&self) -> Vec<String> {
         self.live
             .lock()
@@ -263,14 +271,24 @@ impl RecordedOperations {
             .collect()
     }
 
-    fn set_live(&self, run: LiveRun) {
+    /// Whether `operation_id` is live, decided under the record gate: it
+    /// stays so until the gate is released.
+    fn is_live(&self, _lock: &OperationsLock, operation_id: &str) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|run| run.operation_id == operation_id)
+    }
+
+    fn set_live(&self, _lock: &OperationsLock, run: LiveRun) {
         self.live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(run);
     }
 
-    fn clear_live(&self, operation_id: &str) {
+    fn leave_live(&self, _lock: &OperationsLock, operation_id: &str) {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         live.retain(|run| run.operation_id != operation_id);
     }
@@ -885,7 +903,7 @@ pub(crate) async fn start_optimize(
             let cancellation = OptimizeCancellation::new();
             let landed = answer.is_ok();
             if landed {
-                run_state.recorded.set_live(LiveRun {
+                run_state.recorded.set_live(&lock, LiveRun {
                     operation_id: operation_id.clone(),
                     graph: operation.graph.clone(),
                     cancellation: cancellation.clone(),
@@ -940,6 +958,13 @@ async fn owner_record(owner: &ClusterAdmission, operation_id: &str) -> Option<Op
         .cloned()
 }
 
+decide_seam! {
+    /// After a run's `running` write, before the run acts on its answer. A
+    /// failure here is that answer lost: the run does not start, and a later
+    /// access records it `interrupted`.
+    pub static RECORDED_OPERATION_START_ANSWER = ("recorded_operation.start_answer", Unreachable, [Fail]);
+}
+
 /// Apply `change` to the active operation and write the record once.
 async fn transition(
     state: &AppState,
@@ -948,7 +973,18 @@ async fn transition(
     change: impl FnOnce(&mut Operation),
 ) -> Result<(), String> {
     let lock = owner.lock_operations().await;
-    let updated = update(state, owner, &lock, &[], |record| {
+    transition_under(state, owner, &lock, operation_id, change).await
+}
+
+/// [`transition`] under a record gate the caller holds.
+async fn transition_under(
+    state: &AppState,
+    owner: &ClusterAdmission,
+    lock: &OperationsLock,
+    operation_id: &str,
+    change: impl FnOnce(&mut Operation),
+) -> Result<(), String> {
+    let updated = update(state, owner, lock, &[], |record| {
         match record.active_mut(operation_id) {
             Some(active) => {
                 change(active);
@@ -991,15 +1027,27 @@ async fn run(
     let span = tracing::Span::current();
 
     // `running` in doubt: no table work starts, and the next admission or
-    // lookup records the run `interrupted`.
-    if let Err(error) = transition(&state, &owner, &id, |active| {
-        active.state = OperationState::Running;
-    })
-    .await
+    // lookup records the run `interrupted`. The run leaves the live set under
+    // the gate its failed write held, so a cancel never finds it live and
+    // then answers for a run that has gone.
     {
-        tracing::warn!(operation_id = %id, %error, "recorded operation did not start");
-        state.recorded.clear_live(&id);
-        return Ok(()).into();
+        let lock = owner.lock_operations().await;
+        let started = transition_under(&state, &owner, &lock, &id, |active| {
+            active.state = OperationState::Running;
+        })
+        .await
+        .and_then(|()| {
+            if crate::seams::fail(&RECORDED_OPERATION_START_ANSWER) {
+                Err("injected: the `running` write's answer was lost".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = started {
+            tracing::warn!(operation_id = %id, %error, "recorded operation did not start");
+            state.recorded.leave_live(&lock, &id);
+            return Ok(()).into();
+        }
     }
 
     // Shutdown and containment close admission; the run stops at its next
@@ -1171,7 +1219,7 @@ async fn run(
                 Ending::Unresolved(reason) => record.defer_publication(&id, reason.clone()).is_ok(),
                 Ending::Silent => false,
             };
-            state.recorded.clear_live(&id);
+            state.recorded.leave_live(&lock, &id);
             (changed, ())
         })
         .await;
@@ -1179,7 +1227,7 @@ async fn run(
             // Whatever kept the write from landing, the outcome is known
             // here; it is applied again at the next access to the record as
             // it then stands.
-            state.recorded.clear_live(&id);
+            state.recorded.leave_live(&lock, &id);
             if let Some(pending) = pending {
                 state
                     .recorded
@@ -1368,7 +1416,7 @@ async fn find_authorized(
     // The orphans were settled above, so a non-terminal record no run here
     // holds is a publication in doubt: nothing can stop it, and it settles
     // from history (RFC §1.9). The cancellation is refused, changing nothing.
-    if !state.recorded.live_ids().contains(&op.operation_id) {
+    if !state.recorded.is_live(&lock, &op.operation_id) {
         return Err(ApiError::conflict(format!(
             "[operation_publication_in_doubt] operation {operation_id} is publishing and no run on this server holds it, so its publication may still land and a cancellation cannot stop it; nothing changed. Look the operation up until main's history settles it"
         ))
@@ -1377,7 +1425,9 @@ async fn find_authorized(
     // The request is on the record before the run is told and before the
     // answer: every later state of the record keeps it, whatever ends the
     // run and across a restart, so a 202 and the terminal record agree. A
-    // write that did not land tells the run nothing.
+    // write that did not land tells the run nothing. The run found live above
+    // stays live until this gate is released, since it joins and leaves the
+    // live set only under the gate, so the delivery below reaches it.
     let request = CancellationRequest::now(actor);
     let written = update(state, &owner, &lock, &[], |record| {
         let changed = record
@@ -1386,13 +1436,33 @@ async fn find_authorized(
         (changed, record.find(&graph, operation_id).cloned())
     })
     .await?;
-    state.recorded.cancel_under(
+    if crate::seams::fail(&RECORDED_OPERATION_CANCEL_ANSWER) {
+        return Err(outcome_unknown(
+            operation_id,
+            "injected: the answer was lost; the run was not told",
+        ));
+    }
+    let told = state.recorded.cancel_under(
         &lock,
         Some(operation_id),
         None,
         &format!("cancelled by {actor}"),
     );
+    // Unreachable while the live set changes only under the gate this route
+    // holds; never answered 202 if it ever is.
+    if !told {
+        return Err(ApiError::internal(format!(
+            "operation {operation_id} has the cancellation request on its record, but no run on this server received it; look the operation up"
+        )));
+    }
     Ok(written.value)
+}
+
+decide_seam! {
+    /// In the cancel route, after it wrote the request under the record gate
+    /// and before it tells the run. A failure here is the write's answer
+    /// lost: the route answers `outcome_unknown` and the run is not told.
+    pub static RECORDED_OPERATION_CANCEL_ANSWER = ("recorded_operation.cancel_answer", Unreachable, [Fail]);
 }
 
 #[utoipa::path(
@@ -1702,7 +1772,8 @@ mod tests {
     fn cancellation_reaches_only_the_named_run() {
         let runtime = RecordedOperations::default();
         let cancellation = OptimizeCancellation::new();
-        runtime.set_live(LiveRun {
+        // Joining needs the record gate; the routing of a cancellation does not.
+        runtime.live.lock().unwrap().push(LiveRun {
             operation_id: "01JBQZ00000000000000000001".to_string(),
             graph: "g".to_string(),
             cancellation: cancellation.clone(),
@@ -1719,7 +1790,5 @@ mod tests {
                 .as_deref(),
             Some("deployment d")
         );
-        runtime.clear_live("01JBQZ00000000000000000001");
-        assert!(runtime.live_ids().is_empty());
     }
 }

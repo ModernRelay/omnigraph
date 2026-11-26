@@ -25,6 +25,7 @@ omnigraph-policy = { path = "../omnigraph-policy", version = "0.16.1" }
 omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.16.1" }
 omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.16.1" }
 omnigraph-mcp = { path = "../omnigraph-mcp", version = "0.16.1" }
+omnigraph-seams = { path = "../omnigraph-seams", version = "0.16.1" }
 axum = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }

@@ -184,6 +184,10 @@ to bypass the refusal.
 
 ### Cluster state and rollback
 
+To roll a cluster server back from 0.17.0 to 0.16 after it accepted a
+recorded-operation cancel, follow
+[rolling back to 0.16](recorded-operations.md#rolling-back-to-016).
+
 For the historical v0.10-to-v0.9 rollback, including `external_blobs` state,
 follow the [tagged rollback procedure](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md#cluster-state-and-rollback)
 with those binaries. It is not a downgrade path from v0.14.

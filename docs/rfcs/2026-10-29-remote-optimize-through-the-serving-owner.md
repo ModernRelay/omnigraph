@@ -1670,5 +1670,9 @@ dated pending entry in its decision log:
   that every later state keeps it; §2.2's per-operation row gained the
   request. The route table's “a `publishing` record unchanged” became a 409
   refusal when no run holds the record, since nothing can stop it, and a
-  202 only while a run on the server holds it. The record gains one optional
-  field, so a server older than this change refuses a record that holds it.
+  202 only while a run on the server holds it. A run joins and leaves the
+  server's live set only under the record gate the cancel route decides and
+  delivers under, so a run whose start failed cannot leave between the
+  route's liveness check and its delivery. The record gains one optional
+  field, so a 0.16 server refuses a record that holds it; the recorded
+  operations guide gives the rollback procedure.
