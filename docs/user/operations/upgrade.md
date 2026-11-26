@@ -7,8 +7,10 @@ graph at v8 or v9 (release 0.11.x) or at v13 is converted in place by that offli
 format, and every cluster-managed graph below v14, is refused and takes the
 [export/import rebuild](#rebuild) with the binary that wrote the graph.
 
-For an upgrade from 0.15.0, check your graph format, access policies and
-maintenance scripts against the [0.16.0 upgrade actions](../../releases/v0.16.0-overview.md#upgrade-actions).
+For an upgrade from 0.16.x, check your graph format, graph listings and
+MCP integrations against the [0.17.0 upgrade actions](../../releases/v0.17.0.md#upgrade-actions).
+From 0.15.0, also check your access policies and maintenance scripts against
+the [0.16.0 upgrade actions](../../releases/v0.16.0-overview.md#upgrade-actions).
 Start with the [0.13 → 0.14 checklist](upgrade-0.14.md) for fleet,
 CLI configuration, HTTP/MCP, and client compatibility changes.
 

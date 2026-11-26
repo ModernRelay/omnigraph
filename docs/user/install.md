@@ -225,7 +225,7 @@ is the commit a packaged build was compiled from; a plain source build reports
 it as null and prints no `commit` line. `omnigraph --version` (`-v`) prints
 only the first line.
 
-A server older than 0.16.1 has no `--version` flag. A running server of any
+A server older than 0.17.0 has no `--version` flag. A running server of any
 release reports its package version as `version`, its commit as
 `source_version` and the storage format it writes as `internal_schema_version`
 on `GET /healthz`.
