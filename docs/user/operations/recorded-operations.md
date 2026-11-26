@@ -90,6 +90,10 @@ returns the existing record without starting work again. A lookup answers
 the id. `unknown` does not prove the operation never ran, and it is never a
 reason to resubmit the same work under the same id.
 
+A server older than 0.17.1 refuses a record in which any entry holds a
+`cancellation_request` (409 `operation_record_invalid`); see
+[rolling back from 0.17.1](#rolling-back-from-0171).
+
 Earlier edge builds wrote `tables` and `more_tables`. If the cluster's
 operation record contains either field, submit, lookup and cancel return
 HTTP 409 with `operation_record_invalid` after upgrading. No copy of that
@@ -102,7 +106,7 @@ submitted again, and the next full-catalog run starts at the first table.
 
 | Refusal | Status |
 |---|---|
-| The same id with a different request (message prefix `[operation_request_mismatch]`); an id at or before the record's eviction mark (`[operation_id_expired]`, mint a new one); an outstanding deployment; four unresolved publications; a record from another ledger at this root (`[operation_record_foreign]`); a cluster state file whose text is not valid cluster state (`[invalid_state_json]`) or an operation record whose text is not a valid record (`[operation_record_invalid]`; restore the object from a trusted copy, while bytes that are not text answer 500) | 409 `conflict` |
+| A cancel of a `publishing` operation that no run on this server holds (`[operation_publication_in_doubt]`; nothing changed, look it up until it settles); the same id with a different request (message prefix `[operation_request_mismatch]`); an id at or before the record's eviction mark (`[operation_id_expired]`, mint a new one); an outstanding deployment; four unresolved publications; a record from another ledger at this root (`[operation_record_foreign]`); a cluster state file whose text is not valid cluster state (`[invalid_state_json]`) or an operation record whose text is not a valid record (`[operation_record_invalid]`; restore the object from a trusted copy, while bytes that are not text answer 500) | 409 `conflict` |
 | Another operation is active in the maintenance scope (its id is in the message), or the scope is admitting one | 429 `too_many_requests`, with `Retry-After` |
 | A gate hold above the server's ceiling, an `operation_id` that is not a canonical ULID, or one dated more than a minute ahead of the server's clock | 400 `bad_request` |
 | The routes are off, the server is draining, the graph is closing for a deployment, a storage read of the cluster state file, its lock or the operation record failed temporarily or for an unknown reason (message prefix `[state_read_error]`, `[state_lock_read_error]` or `[operation_record_read_error]`; send the same request again), or the record write was refused and nothing was accepted (`effects: none`). A refusal that names an earlier request of unknown outcome clears once a read sees the record change; for an unconditional write, or a create whose record never appeared, it holds until the server restarts | 503 `service_unavailable` |
@@ -163,11 +167,37 @@ there, so successive bounded runs reach every table that fits the server's
 per-table ceilings; a table over one never moves that position
 ([table ceilings](#table-ceilings-and-the-byte-budget)).
 
-Cancellation stops the run at its next safe boundary. A run that already
-started its publication finishes it and reports that the cancellation arrived
-late; a run that had finished its tables with nothing to publish reports that
-instead. A shutdown and a deployment that affects the graph cancel the running
-operation the same way, and the record names the reason.
+Cancellation stops the run at its next safe boundary. A cancel of an
+operation this server is running is written to the operation's record as
+`cancellation_request` (who asked, and when), then the run is told, then the
+answer is 202. A 202 therefore means both: the request is on the record, and
+the run received it. The run cannot end between the two, because a run joins
+and leaves this server's set of running operations only while it holds the
+same record gate the cancel holds. From then on every state of that record
+keeps the request, whatever ends the run, and across a restart of the server.
+The terminal state says whether it took effect:
+
+- `cancelled`: the run stopped before its publication and published nothing.
+- `succeeded`: the run had already started its publication, or had finished
+  its tables with nothing to publish, and `reason` says the cancellation
+  arrived late. A run still in its publication finishes it; an adjacency
+  artifact refresh whose write has not started is skipped
+  (`outcome.artifact` is `skipped` with detail `cancelled`). A publication
+  that ended in doubt and settled from `main`'s history as `succeeded` has no
+  such reason; the request is still on the record.
+- `failed`, `interrupted` or `unsettled`: the run ended for its own reason
+  first, which `reason` gives; `failed` and `interrupted` published nothing.
+
+A cancel that arrives after the record is terminal answers 200 with the record
+unchanged. A cancel of a `publishing` operation that no run on this server
+holds, a publication in doubt, is refused with 409 and changes nothing: its
+commit may still land, so nothing can stop it, and it settles as described
+above. A cancel whose record write fails is answered as the refusal table
+says, and the run is not told. After a 500 `outcome_unknown` the request may
+still have landed: the record then keeps it, and a run that finishes says
+nothing about a late cancellation, since it never received one. A shutdown and a deployment that affects the
+graph cancel the running operation the same way, without writing a
+`cancellation_request`, and the record names the reason.
 
 The record keeps the 32 newest terminal operations and the time of the newest
 id it evicted: an older id answers `unknown`, and a submission under an id
@@ -176,3 +206,36 @@ never runs again. A retained id always answers its record first, whatever the
 mark says. Because the mark is a caller's time, an id dated more than a minute
 ahead of the server's clock is refused before it is accepted; otherwise one
 such id, once evicted, would refuse every honest id after it.
+
+## Rolling back from 0.17.1
+
+From 0.17.1, the cancel route stores the request on the operation's entry in
+`__cluster/operations.json` as `cancellation_request`. A server older than
+0.17.1 (0.17.0, 0.16 and earlier) does not know the field and refuses the
+whole record once any entry has it: every recorded-operation route answers
+409 `operation_record_invalid`, and a graph deletion leaves the record as it
+is. The rest of the server and every graph are unaffected.
+
+The field is written by a cancel answered 202, and can also be written by a
+cancel answered 500 `outcome_unknown`, whose write may have landed. So decide
+from the record, not from the answers you saw. An entry keeps the field until
+it leaves the 32 newest terminal operations, and an unresolved publication
+keeps it until it settles.
+
+To roll a server back from 0.17.1 to an older release:
+
+1. Stop sending cancels. Look up each operation that is still `accepted`,
+   `running` or `publishing`, and wait until it is terminal. A `publishing`
+   record settles once `main` has a newer commit.
+2. Stop the 0.17.1 server.
+3. Read `__cluster/operations.json`. If no entry contains
+   `cancellation_request`, start the older server: nothing else is needed.
+4. Otherwise move the file out of the cluster root and keep the copy: it is
+   the only record of those operations' outcomes. Then start the older
+   server. Its next submission creates a new record.
+
+Moving the record aside loses what it held, as the recovery from an
+unreadable record above does: an earlier operation id answers `unknown` and
+is accepted as a new operation if it is submitted again, the eviction mark is
+gone, and the next full-catalog run starts at the first table. Do not edit the
+record by hand to remove the field.

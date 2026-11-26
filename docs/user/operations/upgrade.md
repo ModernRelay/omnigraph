@@ -187,6 +187,11 @@ to bypass the refusal.
 
 ### Cluster state and rollback
 
+To roll a cluster server back from 0.17.1 to 0.17.0 or an earlier release,
+check its operation record first, as
+[rolling back from 0.17.1](recorded-operations.md#rolling-back-from-0171)
+says: an older server refuses the record once a cancel has written to it.
+
 For the historical v0.10-to-v0.9 rollback, including `external_blobs` state,
 follow the [tagged rollback procedure](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md#cluster-state-and-rollback)
 with those binaries. It is not a downgrade path from v0.14.

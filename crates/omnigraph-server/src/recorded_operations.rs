@@ -5,7 +5,8 @@
 //! every change of the operation's state go through the cluster's record,
 //! `__cluster/operations.json`, which this process, the lock holder, writes
 //! with one conditional put each time: at acceptance, when the run starts,
-//! before its publication and at its end. The run is an owned server
+//! before its publication, at its end, and when a cancellation is accepted,
+//! before the run is told. The run is an owned server
 //! operation and holds its graph request, so a deployment that affects the
 //! graph cancels it before draining it, and shutdown cancels it too.
 //!
@@ -39,10 +40,12 @@ use omnigraph::db::{
     RunCancellation, TableCeilings, TableOptimizeOutcome,
 };
 use omnigraph_cluster::{
-    AdmissionRefusal, AdmissionScope, Admitted, ClusterAdmission, Operation, OperationKind,
-    OperationRecord, OperationRequest, OperationState, OperationWrite, OperationsLock,
-    OperationsUpdate, OptimizeOptions, Resolution, ResolutionProgress, TableOutcome, TailOutcome,
+    AdmissionRefusal, AdmissionScope, Admitted, CancellationRequest, ClusterAdmission, Operation,
+    OperationKind, OperationRecord, OperationRequest, OperationState, OperationWrite,
+    OperationsLock, OperationsUpdate, OptimizeOptions, Resolution, ResolutionProgress,
+    TableOutcome, TailOutcome,
 };
+use omnigraph_seams::decide_seam;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::Instant;
@@ -232,7 +235,11 @@ pub(crate) struct RecordedOperations {
     pending: SyncMutex<BTreeMap<String, PendingEnding>>,
     /// One admission gate per scope, held by the owned operation.
     gates: BTreeMap<AdmissionScope, Arc<Mutex<()>>>,
-    /// The runs this process holds; changed only under the record gate.
+    /// The runs this process holds. A run joins and leaves only under the
+    /// record gate ([`Self::set_live`], [`Self::leave_live`]), and the cancel
+    /// route decides liveness under it ([`Self::is_live`]), so a run cannot
+    /// leave between that decision and the delivery the route makes under
+    /// the same gate.
     live: SyncMutex<Vec<LiveRun>>,
 }
 
@@ -252,6 +259,9 @@ impl RecordedOperations {
         }
     }
 
+    /// The live runs' ids as they stand. Outside the record gate this is a
+    /// hint for a response (`in_progress`, an unlocked lookup); a decision
+    /// that must hold until a later step takes the gate first.
     fn live_ids(&self) -> Vec<String> {
         self.live
             .lock()
@@ -261,14 +271,24 @@ impl RecordedOperations {
             .collect()
     }
 
-    fn set_live(&self, run: LiveRun) {
+    /// Whether `operation_id` is live, decided under the record gate: it
+    /// stays so until the gate is released.
+    fn is_live(&self, _lock: &OperationsLock, operation_id: &str) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|run| run.operation_id == operation_id)
+    }
+
+    fn set_live(&self, _lock: &OperationsLock, run: LiveRun) {
         self.live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(run);
     }
 
-    fn clear_live(&self, operation_id: &str) {
+    fn leave_live(&self, _lock: &OperationsLock, operation_id: &str) {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         live.retain(|run| run.operation_id != operation_id);
     }
@@ -883,7 +903,7 @@ pub(crate) async fn start_optimize(
             let cancellation = OptimizeCancellation::new();
             let landed = answer.is_ok();
             if landed {
-                run_state.recorded.set_live(LiveRun {
+                run_state.recorded.set_live(&lock, LiveRun {
                     operation_id: operation_id.clone(),
                     graph: operation.graph.clone(),
                     cancellation: cancellation.clone(),
@@ -938,6 +958,13 @@ async fn owner_record(owner: &ClusterAdmission, operation_id: &str) -> Option<Op
         .cloned()
 }
 
+decide_seam! {
+    /// After a run's `running` write, before the run acts on its answer. A
+    /// failure here is that answer lost: the run does not start, and a later
+    /// access records it `interrupted`.
+    pub static RECORDED_OPERATION_START_ANSWER = ("recorded_operation.start_answer", Unreachable, [Fail]);
+}
+
 /// Apply `change` to the active operation and write the record once.
 async fn transition(
     state: &AppState,
@@ -946,7 +973,18 @@ async fn transition(
     change: impl FnOnce(&mut Operation),
 ) -> Result<(), String> {
     let lock = owner.lock_operations().await;
-    let updated = update(state, owner, &lock, &[], |record| {
+    transition_under(state, owner, &lock, operation_id, change).await
+}
+
+/// [`transition`] under a record gate the caller holds.
+async fn transition_under(
+    state: &AppState,
+    owner: &ClusterAdmission,
+    lock: &OperationsLock,
+    operation_id: &str,
+    change: impl FnOnce(&mut Operation),
+) -> Result<(), String> {
+    let updated = update(state, owner, lock, &[], |record| {
         match record.active_mut(operation_id) {
             Some(active) => {
                 change(active);
@@ -989,15 +1027,27 @@ async fn run(
     let span = tracing::Span::current();
 
     // `running` in doubt: no table work starts, and the next admission or
-    // lookup records the run `interrupted`.
-    if let Err(error) = transition(&state, &owner, &id, |active| {
-        active.state = OperationState::Running;
-    })
-    .await
+    // lookup records the run `interrupted`. The run leaves the live set under
+    // the gate its failed write held, so a cancel never finds it live and
+    // then answers for a run that has gone.
     {
-        tracing::warn!(operation_id = %id, %error, "recorded operation did not start");
-        state.recorded.clear_live(&id);
-        return Ok(()).into();
+        let lock = owner.lock_operations().await;
+        let started = transition_under(&state, &owner, &lock, &id, |active| {
+            active.state = OperationState::Running;
+        })
+        .await
+        .and_then(|()| {
+            if crate::seams::fail(&RECORDED_OPERATION_START_ANSWER) {
+                Err("injected: the `running` write's answer was lost".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = started {
+            tracing::warn!(operation_id = %id, %error, "recorded operation did not start");
+            state.recorded.leave_live(&lock, &id);
+            return Ok(()).into();
+        }
     }
 
     // Shutdown and containment close admission; the run stops at its next
@@ -1084,7 +1134,6 @@ async fn run(
         .optimize_as(Some(operation.principal.as_str()), request)
         .await;
     watch.abort();
-    let cancel_reason = state.recorded.cancel_reason(&id);
 
     if let Some(nonce) = publishing_nonce
         .lock()
@@ -1095,61 +1144,67 @@ async fn run(
     }
     operation.timings.queued_ms = Some(started.duration_since(accepted_at).as_millis() as u64);
     operation.timings.compute_ms = Some(started.elapsed().as_millis() as u64);
-    let (ending, failure) = match result {
-        Ok(report) => (
-            Ending::Terminal(Box::new(terminal_from_report(
-                operation,
-                &report,
-                cancel_reason,
-            ))),
-            None,
-        ),
-        Err(error) => {
-            let landed = publishing_landed.load(std::sync::atomic::Ordering::SeqCst);
-            let in_doubt = publishing_in_doubt.load(std::sync::atomic::Ordering::SeqCst);
-            let uncertain = matches!(
-                error.completion_evidence(),
-                Some(omnigraph::error::CompletionEvidence::Uncertain) | None
-            );
-            let message = error.to_string();
-            let ending = if in_doubt {
-                Ending::Silent
-            } else if landed && uncertain {
-                Ending::Unresolved(format!("the publication has no definite answer: {message}"))
-            } else {
-                operation.state = OperationState::Failed;
-                operation.reason = Some(omnigraph_cluster::truncate_detail(message));
-                Ending::Terminal(Box::new(operation))
-            };
-            (ending, Some(ApiError::from_omni(error)))
-        }
-    };
-    match &ending {
-        Ending::Terminal(terminal) => {
-            if let Some(nonce) = &terminal.nonce {
-                span.record("nonce", nonce.as_str());
-            }
-            if let Some(commit) = &terminal.published_commit {
-                span.record("commit", commit.as_str());
-            }
-            tracing::info!(
-                state = ?terminal.state,
-                gate_hold_ms = terminal.timings.gate_hold_ms,
-                compute_ms = terminal.timings.compute_ms,
-                "recorded operation ended"
-            );
-        }
-        Ending::Unresolved(reason) => {
-            tracing::warn!(%reason, "recorded operation's publication is unresolved");
-        }
-        Ending::Silent => {
-            tracing::warn!("recorded operation's publishing write is in doubt");
-        }
-    }
-    {
+    let failure = {
         // The run leaves the live set in the same step as its final write, so
         // a lookup under the gate never meets an ended run still marked active.
+        // The ending is decided under the same gate.
         let lock = owner.lock_operations().await;
+        let (ending, failure) = match result {
+            // The cancellation is read under the record gate, where the
+            // cancel route writes its request and tells the run: a request
+            // it answered 202 is in this ending's reason, and a later one
+            // finds the terminal record. The request itself is the record's,
+            // and `finish` keeps it on every ending, a failed one included.
+            Ok(report) => (
+                Ending::Terminal(Box::new(terminal_from_report(
+                    operation,
+                    &report,
+                    state.recorded.cancel_reason(&id),
+                ))),
+                None,
+            ),
+            Err(error) => {
+                let landed = publishing_landed.load(std::sync::atomic::Ordering::SeqCst);
+                let in_doubt = publishing_in_doubt.load(std::sync::atomic::Ordering::SeqCst);
+                let uncertain = matches!(
+                    error.completion_evidence(),
+                    Some(omnigraph::error::CompletionEvidence::Uncertain) | None
+                );
+                let message = error.to_string();
+                let ending = if in_doubt {
+                    Ending::Silent
+                } else if landed && uncertain {
+                    Ending::Unresolved(format!("the publication has no definite answer: {message}"))
+                } else {
+                    operation.state = OperationState::Failed;
+                    operation.reason = Some(omnigraph_cluster::truncate_detail(message));
+                    Ending::Terminal(Box::new(operation))
+                };
+                (ending, Some(ApiError::from_omni(error)))
+            }
+        };
+        match &ending {
+            Ending::Terminal(terminal) => {
+                if let Some(nonce) = &terminal.nonce {
+                    span.record("nonce", nonce.as_str());
+                }
+                if let Some(commit) = &terminal.published_commit {
+                    span.record("commit", commit.as_str());
+                }
+                tracing::info!(
+                    state = ?terminal.state,
+                    gate_hold_ms = terminal.timings.gate_hold_ms,
+                    compute_ms = terminal.timings.compute_ms,
+                    "recorded operation ended"
+                );
+            }
+            Ending::Unresolved(reason) => {
+                tracing::warn!(%reason, "recorded operation's publication is unresolved");
+            }
+            Ending::Silent => {
+                tracing::warn!("recorded operation's publishing write is in doubt");
+            }
+        }
         let pending = match &ending {
             Ending::Terminal(terminal) => Some(PendingEnding::Finish(terminal.clone())),
             Ending::Unresolved(reason) => Some(PendingEnding::Defer {
@@ -1164,7 +1219,7 @@ async fn run(
                 Ending::Unresolved(reason) => record.defer_publication(&id, reason.clone()).is_ok(),
                 Ending::Silent => false,
             };
-            state.recorded.clear_live(&id);
+            state.recorded.leave_live(&lock, &id);
             (changed, ())
         })
         .await;
@@ -1172,7 +1227,7 @@ async fn run(
             // Whatever kept the write from landing, the outcome is known
             // here; it is applied again at the next access to the record as
             // it then stands.
-            state.recorded.clear_live(&id);
+            state.recorded.leave_live(&lock, &id);
             if let Some(pending) = pending {
                 state
                     .recorded
@@ -1183,7 +1238,8 @@ async fn run(
             }
             tracing::warn!(operation_id = %id, error = %error.message, "the recorded operation's final record write did not land; a later access re-applies it");
         }
-    }
+        failure
+    };
     match failure {
         // A failure that leaves storage in doubt contains the process, as any
         // other owned write's does; the record already holds the outcome.
@@ -1252,16 +1308,20 @@ fn terminal_from_report(
             },
         ));
     }
+    // The engine samples its cancellation once more after the run, so a
+    // request that came after that sample is late although the report says
+    // `NotRequested`: the request the route recorded decides it.
+    let late = report.cancellation == RunCancellation::ArrivedLate || cancel_reason.is_some();
     match report.cancellation {
         RunCancellation::Cancelled => {
             operation.state = OperationState::Cancelled;
             operation.reason = Some(cancel_reason.unwrap_or_else(|| "cancelled".to_string()));
         }
-        RunCancellation::ArrivedLate => {
+        _ if late => {
             operation.state = OperationState::Succeeded;
-            // The engine reports a late cancellation for every run that
-            // passed its last cancellation point, a run that staged nothing
-            // included: only a run with a commit started a publication.
+            // A cancellation that missed the run's last cancellation point is
+            // late for every run, a run that staged nothing included: only a
+            // run with a commit started a publication.
             let passed = if report.graph_commit_id.is_some() {
                 "after the publication started"
             } else {
@@ -1318,7 +1378,9 @@ async fn unlocked_answer(
 
 /// Find the record under the gate and authorize the actor for its kind's
 /// grant; an unknown id is authorized for the start kind, so the refusal
-/// says nothing about which ids exist.
+/// says nothing about which ids exist. With `cancel_by`, a non-terminal
+/// record takes the cancellation request before the live run is told, and a
+/// publication in doubt refuses it.
 async fn find_authorized(
     state: &AppState,
     handle: &GraphRequest,
@@ -1345,18 +1407,62 @@ async fn find_authorized(
         .as_ref()
         .map_or(OperationKind::Optimize, Operation::kind);
     authorize(handle, actor, kind)?;
-    if let (Some(actor), Some(op)) = (cancel_by, &operation)
-        && !op.state.is_terminal()
-        && op.state != OperationState::Publishing
-    {
-        state.recorded.cancel_under(
-            &lock,
-            Some(&op.operation_id),
-            None,
-            &format!("cancelled by {actor}"),
-        );
+    let (Some(actor), Some(op)) = (cancel_by, &operation) else {
+        return Ok(operation);
+    };
+    if op.state.is_terminal() {
+        return Ok(operation);
     }
-    Ok(operation)
+    // The orphans were settled above, so a non-terminal record no run here
+    // holds is a publication in doubt: nothing can stop it, and it settles
+    // from history (RFC §1.9). The cancellation is refused, changing nothing.
+    if !state.recorded.is_live(&lock, &op.operation_id) {
+        return Err(ApiError::conflict(format!(
+            "[operation_publication_in_doubt] operation {operation_id} is publishing and no run on this server holds it, so its publication may still land and a cancellation cannot stop it; nothing changed. Look the operation up until main's history settles it"
+        ))
+        .applied_nothing());
+    }
+    // The request is on the record before the run is told and before the
+    // answer: every later state of the record keeps it, whatever ends the
+    // run and across a restart, so a 202 and the terminal record agree. A
+    // write that did not land tells the run nothing. The run found live above
+    // stays live until this gate is released, since it joins and leaves the
+    // live set only under the gate, so the delivery below reaches it.
+    let request = CancellationRequest::now(actor);
+    let written = update(state, &owner, &lock, &[], |record| {
+        let changed = record
+            .request_cancellation(operation_id, request)
+            .unwrap_or(false);
+        (changed, record.find(&graph, operation_id).cloned())
+    })
+    .await?;
+    if crate::seams::fail(&RECORDED_OPERATION_CANCEL_ANSWER) {
+        return Err(outcome_unknown(
+            operation_id,
+            "injected: the answer was lost; the run was not told",
+        ));
+    }
+    let told = state.recorded.cancel_under(
+        &lock,
+        Some(operation_id),
+        None,
+        &format!("cancelled by {actor}"),
+    );
+    // Unreachable while the live set changes only under the gate this route
+    // holds; never answered 202 if it ever is.
+    if !told {
+        return Err(ApiError::internal(format!(
+            "operation {operation_id} has the cancellation request on its record, but no run on this server received it; look the operation up"
+        )));
+    }
+    Ok(written.value)
+}
+
+decide_seam! {
+    /// In the cancel route, after it wrote the request under the record gate
+    /// and before it tells the run. A failure here is the write's answer
+    /// lost: the route answers `outcome_unknown` and the run is not told.
+    pub static RECORDED_OPERATION_CANCEL_ANSWER = ("recorded_operation.cancel_answer", Unreachable, [Fail]);
 }
 
 #[utoipa::path(
@@ -1390,11 +1496,11 @@ pub(crate) async fn get_operation(
     params(("operation_id" = String, Path, description = "The id the caller submitted")),
     responses(
         (status = 200, description = "The operation is terminal, unchanged; or `lookup: unknown`", body = OperationOutput),
-        (status = 202, description = "Cancellation requested; a `publishing` operation is unchanged", body = OperationOutput),
+        (status = 202, description = "The request is on the operation's record (`cancellation_request`) and the run on this server is told; every later state of the record keeps it, and its terminal state says whether it took effect: `cancelled` if the run stopped, otherwise the run's own outcome. A `publishing` run still finishes its publication, and an artifact refresh whose write has not started is skipped", body = OperationOutput),
         (status = 403, body = crate::api::ErrorOutput),
-        (status = 409, description = "Conflict (code `conflict`): a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)", body = crate::api::ErrorOutput),
-        (status = 500, description = "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a resolution write with no definite answer (code `outcome_unknown`); look the operation up by its id", body = crate::api::ErrorOutput),
-        (status = 503, description = "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed, retry", body = crate::api::ErrorOutput),
+        (status = 409, description = "Conflict (code `conflict`): the operation is `publishing` and no run on this server holds it, so its publication may still land and nothing can stop it (`[operation_publication_in_doubt]`; nothing changed, look it up until it settles); a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)", body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a record write with no definite answer (code `outcome_unknown`): the request may be on the record or not, and the run was not told; look the operation up by its id", body = crate::api::ErrorOutput),
+        (status = 503, description = "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed and the run was not told, retry", body = crate::api::ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1582,11 +1688,12 @@ mod tests {
         )
     }
 
-    /// The engine reports a late cancellation for every run that passed its
-    /// last cancellation point, so the record says a publication started
-    /// only when the run has a commit.
+    /// A cancellation that missed the run's last cancellation point is late,
+    /// whether the engine saw it (`ArrivedLate`) or it came after the
+    /// engine's final sample (`NotRequested` with a recorded request), and
+    /// the record says a publication started only when the run has a commit.
     #[tokio::test]
-    async fn a_late_cancellation_names_a_publication_only_when_one_started() {
+    async fn a_late_cancellation_names_a_publication_only_when_one_started_issue_1554() {
         let (_dir, mut report) = report_with_one_table().await;
         report.cancellation = RunCancellation::ArrivedLate;
 
@@ -1609,6 +1716,35 @@ mod tests {
             published.reason.as_deref(),
             Some("a cancellation arrived after the publication started")
         );
+
+        // After the engine's final sample, only the route's record of the
+        // request says it came.
+        report.cancellation = RunCancellation::NotRequested;
+        let after_sample = terminal_from_report(
+            accepted(),
+            &report,
+            Some("cancelled by operator".to_string()),
+        );
+        assert_eq!(after_sample.state, OperationState::Succeeded);
+        assert_eq!(
+            after_sample.reason.as_deref(),
+            Some("a cancellation arrived after the publication started: cancelled by operator")
+        );
+        report.graph_commit_id = None;
+        let idle_after_sample = terminal_from_report(
+            accepted(),
+            &report,
+            Some("cancelled by operator".to_string()),
+        );
+        assert_eq!(
+            idle_after_sample.reason.as_deref(),
+            Some(
+                "a cancellation arrived after the run had finished its tables, with nothing to publish: cancelled by operator"
+            )
+        );
+        let uncancelled = terminal_from_report(accepted(), &report, None);
+        assert_eq!(uncancelled.state, OperationState::Succeeded);
+        assert_eq!(uncancelled.reason, None);
     }
 
     /// An optimized table whose index link failed after its rewrite keeps its
@@ -1636,7 +1772,8 @@ mod tests {
     fn cancellation_reaches_only_the_named_run() {
         let runtime = RecordedOperations::default();
         let cancellation = OptimizeCancellation::new();
-        runtime.set_live(LiveRun {
+        // Joining needs the record gate; the routing of a cancellation does not.
+        runtime.live.lock().unwrap().push(LiveRun {
             operation_id: "01JBQZ00000000000000000001".to_string(),
             graph: "g".to_string(),
             cancellation: cancellation.clone(),
@@ -1653,7 +1790,5 @@ mod tests {
                 .as_deref(),
             Some("deployment d")
         );
-        runtime.clear_live("01JBQZ00000000000000000001");
-        assert!(runtime.live_ids().is_empty());
     }
 }

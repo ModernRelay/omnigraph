@@ -63,11 +63,11 @@ use diff::{ResourceKind, compute_blast_radius, resource_kind};
 pub use graph_id::{GRAPH_ID_MAX_LEN, graph_id_violation};
 pub use graph_read::GraphReadAuthority;
 pub use operations::{
-    AdmissionRefusal, AdmissionScope, Admitted, CLUSTER_OPERATIONS_FILE, KindStates,
-    MAX_OPERATION_BYTES, MAX_OUTCOME_DETAIL_BYTES, MAX_TABLE_OUTCOMES, MAX_TERMINAL_OPERATIONS,
-    MAX_TERMINAL_OPERATIONS_BYTES, MAX_UNRESOLVED_OPERATIONS, Operation, OperationKind,
-    OperationOutcome, OperationRecord, OperationRequest, OperationState, OperationTimings,
-    OperationWrite, OptimizeOptions, OptimizeOutcome, OptimizeState, Resolution,
+    AdmissionRefusal, AdmissionScope, Admitted, CLUSTER_OPERATIONS_FILE, CancellationRequest,
+    KindStates, MAX_OPERATION_BYTES, MAX_OUTCOME_DETAIL_BYTES, MAX_TABLE_OUTCOMES,
+    MAX_TERMINAL_OPERATIONS, MAX_TERMINAL_OPERATIONS_BYTES, MAX_UNRESOLVED_OPERATIONS, Operation,
+    OperationKind, OperationOutcome, OperationRecord, OperationRequest, OperationState,
+    OperationTimings, OperationWrite, OptimizeOptions, OptimizeOutcome, OptimizeState, Resolution,
     ResolutionProgress, TableOutcome, TailOutcome, canonical_operation_id, new_operation_id,
     operation_id_time_ms, operation_request_digest, truncate_detail,
 };
