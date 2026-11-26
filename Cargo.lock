@@ -5298,7 +5298,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-api-types"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-schema",
  "omnigraph-compiler",
@@ -5311,7 +5311,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-azure-admission"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -5331,7 +5331,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-bench"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5361,7 +5361,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-catalog"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5394,7 +5394,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cli"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -5439,7 +5439,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cluster"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "async-trait",
  "omnigraph-compiler",
@@ -5462,7 +5462,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -5480,7 +5480,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-core"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5519,7 +5519,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-dst"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-array",
  "async-trait",
@@ -5542,7 +5542,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-engine"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -5601,7 +5601,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "async-trait",
  "datatest-stable",
@@ -5624,7 +5624,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt-core"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5647,7 +5647,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt-served"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "axum",
  "datatest-stable",
@@ -5661,7 +5661,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-mcp"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "axum",
  "color-eyre",
@@ -5675,7 +5675,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-planner"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-schema",
  "futures",
@@ -5689,7 +5689,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-policy"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "cedar-policy",
  "clap",
@@ -5702,7 +5702,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-reference-engine"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -5726,7 +5726,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-seams"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "syn",
  "tempfile",
@@ -5736,7 +5736,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-server"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -5787,11 +5787,11 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-skill"
-version = "0.16.1"
+version = "0.17.1"
 
 [[package]]
 name = "omnigraph-storage"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5807,7 +5807,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-vocabulary-guard"
-version = "0.16.1"
+version = "0.17.1"
 dependencies = [
  "clap",
  "proc-macro2",

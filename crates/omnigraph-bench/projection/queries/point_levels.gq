@@ -1,0 +1,11 @@
+query point_levels($point: String) {
+    match {
+        $p: BenchmarkPoint { point_id: $point }
+        $p has $l
+    }
+    return {
+        $l.factor as factor
+        $l.value as value
+    }
+    order { factor asc }
+}

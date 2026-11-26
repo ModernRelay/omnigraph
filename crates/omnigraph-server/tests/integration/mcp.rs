@@ -2279,3 +2279,244 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
         "a denied control leaves the proposal in place: {unpublished}"
     );
 }
+
+/// The read budget and setup link, end to end: the budget applies to
+/// successful reads and graph-backed resources only, so a 403, a write
+/// receipt and a stale `if_graph_commit` 412 larger than it still arrive
+/// whole, and a broad read is refused naming it.
+#[tokio::test]
+async fn mcp_read_budget_and_setup_link_apply_end_to_end() {
+    const BUDGET: usize = 256;
+    let mut settings = omnigraph_server::McpSettings::default();
+    settings.read_budget = omnigraph_server::ReadBudget::new(BUDGET).unwrap();
+    settings.setup_url = Some("https://example.com/setup".into());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    std::fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  writers: [default]\n  readers: [reader]\nrules:\n  \
+         - id: writers\n    allow:\n      actors: { group: writers }\n      actions: [read, change]\n      branch_scope: any\n  \
+         - id: readers\n    allow:\n      actors: { group: readers }\n      actions: [read]\n      branch_scope: any\n",
+    )
+    .unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![
+            ("default".to_string(), "secret".to_string()),
+            ("reader".to_string(), "reader-secret".to_string()),
+        ],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap()
+    .with_mcp_settings(settings);
+    let app = omnigraph_server::build_app(state);
+    let size = |result: &Value| serde_json::to_vec(&result["result"]).unwrap().len();
+
+    let text = instructions(&app, "secret").await;
+    assert!(
+        text.contains("A read's result is limited to 256 bytes"),
+        "{text}"
+    );
+    assert!(text.contains("returns a `setup` link"), "{text}");
+    assert!(!text.contains("https://example.com/setup"), "{text}");
+
+    // A read over the budget is refused, naming the budget and how to
+    // narrow the read.
+    let read = call(
+        &app,
+        "secret",
+        "query",
+        json!({"graph":"default","query":"query n() { match { $p: Person } return { $p.name, $p.age } }"}),
+    )
+    .await;
+    assert_eq!(read["result"]["isError"], true, "{read}");
+    let refusal = &read["result"]["structuredContent"]["error"];
+    assert_eq!(refusal["code"], "result_too_large", "{read}");
+    assert_eq!(
+        refusal["disposition"],
+        json!({"effects": "none", "action": "fix"}),
+        "{read}"
+    );
+    let message = refusal["error"].as_str().unwrap();
+    assert!(message.contains("256 bytes read budget"), "{read}");
+    assert!(message.contains("Narrow the read"), "{read}");
+    // So is a graph-backed resource; the compiled-in references are not.
+    let (_, schema) = json_response(
+        &app,
+        rpc(
+            Some("secret"),
+            "resources/read",
+            json!({"uri":"omnigraph://graphs/default/schema"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        schema["error"]["data"]["error"]["code"], "result_too_large",
+        "{schema}"
+    );
+    let (_, reference) = json_response(
+        &app,
+        rpc(
+            Some("secret"),
+            "resources/read",
+            json!({"uri":"omnigraph://best-practices/queries"}),
+        ),
+    )
+    .await;
+    assert!(size(&reference) > BUDGET, "{reference}");
+
+    // A 403 larger than the budget arrives whole: the reader may not write.
+    let head = main_head(&app).await;
+    let insert = "query add($name: String) { insert Person { name: $name, age: 7 } }";
+    let forbidden = call(
+        &app,
+        "reader-secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Mallory"}}),
+    )
+    .await;
+    assert!(size(&forbidden) > BUDGET, "{forbidden}");
+    let refusal = &forbidden["result"]["structuredContent"];
+    assert_eq!(refusal["status"], 403, "{forbidden}");
+    assert_eq!(refusal["error"]["code"], "forbidden", "{forbidden}");
+    assert_eq!(main_head(&app).await, head);
+
+    // A write receipt larger than the budget arrives whole.
+    let written = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Eve"},"if_graph_commit":head}),
+    )
+    .await;
+    assert_eq!(written["result"]["isError"], false, "{written}");
+    assert!(size(&written) > BUDGET, "{written}");
+
+    // So does the stale conditional write's 412, which says nothing was
+    // written.
+    let stale = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Frank"},"if_graph_commit":head}),
+    )
+    .await;
+    assert!(size(&stale) > BUDGET, "{stale}");
+    let refusal = &stale["result"]["structuredContent"];
+    assert_eq!(refusal["status"], 412, "{stale}");
+    assert_eq!(refusal["error"]["code"], "precondition_failed", "{stale}");
+    assert_eq!(
+        refusal["error"]["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
+        "{stale}"
+    );
+}
+
+/// A served read past the default budget, and one past the 1 MiB memory cap
+/// as well, are both refused naming the 96 KiB read budget and how to narrow
+/// the read; a read within it arrives whole. The rows are 30,000-character
+/// names, selected by age.
+#[tokio::test]
+async fn mcp_a_read_past_the_budget_or_the_cap_is_refused_naming_the_budget() {
+    let schema = std::fs::read_to_string(fixture("test.pg")).unwrap();
+    let rows: String = (0..40)
+        .map(|age| {
+            let name = format!("{age:02}{}", "x".repeat(30_000));
+            format!(
+                "{}\n",
+                json!({"type": "Person", "data": {"name": name, "age": age}})
+            )
+        })
+        .collect();
+    let temp = init_graph_with_schema_and_data(&schema, &rows).await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    std::fs::write(&policy_path, permit_all_policy_yaml(&["default"])).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("default".to_string(), "secret".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap()
+    .with_mcp_settings(omnigraph_server::McpSettings::default());
+    let app = omnigraph_server::build_app(state);
+    let query = "query n($below: I32) { match { $p: Person $p.age < $below } return { $p.name } }";
+    let read = |below: i32| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "secret",
+                "query",
+                json!({"graph": "default", "query": query, "params": {"below": below}}),
+            )
+            .await
+        }
+    };
+    let size = |result: &Value| serde_json::to_vec(&result["result"]).unwrap().len();
+
+    // One row fits the budget, its text copy included.
+    let one = read(1).await;
+    assert_eq!(one["result"]["isError"], false, "{}", size(&one));
+    assert_eq!(one["result"]["structuredContent"]["row_count"], 1);
+    assert!(size(&one) <= 96 * 1024, "{}", size(&one));
+
+    // Two rows pass the budget; forty pass the 1 MiB cap while the DTO is
+    // encoded. Both are refused the same way, naming the budget.
+    for below in [2, 40] {
+        let refused = read(below).await;
+        assert_eq!(refused["result"]["isError"], true, "{below}");
+        let error = &refused["result"]["structuredContent"]["error"];
+        assert_eq!(error["code"], "result_too_large", "{error}");
+        assert_eq!(
+            error["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{error}"
+        );
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains("96 KiB read budget"), "{message}");
+        assert!(message.contains("Narrow the read"), "{message}");
+        assert!(size(&refused) < 4096, "{}", size(&refused));
+    }
+}
+
+/// The setup link appears exactly on a successful empty listing, from the
+/// tool and the `omnigraph://graphs` resource alike: a caller who may act on
+/// no graph gets it, and a caller whose listing names a graph does not.
+#[tokio::test]
+async fn mcp_setup_link_appears_only_on_an_empty_listing() {
+    let mut settings = omnigraph_server::McpSettings::default();
+    settings.setup_url = Some("https://example.com/setup".into());
+    let (_temp, app, _state) = fixture_app_with(settings).await;
+    for (caller, listed) in [("alice", true), ("bob", false)] {
+        let bearer = token(caller, RESOURCE);
+        let graphs = call(&app, &bearer, "graphs", json!({})).await;
+        assert_eq!(graphs["result"]["isError"], false, "{graphs}");
+        let listing = &graphs["result"]["structuredContent"];
+        let names = listing["graphs"].as_array().unwrap();
+        assert_eq!(!names.is_empty(), listed, "{graphs}");
+        if listed {
+            assert!(listing.get("setup").is_none(), "{graphs}");
+        } else {
+            assert_eq!(
+                listing["setup"]["url"], "https://example.com/setup",
+                "{graphs}"
+            );
+        }
+        let (_, read) = json_response(
+            &app,
+            rpc(
+                Some(&bearer),
+                "resources/read",
+                json!({"uri":"omnigraph://graphs"}),
+            ),
+        )
+        .await;
+        let text = read["result"]["contents"][0]["text"].as_str().unwrap();
+        let resource: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(&resource, listing, "{read}");
+    }
+}

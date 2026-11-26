@@ -540,6 +540,28 @@ mod tests {
         assert!(!binding.narrow("tools/call", &call("graphs", None), &mut refused));
         let mut schema = json!({"id": 7, "result": {"structuredContent": listing}});
         assert!(!binding.narrow("tools/call", &call("schema", None), &mut schema));
+
+        // The server's refusal of a listing is relayed as it is, on the
+        // tool and the resource: the bridge never answers for the server.
+        let forbidden = json!({
+            "error": {"code": "forbidden", "error": "not allowed",
+                      "disposition": {"effects": "none", "action": "fix"}},
+            "status": 403,
+        });
+        let refused_listing = json!({"id": 8, "result": {
+            "content": [{"type": "text", "text": forbidden.to_string()}],
+            "structuredContent": forbidden,
+            "isError": true,
+        }});
+        let mut answer = refused_listing.clone();
+        assert!(!binding.narrow("tools/call", &call("graphs", None), &mut answer));
+        assert_eq!(answer, refused_listing);
+        let refused_read = json!({"id": 9, "error": {
+            "code": -32600, "message": "resource read refused", "data": forbidden,
+        }});
+        let mut answer = refused_read.clone();
+        assert!(!binding.narrow("resources/read", &request, &mut answer));
+        assert_eq!(answer, refused_read);
     }
 
     #[test]

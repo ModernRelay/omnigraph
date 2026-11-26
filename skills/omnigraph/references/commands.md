@@ -539,7 +539,8 @@ identities use different targets. There is no `--auth` selector or last-used ide
 
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
-`optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
+`optimize`/`index build`/`index rebuild`/`cleanup --graph`, an inline `s3://`
+graph for the direct reads and `init`/`schema apply`/`load`, both with region
 and endpoint captured from the environment
 ([S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)),
 and a graph shallow clone: `--base URI` opens a direct graph target over the

@@ -1,0 +1,16 @@
+query run_hosts() {
+    match {
+        $r: BenchmarkRun
+        $r measuredBy $h
+        $m hosted $r
+    }
+    return {
+        $r.invocation_id as invocation_id
+        $h.sha as harness
+        $m.label as machine
+        $m.cpu_model as cpu_model
+        $m.architecture as architecture
+        $m.logical_cores as logical_cores
+    }
+    order { invocation_id asc }
+}

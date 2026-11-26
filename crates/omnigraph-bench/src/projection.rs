@@ -111,92 +111,9 @@ const PROJECTION_TRANSFORM_CONTRACT: &str = concat!(
 
 const _: () = assert!(QUERY_FETCH_LIMIT * MAX_PROJECTED_ROW_BYTES <= MAX_PUBLIC_PAGE_BYTES);
 
-const PROJECTION_SCHEMA: &str = r#"
-node BenchmarkPoint {
-    point_id: String @key
-    point_name: String
-    point_identity_version: U32
-    scenario: String
-    run_spec_json: String
-}
-
-node BenchmarkRun {
-    invocation_id: String @key
-    record_sha256: String @unique
-    archive_object: String @unique
-    archive_pointer: String @unique
-    session_id: String
-    invoked_at_unix_ms: U64
-    case_id: String
-    case_digest: String
-    sut_evidence: String
-    package_version: String
-    source_commit: String
-    source_tree_dirty: Bool
-    build_profile: String
-    build_opt_level: String
-    debug_assertions: Bool
-    target_triple: String?
-    rustc_version: String?
-    build_declared_release_lto: String?
-    build_declared_release_codegen_units: U32?
-    build_declared_release_strip: Bool?
-    build_cargo_encoded_rustflags_present: Bool?
-    build_release_profile_environment_overrides_supported: Bool?
-    build_effective_codegen_options_proved: Bool
-    worker_executable_sha256: String?
-    sut_fingerprint: String
-    sut_json: String
-    client_build_json: String?
-    client_machine_json: String?
-    machine_fingerprint: String?
-    machine_format_version: U32?
-    machine_os_name: String?
-    machine_os_version: String?
-    machine_kernel_version: String?
-    machine_architecture: String?
-    machine_cpu_model: String?
-    machine_logical_cores: U32?
-    machine_physical_cores: U32?
-    machine_total_memory_bytes: U64?
-    machine_resource_control_json: String?
-    machine_scheduling_json: String?
-    machine_resource_limits_json: String?
-    machine_label: String?
-    backend_evidence: String
-    backend_fingerprint: String
-    backend_json: String
-    fixture_manifest_sha256: String?
-    fixture_logical_sha256: String
-    fixture_physical_sha256: String?
-    acquisition_status: String
-    claim_eligible: Bool
-    terminal_failed_repetition: U32?
-    terminal_stage: String?
-    terminal_code: String?
-    requested_repetitions: U32
-    observed_repetitions: U32
-    min_us: U64
-    p50_us: U64
-    max_us: U64
-    p95_us: U64?
-    p95_supported: Bool
-    wall_evidence: String
-    floor_multiplier_millis: U32
-    lance_data_plane_logical_calls_min: U64?
-    lance_data_plane_logical_calls_p50: U64?
-    lance_data_plane_logical_calls_max: U64?
-    control_plane_logical_calls_min: U64?
-    control_plane_logical_calls_p50: U64?
-    control_plane_logical_calls_max: U64?
-    logical_counts_presence_json: String
-    physical_counts_presence_json: String
-}
-
-edge Measures: BenchmarkRun -> BenchmarkPoint @card(1..1) {
-    @unique(@src, @dst)
-}
-"#;
+/// The results graph's schema, one file for this generation, `projection
+/// export` and `omnigraph init --schema` (`projection/schema.pg`).
+pub(crate) const PROJECTION_SCHEMA: &str = include_str!("../projection/schema.pg");
 
 const PROJECTION_QUERIES: &str = r#"
 query list_points_page($after_key: String) {
@@ -501,7 +418,7 @@ where
 }
 
 impl ProjectionError {
-    fn new(code: &'static str, path: Option<&Path>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, path: Option<&Path>, message: impl Into<String>) -> Self {
         Self {
             code,
             path: path.map(Path::to_path_buf),
@@ -509,7 +426,7 @@ impl ProjectionError {
         }
     }
 
-    fn io(code: &'static str, path: &Path, error: std::io::Error) -> Self {
+    pub(crate) fn io(code: &'static str, path: &Path, error: std::io::Error) -> Self {
         Self::new(code, Some(path), error.to_string())
     }
 }
@@ -586,7 +503,7 @@ struct ProjectedRowsScan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PointRow {
+pub(crate) struct PointRow {
     point_id: String,
     point_name: String,
     point_identity_version: u32,
@@ -596,7 +513,7 @@ struct PointRow {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunRow {
+pub(crate) struct RunRow {
     invocation_id: String,
     record_sha256: String,
     archive_object: String,
@@ -681,19 +598,19 @@ enum SutEvidence {
 }
 
 #[derive(Serialize)]
-struct NodeEnvelope<'a, T> {
+pub(crate) struct NodeEnvelope<'a, T> {
     #[serde(rename = "type")]
-    node_type: &'a str,
-    data: T,
+    pub(crate) node_type: &'a str,
+    pub(crate) data: T,
 }
 
 #[derive(Serialize)]
-struct EdgeEnvelope<'a, T> {
-    edge: &'a str,
-    id: String,
-    from: &'a str,
-    to: &'a str,
-    data: T,
+pub(crate) struct EdgeEnvelope<'a, T> {
+    pub(crate) edge: &'a str,
+    pub(crate) id: String,
+    pub(crate) from: &'a str,
+    pub(crate) to: &'a str,
+    pub(crate) data: T,
 }
 
 #[derive(Serialize)]
@@ -1714,6 +1631,17 @@ fn run_row<R: ProjectionRecord>(
     receipt: &crate::archive::ArchiveReceiptV1,
 ) -> Result<RunRow, ProjectionError> {
     record.run_row(receipt)
+}
+pub(crate) fn any_point_row(
+    record: &crate::gqt_record::AnyRunRecordV1,
+) -> Result<PointRow, ProjectionError> {
+    point_row(record)
+}
+pub(crate) fn any_run_row(
+    record: &crate::gqt_record::AnyRunRecordV1,
+    receipt: &crate::archive::ArchiveReceiptV1,
+) -> Result<RunRow, ProjectionError> {
+    run_row(record, receipt)
 }
 fn legacy_point_row(record: &RunRecordV1) -> Result<PointRow, ProjectionError> {
     require_sha256(&record.run.point_id, "point id")?;
@@ -3394,7 +3322,7 @@ impl NdjsonBatch {
     }
 }
 
-fn serialize_graph_row(value: &impl Serialize) -> Result<String, ProjectionError> {
+pub(crate) fn serialize_graph_row(value: &impl Serialize) -> Result<String, ProjectionError> {
     serde_json::to_string(value).map_err(|error| {
         ProjectionError::new(
             "projection_row_serialization_failed",
@@ -3578,7 +3506,10 @@ fn summarize_nearest_rank(mut values: Vec<u64>, noun: &str) -> Result<MinP50Max,
     })
 }
 
-fn canonical_json<T: Serialize>(value: &T, noun: &str) -> Result<String, ProjectionError> {
+pub(crate) fn canonical_json<T: Serialize>(
+    value: &T,
+    noun: &str,
+) -> Result<String, ProjectionError> {
     serde_json::to_string(value).map_err(|error| {
         ProjectionError::new(
             "projection_value_serialization_failed",

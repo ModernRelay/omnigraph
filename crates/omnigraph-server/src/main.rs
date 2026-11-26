@@ -71,6 +71,12 @@ struct Cli {
     /// comma-separated from `OMNIGRAPH_MCP_ALLOWED_HOSTS`.
     #[arg(long = "mcp-allowed-host", value_name = "HOST")]
     mcp_allowed_hosts: Vec<String>,
+    /// An `https` page where a user can create a graph. When a caller's
+    /// `graphs` list is successful and empty, MCP returns it as a `setup`
+    /// link. No userinfo, query or fragment; also read from
+    /// `OMNIGRAPH_MCP_SETUP_URL`.
+    #[arg(long = "mcp-setup-url", value_name = "URL")]
+    mcp_setup_url: Option<String>,
 }
 
 #[tokio::main]
@@ -84,7 +90,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let mcp = McpSettings::resolve(cli.mcp_allowed_hosts)?;
+    let mcp = McpSettings::resolve(cli.mcp_allowed_hosts, cli.mcp_setup_url)?;
     if let Some(receipt_path) = cli.bootstrap_handoff.as_deref() {
         let shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
         let settings = load_server_settings_with_bootstrap_handoff(

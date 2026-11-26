@@ -20,7 +20,7 @@ omnigraph optimize --target ./cluster-root --graph knowledge
 
 Follow the command-specific concurrency requirements below. Registered direct
 targets accept local files only; an inline [S3 cluster root](s3-cluster-roots.md)
-is the one cloud-direct exception. See
+is maintenance's cloud-direct exception (reads and loads take an `s3://` graph). See
 [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
 Each command acts as its `--as` actor, and the commit it publishes records
