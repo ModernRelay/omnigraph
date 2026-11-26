@@ -144,6 +144,23 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
         let (status, _) =
             json_response(&app, get_request("/graphs/default/schema", &identity)).await;
         assert_eq!(status, expected, "the same token follows activated policy");
+        // The same admitted identity can name this graph in either case.
+        // A data request reaches the parser only with a grant on the graph.
+        let request = Request::post(g("/query"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header(AUTHORIZATION, format!("Bearer {identity}"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"query":"not gq at all"}).to_string()))
+            .unwrap();
+        let (status, body) = json_response(&app, request).await;
+        if actors[0] == tokens.actor {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["diagnostic"]["code"], "Q001", "{body}");
+        } else {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["code"], "forbidden", "{body}");
+            assert!(body.get("diagnostic").is_none(), "{body}");
+        }
     }
 }
 

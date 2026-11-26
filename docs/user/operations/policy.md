@@ -33,6 +33,12 @@ Graph-scoped actions:
 applied graph IDs and display names, without gaining permission to read their
 schema or contents. See [signed data credentials](server.md#signed-data-credentials).
 
+On a ready graph, a caller with no graph actions can ask `access` for its
+own empty permission report. An ad-hoc query from that caller receives 403
+before the server reads or parses the request body. Once admitted to the
+graph, the caller gets the usual syntax diagnostics and the server checks
+the permission for the requested operation.
+
 `config_manage` is cluster-scoped. It authorizes configuration changes through
 the identity-authorized cluster API, including stored queries, graph creation,
 and policy membership/binding changes on existing graphs. Grants and revocations

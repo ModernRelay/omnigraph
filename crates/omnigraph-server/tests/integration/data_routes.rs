@@ -3455,9 +3455,15 @@ async fn branch_statement_refusals_name_the_door_and_the_envelope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn parse_error_precedes_policy_denial_on_every_door() {
+    // The writer may change unprotected branches, so its read reaches the
+    // route. The team member likewise reaches the route on protected main.
+    let policy = POLICY_YAML.replace(
+        "  admins: [act-ragnor]\n",
+        "  admins: [act-ragnor]\n  writers: [act-writer]\n",
+    ) + "  - id: writers-change\n    allow:\n      actors: { group: writers }\n      actions: [change]\n      branch_scope: unprotected\n";
     let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
-        &[("act-bruno", "team-token"), ("act-nobody", "nobody-token")],
-        POLICY_YAML,
+        &[("act-bruno", "team-token"), ("act-writer", "writer-token")],
+        &policy,
     )
     .await;
     let send = |path: &str, token: &str, body: Value, expected_head: bool| {
@@ -3482,7 +3488,7 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         "branch": "main"
     });
     let denied = [
-        ("/query", "nobody-token", read.clone(), false),
+        ("/query", "writer-token", read, false),
         ("/mutate", "team-token", write.clone(), false),
         ("/mutate/if-graph-commit", "team-token", write, true),
     ];
