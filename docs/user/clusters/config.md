@@ -197,19 +197,28 @@ If present, `storage` is an equality assertion: a mismatch refuses before
 effects. Remote operations require an absolute path or `file://`, `s3://` or
 `az://` URI and read only source files from the caller's filesystem.
 
-An `s3://` root must name one object key. A path with a percent escape or a
-character a URL writes as one (a space, a non-ASCII letter, a brace, a quote;
-the caret aside), or with a query or a fragment, is refused before any request
-with `invalid_storage_root` (`target_invalid` for a `--target`): Omnigraph and
-Lance would store its objects under two key prefixes, so removing a graph would
-delete nothing. The root must also be the one spelling of its key,
-`s3://<bucket>/<key>`, trailing slashes aside: a dot segment (also escaped, as
-`%2e%2e`), a port, user information, or a tab, newline or surrounding space the
-URL parser drops would name the same objects under a second cluster identity,
-so it is refused under the same code, and the message names the spelling to
-use. Two spellings of one prefix, such as `aAb` and `a%41b`, are therefore
-never two clusters. A cluster an earlier release created at such a root is
-refused too; see [the upgrade guide](../operations/upgrade.md#s3-roots-that-name-two-keys).
+An `s3://` root must name one object key, at the root and for every object
+below it, in one spelling. Any other root is refused before any request with
+`invalid_storage_root` (`target_invalid` for a `--target`), in one of three
+cases:
+
+- **Two keys.** A percent escape or a character a URL writes as one (a space,
+  a non-ASCII letter, a brace, a quote; the caret aside), or a space at the end
+  of the path, which becomes part of every key below the root. Omnigraph and
+  Lance would store its objects under two key prefixes, so removing a graph
+  would delete nothing. The message names both keys.
+- **No key.** A query, a fragment, an empty segment, or a control character at
+  the end of the path. Such a root names no key for the objects below it, so
+  the message names no replacement: choose a prefix of plain characters.
+- **Another spelling.** A dot segment (also escaped, as `%2e%2e`), a port,
+  user information, a tab or a newline, which the URL parser resolves or drops.
+  The root names the same objects as a shorter one under a second cluster
+  identity. The message names that spelling, and only when it names the same
+  keys at the root and below it.
+
+Two spellings of one prefix, such as `aAb` and `a%41b`, are therefore never
+two clusters. A cluster an earlier release created at such a root is refused
+too; see [the upgrade guide](../operations/upgrade.md#s3-roots-that-name-two-keys).
 
 Registered direct targets accept local files only. The storage assertion above
 describes the deployment root; it does not select a target. An inline `s3://`

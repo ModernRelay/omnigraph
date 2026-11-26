@@ -552,6 +552,22 @@ async fn s3_cluster_root_with_two_keys_is_refused_before_any_write_issue_1527() 
             "{spelling:?}"
         );
     }
+    // A space at the end of a root: the URL parser strips it from the root
+    // alone, and keeps it as `%20` (adapter) and ` ` (Lance) below it. The
+    // refusal names the split below and no replacement, which would address
+    // another prefix.
+    let trailing = format!("s3://{bucket}/{prefix}/trailing ");
+    let direct = Omnigraph::init(&trailing, SCHEMA_V1)
+        .await
+        .map(|_| ())
+        .expect_err("a root that splits below itself")
+        .to_string();
+    assert!(
+        direct.contains("an object below it under the key")
+            && !direct.contains("another spelling of"),
+        "{direct}"
+    );
+    assert_eq!(bucket_keys(&bucket, &prefix).await, Vec::<String>::new());
 }
 
 /// #1527: two roots that differ only in spelling were two cluster identities

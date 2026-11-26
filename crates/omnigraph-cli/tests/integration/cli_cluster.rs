@@ -6335,7 +6335,9 @@ fn managed_organization_m2m_application_secret_file_never_shares_a_path_with_ano
 
 /// #1527: an inline `s3://` root that names no one key (an escape Lance
 /// decodes to a second key, a query) or respells another root's key (a dot
-/// segment, escaped or not) is refused before any request. The storage
+/// segment, escaped or not) is refused before any request, and names the one
+/// spelling to use only when that spelling names the same objects (not for a
+/// trailing space, which splits the keys below the root). The storage
 /// endpoint is a fixture that records every request it receives; the one
 /// spelling of a key, sent to the same endpoint, shows that it would see one.
 #[test]
@@ -6391,6 +6393,7 @@ fn inline_s3_root_without_one_key_is_refused_before_any_request_issue_1527() {
         "x/%2e%2e/root",
         "x/../root",
         "root/.",
+        "root ",
     ] {
         let root = format!("s3://one-key-bucket/{spelling}");
         let base = "s3://one-key-bucket/base";
@@ -6420,6 +6423,14 @@ fn inline_s3_root_without_one_key_is_refused_before_any_request_issue_1527() {
             );
             assert!(
                 text.contains("must name one object key"),
+                "{arguments:?}: {text}"
+            );
+            // A replacement is named only where it names the same objects:
+            // `root ` splits below itself (`root%20/…`, `root /…`), so none is.
+            let named = text.contains("another spelling of 's3://one-key-bucket/root'");
+            assert_eq!(
+                named,
+                matches!(spelling, "x/%2e%2e/root" | "x/../root" | "root/."),
                 "{arguments:?}: {text}"
             );
             assert!(
