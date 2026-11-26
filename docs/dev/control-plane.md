@@ -371,12 +371,18 @@ mutable keys go to one that makes a single attempt, so their owners see every
 attempt. Scoped control adapters split the same way, whatever builds them: an
 `s3://` root from the environment or from a captured binding (one
 construction, `ObjectStorageAdapter::s3_from_builder`), a `gs://` or Azure
-root, and the reads and marker write of an `s3://` clone open. Their retrying
-client retries at most three times, after a 5xx, 429 or 408 answer, a
-connection failure, or a timeout of a safe or idempotent request; a decode or
-unclassified transport error is never retried. It starts no retry once 180
-seconds have passed since the first attempt, a limit on when a retry may
-begin, not on how long the request takes.
+root, and a scoped `s3://` clone open's requests to the clone root (its reads
+and its marker write). A clone's base is read through an S3 client with
+`object_store`'s default retry policy (ten retries within the same 180
+seconds), scoped or not. The scoped retrying client retries at most three
+times, after a 5xx, 429 or 408 answer, a connection failure, or a timeout of a
+safe or idempotent request; a decode or unclassified transport error is never
+retried. `object_store` 0.14.2 compares the time since the first attempt with
+180 seconds after each failure, before the backoff sleep: once more than 180
+seconds have passed it returns the error, and otherwise it sleeps (at most 15
+seconds) and sends the next attempt. A retry can therefore start after 180
+seconds, and the budget bounds neither when the last attempt starts nor how
+long the request takes.
 Local Lance uses its object-store file provider so direct file writes cannot
 bypass the scope. Embedded defaults and Azure serving clients are unchanged; the
 automatic scoped shutdown path applies only to local and S3 roots.
