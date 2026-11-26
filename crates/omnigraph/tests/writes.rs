@@ -5171,16 +5171,25 @@ async fn multi_table_staging_matches_serial_staging() {
 
 #[tokio::test]
 async fn multi_table_delete_staging_matches_serial_staging() {
-    type Observation = (
-        usize,
-        usize,
-        usize,
-        usize,
-    );
+    type Observation = (usize, usize, usize, usize);
 
     async fn run_once(concurrency: usize, release_after: usize) -> (Observation, u64, u64) {
         let dir = tempfile::tempdir().unwrap();
         let db = init_and_load(&dir).await;
+        // Spread matching and non-matching rows across multiple fragments so
+        // each table performs multiple async deletion-vector writes and cannot
+        // drain in a single poll before the sibling future resumes.
+        for _ in 0..8 {
+            db.load_jsonl(
+                "{\"edge\":\"Knows\",\"from\":\"Alice\",\"to\":\"Diana\"}\n\
+                 {\"edge\":\"Knows\",\"from\":\"Charlie\",\"to\":\"Diana\"}\n\
+                 {\"edge\":\"WorksAt\",\"from\":\"Bob\",\"to\":\"Acme\"}\n\
+                 {\"edge\":\"WorksAt\",\"from\":\"Charlie\",\"to\":\"Globex\"}",
+                LoadMode::Append,
+            )
+            .await
+            .unwrap();
+        }
         let probes = StageWriteProbes::rendezvous(release_after);
         let observed = probes.clone();
         const DELETE_QUERIES: &str = r#"

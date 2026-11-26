@@ -806,28 +806,27 @@ impl MutationStaging {
         }
         let requested_concurrency = concurrency;
         let write_concurrency = requested_concurrency.min(stage_inputs.len()).max(1);
-        let mut write_stream =
-            futures::stream::iter(stage_inputs.into_iter().enumerate().map(
-                |(stage_idx, (table_key, table, path, expected))| async move {
-                    // DST window (loader walk, inside D2): between per-table
-                    // fragment uploads — a partial staged set with no
-                    // breadcrumb (benign by construction; cleanup reclaims).
-                    if stage_idx > 0 {
-                        fail(&LOAD_BETWEEN_TABLE_STAGES)?;
-                    }
-                    stage_pending_table(
-                        db,
-                        table_key,
-                        table,
-                        path,
-                        expected,
-                        write_budget,
-                        overwrite_writers,
-                    )
-                    .await
-                },
-            ))
-            .buffered(write_concurrency);
+        let mut write_stream = futures::stream::iter(stage_inputs.into_iter().enumerate().map(
+            |(stage_idx, (table_key, table, path, expected))| async move {
+                // DST window (loader walk, inside D2): between per-table
+                // fragment uploads — a partial staged set with no
+                // breadcrumb (benign by construction; cleanup reclaims).
+                if stage_idx > 0 {
+                    fail(&LOAD_BETWEEN_TABLE_STAGES)?;
+                }
+                stage_pending_table(
+                    db,
+                    table_key,
+                    table,
+                    path,
+                    expected,
+                    write_budget,
+                    overwrite_writers,
+                )
+                .await
+            },
+        ))
+        .buffered(write_concurrency);
 
         let mut staged_entries = Vec::new();
         while let Some(res) = write_stream.next().await {
@@ -872,22 +871,21 @@ impl MutationStaging {
 
         if !delete_inputs.is_empty() {
             let delete_concurrency = requested_concurrency.min(delete_inputs.len()).max(1);
-            let mut delete_stream =
-                futures::stream::iter(delete_inputs.into_iter().map(
-                    |(table_key, combined, path, expected, removed_ids, row_addrs)| async move {
-                        stage_delete_table(
-                            db,
-                            table_key,
-                            combined,
-                            path,
-                            expected,
-                            removed_ids,
-                            row_addrs,
-                        )
-                        .await
-                    },
-                ))
-                .buffered(delete_concurrency);
+            let mut delete_stream = futures::stream::iter(delete_inputs.into_iter().map(
+                |(table_key, combined, path, expected, removed_ids, row_addrs)| async move {
+                    stage_delete_table(
+                        db,
+                        table_key,
+                        combined,
+                        path,
+                        expected,
+                        removed_ids,
+                        row_addrs,
+                    )
+                    .await
+                },
+            ))
+            .buffered(delete_concurrency);
 
             let mut staged_deletes = Vec::new();
             while let Some(res) = delete_stream.next().await {
