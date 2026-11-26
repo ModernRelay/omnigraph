@@ -191,6 +191,14 @@ For the historical v0.10-to-v0.9 rollback, including `external_blobs` state,
 follow the [tagged rollback procedure](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md#cluster-state-and-rollback)
 with those binaries. It is not a downgrade path from v0.14.
 
+## S3 roots that name two keys
+
+If this release refuses an `s3://` root and the refusal names two keys,
+Omnigraph's and Lance's, an earlier release split the root's objects between
+them: export each graph with that release and [rebuild](#rebuild) it under a
+plain prefix. If it names another spelling, the objects are whole: finish any
+outstanding deployment with the earlier release, then use that spelling.
+
 ## What an export/import rebuild preserves
 
 This table describes rebuilding a graph at a new URI for a graph-format change,

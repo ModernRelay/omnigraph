@@ -161,8 +161,8 @@ overlaps its own graph root.
 
 A base is compared only with a storage root of its own kind: an `s3://` base
 with an `s3://` root, a `file://` base with a local root. When the root is
-spelled with a path component a base URI cannot express (an empty component
-such as `s3://bucket/a//cluster`, or a percent sign in a local path), a
+spelled with a path component a base URI cannot express (a backslash
+such as `s3://bucket/a\b/cluster`, or a percent sign in a local path), a
 same-kind base is refused with `external_blob_storage_root_uncomparable`,
 because disjointness cannot be proven. Moving the base does not clear that
 code; the storage root spelling does.
@@ -196,6 +196,32 @@ Plan and apply always use the selected direct-root or server target. Omitting
 If present, `storage` is an equality assertion: a mismatch refuses before
 effects. Remote operations require an absolute path or `file://`, `s3://` or
 `az://` URI and read only source files from the caller's filesystem.
+
+An `s3://` root must name one object key, at the root and for every object
+below it, in one spelling. Any other root is refused before any request with
+`invalid_storage_root` (`target_invalid` for a `--target`), in one of three
+cases:
+
+- **Two keys.** A character a URL writes as an escape (a space, a non-ASCII
+  letter, a brace, a quote; the caret aside), an escape Lance decodes to
+  another character (`%41`, `%20`, `%2F`, a dot escaped inside a segment), or
+  a space at the end of the path, which becomes part of every key below the
+  root. Omnigraph and Lance would store its objects under two key prefixes, so
+  removing a graph would delete nothing. The message names both keys.
+- **No key.** A query, a fragment, an empty segment, or a control character at
+  the end of the path. Such a root names no key for the objects below it, so
+  the message names no replacement: choose a prefix of plain characters.
+- **Another spelling.** A dot segment, escaped too (`%2e%2e`), a port, user
+  information, a tab or a newline, which the URL parser resolves or drops
+  before either key is derived. The root names the same objects as a shorter
+  one under a second cluster identity. The message names that spelling, and
+  only when it names the same keys at the root and below it.
+
+An escape neither route decodes (`%zz`, a lone `%`) is an ordinary key
+character. Two spellings of one prefix, such as `aAb` and `a%41b`, are
+therefore never two clusters. A cluster an earlier release created at such a
+root is refused too, and its recovery follows the case the refusal names; see
+[the upgrade guide](../operations/upgrade.md#s3-roots-that-name-two-keys).
 
 Registered direct targets accept local files only. The storage assertion above
 describes the deployment root; it does not select a target. An inline `s3://`

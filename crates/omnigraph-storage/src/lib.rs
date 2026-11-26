@@ -1703,8 +1703,8 @@ impl ObjectStorageAdapter {
     ) -> Result<Self> {
         let root = parse_s3_uri(root_uri)?;
         let base = parse_s3_uri(base_uri)?;
-        let root_key = s3_clone_prefix(root_uri)?;
-        let base_key = s3_clone_prefix(base_uri)?;
+        let root_key = s3_root_key(root_uri)?;
+        let base_key = s3_root_key(base_uri)?;
         if root.bucket == base.bucket && s3_prefixes_overlap(root_key.as_ref(), base_key.as_ref()) {
             return Err(StorageError::backend(
                 StorageFailureKind::Configuration,
@@ -3064,7 +3064,10 @@ pub fn normalize_root_uri(uri: &str) -> Result<String> {
             let path = local_path_from_uri(uri)?;
             Ok(normalize_local_path(&path))
         }
-        StorageKind::S3 => Ok(trim_trailing_slashes(uri)),
+        StorageKind::S3 => {
+            s3_root_key(uri)?;
+            Ok(trim_trailing_slashes(uri))
+        }
         StorageKind::Azure => Ok(parse_azure_uri(uri)?.canonical_uri),
         StorageKind::Gcs => Ok(parse_gcs_uri(uri)?.canonical_uri),
     }
@@ -3299,6 +3302,29 @@ fn build_s3_store(builder: AmazonS3Builder, root_uri: &str) -> Result<Arc<DynObj
     }
 }
 
+/// Every object key in `bucket` under the key prefix `prefix`, as the bucket
+/// stores it, sorted. No URI is derived, so a test can see the keys every
+/// route wrote, whichever spelling it used. `prefix` is a key, taken literally.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn s3_bucket_keys(bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    let uri = format!("s3://{bucket}/{prefix}");
+    let store = s3_store(bucket, &uri, |builder| builder)?;
+    let prefix = ObjectPath::parse(prefix).map_err(|err| {
+        StorageError::backend(
+            StorageFailureKind::Configuration,
+            format!("invalid s3 key prefix '{prefix}': {err}"),
+        )
+    })?;
+    let mut keys = store
+        .list(Some(&prefix))
+        .map_ok(|meta| meta.location.to_string())
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| storage_backend_error("list", &uri, err))?;
+    keys.sort();
+    Ok(keys)
+}
+
 /// The clients of one `s3://` root: the store its reads and writes go to and,
 /// when `scoped`, a second client with bounded retries for its reads, the
 /// first then single-attempt (`ObjectStorageAdapter::with_scope_and_retrying`).
@@ -3351,26 +3377,19 @@ fn s3_prefixes_overlap(a: &str, b: &str) -> bool {
         || b.starts_with(&format!("{a}/"))
 }
 
-/// The key every route of a clone addresses the `s3://` root `uri` by: the one
-/// the adapter and Lance both derive, for the root and for a child of it. A
-/// root they spell differently (a `%` escape, a space, a query) is refused.
-fn s3_clone_prefix(uri: &str) -> Result<ObjectPath> {
-    let one_key = |address: &str| {
-        let url = Url::parse(address).ok()?;
-        let adapter = ObjectPath::parse(s3_object_key(address, &url)).ok()?;
-        let lance = ObjectPath::from_url_path(url.path()).ok()?;
-        (adapter == lance).then_some(adapter)
-    };
+/// The key prefix of the `s3://` root `uri`: its [`s3_object_key`], which is
+/// also the prefix of the key of every child of it. A root whose children
+/// would not lie under its own key (a query, a fragment) is refused.
+fn s3_root_key(uri: &str) -> Result<ObjectPath> {
     let root = trim_trailing_slashes(uri);
-    match (one_key(&root), one_key(&format!("{root}/child"))) {
-        (Some(prefix), Some(child)) if child == prefix.clone().join("child") => Ok(prefix),
-        _ => Err(StorageError::backend(
-            StorageFailureKind::Configuration,
-            format!(
-                "read-through storage needs an s3 root whose path names one key, got '{uri}': it holds a percent escape, a character a URL escapes (a space, a non-ASCII letter), a query, a fragment or an empty segment"
-            ),
-        )),
+    let key = ObjectPath::parse(s3_object_key(&root)?)
+        .map_err(|_| s3_key_refusal(uri, S3KeyRefusal::NoKey))?;
+    let child = ObjectPath::parse(s3_object_key(&format!("{root}/child"))?)
+        .map_err(|_| s3_key_refusal(uri, S3KeyRefusal::NoKey))?;
+    if child != key.clone().join("child") {
+        return Err(s3_key_refusal(uri, S3KeyRefusal::NoKey));
     }
+    Ok(key)
 }
 
 /// The mount of an `s3://` clone over the clients of its two buckets. Keys that
@@ -3438,7 +3457,7 @@ fn parse_s3_uri(uri: &str) -> Result<S3Location> {
     })?;
     Ok(S3Location {
         bucket: bucket.to_string(),
-        key: s3_object_key(uri, &url),
+        key: s3_object_key(uri)?,
     })
 }
 
@@ -3570,11 +3589,159 @@ fn validate_gcs_bucket_name(bucket: &str, diagnostic_uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// The key the `s3://` URI `uri`, parsed as `url`, names: its URL path as
-/// `url` spelled it through 2.5.8, which the store takes literally. From 2.5.9
-/// a `^` is written `%5E`; here it stays a caret, so no `url` release moves an object.
+/// The object key the `s3://` URI `uri` names, the one function every
+/// Omnigraph route derives an S3 key by. Two spellings exist: the adapter's,
+/// the URL path as written (below), and Lance's, the percent-decoded URL path
+/// (`lance-io`'s `extract_path`, which Omnigraph does not route). A URI on
+/// which they differ at it or below it (a character a URL escapes, such as a
+/// space, a non-ASCII letter or a brace; an escape Lance decodes, such as
+/// `%41`; a trailing space), or with a query or a fragment, is refused, so a
+/// root never splits its objects across two prefixes. An escaped dot segment
+/// (`%2e%2e`) is resolved by the URL parser before either key is derived, so
+/// it is a respelling, not a second key. A URI
+/// must also be the one spelling of its key, `s3://<bucket>/<key>` (trailing
+/// slashes aside), so two spellings of one key are never two identities.
 #[doc(hidden)]
-pub fn s3_object_key(uri: &str, url: &Url) -> String {
+pub fn s3_object_key(uri: &str) -> Result<String> {
+    s3_one_key(uri, true)
+}
+
+/// [`s3_object_key`]; `suggest` says whether a refused respelling may name a
+/// replacement, which is itself checked by this function with `suggest` off.
+fn s3_one_key(uri: &str, suggest: bool) -> Result<String> {
+    // Trailing slashes spell a prefix as a directory; they name no other key.
+    let trimmed = trim_trailing_slashes(uri);
+    let (written, lance) = s3_key_pair(uri, &trimmed, false)?;
+    // A URI is also a root: every object below it is named by appending to
+    // it, and the URL parser strips a trailing space or control character
+    // only at the end of the string. `s3://bucket/graph ` names `graph`, and
+    // `graph%20/x` (the adapter) and `graph /x` (Lance) below it, so the keys
+    // of a child are compared as well.
+    let child = format!("{trimmed}/child");
+    let (_, below) = s3_key_pair(uri, &child, true)?;
+    // One key has one spelling. The URL parser resolves dot segments (also
+    // escaped, `%2e%2e`), drops tabs and newlines, and ignores user
+    // information and a port, so each of those spells a key that another,
+    // shorter URI names too; such a spelling is refused rather than kept as a
+    // second identity of the same objects.
+    let bucket = Url::parse(&trimmed)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let canonical = if lance.as_ref().is_empty() {
+        format!("s3://{bucket}")
+    } else {
+        format!("s3://{bucket}/{}", lance.as_ref())
+    };
+    if trimmed != canonical {
+        // A replacement is named only when it is itself one key in one
+        // spelling, at the root and below it, and names the same keys as
+        // this URI does there; otherwise none is.
+        let same_keys = suggest
+            && below == lance.clone().join("child")
+            && s3_one_key(&canonical, false).ok().as_deref() == Some(lance.as_ref())
+            && s3_one_key(&format!("{canonical}/child"), false)
+                .ok()
+                .as_deref()
+                == Some(below.as_ref());
+        return Err(s3_key_refusal(
+            uri,
+            S3KeyRefusal::Respelled {
+                canonical: same_keys.then_some(canonical.as_str()),
+            },
+        ));
+    }
+    Ok(written)
+}
+
+/// The adapter's key and Lance's for `address` (the URI `uri`, or a child of
+/// it when `below`), refused unless both exist and are one key.
+fn s3_key_pair(uri: &str, address: &str, below: bool) -> Result<(String, ObjectPath)> {
+    let url = Url::parse(address).map_err(|err| {
+        StorageError::backend(
+            StorageFailureKind::Configuration,
+            format!("invalid s3 uri '{}': {err}", redacted_storage_uri(uri)),
+        )
+    })?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(s3_key_refusal(uri, S3KeyRefusal::NoKey));
+    }
+    let written = s3_key_as_written(address, &url);
+    let lance = ObjectPath::from_url_path(url.path())
+        .map_err(|_| s3_key_refusal(uri, S3KeyRefusal::NoKey))?;
+    if ObjectPath::parse(&written).ok().as_ref() != Some(&lance) {
+        return Err(s3_key_refusal(
+            uri,
+            S3KeyRefusal::TwoKeys {
+                adapter: &written,
+                lance: lance.as_ref(),
+                below,
+            },
+        ));
+    }
+    Ok((written, lance))
+}
+
+/// Why an `s3://` URI names no one key.
+enum S3KeyRefusal<'a> {
+    /// A query, a fragment, an empty path segment or an escape that decodes
+    /// to no text, at the URI or below it. No spelling names its objects.
+    NoKey,
+    /// The adapter's spelling and Lance's are two keys, for the URI itself
+    /// or, when `below`, for an object below it.
+    TwoKeys {
+        adapter: &'a str,
+        lance: &'a str,
+        below: bool,
+    },
+    /// One key in another spelling: `canonical` is the one spelling, when it
+    /// names the same keys at the root and below it.
+    Respelled { canonical: Option<&'a str> },
+}
+
+fn s3_key_refusal(uri: &str, refusal: S3KeyRefusal<'_>) -> StorageError {
+    // The URI as the caller wrote it, a tab or a newline made visible, since
+    // the refusal is about its spelling; a URI with credentials, a query or a
+    // fragment is shown redacted instead.
+    let secret = Url::parse(uri).map_or(true, |url| {
+        !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+    });
+    let uri = if secret {
+        redacted_storage_uri(uri)
+    } else {
+        uri.escape_debug().to_string()
+    };
+    let why = match refusal {
+        S3KeyRefusal::NoKey => "a query, a fragment, an empty path segment or an escape that decodes to no text, at it or below it, names no key, so no spelling names its objects; use a prefix of plain characters".to_string(),
+        S3KeyRefusal::TwoKeys {
+            adapter,
+            lance,
+            below,
+        } => format!(
+            "Omnigraph would store {} under the key '{adapter}' and Lance under '{lance}'; a character a URL escapes (a space, a non-ASCII letter, a brace, a quote), an escape Lance decodes (`%41`, `%20`, `%2F`) or a space at the end of the path has two spellings, so use a path without them",
+            if below { "an object below it" } else { "its objects" }
+        ),
+        S3KeyRefusal::Respelled {
+            canonical: Some(canonical),
+        } => format!(
+            "it is another spelling of '{canonical}' (a dot segment, a port, user information, or a tab or newline the URL parser drops), and one key has one spelling; use that one"
+        ),
+        S3KeyRefusal::Respelled { canonical: None } => "the URL parser rewrites it (a dot segment, a port, user information, or a tab or newline it drops), and no one spelling names the same objects at it and below it; use a prefix of plain characters".to_string(),
+    };
+    StorageError::backend(
+        StorageFailureKind::Configuration,
+        format!("an s3 path must name one object key, got '{uri}': {why}"),
+    )
+}
+
+/// The key the `s3://` URI `uri`, parsed as `url`, names as written: its URL
+/// path as `url` spelled it through 2.5.8, which the store takes literally.
+/// From 2.5.9 a `^` is written `%5E`; here it stays a caret, so no `url`
+/// release moves an object.
+fn s3_key_as_written(uri: &str, url: &Url) -> String {
     let path = url.path().trim_start_matches('/');
     let tilde_for_caret = uri
         .contains('^')
@@ -6970,16 +7137,27 @@ mod tests {
     fn s3_key_keeps_a_caret_as_written() {
         for (uri, key) in [
             ("s3://bucket/a^b/x", "a^b/x"),
-            ("s3://bucket/a%5Eb^c", "a%5Eb^c"),
-            ("s3://bucket/a%5eb^c", "a%5eb^c"),
-            ("s3://bucket/x^/../y^z~^", "y^z~^"),
+            ("s3://bucket/y^z~^", "y^z~^"),
         ] {
             assert_eq!(parse_s3_uri(uri).unwrap().key, key, "{uri}");
         }
+        // Lance decodes `%5E` to a caret, so the escape spelling names a
+        // second key for one path, and a dot segment is a second spelling of
+        // one key; both are refused (#1527).
+        for uri in [
+            "s3://bucket/a%5Eb^c",
+            "s3://bucket/a%5eb^c",
+            "s3://bucket/x^/../y^z~^",
+        ] {
+            let text = parse_s3_uri(uri).expect_err("no one key").to_string();
+            assert!(text.contains("must name one object key"), "{uri}: {text}");
+        }
     }
 
-    /// A `url` release that spells one more character differently moves an
-    /// object under such a path; this test fails first.
+    /// A `url` release that spells one more character differently would move
+    /// an object under such a path; this test fails first. A character the
+    /// URL escapes is refused, since Lance stores it decoded (#1527); every
+    /// other printable character is a key as written.
     #[test]
     fn s3_key_spelling_is_fixed_for_printable_ascii() {
         for byte in b' '..=b'~' {
@@ -6987,23 +7165,248 @@ mod tests {
             if matches!(character, '/' | '?' | '#') {
                 continue;
             }
-            let spelled = match character {
-                ' ' => "%20".to_string(),
-                '"' => "%22".to_string(),
-                '<' => "%3C".to_string(),
-                '>' => "%3E".to_string(),
-                '`' => "%60".to_string(),
-                '{' => "%7B".to_string(),
-                '}' => "%7D".to_string(),
-                other => other.to_string(),
-            };
-            assert_eq!(
-                parse_s3_uri(&format!("s3://bucket/a{character}b"))
-                    .unwrap()
-                    .key,
-                format!("a{spelled}b"),
-                "{character:?}"
+            let uri = format!("s3://bucket/a{character}b");
+            if matches!(character, ' ' | '"' | '<' | '>' | '`' | '{' | '}') {
+                let text = parse_s3_uri(&uri).expect_err("no one key").to_string();
+                assert!(
+                    text.contains("must name one object key"),
+                    "{character:?}: {text}"
+                );
+            } else {
+                assert_eq!(
+                    parse_s3_uri(&uri).unwrap().key,
+                    format!("a{character}b"),
+                    "{character:?}"
+                );
+            }
+        }
+    }
+
+    /// #1527 (second review): the URL parser strips a space or control
+    /// character only at the end of a string, so `s3://bucket/graph ` names
+    /// `graph` alone and two keys below it (`graph%20/x`, `graph /x`): the
+    /// objects an earlier release wrote there are split. Every route refuses
+    /// it as a split below the root and names no replacement.
+    #[tokio::test]
+    async fn s3_root_that_splits_below_itself_is_refused_with_no_replacement_issue_1527() {
+        for (uri, adapter, lance) in [
+            ("s3://bucket/graph ", "graph%20/child", "graph /child"),
+            ("s3://bucket/graph  ", "graph%20%20/child", "graph  /child"),
+            (
+                "s3://bucket/a/graph \t",
+                "a/graph%20/child",
+                "a/graph /child",
+            ),
+        ] {
+            let mut texts = vec![
+                parse_s3_uri(uri).expect_err("adapter key").to_string(),
+                s3_object_key(uri).expect_err("one key").to_string(),
+                normalize_root_uri(uri).expect_err("root").to_string(),
+                s3_root_key(uri).expect_err("root key").to_string(),
+                ObjectStorageAdapter::s3_from_root_uri(uri)
+                    .map(|_| ())
+                    .expect_err("adapter")
+                    .to_string(),
+            ];
+            texts.push(
+                ObjectStorageAdapter::durable_read_through("s3://bucket/base", uri)
+                    .await
+                    .map(|_| ())
+                    .expect_err("clone root")
+                    .to_string(),
             );
+            for text in texts {
+                assert!(
+                    text.contains(&format!(
+                        "an object below it under the key '{adapter}' and Lance under '{lance}'"
+                    )) && !text.contains("another spelling of"),
+                    "{uri:?}: {text}"
+                );
+            }
+        }
+        // A control character at the end names no key below the root.
+        let text = s3_object_key("s3://bucket/graph\u{1}")
+            .expect_err("no key below")
+            .to_string();
+        assert!(
+            text.contains("names no key") && !text.contains("another spelling of"),
+            "{text}"
+        );
+    }
+
+    /// #1527 (second review): a refusal names a replacement only when the
+    /// replacement is itself one key in one spelling and names the keys the
+    /// refused spelling named, at the root and below it, where an earlier
+    /// release wrote its objects. Checked over every decoration of a few keys.
+    #[test]
+    fn s3_refusal_names_only_a_replacement_with_the_same_keys_issue_1527() {
+        let mut uris = Vec::new();
+        for key in ["graph", "a/b", "c^1/g", "x~[y]"] {
+            for (before, after) in [
+                ("", " "),
+                ("", "  "),
+                ("", "\t"),
+                ("", "\n"),
+                ("", " \t"),
+                ("", "\t "),
+                ("", "\u{1}"),
+                ("", "/."),
+                ("", "/x/.."),
+                ("", "/%2e"),
+                ("", "/z/%2e%2e"),
+                ("x/../", ""),
+                ("./", ""),
+                ("%2e/", ""),
+                ("a/%2e%2e/", ""),
+                ("a/.%2E/", ""),
+                ("\t", ""),
+                ("x/../", " "),
+                ("./", "/."),
+            ] {
+                uris.push(format!("s3://bucket/{before}{key}{after}"));
+                uris.push(format!("s3://user:pw@bucket/{before}{key}{after}"));
+                uris.push(format!("s3://bucket:9000/{before}{key}{after}"));
+            }
+        }
+        let mut named = 0;
+        for uri in &uris {
+            let Err(error) = s3_object_key(uri) else {
+                panic!("{uri:?} is not its key's one spelling, yet was accepted");
+            };
+            let text = error.to_string();
+            let Some(rest) = text.split("another spelling of '").nth(1) else {
+                continue;
+            };
+            let replacement = rest.split('\'').next().unwrap();
+            named += 1;
+            let trimmed = trim_trailing_slashes(uri);
+            let (_, root) = s3_key_pair(uri, &trimmed, false)
+                .unwrap_or_else(|e| panic!("{uri:?} named {replacement} with no root key: {e}"));
+            let (old_adapter, below) = s3_key_pair(uri, &format!("{trimmed}/child"), true)
+                .unwrap_or_else(|e| {
+                    panic!("{uri:?} named {replacement} though it splits below: {e}")
+                });
+            assert_eq!(old_adapter, below.as_ref(), "{uri:?}");
+            assert_eq!(
+                s3_object_key(replacement).unwrap(),
+                root.as_ref(),
+                "{uri:?}"
+            );
+            assert_eq!(normalize_root_uri(replacement).unwrap(), replacement);
+            assert_eq!(
+                s3_object_key(&format!("{replacement}/child")).unwrap(),
+                below.as_ref(),
+                "{uri:?}"
+            );
+        }
+        assert!(named > uris.len() / 3, "{named} of {}", uris.len());
+    }
+
+    /// #1527 (review): one key has one spelling. The URL parser resolves dot
+    /// segments (escaped too), drops tabs and newlines, and ignores user
+    /// information and a port, so each of these named the
+    /// objects of `s3://bucket/cluster` under a second root identity. Every
+    /// route refuses them, and the refusal names the one spelling.
+    #[test]
+    fn s3_uri_that_respells_a_key_is_refused_by_every_route_issue_1527() {
+        for uri in [
+            "s3://bucket/a/../cluster",
+            "s3://bucket/a/%2e%2e/cluster",
+            "s3://bucket/a/.%2E/cluster",
+            "s3://bucket/./cluster",
+            "s3://bucket/%2e/cluster",
+            "s3://bucket/cluster/.",
+            "s3://bucket/cluster/x/..",
+            "s3://bucket/clu\tster",
+            "s3://bucket/clu\nster",
+            "s3://user:secret@bucket/cluster",
+            "s3://bucket:9000/cluster",
+        ] {
+            for text in [
+                parse_s3_uri(uri).expect_err("adapter key").to_string(),
+                s3_object_key(uri).expect_err("one key").to_string(),
+                normalize_root_uri(uri).expect_err("root").to_string(),
+                s3_root_key(uri).expect_err("root key").to_string(),
+                ObjectStorageAdapter::s3_from_root_uri(uri)
+                    .map(|_| ())
+                    .expect_err("adapter")
+                    .to_string(),
+            ] {
+                assert!(
+                    text.contains("must name one object key")
+                        && text.contains("another spelling of 's3://bucket/cluster'")
+                        && !text.contains("secret"),
+                    "{uri:?}: {text}"
+                );
+            }
+        }
+        let text = s3_object_key("s3://bucket/a/%2e%2e/cluster")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("got 's3://bucket/a/%2e%2e/cluster'"),
+            "{text}"
+        );
+        assert_eq!(s3_object_key("s3://bucket/cluster").unwrap(), "cluster");
+        assert_eq!(s3_object_key("s3://bucket/cluster//").unwrap(), "cluster");
+        assert_eq!(
+            normalize_root_uri("s3://bucket/cluster/").unwrap(),
+            "s3://bucket/cluster"
+        );
+    }
+
+    /// #1527: every route derives one key for an `s3://` URI or refuses it.
+    /// A spelling Lance decodes to another key (an escape such as `%41`, also a
+    /// dot escaped inside a segment, a space, a non-ASCII letter, a brace) is
+    /// refused as two keys by the adapter, by root
+    /// normalization and by the clone open alike, so two roots that differ
+    /// only in escaping are never two sets of keys.
+    #[test]
+    fn s3_uri_whose_lance_key_differs_is_refused_by_every_route_issue_1527() {
+        for uri in [
+            "s3://bucket/my data/root",
+            "s3://bucket/my%20data/root",
+            "s3://bucket/\u{e9}t\u{e9}/root",
+            "s3://bucket/%C3%A9t%C3%A9/root",
+            "s3://bucket/a%41b",
+            "s3://bucket/{x}/root",
+            "s3://bucket/50%25off",
+            "s3://bucket/a%2eb",
+            "s3://bucket/root?x",
+            "s3://bucket/root#f",
+        ] {
+            for text in [
+                parse_s3_uri(uri).expect_err("adapter key").to_string(),
+                s3_object_key(uri).expect_err("one key").to_string(),
+                normalize_root_uri(uri).expect_err("root").to_string(),
+                s3_root_key(uri).expect_err("root key").to_string(),
+                ObjectStorageAdapter::s3_from_root_uri(uri)
+                    .map(|_| ())
+                    .expect_err("adapter")
+                    .to_string(),
+            ] {
+                // The upgrade guide keys its recovery on this: a refusal that
+                // names two keys is a split; a query or fragment names none.
+                let case = if uri.contains(['?', '#']) {
+                    "names no key"
+                } else {
+                    "and Lance under"
+                };
+                assert!(
+                    text.contains("must name one object key") && text.contains(case),
+                    "{uri:?}: {text}"
+                );
+            }
+        }
+        // The spelling both routes agree on is accepted, unchanged.
+        for (uri, key) in [
+            ("s3://bucket/aAb", "aAb"),
+            ("s3://bucket/a%zz", "a%zz"),
+            ("s3://bucket/c^1/g", "c^1/g"),
+            ("s3://bucket/my-data_1.x/root", "my-data_1.x/root"),
+        ] {
+            assert_eq!(s3_object_key(uri).unwrap(), key, "{uri:?}");
+            assert_eq!(normalize_root_uri(uri).unwrap(), uri, "{uri:?}");
         }
     }
 
@@ -7659,7 +8062,6 @@ mod tests {
             ("s3://bucket", "s3://bucket/clone"),
             ("s3://bucket/graph/", "s3://bucket/graph"),
             ("s3://bucket/graph//", "s3://bucket/graph/clone/"),
-            ("s3://bucket/graph", "s3://bucket/graph/./clone"),
             ("s3://bucket/graph", "s3://bucket"),
         ] {
             let text = ObjectStorageAdapter::durable_read_through(base, root)
@@ -7679,12 +8081,16 @@ mod tests {
             ("s3://bucket/graph/sub", "s3://bucket/graph//sub/"),
             ("s3://bucket//graph", "s3://bucket/graph/clone"),
             ("s3://bucket/graph", "s3://bucket/graph?clone"),
+            ("s3://bucket/graph", "s3://bucket/graph/./clone"),
         ] {
             let text = ObjectStorageAdapter::durable_read_through(base, root)
                 .await
                 .expect_err("a root with two spellings")
                 .to_string();
-            assert!(text.contains("names one key"), "{base} and {root}: {text}");
+            assert!(
+                text.contains("must name one object key"),
+                "{base} and {root}: {text}"
+            );
         }
         assert!(!s3_prefixes_overlap("graph", "graphs"));
         assert!(!s3_prefixes_overlap("a/graph", "b/graph"));
@@ -7692,7 +8098,7 @@ mod tests {
 
     /// GQT cannot name its store's root, and only an `s3://` clone has this prefix.
     #[test]
-    fn s3_clone_prefix_keeps_a_caret_as_written() {
+    fn s3_root_key_keeps_a_caret_as_written() {
         for (uri, key) in [
             ("s3://bucket/graph", "graph"),
             ("s3://bucket/a/b//", "a/b"),
@@ -7702,11 +8108,9 @@ mod tests {
             ("s3://bucket/a|b*c", "a|b*c"),
             ("s3://bucket/a%zz", "a%zz"),
             ("s3://bucket/100%", "100%"),
-            ("s3://bucket/graph/../other", "other"),
-            ("s3://bucket/graph\n", "graph"),
             ("s3://bucket", ""),
         ] {
-            assert_eq!(s3_clone_prefix(uri).unwrap().as_ref(), key, "{uri:?}");
+            assert_eq!(s3_root_key(uri).unwrap().as_ref(), key, "{uri:?}");
         }
         for uri in [
             "s3://bucket/c%41",
@@ -7724,9 +8128,11 @@ mod tests {
             "s3://bucket/child?x",
             "s3://bucket//clone",
             "s3://bucket/a//b",
+            "s3://bucket/graph/../other",
+            "s3://bucket/graph\n",
         ] {
-            let text = s3_clone_prefix(uri).expect_err("no one key").to_string();
-            assert!(text.contains("names one key"), "{uri:?}: {text}");
+            let text = s3_root_key(uri).expect_err("no one key").to_string();
+            assert!(text.contains("must name one object key"), "{uri:?}: {text}");
         }
     }
 

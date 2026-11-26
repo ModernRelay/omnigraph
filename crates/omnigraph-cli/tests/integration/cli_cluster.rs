@@ -6332,3 +6332,123 @@ fn managed_organization_m2m_application_secret_file_never_shares_a_path_with_ano
     assert!(api.workflow_requests().is_empty());
     api.assert_complete();
 }
+
+/// #1527: an inline `s3://` root that names no one key (an escape Lance
+/// decodes to a second key, a query) or respells another root's key (a dot
+/// segment, escaped or not) is refused before any request, and names the one
+/// spelling to use only when that spelling names the same objects (not for a
+/// trailing space, which splits the keys below the root). The storage
+/// endpoint is a fixture that records every request it receives; the one
+/// spelling of a key, sent to the same endpoint, shows that it would see one.
+#[test]
+fn inline_s3_root_without_one_key_is_refused_before_any_request_issue_1527() {
+    let bucket = IntentApiFixture::new(vec![IntentReply::json(
+        403,
+        serde_json::json!({"type": "denied"}),
+    )]);
+    let s3 = || {
+        let mut command = cli();
+        command.envs([
+            ("AWS_ACCESS_KEY_ID", "one-key-test-key"),
+            ("AWS_SECRET_ACCESS_KEY", "one-key-test-secret"),
+            ("AWS_SESSION_TOKEN", ""),
+            (
+                "AWS_CONFIG_FILE",
+                "/nonexistent/omnigraph-one-key-aws-config",
+            ),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                "/nonexistent/omnigraph-one-key-aws-credentials",
+            ),
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_DEFAULT_REGION", "us-east-1"),
+            ("AWS_ENDPOINT", bucket.http_origin.as_str()),
+            ("AWS_ENDPOINT_URL", bucket.http_origin.as_str()),
+            ("AWS_ENDPOINT_URL_S3", bucket.http_origin.as_str()),
+            ("AWS_ALLOW_HTTP", "true"),
+            ("AWS_S3_FORCE_PATH_STYLE", "true"),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+            ("OBJECT_STORE_CLIENT_MAX_RETRIES", "0"),
+            ("OBJECT_STORE_CLIENT_RETRY_TIMEOUT", "2"),
+        ]);
+        command
+    };
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("g.pg"),
+        "node X {\n  slug: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  g:\n    schema: g.pg\n",
+    )
+    .unwrap();
+    let config = dir.path().to_str().unwrap();
+    for spelling in [
+        "my data/root",
+        "\u{e9}t\u{e9}/root",
+        "a%41b/root",
+        "{x}/root",
+        "x/%2e%2e/root",
+        "x/../root",
+        "root/.",
+        "root ",
+    ] {
+        let root = format!("s3://one-key-bucket/{spelling}");
+        let base = "s3://one-key-bucket/base";
+        let commands: [Vec<&str>; 4] = [
+            vec!["cluster", "status", "--target", &root, "--json"],
+            vec![
+                "cluster", "apply", "--target", &root, "--config", config, "--json",
+            ],
+            vec!["optimize", "--target", &root, "--graph", "g", "--json"],
+            vec![
+                "query",
+                "--target",
+                &root,
+                "--base",
+                base,
+                "-e",
+                "query q() { match { $x: X } return { $x.slug } }",
+                "--json",
+            ],
+        ];
+        for arguments in commands {
+            let output = output_failure(s3().args(&arguments));
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                text.contains("must name one object key"),
+                "{arguments:?}: {text}"
+            );
+            // A replacement is named only where it names the same objects:
+            // `root ` splits below itself (`root%20/…`, `root /…`), so none is.
+            let named = text.contains("another spelling of 's3://one-key-bucket/root'");
+            assert_eq!(
+                named,
+                matches!(spelling, "x/%2e%2e/root" | "x/../root" | "root/."),
+                "{arguments:?}: {text}"
+            );
+            assert!(
+                bucket.requests().is_empty(),
+                "{arguments:?} reached the storage endpoint: {:?}",
+                bucket.requests()
+            );
+        }
+    }
+    let output = output_failure(s3().args([
+        "cluster",
+        "status",
+        "--target",
+        "s3://one-key-bucket/root",
+        "--json",
+    ]));
+    assert!(
+        !bucket.requests().is_empty(),
+        "the one spelling reaches the endpoint: {output:?}"
+    );
+}

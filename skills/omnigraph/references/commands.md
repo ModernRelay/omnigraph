@@ -547,9 +547,12 @@ and a graph shallow clone: `--base URI` opens a direct graph target over the
 graph at `URI` (reads fall through to the base, writes land in the target, the
 base is never written) for `query`, `mutate`, `load`, `branch`, `commit`,
 `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`; an inline
-`s3://` clone root with an `s3://` base is admitted there, each with a path free
-of empty inner segments and percent escapes (a space or a non-ASCII letter is written
-as one). Nothing in the target
+`s3://` clone root with an `s3://` base is admitted there. Every `s3://` root,
+clone, base or cluster, needs a path free of empty inner segments, queries and
+percent escapes (a space, a brace or a non-ASCII letter is written as one), and
+must be the one spelling `s3://<bucket>/<key>` (no dot segment, port, user
+information or trailing space); any other path is refused before any request,
+and the refusal names a replacement only when one names the same objects. Nothing in the target
 records its base, so every reopen passes the same `--base`; a clone root opened
 without it is refused. `--stats PATH` writes one JSON document per invocation
 with the logical object-store calls, the exit code and the peak resident set.

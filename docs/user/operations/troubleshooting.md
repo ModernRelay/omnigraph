@@ -281,9 +281,18 @@ between graph roots.
   and apply them. An invalid applied binding keeps its graph blocked;
   if every graph is blocked, startup fails with `cluster_no_healthy_graphs`. See
   [External Blob references](../clusters/config.md#external-blob-references).
+- `invalid_storage_root` or `target_invalid` with "an s3 path must name one
+  object key": the `s3://` root is refused before any request. When the
+  message names two keys (a space, a non-ASCII letter, a brace, a quote, a
+  trailing space, or an escape Lance decodes, such as `%41`), Omnigraph and
+  Lance would split its objects. When it says the root names no key (a query,
+  a fragment, an empty segment, a trailing control character), choose a plain
+  prefix. When it names another spelling (a dot segment, `%2e%2e` included, a
+  port, user information, a tab or newline), use that one. For a cluster an earlier release created at such a root, see
+  [S3 roots that name two keys](upgrade.md#s3-roots-that-name-two-keys).
 - `external_blob_storage_root_uncomparable`: the cluster storage root is
-  spelled with a path component an external Blob base cannot express (an empty
-  component, or a percent sign in a local path), so a base of the same storage
+  spelled with a path component an external Blob base cannot express (a
+  backslash, or a percent sign in a local path), so a base of the same storage
   kind cannot be proven to lie outside it. Moving the base does not help:
   correct the declaration or remove the allow-list before applying. Graph roots
   remain fixed. Validation refuses the base, and an invalid applied
