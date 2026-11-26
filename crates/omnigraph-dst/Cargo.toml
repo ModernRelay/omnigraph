@@ -37,6 +37,7 @@ serde_json = { workspace = true }
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.17.1" }
 
 [dev-dependencies]
+ctor = { workspace = true }
 serial_test = "3"
 # The cluster lock's lease protocol, simulated in `scenarios.rs`.
 omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.17.1", features = ["test-util"] }

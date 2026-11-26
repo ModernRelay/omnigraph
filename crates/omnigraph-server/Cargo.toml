@@ -57,6 +57,7 @@ aws-config = { version = "1", optional = true, default-features = false, feature
 aws-sdk-secretsmanager = { version = "1", optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 
 [dev-dependencies]
+ctor = { workspace = true }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "testing"] }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic-messages", "trace"] }
 prost = "0.14"

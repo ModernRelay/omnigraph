@@ -92,6 +92,9 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 yaml_serde = "0.10.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Test binaries only: installs the global subscriber that keeps tracing's
+# callsite interest dynamic before any test runs (docs/dev/testing.md#log-capture).
+ctor = "1"
 tower = "0.5"
 color-eyre = "0.6"
 tempfile = "3"
