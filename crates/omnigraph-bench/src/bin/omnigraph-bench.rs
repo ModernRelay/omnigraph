@@ -1,6 +1,7 @@
 mod bench_cli;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{self, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -625,6 +626,26 @@ enum ProjectionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Emit the results graph's rows, graph JSONL for `omnigraph load --mode merge`,
+    /// from a store's records and the catalogs that declared them.
+    Export {
+        /// The fixture store whose `records/` are read.
+        #[arg(long)]
+        store: String,
+        /// A catalog, repeatable: a benchmarks.yaml or the directory holding one; none means records alone.
+        #[arg(long, value_name = "DIR|FILE")]
+        catalog: Vec<PathBuf>,
+        /// Write the rows to this file, whole and only when the export succeeds; the summary then goes to stdout instead of stderr.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Emit the summary as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the results graph's schema, the file `omnigraph init --schema` takes.
+    Schema,
+    /// Print the stored queries as one GQ file; `omnigraph query <name> --query <file>` selects one.
+    Queries,
 }
 
 fn parse_projection_cursor(value: &str) -> Result<ProjectionCursorV1, String> {
@@ -1000,6 +1021,153 @@ struct ProjectionFailure {
     error: ProjectionError,
 }
 
+/// Where `projection export` reports. With no `--out` the rows own stdout,
+/// so the summary and every failure take stderr, and a pipe into
+/// `omnigraph load` carries rows alone.
+#[derive(Clone, Copy)]
+enum ExportReport {
+    Stdout,
+    Stderr,
+}
+
+impl ExportReport {
+    fn line(self, text: &str) {
+        match self {
+            Self::Stdout => println!("{text}"),
+            Self::Stderr => eprintln!("{text}"),
+        }
+    }
+
+    fn failure(self, report: &impl Serialize) -> ExitCode {
+        match serde_json::to_string_pretty(report) {
+            Ok(text) => self.line(&text),
+            Err(error) => eprintln!("could not serialize JSON output: {error}"),
+        }
+        ExitCode::FAILURE
+    }
+
+    fn diagnostic(self, diagnostic: Diagnostic, json: bool) -> ExitCode {
+        let diagnostics = vec![diagnostic];
+        if json {
+            self.failure(&ValidationOutcome::<()>::failure(diagnostics))
+        } else {
+            print_diagnostics(&diagnostics)
+        }
+    }
+}
+
+/// `projection export`: the rows to `--out` or stdout, the report to the
+/// other stream.
+async fn run_export(
+    store: String,
+    catalog: Vec<PathBuf>,
+    out: Option<PathBuf>,
+    json: bool,
+) -> ExitCode {
+    let report = if out.is_some() {
+        ExportReport::Stdout
+    } else {
+        ExportReport::Stderr
+    };
+    let catalogs = if catalog.is_empty() {
+        Vec::new()
+    } else {
+        match bench_cli::load_all(&bench_cli::CatalogArgs {
+            config: None,
+            catalog,
+            json,
+        }) {
+            Ok(catalogs) => catalogs,
+            Err(diagnostics) if json => {
+                return report.failure(&bench_cli::failure_report(&diagnostics));
+            }
+            Err(diagnostics) => return print_diagnostics(&diagnostics),
+        }
+    };
+    let fixture_store = match omnigraph_bench::store::FixtureStore::open(&store) {
+        Ok(store) => store,
+        Err(error) => {
+            return report.diagnostic(Diagnostic::error(&error.code, "store", error.message), json);
+        }
+    };
+    let summary = match &out {
+        Some(path) => {
+            let mut rows = Vec::new();
+            let summary =
+                omnigraph_bench::export::export(&fixture_store, &catalogs, &mut rows).await;
+            if summary.is_ok() {
+                if let Err(error) = fs::write(path, &rows) {
+                    return report.diagnostic(
+                        Diagnostic::error(
+                            "export_write_failed",
+                            "out",
+                            format!("{}: {error}", path.display()),
+                        ),
+                        json,
+                    );
+                }
+            }
+            summary
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut writer = std::io::BufWriter::new(stdout.lock());
+            let summary =
+                omnigraph_bench::export::export(&fixture_store, &catalogs, &mut writer).await;
+            if let Err(error) = writer.flush() {
+                return report.diagnostic(
+                    Diagnostic::error("export_write_failed", "stdout", error.to_string()),
+                    json,
+                );
+            }
+            summary
+        }
+    };
+    match summary {
+        Ok(summary) => {
+            let text = if json {
+                match serde_json::to_string(&summary) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        return report.diagnostic(
+                            Diagnostic::error(
+                                "output_serialization_failed",
+                                "$",
+                                error.to_string(),
+                            ),
+                            json,
+                        );
+                    }
+                }
+            } else {
+                format!(
+                    "exported {} rows: {} catalogs, {} suites, {} scenarios, {} fixtures, {} workloads, {} records ({} legacy skipped, {} unparsed skipped), {} points, {} levels, {} runs ({} without a product commit), {} revisions, {} machines, {} edges",
+                    summary.rows,
+                    summary.catalogs,
+                    summary.suites,
+                    summary.scenarios,
+                    summary.fixtures,
+                    summary.workloads,
+                    summary.records,
+                    summary.legacy_records_skipped,
+                    summary.unparsed_records_skipped,
+                    summary.points,
+                    summary.levels,
+                    summary.runs,
+                    summary.runs_without_commit,
+                    summary.revisions,
+                    summary.machines,
+                    summary.edges
+                )
+            };
+            report.line(&text);
+            ExitCode::SUCCESS
+        }
+        Err(error) if json => report.failure(&ProjectionFailure { ok: false, error }),
+        Err(error) => print_projection_failure(error, false),
+    }
+}
+
 async fn run_projection(command: ProjectionCommand) -> ExitCode {
     match command {
         ProjectionCommand::Rebuild {
@@ -1023,6 +1191,20 @@ async fn run_projection(command: ProjectionCommand) -> ExitCode {
             }
             Err(error) => print_projection_failure(error, json),
         },
+        ProjectionCommand::Schema => {
+            print!("{}", omnigraph_bench::export::RESULTS_SCHEMA);
+            ExitCode::SUCCESS
+        }
+        ProjectionCommand::Queries => {
+            print!("{}", omnigraph_bench::export::results_queries_document());
+            ExitCode::SUCCESS
+        }
+        ProjectionCommand::Export {
+            store,
+            catalog,
+            out,
+            json,
+        } => run_export(store, catalog, out, json).await,
         ProjectionCommand::ListPoints {
             root,
             limit,

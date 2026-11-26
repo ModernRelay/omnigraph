@@ -108,6 +108,26 @@ pub mod build {
         }
     }
 
+    /// The repository revision whose documentation a build of `package`
+    /// links: the release tag of a stable build, the commit of any other
+    /// stamped build, and none for a local or source build, which cannot
+    /// name a revision that has its pages.
+    pub fn docs_revision(package: &str) -> Option<String> {
+        revision(package, RELEASE_CHANNEL, SOURCE_COMMIT)
+    }
+
+    pub(crate) fn revision(
+        package: &str,
+        channel: Option<&str>,
+        commit: Option<&str>,
+    ) -> Option<String> {
+        match (channel, commit) {
+            (Some("stable"), Some(_)) => Some(format!("v{package}")),
+            (_, Some(commit)) => Some(commit.to_owned()),
+            (_, None) => None,
+        }
+    }
+
     /// The internal-schema stamp of a graph this build creates, the highest
     /// it writes.
     pub const INTERNAL_SCHEMA_WRITES: u32 =
@@ -4028,6 +4048,25 @@ mod tests {
         assert_eq!(versioned("0.14.0", Some("stable"), Some(commit)), "0.14.0");
         assert_eq!(versioned("0.14.0", None, Some(commit)), "0.14.0");
         assert_eq!(versioned("0.14.0", None, None), "0.14.0");
+    }
+
+    #[test]
+    fn docs_links_name_the_release_tag_the_commit_or_nothing() {
+        use super::build::revision;
+        let commit = "9c2b3679e8f66062252e7ed6270a9478b4b77413";
+        assert_eq!(
+            revision("0.16.1", Some("stable"), Some(commit)).as_deref(),
+            Some("v0.16.1")
+        );
+        assert_eq!(
+            revision("0.16.1", Some("edge"), Some(commit)).as_deref(),
+            Some(commit)
+        );
+        assert_eq!(
+            revision("0.16.1", None, Some(commit)).as_deref(),
+            Some(commit)
+        );
+        assert_eq!(revision("0.16.1", None, None), None);
     }
 
     #[test]

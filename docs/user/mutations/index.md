@@ -44,9 +44,9 @@ where; a where compares the row's own properties, parameters and now()``. A
 compound `where` runs under either `engine` setting. A `where` that tests over
 four properties twice each with `=`, `!=` or `in` is refused.
 
-Assignment values are constants: literals, parameters, `now()`, and comparisons
-or Boolean operators over them, such as `adult: true or $flag`. A constant's
-value is fixed per invocation: parameters and `now()` are bound once before any
+Assignment values are constants: literals, parameters, `now()`, and comparisons or Boolean
+operators over them, such as `adult: true or $flag`; `[]` takes a list property's element type.
+A constant's value is fixed per invocation: parameters and `now()` are bound once before any
 retry, so a retried mutation computes the same value. It follows the read rules
 for null: with `$flag` null, `true or $flag` is `true` and `false and $flag` is
 `false`, and `$age > 30` with `$age` null is null. A null result assigned to a
@@ -253,8 +253,8 @@ entities per touched type. The [`write_max_bytes`](../queries/settings.md)
 setting (default 32 MiB) bounds retained row data per type and across all
 touched types. Blob payloads have a separate allowance of the same size,
 including inline bytes, copied external bytes and carried update values.
-Every version of a key written in one mutation counts, so an insert and an
-update of the same row charge its Blob twice.
+A later write of an entity in one mutation replaces its pending version, so it
+counts once; an update's scan holds both, so rewriting N of them needs 2 × N.
 Keyed loads also bound their parser estimate independently. A strict JSONL
 load retains its projected input check, `strict_input_arrow_bytes`.
 A vector counts its full width (dimension × 4 bytes), present or null: 12 KiB for `Vector(3072)`.

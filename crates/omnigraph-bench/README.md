@@ -590,6 +590,79 @@ root and rebuilding it.
 Query callers choose fixed, parameterized names; arbitrary GQ text is not
 accepted. The projection may be deleted at any time and rebuilt without losing
 evidence.
+
+### The results graph
+
+The same schema serves a graph of your own, wherever `omnigraph` can address
+one. `projection/schema.pg` is the file; `projection/queries/*.gq` are the
+stored queries beside it (`series_for_scenario`, `suite_series`,
+`runs_for_commit`, `scenarios_in_suite`, and without parameters `all_series`,
+`suite_members`, `scenario_facts`, `run_hosts`, the four a rendered page reads,
+and for a point's spec `point_levels` and `points_at`; `projection queries`
+prints them as one GQ file), and the harness emits rows for them from a
+store's records and the catalogs that declared them:
+
+```bash
+target/release/omnigraph-bench projection schema > schema.pg
+omnigraph init s3://bucket/bench/main/graph --schema schema.pg
+target/release/omnigraph-bench projection export \
+  --store s3://bucket/bench/main \
+  --catalog benchmarks --catalog catalogs/private \
+  | omnigraph load --target s3://bucket/bench/main/graph --mode merge --data /dev/stdin
+omnigraph query --target s3://bucket/bench/main/graph \
+  --query projection/queries/series_for_scenario.gq series_for_scenario \
+  --params '{"scenario": "branch-merge-d50-process-cold"}'
+```
+
+`--out <file>` takes the rows in place of stdout and is written whole, once,
+when the export succeeds; an export that stops leaves the file as it was. A run
+row's `archive_object` and `archive_pointer` both name the store's record,
+`records/<sha256>.json`: the store writes no pointer objects, so a record is its
+own pointer.
+
+The rows are graph JSONL in the loader's envelope, every node first and every
+edge after, and the schema's keys say what each row is: a `Scenario` and a
+`Suite` are their names, a `Workload` is its bytes, a `Fixture` its file or
+declaration, a `Revision` a commit, a `Machine` its fingerprint, a
+`BenchmarkRun` its invocation, and a `BenchmarkPoint` the digest of its run's
+spec. A scenario edited in the catalog stays one node carrying the new
+declaration, and what was measured stays apart on the points: a change to the
+spec (the queries, the measured step, the dataset, the protocol) is a new
+point under the same name, and a change to the repetitions alone is the same
+point, each run with its own count. A point's spec is also written as `Level`
+rows, one per field (`protocol.reset` is `clone`), so a query holds any of
+them fixed: `points_at` answers a scenario's points at one level, and
+`point_levels` one point's spec, which tells two points apart. A case name the
+records hold and no catalog declares is still a `Scenario`, with no
+declaration, so its runs stay in the series. Each run `ran` the scenario its
+record names, so two case names that measure one point keep their own runs.
+A second export of the same store under `--mode merge` changes nothing. A
+merge load replaces a row and deletes none: a scenario taken out of a suite
+stays in it, and a scenario the last export did not declare keeps the
+workload and fixture of its last declaration. Its facts are empty when the
+records still hold its name, since the export writes that name's row with no
+declaration; with no record under its name the export writes no row for it,
+and its whole last declaration stays. A fresh
+export loaded into a new graph holds neither; `--mode overwrite` replaces
+only the types its rows carry. One scenario name declared differently by two
+of the catalogs stops the export. The catalog's structure is the graph's:
+`Catalog` declares `Scenario`, `Suite` groups it, it `uses` a `Fixture` and
+`executes` a `Workload` and `defines` the `BenchmarkPoint` the runs measure;
+a run `ran` its `Scenario`, is `built` from a `Revision`, `measuredBy` the
+harness's, and a `Machine` `hosted` it. `Campaign` and `Produced` are a lab's to load
+beside these rows; the harness emits none. A scenario's `repetitions` are the
+ones the harness runs when the command line names none: the entry's, else its
+workload's `--- bench` section's, else the catalog's default. A legacy record
+is skipped and counted, and so is a record no format of this harness parses,
+such as one an older harness wrote; a record whose bytes do not hash to its
+name stops the export, and so do two records of one invocation
+(`export_invocation_conflict`, which names both objects, since the graph
+keys a run by its invocation); an export that stops writes no row. A run whose record names no product commit (a product
+binary that states none, measured without `--at`) has no `Built` edge, so
+`series_for_scenario`, `suite_series`, `runs_for_commit` and `all_series` do
+not return it; the summary counts those runs. The summary line names every
+count. With no `--out` the rows are on stdout, so the summary and a failure's
+report go to stderr, under `--json` too; with `--out` both are on stdout.
 For `declared-deployment` rows (`sut_evidence` and `backend_evidence`), the
 build, machine and backend columns hold the receipt's declared values, and the
 observed client is in `client_build_json` and `client_machine_json`.

@@ -1607,7 +1607,14 @@ fn typecheck_constant(
     type_name: &str,
 ) -> Result<TypedExpr> {
     let scope = Scope::Constant { clause, type_name };
-    let typed = resolve_expr(catalog, value, &TypeContext::empty(), params, scope)?;
+    let mut typed = resolve_expr(catalog, value, &TypeContext::empty(), params, scope)?;
+    if matches!(clause, ConstantClause::Assignment)
+        && expected.list
+        && let Some(ty) =
+            contextual_literal_type(&typed, &ResolvedType::Scalar(expected.clone()), None)
+    {
+        typed.set_ty(ty);
+    }
     check_constant(&typed, expected, property, clause)?;
     completed(typed)
 }
