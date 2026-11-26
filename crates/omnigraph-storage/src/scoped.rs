@@ -196,11 +196,11 @@ impl StorageIoScope {
         self.inner.state.lock().unwrap().unsettled.len()
     }
 
-    /// A read of `path` observed the object at `observed` (its ETag), or
-    /// absent (`None`). A conditional request left unsettled there whose
-    /// precondition no longer holds can never apply: an if-match names
-    /// another version (or an object that is gone), a create-if-absent meets
-    /// an object. Settle it, as the module documentation says an owner's read
+    /// A read of `path` observed the object at `observed` (its CAS token: the
+    /// ETag, or the generation on Google Cloud Storage), or absent (`None`).
+    /// A conditional request left unsettled there whose precondition no
+    /// longer holds can never apply: an if-match names another version (or
+    /// an object that is gone), a create-if-absent meets an object. Settle it, as the module documentation says an owner's read
     /// does. An unconditional request stays unsettled.
     ///
     /// "Another ETag" stands for "another version" only while an object's
@@ -209,12 +209,18 @@ impl StorageIoScope {
     /// returns A's ETag, and a late copy conditioned on A could then apply.
     /// The keys this settles are records that change on every write (ids,
     /// times), so their bytes never repeat; a key whose bytes can repeat must
-    /// not rely on this.
+    /// not rely on this. A GCS generation is new on every write, so it has no
+    /// such return.
     pub(crate) fn settle_superseded(&self, path: &Path, observed: Option<&str>) {
         let mut state = self.inner.state.lock().unwrap();
         let superseded = match (state.unsettled.get(path), observed) {
-            (Some(Some(Precondition::Matches(expected))), Some(etag)) => {
-                expected.rsplit_once('/').map(|(tag, _)| tag) != Some(etag)
+            (Some(Some(Precondition::Matches(expected))), Some(token)) => {
+                // The precondition names its version by ETag or by version id
+                // (`Precondition::update`); it still holds when the observed
+                // token is the one it names.
+                !expected.rsplit_once('/').is_some_and(|(tag, version)| {
+                    (!tag.is_empty() && tag == token) || (!version.is_empty() && version == token)
+                })
             }
             (Some(Some(Precondition::Matches(_))), None) => true,
             (Some(Some(Precondition::Absent)), Some(_)) => true,
@@ -1475,6 +1481,14 @@ mod tests {
         scope.settle_superseded(&path, Some("\"e1\""));
         assert_eq!(scope.unsettled_keys(), 1, "the precondition still holds");
         scope.settle_superseded(&path, Some("\"e2\""));
+        assert_eq!(scope.unsettled_keys(), 0, "another generation settles it");
+
+        // A generation-conditioned request (GCS) names its version in the
+        // version-id half and is compared there.
+        unsettle(Some(Precondition::Matches("/1700000000000001".into())));
+        scope.settle_superseded(&path, Some("1700000000000001"));
+        assert_eq!(scope.unsettled_keys(), 1, "the generation still holds");
+        scope.settle_superseded(&path, Some("1700000000000002"));
         assert_eq!(scope.unsettled_keys(), 0, "another generation settles it");
 
         unsettle(Some(Precondition::Matches("\"e1\"/".into())));

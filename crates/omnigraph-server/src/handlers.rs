@@ -7,8 +7,8 @@ use crate::api::{GraphAvailability, GraphAvailabilityAction};
 use crate::challenge::Unauthenticated;
 use crate::operations::OwnedResult;
 use crate::redacted_cause::RedactedCause;
-use crate::registry::{GraphEntry, RegistryCapture, StartupFailure};
-use crate::serving::GraphRequest;
+use crate::registry::{GraphEntry, StartupFailure};
+use crate::serving::{GraphRequest, ServingView};
 use crate::workload::{AdmissionGuard, IngressLease};
 use futures::StreamExt;
 use omnigraph::Session;
@@ -503,6 +503,25 @@ pub(crate) async fn resolve_graph_handle(
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
+    let key = request_graph_key(&request)?;
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .ok_or_else(|| ApiError::internal("graph admission is missing its matched route"))?;
+    let handle = resolve_registered_graph(
+        &state,
+        &key,
+        request.extensions().get::<AuthenticatedActor>(),
+        ingress::graph_grant(request.method(), route.as_str()),
+    )?;
+
+    // Per-request observability. No enclosing span declares a graph_id field.
+    info!(graph_id = %key.graph_id, "graph routed");
+    request.extensions_mut().insert(handle);
+    ingress::admit(&state, request, next).await
+}
+
+fn request_graph_key(request: &Request) -> std::result::Result<GraphKey, ApiError> {
     // `Router::nest("/graphs/{graph_id}", inner)` rewrites
     // `request.uri().path()` to the inner suffix (e.g. `/snapshot`).
     // The pre-rewrite URI is preserved in the `OriginalUri`
@@ -510,11 +529,11 @@ pub(crate) async fn resolve_graph_handle(
     // extract `{graph_id}`. Fall back to the current URI only if
     // the extension is missing, which shouldn't happen for
     // nested routes but is safe defensive code.
-    let original_path: String = request
+    let original_path = request
         .extensions()
         .get::<OriginalUri>()
-        .map(|OriginalUri(uri)| uri.path().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
+        .map(|OriginalUri(uri)| uri.path())
+        .unwrap_or_else(|| request.uri().path());
     let graph_id_str = original_path
         .strip_prefix("/graphs/")
         .and_then(|rest| rest.split('/').next())
@@ -522,50 +541,137 @@ pub(crate) async fn resolve_graph_handle(
         .ok_or_else(|| {
             ApiError::bad_request("cluster route missing /graphs/{graph_id} prefix".to_string())
         })?;
-    let graph_id = GraphId::try_from(graph_id_str.to_string())
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let key = GraphKey::cluster(graph_id.clone());
-    let handle = resolve_registered_graph(
-        &state,
-        &key,
-        request.extensions().get::<AuthenticatedActor>(),
-    )?;
-
-    // Per-request observability. `Span::current().record` would silently
-    // no-op here because no upstream `#[tracing::instrument(...)]` macro
-    // declares a `graph_id` field; emit an explicit event instead so the
-    // routing decision actually lands in logs.
-    info!(graph_id = %handle.key.graph_id, "graph routed");
-
-    request.extensions_mut().insert(handle);
-    ingress::admit(&state, request, next).await
+    GraphId::try_from(graph_id_str)
+        .map(GraphKey::cluster)
+        .map_err(|err| ApiError::bad_request(err.to_string()))
 }
 
-/// HTTP and MCP share identity and unavailable-graph disclosure.
+#[derive(Clone, Copy)]
+pub(crate) enum GraphGrant {
+    AnyAction,
+    InvokeQuery,
+}
+
+impl GraphGrant {
+    pub(crate) fn for_query(stored: bool) -> Self {
+        if stored {
+            Self::InvokeQuery
+        } else {
+            Self::AnyAction
+        }
+    }
+
+    fn authorize(
+        self,
+        actor: Option<&AuthenticatedActor>,
+        policy: Option<&PolicyEngine>,
+    ) -> std::result::Result<(), ApiError> {
+        if matches!(self, Self::InvokeQuery) {
+            return match authorize(
+                actor,
+                policy,
+                PolicyRequest {
+                    action: PolicyAction::InvokeQuery,
+                    branch: None,
+                    target_branch: None,
+                },
+            )? {
+                Authz::Allowed => Ok(()),
+                Authz::Denied(_) => Err(ApiError::not_found("stored query not found")),
+            };
+        }
+        match holds_graph_grant(actor, policy)? {
+            Authz::Allowed => Ok(()),
+            Authz::Denied(message) => Err(ApiError::forbidden(message)),
+        }
+    }
+}
+
+/// Whether `actor` holds any grant on a graph bound to `policy`. One
+/// predicate admits a data request to a ready graph and tells a caller that
+/// a graph is unavailable.
+fn holds_graph_grant(
+    actor: Option<&AuthenticatedActor>,
+    policy: Option<&PolicyEngine>,
+) -> std::result::Result<Authz, ApiError> {
+    if let (Some(actor), Some(policy)) = (actor, policy) {
+        let allowed = policy
+            .may_act_on_graph(actor.actor_id.as_ref())
+            .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
+        return Ok(if allowed {
+            Authz::Allowed
+        } else {
+            Authz::Denied("the graph policy grants no action to this credential".to_string())
+        });
+    }
+    // With no applied policy, read is the only possible static-token
+    // grant. The ordinary decision also handles open and signed-token modes.
+    authorize(
+        actor,
+        policy,
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some("main".into()),
+            target_branch: None,
+        },
+    )
+}
+
+/// A data request must have a graph grant before it can own the serving
+/// epoch or reserve input capacity. The handler still authorizes its action.
 pub(crate) fn resolve_registered_graph(
     state: &AppState,
     key: &GraphKey,
     actor: Option<&AuthenticatedActor>,
+    grant: GraphGrant,
 ) -> std::result::Result<GraphRequest, ApiError> {
-    let (captured, server_policy) = state
-        .routing()
-        .registry
-        .capture_with_policy(&state.operations, key)?;
-    let (policy, invalid_policy, message) = match captured {
-        RegistryCapture::Loading(graph) => (
-            graph.policy.clone(),
+    state.routing().registry.with_current_entry(
+        &state.operations,
+        key,
+        |entry, server_policy| {
+            let view = ready_graph(entry, server_policy, actor)?;
+            grant.authorize(actor, view.policy.as_deref())?;
+            Ok(view)
+        },
+        |view| view.capture(),
+    )
+}
+
+/// An access report needs only the effective policy. It can report zero
+/// actions without taking any ownership of the graph.
+pub(crate) fn resolve_graph_policy(
+    state: &AppState,
+    key: &GraphKey,
+    actor: Option<&AuthenticatedActor>,
+) -> std::result::Result<Option<Arc<PolicyEngine>>, ApiError> {
+    state.routing().registry.with_current_entry(
+        &state.operations,
+        key,
+        |entry, server_policy| Ok(ready_graph(entry, server_policy, actor)?.policy.clone()),
+        Ok,
+    )
+}
+
+fn ready_graph(
+    entry: Option<&GraphEntry>,
+    server_policy: Option<&PolicyEngine>,
+    actor: Option<&AuthenticatedActor>,
+) -> std::result::Result<Arc<ServingView>, ApiError> {
+    let (policy, invalid_policy, message) = match entry {
+        Some(GraphEntry::Ready(view)) => return Ok(Arc::clone(view)),
+        None => return Err(ApiError::not_found("graph not found")),
+        Some(GraphEntry::Loading(graph)) => (
+            graph.policy.as_deref(),
             false,
             "graph is loading; wait for its startup attempt to complete",
         ),
-        RegistryCapture::Ready(handle) => return Ok(handle),
-        RegistryCapture::Gone => return Err(ApiError::not_found("graph not found")),
-        RegistryCapture::Transitioning(view) => (
-            view.policy.clone(),
+        Some(GraphEntry::Transitioning(view)) => (
+            view.policy.as_deref(),
             false,
             "graph admission is closed for a serving transition",
         ),
-        RegistryCapture::Blocked(graph) => (
-            graph.policy.clone(),
+        Some(GraphEntry::Blocked(graph)) => (
+            graph.policy.as_deref(),
             matches!(
                 graph.failure,
                 StartupFailure::InvalidPolicy | StartupFailure::InvalidConfiguration
@@ -573,27 +679,18 @@ pub(crate) fn resolve_registered_graph(
             "graph is unavailable; an operator must apply an explicit correction or restart after fixing startup configuration",
         ),
     };
-    // Invalid policy is not equivalent to the operator choosing no policy.
-    // Both startup failures and transitions preserve authorization before
-    // disclosing a known graph's unavailability.
-    let readable = !invalid_policy
-        && matches!(
-            authorize(
-                actor,
-                policy.as_deref(),
-                PolicyRequest {
-                    action: PolicyAction::Read,
-                    branch: Some("main".into()),
-                    target_branch: None,
-                }
-            )?,
-            Authz::Allowed
-        );
-    let listable = readable
+    // A caller that may know the graph exists is told it is unavailable: an
+    // admitted identity, which discovery names every registered graph to, a
+    // holder of any grant on the graph, which a ready graph would admit, and
+    // a holder of `graph_list`. Any other caller gets the unknown graph's
+    // answer. Invalid policy is not equivalent to the operator choosing no
+    // policy, so it grants nothing.
+    let known = actor.is_some_and(AuthenticatedActor::is_identity)
+        || (!invalid_policy && matches!(holds_graph_grant(actor, policy)?, Authz::Allowed))
         || matches!(
             authorize(
                 actor,
-                server_policy.as_deref(),
+                server_policy,
                 PolicyRequest {
                     action: PolicyAction::GraphList,
                     branch: None,
@@ -602,7 +699,7 @@ pub(crate) fn resolve_registered_graph(
             )?,
             Authz::Allowed
         );
-    if !listable {
+    if !known {
         return Err(ApiError::not_found("graph not found"));
     }
     Err(ApiError::new(ErrorCode::GraphUnavailable, message))
@@ -832,6 +929,42 @@ pub(crate) async fn server_snapshot(
     Ok(Json(output))
 }
 
+/// A policy report holds only the policy observed when its graph was resolved.
+/// Keeping the HTTP or MCP response open cannot hold a graph transition open.
+#[derive(Clone)]
+pub(crate) struct GraphAccess {
+    graph_id: GraphId,
+    policy: Option<Arc<PolicyEngine>>,
+}
+
+impl GraphAccess {
+    pub(crate) fn capture(
+        state: &AppState,
+        key: GraphKey,
+        actor: Option<&AuthenticatedActor>,
+    ) -> std::result::Result<Self, ApiError> {
+        let policy = resolve_graph_policy(state, &key, actor)?;
+        Ok(Self {
+            graph_id: key.graph_id,
+            policy,
+        })
+    }
+}
+
+pub(crate) async fn resolve_graph_access(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> std::result::Result<Response, ApiError> {
+    let access = GraphAccess::capture(
+        &state,
+        request_graph_key(&request)?,
+        request.extensions().get::<AuthenticatedActor>(),
+    )?;
+    request.extensions_mut().insert(access);
+    ingress::admit(&state, request, next).await
+}
+
 #[utoipa::path(
     get,
     path = "/access",
@@ -852,12 +985,12 @@ pub(crate) async fn server_snapshot(
 /// that performs it shapes them. It needs no graph action itself, reads no
 /// graph data, and never checks whether a named branch exists.
 pub(crate) async fn server_access(
-    Extension(handle): Extension<GraphRequest>,
+    Extension(access): Extension<GraphAccess>,
     actor: Option<Extension<AuthenticatedActor>>,
     ApiQuery(query): ApiQuery<api::AccessQuery>,
 ) -> std::result::Result<Json<api::AccessOutput>, ApiError> {
     Ok(Json(access_body(
-        &handle,
+        &access,
         actor.as_ref().map(|Extension(actor)| actor),
         query,
     )?))
@@ -866,7 +999,7 @@ pub(crate) async fn server_access(
 /// The access route's answer, shared by `GET /access` and the MCP `access`
 /// tool.
 pub(crate) fn access_body(
-    handle: &GraphRequest,
+    graph: &GraphAccess,
     actor: Option<&AuthenticatedActor>,
     query: api::AccessQuery,
 ) -> std::result::Result<api::AccessOutput, ApiError> {
@@ -876,10 +1009,10 @@ pub(crate) fn access_body(
         ));
     }
     require_canonical_branches([query.branch.as_deref(), query.target_branch.as_deref()])?;
-    let policy = handle.policy.as_deref();
+    let policy = graph.policy.as_deref();
     let mut output = api::AccessOutput::evaluate(
         actor.map(|actor| actor.actor_id.to_string()),
-        handle.key.graph_id.to_string(),
+        graph.graph_id.to_string(),
         query.branch,
         query.target_branch,
         |access, branch, target_branch| {
@@ -905,7 +1038,7 @@ pub(crate) fn access_body(
         (status = 400, description = "Bad request - also returned when the query body contains mutations (use POST /mutate, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "A full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required); neither is cleared by retrying", body = ErrorOutput),
+        (status = 409, description = "A full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required), neither cleared by retrying; or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 424, description = "A load explain could not probe an allowed external source", body = ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
@@ -1138,7 +1271,7 @@ pub(crate) async fn server_blob_head(
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Unknown branch, or no entity with this id", body = ErrorOutput),
         (status = 408, description = "The request body did not arrive before the body deadline", body = ErrorOutput),
-        (status = 409, description = "Write-authority conflict, or the branch's incarnation or accepted schema changed while the write retried", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict, the branch's incarnation or accepted schema changed while the write retried, or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 412, description = "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator", body = ErrorOutput,
             headers(
                 ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
@@ -1253,7 +1386,7 @@ pub(crate) async fn server_blob_put(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Unknown branch, or no entity with this id", body = ErrorOutput),
-        (status = 409, description = "Write-authority conflict, or the branch's incarnation or accepted schema changed while the write retried", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict, the branch's incarnation or accepted schema changed while the write retried, or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 412, description = "If-Match did not hold for the cell; `blob_precondition_failure` names its current validator", body = ErrorOutput,
             headers(
                 ("ETag" = String, description = "The cell's current validator, when it holds a managed value"),
@@ -2065,7 +2198,7 @@ fn engine_error_with_cause(error: OmniError) -> (ApiError, Option<RedactedCause>
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "`branch delete` of a branch that does not exist, as DELETE /branches/{branch_name} answers", body = ErrorOutput),
-        (status = 409, description = "Write-authority conflict; also `branch create` of a branch that already exists, and a conflicting `branch merge`, whose body carries `merge_conflicts`", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict; also `branch create` of a branch that exists (`branch_exists`), a conflicting `branch merge`, whose body carries `merge_conflicts`, and a branch that was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
@@ -2136,7 +2269,7 @@ pub(crate) async fn server_mutate(
         (status = 400, description = "Missing, duplicate, malformed, or invalid request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Write-authority conflict", body = ErrorOutput),
+        (status = 409, description = "Write-authority conflict, or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 412, description = "Graph-commit precondition failed; the write had no effect", body = ErrorOutput),
         (status = 413, description = "Keyed write exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "An allowed external Blob source could not be probed or read", body = ErrorOutput),
@@ -2212,7 +2345,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
-        (status = 409, description = "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required); neither is cleared by retrying", body = ErrorOutput),
+        (status = 409, description = "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required), neither cleared by retrying; or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 413, description = "Stored keyed mutation exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
@@ -2260,7 +2393,7 @@ pub(crate) async fn server_invoke_query(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden (the inner `change` gate)", body = ErrorOutput),
         (status = 404, description = "Unknown stored mutation, or `invoke_query` denied", body = ErrorOutput),
-        (status = 409, description = "Stored mutation write-authority conflict", body = ErrorOutput),
+        (status = 409, description = "Stored mutation write-authority conflict, or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 412, description = "Stored mutation graph-commit precondition failed; the write had no effect", body = ErrorOutput),
         (status = 413, description = "Stored keyed mutation exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
@@ -2313,27 +2446,7 @@ async fn invoke_stored_query(
     const NOT_FOUND: &str = "stored query not found";
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
 
-    // Boundary gate (authentication already ran in `require_bearer_auth`).
-    // A denial is hidden as 404 (deny == missing, so the catalog can't be
-    // probed without the grant), but operational failures (401 missing bearer,
-    // 500 policy-evaluation error) propagate with their true status via `?`
-    // rather than being masked as a missing query.
-    match authorize(
-        actor_ref,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::InvokeQuery,
-            // Graph-scoped: no branch dimension. The per-branch/snapshot
-            // access is enforced by the inner read/change gate in the
-            // runner, so the outer gate must not resolve a branch (doing so
-            // was wrong for snapshot reads).
-            branch: None,
-            target_branch: None,
-        },
-    )? {
-        Authz::Allowed => {}
-        Authz::Denied(_) => return Err(ApiError::not_found(NOT_FOUND)),
-    }
+    GraphGrant::InvokeQuery.authorize(actor_ref, handle.policy.as_deref())?;
 
     // Resolve against the per-graph registry (same 404 on a miss).
     let stored = handle
@@ -2514,6 +2627,15 @@ async fn authorize_load_scope(
     from: Option<&str>,
 ) -> std::result::Result<(), ApiError> {
     require_canonical_branches([Some(branch), from])?;
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Change,
+            branch: Some(branch.to_string()),
+            target_branch: None,
+        },
+    )?;
     let branch_exists = handle
         .engine
         .branch_list()
@@ -2543,15 +2665,6 @@ async fn authorize_load_scope(
             )?,
         }
     }
-    authorize_request(
-        actor,
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::Change,
-            branch: Some(branch.to_string()),
-            target_branch: None,
-        },
-    )?;
     Ok(())
 }
 
@@ -2920,7 +3033,7 @@ async fn branch_list_body(
         // A commit the actor may not branch from is indistinguishable from
         // one that does not exist.
         (status = 404, description = "`from` names no branch, or `from_commit` names no commit the actor may branch from", body = ErrorOutput),
-        (status = 409, description = "Branch already exists, or the commit `from_commit` names cannot start a branch; see branch_start_refusal", body = ErrorOutput),
+        (status = 409, description = "The branch exists (`branch_exists`), its source was deleted under the create or the commit it starts at is on a deleted branch (`branch_deleted`), another process holds `main` (`writer_fenced`), or the commit `from_commit` names cannot start a branch; see branch_start_refusal", body = ErrorOutput),
         (status = 410, description = "The commit `from_commit` names is no longer retained; see branch_start_refusal", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
@@ -3168,6 +3281,7 @@ fn branch_method_not_allowed(action: Option<BranchAction>) -> Response {
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Branch not found", body = ErrorOutput),
+        (status = 409, description = "Another process holds `main` (`writer_fenced`); nothing was written", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`), or unsettled write completion (code `outcome_unknown`); follow the returned disposition before another write", body = ErrorOutput),
         (status = 503, description = "An overlapping durable recovery intent must be resolved before retry", body = ErrorOutput),
@@ -3246,7 +3360,7 @@ async fn branch_delete_body(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 409, description = "Merge conflict, or a branch that was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 413, description = "Merge entity, byte, or recovery-chain ceiling exceeded before effects", body = ErrorOutput),
         (status = 424, description = "A merge could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),

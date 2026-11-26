@@ -33,6 +33,7 @@ use omnigraph_compiler::{
 use omnigraph_planner::{BoundPlan, PhysicalNode};
 use serde_json::Value;
 
+mod bench;
 pub mod concurrent;
 pub mod diagnostic;
 mod generate;
@@ -41,7 +42,10 @@ mod process;
 pub mod runner_config;
 mod served;
 mod yaml;
-pub use concurrent::{ConcurrentStep, SessionExpect, SessionKind, SessionOp};
+pub use bench::{BenchSection, MAX_DURATION_SECONDS, MAX_WARMUP_SECONDS, Sweep};
+pub use concurrent::{
+    ConcurrentStep, Dealt, MergeOp, Pass, SessionExpect, SessionKind, SessionOp, Worker,
+};
 pub use diagnostic::{CaseError, CaseErrorCode, CaseErrors};
 use diagnostic::{nearest, suggestion};
 pub use generate::{BRANCH_MARKER, Branches, Generated, GeneratedParams, Seed};
@@ -53,7 +57,10 @@ pub enum ParamsInput {
     Literal(String),
     Generated(GeneratedParams),
 }
-pub use host::{ExecutionHost, PlainHost};
+pub use host::{
+    ExecutionHost, Observer, PlainHost, SCRIPTED_HOST_WORKERS, admit_ungated_case, admit_workers,
+    admit_workers_within, run_block_once,
+};
 use omnigraph::storage::StorageAdapter;
 pub use process::{
     PROCESS_STATS_RECORD, ProcessTarget, admit_process_workload, execute_measured_process,
@@ -67,8 +74,9 @@ pub use runner_config::{
 /// changes, pinned by the grammar golden under `tests/grammar/`.
 pub const GQT_FORMAT_VERSION: u32 = 1;
 pub use served::{
-    ServerTarget, admit_served, admit_served_workload, execute_measured_served,
-    execute_steps_served,
+    SeededTable, ServedSession, ServerTarget, admit_served, admit_served_workload,
+    execute_measured_served, execute_steps_served, provision_served, server_ready,
+    server_source_commit,
 };
 
 mod load_plan;
@@ -111,6 +119,10 @@ pub struct Case {
     /// case, set by [`Case::materialize_csv_fixtures`]: one embedded-only
     /// `file://` base over the materialized sections.
     pub external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
+    /// The `--- bench` section: the run of the case's measured block.
+    pub bench: Option<BenchSection>,
+    /// The value this parse bound the section's swept name to.
+    swept: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -153,14 +165,45 @@ impl Case {
         self.items.iter().any(|i| matches!(i, Item::Loop { .. }))
     }
 
+    /// The block a measuring host loops for the `--- bench` section's
+    /// duration; every other host runs it as any free-running block.
+    pub fn measured_block(&self) -> Option<&ConcurrentStep> {
+        self.items.iter().find_map(|item| match item {
+            Item::Step(Step::Concurrent(block)) if block.measured => Some(block),
+            _ => None,
+        })
+    }
+
+    /// The name the `--- bench` section sweeps and the value it reads as in
+    /// this parse: the one [`parse_case_at`] was given, else the first.
+    pub fn swept(&self) -> Option<(&str, u64)> {
+        let sweep = self.bench.as_ref()?.sweep.as_ref()?;
+        Some((sweep.name.as_str(), self.swept?))
+    }
+
     /// Whether the case needs the DST runner: a seam directive or a
-    /// concurrent block, neither of which the direct engine can host.
+    /// concurrent block with an `order:` line, neither of which the direct
+    /// engine can host. A free-running block runs on every host.
     pub fn needs_dst(&self) -> bool {
         !self.seams.is_empty()
-            || self
-                .items
-                .iter()
-                .any(|i| matches!(i, Item::Step(Step::Concurrent(_))))
+            || self.items.iter().any(
+                |i| matches!(i, Item::Step(Step::Concurrent(block)) if !block.is_free_running()),
+            )
+    }
+
+    /// How many passes the plain host runs the case in: one per session
+    /// order of its largest free-running block, one with no block.
+    pub fn plain_passes(&self) -> usize {
+        self.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Step(Step::Concurrent(block)) if block.is_free_running() => {
+                    Some(concurrent::passes(block.sessions.len()))
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1)
     }
 }
 
@@ -1363,6 +1406,23 @@ fn yaml_body(body: &[(usize, &str)]) -> String {
     text
 }
 
+/// A recipe body written as a session statement's continuation lines, which
+/// are indented so they open no session, with that common indentation gone.
+fn dedent(text: &str) -> String {
+    let indent = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        out.push_str(line.get(indent..).unwrap_or(""));
+        out.push('\n');
+    }
+    out
+}
+
 fn refuse_comment_lines(body: &[(usize, &str)], section: &str) -> Result<(), CaseError> {
     for (idx, line) in body {
         if line.trim_start().starts_with('#') {
@@ -2190,8 +2250,9 @@ fn complete_decl_step(
 }
 
 /// The section kinds a header may name, for a near miss.
-const SECTION_KINDS: [&str; 17] = [
+const SECTION_KINDS: [&str; 18] = [
     "runner",
+    "bench",
     "schema",
     "seed",
     "branches",
@@ -2572,6 +2633,28 @@ pub fn grammar_text() -> String {
 }
 
 pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
+    parse_case_at(stem, text, None)
+}
+
+/// [`parse_case`] with the name the case's `--- bench` section sweeps bound
+/// to `swept`, one of the sweep's values; `None` binds the first, which is
+/// what a host with a scripted clock runs.
+pub fn parse_case_at(stem: &str, text: &str, swept: Option<u64>) -> Result<Case, CaseErrors> {
+    let bound = if text.contains('\r') {
+        None
+    } else {
+        bench::bind(text, swept).map_err(CaseErrors::one)?
+    };
+    let Some((bound, value)) = bound else {
+        return parse_text(stem, text);
+    };
+    let mut case = parse_text(stem, &bound)?;
+    case.input_text = text.into();
+    case.swept = Some(value);
+    Ok(case)
+}
+
+fn parse_text(stem: &str, text: &str) -> Result<Case, CaseErrors> {
     if text.contains('\r') {
         return Err(CaseErrors::one(
             CaseError::new(
@@ -2640,6 +2723,19 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             (None, &sections[..])
         }
     };
+    let (bench_header, sections) = match sections.first() {
+        Some(first) if first.name == "bench" => (Some(first), &sections[1..]),
+        _ => (None, sections),
+    };
+    let bench = match bench_header.map(|section| bench::parse(&yaml_body(&section.body))) {
+        Some(Ok(bench)) => Some(bench),
+        Some(Err(error)) => {
+            let line = bench_header.map_or(1, |section| section.header_line + 1);
+            errors.push(error.located(line, &lines));
+            None
+        }
+        None => None,
+    };
     let fixture_sections = sections;
     let (fixture, sections) = match parse_fixture(sections) {
         Ok(parts) => parts,
@@ -2680,6 +2776,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
     }
     let mut bound_names: HashSet<String> = HashSet::new();
+    let mut block_refused = false;
+    let mut bench_misplaced = false;
 
     for section in sections {
         let (kind, rest) = match section.name.split_once([' ', '\t']) {
@@ -2765,6 +2863,13 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         "there is no `--- fault` section; a code seam is a `--- seam` with the same `at`, `occurrence` and `scope` and `action: fail` (was `return_error`) or `action: skip`, and a store fault is a `--- seam` naming a store place with `subject:` or a decision seam with a store action",
                     )
                     .fix("write `--- seam` with `at:`, `occurrence:`, `scope:` and `action:` lines"));
+                }
+                "bench" => {
+                    return Err(CaseError::new(
+                        CaseErrorCode::SectionOrder,
+                        "`--- bench` is out of position; it directly follows `--- runner`, once",
+                    )
+                    .fix("move the `--- bench` section directly under the `--- runner` section"));
                 }
                 "runner" | "schema" | "seed" | "branches" => {
                     return Err(CaseError::new(
@@ -3134,12 +3239,20 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                 }
                 "concurrent" => {
                     let line = section.header_line + 1;
-                    if !rest.is_empty() {
-                        return Err(CaseError::new(
-                            CaseErrorCode::StepKind,
-                            "`--- concurrent` takes no arguments",
-                        ));
-                    }
+                    let (scripted, measured) = match rest.trim() {
+                        "" => (false, false),
+                        "scripted" => (true, false),
+                        "measured" => (false, true),
+                        other => {
+                            return Err(CaseError::new(
+                                CaseErrorCode::StepKind,
+                                format!(
+                                    "`--- concurrent` is the free-running block, `--- concurrent measured` the free-running block a bench times and `--- concurrent scripted` the block with an `order:` line, got `--- concurrent {other}`"
+                                ),
+                            )
+                            .fix("write `--- concurrent`, `--- concurrent measured` or `--- concurrent scripted`"));
+                        }
+                    };
                     if loops.open.is_some() {
                         return Err(CaseError::new(
                             CaseErrorCode::LoopStructure,
@@ -3152,82 +3265,24 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     if cursor.pending.is_some() {
                         return Err(missing_previous_expect());
                     }
-                    let (lines, order) = concurrent::parse_block(&section.body).map_err(|e| {
+                    let parsed = if measured {
+                        concurrent::parse_measured_block(&section.body)
+                    } else {
+                        concurrent::parse_block(&section.body, scripted)
+                    };
+                    let (lines, order) = parsed.map_err(|e| {
                         CaseError::from(e)
                             .code(CaseErrorCode::BodyShape)
                             .line_or(line)
                     })?;
-                    let mut sessions = Vec::with_capacity(lines.len());
-                    for session in lines {
-                        let file = parse_query(&session.text).map_err(|e| {
-                            CaseError::new(
-                                CaseErrorCode::QueryParse,
-                                format!("session `{}` does not parse: {e}", session.label),
-                            )
-                            .fix("rewrite the session's statement so it parses; the message names where the grammar stopped")
-                            .at_line(session.line)
-                        })?;
-                        if !file.settings.is_empty() {
-                            return Err(CaseError::new(
-                                CaseErrorCode::StepKind,
-                                format!(
-                                    "session `{}` carries `set` or `reset` lines; a block session is one statement",
-                                    session.label
-                                ),
-                            )
-                            .at_line(session.line));
-                        }
-                        let FileBody::Queries(decls) = file.body else {
-                            return Err(CaseError::new(
-                                CaseErrorCode::StepKind,
-                                format!(
-                                    "session `{}` must be a query or mutation declaration; show, branch and explain statements are not admitted in a block",
-                                    session.label
-                                ),
-                            )
-                            .at_line(session.line));
-                        };
-                        let [decl] = decls.as_slice() else {
-                            return Err(CaseError::new(
-                                CaseErrorCode::StepKind,
-                                format!(
-                                    "session `{}` holds exactly one declaration, got {}",
-                                    session.label,
-                                    decls.len()
-                                ),
-                            )
-                            .at_line(session.line));
-                        };
-                        if !decl.params.is_empty() {
-                            return Err(CaseError::new(
-                                CaseErrorCode::StepKind,
-                                format!(
-                                    "session `{}` declares parameters; a block session takes none",
-                                    session.label
-                                ),
-                            )
-                            .at_line(session.line));
-                        }
-                        inspect_decl(decl, &mut needs_indices)?;
-                        let kind = if decl.mutations.is_empty() {
-                            SessionKind::Query
-                        } else {
-                            SessionKind::Mutation
-                        };
-                        sessions.push(SessionOp {
-                            label: session.label,
-                            branch: session.branch,
-                            source: session.text,
-                            name: decl.name.clone(),
-                            kind,
-                            expect: SessionExpect::Ok,
-                        });
-                    }
+                    substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+                    let sessions = concurrent::build_sessions(lines, &mut needs_indices)?;
                     ordinal += 1;
                     cursor.pending = Some(Pending::Concurrent(ConcurrentStep {
                         ordinal,
                         sessions,
                         order,
+                        measured,
                     }));
                 }
                 "params" => {
@@ -3317,16 +3372,28 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                             .fix("write `--- expect` with no mode word, then one `<label>: ok` or `<label>: error: <needle>` line per session"));
                         }
                         refuse_comment_lines(&section.body, "expect")?;
-                        let labels: Vec<&str> =
-                            step.sessions.iter().map(|s| s.label.as_str()).collect();
-                        let expects = concurrent::parse_expect_body(&section.body, &labels)
+                        let mut groups: Vec<&str> = Vec::new();
+                        for op in &step.sessions {
+                            if !groups.contains(&op.group.as_str()) {
+                                groups.push(op.group.as_str());
+                            }
+                        }
+                        let expects = concurrent::parse_expect_body(&section.body, &groups)
                             .map_err(|e| {
                                 CaseError::from(e)
                                     .code(CaseErrorCode::BodyShape)
                                     .line_or(line)
                             })?;
-                        for (op, expect) in step.sessions.iter_mut().zip(expects) {
-                            op.expect = expect;
+                        let expects: Vec<(String, SessionExpect)> = groups
+                            .iter()
+                            .map(|g| (*g).to_string())
+                            .zip(expects)
+                            .collect();
+                        for op in step.sessions.iter_mut() {
+                            if let Some((_, expect)) = expects.iter().find(|(g, _)| *g == op.group)
+                            {
+                                op.expect = expect.clone();
+                            }
                         }
                         push_step(&mut items, &mut loops, Step::Concurrent(step));
                         return Ok(());
@@ -3646,6 +3713,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             Ok(())
         })();
         if let Err(error) = outcome {
+            block_refused |= kind == "concurrent";
+            bench_misplaced |= kind == "bench";
             errors.push(error.located(section.header_line + 1, &lines));
             substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
             cursor.abandon();
@@ -3693,7 +3762,44 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             .located(loops.header_line, &lines),
         );
     }
-    for (idx, line) in lines.iter().enumerate() {
+    let measured: Vec<usize> = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Step(Step::Concurrent(block)) if block.measured => Some(block.ordinal),
+            _ => None,
+        })
+        .collect();
+    let block_line = |ordinal: &usize| source_lines.get(ordinal).copied().unwrap_or(last_line);
+    if let Some(second) = measured.get(1) {
+        errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "a case holds one `--- concurrent measured` block: one `--- bench` section describes one run",
+            )
+            .fix("keep `measured` on the block the bench times and write the other as `--- concurrent`")
+            .located(block_line(second), &lines),
+        );
+    }
+    match (bench_header, measured.first()) {
+        (Some(section), None) if !block_refused => errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "`--- bench` describes the run of a `--- concurrent measured` block and the case holds none",
+            )
+            .fix("mark the block the bench times `--- concurrent measured`, or drop the `--- bench` section")
+            .located(section.header_line + 1, &lines),
+        ),
+        (None, Some(block)) if !bench_misplaced => errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "`--- concurrent measured` needs a `--- bench` section, which says how long a measuring host runs it",
+            )
+            .fix("write `--- bench` with `duration_seconds:` directly under `--- runner`")
+            .located(block_line(block), &lines),
+        ),
+        _ => {}
+    }
+    for (idx, line) in lines.iter().enumerate().skip(header_lines.len()) {
         if line.contains("${") && !substitutable_lines.contains(&idx) {
             errors.push(
                 CaseError::new(
@@ -3726,6 +3832,8 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         needs_indices,
         csv_sections,
         external_blob_policy: None,
+        bench,
+        swept: None,
     };
     Ok(case)
 }
@@ -4272,6 +4380,7 @@ struct Inspection {
 
 async fn run_query_step(
     host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &Session,
     mode: Option<&'static str>,
     step: &QueryStep,
@@ -4302,7 +4411,7 @@ async fn run_query_step(
         Err(e) => {
             return match &step.expect {
                 QueryExpect::Error { needle } if e.contains(needle) => {
-                    host.record("parameter_error", || serde_json::json!({"message": e}));
+                    observer.record("parameter_error", || serde_json::json!({"message": e}));
                     Ok(())
                 }
                 QueryExpect::Error { needle } => {
@@ -4314,7 +4423,8 @@ async fn run_query_step(
     };
     let (outcome, counts, inspection) = if inspected {
         let door = session.query_inspected(target.clone(), &step.source, &step.name, &params);
-        let (outcome, counts) = under_traversal(mode, operation(host, step.ordinal, door)).await;
+        let (outcome, counts) =
+            under_traversal(mode, operation(observer, step.ordinal, door)).await;
         let outcome = outcome.map_err(&fail)?;
         match outcome {
             Ok(run) => {
@@ -4337,11 +4447,12 @@ async fn run_query_step(
         }
     } else {
         let query = session.query(target.clone(), &step.source, &step.name, &params);
-        let (outcome, counts) = under_traversal(mode, operation(host, step.ordinal, query)).await;
+        let (outcome, counts) =
+            under_traversal(mode, operation(observer, step.ordinal, query)).await;
         let outcome = outcome.map_err(&fail)?;
         (outcome, counts, None)
     };
-    host.observe_query(
+    observer.observe_query(
         &outcome,
         matches!(step.expect, QueryExpect::Rows { ordered: true, .. }),
     );
@@ -4409,7 +4520,9 @@ async fn run_query_step(
             if let Some(drift) = drift {
                 return Err(fail(drift));
             }
-            check_rows(host, &label, &result, *ordered, body_raw, *span, binding)?;
+            check_rows(
+                observer, &label, &result, *ordered, body_raw, *span, binding,
+            )?;
             if step.same_as_v1 && !host.active() {
                 check_same_as_v1(host, session, step, target, &params, &result, *ordered)
                     .await
@@ -4418,7 +4531,7 @@ async fn run_query_step(
             Ok(())
         }
         QueryExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "the query succeeded").map_err(fail)
+            check_error_expect(observer, needle, outcome, "the query succeeded").map_err(fail)
         }
     }
 }
@@ -4457,7 +4570,7 @@ async fn check_same_as_v1(
 /// Compares the executed rows with the expect body; a mismatch carries the
 /// actual rows as the bless target.
 fn check_rows(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     label: &str,
     result: &QueryResult,
     ordered: bool,
@@ -4476,14 +4589,14 @@ fn check_rows(
     let Value::Array(actual) = rows else {
         return Err(fail("engine returned a non-array row set".into()));
     };
-    check_rows_json(host, label, &actual, ordered, body_raw, span, binding)
+    check_rows_json(observer, label, &actual, ordered, body_raw, span, binding)
 }
 
 /// `check_rows` on rows already rendered as JSON objects: the in-process
 /// path renders them from the `QueryResult`, the served path reads them off
 /// the wire, and both judge the expect body here.
 fn check_rows_json(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     label: &str,
     actual: &[Value],
     ordered: bool,
@@ -4496,7 +4609,7 @@ fn check_rows_json(
         message,
         bless_lines: None,
     };
-    host.observe(|| {
+    observer.observe(|| {
         let mut rows = actual.iter().map(Value::to_string).collect::<Vec<_>>();
         if !ordered {
             rows.sort();
@@ -4514,7 +4627,7 @@ fn check_rows_json(
 /// Holds an `error: <needle>` expect against the step's outcome: the step
 /// must fail, and the rendered error must contain the needle.
 fn check_error_expect<T, E: std::fmt::Display>(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     needle: &str,
     outcome: Result<T, E>,
     succeeded: &str,
@@ -4525,7 +4638,7 @@ fn check_error_expect<T, E: std::fmt::Display>(
         )),
         Err(e) => {
             let msg = e.to_string();
-            host.observe(|| format!("error: {msg}"));
+            observer.observe(|| format!("error: {msg}"));
             if msg.contains(needle) {
                 Ok(())
             } else {
@@ -4549,7 +4662,7 @@ fn list_result(mut names: Vec<String>) -> Result<QueryResult, String> {
 }
 
 async fn run_load_step(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &Session,
     step: &LoadStep,
     binding: Option<(&str, &str)>,
@@ -4558,22 +4671,22 @@ async fn run_load_step(
     let fail = |message: String| StepFail::new(label.clone(), message);
     let outcome = if let Some(batch) = step.generated.single_batch().map_err(&fail)? {
         operation(
-            host,
+            observer,
             step.ordinal,
             session.load(&step.branch, &batch, step.mode),
         )
         .await
         .map_err(&fail)?
-        .inspect_err(|error| host.observe_fault(error))
+        .inspect_err(|error| observer.observe_fault(error))
         .map(|_| ())
         .map_err(|error| error.to_string())
     } else {
         operation(
-            host,
+            observer,
             step.ordinal,
             step.generated
                 .load_observed(session, &step.branch, step.mode, |error| {
-                    host.observe_fault(error)
+                    observer.observe_fault(error)
                 }),
         )
         .await
@@ -4582,13 +4695,13 @@ async fn run_load_step(
     match &step.expect {
         WriteExpect::Ok => outcome.map_err(fail),
         WriteExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "load succeeded").map_err(fail)
+            check_error_expect(observer, needle, outcome, "load succeeded").map_err(fail)
         }
     }
 }
 
 async fn run_list_step(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &Session,
     step: &ListStep,
     binding: Option<(&str, &str)>,
@@ -4599,7 +4712,7 @@ async fn run_list_step(
         message,
         bless_lines: None,
     };
-    let outcome = match operation(host, step.ordinal, session.branch_list())
+    let outcome = match operation(observer, step.ordinal, session.branch_list())
         .await
         .map_err(&fail)?
     {
@@ -4607,7 +4720,7 @@ async fn run_list_step(
         Err(error) => Err(error),
     };
     check_synthetic_expect(
-        host,
+        observer,
         session,
         &label,
         &step.expect,
@@ -4621,7 +4734,7 @@ async fn run_list_step(
 /// operands replaced, and holds its rows (rendered as the read door renders
 /// them) or its error against the expect.
 async fn run_branch_read_step(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &Session,
     step: &BranchReadStep,
     binding: Option<(&str, &str)>,
@@ -4635,7 +4748,7 @@ async fn run_branch_read_step(
         bless_lines: None,
     };
     let read = resolve_branch_read(&step.read, bindings).map_err(&fail)?;
-    let outcome = operation(host, step.ordinal, session.branch_read(&read))
+    let outcome = operation(observer, step.ordinal, session.branch_read(&read))
         .await
         .map_err(&fail)?;
     match &step.expect {
@@ -4651,7 +4764,7 @@ async fn run_branch_read_step(
             let rows: Vec<Value> = serde_json::from_str(output.rows.get())
                 .map_err(|e| fail(format!("`{statement}` rows are not a JSON array: {e}")))?;
             check_rows_json(
-                host,
+                observer,
                 &label,
                 &rows,
                 *ordered,
@@ -4660,10 +4773,13 @@ async fn run_branch_read_step(
                 binding,
             )
         }
-        QueryExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, &format!("`{statement}` succeeded"))
-                .map_err(fail)
-        }
+        QueryExpect::Error { needle } => check_error_expect(
+            observer,
+            needle,
+            outcome,
+            &format!("`{statement}` succeeded"),
+        )
+        .map_err(fail),
     }
 }
 
@@ -4671,7 +4787,7 @@ async fn run_branch_read_step(
 /// list`, `show`): the result's own schema is the inferred one, so the
 /// shape check has no compiler to disagree with.
 fn check_synthetic_expect<E: std::fmt::Display>(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &Session,
     label: &str,
     expect: &QueryExpect,
@@ -4684,7 +4800,7 @@ fn check_synthetic_expect<E: std::fmt::Display>(
         message,
         bless_lines: None,
     };
-    host.observe_query(
+    observer.observe_query(
         &outcome,
         matches!(expect, QueryExpect::Rows { ordered: true, .. }),
     );
@@ -4709,12 +4825,15 @@ fn check_synthetic_expect<E: std::fmt::Display>(
                     bless_lines,
                 });
             }
-            check_rows(host, label, &result, *ordered, body_raw, *span, binding)
+            check_rows(observer, label, &result, *ordered, body_raw, *span, binding)
         }
-        QueryExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, &format!("`{statement}` succeeded"))
-                .map_err(fail)
-        }
+        QueryExpect::Error { needle } => check_error_expect(
+            observer,
+            needle,
+            outcome,
+            &format!("`{statement}` succeeded"),
+        )
+        .map_err(fail),
     }
 }
 
@@ -4750,7 +4869,7 @@ fn scoped_session(session: &Session, prefix: &[SettingStmt]) -> Result<Session, 
 }
 
 fn run_show_step(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &Session,
     step: &ShowStep,
     binding: Option<(&str, &str)>,
@@ -4759,13 +4878,21 @@ fn run_show_step(
     let label = step_label(step.ordinal, &name, binding);
     let outcome =
         scoped_session(session, &step.prefix).and_then(|scoped| show_result(&scoped.show(step.id)));
-    check_synthetic_expect(host, session, &label, &step.expect, outcome, &name, binding)
+    check_synthetic_expect(
+        observer,
+        session,
+        &label,
+        &step.expect,
+        outcome,
+        &name,
+        binding,
+    )
 }
 
 /// Applies a settings step to the case session: every statement in order,
 /// for the steps that follow.
 fn run_settings_step(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &mut Session,
     step: &SettingsStep,
     binding: Option<(&str, &str)>,
@@ -4778,12 +4905,12 @@ fn run_settings_step(
             bless_lines: None,
         })?;
     }
-    host.observe(|| format!("actual settings: {:?}", session.settings()));
+    observer.observe(|| format!("actual settings: {:?}", session.settings()));
     Ok(())
 }
 
 fn check_write_expect<T, E: std::fmt::Display>(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     name: &str,
     expect: &WriteExpect,
     outcome: Result<T, E>,
@@ -4793,7 +4920,7 @@ fn check_write_expect<T, E: std::fmt::Display>(
             .map(|_| ())
             .map_err(|e| format!("`{name}` failed: {e}")),
         WriteExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, &format!("`{name}` succeeded"))
+            check_error_expect(observer, needle, outcome, &format!("`{name}` succeeded"))
         }
     }
 }
@@ -4802,7 +4929,7 @@ fn check_write_expect<T, E: std::fmt::Display>(
 /// plus the section's prefix); a `branch delete` reclaims the branch's forks
 /// in a background task the step joins before the next step runs.
 async fn run_control_step(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &Session,
     step: &ControlStep,
     binding: Option<(&str, &str)>,
@@ -4830,14 +4957,14 @@ async fn run_control_step(
                 None => ReadTarget::branch(MAIN_BRANCH),
             };
             let outcome = operation(
-                host,
+                observer,
                 step.ordinal,
                 db.branch_create_from_as(start, branch, None),
             )
             .await
             .map_err(&fail)?;
-            host.observe(|| format!("actual control: {outcome:?}"));
-            check_write_expect(host, name, expect, outcome)
+            observer.observe(|| format!("actual control: {outcome:?}"));
+            check_write_expect(observer, name, expect, outcome)
                 .map(|()| None)
                 .map_err(fail)
         }
@@ -4845,11 +4972,11 @@ async fn run_control_step(
             name: branch,
             expect,
         } => {
-            let outcome = operation(host, step.ordinal, db.branch_delete_as(branch, None))
+            let outcome = operation(observer, step.ordinal, db.branch_delete_as(branch, None))
                 .await
                 .map_err(&fail)?;
-            host.observe(|| format!("actual control: {outcome:?}"));
-            check_write_expect(host, name, expect, outcome)
+            observer.observe(|| format!("actual control: {outcome:?}"));
+            check_write_expect(observer, name, expect, outcome)
                 .map(|()| None)
                 .map_err(fail)
         }
@@ -4858,15 +4985,15 @@ async fn run_control_step(
             expect,
         } => {
             let id = resolve_operand(graph_commit_id, bindings).map_err(&fail)?;
-            let outcome = operation(host, step.ordinal, db.publish_commit_as(&id, None))
+            let outcome = operation(observer, step.ordinal, db.publish_commit_as(&id, None))
                 .await
                 .map_err(&fail)?;
-            host.observe(|| format!("actual control: {outcome:?}"));
+            observer.observe(|| format!("actual control: {outcome:?}"));
             let published = outcome
                 .as_ref()
                 .ok()
                 .map(|commit| commit.graph_commit_id.clone());
-            check_write_expect(host, name, expect, outcome)
+            check_write_expect(observer, name, expect, outcome)
                 .map(|()| published)
                 .map_err(fail)
         }
@@ -4875,11 +5002,11 @@ async fn run_control_step(
             expect,
         } => {
             let id = resolve_operand(graph_commit_id, bindings).map_err(&fail)?;
-            let outcome = operation(host, step.ordinal, db.drop_commit_as(&id, None))
+            let outcome = operation(observer, step.ordinal, db.drop_commit_as(&id, None))
                 .await
                 .map_err(&fail)?;
-            host.observe(|| format!("actual control: {outcome:?}"));
-            check_write_expect(host, name, expect, outcome)
+            observer.observe(|| format!("actual control: {outcome:?}"));
+            check_write_expect(observer, name, expect, outcome)
                 .map(|()| None)
                 .map_err(fail)
         }
@@ -4892,14 +5019,14 @@ async fn run_control_step(
             let target = branch.as_deref().unwrap_or(MAIN_BRANCH);
             let request = omnigraph::loader::CsvLoadRequest::from_statement(stmt);
             let outcome = operation(
-                host,
+                observer,
                 step.ordinal,
                 db.load_csv_as_with_receipt(target, &request, None),
             )
             .await
             .map_err(&fail)?
-            .inspect_err(|error| host.observe_fault(error));
-            host.observe(|| {
+            .inspect_err(|error| observer.observe_fault(error));
+            observer.observe(|| {
                 format!(
                     "actual control: {:?}",
                     outcome.as_ref().map(|receipt| &receipt.result)
@@ -4915,14 +5042,14 @@ async fn run_control_step(
                     receipt.executed.clone(),
                 )
             });
-            check_write_expect(host, name, expect, outcome).map_err(&fail)?;
+            check_write_expect(observer, name, expect, outcome).map_err(&fail)?;
             if let Some(expect) = plan {
                 let Some((Some(accepted), executed)) = executed else {
                     return Err(fail(
                         "`--- expect plan` on a load whose receipt carries no plan".to_string(),
                     ));
                 };
-                host.observe(|| {
+                observer.observe(|| {
                     let facts: Vec<String> = load_plan::plan_facts(&accepted, &executed)
                         .iter()
                         .map(load_plan::LoadFact::spell)
@@ -4944,16 +5071,16 @@ async fn run_control_step(
         } => {
             let target = into.as_deref().unwrap_or(MAIN_BRANCH);
             let outcome = operation(
-                host,
+                observer,
                 step.ordinal,
                 db.branch_merge_as_with_options(source, target, None, *as_commit),
             )
             .await
             .map_err(&fail)?
-            .inspect_err(|error| host.observe_fault(error));
+            .inspect_err(|error| observer.observe_fault(error));
             let commit = outcome.as_ref().ok().and_then(|result| {
                 result.commit.as_ref().map(|commit| {
-                    host.record("commit", || commit_evidence(commit.published));
+                    observer.record("commit", || commit_evidence(commit.published));
                     commit.graph_commit_id.clone()
                 })
             });
@@ -4963,11 +5090,11 @@ async fn run_control_step(
                 .map(|result| result.plans.iter().map(|plan| plan.to_value()).collect())
                 .unwrap_or_default();
             let outcome = outcome.map(|result| result.outcome);
-            host.observe(|| format!("actual merge: {outcome:?}"));
+            observer.observe(|| format!("actual merge: {outcome:?}"));
             match expect {
                 MergeExpect::Write(expect) => {
-                    host.observe(|| format!("actual control: {outcome:?}"));
-                    check_write_expect(host, name, expect, outcome).map_err(&fail)?;
+                    observer.observe(|| format!("actual control: {outcome:?}"));
+                    check_write_expect(observer, name, expect, outcome).map_err(&fail)?;
                 }
                 MergeExpect::Outcome(want) => match outcome {
                     Ok(got) if got == *want => {}
@@ -4982,7 +5109,7 @@ async fn run_control_step(
                 },
             }
             if let Some(expect) = plan {
-                check_write_plans(host, expect, &plans, "merge").map_err(fail)?;
+                check_write_plans(observer, expect, &plans, "merge").map_err(fail)?;
             }
             Ok(commit)
         }
@@ -4993,7 +5120,7 @@ async fn run_control_step(
 /// planner documents its receipt carries: a fact holds when any validated
 /// table's document holds it.
 fn check_write_plans(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     expect: &LoadPlanExpect,
     documents: &[Value],
     what: &str,
@@ -5003,7 +5130,7 @@ fn check_write_plans(
             "`--- expect plan` on a {what} whose receipt carries no plan: the write validated no table"
         ));
     }
-    host.observe(|| {
+    observer.observe(|| {
         let facts: Vec<String> = load_plan::write_plan_facts(documents);
         format!("actual {what} plans: {facts:?}")
     });
@@ -5014,7 +5141,7 @@ fn check_write_plans(
 }
 
 async fn run_mutate_step(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &Session,
     mode: Option<&'static str>,
     step: &MutateStep,
@@ -5038,7 +5165,7 @@ async fn run_mutate_step(
         Err(e) => {
             return match &step.expect {
                 MutateExpect::Error { needle } if e.contains(needle) => {
-                    host.record("parameter_error", || serde_json::json!({"message": e}));
+                    observer.record("parameter_error", || serde_json::json!({"message": e}));
                     Ok(None)
                 }
                 MutateExpect::Error { needle } => {
@@ -5051,7 +5178,7 @@ async fn run_mutate_step(
     let (outcome, counts) = under_traversal(
         mode,
         operation(
-            host,
+            observer,
             step.ordinal,
             session.mutate_as_with_optional_branch_receipt(
                 step.branch_spelled.then_some(step.branch.as_str()),
@@ -5066,8 +5193,8 @@ async fn run_mutate_step(
     .await;
     let outcome = outcome
         .map_err(&fail)?
-        .inspect_err(|error| host.observe_fault(error));
-    host.record("mutation_result", || match &outcome {
+        .inspect_err(|error| observer.observe_fault(error));
+    observer.record("mutation_result", || match &outcome {
         Ok(receipt) => {
             serde_json::json!({"nodes": receipt.result.affected_nodes, "edges": receipt.result.affected_edges})
         }
@@ -5078,9 +5205,9 @@ async fn run_mutate_step(
         ..
     }) = &outcome
     {
-        host.record("commit", || commit_evidence(commit.published));
+        observer.record("commit", || commit_evidence(commit.published));
     }
-    host.observe(|| match &outcome {
+    observer.observe(|| match &outcome {
         Ok(receipt) => format!(
             "actual affected: nodes={} edges={}",
             receipt.result.affected_nodes, receipt.result.affected_edges
@@ -5104,14 +5231,14 @@ async fn run_mutate_step(
             receipt
         }
         MutateExpect::Error { needle } => {
-            return check_error_expect(host, needle, outcome, "the mutation succeeded")
+            return check_error_expect(observer, needle, outcome, "the mutation succeeded")
                 .map(|()| None)
                 .map_err(fail);
         }
     };
     if let Some(expect) = &step.plan {
         let plans: Vec<Value> = receipt.plans.iter().map(|plan| plan.to_value()).collect();
-        check_write_plans(host, expect, &plans, "mutation").map_err(fail)?;
+        check_write_plans(observer, expect, &plans, "mutation").map_err(fail)?;
     }
     Ok(receipt
         .commit
@@ -5119,24 +5246,90 @@ async fn run_mutate_step(
         .map(|commit| commit.graph_commit_id.clone()))
 }
 
-/// One session of a block: the statement on its branch through the case
-/// session under the case's traversal pin, compared with the session's expect.
+/// What one run of a session's statement reported: its authority conflicts,
+/// the times its write was prepared again after `ReadSetChanged`, inside the
+/// engine (the pre-effect reprepares behind an acknowledged write) or by the
+/// host once the engine's budget was spent. A measurement, never an oracle:
+/// under DST the count differs between replays of one seed (the Lance CPU
+/// pool's one-tick window), so no evidence row compares it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionReport {
+    pub conflicts: u32,
+}
+
+/// One run of a session's statement on `session`; `seq` is the ordinal of
+/// this run on the worker, 0 under a scripted clock. The statement runs under
+/// a probe that counts the engine's reprepares; a statement the engine still
+/// answers with `ReadSetChanged` is run again by the host, up to
+/// [`concurrent::MAX_HOST_RETRIES`] times, each counted too; the session's
+/// expect holds against the final outcome. One rule on every host, so
+/// `authority_conflicts` means the same in the DST evidence row and in a
+/// measuring host's record.
 pub async fn run_session(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     session: &Session,
     op: &SessionOp,
-) -> Result<(), String> {
-    let params = build_params(None, &[], None, &Bindings::new())?;
+    seq: u64,
+) -> Result<SessionReport, String> {
+    let reprepares = Arc::new(AtomicU64::new(0));
+    let mut host_retries = 0u32;
+    loop {
+        let probes = QueryIoProbes {
+            mutation_reprepares: Arc::clone(&reprepares),
+            ..capture_query_io_probes().unwrap_or_default()
+        };
+        let outcome =
+            with_query_io_probes(probes, attempt_session(observer, session, op, seq)).await?;
+        if let Err(error) = &outcome
+            && error.is_read_set_changed()
+            && host_retries < concurrent::MAX_HOST_RETRIES
+        {
+            host_retries += 1;
+            observer.observe(|| {
+                format!(
+                    "session `{}` runs again after authority conflict {}: {error}",
+                    op.label, host_retries
+                )
+            });
+            continue;
+        }
+        let report = SessionReport {
+            conflicts: u32::try_from(reprepares.load(Ordering::Relaxed))
+                .unwrap_or(u32::MAX)
+                .saturating_add(host_retries),
+        };
+        let what = op.kind.name();
+        return match &op.expect {
+            SessionExpect::Ok => outcome
+                .map(|()| report)
+                .map_err(|e| format!("{what} failed: {e}")),
+            SessionExpect::Error { needle } => {
+                check_error_expect(observer, needle, outcome, &format!("the {what} succeeded"))
+                    .map(|()| report)
+            }
+        };
+    }
+}
+
+/// One attempt of a session's statement: `Err` is the harness's own refusal
+/// (a traversal pin violated, a recipe exhausted), `Ok` the engine's answer.
+async fn attempt_session(
+    observer: &impl Observer,
+    session: &Session,
+    op: &SessionOp,
+    seq: u64,
+) -> Result<Result<(), omnigraph::error::OmniError>, String> {
     let mode = pinned_mode(session);
-    match op.kind {
+    match &op.kind {
         SessionKind::Mutation => {
+            let params = build_params(None, &[], None, &Bindings::new())?;
             let (outcome, counts) = under_traversal(
                 mode,
                 session.mutate(&op.branch, &op.source, &op.name, &params),
             )
             .await;
-            let outcome = outcome.inspect_err(|error| host.observe_fault(error));
-            host.record(
+            let outcome = outcome.inspect_err(|error| observer.observe_fault(error));
+            observer.record(
                 "mutation_result",
                 || match &outcome {
                     Ok(result) => {
@@ -5145,7 +5338,7 @@ pub async fn run_session(
                     Err(error) => serde_json::json!({"error": error.to_string()}),
                 },
             );
-            host.observe(|| match &outcome {
+            observer.observe(|| match &outcome {
                 Ok(result) => format!(
                     "session `{}` actual affected: nodes={} edges={}",
                     op.label, result.affected_nodes, result.affected_edges
@@ -5155,16 +5348,10 @@ pub async fn run_session(
             if let Some(violation) = check_pin(mode, &counts, false) {
                 return Err(violation);
             }
-            match &op.expect {
-                SessionExpect::Ok => outcome
-                    .map(|_| ())
-                    .map_err(|e| format!("mutation failed: {e}")),
-                SessionExpect::Error { needle } => {
-                    check_error_expect(host, needle, outcome, "the mutation succeeded")
-                }
-            }
+            Ok(outcome.map(|_| ()))
         }
         SessionKind::Query => {
+            let params = build_params(None, &[], None, &Bindings::new())?;
             let query = session.query(
                 ReadTarget::branch(&op.branch),
                 &op.source,
@@ -5172,20 +5359,286 @@ pub async fn run_session(
                 &params,
             );
             let (outcome, counts) = under_traversal(mode, query).await;
-            host.observe_query(&outcome, false);
+            observer.observe_query(&outcome, false);
             if let Some(violation) = check_pin(mode, &counts, false) {
                 return Err(violation);
             }
-            match &op.expect {
-                SessionExpect::Ok => outcome
-                    .map(|_| ())
-                    .map_err(|e| format!("query failed: {e}")),
-                SessionExpect::Error { needle } => {
-                    check_error_expect(host, needle, outcome, "the query succeeded")
-                }
+            Ok(outcome.map(|_| ()))
+        }
+        SessionKind::Load(recipe) => {
+            let index = op.dealt_index(seq);
+            let text = recipe.generated.dealt_row(index)?;
+            let outcome = session
+                .load(&op.branch, &text, recipe.mode)
+                .await
+                .inspect_err(|error| observer.observe_fault(error));
+            observer.observe(|| match &outcome {
+                Ok(_) => format!(
+                    "session `{}` loaded dealt row {index} on {}",
+                    op.label, op.branch
+                ),
+                Err(error) => format!("session `{}` actual load error: {error}", op.label),
+            });
+            Ok(outcome.map(|_| ()))
+        }
+        SessionKind::Merge(merge) => {
+            let target = merge.into.as_deref().unwrap_or(MAIN_BRANCH);
+            let outcome = session
+                .branch_merge_as_with_options(&merge.source, target, None, merge.as_commit)
+                .await
+                .inspect_err(|error| observer.observe_fault(error));
+            if let Ok(result) = &outcome
+                && let Some(commit) = &result.commit
+            {
+                observer.record("commit", || commit_evidence(commit.published));
             }
+            observer.observe(|| {
+                format!(
+                    "session `{}` actual merge: {:?}",
+                    op.label,
+                    outcome.as_ref().map(|result| result.outcome)
+                )
+            });
+            Ok(outcome.map(|_| ()))
         }
     }
+}
+
+/// One read of a branch, answered as JSON rows: the door a block's readback
+/// asks through. A session answers it in process and a served session over
+/// HTTP, so the readback is the same check on every route a block runs on.
+pub trait ReadDoor: Sync {
+    /// The rows query `name` of `source` returns on `branch`; `Err` is the
+    /// read's own failure as text.
+    fn rows<'a>(
+        &'a self,
+        branch: &'a str,
+        source: &'a str,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>>;
+}
+
+impl ReadDoor for Session {
+    fn rows<'a>(
+        &'a self,
+        branch: &'a str,
+        source: &'a str,
+        name: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>> {
+        async move {
+            let params = build_params(None, &[], None, &Bindings::new())?;
+            let result = self
+                .query(ReadTarget::branch(branch), source, name, &params)
+                .await
+                .map_err(|e| e.to_string())?;
+            match result
+                .to_rust_json()
+                .map_err(|e| format!("engine rows failed to render as JSON: {e}"))?
+            {
+                Value::Array(rows) => Ok(rows),
+                _ => Err("engine returned a non-array row set".into()),
+            }
+        }
+        .boxed()
+    }
+}
+
+/// After a block, every row a `load generate:` session dealt is read back by
+/// its key through `door`, `runs` runs per worker, and compared column
+/// by column with the row the recipe generated; a missing row or a changed
+/// column fails the block. The check needs no line in the file: a dealt row
+/// is a row the host knows, so the host asks for it. A session whose expect
+/// is an `error:` loaded nothing the file claims, so it is not read back.
+pub async fn readback_dealt_rows(
+    observer: &impl Observer,
+    door: &impl ReadDoor,
+    step: &ConcurrentStep,
+    runs: u64,
+) -> Result<(), String> {
+    for op in &step.sessions {
+        let SessionKind::Load(recipe) = &op.kind else {
+            continue;
+        };
+        if matches!(op.expect, SessionExpect::Error { .. }) {
+            continue;
+        }
+        for seq in 0..runs {
+            readback_row(observer, door, op, recipe, seq).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The row session `op` dealt on its run `seq`, read by its key and compared
+/// column by column with the row the recipe generated.
+async fn readback_row(
+    observer: &impl Observer,
+    door: &impl ReadDoor,
+    op: &SessionOp,
+    recipe: &Dealt,
+    seq: u64,
+) -> Result<(), String> {
+    let index = op.dealt_index(seq);
+    let (table, column, value) = recipe.generated.dealt_key(index)?;
+    let literal = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+    let dealt: Value = serde_json::from_str(&recipe.generated.dealt_row(index)?)
+        .map_err(|e| format!("dealt row {index} is not JSON: {e}"))?;
+    let Some(Value::Object(data)) = dealt.get("data") else {
+        return Err(format!("dealt row {index} carries no `data` object"));
+    };
+    let projection: Vec<String> = data.keys().map(|name| format!("$r.{name}")).collect();
+    let expected = Value::Object(
+        data.iter()
+            .map(|(name, value)| (format!("r.{name}"), value.clone()))
+            .collect(),
+    );
+    let source = format!(
+        "query readback() {{ match {{ $r: {table} {{ {column}: {literal} }} }} return {{ {} }} }}",
+        projection.join(", ")
+    );
+    let actual = door
+        .rows(&op.branch, &source, "readback")
+        .await
+        .map_err(|e| {
+            format!(
+                "readback of the row session `{}` dealt on {}: {e}",
+                op.label, op.branch
+            )
+        })?;
+    if actual.len() != 1 {
+        return Err(format!(
+            "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback found {} rows",
+            op.label,
+            op.branch,
+            actual.len()
+        ));
+    }
+    compare_rows(&[expected], &actual, false).map_err(|(message, _)| {
+        format!(
+            "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback differs: {message}",
+            op.label, op.branch
+        )
+    })?;
+    observer.observe(|| {
+        format!(
+            "readback: row {index} of session `{}` ({column} = {literal}) is on {} as dealt",
+            op.label, op.branch
+        )
+    });
+    Ok(())
+}
+
+/// How many dealt rows of one session the readback after a measured block
+/// compares column by column; every acknowledged key is looked for.
+pub const READBACK_COMPARED_PER_SESSION: u64 = 8;
+
+/// What the readback after a measured block read: the acknowledged dealt
+/// rows it found by key, and how many of those it compared in full.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Readback {
+    pub rows: u64,
+    pub compared: u64,
+}
+
+/// The readback after a block whose sessions ran many times: `acked[i]` is
+/// how many runs session `i` of the block was acknowledged for. Every dealt
+/// key of those runs must be in one scan of its recipe's key column, and
+/// [`READBACK_COMPARED_PER_SESSION`] rows spread over each session's runs are
+/// compared column by column, as [`readback_dealt_rows`] compares them all.
+pub async fn readback_acked_rows(
+    observer: &impl Observer,
+    door: &impl ReadDoor,
+    step: &ConcurrentStep,
+    acked: &[u64],
+) -> Result<Readback, String> {
+    let mut scans: HashMap<(String, String, String), HashSet<String>> = HashMap::new();
+    let mut readback = Readback::default();
+    for (op, &runs) in step.sessions.iter().zip(acked) {
+        let SessionKind::Load(recipe) = &op.kind else {
+            continue;
+        };
+        if runs == 0 || matches!(op.expect, SessionExpect::Error { .. }) {
+            continue;
+        }
+        let (table, column, _) = recipe.generated.dealt_key(op.dealt_index(0))?;
+        let scan = (op.branch.clone(), table.clone(), column.clone());
+        if !scans.contains_key(&scan) {
+            let source = format!(
+                "query readback_keys() {{ match {{ $r: {table} }} return {{ $r.{column} }} }}"
+            );
+            let rows = door
+                .rows(&op.branch, &source, "readback_keys")
+                .await
+                .map_err(|e| format!("readback of the keys of {table} on {}: {e}", op.branch))?;
+            let name = format!("r.{column}");
+            let keys = rows
+                .iter()
+                .filter_map(|row| row.get(&name))
+                .map(|key| serde_json::to_string(key).map_err(|e| e.to_string()))
+                .collect::<Result<HashSet<String>, String>>()?;
+            scans.insert(scan.clone(), keys);
+        }
+        let keys = &scans[&scan];
+        for seq in 0..runs {
+            let index = op.dealt_index(seq);
+            let (_, _, value) = recipe.generated.dealt_key(index)?;
+            let literal = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+            if !keys.contains(&literal) {
+                return Err(format!(
+                    "session `{}` acknowledged dealt row {index} ({column} = {literal}) on {} and the readback found no such row",
+                    op.label, op.branch
+                ));
+            }
+        }
+        readback.rows += runs;
+        let stride = runs.div_ceil(READBACK_COMPARED_PER_SESSION).max(1);
+        let mut seq = 0;
+        while seq < runs {
+            readback_row(observer, door, op, recipe, seq).await?;
+            readback.compared += 1;
+            seq += stride;
+        }
+    }
+    Ok(readback)
+}
+
+/// A free-running block under a scripted clock with no gate: every session
+/// runs its statement once, in the session order `order` (a permutation of
+/// the block's sessions), on the case session. One pass is the same
+/// statements as sequential steps; the plain host runs the case once per
+/// order ([`concurrent::passes`]), so the block's expects and every step
+/// after it must hold whoever goes first. The interleaving search inside a
+/// statement stays the DST runner's.
+pub async fn run_free_running_block(
+    observer: &impl Observer,
+    session: &Session,
+    step: &ConcurrentStep,
+    order: &[usize],
+) -> Result<(), StepFail> {
+    let label = format!("step {} (concurrent)", step.ordinal);
+    let fail = |message: String| StepFail::new(label.clone(), message);
+    observer.observe(|| {
+        let names: Vec<&str> = order
+            .iter()
+            .map(|&i| step.sessions[i].label.as_str())
+            .collect();
+        format!("free-running block: session order {names:?}")
+    });
+    let mut conflicts = 0u32;
+    for &index in order {
+        let op = &step.sessions[index];
+        let report = run_session(observer, session, op, 0)
+            .await
+            .map_err(|message| fail(format!("session `{}`: {message}", op.label)))?;
+        conflicts += report.conflicts;
+    }
+    observer.record(
+        "concurrent_block",
+        || serde_json::json!({"free_running": true, "order": order, "authority_conflicts": conflicts}),
+    );
+    readback_dealt_rows(observer, session, step, 1)
+        .await
+        .map_err(fail)
 }
 
 /// The case session: the definition's defaults over the fresh handle, the
@@ -5226,7 +5679,7 @@ pub async fn seed_case(
 }
 
 /// Executes the parsed steps and returns the current session, including any restart replacement.
-pub fn execute_steps<'a, H: ExecutionHost>(
+pub fn execute_steps<'a, H: ExecutionHost, O: Observer>(
     case: &'a Case,
     path: &'a Path,
     bless: bool,
@@ -5234,8 +5687,9 @@ pub fn execute_steps<'a, H: ExecutionHost>(
     uri: &'a str,
     storage: Option<Arc<dyn StorageAdapter>>,
     host: &'a H,
+    observer: &'a O,
 ) -> futures::future::BoxFuture<'a, Result<Session, String>> {
-    let steps = execute_steps_inner(case, path, bless, session, uri, storage, host);
+    let steps = execute_steps_inner(case, path, bless, session, uri, storage, host, observer);
     let steps = match case.csv_slice_bytes {
         Some(bytes) => omnigraph::instrumentation::with_csv_slice_bytes(bytes, steps).boxed(),
         None => steps.boxed(),
@@ -5246,7 +5700,7 @@ pub fn execute_steps<'a, H: ExecutionHost>(
     }
 }
 
-async fn execute_steps_inner<H: ExecutionHost>(
+async fn execute_steps_inner<H: ExecutionHost, O: Observer>(
     case: &Case,
     path: &Path,
     bless: bool,
@@ -5254,6 +5708,7 @@ async fn execute_steps_inner<H: ExecutionHost>(
     uri: &str,
     storage: Option<Arc<dyn StorageAdapter>>,
     host: &H,
+    observer: &O,
 ) -> Result<Session, String> {
     host.admit_case(case)?;
     if case.writer_held {
@@ -5266,7 +5721,7 @@ async fn execute_steps_inner<H: ExecutionHost>(
     let mut first_fail: Option<StepFail> = None;
     let mut generation = 0usize;
     let mut bindings = Bindings::new();
-    host.observe(|| {
+    observer.observe(|| {
         if case.fixture.is_some() {
             "lifetime: initialized generation 0".into()
         } else {
@@ -5286,31 +5741,39 @@ async fn execute_steps_inner<H: ExecutionHost>(
             let binding = var.zip(value);
             for step in &steps {
                 let ordinal = step.ordinal();
-                host.begin_operation(||
+                observer.begin_operation(||
                     serde_json::json!({"ordinal": ordinal, "source_line": case.source_lines.get(&ordinal), "loop_binding": binding, "generation": generation}),
                 );
-                host.observe(|| {
+                observer.observe(|| {
                     format!(
                         "operation: ordinal={ordinal} line={:?} binding={binding:?} generation={generation} expected={step:?}",
                         case.source_lines.get(&ordinal)
                     )
                 });
-                host.record("expectation", || expectation_evidence(step));
+                observer.record("expectation", || expectation_evidence(step));
                 let seams = case.seams.get(&ordinal).map_or(&[][..], Vec::as_slice);
                 let armed = host.arm_seams(seams, step)?;
-                let lifetime_before = host.lifetime_counts();
-                host.measure_step_begin(
+                let lifetime_before = observer.lifetime_counts();
+                observer.measure_step_begin(
                     ordinal as u64,
                     case.source_lines.get(&ordinal).map(|line| *line as u64),
                     step_kind(step),
                 );
                 let outcome = match step {
                     Step::Query(q) => {
-                        run_query_step(host, &session, pinned_mode(&session), q, binding, &bindings)
-                            .await
+                        run_query_step(
+                            host,
+                            observer,
+                            &session,
+                            pinned_mode(&session),
+                            q,
+                            binding,
+                            &bindings,
+                        )
+                        .await
                     }
                     Step::Mutate(m) => run_mutate_step(
-                        host,
+                        observer,
                         &session,
                         pinned_mode(&session),
                         m,
@@ -5326,8 +5789,8 @@ async fn execute_steps_inner<H: ExecutionHost>(
                             &step_label(ordinal, "mutate", binding),
                         )
                     }),
-                    Step::Load(step) => run_load_step(host, &session, step, binding).await,
-                    Step::Control(c) => run_control_step(host, &session, c, binding, &bindings)
+                    Step::Load(step) => run_load_step(observer, &session, step, binding).await,
+                    Step::Control(c) => run_control_step(observer, &session, c, binding, &bindings)
                         .await
                         .and_then(|commit| {
                             record_binding(
@@ -5337,20 +5800,20 @@ async fn execute_steps_inner<H: ExecutionHost>(
                                 &step_label(ordinal, c.name, binding),
                             )
                         }),
-                    Step::List(l) => run_list_step(host, &session, l, binding).await,
-                    Step::Settings(s) => run_settings_step(host, &mut session, s, binding),
-                    Step::Show(s) => run_show_step(host, &session, s, binding),
+                    Step::List(l) => run_list_step(observer, &session, l, binding).await,
+                    Step::Settings(s) => run_settings_step(observer, &mut session, s, binding),
+                    Step::Show(s) => run_show_step(observer, &session, s, binding),
                     Step::BranchRead(r) => {
-                        run_branch_read_step(host, &session, r, binding, &bindings).await
+                        run_branch_read_step(observer, &session, r, binding, &bindings).await
                     }
-                    Step::Concurrent(c) => host.concurrent_step(&session, case, c).await,
+                    Step::Concurrent(c) => host.concurrent_step(observer, &session, case, c).await,
                     Step::Restart { ordinal } => {
                         generation += 1;
-                        host.observe(|| format!("lifetime: reopen generation {generation}"));
+                        observer.observe(|| format!("lifetime: reopen generation {generation}"));
                         let detached = session.detach();
-                        host.operation_started(*ordinal)?;
+                        observer.operation_started(*ordinal)?;
                         let reopened = host.reopen(uri, storage.clone()).await;
-                        host.operation_finished(*ordinal)?;
+                        observer.operation_finished(*ordinal)?;
                         let reopened = reopened.and_then(|db| match &case.external_blob_policy {
                             Some(policy) => db.with_external_blob_policy(policy.clone()),
                             None => Ok(db),
@@ -5358,9 +5821,9 @@ async fn execute_steps_inner<H: ExecutionHost>(
                         session = match reopened {
                             Ok(db) => detached.attach(Arc::new(db)),
                             Err(error) => {
-                                host.observe_fault(&error);
-                                let lifetime_after = host.lifetime_counts();
-                                host.record(
+                                observer.observe_fault(&error);
+                                let lifetime_after = observer.lifetime_counts();
+                                observer.record(
                                     "engine_lifetime",
                                     || serde_json::json!({"before": lifetime_before, "after": lifetime_after}),
                                 );
@@ -5377,11 +5840,11 @@ async fn execute_steps_inner<H: ExecutionHost>(
                                     message: format!("reopen failed: {error}"),
                                     bless_lines: None,
                                 };
-                                host.record(
+                                observer.record(
                                     "assertion",
                                     || serde_json::json!({"status": "failed", "code": "assertion_failed", "message": fail.message}),
                                 );
-                                host.observe(|| {
+                                observer.observe(|| {
                                     format!(
                                         "operation result: Err({:?})",
                                         (&fail.label, &fail.message)
@@ -5394,9 +5857,9 @@ async fn execute_steps_inner<H: ExecutionHost>(
                     }
                 };
                 let seam_result = host.finish_seams(armed);
-                host.measure_step_end(ordinal as u64);
-                let lifetime_after = host.lifetime_counts();
-                host.record(
+                observer.measure_step_end(ordinal as u64);
+                let lifetime_after = observer.lifetime_counts();
+                observer.record(
                     "engine_lifetime",
                     || serde_json::json!({"before": lifetime_before, "after": lifetime_after}),
                 );
@@ -5408,7 +5871,7 @@ async fn execute_steps_inner<H: ExecutionHost>(
                         ));
                     }
                 }
-                host.record(
+                observer.record(
                     "assertion",
                     || match &outcome {
                         Ok(()) => serde_json::json!({"status": "passed"}),
@@ -5417,7 +5880,7 @@ async fn execute_steps_inner<H: ExecutionHost>(
                         }
                     },
                 );
-                host.observe(|| {
+                observer.observe(|| {
                     format!(
                         "operation result: {:?}",
                         outcome.as_ref().map_err(|f| (&f.label, &f.message))
@@ -5429,12 +5892,12 @@ async fn execute_steps_inner<H: ExecutionHost>(
                         outcome.as_ref().map_err(|f| (&f.label, &f.message))
                     ));
                 }
-                if host.observe_snapshot() {
+                if observer.observe_snapshot() {
                     let snapshot = session
                         .resolve_snapshot("main")
                         .await
                         .map_err(|e| format!("observe main snapshot: {e}"))?;
-                    host.observe(|| format!("main snapshot: {snapshot}"));
+                    observer.observe(|| format!("main snapshot: {snapshot}"));
                 }
                 if let Err(fail) = outcome {
                     first_fail = Some(fail);
@@ -5590,13 +6053,13 @@ impl StepFail {
 }
 
 async fn operation<F: Future>(
-    host: &impl ExecutionHost,
+    observer: &impl Observer,
     ordinal: usize,
     future: F,
 ) -> Result<F::Output, String> {
-    host.operation_started(ordinal)?;
+    observer.operation_started(ordinal)?;
     let result = future.await;
-    host.operation_finished(ordinal)?;
+    observer.operation_finished(ordinal)?;
     Ok(result)
 }
 

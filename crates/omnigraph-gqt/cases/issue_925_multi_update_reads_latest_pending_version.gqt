@@ -1,0 +1,114 @@
+# issue: 925
+# red_on: d20eba74; 3 updates on a keyed/@unique row fail with false @unique violation, stale pending versions cause a silent lost update on `where age > 30`, and unkeyed multi-updates double affected counts.
+# notes: Read-your-writes within one mutation must see only the latest pending version of each row.
+# notes: Covers 3+ updates on @key/@unique, insert + 2 updates, silent lost-update predicate check,
+# notes: partial-batch eviction across two rows, unkeyed multi-update affected counts, and real @unique refusal.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    email: String @key
+    handle: String @unique
+    age: I64?
+    flag: Bool?
+    score: F64?
+}
+node Note {
+    label: String
+    step: I64
+}
+
+--- seed
+{"type":"Person","data":{"email":"a@x","handle":"alice","age":10}}
+{"type":"Person","data":{"email":"c@x","handle":"carol","age":10}}
+{"type":"Note","data":{"label":"n1","step":0}}
+
+--- mutate
+query three_updates_same_keyed_row() {
+    update Person set { score: 1.0 } where email = "a@x"
+    update Person set { score: 2.0 } where email = "a@x"
+    update Person set { score: 3.0 } where email = "a@x"
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- mutate
+query insert_then_two_updates() {
+    insert Person { email: "b@x", handle: "bob", age: 15 }
+    update Person set { score: 1.5 } where email = "b@x"
+    update Person set { score: 2.5 } where email = "b@x"
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- mutate
+query stale_pending_version_must_not_match_later_where() {
+    update Person set { age: 35 } where email = "a@x"
+    update Person set { age: 20 } where email = "a@x"
+    update Person set { flag: true } where age > 30
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+query partial_batch_eviction_preserves_untouched_sibling() {
+    update Person set { score: 10.0 } where age <= 20
+    update Person set { score: 11.0 } where email = "a@x"
+    update Person set { flag: false } where score >= 10.0
+}
+
+--- expect affected: nodes=7 edges=0
+
+--- query
+query check_people() {
+    match { $p: Person }
+    return { $p.email, $p.handle, $p.age, $p.flag, $p.score }
+}
+
+--- expect unordered
+{"p.email":"a@x","p.handle":"alice","p.age":20,"p.flag":false,"p.score":11.0}
+{"p.email":"b@x","p.handle":"bob","p.age":15,"p.flag":false,"p.score":10.0}
+{"p.email":"c@x","p.handle":"carol","p.age":10,"p.flag":false,"p.score":10.0}
+
+--- expect shape
+p.email: String
+p.handle: String
+p.age: I64?
+p.flag: Bool?
+p.score: F64?
+
+--- mutate
+query unkeyed_four_updates_count_accurately() {
+    update Note set { step: 1 } where label = "n1"
+    update Note set { step: 2 } where label = "n1"
+    update Note set { step: 3 } where label = "n1"
+    update Note set { step: 4 } where label = "n1"
+}
+
+--- expect affected: nodes=4 edges=0
+
+--- query
+query check_note() {
+    match { $n: Note }
+    return { $n.label, $n.step }
+}
+
+--- expect unordered
+{"n.label":"n1","n.step":4}
+
+--- expect shape
+n.label: String
+n.step: I64
+
+--- mutate
+query real_unique_collision_across_distinct_rows_still_refuses() {
+    update Person set { handle: "taken" } where email = "a@x"
+    update Person set { handle: "taken" } where email = "b@x"
+}
+
+--- expect error: @unique violation

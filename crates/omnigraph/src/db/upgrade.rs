@@ -14,7 +14,7 @@ use std::sync::Arc;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::refs::{BranchContents, Ref};
+use lance::dataset::refs::{BranchContents, BranchIdentifier, Ref};
 use lance::dataset::transaction::{Operation, Transaction, UpdateMap};
 use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
 use lance::session::Session;
@@ -39,10 +39,13 @@ use crate::db::manifest::migrations::{
     MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION, SourceBranch, SourceLock, UPGRADE_PENDING_KEY,
     UPGRADE_PROTOCOL, UPGRADE_RECEIPT_KEY, UPGRADE_SOURCE_FORMATS, UpgradeIntent,
     UpgradeSchemaContract, UpgradeSource, branch_completed, fence_operation, guard_stamp,
-    intent_from, read_stamp, receipt, recovery_guidance, stamp_operation,
+    intent_from, read_stamp, receipt, recovery_guidance, stamp_rows_operation,
 };
 use crate::db::manifest::retention::retired_manifest_branches;
 use crate::db::manifest::state::{SchemaContractRow, TablePin, TableState, read_converted_state};
+use crate::db::manifest::{
+    BranchRow, BranchRows, MAIN_BRANCH_HEAD_KEY, branch_rows::retired_entry, has_branch_rows,
+};
 use crate::db::manifest::{DatasetEntry, TableIdentity, TableRegistration, open_dataset_entry};
 use crate::db::omnigraph::{fixup_physical_schemas, schema_for_table_key, schema_table_key};
 use crate::error::{OmniError, Result};
@@ -54,7 +57,7 @@ mod root_schema;
 /// What a report names when the run stopped before the stamp of the source
 /// told the route: the pending intent is unreadable, or main carries a stamp
 /// no route converts.
-const UNROUTED_HANDLER: &str = "history-lance-files-to-v17";
+const UNROUTED_HANDLER: &str = "history-lance-files-to-v18";
 /// The logical name of the ref a 0.11.x schema apply holds while it runs.
 const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 /// The release whose roots are stamped 8 or 9, as a refusal names it.
@@ -175,6 +178,12 @@ pub struct UpgradeWork {
     /// The tables of main's head opened to compare their columns with the
     /// contract at the graph root; zero on the route whose contract is a row.
     pub table_opens: u64,
+    /// The branch rows and retired rows main's stamp commit carried, one per
+    /// ref the source held, on the route that raises main to the branch-row
+    /// stamp.
+    pub rows_written: u64,
+    /// The ref files unlinked once the rows are the branch set.
+    pub refs_unlinked: u64,
 }
 
 impl UpgradeWork {
@@ -195,6 +204,8 @@ impl UpgradeWork {
             census_cells: counts.census_cells,
             legacy_bytes: counts.legacy_bytes,
             table_opens: 0,
+            rows_written: 0,
+            refs_unlinked: 0,
         }
     }
 
@@ -781,6 +792,13 @@ async fn run(
             };
             let json = intent_json(&intent)?;
             if options.check {
+                let main = open_with_session(root, None, &session).await?;
+                report.work.rows_written = rows_of_refs(&main, &intent.attempt).await?.len() as u64;
+                report.work.refs_unlinked = crate::branch_control::branch_ref_names(&main)
+                    .await?
+                    .into_iter()
+                    .filter(|native| !intent.retire.iter().any(|lock| lock.native == *native))
+                    .count() as u64;
                 report.outcome = UpgradeOutcome::CheckPassed;
                 return Ok(());
             }
@@ -875,9 +893,14 @@ async fn run(
     )
     .await?;
     fail(&UPGRADE_BEFORE_ACTIVATION)?;
-    publish_activation(open_with_session(root, None, &session).await?).await?;
+    let main = open_with_session(root, None, &session).await?;
+    let rows = rows_of_refs(&main, &intent.attempt).await?;
+    report.work.rows_written = rows.len() as u64;
+    publish_activation(main, rows).await?;
     report.last_durable_completed_boundary = Some("activated".into());
     fail(&UPGRADE_AFTER_ACTIVATION)?;
+    let main = open_with_session(root, None, &session).await?;
+    unlink_refs(&main, report).await?;
     report.outcome = UpgradeOutcome::Completed;
     report.completed_handlers.push(handler(source));
     Ok(())
@@ -1303,6 +1326,18 @@ fn authorize(
 
 /// The live refs of the source pinned at their heads, by native name, main last.
 async fn inventory(main: &Dataset) -> Result<Vec<SourceBranch>> {
+    let live = live_refs(main).await?;
+    let mut branches = Vec::with_capacity(live.len() + 1);
+    for (native, contents) in live {
+        branches.push(pinned_ref(main, native, contents.parent_version).await?);
+    }
+    branches.push(main_source(main));
+    Ok(branches)
+}
+
+/// The live refs of the source by native name, sorted, bounded by
+/// [`MAX_BRANCHES`].
+async fn live_refs(main: &Dataset) -> Result<Vec<(String, BranchContents)>> {
     let live = crate::branch_control::list_live_manifest_branch_contents(main).await?;
     if live.len() >= MAX_BRANCHES {
         return Err(invalid(format!(
@@ -1313,30 +1348,111 @@ async fn inventory(main: &Dataset) -> Result<Vec<SourceBranch>> {
     }
     let mut live: Vec<_> = live.into_iter().collect();
     live.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut branches = Vec::with_capacity(live.len() + 1);
-    for (native, contents) in live {
-        let head = main
-            .checkout_branch(&native)
-            .await
-            .map_err(OmniError::storage)?;
-        branches.push(SourceBranch {
-            identity: crate::branch_control::dataset_branch_identifier(&head)
-                .await
-                .map_err(OmniError::storage)?,
-            version: head.version().version,
-            parent_version: contents.parent_version,
-            native: Some(native),
-        });
-    }
-    branches.push(SourceBranch {
-        native: None,
-        identity: crate::branch_control::dataset_branch_identifier(main)
+    Ok(live)
+}
+
+/// A live ref of the source pinned at its head, its identity read from the ref.
+async fn pinned_ref(main: &Dataset, native: String, parent_version: u64) -> Result<SourceBranch> {
+    let head = main
+        .checkout_branch(&native)
+        .await
+        .map_err(OmniError::storage)?;
+    Ok(SourceBranch {
+        identity: crate::branch_control::dataset_branch_identifier(&head)
             .await
             .map_err(OmniError::storage)?,
+        version: head.version().version,
+        parent_version,
+        native: Some(native),
+    })
+}
+
+fn main_source(main: &Dataset) -> SourceBranch {
+    SourceBranch {
+        native: None,
+        identity: BranchIdentifier::main(),
         version: main.version().version,
         parent_version: 0,
-    });
-    Ok(branches)
+    }
+}
+
+/// The branches the stamp route stamps, main last, with the rows main's stamp
+/// commit carries: at or above the branch-row stamp the ready live rows pinned
+/// at their trees' heads and no row to write, below it the refs and [`rows_of_refs`].
+async fn stamp_inventory(
+    main: &Dataset,
+    attempt: &str,
+) -> Result<(Vec<SourceBranch>, Vec<(String, String)>)> {
+    if !has_branch_rows(main) {
+        return Ok((inventory(main).await?, rows_of_refs(main, attempt).await?));
+    }
+    let rows = BranchRows::decode(main.manifest())?;
+    let mut branches = Vec::with_capacity(rows.live_count() + 1);
+    for row in rows.live() {
+        let head = match main.checkout_branch(&row.native).await {
+            Ok(head) => head,
+            Err(lance::Error::NotFound { .. }) => continue,
+            Err(error) => return Err(OmniError::storage(error)),
+        };
+        branches.push(SourceBranch {
+            identity: row.identifier.clone(),
+            version: head.version().version,
+            parent_version: row.parent_version,
+            native: Some(row.native.clone()),
+        });
+    }
+    branches.push(main_source(main));
+    Ok((branches, Vec::new()))
+}
+
+/// The rows the commit raising main to the branch-row stamp carries (RFC
+/// "Branch existence in the catalog" §Upgrade): a `branch` row per live ref
+/// under `attempt`, a retired row per retired ref, whose tree the collector then reclaims.
+async fn rows_of_refs(main: &Dataset, attempt: &str) -> Result<Vec<(String, String)>> {
+    let mut rows: Vec<(String, String)> = live_refs(main)
+        .await?
+        .into_iter()
+        .map(|(native, contents)| {
+            BranchRow {
+                native,
+                identifier: contents.identifier,
+                parent: contents
+                    .parent_branch
+                    .unwrap_or_else(|| MAIN_BRANCH_HEAD_KEY.to_string()),
+                parent_version: contents.parent_version,
+                created_at: contents.create_at,
+                attempt_id: attempt.to_string(),
+            }
+            .entry()
+        })
+        .collect();
+    let mut retired: Vec<String> = retired_manifest_branches(main).await?.into_keys().collect();
+    retired.sort();
+    rows.extend(retired.iter().map(|native| retired_entry(native)));
+    Ok(rows)
+}
+
+/// Unlink every ref file under `_refs/branches/`, counting each into the
+/// report; the boundary names the last.
+async fn unlink_refs(main: &Dataset, report: &mut UpgradeReport) -> Result<()> {
+    let mut names = crate::branch_control::branch_ref_names(main).await?;
+    names.sort();
+    for native in names {
+        crate::branch_control::unlink_branch_ref(main, &native).await?;
+        report.work.refs_unlinked += 1;
+        report.last_durable_completed_boundary = Some(format!("unlinked:ref '{native}'"));
+    }
+    Ok(())
+}
+
+/// The logical name two of `branches` carry, whose rows no open would decode.
+fn shared_logical_name(branches: &[SourceBranch]) -> Option<&str> {
+    let mut logical_names = HashSet::from(["main"]);
+    branches
+        .iter()
+        .filter_map(|branch| branch.native.as_deref())
+        .map(logical_branch_name)
+        .find(|logical| !logical_names.insert(*logical))
 }
 
 /// The refs the census reads: the pinned live refs with the ref each forked
@@ -1847,9 +1963,9 @@ async fn fence_main_with_session(
     }
 }
 
-/// The stamp-only route (RFC "Unpublished graph commits"): one metadata
-/// commit per live ref still stamped below the binary's, main first; the
-/// stamps are the resume state, so a rerun answers `AlreadyCurrent` when done.
+/// The stamp-only route (RFC "Unpublished graph commits"; RFC "Branch existence
+/// in the catalog" §Upgrade): a metadata commit per branch stamped below the
+/// binary's, main first with the rows of every ref, then every ref file unlinked.
 async fn stamp_live_refs(
     root: &str,
     main: &Dataset,
@@ -1859,8 +1975,10 @@ async fn stamp_live_refs(
     report: &mut UpgradeReport,
 ) -> Result<()> {
     let session = main.session();
-    let mut refs = inventory(main).await?;
+    let attempt = crate::branch_names::mint_incarnation();
+    let (mut refs, rows) = stamp_inventory(main, &attempt).await?;
     refs.rotate_right(1);
+    let unlink = crate::branch_control::branch_ref_names(main).await?;
     let mut behind = Vec::new();
     for branch in &refs {
         let dataset = open_with_session(root, branch.native.as_deref(), &session).await?;
@@ -1868,31 +1986,56 @@ async fn stamp_live_refs(
             behind.push((branch, dataset));
         }
     }
-    if behind.is_empty() {
+    if behind.is_empty() && unlink.is_empty() {
         report.outcome = UpgradeOutcome::AlreadyCurrent;
+        return Ok(());
+    }
+    if let Some(logical) = shared_logical_name(&refs) {
+        report.finding(
+            "unsupported_source",
+            format!("two live refs carry the logical branch name '{logical}'"),
+        );
         return Ok(());
     }
     authorize(&refs, actor, policy)?;
     report.route.push(stamp_handler());
     report.work.live_refs = refs.len() as u64;
+    let main_behind = behind.iter().any(|(branch, _)| branch.native.is_none());
+    let mut rows = main_behind.then_some(rows);
+    report.work.rows_written = rows.as_ref().map_or(0, |rows| rows.len() as u64);
     if options.check {
+        report.work.refs_unlinked = unlink.len() as u64;
         report.outcome = UpgradeOutcome::CheckPassed;
         return Ok(());
     }
     for (branch, dataset) in behind {
-        publish_stamp(dataset, INTERNAL_MANIFEST_SCHEMA_VERSION).await?;
+        let rows = match branch.native {
+            None => rows.take().unwrap_or_default(),
+            Some(_) => Vec::new(),
+        };
+        publish_stamp(dataset, INTERNAL_MANIFEST_SCHEMA_VERSION, rows).await?;
         report.last_durable_completed_boundary =
             Some(format!("stamped:{}", named(branch.native.as_deref())));
     }
+    unlink_refs(main, report).await?;
     report.completed_handlers.push(stamp_handler());
     report.outcome = UpgradeOutcome::Completed;
     Ok(())
 }
 
-/// One metadata-only commit that stamps a ref `target` and changes nothing
-/// else, never retried: the version number is the CAS.
-async fn publish_stamp(dataset: Dataset, target: u32) -> Result<Dataset> {
-    let transaction = Transaction::new(dataset.version().version, stamp_operation(target), None);
+/// One metadata-only commit that stamps a chain `target`, with `rows` in
+/// main's config map when the stamp makes them the branch set, and changes
+/// nothing else, never retried: the version number is the CAS.
+async fn publish_stamp(
+    dataset: Dataset,
+    target: u32,
+    rows: Vec<(String, String)>,
+) -> Result<Dataset> {
+    let transaction = Transaction::new(
+        dataset.version().version,
+        stamp_rows_operation(target, rows),
+        None,
+    );
     crate::lance_commit::commit_builder(Arc::new(dataset))
         .with_max_retries(0)
         .with_skip_auto_cleanup(true)
@@ -1915,9 +2058,15 @@ async fn publish_fence(dataset: Dataset, intent: String, target: u32) -> Result<
         .map_err(OmniError::storage)
 }
 
-async fn publish_activation(dataset: Dataset) -> Result<Dataset> {
+/// The commit that lifts main's fence, carrying `rows`, the branch set of the
+/// converted root, in its config map.
+async fn publish_activation(dataset: Dataset, rows: Vec<(String, String)>) -> Result<Dataset> {
+    let config_updates = (!rows.is_empty()).then(|| UpdateMap {
+        update_entries: rows.into_iter().map(Into::into).collect(),
+        replace: false,
+    });
     let operation = Operation::UpdateConfig {
-        config_updates: None,
+        config_updates,
         table_metadata_updates: None,
         field_metadata_updates: HashMap::new(),
         schema_metadata_updates: Some(UpdateMap {

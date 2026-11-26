@@ -31,6 +31,9 @@ const PEOPLE: &str =
 /// writes may contain it.
 const AGENT_TOKEN: &str = "agent-secret-token-4f1c";
 const OTHER_TOKEN: &str = "other-secret-token-9a2e";
+/// The token of `act-reader`, which may read both graphs and holds no
+/// `graph_list`.
+const READER_TOKEN: &str = "reader-secret-token-c83d";
 /// The protocol version the test agent asks for.
 const PROTOCOL: &str = "2025-11-25";
 
@@ -316,7 +319,8 @@ const WRITE_TOOLS: [&str; 8] = [
 
 /// A served two-graph cluster, `knowledge` loaded with the standard fixture
 /// and `other` empty, whose policy lets `act-agent` read, change and list
-/// graphs. The server lists every tool.
+/// graphs, and `act-reader` read them without `graph_list`. The server lists
+/// every tool.
 struct Served {
     _cluster: TempDir,
     server: TestServer,
@@ -329,8 +333,9 @@ impl Served {
         std::fs::copy(fixture("test.pg"), dir.join("people.pg")).unwrap();
         std::fs::write(
             dir.join("graph.policy.yaml"),
-            "version: 1\ngroups:\n  agents: [act-agent]\nrules:\n  - id: agents\n    allow:\n      \
-             actors: { group: agents }\n      actions: [read, change]\n      branch_scope: any\n",
+            "version: 1\ngroups:\n  agents: [act-agent]\n  readers: [act-reader]\nrules:\n  - id: agents\n    allow:\n      \
+             actors: { group: agents }\n      actions: [read, change]\n      branch_scope: any\n  - id: readers\n    allow:\n      \
+             actors: { group: readers }\n      actions: [read]\n      branch_scope: any\n",
         )
         .unwrap();
         std::fs::write(
@@ -360,7 +365,9 @@ impl Served {
                 .arg(dir.join("graphs").join("knowledge.omni")),
         );
         unlock_cluster_fixture(dir);
-        let tokens = format!(r#"{{"act-agent":"{AGENT_TOKEN}","act-other":"{OTHER_TOKEN}"}}"#);
+        let tokens = format!(
+            r#"{{"act-agent":"{AGENT_TOKEN}","act-other":"{OTHER_TOKEN}","act-reader":"{READER_TOKEN}"}}"#
+        );
         let server = spawn_server_with_cluster_env(
             dir,
             &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", tokens.as_str())],
@@ -378,12 +385,17 @@ impl Served {
     /// The server's own answer to `message` at `/mcp`, sent as the agent's
     /// token with the negotiated protocol version, through its TLS gateway.
     fn rpc(&self, message: &Value) -> Value {
+        self.rpc_as(AGENT_TOKEN, message)
+    }
+
+    /// The server's own answer to `message` at `/mcp`, sent as `token`.
+    fn rpc_as(&self, token: &str, message: &Value) -> Value {
         reqwest::blocking::Client::builder()
             .add_root_certificate(tls_gateway::certificate())
             .build()
             .unwrap()
             .post(format!("{}/mcp", self.url()))
-            .bearer_auth(AGENT_TOKEN)
+            .bearer_auth(token)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", PROTOCOL)
@@ -676,6 +688,26 @@ fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     let finished = bridge.finish();
     finished.assert_success();
     finished.assert_never_shows(&[AGENT_TOKEN]);
+
+    // The reader has no server-scoped graph_list permit. A bound graph does
+    // not change the server's refusal on either listing surface.
+    let reader_token = [("OMNIGRAPH_TOKEN_STAGING", READER_TOKEN)];
+    let mut bridge = home.bridge(&["--target", "staging"], &reader_token);
+    let list = tool_call(8, "graphs", json!({}));
+    let refused = served.rpc_as(READER_TOKEN, &list);
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert_eq!(
+        refused["result"]["structuredContent"]["status"], 403,
+        "{refused}"
+    );
+    assert_eq!(bridge.call(list), refused);
+    let read_listing = resource(9, "omnigraph://graphs");
+    let refused = served.rpc_as(READER_TOKEN, &read_listing);
+    assert_eq!(refused["error"]["data"]["status"], 403, "{refused}");
+    assert_eq!(bridge.call(read_listing), refused);
+    let finished = bridge.finish();
+    finished.assert_success();
+    finished.assert_never_shows(&[READER_TOKEN]);
 
     // `--as` asserts the actor on every request: a match changes nothing,
     // and another actor is refused by the server before anything runs.

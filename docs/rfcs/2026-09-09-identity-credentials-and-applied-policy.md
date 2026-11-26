@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-09
-updated: 2026-10-29
+updated: 2026-11-26
 discussion: https://github.com/ModernRelay/omnigraph/pull/691
 supersedes: []
 superseded_by: []
@@ -252,6 +252,36 @@ of a particular deployment remain separate from the accepted library contract.
 
 ## Decision log
 
+- 2026-11-26: Restore the identity discovery contract that preceded 0.17.0.
+  An admitted identity can learn the IDs and display names of every registered
+  graph. Cedar authorizes each graph operation when the caller requests it.
+  This supersedes the 2026-11-24 decision below. The contradiction that
+  decision removed stays removed another way: an unavailable graph answers 503
+  to every admitted identity and to a caller holding any permission on it, not
+  only to one that can read `main`, so discovery names no graph that routing
+  answers as not found.
+
+- 2026-11-24: Discovery lists the graphs the caller may use. The first rule,
+  every graph for every identity with no policy check, contradicted graph
+  resolution, which answers 404 for an unavailable graph the caller cannot
+  use, so discovery named graphs that routing hid. Static and OAuth client
+  credentials got 403 unless the cluster policy granted `graph_list`. One
+  predicate now decides which graphs a caller may know exist, for the listing
+  and for every graph route alike: the caller holds some permission on the
+  graph, for any action on any branch, or holds `graph_list`. The policy
+  context carries only whether a branch is named and protected, so one
+  protected and one unprotected branch decide every branch scope. A graph is
+  therefore listed exactly when its routes do not answer that it does not
+  exist, and a probe finds nothing the listing hides. A grant without `read`
+  counts, because a writer or stored-query invoker must reach its routes
+  (a write needs no permission to read). Discovery also names the caller's
+  actor and OAuth client, so it is the identity check for every credential,
+  including one granted nothing, which `access` answers with 404. The empty
+  list a caller with no grant receives is the case the rejected alternative
+  feared; a setup link for it belongs to the MCP surface
+  ([#1526](https://github.com/ModernRelay/omnigraph/pull/1526)). This replaces
+  User behavior's every-graph discovery sentence and Alternatives' rejection
+  of hiding graphs.
 - 2026-10-29: New human logins receive a 30-day absolute renewal deadline;
   existing saved deadlines remain unchanged. Required provider inactivity is 14 days,
   access JWTs remain at most 15 minutes, and graph credentials retain their

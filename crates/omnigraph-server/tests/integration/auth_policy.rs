@@ -50,9 +50,29 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
             failure: omnigraph_server::api::GraphStartupFailure::InvalidConfiguration,
         },
     )));
+    let open_entries = entries.clone();
+    // `loading` lets `writer` change unprotected branches and read nothing.
+    entries.push(omnigraph_server::GraphEntry::Loading(Arc::new(
+        omnigraph_server::LoadingGraph {
+            key: omnigraph_server::GraphKey::cluster(
+                omnigraph_server::GraphId::try_from("loading").unwrap(),
+            ),
+            uri: temp.path().join("loading").to_string_lossy().into_owned(),
+            policy: Some(Arc::new(
+                omnigraph_server::PolicyEngine::load_graph_from_source(
+                    "version: 1\nprotected_branches: [main]\ngroups:\n  writers: [writer]\nrules:\n  - id: write\n    allow: {actors: {group: writers}, actions: [change], branch_scope: unprotected}\n",
+                    "loading",
+                )
+                .unwrap(),
+            )),
+        },
+    )));
     let state = AppState::new_multi_entries(
         entries,
-        vec![("breakglass".into(), "static-token".into())],
+        vec![
+            ("breakglass".into(), "static-token".into()),
+            ("writer".into(), "writer-token".into()),
+        ],
         None,
         omnigraph_server::workload::WorkloadController::with_defaults(),
         None,
@@ -63,7 +83,7 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
     // open-mode read defaults, and does not disable healthy public graphs.
     let open = build_app(
         AppState::new_multi_entries(
-            state.routing().registry.entries(),
+            open_entries,
             vec![],
             None,
             omnigraph_server::workload::WorkloadController::with_defaults(),
@@ -86,6 +106,7 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
         catalog,
         json!({"graphs":[
             {"graph_id":"default","display_name":"default"},
+            {"graph_id":"loading","display_name":"loading"},
             {"graph_id":"unavailable","display_name":"unavailable"}
         ]})
     );
@@ -110,6 +131,36 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
             StatusCode::FORBIDDEN,
             "existence is not permission: {path}"
         );
+    }
+    // A graph that is not ready answers 503 to every caller that may know it
+    // exists: an admitted identity, which discovery names it to, and a holder
+    // of any grant on it, here `change` with no read of `main`. A refused
+    // configuration grants nothing, and any other caller gets the unknown
+    // graph's answer, so discovery names no graph that a route calls missing.
+    let (_, missing) =
+        json_response(&app, get_request("/graphs/missing/snapshot", &identity)).await;
+    for (token, path, unavailable) in [
+        (&identity[..], "/graphs/unavailable/snapshot", true),
+        (&identity[..], "/graphs/unavailable/access", true),
+        (&identity[..], "/graphs/loading/snapshot", true),
+        ("writer-token", "/graphs/loading/snapshot", true),
+        ("writer-token", "/graphs/unavailable/snapshot", false),
+        ("static-token", "/graphs/loading/snapshot", false),
+        ("static-token", "/graphs/unavailable/snapshot", false),
+    ] {
+        let caller = if token == identity { "identity" } else { token };
+        let (status, body) = json_response(&app, get_request(path, token)).await;
+        if unavailable {
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{caller} {path}: {body}"
+            );
+            assert_eq!(body["code"], "graph_unavailable", "{caller} {path}");
+        } else {
+            assert_eq!(status, StatusCode::NOT_FOUND, "{caller} {path}: {body}");
+            assert_eq!(body, missing, "{caller} {path}");
+        }
     }
     let (status, _) = json_response(
         &app,
@@ -144,6 +195,23 @@ async fn identity_discovery_exposes_only_existence_and_policy_controls_schema() 
         let (status, _) =
             json_response(&app, get_request("/graphs/default/schema", &identity)).await;
         assert_eq!(status, expected, "the same token follows activated policy");
+        // The same admitted identity can name this graph in either case.
+        // A data request reaches the parser only with a grant on the graph.
+        let request = Request::post(g("/query"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header(AUTHORIZATION, format!("Bearer {identity}"))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"query":"not gq at all"}).to_string()))
+            .unwrap();
+        let (status, body) = json_response(&app, request).await;
+        if actors[0] == tokens.actor {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["diagnostic"]["code"], "Q001", "{body}");
+        } else {
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["code"], "forbidden", "{body}");
+            assert!(body.get("diagnostic").is_none(), "{body}");
+        }
     }
 }
 
@@ -305,6 +373,13 @@ async fn signed_identities_obey_current_policy_and_attribute_writes() {
             "load requires change and fork authority on the same graph",
         );
     }
+    // A read-only credential is denied a load on the target before and after
+    // its creation. A caller with change still gets the missing-branch error.
+    let (status, denied_before_create) =
+        json_response(&app, signed_load_request(&read, false)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = json_response(&app, signed_load_request(&write, false)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (_, after_load_branches) = json_response(&app, get_request(&g("/branches"), &read)).await;
     let (_, after_load_commits) =
         json_response(&app, get_request(&g("/commits?branch=main"), &read)).await;
@@ -329,6 +404,10 @@ async fn signed_identities_obey_current_policy_and_attribute_writes() {
         "existing branch only needs change: {loaded_again}"
     );
     assert_eq!(loaded_again["branch_created"], false);
+    let (status, denied_after_create) =
+        json_response(&app, signed_load_request(&read, false)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(denied_before_create, denied_after_create);
 }
 
 fn signed_load_request(token: &str, fork: bool) -> Request<Body> {
@@ -416,6 +495,24 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
             body,
             "signed load cannot bypass missing Cedar permission",
         );
+
+        // The JSON collector follows graph admission. This one-chunk request
+        // must be rejected before the collector polls its first byte.
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&polled);
+        let body = Body::from_stream(futures::stream::once(async move {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{}"))
+        }));
+        let request = Request::post(g("/load"))
+            .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+            .header(AUTHORIZATION, format!("Bearer {load_token}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap();
+        let (status, _) = json_response(denied_app, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
     }
     let (_, after_load) = json_response(&app, get_request(&g("/branches"), "static-token")).await;
     assert_eq!(

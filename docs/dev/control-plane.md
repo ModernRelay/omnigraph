@@ -47,7 +47,7 @@ credential custody. Preserve it across removal, logout and upgrade. Retiring the
 old grammar does not authorize discarding unresolved work or replaying it under
 a new identity. `config recover-operations --source DIR --profile NAME`
 preserves matching legacy folder evidence without accepting old configuration
-or submitting remote operations; `managed/lifecycle/pending` owns that copy/retire
+or submitting remote operations; `managed::lifecycle::pending` (in `omnigraph-cli`) owns that copy/retire
 protocol.
 
 The CLI's managed HTTP adapter obtains current access before each new request,
@@ -83,9 +83,10 @@ scope, response validation and refusal tests.
 |---|---|
 | `__cluster/state.json` | Applied ledger; v2 also owns outstanding deployment authority and bounded results |
 | `__cluster/resources/` | Content-addressed queries, policies and immutable deployment bundles |
-| `__cluster/recoveries/` | Legacy evidence read only during explicit conversion checks |
+| `__cluster/recoveries/` | Legacy evidence, never executed or swept: serving quarantines a graph a sidecar names, plan/status/observe warn, an identity-authorized plan refuses, and ledger conversion requires it resolved |
 | `__cluster/approvals/` | Preserved legacy audit artifacts; no operational approval writer |
 | `__cluster/lock.json` | Persisted control lock; v2 lifetime cluster admission |
+| `__cluster/lease/<lock_id>/` | Heartbeats and the takeover claim of a leased S3 serving lock |
 | `__cluster/operations.json` | The operation record: each admission scope's active operation, unresolved publications, bounded terminal results, the eviction mark and each kind's state per graph |
 | `graphs/<id>.omni/` | Derived graph roots managed through apply |
 
@@ -157,7 +158,7 @@ revision. Retained roots, trust and storage format stay fixed. Removing a graph
 from desired configuration deletes its exact managed root, including all branches,
 retained history and managed Blob bytes. It does not follow external Blob
 references or delete peer roots. Adoption, missing-root recreation and catalog
-repair refuse. Normal engine open requires v14 to v17; server HTTP requires v0.14.
+repair refuse. Normal engine open requires v14 to v18; server HTTP requires v0.14.
 
 The applied revision and every achieved base retain each graph's exact source/IR
 digests and identity domain/version, captured coherently during conversion and
@@ -201,8 +202,7 @@ graph. A replacement lifetime refuses, while an unreadable partial root remains
 bound to its original intent.
 Completion requires verified root absence before a `Deleted` outcome removes
 the graph's applied resources and contract. A lost completion acknowledgement is
-reconciled by original ID. No deletion queue, side record or retained-owner pool
-is introduced, and matching source text never authorizes a replacement root.
+reconciled by original ID. There is no deletion queue, side record or retained-owner pool, and matching source text never authorizes a replacement root.
 
 A graph-birth token binds canonical root, exact source/IR contract and genesis
 identity. Reconciliation accepts only that birth, not matching text. Under
@@ -368,7 +368,21 @@ hold from an earlier unacknowledged completion.
 Scoped stores hold two clients. Reads and fresh immutable writes go to one
 with Lance's own bounded transport and AIMD retries; conditional requests and
 mutable keys go to one that makes a single attempt, so their owners see every
-attempt. Scoped control adapters keep three read retries within three minutes.
+attempt. Scoped control adapters split the same way, whatever builds them: an
+`s3://` root from the environment or from a captured binding (one
+construction, `ObjectStorageAdapter::s3_from_builder`), a `gs://` or Azure
+root, and a scoped `s3://` clone open's requests to the clone root (its reads
+and its marker write). A clone's base is read through an S3 client with
+`object_store`'s default retry policy (ten retries within the same 180
+seconds), scoped or not. The scoped retrying client retries at most three
+times, after a 5xx, 429 or 408 answer, a connection failure, or a timeout of a
+safe or idempotent request; a decode or unclassified transport error is never
+retried. `object_store` 0.14.2 compares the time since the first attempt with
+180 seconds after each failure, before the backoff sleep: once more than 180
+seconds have passed it returns the error, and otherwise it sleeps (at most 15
+seconds) and sends the next attempt. A retry can therefore start after 180
+seconds, and the budget bounds neither when the last attempt starts nor how
+long the request takes.
 Local Lance uses its object-store file provider so direct file writes cannot
 bypass the scope. Embedded defaults and Azure serving clients are unchanged; the
 automatic scoped shutdown path applies only to local and S3 roots.
@@ -461,7 +475,7 @@ I/O settlement. Azure writers also acquire the external admission lease through
 
 A directory lets the server resolve the storage root from `cluster.yaml`; a URI reads the applied deployment artifact directly. There is no single-graph positional boot, `--target`, or independent graph add/remove API; inventory additions and destructive removals use deployment.
 
-Serving captures ledger/resource digests, graph identity, expected contracts and validated policies before binding the listener. The captured registry initially contains loading or preflight-blocked entries, with the same captured policy later installed on the engine. One process-owned startup batch opens at most four graphs concurrently, checks accepted contracts, projects external-Blob policy, and validates stored queries. Each completed graph becomes ready or blocked through the process/registry admission boundary; shutdown prevents late activation and drains entered opens. Default startup admits healthy graphs individually. `--require-all-graphs` installs successful handles atomically only when every graph succeeds; any failure stops startup. A nonempty inventory with zero healthy graphs fails after the batch finishes. No attempt timeout, startup retry, reopen or native-settlement proof is introduced.
+Serving captures ledger/resource digests, graph identity, expected contracts and validated policies before binding the listener. The captured registry initially contains loading or preflight-blocked entries, with the same captured policy later installed on the engine. One process-owned startup batch opens at most four graphs concurrently, checks accepted contracts, projects external-Blob policy, and validates stored queries. Each completed graph becomes ready or blocked through the process/registry admission boundary; shutdown prevents late activation and drains entered opens. Default startup admits healthy graphs individually. `--require-all-graphs` installs successful handles atomically only when every graph succeeds; any failure stops startup. A nonempty inventory with zero healthy graphs fails after the batch finishes. There is no attempt timeout, startup retry, reopen or native-settlement proof.
 
 `POST /cluster/deployments` submits a bounded immutable bundle and original ID
 to the running owner. The bearer actor needs applied cluster `ConfigManage` and
@@ -528,7 +542,7 @@ Protected graph and registry HTTP calls require the v0.14 contract header after
 authentication and before graph resolution. CLI discovery and response validation
 are specified by [wire compatibility](versioning.md#wire-compatibility); the
 managed control-plane API and standard MCP/OAuth protocols are separate surfaces.
-This admission check changes no ledger or serving-reload behavior.
+
 
 Bearer authentication is a server concern. Cedar mutation enforcement also lives in the engine's `_as` APIs so embedded and CLI writers cannot bypass it. Cluster policy application publishes the bundles and bindings; it does not replace either enforcement layer.
 
@@ -545,18 +559,21 @@ reachability is outside the serving request path. The profile boundary and
 applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
-`GET /graphs/discovery` accepts only the verified identity profile and returns
-IDs and display names for the loading, ready and blocked graph inventory captured
-at boot. It neither scans storage nor discloses availability, paths, policy,
+`GET /graphs/discovery` accepts only the verified identity profile and returns IDs and display names for every graph in the current
+serving registry (loading, ready, transitioning or blocked), as last installed
+by boot or a deployment activation. It neither scans storage nor discloses availability, paths, policy,
 schema, or query definitions. It needs no policy membership. The separate
 `GET /graphs` uses the same registry with a `graph_list` gate and returns one
 list containing runtime availability, sanitized failure and action. Neither inventory synthesizes graph
 entries from the boot witness. Discovery still discloses no availability.
 
 HTTP and MCP graph resolution atomically capture a serving view with its graph-epoch lease. A loading, blocked or
-transitioning graph yields 503 only after graph `read` authorization on `main` or
-management `graph_list` authorization; otherwise it remains undisclosed as 404.
-An invalid graph policy or configuration cannot authorize the graph-read fallback.
+transitioning graph yields 503 to a caller that may know the graph exists: an
+admitted identity, which discovery names it to, a holder of some grant on the
+graph (`PolicyEngine::may_act_on_graph`, the predicate that admits a data request
+to a ready graph), or a holder of management `graph_list`. Any other caller gets
+the unknown graph's 404. A graph policy or configuration refused at startup
+grants nothing, so it discloses the graph only to an identity or a `graph_list` holder.
 Availability booleans describe the runtime, not a policy grant; route
 authorization still applies to ready graphs.
 
@@ -713,6 +730,16 @@ enums are exhaustive, so an external exhaustive match must add the relevant
 arm when upgrading. Preserving existing constructors and direct storage-holder
 behavior does not remove that source compatibility requirement.
 
+MCP hosts implement `omnigraph_mcp::Host`. `start_tool` answers
+`Encoded::new(&dto)`, which encodes the DTO under the 1 MiB memory cap and
+replaces `bounded_result`; `HostError::from_output` wraps an error body and
+cannot fail. Neither judges size: the protocol crate does, and replaces an
+answer past its limit with `Host::error`'s refusal for the call. `router` takes
+the build's documentation revision (`build::docs_revision`, or `None` to link
+no guide page), and `McpSettings::resolve` takes the setup URL (`None` when
+unset). `ProtocolError` is exhaustive and adds `ReadOverBudget(ReadBudget)`:
+project it as `result_too_large`, naming the budget.
+
 In-process hosts that assemble `AppState` and call its existing
 `with_data_token_trust` method continue to own their graph/root binding. Use
 the managed settings loader when the library should validate the applied
@@ -752,8 +779,10 @@ or token expiry. The exact format and limits are in
 The server mounts `/mcp` whenever it has a bearer credential source: static
 tokens, signed data tokens or OIDC. OIDC additionally enables
 `/.well-known/oauth-protected-resource` and the metadata path advertised in the
-authentication challenge. Ad-hoc reads and write tools require their separate
-boot opt-ins; every invocation uses the same handlers and policy as HTTP.
+authentication challenge. `/mcp` lists every tool; its boot settings are the
+allowed-host list (`--mcp-allowed-host`) and the setup page an empty `graphs`
+listing offers (`--mcp-setup-url`). Every invocation uses the same handlers and
+policy as HTTP.
 A registered resource or listed tool is never a permission grant.
 
 `omnigraph-mcp` owns the SDK integration, tool/resource catalog, settings,
@@ -762,6 +791,9 @@ owns authentication, OAuth metadata, handler dispatch and admission, retaining
 execution ownership when the caller stops waiting. It also supplies the canonical
 `ApiError` projection for protocol refusals and handler failures, including the
 unknown-effect disposition when an admitted write's result cannot be delivered.
-The protocol crate wraps these bodies without a second error-code registry.
+The protocol crate wraps these bodies without a second error-code registry, and
+judges the size of every complete response in one place: a successful read by
+the read budget, a write's result or a refusal by the 1 MiB cap, replacing an
+answer past its limit with the adapter's refusal for the same call.
 Both transports share one listener and serving lifecycle. The supported tools
 and limits live in the [MCP guide](../user/operations/mcp.md).

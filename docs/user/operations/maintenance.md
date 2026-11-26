@@ -1,6 +1,6 @@
 # Maintenance
 
-OmniGraph provides four direct-storage maintenance commands:
+Omnigraph provides four maintenance commands that work on storage directly:
 
 - `optimize` compacts data and reconciles declared indexes on `main`.
 - `index build` brings one branch's declared indexes up to its rows.
@@ -8,8 +8,10 @@ OmniGraph provides four direct-storage maintenance commands:
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
 
-They do not run through the HTTP server; a cluster server runs optimize as a
-[recorded operation](recorded-operations.md). Address a graph directly, or from a cluster root:
+Only `optimize` also runs through the HTTP server: a cluster server runs it as
+a [recorded operation](recorded-operations.md), and
+`omnigraph optimize --target <server>` submits one. Otherwise, address a graph
+directly, or from a cluster root:
 
 ```bash
 omnigraph optimize --target ./graph.omni
@@ -18,7 +20,7 @@ omnigraph optimize --target ./cluster-root --graph knowledge
 
 Follow the command-specific concurrency requirements below. Registered direct
 targets accept local files only; an inline [S3 cluster root](s3-cluster-roots.md)
-is the one cloud-direct exception. See
+is maintenance's cloud-direct exception (reads and loads take an `s3://` graph). See
 [operator configuration](../cli/targets.md#transport-and-capability-boundaries).
 
 Each command acts as its `--as` actor, and the commit it publishes records
@@ -193,7 +195,7 @@ their parent data file's reachability.
 
 `omnigraph cleanup` is the only cleanup to run against a graph root. Lance's
 own cleanup (`cleanup_old_versions`, and every vacuum or retention tool built
-on it) does not trace OmniGraph's detached table versions. On Lance 13 it can
+on it) does not trace Omnigraph's detached table versions. On Lance 13 it can
 delete files used only by detached versions once those files are older than
 seven days, leaving the manifests present but affected snapshots unreadable.
 This can affect the current graph or a recent commit that inherits an old file;
@@ -276,10 +278,12 @@ versions, incarnations and tags still match after all table inventories.
 A changed observation refuses the whole plan before deletion; rerun with the
 same policy. This includes a branch deleted after cleanup listed it: cleanup
 returns a retryable conflict, and a new run captures the current branches.
-Retirement archives exact branch identity and ancestry inside
-its native tree, then removes the active ref. Creation does not scan retired
-histories. Cleanup removes unneeded retired trees and their archives, while
-preserving trees needed by live descendants, merge bases or tags.
+Below storage format v18, retirement archives exact branch identity and
+ancestry inside its native tree, then removes the active ref; from v18 the
+branch stays a retired catalog entry. Cleanup removes unneeded retired trees
+and their archives (then, from v18, the entry), preserving trees needed by
+live descendants, merge bases or tags; from v18 a tag does not block deletion.
+Creation does not scan retired histories.
 
 Ordinary graph writes and branch merges may overlap cleanup. A merge protects
 its accepted source, target and base snapshots with durable native tags;
@@ -308,36 +312,24 @@ rule, including temporary manifests. Each orphan Blob sidecar must satisfy
 that age rule itself, even when its parent data file is older.
 
 Each table's result row (under `--json`) carries `bytes_removed`,
-`manifests_removed` (table versions deleted: published ones no retained
-graph commit names, and dead staging), `unpublished_manifests` and
+`manifests_removed` (table versions deleted: published ones no retained graph
+commit names, and dead staging), `unpublished_manifests` and
 `unpublished_bytes` (the staging the run found, dead ones included),
-`foreign_versions` (Lance versions above the table's last linear version,
-which the run never deletes) and `error`, set only when the table's trace
-did not finish, in which case its counts are zero. `old_versions_removed`
-stays for one release beside `manifests_removed` and carries the same
-number; nothing defers a table, so the row has no `deferred` field.
+`foreign_versions` (Lance versions above the table's last linear version, which
+the run never deletes) and `error`, set only when the table's trace did not
+finish, in which case its counts are zero. `old_versions_removed` stays for one
+release beside `manifests_removed` and carries the same number. Nothing defers
+a table; from v18 a run that reclaims deleted branches adds a catalog row:
+`manifest_trees_removed` (retired trees removed), `branch_entries_removed`
+(retired entries removed), `branch_entries_deferred` (entries a concurrent
+catalog write left for the next run) and `ref_files_unlinked` (ref files the
+upgrade left, removed). When one is nonzero the text report prints their
+sums as `branches: N trees removed, N entries removed (N deferred), N refs unlinked`.
 
 Exit 0 means every table was visited and that nothing a retained graph
 commit pins, and no file such a commit references, was removed. It does not mean every table was collected: read the result rows
-for tables with an `error`.
-
-### Foreign versions
-
-Every Omnigraph table write is a detached Lance commit that a graph commit
-pins, so a table's linear Lance history ends where the table was created. The
-registration records that point as its last linear version
-(`omnigraph.last_linear_version`). A linear commit above it came from
-something other than Omnigraph writing the table directory, such as a Lance
-client pointed at it. No read or write of the graph resolves the linear
-HEAD, so a foreign version changes no query result and blocks no writer, and
-no command adopts it. A confirmed cleanup run (`cleanup --keep N --confirm`,
-which also removes what its policy does not retain) lists these versions per
-table, under `foreign_versions` with `--json` and by name in the human report,
-and leaves them and their files in place. The preview without `--confirm`
-does not open the graph and lists nothing. Embedded hosts can read the same
-list from the read-only `Omnigraph::cleanup_plan`. To discard them,
-export the graph and load it into a new one; see
-[Troubleshooting](troubleshooting.md#foreign-versions).
+for tables with an `error`. Versions Omnigraph did not write are
+[foreign versions](cleanup-foreign-versions.md).
 
 ## Suggested cadence
 

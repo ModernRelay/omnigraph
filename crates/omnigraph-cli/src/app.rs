@@ -467,6 +467,12 @@ async fn run(
     stdout_is_terminal: bool,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
+    // Before the statistics recorder exists: a refused client secret
+    // destination must not be written by any output, the recorder included.
+    let operator = operator.with_path(cli.operator_config.as_deref(), &std::env::current_dir()?);
+    if let Some((failure, json)) = managed::output_collision(&cli, &operator) {
+        return Ok(Completion::exit(failure.emit(json, stdout, stderr)?));
+    }
     let Some(stats) = cli.stats.clone() else {
         return run_resolved(
             cli,
@@ -617,12 +623,17 @@ async fn dispatch(
             auth.token().await?;
         }
     }
+    let mut input = crate::input::Input {
+        reader: stdin,
+        is_terminal: stdin_is_terminal,
+    };
     if let Some(targets::ResolvedTarget {
         binding: targets::TargetBinding::Managed(binding),
         ..
     }) = &target
     {
-        if let Some(result) = managed::dispatch(&cli, binding, &operator, stderr).await {
+        if let Some(result) = managed::dispatch(&cli, binding, &operator, &mut input, stderr).await
+        {
             return Ok(Completion::exit(result.emit(stdout, stderr)?));
         }
     }
@@ -630,10 +641,6 @@ async fn dispatch(
         target
             .as_ref()
             .expect("operation applicability requires a target")
-    };
-    let mut input = crate::input::Input {
-        reader: stdin,
-        is_terminal: stdin_is_terminal,
     };
     match cli.command {
         Command::Login { .. } | Command::Logout { .. } => {

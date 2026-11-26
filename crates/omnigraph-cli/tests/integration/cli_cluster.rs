@@ -3287,6 +3287,91 @@ fn optimize_resolves_a_cluster_graph_by_id() {
     );
 }
 
+/// A direct `load csv` whose source lies anywhere inside the cluster's
+/// storage root (the graph's own root, the root itself, another graph's root,
+/// or the ledger directory) is refused before the command takes the
+/// cluster's admission, as `cluster validate` refuses a configured Blob base
+/// there: it reports no effects, retains no admission lock, and the graph
+/// does not move, so the corrected load is not blocked. `explain load csv`
+/// refuses the same sources, and a source outside the cluster root loads.
+#[test]
+fn load_statement_over_the_cluster_root_is_refused_before_admission() {
+    let temp = applied_knowledge_cluster();
+    let graph = temp.path().join("graphs/knowledge.omni");
+    let other_graph = temp.path().join("graphs/other.omni");
+    fs::create_dir_all(&other_graph).unwrap();
+    let version_before = manifest_dataset_version(&graph);
+    let run = |statement: String| {
+        cli()
+            .arg("mutate")
+            .arg("--target")
+            .arg(temp.path())
+            .args(["--graph", "knowledge", "--as", "act-operator", "-e"])
+            .arg(statement)
+            .arg("--json")
+            .output()
+            .unwrap()
+    };
+    let load = |csv_path: &std::path::Path| {
+        format!(
+            "load csv \"file://{}\" into node:Person mode append header",
+            csv_path.display()
+        )
+    };
+
+    for directory in [
+        graph.clone(),
+        temp.path().to_path_buf(),
+        other_graph.clone(),
+        temp.path().join("__cluster"),
+    ] {
+        let csv_path = directory.join("people.csv");
+        fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+        let explain = cli()
+            .arg("query")
+            .arg("--target")
+            .arg(temp.path())
+            .args(["--graph", "knowledge", "-e"])
+            .arg(format!("explain {}", load(&csv_path)))
+            .arg("--json")
+            .output()
+            .unwrap();
+        for output in [run(load(&csv_path)), explain] {
+            assert_eq!(output.status.code(), Some(1), "{csv_path:?}: {output:?}");
+            let refused = parse_stdout_json(&output);
+            assert!(
+                refused["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("overlaps an Omnigraph storage root"),
+                "{csv_path:?}: {refused}"
+            );
+            assert_eq!(
+                refused["disposition"],
+                serde_json::json!({"effects": "none", "action": "fix"}),
+                "{csv_path:?}: {refused}"
+            );
+            assert!(
+                !String::from_utf8_lossy(&output.stderr).contains("cluster admission retained"),
+                "{csv_path:?}: {output:?}"
+            );
+        }
+        assert!(!temp.path().join("__cluster/lock.json").exists());
+        assert_eq!(manifest_dataset_version(&graph), version_before);
+    }
+
+    let outside = tempdir().unwrap();
+    let csv_path = outside.path().join("people.csv");
+    fs::write(&csv_path, "name,age\nzed,41\n").unwrap();
+    let output = run(load(&csv_path));
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        parse_stdout_json(&output)["affected_nodes"],
+        1,
+        "{output:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
     let temp = applied_knowledge_cluster();
@@ -5260,4 +5345,1110 @@ fn managed_workload_token_exchange_refuses_redirects_and_errors_without_secret_o
         api.assert_complete();
         assert_no_core_effects(temp.path());
     }
+}
+
+const APPLICATION_SECRET: &str = "fixture-client-secret-stays-in-its-file";
+const ROTATED_SECRET: &str = "fixture-rotated-client-secret-stays-in-its-file";
+const APPLICATION_TOKEN_ENDPOINT: &str = "https://auth.example.test/oauth2/token";
+
+fn team_application(client: &str, name: &str) -> Value {
+    serde_json::json!({"client_id":client,"organization_id":"account-one","name":name,"permissions":["status"],"actor_id":format!("principal:01P{client}"),"created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})
+}
+
+fn application_page(applications: Vec<Value>, after: Option<&str>) -> Value {
+    serde_json::json!({"data":{"organization_id":"account-one","applications":applications,"after":after,"grantable_permissions":["create","status"],"token_endpoint":APPLICATION_TOKEN_ENDPOINT},"meta":{"provenance":"service_db"}})
+}
+
+fn application_secret(id: &str) -> Value {
+    serde_json::json!({"id":id,"secret_hint":"ets","created_at":"2026-11-25T10:00:00Z","updated_at":"2026-11-25T10:00:00Z"})
+}
+
+fn application_secret_page(ids: &[&str]) -> Value {
+    serde_json::json!({"data":{"client_id":"client_one","secrets":ids.iter().map(|id| application_secret(id)).collect::<Vec<_>>(),"after":null},"meta":{}})
+}
+
+fn generated_secret(id: &str, secret: Option<&str>) -> Value {
+    serde_json::json!({"data":{"client_id":"client_one","secret":application_secret(id),"client_secret":secret},"meta":{}})
+}
+
+/// Neither stream, in any form, carries a disclosed secret.
+fn assert_no_secret_output(output: &std::process::Output) {
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for secret in [APPLICATION_SECRET, ROTATED_SECRET] {
+        assert!(!printed.contains(secret), "{printed}");
+    }
+}
+
+/// No operator-home file but the named secret file holds a secret: not the
+/// operator config, request custody or credential state.
+fn assert_secret_only_in(root: &std::path::Path, secret_file: &std::path::Path) {
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path != secret_file {
+                let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+                for secret in [APPLICATION_SECRET, ROTATED_SECRET] {
+                    assert!(!text.contains(secret), "{} holds a secret", path.display());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_owner_only(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "{mode:o}");
+}
+
+fn application_records(root: &std::path::Path) -> Value {
+    let path = organization_record(root).with_file_name("m2m-applications.json");
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn managed_organization_m2m_applications_list_follows_every_page_and_shows_actor_ids() {
+    for json in [true, false] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(
+                200,
+                application_page(
+                    vec![team_application("client_one", "ci bot")],
+                    Some("cursor/2"),
+                ),
+            ),
+            IntentReply::json(
+                200,
+                application_page(vec![team_application("client_two", "etl")], None),
+            ),
+        ]);
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.args(["m2m-applications", "list"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = output_success(&mut command);
+        if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["data"]["applications"].as_array().unwrap().len(), 2);
+            assert_eq!(body["data"]["applications"][1]["client_id"], "client_two");
+            assert_eq!(body["data"]["after"], Value::Null);
+            assert_eq!(body["data"]["token_endpoint"], APPLICATION_TOKEN_ENDPOINT);
+            assert_eq!(
+                body["data"]["grantable_permissions"],
+                serde_json::json!(["create", "status"])
+            );
+        } else {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for expected in [
+                "ci bot",
+                "client_two",
+                "principal:01Pclient_one",
+                "ACTOR ID",
+                APPLICATION_TOKEN_ENDPOINT,
+                "Permissions you can grant: create, status",
+                "no graph access",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        let requests = api.workflow_requests();
+        assert_control_request(
+            &requests[0],
+            "GET",
+            "/v1/organization/m2m-applications",
+            Value::Null,
+            None,
+        );
+        assert_control_request(
+            &requests[1],
+            "GET",
+            "/v1/organization/m2m-applications?after=cursor%2F2",
+            Value::Null,
+            None,
+        );
+        assert!(!temp.path().join(".omnigraph").exists());
+        api.assert_complete();
+    }
+    // A foreign application, an actor ID that is not `principal:<id>` or a repeated
+    // cursor refuses the whole listing.
+    for replies in [
+        vec![application_page(
+            vec![{
+                let mut application = team_application("client_one", "ci");
+                application["organization_id"] = serde_json::json!("account-two");
+                application
+            }],
+            None,
+        )],
+        vec![application_page(
+            vec![{
+                let mut application = team_application("client_one", "ci");
+                application["actor_id"] = serde_json::json!("someone-else");
+                application
+            }],
+            None,
+        )],
+        vec![
+            application_page(vec![], Some("same")),
+            application_page(vec![], Some("same")),
+        ],
+    ] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(
+            replies
+                .into_iter()
+                .map(|reply| IntentReply::json(200, reply))
+                .collect(),
+        );
+        let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+            "m2m-applications",
+            "list",
+            "--json",
+        ]));
+        assert_eq!(parse_stdout_json(&output)["type"], "api_response_invalid");
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_m2m_application_create_delivers_its_secret_only_to_the_named_file() {
+    for json in [true, false] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, application_page(vec![], None)),
+            IntentReply::json(
+                201,
+                serde_json::json!({"data":{"application":team_application("client_one", "ci bot")},"meta":{}}),
+            ),
+            IntentReply::json(201, generated_secret("sec_one", Some(APPLICATION_SECRET))),
+        ]);
+        fs::create_dir_all(temp.path().join("secrets")).unwrap();
+        let secret_file = temp.path().join("secrets/ci-secret");
+        let arguments = [
+            "m2m-applications",
+            "create",
+            "ci bot",
+            "--permission",
+            "status",
+            "--client-secret-file",
+            secret_file.to_str().unwrap(),
+            "--create-profile",
+            "ci",
+            "--idempotency-key",
+            "application-key",
+        ];
+        let run = || {
+            let mut command = organization_cli(temp.path(), &api.origin);
+            command.args(arguments);
+            if json {
+                command.arg("--json");
+            }
+            output_success(&mut command)
+        };
+        let output = run();
+        assert_no_secret_output(&output);
+        if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["data"]["application"]["client_id"], "client_one");
+            assert_eq!(
+                body["data"]["application"]["actor_id"],
+                "principal:01Pclient_one"
+            );
+            assert_eq!(body["data"]["secret_id"], "sec_one");
+            assert_eq!(
+                body["data"]["client_secret_file"],
+                secret_file.to_str().unwrap()
+            );
+            assert_eq!(body["data"]["profile"], "ci");
+        } else {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for expected in [
+                "Client ID: client_one",
+                "Actor ID: principal:01Pclient_one",
+                "Client secret sec_one written to",
+                "Profile: ci",
+                "no graph access",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(&secret_file).unwrap(),
+            APPLICATION_SECRET
+        );
+        #[cfg(unix)]
+        assert_owner_only(&secret_file);
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 3);
+        assert_control_request(
+            &requests[0],
+            "GET",
+            "/v1/organization/m2m-applications",
+            Value::Null,
+            None,
+        );
+        assert_control_request(
+            &requests[1],
+            "POST",
+            "/v1/organization/m2m-applications",
+            serde_json::json!({"organization_id":"account-one","name":"ci bot","permissions":["status"]}),
+            Some("application-key:application"),
+        );
+        assert_control_request(
+            &requests[2],
+            "POST",
+            "/v1/organization/m2m-applications/client_one/secrets",
+            serde_json::json!({"organization_id":"account-one"}),
+            Some("application-key:secret"),
+        );
+        let config: Value = yaml_serde::from_str(
+            &fs::read_to_string(managed_home(temp.path()).join("config.yaml")).unwrap(),
+        )
+        .unwrap();
+        let profile = &config["profiles"]["ci"];
+        assert_eq!(profile["api"], config["profiles"]["managed-account"]["api"]);
+        assert_eq!(profile["organization_id"], "account-one");
+        assert_eq!(
+            profile["auth"],
+            serde_json::json!({"provider":"oauth_client_credentials","token_endpoint":APPLICATION_TOKEN_ENDPOINT,"client_id":"client_one","client_secret":{"file":secret_file}})
+        );
+        assert_eq!(
+            profile["transport"],
+            config["profiles"]["managed-account"]["transport"]
+        );
+        assert_secret_only_in(temp.path(), &secret_file);
+
+        // The identical request finds its retained, delivered result and
+        // writes nothing again.
+        let again = run();
+        assert_no_secret_output(&again);
+        assert_eq!(api.workflow_requests().len(), 3);
+        assert_eq!(
+            fs::read_to_string(&secret_file).unwrap(),
+            APPLICATION_SECRET
+        );
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_m2m_application_create_refuses_unsafe_destinations_before_any_write() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    write_managed_target(temp.path(), &api.origin);
+    let config_path = managed_home(temp.path()).join("config.yaml");
+    let mut config: Value =
+        yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["profiles"]["taken"] = config["profiles"]["managed-account"].clone();
+    fs::write(&config_path, yaml_serde::to_string(&config).unwrap()).unwrap();
+    let existing = temp.path().join("existing-secret");
+    fs::write(&existing, "keep me").unwrap();
+    let fresh = temp.path().join("fresh-secret");
+    let slashed = format!("{}/", fresh.display());
+    let key = "k".repeat(201);
+    for (arguments, kind) in [
+        (
+            vec!["--client-secret-file", existing.to_str().unwrap()],
+            "m2m_application_secret_file_exists",
+        ),
+        (
+            vec![
+                "--client-secret-file",
+                temp.path().join("missing/secret").to_str().unwrap(),
+            ],
+            "m2m_application_secret_file_invalid",
+        ),
+        // Regression (review of PR 1546): a slash-terminated destination
+        // was accepted and failed only after the client secret existed.
+        (
+            vec!["--client-secret-file", &slashed],
+            "m2m_application_secret_file_invalid",
+        ),
+        (
+            vec![
+                "--client-secret-file",
+                fresh.to_str().unwrap(),
+                "--create-profile",
+                "taken",
+            ],
+            "m2m_application_profile_exists",
+        ),
+        (
+            vec![
+                "--client-secret-file",
+                fresh.to_str().unwrap(),
+                "--create-profile",
+                "managed-account",
+            ],
+            "m2m_application_profile_invalid",
+        ),
+        (
+            vec![
+                "--client-secret-file",
+                fresh.to_str().unwrap(),
+                "--permission",
+                "members_manage",
+            ],
+            "m2m_application_permissions_invalid",
+        ),
+        (
+            vec![
+                "--client-secret-file",
+                fresh.to_str().unwrap(),
+                "--idempotency-key",
+                &key,
+            ],
+            "idempotency_key_invalid",
+        ),
+    ] {
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command
+            .args(["m2m-applications", "create", "ci", "--json"])
+            .args(&arguments);
+        if !arguments.contains(&"--idempotency-key") {
+            command.args(["--idempotency-key", "refused-key"]);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(parse_stdout_json(&output)["type"], kind, "{arguments:?}");
+    }
+    assert!(api.workflow_requests().is_empty());
+    assert_eq!(fs::read_to_string(&existing).unwrap(), "keep me");
+    assert!(!fresh.exists());
+    let after: Value = yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(after, config);
+    api.assert_complete();
+}
+
+#[test]
+fn managed_organization_m2m_application_secret_lost_in_delivery_is_reported_by_id_never_resent() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, application_page(vec![], None)),
+        IntentReply::json(
+            201,
+            serde_json::json!({"data":{"application":team_application("client_one", "ci")},"meta":{}}),
+        ),
+        IntentReply::json(
+            503,
+            serde_json::json!({"type":"provider_unavailable","title":"provider unavailable","status":503}),
+        ),
+        // The identical retry replays the stored receipt, which never holds a secret.
+        IntentReply::json(201, generated_secret("sec_one", None)),
+    ]);
+    let secret_file = temp.path().join("ci-secret");
+    let arguments = [
+        "m2m-applications",
+        "create",
+        "ci",
+        "--permission",
+        "status",
+        "--client-secret-file",
+        secret_file.to_str().unwrap(),
+        "--create-profile",
+        "ci",
+        "--idempotency-key",
+        "lost-key",
+    ];
+    let first = output_failure(organization_cli(temp.path(), &api.origin).args(arguments));
+    assert_eq!(first.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&first.stderr)
+            .contains("repeat the identical request with the same key"),
+        "{first:?}"
+    );
+    assert!(!secret_file.exists());
+    let records = application_records(temp.path());
+    assert_eq!(
+        records[0]["progress"]["application"]["client_id"],
+        "client_one"
+    );
+    assert_eq!(records[0]["progress"]["delivered"], Value::Null);
+
+    for json in [false, true] {
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.args(arguments);
+        if json {
+            command.arg("--json");
+        }
+        let output = output_failure(&mut command);
+        assert_no_secret_output(&output);
+        let report = if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["type"], "m2m_application_secret_undelivered");
+            assert_eq!(body["secret_id"], "sec_one");
+            body["detail"].as_str().unwrap().to_owned()
+        } else {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+        assert!(report.contains("Revoke client secret sec_one"), "{report}");
+        assert!(
+            report.contains("secret rotate --application-profile ci"),
+            "{report}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("repeat the identical request"),
+            "{output:?}"
+        );
+        if !json {
+            // The second replay has no further reply; exactly one was scripted.
+            break;
+        }
+    }
+    let requests = api.workflow_requests();
+    // Neither retry created the application again or listed again.
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[2].path, requests[3].path);
+    assert_eq!(requests[2].body, requests[3].body);
+    assert_eq!(
+        requests[3]
+            .headers
+            .get("idempotency-key")
+            .map(String::as_str),
+        Some("lost-key:secret")
+    );
+    assert!(!secret_file.exists());
+    assert_secret_only_in(temp.path(), &secret_file);
+    api.assert_complete();
+}
+
+/// A configured application profile `ci` whose client secret file holds `old`.
+fn write_application_profile(
+    root: &std::path::Path,
+    origin: &str,
+    token_endpoint: &str,
+) -> std::path::PathBuf {
+    write_managed_target(root, origin);
+    let secret_file = root.join("ci-secret");
+    fs::write(&secret_file, "old-client-secret").unwrap();
+    let path = managed_home(root).join("config.yaml");
+    let mut config: Value = yaml_serde::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["profiles"]["ci"] = serde_json::json!({"api":origin,"organization_id":"account-one","auth":{
+        "provider":"oauth_client_credentials","token_endpoint":token_endpoint,
+        "client_id":"client_one","client_secret":{"file":secret_file}}});
+    fs::write(&path, yaml_serde::to_string(&config).unwrap()).unwrap();
+    secret_file
+}
+
+fn token_reply(status: u16) -> IntentReply {
+    if status == 200 {
+        IntentReply::json(
+            200,
+            serde_json::json!({"access_token":"oauth-application-token","token_type":"Bearer","expires_in":300}),
+        )
+    } else {
+        IntentReply::json(status, serde_json::json!({"error":"invalid_client"}))
+    }
+}
+
+fn rotate_cli(root: &std::path::Path, origin: &str) -> assert_cmd::Command {
+    let mut command = organization_cli(root, origin);
+    command
+        .env("SSL_CERT_FILE", crate::support::tls_gateway::ca_path())
+        .args([
+            "m2m-applications",
+            "secret",
+            "rotate",
+            "--application-profile",
+            "ci",
+        ]);
+    command
+}
+
+fn revoked_secret(id: &str) -> Value {
+    serde_json::json!({"data":{"client_id":"client_one","secret_id":id,"revoked":true},"meta":{}})
+}
+
+#[test]
+fn managed_organization_m2m_application_rotation_proves_the_new_secret_before_revoking_the_old() {
+    for json in [true, false] {
+        let temp = tempdir().unwrap();
+        let provider = IntentApiFixture::new(vec![token_reply(200), token_reply(200)]);
+        let api = lifecycle_fixture(vec![
+            IntentReply::json(200, application_secret_page(&["sec_old"])),
+            IntentReply::json(201, generated_secret("sec_new", Some(ROTATED_SECRET))),
+            IntentReply::json(200, revoked_secret("sec_old")),
+            IntentReply::json(200, revoked_secret("sec_old")),
+        ]);
+        let secret_file = write_application_profile(
+            temp.path(),
+            &api.origin,
+            &format!("{}/oauth2/token", provider.origin),
+        );
+        let run = || {
+            let mut command = rotate_cli(temp.path(), &api.origin);
+            command.args(["--idempotency-key", "rotate-key"]);
+            if json {
+                command.arg("--json");
+            }
+            output_success(&mut command)
+        };
+        let output = run();
+        assert_no_secret_output(&output);
+        if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["data"]["secret_id"], "sec_new");
+            assert_eq!(body["data"]["revoked"], serde_json::json!(["sec_old"]));
+            assert_eq!(body["data"]["proved"], true);
+        } else {
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("Token exchange: succeeded"), "{text}");
+            assert!(text.contains("Revoked: sec_old"), "{text}");
+        }
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), ROTATED_SECRET);
+        #[cfg(unix)]
+        assert_owner_only(&secret_file);
+        // The proof sent the new secret, and only to the token endpoint.
+        let exchange = &provider.requests()[0];
+        assert_eq!(exchange.path, "/oauth2/token");
+        assert_eq!(exchange.body["client_id"], "client_one");
+        assert_eq!(exchange.body["client_secret"], ROTATED_SECRET);
+        let requests = api.workflow_requests();
+        assert_control_request(
+            &requests[0],
+            "GET",
+            "/v1/organization/m2m-applications/client_one/secrets",
+            Value::Null,
+            None,
+        );
+        assert_control_request(
+            &requests[1],
+            "POST",
+            "/v1/organization/m2m-applications/client_one/secrets",
+            serde_json::json!({"organization_id":"account-one"}),
+            Some("rotate-key:secret"),
+        );
+        assert_control_request(
+            &requests[2],
+            "POST",
+            "/v1/organization/m2m-applications/client_one/secrets/sec_old:revoke",
+            serde_json::json!({"organization_id":"account-one"}),
+            Some("rotate-key:revoke-0"),
+        );
+        assert_secret_only_in(temp.path(), &secret_file);
+
+        // The identical request generates nothing again: it proves the
+        // delivered secret and repeats the exact revocation.
+        assert_no_secret_output(&run());
+        let requests = api.workflow_requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[3].path, requests[2].path);
+        assert_eq!(
+            requests[3].headers.get("idempotency-key"),
+            requests[2].headers.get("idempotency-key")
+        );
+        assert_eq!(fs::read_to_string(&secret_file).unwrap(), ROTATED_SECRET);
+        provider.assert_complete();
+        api.assert_complete();
+    }
+}
+
+#[test]
+fn managed_organization_m2m_application_rotation_keeps_both_secrets_until_the_exchange_succeeds() {
+    let temp = tempdir().unwrap();
+    let provider = IntentApiFixture::new(vec![token_reply(401), token_reply(200)]);
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, application_secret_page(&["sec_old"])),
+        IntentReply::json(201, generated_secret("sec_new", Some(ROTATED_SECRET))),
+        IntentReply::json(200, revoked_secret("sec_old")),
+    ]);
+    let secret_file = write_application_profile(
+        temp.path(),
+        &api.origin,
+        &format!("{}/oauth2/token", provider.origin),
+    );
+    let failed = output_failure(rotate_cli(temp.path(), &api.origin).args([
+        "--idempotency-key",
+        "rotate-key",
+        "--json",
+    ]));
+    assert_no_secret_output(&failed);
+    let body = parse_stdout_json(&failed);
+    assert_eq!(body["type"], "m2m_application_secret_unproven");
+    assert_eq!(body["secret_id"], "sec_new");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("Nothing was revoked") && detail.contains("same key"),
+        "{detail}"
+    );
+    assert!(!detail.contains("invalid_client"), "{detail}");
+    // The new secret stays in the file; no revocation was sent.
+    assert_eq!(fs::read_to_string(&secret_file).unwrap(), ROTATED_SECRET);
+    assert_eq!(api.workflow_requests().len(), 2);
+
+    let output = output_success(
+        rotate_cli(temp.path(), &api.origin).args(["--idempotency-key", "rotate-key"]),
+    );
+    assert_no_secret_output(&output);
+    let requests = api.workflow_requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].path,
+        "/v1/organization/m2m-applications/client_one/secrets/sec_old:revoke"
+    );
+    assert_eq!(provider.requests().len(), 2);
+    assert_secret_only_in(temp.path(), &secret_file);
+    provider.assert_complete();
+    api.assert_complete();
+}
+
+#[test]
+fn managed_organization_m2m_application_rotation_with_several_secrets_needs_an_explicit_revocation()
+{
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, application_secret_page(&["sec_a", "sec_b"])),
+        IntentReply::json(200, application_secret_page(&["sec_a", "sec_b"])),
+    ]);
+    let secret_file =
+        write_application_profile(temp.path(), &api.origin, APPLICATION_TOKEN_ENDPOINT);
+    let output = output_failure(rotate_cli(temp.path(), &api.origin).args([
+        "--idempotency-key",
+        "ambiguous-key",
+        "--json",
+    ]));
+    let body = parse_stdout_json(&output);
+    assert_eq!(body["type"], "m2m_application_secret_ambiguous");
+    let detail = body["detail"].as_str().unwrap();
+    assert!(detail.contains("sec_a") && detail.contains("sec_b") && detail.contains("--revoke"));
+    let output = output_failure(rotate_cli(temp.path(), &api.origin).args([
+        "--revoke",
+        "sec_c",
+        "--idempotency-key",
+        "missing-key",
+        "--json",
+    ]));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "m2m_application_secret_not_found"
+    );
+    assert!(
+        api.workflow_requests()
+            .iter()
+            .all(|request| request.method == "GET"),
+        "no secret was generated or revoked"
+    );
+    assert_eq!(
+        fs::read_to_string(&secret_file).unwrap(),
+        "old-client-secret"
+    );
+    // Only a client-credentials profile with a file source can be rotated.
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+        "m2m-applications",
+        "secret",
+        "rotate",
+        "--application-profile",
+        "managed-account",
+        "--idempotency-key",
+        "admin-key",
+        "--json",
+    ]));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "m2m_application_profile_invalid"
+    );
+    api.assert_complete();
+}
+
+#[test]
+fn managed_organization_m2m_application_revoke_resolves_once_and_requires_confirmation() {
+    let listing = application_page(
+        vec![
+            team_application("client_one", "ci bot"),
+            team_application("client_two", "etl"),
+            team_application("client_three", "etl"),
+        ],
+        None,
+    );
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, listing.clone()),
+        IntentReply::json(200, listing.clone()),
+        IntentReply::json(
+            200,
+            serde_json::json!({"data":{"client_id":"client_one","deleted":true},"meta":{}}),
+        ),
+        IntentReply::json(200, listing.clone()),
+        IntentReply::json(200, listing.clone()),
+        IntentReply::json(
+            200,
+            serde_json::json!({"data":{"client_id":"client_two","deleted":true},"meta":{}}),
+        ),
+    ]);
+    // Without --yes a noninteractive or JSON run refuses before the write.
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+        "m2m-applications",
+        "delete",
+        "ci bot",
+        "--idempotency-key",
+        "delete-key",
+        "--json",
+    ]));
+    assert_eq!(parse_stdout_json(&output)["type"], "confirmation_required");
+    assert!(
+        parse_stdout_json(&output)["detail"]
+            .as_str()
+            .unwrap()
+            .contains("--yes"),
+        "{output:?}"
+    );
+    let output = output_success(organization_cli(temp.path(), &api.origin).args([
+        "m2m-applications",
+        "delete",
+        "ci bot",
+        "--idempotency-key",
+        "delete-key-2",
+        "--yes",
+    ]));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("ci bot (client_one) deleted"), "{text}");
+    assert!(text.contains("principal:01Pclient_one"), "{text}");
+    // A shared name is ambiguous; the exact client ID selects one application.
+    let output = output_failure(organization_cli(temp.path(), &api.origin).args([
+        "m2m-applications",
+        "delete",
+        "etl",
+        "--idempotency-key",
+        "delete-etl",
+        "--yes",
+        "--json",
+    ]));
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "m2m_application_ambiguous"
+    );
+    output_success(organization_cli(temp.path(), &api.origin).args([
+        "m2m-applications",
+        "delete",
+        "client_two",
+        "--idempotency-key",
+        "delete-etl-client",
+        "--yes",
+    ]));
+    let posts: Vec<_> = api
+        .workflow_requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .collect();
+    assert_eq!(posts.len(), 2);
+    assert_control_request(
+        &posts[0],
+        "POST",
+        "/v1/organization/m2m-applications/client_one:delete",
+        serde_json::json!({"organization_id":"account-one"}),
+        Some("delete-key-2"),
+    );
+    assert_eq!(
+        posts[1].path,
+        "/v1/organization/m2m-applications/client_two:delete"
+    );
+    api.assert_complete();
+}
+
+/// Regression (review of PR 1546): replaying a completed
+/// `create --replace-profile` wrote its profile again, overwriting a profile
+/// a later request had installed under the same name.
+#[test]
+fn managed_organization_m2m_application_create_replay_never_rewrites_its_profile() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, application_page(vec![], None)),
+        IntentReply::json(
+            201,
+            serde_json::json!({"data":{"application":team_application("client_one", "ci")},"meta":{}}),
+        ),
+        IntentReply::json(201, generated_secret("sec_one", Some(APPLICATION_SECRET))),
+    ]);
+    write_managed_target(temp.path(), &api.origin);
+    let config_path = managed_home(temp.path()).join("config.yaml");
+    let mut config: Value =
+        yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["profiles"]["ci"] = config["profiles"]["managed-account"].clone();
+    fs::write(&config_path, yaml_serde::to_string(&config).unwrap()).unwrap();
+    let secret_file = temp.path().join("ci-secret");
+    let run = || {
+        output_success(organization_cli(temp.path(), &api.origin).args([
+            "m2m-applications",
+            "create",
+            "ci",
+            "--permission",
+            "status",
+            "--client-secret-file",
+            secret_file.to_str().unwrap(),
+            "--create-profile",
+            "ci",
+            "--replace-profile",
+            "--idempotency-key",
+            "replace-key",
+            "--json",
+        ]))
+    };
+    run();
+    let mut later: Value =
+        yaml_serde::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(later["profiles"]["ci"]["auth"]["client_id"], "client_one");
+    // A later request installs another application under the same profile.
+    later["profiles"]["ci"]["auth"]["client_id"] = serde_json::json!("client_later");
+    fs::write(&config_path, yaml_serde::to_string(&later).unwrap()).unwrap();
+    let before = fs::read(&config_path).unwrap();
+    assert_no_secret_output(&run());
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert_eq!(api.workflow_requests().len(), 3);
+    api.assert_complete();
+}
+
+/// Regression (review of PR 1546): a same-key rotation retry proved whatever
+/// the file held and then revoked the earlier client secret, even after the
+/// operator had restored that secret to the file.
+#[test]
+fn managed_organization_m2m_application_rotation_retry_never_revokes_a_restored_secret() {
+    let temp = tempdir().unwrap();
+    let provider = IntentApiFixture::new(vec![token_reply(401)]);
+    let api = lifecycle_fixture(vec![
+        IntentReply::json(200, application_secret_page(&["sec_old"])),
+        IntentReply::json(201, generated_secret("sec_new", Some(ROTATED_SECRET))),
+    ]);
+    let secret_file = write_application_profile(
+        temp.path(),
+        &api.origin,
+        &format!("{}/oauth2/token", provider.origin),
+    );
+    let failed = output_failure(rotate_cli(temp.path(), &api.origin).args([
+        "--idempotency-key",
+        "rotate-key",
+        "--json",
+    ]));
+    assert_eq!(
+        parse_stdout_json(&failed)["type"],
+        "m2m_application_secret_unproven"
+    );
+    // The operator rolls back by restoring the earlier client secret.
+    fs::write(&secret_file, "old-client-secret").unwrap();
+    for json in [true, false] {
+        let mut command = rotate_cli(temp.path(), &api.origin);
+        command.args(["--idempotency-key", "rotate-key"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = output_failure(&mut command);
+        assert_no_secret_output(&output);
+        let report = if json {
+            let body = parse_stdout_json(&output);
+            assert_eq!(body["type"], "m2m_application_secret_file_changed");
+            assert_eq!(body["secret_id"], "sec_new");
+            body["detail"].as_str().unwrap().to_owned()
+        } else {
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+        assert!(report.contains("nothing was proven or revoked"), "{report}");
+    }
+    // No exchange with the restored value and no revocation was sent.
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(api.workflow_requests().len(), 2);
+    assert_eq!(
+        fs::read_to_string(&secret_file).unwrap(),
+        "old-client-secret"
+    );
+    provider.assert_complete();
+    api.assert_complete();
+}
+
+/// Regression (review of PR 1546): `--stats` naming the client secret file
+/// overwrote the delivered secret with statistics after the command
+/// succeeded. Every collision with another output refuses before anything,
+/// the statistics recorder included, writes.
+#[test]
+fn managed_organization_m2m_application_secret_file_never_shares_a_path_with_another_output() {
+    let temp = tempdir().unwrap();
+    let api = lifecycle_fixture(vec![]);
+    let secret_file =
+        write_application_profile(temp.path(), &api.origin, APPLICATION_TOKEN_ENDPOINT);
+    let fresh = temp.path().join("fresh-secret");
+    let config = managed_home(temp.path()).join("config.yaml");
+    let custody = managed_home(temp.path())
+        .join("organization")
+        .join("secret");
+    fs::create_dir_all(custody.parent().unwrap()).unwrap();
+    let config_before = fs::read(&config).unwrap();
+    for (destination, stats) in [
+        (fresh.clone(), Some(fresh.clone())),
+        (config.clone(), None),
+        (custody.clone(), None),
+    ] {
+        let mut command = organization_cli(temp.path(), &api.origin);
+        if let Some(stats) = &stats {
+            command.arg("--stats").arg(stats);
+        }
+        command.args([
+            "m2m-applications",
+            "create",
+            "ci",
+            "--client-secret-file",
+            destination.to_str().unwrap(),
+            "--replace-client-secret-file",
+            "--idempotency-key",
+            "collision-key",
+            "--json",
+        ]);
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(
+            parse_stdout_json(&output)["type"],
+            "m2m_application_secret_file_collision",
+            "{destination:?}"
+        );
+    }
+    assert!(
+        !fresh.exists(),
+        "the statistics recorder wrote the refused path"
+    );
+    assert!(!custody.exists());
+    assert_eq!(fs::read(&config).unwrap(), config_before);
+    // Rotation's destination comes from the profile; its file is unchanged.
+    let output = output_failure(
+        rotate_cli(temp.path(), &api.origin)
+            .arg("--stats")
+            .arg(&secret_file)
+            .args(["--idempotency-key", "rotate-collision", "--json"]),
+    );
+    assert_eq!(
+        parse_stdout_json(&output)["type"],
+        "m2m_application_secret_file_collision"
+    );
+    assert_eq!(
+        fs::read_to_string(&secret_file).unwrap(),
+        "old-client-secret"
+    );
+    assert!(api.workflow_requests().is_empty());
+    api.assert_complete();
+}
+
+/// #1527: an inline `s3://` root that names no one key (an escape Lance
+/// decodes to a second key, a query) or respells another root's key (a dot
+/// segment, escaped or not) is refused before any request, and names the one
+/// spelling to use only when that spelling names the same objects (not for a
+/// trailing space, which splits the keys below the root). The storage
+/// endpoint is a fixture that records every request it receives; the one
+/// spelling of a key, sent to the same endpoint, shows that it would see one.
+#[test]
+fn inline_s3_root_without_one_key_is_refused_before_any_request_issue_1527() {
+    let bucket = IntentApiFixture::new(vec![IntentReply::json(
+        403,
+        serde_json::json!({"type": "denied"}),
+    )]);
+    let s3 = || {
+        let mut command = cli();
+        command.envs([
+            ("AWS_ACCESS_KEY_ID", "one-key-test-key"),
+            ("AWS_SECRET_ACCESS_KEY", "one-key-test-secret"),
+            ("AWS_SESSION_TOKEN", ""),
+            (
+                "AWS_CONFIG_FILE",
+                "/nonexistent/omnigraph-one-key-aws-config",
+            ),
+            (
+                "AWS_SHARED_CREDENTIALS_FILE",
+                "/nonexistent/omnigraph-one-key-aws-credentials",
+            ),
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_DEFAULT_REGION", "us-east-1"),
+            ("AWS_ENDPOINT", bucket.http_origin.as_str()),
+            ("AWS_ENDPOINT_URL", bucket.http_origin.as_str()),
+            ("AWS_ENDPOINT_URL_S3", bucket.http_origin.as_str()),
+            ("AWS_ALLOW_HTTP", "true"),
+            ("AWS_S3_FORCE_PATH_STYLE", "true"),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+            ("OBJECT_STORE_CLIENT_MAX_RETRIES", "0"),
+            ("OBJECT_STORE_CLIENT_RETRY_TIMEOUT", "2"),
+        ]);
+        command
+    };
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("g.pg"),
+        "node X {\n  slug: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  g:\n    schema: g.pg\n",
+    )
+    .unwrap();
+    let config = dir.path().to_str().unwrap();
+    for spelling in [
+        "my data/root",
+        "\u{e9}t\u{e9}/root",
+        "a%41b/root",
+        "{x}/root",
+        "x/%2e%2e/root",
+        "x/../root",
+        "root/.",
+        "root ",
+    ] {
+        let root = format!("s3://one-key-bucket/{spelling}");
+        let base = "s3://one-key-bucket/base";
+        let commands: [Vec<&str>; 4] = [
+            vec!["cluster", "status", "--target", &root, "--json"],
+            vec![
+                "cluster", "apply", "--target", &root, "--config", config, "--json",
+            ],
+            vec!["optimize", "--target", &root, "--graph", "g", "--json"],
+            vec![
+                "query",
+                "--target",
+                &root,
+                "--base",
+                base,
+                "-e",
+                "query q() { match { $x: X } return { $x.slug } }",
+                "--json",
+            ],
+        ];
+        for arguments in commands {
+            let output = output_failure(s3().args(&arguments));
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                text.contains("must name one object key"),
+                "{arguments:?}: {text}"
+            );
+            // A replacement is named only where it names the same objects:
+            // `root ` splits below itself (`root%20/…`, `root /…`), so none is.
+            let named = text.contains("another spelling of 's3://one-key-bucket/root'");
+            assert_eq!(
+                named,
+                matches!(spelling, "x/%2e%2e/root" | "x/../root" | "root/."),
+                "{arguments:?}: {text}"
+            );
+            assert!(
+                bucket.requests().is_empty(),
+                "{arguments:?} reached the storage endpoint: {:?}",
+                bucket.requests()
+            );
+        }
+    }
+    let output = output_failure(s3().args([
+        "cluster",
+        "status",
+        "--target",
+        "s3://one-key-bucket/root",
+        "--json",
+    ]));
+    assert!(
+        !bucket.requests().is_empty(),
+        "the one spelling reaches the endpoint: {output:?}"
+    );
 }

@@ -16,7 +16,10 @@ GQT can benchmark them. GQT must not introduce separate maintenance commands.
 
 - `crates/omnigraph/benches/`: the former scenario harness and its modules.
   Branch cleanup and physical compaction controls require GQ maintenance support.
-  Concurrent writes require a benchmark executor that measures actual overlap.
+  The concurrent-writes module's closed-loop driver now runs as the catalog's
+  measured block (`concurrent-writes`, below); its source stays for the axes
+  that scenario lacks: an S3-compatible root, the fragmented manifest layout
+  and several write branches.
   Forced RRF plans, process settings and physical index treatments need explicit
   support before their experiments can return with the same meaning.
 - `crates/omnigraph/tests/benchmark_scenario_contract.rs.disabled`: the retired
@@ -72,6 +75,12 @@ reopening the database. They use new experiment identities: their bounded
 fixtures, vector values, topology, batches, cache preparation or repetition
 boundaries differ from the historical instruments. They do not establish
 equivalent large-scale, HTTP, concurrency or physical-plan performance.
+
+The `concurrency` suite's `concurrent-writes` scenario runs the
+concurrent-writes module's closed-loop driver as a
+[measured block](../README.md#measured-concurrent-blocks) on a local store: a
+swept number of writers beside readers on one engine handle. It has a new
+experiment identity and, like the module, is never claim-grade.
 
 ## Restoring a deferred scenario
 

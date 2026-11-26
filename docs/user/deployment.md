@@ -1,11 +1,11 @@
 # Deployment
 
-OmniGraph can keep a cluster on a local filesystem, S3-compatible object
+Omnigraph can keep a cluster on a local filesystem, S3-compatible object
 storage, or Azure Blob Storage. The server always boots from one cluster root
 and exposes its ready applied graphs under `/graphs/{graph_id}/…`; use
 `--require-all-graphs` when any blocked graph must fail startup.
 
-Servers use the v0.14 HTTP contract and open graph storage formats v14 to v17. The
+Servers use the v0.14 HTTP contract and open graph storage formats v14 to v18. The
 cluster ledger has a separate version: explicitly converting it to v2 preserves
 graph data and history. Start with [Operating a cluster](clusters/index.md) to
 create and apply a deployment bundle.
@@ -74,9 +74,9 @@ partial convergence and shutdown keep it false; a restart must verify its bindin
 again. Successful apply alone is not activation, which never rewrites the durable
 achieved result or receipt.
 
-Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to callers authorized to
-read `main` or list the management inventory; other callers cannot use this response to discover
-them. Unknown graphs return 404. A 503 does not authorize replaying a write.
+Known loading, blocked or transitioning graphs return 503 (`graph_unavailable`) to an admitted identity
+and to a caller holding any permission on the graph or `graph_list`. Any other caller gets 404, as for
+an unknown graph, so it cannot use the response to discover them. A 503 does not authorize replaying a write.
 `omnigraph graphs list --target NAME` displays graph ID, state and URI for a
 registered server or managed target. `--json` preserves the full inventory
 fields. Minimal discovery remains IDs/names only.
@@ -222,8 +222,8 @@ a gateway can relay a socket to its loopback listener:
 socat UNIX-LISTEN:/run/omnigraph/server.sock,fork TCP:127.0.0.1:8080
 ```
 
-The version-1 CLI does not accept Unix socket targets; use a registered HTTPS
-endpoint instead. Relay requests and responses unchanged, including
+The CLI's operator configuration (`version: 1`) refuses a `unix://` server
+endpoint; register an HTTPS endpoint instead. Relay requests and responses unchanged, including
 `Omnigraph-Http-Api`. Restrict socket-directory permissions; bearer authentication
 and policy still apply.
 

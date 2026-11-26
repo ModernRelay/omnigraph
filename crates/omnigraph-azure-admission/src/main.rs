@@ -10,7 +10,7 @@ use omnigraph_azure_admission::{
 #[derive(Debug, Parser)]
 #[command(
     name = "omnigraph-azure-admission",
-    about = "Azure Blob lease admission for one OmniGraph process"
+    about = "Azure Blob lease admission for one Omnigraph process"
 )]
 struct Cli {
     #[command(subcommand)]

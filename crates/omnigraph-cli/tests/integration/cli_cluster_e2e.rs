@@ -1580,6 +1580,11 @@ fn live_policy_mutation(server: &TestServer, name: &str) -> assert_cmd::Command 
 fn live_policy_expect_forbidden(command: &mut assert_cmd::Command) {
     let output = output_failure(command);
     let error = parse_stdout_json(&output);
+    if let Some(status) = error.get("http_status") {
+        assert_eq!(status, 403, "{error}");
+        assert_eq!(error["code"], "forbidden", "{error}");
+        return;
+    }
     let message = error["error"]
         .as_str()
         .expect("CLI error message")

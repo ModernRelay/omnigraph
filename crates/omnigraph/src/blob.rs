@@ -393,7 +393,7 @@ impl std::fmt::Display for StorageRootConflict {
         match self {
             Self::Overlap { base } => write!(
                 formatter,
-                "external Blob base '{base}' overlaps an OmniGraph storage root; bases must name storage outside every graph and cluster root"
+                "external Blob base '{base}' overlaps an Omnigraph storage root; bases must name storage outside every graph and cluster root"
             ),
             Self::UncomparableRoot { base } => write!(
                 formatter,
@@ -715,7 +715,9 @@ impl NormalizedExternalUri {
         let root_scheme = match kind {
             omnigraph_storage::StorageKind::S3 => "s3",
             omnigraph_storage::StorageKind::Local => "file",
-            omnigraph_storage::StorageKind::Azure => return Ok(Vec::new()),
+            omnigraph_storage::StorageKind::Azure | omnigraph_storage::StorageKind::Gcs => {
+                return Ok(Vec::new());
+            }
         };
         if base_scheme != root_scheme {
             return Ok(Vec::new());
@@ -2052,7 +2054,7 @@ mod tests {
             OmniError::ExternalBlobPolicy { uri, reason } => {
                 assert_eq!(uri, "<redacted>");
                 assert!(
-                    reason.contains("overlaps an OmniGraph storage root"),
+                    reason.contains("overlaps an Omnigraph storage root"),
                     "unexpected reason: {reason}"
                 );
             }
@@ -2117,6 +2119,7 @@ mod tests {
         for scheme in EXTERNAL_BASE_SCHEMES {
             for root in [
                 "az://container/c",
+                "gs://bucket/graph",
                 "memory://graph",
                 "shared-memory://universe/g",
             ] {
@@ -2127,7 +2130,7 @@ mod tests {
                     "{root}"
                 );
             }
-            for root in ["gs://bucket/graph", "og://graph", "S3://bucket/graph"] {
+            for root in ["og://graph", "S3://bucket/graph"] {
                 assert!(
                     matches!(
                         NormalizedExternalUri::storage_root_forms(root, scheme),

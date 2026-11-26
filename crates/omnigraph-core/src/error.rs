@@ -224,6 +224,16 @@ pub enum BranchStartRefusal {
     UnattachedSnapshot,
 }
 
+fn format_branch_exists(branch: &str, live: &str) -> String {
+    if branch == live {
+        return format!("branch '{branch}' already exists");
+    }
+    format!(
+        "cannot create branch '{branch}' while live branch '{live}' shares its physical Lance \
+         path; live graph branch names may not be ancestors or descendants"
+    )
+}
+
 fn format_branch_start_refusal(graph_commit_id: &str, reason: &BranchStartRefusal) -> String {
     let why = match reason {
         BranchStartRefusal::NotRetained {
@@ -375,6 +385,22 @@ pub enum OmniError {
     /// an arbitrary storage `NotFound` as branch absence.
     #[error("branch '{branch}' not found")]
     BranchNotFound { branch: String },
+    /// `branch create` named a logical name a live branch holds, or one an
+    /// ancestor or descendant of a live branch's name, which would share its
+    /// physical Lance path. Refused before any effect.
+    #[error("{}", format_branch_exists(branch, live))]
+    BranchExists { branch: String, live: String },
+    /// The branch was deleted under the operation: its chain carries a
+    /// tombstone, or main's rows hold no live row with the identifier the
+    /// operation captured.
+    #[error("branch '{branch}' was deleted")]
+    BranchDeleted { branch: String },
+    /// The branch has a live row and no tree: its create was interrupted
+    /// between the row and the tree. `branch delete` removes the row.
+    #[error(
+        "branch '{branch}' is not ready: its create left no tree; delete it and create it again"
+    )]
+    BranchNotReady { branch: String },
     /// A graph diff endpoint names neither a live branch nor a resolvable
     /// graph commit. Carries only the caller's own spelling.
     #[error("'{target}' names no branch and no commit")]
@@ -749,6 +775,61 @@ impl OmniError {
                     ..
                 })
         )
+    }
+
+    /// Whether the type of this failure is a refusal: the step that raised it
+    /// refused before its first durable effect, or before its publication
+    /// with every earlier effect of its own unreachable, so the step did not
+    /// move the graph. This is what a typed outcome states. Completion
+    /// evidence the owning operation attaches composes over it: an earlier
+    /// publication of the same operation still stands beside the refusal,
+    /// and explicit uncertainty wins. An opaque failure, one that needs
+    /// recovery or a rebuild, and an internal surprise are not refusals.
+    /// The match is exhaustive, so a new variant decides.
+    pub fn is_refusal(&self) -> bool {
+        match self.without_evidence() {
+            Self::Compiler(_)
+            | Self::MergeConflicts(_)
+            | Self::KeyConflict { .. }
+            | Self::ResourceLimitExceeded { .. }
+            | Self::ChangeCursorRejected { .. }
+            | Self::BranchNotFound { .. }
+            | Self::BranchExists { .. }
+            | Self::BranchDeleted { .. }
+            | Self::BranchNotReady { .. }
+            | Self::ReadTargetNotFound { .. }
+            | Self::AmbiguousReadTarget { .. }
+            | Self::BranchStartRefused { .. }
+            | Self::ChangeFeedGap { .. }
+            | Self::CommitHasNoParent { .. }
+            | Self::ChangeSchemaBoundary { .. }
+            | Self::ExternalBlobPolicy { .. }
+            | Self::ExternalBlobSource { .. }
+            | Self::StoredExternalBlobDenied { .. }
+            | Self::BlobRangeNotSatisfiable { .. }
+            | Self::PreconditionFailed { .. }
+            | Self::BlobWritePreconditionFailed { .. }
+            | Self::Policy(_)
+            | Self::AlreadyInitialized { .. }
+            | Self::InitializationClaimed { .. } => true,
+            Self::Manifest(ManifestError {
+                kind,
+                publication_in_doubt,
+                ..
+            }) => publication_in_doubt.is_none() && *kind != ManifestErrorKind::Internal,
+            Self::Storage(_)
+            | Self::Io(_)
+            | Self::DataFusion(_)
+            | Self::BlobIntegrity { .. }
+            | Self::RetryableCommitConflict(_)
+            | Self::HistoricalVersionReclaimed { .. }
+            | Self::FullTextIndexRebuildRequired { .. }
+            | Self::FullTextIndexRequired { .. }
+            | Self::RecoveryRequired { .. }
+            | Self::InitializationCommitted { .. }
+            | Self::InitializationIndeterminate { .. } => false,
+            Self::Completion { .. } => unreachable!("completion evidence was unwrapped"),
+        }
     }
 
     /// Remove a sub-operation's definite proof (no effect, or no
@@ -1605,6 +1686,7 @@ mod tests {
             OmniError::manifest_internal("coordinator view is stale"),
         ] {
             let message = opaque.to_string();
+            assert!(!opaque.is_refusal(), "{message}");
             assert_eq!(
                 opaque.unpublished().completion_evidence(),
                 Some(CompletionEvidence::Unpublished),
@@ -1612,10 +1694,13 @@ mod tests {
             );
         }
 
-        // A typed outcome already says what happened: it keeps its shape, so
-        // a caller matching on the variant sees the same error.
+        // A typed outcome already says what happened, that its step refused
+        // before it moved the graph: it keeps its shape, so a caller matching
+        // on the variant sees the same error, and its type is a refusal.
         for typed in [
             OmniError::manifest("bad request"),
+            OmniError::manifest_not_found("branch 'b' not found"),
+            OmniError::external_blob_policy("<redacted>", "base overlaps a storage root"),
             OmniError::manifest_conflict("authority conflict"),
             OmniError::manifest_read_set_changed("graph_head:main", None, None),
             OmniError::KeyConflict {
@@ -1630,7 +1715,10 @@ mod tests {
             OmniError::Policy("denied".into()),
         ] {
             let message = typed.to_string();
+            assert!(typed.is_refusal(), "{message}");
+            assert!(!typed.outcome_opaque(), "{message}");
             let marked = typed.unpublished();
+            assert!(marked.is_refusal(), "{message}");
             assert_eq!(marked.completion_evidence(), None, "{message}");
             assert!(!matches!(marked, OmniError::Completion { .. }), "{message}");
         }
@@ -1643,6 +1731,13 @@ mod tests {
         ] {
             let message = uncertain.to_string();
             let marked = uncertain.unpublished();
+            // Uncertainty is not a refusal of a publication in doubt or of
+            // a pending recovery; a refusal's evidence still says it was.
+            assert_eq!(
+                marked.is_refusal(),
+                message == "returned after effects",
+                "{message}"
+            );
             assert_eq!(
                 marked.completion_evidence(),
                 Some(CompletionEvidence::Uncertain),

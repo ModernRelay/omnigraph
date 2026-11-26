@@ -181,7 +181,7 @@ async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
                 frozen.metadata_digest().clone(),
             )
         }
-        ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone => {
+        ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone | ResetMode::Rebuild => {
             return failure(
                 "unsupported_runner_axis",
                 "the legacy fixture worker freezes a restore level's template only",
@@ -1132,7 +1132,10 @@ mod tests {
                     .unwrap()
                     .restore_active()
                     .unwrap(),
-                    ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone => {
+                    ResetMode::None
+                    | ResetMode::S3Versioning
+                    | ResetMode::Clone
+                    | ResetMode::Rebuild => {
                         panic!("test helper restores a restore level only")
                     }
                 };

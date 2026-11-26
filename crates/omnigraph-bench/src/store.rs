@@ -47,7 +47,8 @@ pub enum StoreLocation {
 
 impl StoreLocation {
     /// `s3://bucket/prefix` or a local path; a local path is created and made
-    /// canonical, since the key names the place.
+    /// canonical, since the key names the place. A prefix segment may carry a
+    /// colon: an EC2 role's `aws:userid` is `<role id>:<instance id>`.
     pub fn parse(text: &str) -> RunnerResult<Self> {
         if let Some(rest) = text.strip_prefix("s3://") {
             let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
@@ -65,11 +66,11 @@ impl StoreLocation {
                     || segment == ".."
                     || !segment
                         .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
             }) && !prefix.is_empty()
             {
                 return Err(invalid(format!(
-                    "`{text}` has a prefix segment outside [A-Za-z0-9-_.]"
+                    "`{text}` has a prefix segment outside [A-Za-z0-9-_.:]"
                 )));
             }
             return Ok(Self::S3 {
@@ -211,6 +212,31 @@ pub struct CloneRoot {
     pub uri: String,
     pub run: String,
     pub repetition: u32,
+}
+
+/// One repetition's cluster root: empty when handed out, deleted after. A
+/// directory of a local store or a prefix of a bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerRoot {
+    Local(PathBuf),
+    S3(String),
+}
+
+impl ServerRoot {
+    /// The root as the product takes it for `--target` and as the storage
+    /// adapter addresses it: the directory's path or the `s3://` URI.
+    pub fn as_os_str(&self) -> &std::ffi::OsStr {
+        match self {
+            Self::Local(path) => path.as_os_str(),
+            Self::S3(uri) => std::ffi::OsStr::new(uri),
+        }
+    }
+}
+
+impl std::fmt::Display for ServerRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_os_str().to_string_lossy().fmt(f)
+    }
 }
 
 /// The receipt of one record put: its digest names the object.
@@ -569,6 +595,37 @@ impl FixtureStore {
     /// An empty clone root for one repetition, its emptiness witnessed by a
     /// listing before it is handed out.
     pub async fn empty_clone(&self, run: &str, repetition: u32) -> RunnerResult<CloneRoot> {
+        let uri = self
+            .empty_root("clones", run, repetition, "clone_root_not_empty")
+            .await?;
+        Ok(CloneRoot {
+            uri,
+            run: run.to_owned(),
+            repetition,
+        })
+    }
+
+    /// An empty cluster root for one repetition under `servers/`, its
+    /// emptiness witnessed by a listing before it is handed out.
+    pub async fn empty_server_root(&self, run: &str, repetition: u32) -> RunnerResult<ServerRoot> {
+        let uri = self
+            .empty_root("servers", run, repetition, "server_root_not_empty")
+            .await?;
+        Ok(match self.location {
+            StoreLocation::Local { .. } => ServerRoot::Local(PathBuf::from(uri)),
+            StoreLocation::S3 { .. } => ServerRoot::S3(uri),
+        })
+    }
+
+    /// `<store>/<kind>/<run>-<repetition>`, created when the store is local
+    /// and refused with `occupied` when a listing finds anything under it.
+    async fn empty_root(
+        &self,
+        kind: &str,
+        run: &str,
+        repetition: u32,
+        occupied: &'static str,
+    ) -> RunnerResult<String> {
         if run.is_empty()
             || !run
                 .bytes()
@@ -578,25 +635,38 @@ impl FixtureStore {
         }
         let uri = self
             .location
-            .join(&["clones", &format!("{run}-{repetition:08}")]);
+            .join(&[kind, &format!("{run}-{repetition:08}")]);
         if let StoreLocation::Local { .. } = self.location {
             std::fs::create_dir_all(&uri).map_err(|e| io_error(&uri, e))?;
         }
         let present = self.witness(&uri).await?;
         if !present.is_empty() {
             return Err(RunnerError::new(
-                "clone_root_not_empty",
+                occupied,
                 format!(
                     "{} object(s) under {uri} before the repetition",
                     present.len()
                 ),
             ));
         }
-        Ok(CloneRoot {
-            uri,
-            run: run.to_owned(),
-            repetition,
-        })
+        Ok(uri)
+    }
+
+    /// Deletes everything under `uri` and refuses with `kept` when a listing
+    /// still finds an object there.
+    async fn delete_root(&self, uri: &str, kept: &'static str) -> RunnerResult<()> {
+        self.storage
+            .delete_prefix(uri)
+            .await
+            .map_err(|e| storage_error(uri, e))?;
+        let left = self.witness(uri).await?;
+        if !left.is_empty() {
+            return Err(RunnerError::new(
+                kept,
+                format!("{} object(s) under {uri} after its deletion", left.len()),
+            ));
+        }
+        Ok(())
     }
 
     /// The paths under a clone root outside the engine's reserved marker:
@@ -616,22 +686,13 @@ impl FixtureStore {
 
     /// Delete the clone root and witness that nothing is left under it.
     pub async fn delete_clone(&self, clone: &CloneRoot) -> RunnerResult<()> {
-        self.storage
-            .delete_prefix(&clone.uri)
+        self.delete_root(&clone.uri, "clone_root_not_deleted").await
+    }
+
+    /// Delete the cluster root and witness that nothing is left under it.
+    pub async fn delete_server_root(&self, root: &ServerRoot) -> RunnerResult<()> {
+        self.delete_root(&root.to_string(), "server_root_not_deleted")
             .await
-            .map_err(|e| storage_error(&clone.uri, e))?;
-        let left = self.witness(&clone.uri).await?;
-        if !left.is_empty() {
-            return Err(RunnerError::new(
-                "clone_root_not_deleted",
-                format!(
-                    "{} object(s) under {} after its deletion",
-                    left.len(),
-                    clone.uri
-                ),
-            ));
-        }
-        Ok(())
     }
 
     /// Put one validated record as the immutable object its digest names; a
@@ -980,7 +1041,18 @@ mod tests {
             StoreLocation::parse("s3://bucket-1").unwrap().uri(),
             "s3://bucket-1"
         );
-        for text in ["s3://", "s3://Bucket/x", "s3://b/a//b", "gs://bucket/x"] {
+        let per_machine = StoreLocation::parse("s3://bucket-1/bench-pr/AROA:i-0").unwrap();
+        assert_eq!(per_machine.uri(), "s3://bucket-1/bench-pr/AROA:i-0");
+        for text in [
+            "s3://",
+            "s3://Bucket/x",
+            "s3://b/a//b",
+            "s3://b/a b",
+            "s3://b/a#b",
+            "s3://b/a?b",
+            "s3://b/a%3Ab",
+            "gs://bucket/x",
+        ] {
             assert_eq!(
                 StoreLocation::parse(text).unwrap_err().code,
                 "invalid_store",
@@ -1132,6 +1204,35 @@ mod tests {
                     .is_empty()
             );
         }
+        let root = runtime.block_on(store.empty_server_root(run, 1)).unwrap();
+        let root_uri = root.to_string();
+        assert!(root_uri.ends_with(&format!("servers/{run}-00000001")));
+        assert_eq!(
+            matches!(root, ServerRoot::S3(_)),
+            store.location().is_s3(),
+            "a cluster root is of the store's kind"
+        );
+        runtime
+            .block_on(
+                store
+                    .storage
+                    .write_text(&format!("{root_uri}/state.json"), "{}"),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .block_on(store.empty_server_root(run, 1))
+                .unwrap_err()
+                .code,
+            "server_root_not_empty"
+        );
+        runtime.block_on(store.delete_server_root(&root)).unwrap();
+        assert!(
+            runtime
+                .block_on(store.witness(&root_uri))
+                .unwrap()
+                .is_empty()
+        );
         runtime.block_on(store.verify_base(&base)).unwrap();
         let after = runtime
             .block_on(store.acquire_base(&plan, scratch.path(), None, true))
@@ -1313,7 +1414,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let location = format!("s3://{bucket}/{prefix}/bench-store/{unique}");
+        let location = format!("s3://{bucket}/{prefix}/bench-store/AROA:i-{unique}");
         exercise(&location);
         runtime().block_on(async {
             storage_for_uri(&location)

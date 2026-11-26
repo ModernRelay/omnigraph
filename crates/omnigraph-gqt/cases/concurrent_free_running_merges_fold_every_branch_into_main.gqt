@@ -1,0 +1,51 @@
+# issue: none
+# red_on: fd4d61f6; the parser refuses the block for lacking an `order:` line, and a `branch merge` is no session statement there, so no step runs on either host.
+# notes: A `branch merge <source> into <target>` is a session statement, and the worker marker in it names each worker's own branch. Three mergers fold three declared branches into `main` at once; a merge the engine answers with a changed write authority is run again by the host and counted, and `main` ends with the seed rows plus one row per branch.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Chunk { slug: String @key n: I64 }
+
+--- seed generate: v1 seed: 0
+tables:
+  - kind: node
+    name: Chunk
+    rows: 2
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: base-, width: 3}
+      n: {kind: ordinal, start: 0, step: 1}
+
+--- branches generate: v1 seed: 0 count: 3 prefix: w from: main
+tables:
+  - kind: node
+    name: Chunk
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: ${branch}-, width: 3}
+      n: {kind: ordinal, start: 10, step: 1}
+
+--- concurrent
+merger x3: branch merge w${worker} into main
+--- expect
+merger: ok
+
+--- query
+query on_main() { match { $c: Chunk } return { $c.slug } }
+--- expect unordered
+{"c.slug": "base-000"}
+{"c.slug": "base-001"}
+{"c.slug": "w0-000"}
+{"c.slug": "w1-000"}
+{"c.slug": "w2-000"}
+--- expect shape
+c.slug: String

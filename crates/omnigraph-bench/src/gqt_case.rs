@@ -8,13 +8,22 @@ pub use crate::model::{digest, sha256_bytes};
 use crate::model::{read_text_file, typed_sha256, valid_kebab_id};
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_gqt_core::{
-    Case, ExecutionHost, Item, PlainHost, Step, StepDescriptor, StepKind, step_kind,
+    Case, Item, MAX_DURATION_SECONDS, MAX_WARMUP_SECONDS, SCRIPTED_HOST_WORKERS, Step,
+    StepDescriptor, StepKind, step_kind,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const MAX_SOURCE_BYTES: usize = 512 * 1024;
 pub const MAX_EXPANDED_STEPS: usize = 4096;
+/// The most workers one label of a workload's measured block declares; any
+/// other block of the workload keeps the scripted hosts' bound.
+pub const MEASURED_BLOCK_WORKERS: usize = 256;
+/// The most sessions a workload's measured block declares against a server,
+/// counted over the whole block at the swept value: every session there is
+/// an actor with a bearer token of its own.
+pub const SERVED_BLOCK_SESSIONS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GqtScenario {
@@ -55,6 +64,58 @@ pub struct MeasuredStep {
     pub ordinal: usize,
     pub text: String,
 }
+
+/// A catalog entry expanded for one run, before its workload is read. An
+/// entry without `step` measures its workload's `--- concurrent measured`
+/// block, whose ordinal and text planning reads off the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScenarioCase {
+    pub id: String,
+    pub fixture: GqtFixture,
+    pub queries: PathBuf,
+    pub step: Option<MeasuredStep>,
+    pub environment: GqtEnvironment,
+    pub protocol: Protocol,
+}
+
+impl ScenarioCase {
+    /// The case measuring `step`.
+    pub fn measuring(self, step: MeasuredStep) -> GqtCaseV1 {
+        GqtCaseV1 {
+            version: 1,
+            id: self.id,
+            scenario: GqtScenario::GqtV1,
+            fixture: self.fixture,
+            workload: GqtWorkload {
+                queries: self.queries,
+                measured_step: step,
+            },
+            environment: self.environment,
+            protocol: self.protocol,
+        }
+    }
+
+    /// What [`validate_definition`] checks of the case, the step when the
+    /// entry names one.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_run(1, &self.id, &self.environment, &self.protocol)?;
+        self.step.as_ref().map_or(Ok(()), validate_step)
+    }
+}
+
+impl From<GqtCaseV1> for ScenarioCase {
+    fn from(case: GqtCaseV1) -> Self {
+        Self {
+            id: case.id,
+            fixture: case.fixture,
+            queries: case.workload.queries,
+            step: Some(case.workload.measured_step),
+            environment: case.environment,
+            protocol: case.protocol,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "GqtEnvironmentWire", into = "GqtEnvironmentWire")]
 pub struct GqtEnvironment {
@@ -133,14 +194,98 @@ pub struct FrozenSource {
     pub stem: String,
     pub text: String,
     pub sha256: String,
+    /// The name the file's `--- bench` section sweeps and the value this
+    /// plan reads it as; empty for a file that sweeps nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sweep: BTreeMap<String, u64>,
 }
 impl FrozenSource {
     pub fn parse(&self) -> Result<Case, String> {
+        let case = self.parse_bound()?;
+        if swept_binding(&case) != self.sweep {
+            return Err("the frozen sweep binding names another name than the file sweeps".into());
+        }
+        Ok(case)
+    }
+
+    /// The file parsed at the frozen value of its swept name, the sweep's
+    /// first when none is frozen yet.
+    fn parse_bound(&self) -> Result<Case, String> {
         if self.text.len() > MAX_SOURCE_BYTES || sha256_bytes(self.text.as_bytes()) != self.sha256 {
             return Err("GQT source digest or size does not match frozen input".into());
         }
-        omnigraph_gqt_core::parse_case(&self.stem, &self.text).map_err(String::from)
+        let mut values = self.sweep.values();
+        let swept = match (values.next(), values.next()) {
+            (value, None) => value.copied(),
+            _ => return Err("a frozen source binds at most one swept name".into()),
+        };
+        omnigraph_gqt_core::parse_case_at(&self.stem, &self.text, swept).map_err(String::from)
     }
+
+    /// The same file read at another value of its swept name.
+    pub fn bound_to(&self, name: &str, value: u64) -> Self {
+        Self {
+            sweep: BTreeMap::from([(name.to_string(), value)]),
+            ..self.clone()
+        }
+    }
+}
+
+fn swept_binding(case: &Case) -> BTreeMap<String, u64> {
+    case.swept()
+        .map(|(name, value)| (name.to_string(), value))
+        .into_iter()
+        .collect()
+}
+
+/// How long the bench host loops a workload's measured block. A run setting:
+/// the file's `--- bench` section gives the values and the command line may
+/// override them, so they stay outside the point's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockRun {
+    pub warmup_seconds: u32,
+    pub duration_seconds: u32,
+}
+
+impl BlockRun {
+    /// Whether the run is one a `--- bench` section may state: a warmup of
+    /// 0 to `MAX_WARMUP_SECONDS`, a duration of 1 to `MAX_DURATION_SECONDS`.
+    pub fn in_bounds(self) -> bool {
+        self.warmup_seconds <= MAX_WARMUP_SECONDS
+            && (1..=MAX_DURATION_SECONDS).contains(&self.duration_seconds)
+    }
+
+    /// The warmup, then the measured window: what the block takes by
+    /// declaration.
+    pub fn declared(self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            u64::from(self.warmup_seconds) + u64::from(self.duration_seconds),
+        )
+    }
+}
+
+/// The run of the workload's measured block when `selected` is that block.
+fn block_run(case: &Case, selected: usize) -> Option<BlockRun> {
+    case.measured_block()
+        .filter(|block| block.ordinal == selected)?;
+    let bench = case.bench.as_ref()?;
+    Some(BlockRun {
+        warmup_seconds: bench.warmup_seconds,
+        duration_seconds: bench.duration_seconds,
+    })
+}
+
+/// The admission of a host with neither the DST runner's gate nor the
+/// reference engine, at the bench host's worker bounds.
+pub(crate) fn admit_case(case: &Case) -> Result<(), String> {
+    omnigraph_gqt_core::admit_ungated_case(case, "the bench host", |block| {
+        if block.measured {
+            MEASURED_BLOCK_WORKERS
+        } else {
+            SCRIPTED_HOST_WORKERS
+        }
+    })
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
@@ -178,7 +323,7 @@ impl DatasetBuildPlan {
         let query_indices = match &self.index_queries {
             Some(source) => {
                 let case = source.parse()?;
-                PlainHost.admit_case(&case)?;
+                admit_case(&case)?;
                 if case.fixture.is_some() {
                     return Err("index-requirement queries must be schema-less".into());
                 }
@@ -270,6 +415,9 @@ pub struct PlannedGqt {
     pub planned_sha256: String,
     pub cache_condition: CacheCondition,
     pub needs_indices: bool,
+    /// The run of the measured block, when the measured step is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<BlockRun>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -284,6 +432,11 @@ pub struct GqtPointIdentityV1 {
     pub cache_condition: CacheCondition,
     pub environment: GqtEnvironment,
     pub protocol: Protocol,
+    /// The swept name and the value this point read it as. Absent on a point
+    /// whose workload sweeps nothing, so no such point's id moved when the
+    /// field arrived.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sweep: BTreeMap<String, u64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -296,30 +449,95 @@ pub struct BoundGqt {
 impl PlannedGqt {
     pub fn dataset_build_plan(&self) -> Result<DatasetBuildPlan, String> {
         match self.definition.environment.target {
-            Target::Engine => Ok(DatasetBuildPlan {
-                dataset: self.dataset.clone(),
-                index_queries: Some(self.queries.clone()),
-                recipe_sha256: self.recipe_sha256.clone(),
-                environment: self.definition.environment.clone(),
-                reset: self.definition.protocol.reset,
-                needs_indices: self.needs_indices,
-            }),
+            Target::Engine => Ok(self.build_plan_in(
+                self.definition.environment.clone(),
+                self.definition.protocol.reset,
+            )),
             Target::Server => Err(
                 "served scenarios run against a provisioned graph; the dataset cache does not apply"
                     .into(),
             ),
         }
     }
+
+    /// The build of the frozen base a `reset: rebuild` server point binds its
+    /// dataset identity to and counts its seeded tables against: the base an
+    /// embedded clone point of the same scenario and backend reads.
+    pub fn base_build_plan(&self) -> Result<DatasetBuildPlan, String> {
+        let environment = &self.definition.environment;
+        if environment.target != Target::Server
+            || self.definition.protocol.reset != ResetMode::Rebuild
+        {
+            return Err(
+                "only a server point under reset: rebuild binds a base it does not read".into(),
+            );
+        }
+        Ok(self.build_plan_in(
+            GqtEnvironment::embedded(environment.backend.clone()),
+            ResetMode::Clone,
+        ))
+    }
+
+    fn build_plan_in(&self, environment: GqtEnvironment, reset: ResetMode) -> DatasetBuildPlan {
+        DatasetBuildPlan {
+            dataset: self.dataset.clone(),
+            index_queries: Some(self.queries.clone()),
+            recipe_sha256: self.recipe_sha256.clone(),
+            environment,
+            reset,
+            needs_indices: self.needs_indices,
+        }
+    }
+    /// A workload that sweeps nothing hashes as it always did; a swept value
+    /// joins the hash, so every value plans a point of its own.
     pub fn planned_hash(&self) -> Result<String, String> {
-        typed_sha256(&(
+        let point = (
             &self.recipe_sha256,
             &self.queries.sha256,
             &self.definition.workload.measured_step,
             &self.cache_condition,
             &self.definition.environment,
             &self.definition.protocol,
-        ))
-        .map_err(|e| e.to_string())
+        );
+        let hashed = if self.queries.sweep.is_empty() {
+            typed_sha256(&point)
+        } else {
+            typed_sha256(&(point, &self.queries.sweep))
+        };
+        hashed.map_err(|e| e.to_string())
+    }
+
+    /// The plan with the measured block's run replaced by the command line's
+    /// values, each kept where none is given.
+    pub fn with_block_run(
+        mut self,
+        warmup_seconds: Option<u32>,
+        duration_seconds: Option<u32>,
+    ) -> Result<Self, String> {
+        if warmup_seconds.is_none() && duration_seconds.is_none() {
+            return Ok(self);
+        }
+        let Some(run) = self.block.as_mut() else {
+            return Err(format!(
+                "scenario '{}' measures no `--- concurrent measured` block, so it takes no warmup or duration",
+                self.definition.id
+            ));
+        };
+        run.warmup_seconds = warmup_seconds.unwrap_or(run.warmup_seconds);
+        run.duration_seconds = duration_seconds.unwrap_or(run.duration_seconds);
+        self.revalidate()?;
+        Ok(self)
+    }
+
+    /// `budget` for the measured step, counted past what the step takes by
+    /// declaration: a measured block's warmup and duration come first, so the
+    /// case's `timeout_ms` and the scenario's deadline bound the rest of the
+    /// file and the block's drain, whatever run the command line gave it.
+    pub fn past_declared_run(&self, budget: std::time::Duration) -> std::time::Duration {
+        budget
+            + self
+                .block
+                .map_or(std::time::Duration::ZERO, BlockRun::declared)
     }
 
     pub fn bind(&self, logical: &str, algorithm: &str) -> Result<BoundGqt, String> {
@@ -337,6 +555,7 @@ impl PlannedGqt {
             cache_condition: self.cache_condition.clone(),
             environment: self.definition.environment.clone(),
             protocol: self.definition.protocol.clone(),
+            sweep: self.queries.sweep.clone(),
         };
         validate_point_spec(&identity)?;
         let point_id = typed_sha256(&identity).map_err(|e| e.to_string())?;
@@ -374,6 +593,14 @@ impl PlannedGqt {
         {
             return Err("derived GQT treatment differs from frozen plan".into());
         }
+        let measured = block_run(&queries, self.definition.workload.measured_step.ordinal);
+        if self.block.is_some() != measured.is_some()
+            || self.block.is_some_and(|run| !run.in_bounds())
+        {
+            return Err(format!(
+                "the measured block's run is `warmup_seconds` 0 to {MAX_WARMUP_SECONDS} and `duration_seconds` 1 to {MAX_DURATION_SECONDS}, on a plan whose measured step is that block and on no other"
+            ));
+        }
         if self.planned_hash()? != self.planned_sha256
             || recipe_hash(&self.dataset)? != self.recipe_sha256
             || typed_sha256(&self.definition).map_err(|e| e.to_string())? != self.case_digest
@@ -407,12 +634,23 @@ impl BoundGqt {
     }
 }
 pub fn validate_definition(c: &GqtCaseV1) -> Result<(), String> {
-    if c.version != 1 || !valid_kebab_id(&c.id) || c.id.len() > 128 {
+    validate_run(c.version, &c.id, &c.environment, &c.protocol)?;
+    validate_step(&c.workload.measured_step)
+}
+
+/// Everything [`validate_definition`] checks but the measured step.
+fn validate_run(
+    version: u32,
+    id: &str,
+    environment: &GqtEnvironment,
+    protocol: &Protocol,
+) -> Result<(), String> {
+    if version != 1 || !valid_kebab_id(id) || id.len() > 128 {
         return Err("gqt-v1 requires version 1 and a bounded kebab-case id".into());
     }
-    if c.protocol.schedule != Schedule::Manual
-        || c.protocol.reset == ResetMode::S3Versioning
-        || c.protocol
+    if protocol.schedule != Schedule::Manual
+        || protocol.reset == ResetMode::S3Versioning
+        || protocol
             .deadline_seconds
             .is_some_and(|x| x == 0 || x > 3600)
     {
@@ -420,32 +658,45 @@ pub fn validate_definition(c: &GqtCaseV1) -> Result<(), String> {
             "gqt-v1 requires a manual local reset and a null or 1..=3600 second deadline".into(),
         );
     }
-    if matches!(c.environment.backend, Backend::S3 { .. })
-        && (c.environment.target != Target::Engine || c.protocol.reset != ResetMode::Clone)
+    if matches!(environment.backend, Backend::S3 { .. })
+        && !matches!(
+            (environment.target, protocol.reset),
+            (Target::Engine, ResetMode::Clone) | (Target::Server, ResetMode::Rebuild)
+        )
     {
-        return Err("gqt-v1 reaches an S3 store embedded and under reset: clone only".into());
+        return Err(
+            "gqt-v1 reaches an S3 store embedded under reset: clone, or through a server started per repetition under reset: rebuild".into(),
+        );
     }
-    match c.environment.target {
+    match environment.target {
         Target::Engine => {
-            validate_backend_reset(&c.environment.backend, c.protocol.reset)?;
-            if c.environment.network_position != NetworkPosition::SameHost {
+            validate_backend_reset(&environment.backend, protocol.reset)?;
+            if environment.network_position != NetworkPosition::SameHost {
                 return Err("embedded execution requires same-host network position".into());
             }
         }
         Target::Server => {
-            if c.protocol.reset != ResetMode::None
-                || c.protocol.attribution != crate::case::Attribution::Off
+            if !matches!(protocol.reset, ResetMode::None | ResetMode::Rebuild)
+                || protocol.attribution != crate::case::Attribution::Off
             {
                 return Err(
-                    "served read-only execution requires reset:none and attribution:off".into(),
+                    "served execution requires reset: none (a provisioned graph) or reset: rebuild (a server started per repetition), and attribution: off".into(),
+                );
+            }
+            if protocol.reset == ResetMode::Rebuild
+                && environment.network_position != NetworkPosition::SameHost
+            {
+                return Err(
+                    "reset: rebuild starts the server beside the bench and requires network_position: same-host".into(),
                 );
             }
         }
     }
-    if c.workload.measured_step.ordinal == 0
-        || c.workload.measured_step.text.trim().is_empty()
-        || c.workload.measured_step.text.len() > 16 * 1024
-    {
+    Ok(())
+}
+
+fn validate_step(step: &MeasuredStep) -> Result<(), String> {
+    if step.ordinal == 0 || step.text.trim().is_empty() || step.text.len() > 16 * 1024 {
         return Err("measured_step requires a positive ordinal and exact operation text".into());
     }
     Ok(())
@@ -484,9 +735,76 @@ pub fn load_with_root(
     root: &Path,
 ) -> Result<PlannedGqt, String> {
     validate_definition(&definition)?;
+    let mut points = load_points(path, definition.into(), root)?.plans;
+    let point = points.swap_remove(0);
+    admit_one_point(&point.queries.parse()?)?;
+    Ok(point)
+}
+
+/// Refuses a workload that sweeps several values on a route that plans one
+/// point: only a catalog scenario plans a point per value.
+fn admit_one_point(queries: &Case) -> Result<(), String> {
+    match queries
+        .bench
+        .as_ref()
+        .and_then(|bench| bench.sweep.as_ref())
+    {
+        Some(sweep) if sweep.values.len() > 1 => Err(format!(
+            "the workload sweeps `{}` over {} values and this route plans one point; run it as a catalog scenario, which plans one point per value",
+            sweep.name,
+            sweep.values.len()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The points one scenario plans, in the order of the swept values, and the
+/// repetitions its workload's `--- bench` section asks for.
+#[derive(Debug, Clone)]
+pub struct ScenarioPoints {
+    pub plans: Vec<PlannedGqt>,
+    pub repetitions: Option<u32>,
+}
+
+/// The step a workload's `--- concurrent measured` block is, as a catalog
+/// entry would echo it: its ordinal and its text as written.
+fn measured_block_step(case: &Case) -> Result<MeasuredStep, String> {
+    let block = case.measured_block().ok_or(
+        "the scenario names no measured_step and its workload holds no `--- concurrent measured` block",
+    )?;
+    let step = workload_steps(case)?
+        .into_iter()
+        .find(|step| step.ordinal == block.ordinal)
+        .ok_or("the measured block has no step descriptor")?;
+    Ok(MeasuredStep {
+        ordinal: step.ordinal,
+        text: step.source,
+    })
+}
+
+/// Every point of `case`, its inputs resolved against `root`: one per value
+/// its workload sweeps, one for a workload that sweeps nothing.
+pub fn load_points(path: &Path, case: ScenarioCase, root: &Path) -> Result<ScenarioPoints, String> {
+    case.validate()?;
     let parent = path.parent().ok_or("config path has no parent")?;
     let catalog = root.canonicalize().map_err(|e| e.to_string())?;
-    let queries = read_source(&resolve(parent, &definition.workload.queries, &catalog)?)?;
+    let queries = read_source(&resolve(parent, &case.queries, &catalog)?)?;
+    let first = queries.parse()?;
+    let step = match case.step.clone() {
+        Some(step) => step,
+        None => measured_block_step(&first)?,
+    };
+    let definition = case.measuring(step);
+    validate_definition(&definition)?;
+    let sweep = first.bench.as_ref().and_then(|bench| bench.sweep.as_ref());
+    let sources: Vec<FrozenSource> = match sweep {
+        Some(sweep) => sweep
+            .values
+            .iter()
+            .map(|value| queries.bound_to(&sweep.name, *value))
+            .collect(),
+        None => vec![queries],
+    };
     let dataset = match &definition.fixture {
         GqtFixture::Dataset { path } => DatasetRecipe::Gqt {
             source: read_source(&resolve(parent, path, &catalog)?)?,
@@ -505,33 +823,45 @@ pub fn load_with_root(
             preparation: read_source(&resolve(parent, preparation, &catalog)?)?,
         },
     };
-    let parsed_queries = queries.parse()?;
     let parsed_dataset = match &dataset {
         DatasetRecipe::Gqt { source } => source.parse()?,
         DatasetRecipe::Registered { preparation, .. } => preparation.parse()?,
     };
-    let mut plan = PlannedGqt {
-        planned_sha256: String::new(),
-        case_digest: typed_sha256(&definition).map_err(|e| e.to_string())?,
-        recipe_sha256: recipe_hash(&dataset)?,
-        cache_condition: admit_point_queries(
-            &parsed_queries,
-            &definition.workload.measured_step,
-            definition.environment.target,
-            definition.protocol.reset,
-        )?,
-        needs_indices: parsed_queries.needs_indices || parsed_dataset.needs_indices,
-        definition,
-        dataset,
-        queries,
-    };
-    plan.planned_sha256 = plan.planned_hash()?;
-    plan.revalidate()?;
-    if serde_json::to_vec(&plan).map_err(|e| e.to_string())?.len() > 256 * 1024 {
-        return Err("frozen GQT inputs exceed the bounded worker protocol budget".into());
+    let case_digest = typed_sha256(&definition).map_err(|e| e.to_string())?;
+    let recipe_sha256 = recipe_hash(&dataset)?;
+    let mut plans = Vec::with_capacity(sources.len());
+    for queries in sources {
+        let parsed_queries = queries.parse()?;
+        let mut plan = PlannedGqt {
+            planned_sha256: String::new(),
+            case_digest: case_digest.clone(),
+            recipe_sha256: recipe_sha256.clone(),
+            cache_condition: admit_point_queries(
+                &parsed_queries,
+                &definition.workload.measured_step,
+                definition.environment.target,
+                definition.protocol.reset,
+            )?,
+            needs_indices: parsed_queries.needs_indices || parsed_dataset.needs_indices,
+            block: block_run(&parsed_queries, definition.workload.measured_step.ordinal),
+            definition: definition.clone(),
+            dataset: dataset.clone(),
+            queries,
+        };
+        plan.planned_sha256 = plan.planned_hash()?;
+        plan.revalidate()?;
+        if serde_json::to_vec(&plan).map_err(|e| e.to_string())?.len() > 256 * 1024 {
+            return Err("frozen GQT inputs exceed the bounded worker protocol budget".into());
+        }
+        plans.push(plan);
     }
-    Ok(plan)
+    Ok(ScenarioPoints {
+        plans,
+        repetitions: first.bench.as_ref().and_then(|bench| bench.repetitions),
+    })
 }
+/// The file frozen at the first value of the name its `--- bench` section
+/// sweeps, which is what a bare parse reads.
 pub fn read_source(path: &Path) -> Result<FrozenSource, String> {
     let text = read_text_file(path, MAX_SOURCE_BYTES, "GQT").map_err(|e| e.message)?;
     let stem = path
@@ -539,12 +869,13 @@ pub fn read_source(path: &Path) -> Result<FrozenSource, String> {
         .and_then(|x| x.to_str())
         .ok_or("GQT filename must be UTF-8")?
         .into();
-    let source = FrozenSource {
+    let mut source = FrozenSource {
         stem,
         sha256: sha256_bytes(text.as_bytes()),
         text,
+        sweep: BTreeMap::new(),
     };
-    source.parse()?;
+    source.sweep = swept_binding(&source.parse_bound()?);
     Ok(source)
 }
 fn resolve(parent: &Path, path: &Path, root: &Path) -> Result<PathBuf, String> {
@@ -597,6 +928,7 @@ pub(crate) fn admit_point_queries(
 ) -> Result<CacheCondition, String> {
     admit_target_environment(case, target)?;
     let process = match (target, reset) {
+        (Target::Server, ResetMode::Rebuild) => ProcessLifecycle::FreshPerRepetition,
         (Target::Server, _) => ProcessLifecycle::LongRunningServer,
         (Target::Engine, ResetMode::Clone) => ProcessLifecycle::FreshPerStep,
         (Target::Engine, _) => ProcessLifecycle::FreshPerRepetition,
@@ -612,7 +944,9 @@ pub(crate) fn admit_point_queries(
             Item::Loop { steps, .. } => steps.as_slice(),
         }) {
             let ordinal = step.ordinal();
-            if let Some(refusal) = served_step_refusal(step, selected.ordinal) {
+            if reset != ResetMode::Rebuild
+                && let Some(refusal) = served_step_refusal(step, selected.ordinal)
+            {
                 return Err(format!(
                     "step {ordinal} ({}) {refusal}",
                     served_step_label(step)
@@ -640,13 +974,43 @@ pub(crate) fn admit_point_queries(
     if step.in_loop || step.source.trim() != selected.text.trim() {
         return Err("measured step moved, its text changed, or it is inside a loop".into());
     }
-    if matches!(
-        step.kind,
-        StepKind::Settings | StepKind::Show | StepKind::Concurrent
-    ) {
-        return Err(
-            "selected step must execute one query, load, or control/mutation operation".into(),
-        );
+    match case.measured_block() {
+        Some(block) if block.ordinal != selected.ordinal => {
+            return Err(format!(
+                "the workload's `--- concurrent measured` block is step {}, and the measured step is step {}; a workload's measured block is its measured step",
+                block.ordinal, selected.ordinal
+            ));
+        }
+        Some(_)
+            if match target {
+                Target::Engine => reset == ResetMode::Clone,
+                Target::Server => reset != ResetMode::Rebuild,
+            } =>
+        {
+            return Err(
+                "a `--- concurrent measured` block runs embedded on a restored store, or against a server started per repetition (reset: rebuild); a provisioned server and the clone reset level do not run it"
+                    .into(),
+            );
+        }
+        Some(block) if target == Target::Server && block.sessions.len() > SERVED_BLOCK_SESSIONS => {
+            return Err(format!(
+                "a measured block against a server runs at most {SERVED_BLOCK_SESSIONS} sessions, each an actor with a token of its own; step {} declares {}",
+                block.ordinal,
+                block.sessions.len()
+            ));
+        }
+        Some(_) => {}
+        None if matches!(
+            step.kind,
+            StepKind::Settings | StepKind::Show | StepKind::Concurrent
+        ) =>
+        {
+            return Err(
+                "selected step must execute one query, load, or control/mutation operation, or be the workload's `--- concurrent measured` block"
+                    .into(),
+            );
+        }
+        None => {}
     }
     let mut reads = 0u32;
     let mut reopened = false;
@@ -742,6 +1106,7 @@ pub fn override_sources(
         plan.definition.workload.queries = path.to_path_buf();
     }
     let parsed = plan.queries.parse()?;
+    admit_one_point(&parsed)?;
     let dataset = match &plan.dataset {
         DatasetRecipe::Gqt { source } => source.parse()?,
         DatasetRecipe::Registered { preparation, .. } => preparation.parse()?,
@@ -752,6 +1117,7 @@ pub fn override_sources(
         plan.definition.environment.target,
         plan.definition.protocol.reset,
     )?;
+    plan.block = block_run(&parsed, plan.definition.workload.measured_step.ordinal);
     plan.needs_indices = dataset.needs_indices || parsed.needs_indices;
     plan.recipe_sha256 = recipe_hash(&plan.dataset)?;
     plan.case_digest = typed_sha256(&plan.definition).map_err(|e| e.to_string())?;
@@ -806,6 +1172,9 @@ pub(crate) fn served_step_refusal(step: &Step, measured: usize) -> Option<String
         StepKind::CommitDrop => Some(
             "drops a commit this workload did not bind; a served drop names a `--- bind commit $name` of this workload".into(),
         ),
+        StepKind::Concurrent => Some(
+            "writes the graph every repetition shares; a measured block runs against a server started per repetition (reset: rebuild)".into(),
+        ),
         _ => Some(
             "is not admissible served; reset:none requires every served workload step, including loops and verification, to be a read, an `as commit` write, or the drop of a bound commit".into(),
         ),
@@ -840,7 +1209,7 @@ pub(crate) fn admit_environment(case: &Case) -> Result<(), String> {
     admit_target_environment(case, Target::Engine)
 }
 fn admit_target_environment(case: &Case, target: Target) -> Result<(), String> {
-    PlainHost.admit_case(case)?;
+    admit_case(case)?;
     if !case.runner.environments.iter().any(|e| {
         matches!(
             (&e.execution, target),
@@ -880,7 +1249,20 @@ pub fn validate_point_spec(spec: &GqtPointIdentityV1) -> Result<(), String> {
     };
     validate_definition(&synthetic)?;
     let c = &spec.cache_condition;
-    let valid = if spec.environment.target == Target::Server {
+    let server = spec.environment.target == Target::Server;
+    let valid = if server && spec.protocol.reset == ResetMode::Rebuild {
+        c.process == ProcessLifecycle::FreshPerRepetition
+            && c.page_cache == PageCacheCondition::Uncontrolled
+            && matches!(
+                (c.engine, c.program, c.iterations),
+                (EnginePreparation::PreparationOnly, WarmupProgram::None, 0)
+                    | (
+                        EnginePreparation::WarmedByProgram,
+                        WarmupProgram::GqtReadSetV1,
+                        1..=4096
+                    )
+            )
+    } else if server {
         c.process == ProcessLifecycle::LongRunningServer
             && c.page_cache == PageCacheCondition::Uncontrolled
             && matches!(
@@ -936,6 +1318,9 @@ pub fn validate_point_spec(spec: &GqtPointIdentityV1) -> Result<(), String> {
         if !digest(d) {
             return Err("invalid point content digest".into());
         }
+    }
+    if spec.sweep.len() > 1 {
+        return Err("a point binds at most one swept name".into());
     }
     if spec.identity_version != 1
         || !matches!(
@@ -1011,6 +1396,7 @@ pub fn explicit_pair_in_environment(
         environment,
     };
     let query_case = query_source.parse()?;
+    admit_one_point(&query_case)?;
     let dataset_case = dataset_source.parse()?;
     let recipe = DatasetRecipe::Gqt {
         source: dataset_source,
@@ -1026,6 +1412,7 @@ pub fn explicit_pair_in_environment(
             definition.protocol.reset,
         )?,
         needs_indices: query_case.needs_indices || dataset_case.needs_indices,
+        block: block_run(&query_case, definition.workload.measured_step.ordinal),
         definition,
         dataset: recipe,
         queries: query_source,

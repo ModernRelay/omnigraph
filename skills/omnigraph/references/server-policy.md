@@ -87,8 +87,9 @@ a graph is loading, when a nonempty inventory has no ready graph, and while
 draining, and includes `served_graph_count`, `ready_graph_count`,
 `loading_graph_count` and `blocked_graph_count`. Authorized `GET /graphs`
 returns one `graphs` list with each graph's `state`, availability, `action`
-and, when blocked, `failure`; an authorized request to a blocked graph answers
-`503 graph_unavailable`, not `404`. Healthy graphs keep serving unless startup
+and, when blocked, `failure`; a request to a blocked graph answers
+`503 graph_unavailable`, not `404`, to an identity credential and to a caller
+holding any permission on the graph or `graph_list`. Healthy graphs keep serving unless startup
 uses `--require-all-graphs`; an applied empty cluster can be ready, while a
 nonempty cluster with every graph failed refuses startup. A readiness request
 never activates a revision.
@@ -98,7 +99,7 @@ never activates a revision.
 Bearer tokens map actors at the server boundary. Request headers and bodies
 cannot choose another actor. Configure token sources on the server process;
 clients configure `auth: {provider: token, source: {store: {}}}` on `production`
-using the [operator reference](../../../docs/user/cli/targets.md), then install it:
+using the [operator reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md), then install it:
 
 ```bash
 printf '%s\n' "$TOKEN" | omnigraph credentials set --target production --stdin
@@ -135,7 +136,10 @@ route under the caller's actor and that route's Cedar action: narrow an
 agent's policy to keep it read-only. The `query` tool takes GQ source or a
 stored read's `name`. No server flag narrows the tool list; policy alone
 decides. List every non-loopback `Host` with `--mcp-allowed-host`. `/mcp`
-needs no `Omnigraph-Http-Api` header.
+needs no `Omnigraph-Http-Api` header. A successful MCP read over the fixed 96 KiB
+read budget is refused with `result_too_large`, naming it: narrow the read with
+filters, a lower `limit` or fewer properties. `--mcp-setup-url` returns a
+`setup` link with a successful, empty `graphs` list.
 
 `--oidc-identity-trust <file>` admits OIDC access tokens (for example an MCP
 client's OAuth sign-in) as `principal:<id>` actors and serves the
@@ -148,8 +152,8 @@ Logs go to stdout (`OMNIGRAPH_LOG_FORMAT=json` for JSON, level from
 `RUST_LOG`). OTLP trace export is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is
 set; JSON logs carry `trace_id`/`span_id`. A publication with an unknown
 outcome is logged with its graph commit in a `publication` field. See
-[MCP](../../../docs/user/operations/mcp.md) and
-[logs and traces](../../../docs/user/operations/observability.md).
+[MCP](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/mcp.md) and
+[logs and traces](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/observability.md).
 
 ## Cedar actions
 

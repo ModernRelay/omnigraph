@@ -1,0 +1,22 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+--- bench
+duration_seconds: 5
+rate: 100
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+--- seed
+{"type":"Person","data":{"name":"alice","age":1}}
+--- concurrent measured
+w1: query add() { insert Person { name: "bob", age: 2 } }
+r1: query all() { match { $p: Person } return { $p.name } }
+--- expect
+w1: ok
+r1: ok

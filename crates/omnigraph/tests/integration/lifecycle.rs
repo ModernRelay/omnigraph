@@ -448,12 +448,12 @@ async fn init_creates_graph() {
         db.internal_schema_version_of(ReadTarget::branch("main"))
             .await
             .unwrap(),
-        17,
-        "fresh graphs are stamped v17: current state in `__manifest`, settled commits in `__history`"
+        18,
+        "fresh graphs are stamped v18: current state in `__manifest`, settled commits in `__history`"
     );
     assert_eq!(
         omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
-        17,
+        18,
         "the writer's stamp constant is the released format number"
     );
     assert_eq!(contract_row.source, TEST_SCHEMA);
@@ -1035,13 +1035,13 @@ async fn refresh_detects_identity_aba_when_source_bytes_are_unchanged() {
     );
 }
 
-/// An open of a root without a graph fails, and so does the open of a graph
-/// whose live manifest names a missing object, with the same storage kind.
-/// `exists` tells them apart: only a root without a `__manifest` dataset is
-/// absent, so a damaged graph never reads as a missing one. The bound form
-/// answers as the unbound one does.
+/// An open of a root without a graph is refused as a typed not-found, in both
+/// open modes, while the open of a graph whose live manifest names a missing
+/// object stays a storage failure. The open and `exists` agree: only a root
+/// without a `__manifest` dataset is absent, so a damaged graph never reads
+/// as a missing one. The bound form answers as the unbound one does.
 #[tokio::test]
-async fn open_nonexistent_fails_and_exists_reports_only_dataset_absence() {
+async fn open_nonexistent_is_refused_as_not_found_and_exists_reports_only_dataset_absence() {
     use omnigraph::error::StorageFailureKind;
     use omnigraph::storage::{CapturedStorageBinding, StorageDestination, storage_for_binding};
     let not_found = |error: omnigraph::error::OmniError| {
@@ -1067,8 +1067,29 @@ async fn open_nonexistent_fails_and_exists_reports_only_dataset_absence() {
             .await
             .unwrap()
     );
-    not_found(Omnigraph::open(absent).await.err().unwrap());
-    not_found(Omnigraph::open_read_only(absent).await.err().unwrap());
+    let no_graph = |error: omnigraph::error::OmniError| {
+        assert!(
+            matches!(
+                &error,
+                omnigraph::error::OmniError::Manifest(manifest)
+                    if manifest.kind == omnigraph::error::ManifestErrorKind::NotFound
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("no graph at"), "{error}");
+    };
+    no_graph(Omnigraph::open(absent).await.err().unwrap());
+    no_graph(Omnigraph::open_read_only(absent).await.err().unwrap());
+    no_graph(
+        Omnigraph::open_with_storage(absent, bound(absent))
+            .await
+            .err()
+            .unwrap(),
+    );
+    assert!(
+        !std::path::Path::new(absent).exists(),
+        "a refused open creates nothing"
+    );
 
     let root = dir.path().join("graph");
     let uri = root.to_str().unwrap();

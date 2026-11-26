@@ -9,8 +9,8 @@ record, so a caller that lost a response learns what happened instead of
 guessing. `optimize` is the first recorded kind; lookup and cancel serve every
 kind.
 
-The routes are off by default. A standalone server, which has no cluster
-record, refuses them; direct `omnigraph optimize` stays available there.
+The routes are off by default. Without them, stop the server and run
+`omnigraph optimize` on the cluster root directly.
 
 ## Enable it
 
@@ -70,12 +70,13 @@ starts again.
 
 ```bash
 curl -X POST "$SERVER/graphs/knowledge/operations/optimize" \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" -H 'Omnigraph-Http-Api: 0.14' \
+  -H 'Content-Type: application/json' \
   -d '{"operation_id": "01JC0000000000000000000000", "max_gate_hold_ms": 30000}'
 curl "$SERVER/graphs/knowledge/operations/01JC0000000000000000000000" \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $TOKEN" -H 'Omnigraph-Http-Api: 0.14'
 curl -X POST "$SERVER/graphs/knowledge/operations/01JC0000000000000000000000/cancel" \
-  -H "Authorization: Bearer $TOKEN"
+  -H "Authorization: Bearer $TOKEN" -H 'Omnigraph-Http-Api: 0.14'
 ```
 
 `operation_id` is a canonical ULID the caller generates. The body also takes
@@ -91,7 +92,13 @@ reason to resubmit the same work under the same id.
 
 Earlier edge builds wrote `tables` and `more_tables`. If the cluster's
 operation record contains either field, submit, lookup and cancel return
-HTTP 409 with `operation_record_invalid` after upgrading.
+HTTP 409 with `operation_record_invalid` after upgrading. No copy of that
+record is valid for this build, so restoring one does not help. To recover,
+stop the server, move `__cluster/operations.json` out of the cluster root and
+start the server again. The next submission creates a new record. The old
+record's results, resume position and eviction mark are lost: an earlier
+operation id answers `unknown` and is accepted as a new operation if it is
+submitted again, and the next full-catalog run starts at the first table.
 
 | Refusal | Status |
 |---|---|

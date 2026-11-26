@@ -45,7 +45,7 @@ it with a `table version … already exists` error.
   branch, or a table on a fork left by a branch created before storage format
   v11, `main` ends on its own version of that table, so a later merge from
   that branch can report **Merged**. The merged data is the same.
-- **Merged**: both branches changed, so OmniGraph performs a three-way,
+- **Merged**: both branches changed, so Omnigraph performs a three-way,
   entity-level merge and creates a commit with two parents.
 
 `branch merge --json`, the HTTP merge route and the GQ merge statement all
@@ -58,6 +58,13 @@ If a remote response is lost or incomplete, the merge may have committed. The
 CLI does not resubmit it automatically. Inspect the intended target changes and
 relevant history before deciding what to do next; a later head alone cannot
 identify the missing merge receipt.
+
+Against a managed target, every merge request has a 300-second deadline, the
+same as a bulk load, rather than the 30-second deadline of other requests:
+`branch merge` and the GQ `branch merge` statement, published or `as commit`,
+and the dry run of each (`branch merge --dry-run`, `branch merge … dry run`).
+A merge whose response does not arrive within that time may still have
+committed, as above; a dry run that times out changed nothing.
 
 When only the source changed a table since the merge base, a merge into a
 named branch can adopt that exact table snapshot without copying its rows.

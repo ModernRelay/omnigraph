@@ -50,7 +50,7 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `list` `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | List the organizations you belong to; manage the selected organization's members and invitations; requires a profile; `org` is an alias |
+| `organization` | `list` `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` `m2m-applications list` `m2m-applications create` `m2m-applications secret rotate` `m2m-applications delete` | List the organizations you belong to; manage the selected organization's members, invitations and M2M applications; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
 | `login` | — | Create a profile with `--create-profile` (pass `--organization ID` when you belong to several), or sign in to its `omnigraph` auth provider |
@@ -282,7 +282,7 @@ Address either direct storage or a served graph. See [`data.md`](data.md).
 "file:///data/person.csv" into node:Person mode append header'` (optional
 `delimiter "|"`, `columns (…)`, `--branch`). A served graph reads only `s3://`
 sources its external Blob policy admits. See
-[CSV loading](../../../docs/user/mutations/index.md#csv-loading).
+[CSV loading](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/mutations/index.md#csv-loading).
 
 ## Query / Mutate
 
@@ -421,7 +421,7 @@ Distinct from `lint`, which validates authoring source. See
 
 ## Operator Config & Credentials
 
-Use the primary [operator reference](../../../docs/user/cli/targets.md).
+Use the primary [operator reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md).
 The format is `version: 1`.
 `--operator-config FILE` replaces the default operator file without merging.
 Secrets never belong in YAML. Login/logout are platform-session operations;
@@ -442,7 +442,7 @@ omnigraph access --target production --branch main --json
 identity check, with no separate `whoami` command. Direct targets use `--as`
 or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
 update scripts that read protocol 1's `actor`. Managed targets use their issued resource identity. See
-[access scope and policy semantics](../../../docs/user/cli/targets.md#what-you-may-do-at-a-target).
+[access scope and policy semantics](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#what-you-may-do-at-a-target).
 
 Set/remove require `token`/`store`; an existing entry needs `--replace`.
 Status never calls network/helpers or prompts; secure-store availability and
@@ -469,7 +469,7 @@ replaces.
 Managed target add uses `--profile NAME` or `defaults.profile`.
 `config recover-operations --source DIR --profile NAME [--json]`
 preserves matching legacy folder evidence; it neither converts config nor submits
-operations. See the [upgrade reference](../../../docs/user/cli/targets.md#upgrade-from-the-old-format).
+operations. See the [upgrade reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#upgrade-from-the-old-format).
 
 Rename commands preserve custody and update references/defaults:
 
@@ -518,7 +518,7 @@ digest differs from what `target inspect NAME --json` reports in its own
 operator home. Direct and managed targets refuse with
 `target_kind_unsupported`. Where nothing opens Studio's links it prints the
 link and refuses with `studio_unavailable`; it never opens a browser. See
-[Open Studio](../../../docs/user/cli/studio.md).
+[Open Studio](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/studio.md).
 
 ## Addressing a Graph
 
@@ -531,14 +531,20 @@ identities use different targets. There is no `--auth` selector or last-used ide
 
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
-`optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
+`optimize`/`index build`/`index rebuild`/`cleanup --graph`, an inline `s3://`
+graph for the direct reads and `init`/`schema apply`/`load`, both with region
 and endpoint captured from the environment
-([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)),
+([S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)),
 and a graph shallow clone: `--base URI` opens a direct graph target over the
 graph at `URI` (reads fall through to the base, writes land in the target, the
 base is never written) for `query`, `mutate`, `load`, `branch`, `commit`,
 `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`; an inline
-`s3://` clone root with an `s3://` base is admitted there. Nothing in the target
+`s3://` clone root with an `s3://` base is admitted there. Every `s3://` root,
+clone, base or cluster, needs a path free of empty inner segments, queries and
+percent escapes (a space, a brace or a non-ASCII letter is written as one), and
+must be the one spelling `s3://<bucket>/<key>` (no dot segment, port, user
+information or trailing space); any other path is refused before any request,
+and the refusal names a replacement only when one names the same objects. Nothing in the target
 records its base, so every reopen passes the same `--base`; a clone root opened
 without it is refused. `--stats PATH` writes one JSON document per invocation
 with the logical object-store calls, the exit code and the peak resident set.
@@ -618,14 +624,36 @@ omnigraph organization members list --profile work --json
 omnigraph organization invitations send person@example.com --role member --profile work --idempotency-key invite-person
 omnigraph organization members set person@example.com --profile work --role member --idempotency-key role-person
 omnigraph organization members offboard person@example.com --profile work --idempotency-key offboard-person --json
+omnigraph organization m2m-applications create ci-sync --profile work --permission status --client-secret-file ~/.omnigraph/ci-sync.secret --create-profile ci-sync --idempotency-key create-ci-sync
+omnigraph organization m2m-applications secret rotate --profile work --application-profile ci-sync --idempotency-key rotate-ci-sync
+omnigraph organization m2m-applications delete ci-sync --profile work --idempotency-key delete-ci-sync --yes
 ```
+
+M2M applications are organization-owned client applications for unattended
+work. `m2m-applications list` shows each one's client ID, permissions and actor
+ID (`principal:ID`). `m2m-applications create` writes the one-time client
+secret only to `--client-secret-file` (0600, atomic; an existing file needs
+`--replace-client-secret-file`) and never prints it; `--create-profile NAME`
+adds an `oauth_client_credentials` profile with a `{file: PATH}` client secret
+(an existing name needs `--replace-profile`). An M2M application has no graph
+access until a cluster's policy names its actor ID. `secret rotate` writes a
+new client secret to the application profile's file, proves a token exchange,
+then revokes the one earlier client secret; with several, pass
+`--revoke SECRET_ID` for each. A failed exchange revokes nothing; repeat with
+the same key; a repeat refuses, revoking nothing, if the file no longer holds
+the new client secret. Writing a client secret works on Linux and macOS only,
+keeps a replaced file's owner, and refuses a path any other output (such as
+`--stats`) writes. `m2m-applications delete` deletes by name or client ID and needs
+`--yes` without a terminal. A client secret whose one disclosure was lost
+cannot be recovered: revoke its ID and generate another, as the command's
+message says.
 
 `organization list` shows the organizations the signed-in person is an active
 member of, with names and IDs, and marks the profile's; it needs no service
 permission, and its `--json` is the API envelope (`data.organizations`).
 Use an ID from it with `login --create-profile NAME --organization ID` to work
 in another organization. The member and invitation commands need current
-provider `members_manage` permission. WorkOS owns
+provider `members_manage` permission. The identity provider owns
 organization membership and service roles; applied cluster configuration owns
 graph and deployment permissions. No local enrollment or member-patch command
 is required. Member operations accept an email or exact user ID. `members set`
@@ -639,7 +667,7 @@ revocation before offboarding and verify denial with an existing data credential
 Writes require exact idempotency keys and uncertain outcomes must be reconciled;
 a partial offboard stays partial on replay. Keep the same operator home and profile:
 the CLI retains the resolved request before sending and never resolves its
-subject again on a same-key retry. See [team administration](../../../docs/user/cli/managed-team.md).
+subject again on a same-key retry. See [team administration](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/managed-team.md).
 
 ## Cluster Control Plane
 

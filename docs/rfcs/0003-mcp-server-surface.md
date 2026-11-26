@@ -7,7 +7,7 @@ implementation: partial
 authors:
   - OmniGraph maintainers
 created: 2026-06-01
-updated: 2026-10-30
+updated: 2026-11-26
 discussion: https://github.com/ModernRelay/omnigraph/issues/991
 supersedes: []
 superseded_by: []
@@ -169,9 +169,11 @@ wants an agent narrower than a person grants the agent's credential less.
 
 ### Tool catalog
 
-Every graph-scoped tool resolves its graph through the registry exactly as an HTTP
-request does (unknown and denied graphs are 404, an authorized unavailable graph is
-503) and then calls the named handler.
+Graph-scoped tools use the HTTP registry and handlers. An unknown graph returns
+404. An unavailable graph returns 503 to an admitted identity and to a caller
+holding any permission on the graph or the server's `graph_list` permission,
+and 404 otherwise. On a ready graph, the handler checks the requested action
+and can return 403.
 
 | Tool | Phase | Handler (HTTP route) | Cedar action | Annotations |
 |---|---|---|---|---|

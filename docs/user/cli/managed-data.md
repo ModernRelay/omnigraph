@@ -42,9 +42,11 @@ configuration workflow; editing a source file alone has no effect. Changes use t
 identity credentials do not bypass its ownership or permission checks.
 
 Issuance takes no `--graph`; choose a graph on the
-operation that needs it. `--ttl` accepts seconds or an `s`, `m`, `h`, or `d`
-suffix, defaults to one hour, and must be between 60 seconds and 24 hours.
-The service can shorten the requested lifetime. Issuer clock tolerance is
+operation that needs it. `--ttl` requests a lifetime: seconds or an `s`, `m`, `h`, or `d`
+suffix, one hour by default, between 60 seconds and 24 hours.
+The service can issue a shorter credential than requested (Omnigraph's
+managed service currently issues at most 300 seconds), and the result's `expires_at`
+reports the lifetime it actually issued. Issuer clock tolerance is
 30 seconds; a credential is never accepted after its stated expiry.
 `--json` and human output contain metadata only, never the signed credential.
 
@@ -99,7 +101,10 @@ universal control-plane independence. Missing or expired access uses only the
 selected provider; auth never falls back or replays an uncertain write.
 
 Managed JSON requests refuse redirects and accept at most 8 MiB of response data,
-with a 30-second deadline and at most 10 seconds to connect.
+with a 30-second deadline and at most 10 seconds to connect. A branch merge
+has a 300-second deadline instead, whether it publishes or is a dry run, and
+whether it is sent as `branch merge` or as a GQ `branch merge` statement,
+because its time grows with what both branches changed.
 A lost write response never triggers an automatic retry. Managed loads
 have the bounds below; Blob and streaming operations keep their own bounds.
 

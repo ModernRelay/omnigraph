@@ -1763,7 +1763,13 @@ impl Omnigraph {
                 } else {
                     PendingMode::StrictInsert
                 };
-                staging.append_batch(&table_key, schema, mode, batch)?;
+                staging.upsert_statement_batch(
+                    &table_key,
+                    schema,
+                    mode,
+                    batch,
+                    catalog.system_columns,
+                )?;
 
                 Ok(MutationResult {
                     affected_nodes: 1,
@@ -1852,7 +1858,13 @@ impl Omnigraph {
                 } else {
                     PendingMode::StrictInsert
                 };
-                staging.append_batch(&table_key, schema, mode, batch)?;
+                staging.upsert_statement_batch(
+                    &table_key,
+                    schema,
+                    mode,
+                    batch,
+                    catalog.system_columns,
+                )?;
 
                 self.invalidate_graph_index_for([table_key.as_str()]).await;
 
@@ -2051,11 +2063,12 @@ impl Omnigraph {
                     // (`pending_resource_usage`) and charge the same
                     // `write_batch_bytes`. `UpdateRowsOverBudget` in the DST
                     // storage-cost golden pins this path's cost.
-                    match staging.append_batch(
+                    match staging.upsert_statement_batch(
                         &table_key,
                         updated_schema,
                         PendingMode::Upsert,
                         updated,
+                        catalog.system_columns,
                     ) {
                         Err(OmniError::ResourceLimitExceeded { .. }) => {
                             stage_patch(staging, vec![matched])?;
@@ -2139,13 +2152,17 @@ impl Omnigraph {
         )?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
-        // Accumulate the updated batch into the Merge-mode pending stream.
-        // The accumulator may now contain entries with the same id as a
-        // prior insert or update on this table; `prepare_pending_table`
-        // dedupes by id (last-occurrence wins) before issuing the single
-        // `stage_keyed_write` call at end-of-query.
+        // Accumulate the updated batch into the Merge-mode pending stream,
+        // replacing the pending version of every id it rewrites, so the next
+        // statement's scan sees one version per entity (issue #925).
         let updated_schema = updated.schema();
-        staging.append_batch(&table_key, updated_schema, PendingMode::Upsert, updated)?;
+        staging.upsert_statement_batch(
+            &table_key,
+            updated_schema,
+            PendingMode::Upsert,
+            updated,
+            catalog.system_columns,
+        )?;
 
         Ok(MutationResult {
             affected_nodes: affected_count,

@@ -515,7 +515,13 @@ pub(crate) async fn resolve_recorded_target(
     match (graph_branch, native_branch) {
         (None, None) => Ok(Some(main.clone())),
         (Some(logical), Some(native)) => {
-            match crate::branch_control::resolve_live_native_branch(main, logical).await? {
+            let live = match crate::layout::has_branch_rows(main) {
+                true => crate::BranchRows::decode(main.manifest())?
+                    .by_logical(logical)
+                    .map(|row| row.native.clone()),
+                false => crate::branch_control::resolve_live_native_branch(main, logical).await?,
+            };
+            match live {
                 Some(live) if live == native => match main.checkout_branch(native).await {
                     Ok(dataset) => Ok(Some(dataset)),
                     Err(lance::Error::RefNotFound { .. }) => Ok(None),

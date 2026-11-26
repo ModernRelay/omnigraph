@@ -1,6 +1,6 @@
-# OmniGraph user guide
+# Omnigraph user guide
 
-OmniGraph is a typed property-graph engine with atomic graph commits,
+Omnigraph is a typed property-graph engine with atomic graph commits,
 versioned branches, full-text and vector search, and local or object-storage
 deployment.
 
@@ -37,8 +37,10 @@ deployment.
 - [Sign in to a managed profile](cli/login.md)
 - [Managed creation, configuration and deletion](cli/managed-lifecycle.md)
 - [Managed organization members and invitations](cli/managed-team.md)
+- [Managed M2M applications for unattended workloads](cli/managed-m2m-applications.md)
 - [HTTP server](operations/server.md)
 - [MCP](operations/mcp.md)
+- [Connect Claude to Omnigraph Cloud](operations/claude.md)
 - [Troubleshooting](operations/troubleshooting.md)
 
 ## Operate a deployment
@@ -50,6 +52,7 @@ deployment.
 - [Server logs and traces](operations/observability.md)
 - [Authorization and actors](operations/policy.md)
 - [Maintenance](operations/maintenance.md)
+- [Foreign versions](operations/cleanup-foreign-versions.md): Lance commits Omnigraph did not write, listed by `cleanup`
 - [Recorded operations](operations/recorded-operations.md): optimize through the serving owner, looked up by id
 - [S3 cluster roots](operations/s3-cluster-roots.md): deployment, recovery and maintenance with the server stopped
 - [Upgrade from 0.13 to 0.14](operations/upgrade-0.14.md): checklist, YAML and CLI replacements

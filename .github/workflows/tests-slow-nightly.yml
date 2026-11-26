@@ -73,6 +73,7 @@ jobs:
           filter=""
           owners=()
           for test_name in \
+            client::tests::managed_branch_merge_outlives_the_thirty_second_deadline_issue_1457 \
             client::tests::managed_mutations_use_thirty_second_deadline_without_retrying \
             client::tests::managed_reads_use_thirty_second_deadline_without_retrying \
             client::tests::graph_http_discovery_has_its_own_five_second_bound \
@@ -99,7 +100,9 @@ jobs:
             repro_issue_1442::delete_of_many_ids_over_indexed_and_unindexed_edge_fragments_stays_bounded_issue_1442 \
             mutation_keyed_write_row_cap_accepts_limit_and_rejects_one_over_pre_effect \
             merge_fast_forward::hydration_chunks_stay_bounded_when_row_widths_step_up \
-            merge_fast_forward::hydration_chunks_stay_bounded_when_wide_rows_interleave
+            merge_fast_forward::hydration_chunks_stay_bounded_when_wide_rows_interleave \
+            gqt_tests::concurrent::owned_server::process::a_rebuild_repetition_runs_against_the_builds_own_server \
+            gqt_tests::concurrent::owned_server::process::every_statement_kind_runs_against_the_builds_own_server
           do
             filter="${filter:+$filter + }test(=$test_name)"
             owners+=(--passed "$test_name")

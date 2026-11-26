@@ -77,7 +77,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Prebuilt Linux archives need glibc 2.39 or newer (Ubuntu 24.04, Debian 13).
 Windows has a PowerShell installer; older Linux and Intel macOS build from
-source. Both are in the [install guide](../../../docs/user/install.md).
+source. Both are in the [install guide](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/install.md).
 
 Run `omnigraph version` again. It prints the CLI version, the storage format
 it writes (`internal-schema`) and the HTTP contract it speaks.
@@ -134,6 +134,7 @@ have seen the options (then continue with 3a):
 | Competitive intelligence | Trials, filings and deals, weighed against your own assumptions | Which signals contradict my thesis? | `pharma-intel` |
 | Venture capital | Deal flow, diligence, decisions, portfolio and network | Which questions are still open on this deal? | `vc-os` |
 | Hardware program | Requirements, architecture, budgets, tests, risks and reviews | Does the mass budget still close? | `hardware-program` |
+| Health record | One person's lab results, readings, targets, medication and vaccine doses | Which results are outside my own targets? | `health-record` |
 
 When they pick one, offer to load it so they can see a real graph before
 designing their own. Every [cookbook](https://github.com/ModernRelay/omnigraph-cookbooks)
@@ -160,10 +161,11 @@ build the user's graph in the project directory, not in `omnigraph-trial`.
 
 The cookbooks are full cluster deployments with seed data, stored queries and
 policies. Start with the small local graph in this guide unless the user asks
-for the full deployment. Each cookbook pins a CLI and server release, named at
-the top of its README. Follow its README only when `omnigraph version` reports
-that release, or after installing it
-([release channels](../../../docs/user/install.md#release-channels) shows how to pin a
+for the full deployment. The cookbooks repository's README names the CLI and
+server release they are checked against (under "Version"). Follow a
+cookbook's full setup only when `omnigraph version` reports that release, or
+after installing it
+([release channels](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/install.md#release-channels) shows how to pin a
 version). Its schema and queries can still be borrowed for a local graph; if
 `lint` refuses them on the installed CLI, tell the user and fix them or start
 from step 4.
@@ -388,10 +390,12 @@ Tell the user what they have, then offer the step that fits:
   `omnigraph-server`, on local disk or S3, in [cluster](cluster.md) and
   [server and policy](server-policy.md). `omnigraph mcp` connects an agent to a
   served or managed target, not to a local file.
-- **Omnigraph Cloud, managed for them:** `omnigraph login --create-profile NAME`
-  signs in to `https://platform.omnigraph.dev`; see
+- **Omnigraph Cloud, managed for them:** Cloud is in private preview, so the
+  user joins the waitlist at https://www.omnigraph.dev/cloud and gets an
+  invitation. With one, `omnigraph login --create-profile NAME` signs in to
+  `https://platform.omnigraph.dev`; see
   [operator config and credentials](commands.md#operator-config--credentials)
-  and the [operator reference](../../../docs/user/cli/targets.md).
+  and the [operator reference](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md).
 
 ### See the graph in Studio
 
@@ -410,18 +414,23 @@ graphs:
 ```
 
 Create a served copy in `./served` and load the seed again, since
-`cluster apply` creates the graph empty. Each write leaves the cluster locked:
-release it with the `lock_id` from
-`omnigraph cluster status --target ./served --json` before the next write and
-before the server starts.
+`cluster apply` creates the graph empty. A finished `cluster apply` releases
+its lock, but a direct `load` keeps the cluster locked: once it has finished,
+release that lock with the `lock_id` from
+`omnigraph cluster status --target ./served --json` before the server starts.
 
 ```bash
 mkdir served
 omnigraph cluster apply --target ./served --config . --json
-omnigraph cluster force-unlock <LOCK_ID> --target ./served
 omnigraph load --data seed.jsonl --mode merge --target ./served --graph knowledge
+omnigraph cluster status --target ./served --json   # note lock_id
 omnigraph cluster force-unlock <LOCK_ID> --target ./served
 ```
+
+The server must come from the same release as the CLI: an older
+`omnigraph-server` refuses a graph the newer CLI created, and the server
+exits with "no healthy graphs opened". Reinstall both with step 1 if that
+happens.
 
 Run the server in a process that keeps running (a background job or a second
 terminal), on loopback only, because `--unauthenticated` lets every request in:
@@ -445,22 +454,21 @@ with `studio_unavailable`. `./served` is a second graph, so writes through
 `--target local` land there, not in `./graph.omni`; if the user keeps it, use
 `local` instead of `brain` in both agent files and add `served/` to
 `.gitignore`. See
-[Open Studio](../../../docs/user/cli/studio.md) and [cluster](cluster.md).
+[Open Studio](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/studio.md) and [cluster](cluster.md).
 
 ### Show the user things in Studio
 
-From 0.4.8, Studio serves MCP tools that open views in its window: a type's
+Studio 0.4.9 and later serves MCP tools that open views in its window: a type's
 table, a node's page, a canvas or tree from a node, the schema's map, a branch's
 review or history, a commit, or a query tab that is not run. They never write,
 run queries or return property values, so read and write with the CLI and use
 Studio to show the user what you found. Agents in Studio's own panel have the
 tools already.
 
-An agent outside Studio needs **Settings › Agent › Let agents outside Studio
-show things in Studio** on. It ships off in 0.4.8 and on in later releases, and
-only the user changes it. Studio then offers a Claude Code command and a Codex
-`config.toml` entry to copy. You can run the same command; it reads the token
-from a file, so the token never appears on screen (macOS path):
+An agent outside Studio connects once. **Settings › Agent** shows a Claude Code
+command and a Codex `config.toml` entry to copy. You can run the same command;
+it reads the token from a file, so the token never appears on screen (macOS
+path):
 
 ```bash
 D="$HOME/Library/Application Support/Omnigraph Studio/ui-tools"
@@ -468,11 +476,11 @@ claude mcp add --transport http omnigraph-studio "$(jq -r .url "$D/endpoint.json
   --header "Authorization: Bearer $(cat "$D/token")"
 ```
 
-Most agents load MCP servers when a session starts, so the user starts a new
-session before you use the tools. In 0.4.8 the address and token change each
-time Studio starts, so after a restart run `claude mcp remove omnigraph-studio`
-and add it again; later releases keep both by default (port 24187, the token in
-the system keychain).
+The address (port 24187) and token survive restarts. Most agents load MCP
+servers when a session starts, so the user starts a new session before you use
+the tools. If `endpoint.json` is missing, Studio is older than 0.4.9 or the user
+turned off **Run Studio's MCP server for external agents** in that tab: ask
+them to update or turn it on.
 
 Call `studio_windows` first: it gives each window's id, server, graph and
 branch, and every other tool takes a window id. `graph_open_type` opens a table,
@@ -480,6 +488,6 @@ branch, and every other tool takes a window id. `graph_open_type` opens a table,
 the rest. If Studio is connected, add a rule to the agent file: before asking
 the user to approve a merge, open the branch's review with `graph_open_branch`.
 
-Point them to the [quickstart](../../../docs/user/quickstart.md) and the
+Point them to the [quickstart](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/quickstart.md) and the
 [Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
 for questions.

@@ -8,19 +8,25 @@ open work in issues.
 
 Before every task and every change:
 
-1. Read [architectural invariants](docs/dev/invariants.md). Apply the hard
+1. Read [the contract](docs/dev/contract.md): what each kind of operation
+   promises its caller, where the engine differs today, and the direction the
+   work asks for. For a non-trivial change, name the statements it keeps,
+   closes, decides or changes.
+2. Read [architectural invariants](docs/dev/invariants.md). Apply the hard
    invariants and deny-list to implementation and review work.
-2. Consult the domain map in [Lance alignment](docs/dev/lance.md). Fetch and
+3. Consult the domain map in [Lance alignment](docs/dev/lance.md). Fetch and
    read the **complete content** of every page in the matching domain plus every
    page that is even slightly relevant. The index and summaries are not
-   substitutes for the upstream pages. A reliable local form is
-   `curl -sL <url> | pandoc -f html -t markdown`.
-3. Read [testing](docs/dev/testing.md). Find the existing owner and run a clean
-   focused baseline before changing tests. Extend an existing assertion,
-   fixture, or parameterization before creating a parallel setup.
+   substitutes for the upstream pages. Then read the matching entries in
+   [Lance compatibility fences](docs/dev/lance-fences.md).
+4. Read [testing](docs/dev/testing.md). Find the existing owner, in
+   [test ownership](docs/dev/test-ownership.md) when the map does not name it,
+   and run a clean focused baseline before changing tests. Extend an existing
+   assertion, fixture, or parameterization before creating a parallel setup.
 
 Tools that support `@` imports include these automatically:
 
+@docs/dev/contract.md
 @docs/dev/invariants.md
 @docs/dev/lance.md
 @docs/dev/testing.md
@@ -29,24 +35,8 @@ Tools that support `@` imports include these automatically:
 
 ## Repository snapshot
 
-- Version surveyed: 0.15.0
 - Rust stable, edition 2024; toolchain pinned in `rust-toolchain.toml`
 - Storage substrate: Lance 13.0.0
-- Workspace: compiler, planner (logical/physical plans and optimizer), storage,
-  `omnigraph-core` (the engine's shared base: `OmniError`, Lance dataset
-  access, request instrumentation, Lance native ref control
-  (`branch_control`), dataset addressing),
-  `omnigraph-catalog` (the `__manifest` catalog: graph branch registrations
-  and lineage, the publish), `omnigraph-seams` (the one seam type every
-  test-time substitution uses; RFC 0066), engine (`omnigraph-engine`
-  package), policy, API types, cluster, CLI,
-  `omnigraph-skill` (rooted at `skills/`; embeds the `skills/omnigraph` agent
-  skill in the CLI and MCP), `omnigraph-mcp` (MCP protocol and catalog), server,
-  Azure admission wrapper, benchmark harness,
-  `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
-  test per case), and `omnigraph-dst` (deterministic simulation testing; needs
-  `--cfg tokio_unstable`, set by the workspace `.cargo/config.toml` for every
-  build — the workspace test gate excludes the crate by name)
 - License: MIT
 
 Omnigraph is a typed property-graph engine coordinating many versioned Lance
@@ -65,8 +55,34 @@ compiler: parse, typecheck, IR, lowering
 engine: snapshots, execution, graph publication, recovery
         |
         v
-Lance datasets on file, S3-compatible, or Azure Blob storage
+Lance datasets on file, S3-compatible, Azure Blob, or Google Cloud Storage
 ```
+
+Workspace members live under `crates/`, plus `skills/` and
+`tools/omnigraph-vocabulary-guard` (the vocabulary audit CI runs):
+
+- **Language:** `omnigraph-compiler` (parse, typecheck, IR, lowering) and
+  `omnigraph-planner` (logical/physical plans and optimizer).
+- **Engine:** `omnigraph-engine` (directory `crates/omnigraph`);
+  `omnigraph-core`, the engine's shared base (`OmniError`, Lance dataset
+  access, request instrumentation, Lance native ref control
+  (`branch_control`), dataset addressing); `omnigraph-catalog`, the
+  `__manifest` catalog (graph branch registrations and lineage, the publish);
+  `omnigraph-storage` (control-object storage); `omnigraph-seams` (the one seam
+  type every test-time substitution uses; RFC 0066).
+- **Policy and serving:** `omnigraph-policy`, `omnigraph-api-types`,
+  `omnigraph-cluster`, `omnigraph-server`, `omnigraph-mcp` (MCP protocol and
+  catalog), `omnigraph-azure-admission` (Azure admission wrapper).
+- **Clients:** `omnigraph-cli` and `omnigraph-skill` (rooted at `skills/`;
+  embeds the `skills/omnigraph` agent skill in the CLI and MCP).
+- **GQT:** `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one
+  libtest test per case), `omnigraph-gqt-core` (the GQT format and its
+  execution), `omnigraph-gqt-served` (the corpus against an in-process
+  server), `omnigraph-reference-engine` (engine v1, frozen).
+- **Other test infrastructure:** `omnigraph-dst` (deterministic
+  simulation testing; needs `--cfg tokio_unstable`, set by the workspace
+  `.cargo/config.toml` for every build; the workspace test gate excludes the
+  crate by name), `omnigraph-bench` (benchmark harness).
 
 See [architecture](docs/dev/architecture.md) for the current component and
 authority model.
@@ -77,9 +93,11 @@ authority model.
 |---|---|
 | Use Omnigraph | [User guide](docs/user/index.md) |
 | Change Omnigraph | [Developer guide](docs/dev/index.md) |
+| See what each operation promises | [The contract](docs/dev/contract.md) |
+| See the work Omnigraph is built for | [The work](docs/dev/workload.md) |
 | Review architectural rules | [Invariants](docs/dev/invariants.md) |
-| Align with Lance | [Lance guide](docs/dev/lance.md) |
-| Find test ownership | [Testing guide](docs/dev/testing.md) |
+| Align with Lance | [Lance guide](docs/dev/lance.md) and [compatibility fences](docs/dev/lance-fences.md) |
+| Find test ownership | [Testing guide](docs/dev/testing.md) and [test ownership](docs/dev/test-ownership.md) |
 | Keep builds warm across features and worktrees | [Local builds](docs/dev/local-builds.md) |
 | Understand atomic writes and crashes | [Write path](docs/dev/writes.md) and [recovery](docs/dev/recovery.md) |
 | Understand query execution | [Execution](docs/dev/execution.md) |
@@ -95,9 +113,50 @@ The decision lens is ongoing liability: ask what a design looks like after five
 more changes of the same kind. Prefer one source of truth with cheap derived
 views. Correctness outranks simplicity, which outranks performance. Demand more
 evidence for irreversible format, protocol, and substrate decisions.
-Always validate your assumptions and don't assume a certain function/modules/symbol will work in a certain way. Especially always validate your assumptions about Lance internals by reading the implementations in the upstream code.
-Reason from first principles about Omnigraph instead of in arbitrary database categories.
-Fundamentally, a database is **an observable contract, implemented by physical mechanisms optimized for an expected distribution of work**. Therefore, you should always be explicit and aware what observable contract and distribution of work you are implementing for and what tradeoffs you are making. Read [first principles data systems](docs/dev/systems.md)
+
+Applied to the shape of a design, that lens is **conceptual integrity**
+(Brooks): few ideas, applied everywhere. Always weigh it. The lenses are the
+default; where one conflicts with the counterweight, the test that closes this
+section decides.
+
+- **Correct by construction.** Make the illegal state unrepresentable; fix the
+  class, not the reported instance.
+- **Generality.** The prompting case is an instance of the mechanism, with no
+  branch, flag or constant of its own (zero-one-infinity: none, one or any
+  number, never a fixed few).
+- **Orthogonality and composability.** Primitives vary independently and close
+  under composition (a composition composes again); extend or compose one
+  before adding one.
+- **Information hiding** (Parnas). A module owns one decision and hides more
+  than it shows (a deep module, Ousterhout); code outside it never works on
+  its representation.
+- **Intrinsic naming.** Name a thing by what it is or selects, never by the
+  caller, scenario or change that prompted it. The `issue_N` in a regression
+  test's name is a cross-reference the gate reads, and stays.
+- **Cases as data.** Real variation is a parameter or a table row, not new
+  code.
+
+The counterweight is **speculative generality** (Fowler) and **the wrong
+abstraction** (Metz): YAGNI. For a design choice, state the specific form and
+the general form, argue for and against each, and name what the choice trades
+away. Decide by the same lens, on evidence: the general form
+wins only when the tree has the cases it serves today and it leaves fewer
+concepts than the specific one (parsimony).
+
+Validate every assumption. Do not assume how a function, module or symbol
+behaves: read it. For Lance internals, read the upstream implementation.
+
+Before every design, review the Lance primitives that bear on it and use them
+fully: build beside one only where its upstream source shows it cannot serve
+or a [compatibility fence](docs/dev/lance-fences.md) forbids it.
+
+Reason about Omnigraph from first principles, not from database categories. A
+database is **an observable contract, implemented by physical mechanisms
+optimized for an expected distribution of work**. State which contract and
+which distribution of work a change serves, and what it trades away. Read
+[first principles of data systems](docs/dev/systems.md) for the method,
+[the contract](docs/dev/contract.md) for what each operation promises, and
+[the work](docs/dev/workload.md) for the workload hypothesis.
 
 The full rules live in [invariants](docs/dev/invariants.md). Keep these in
 working memory:
@@ -121,8 +180,10 @@ working memory:
    Never acknowledge before durable graph visibility or return silent partial
    results.
 
-Do not add a queue for manifest-derived work, inline vector/FTS rebuilds, raw public Lance writers, string-built query semantics, process-local locks advertised as distributed fencing, cloud-only correctness paths, or a shadow source of truth without an accepted RFC that
-changes the invariant.
+Do not add a queue for manifest-derived work, inline vector/FTS rebuilds, raw
+public Lance writers, string-built query semantics, process-local locks
+advertised as distributed fencing, cloud-only correctness paths, or a shadow
+source of truth without an accepted RFC that changes the invariant.
 
 ## Build and test
 
@@ -131,8 +192,8 @@ its Cargo package is `omnigraph-engine`.
 
 In a new worktree, run `sh scripts/seed-target.sh` once before the first build
 to clone a warm `target/` (a Claude Code session-start hook already does), and
-prefer the `cargo dev-test` / `dev-nextest` / `dev-clippy` aliases, which share
-one feature set; see [local builds](docs/dev/local-builds.md).
+prefer the `cargo dev-test` / `dev-nextest` aliases, which share one feature
+set, and `cargo dev-clippy`; see [local builds](docs/dev/local-builds.md).
 
 ```bash
 cargo build --workspace --locked
@@ -153,18 +214,15 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- \
   -D warnings -W clippy::dbg_macro
 
-# Activate the documentation environment first; see docs/dev/documentation.md.
+# Docs changes. Activate the documentation environment first; see docs/dev/documentation.md.
 bash scripts/check-agents-md.sh
 python3 scripts/check-docs.py
-python3 scripts/check-workflow-action-pins.py
-python3 scripts/check-dependency-sources.py   # no path copy, [patch] table, or source replacement
-cargo deny --locked check               # from the repository root, after Cargo.lock is current; allowlist in deny.toml
-python3 scripts/check-merge-group-triggers.py --self-test   # after a workflow or branch-protection.json edit; also pins the CI Gate wiring
-python3 scripts/ci_gate.py --self-test   # after a ci.yml job `if:` change or an edit to the gate's needs/table
-python3 scripts/check-ci-cells.py --self-test   # after deleting or renaming a test a workflow requires by name
-python3 scripts/check-workspace-test-owners.py --self-test   # after editing the `Test Workspace` owner list or .config/nextest.toml
-typos                                   # from the repository root; version pinned in ci.yml; exemptions in .typos.toml
+typos                                   # from the repository root; version pinned in ci.yml
 ```
+
+Workflow, CI-gate, test-owner and dependency changes each have their own check
+script. [Local pre-push checks](docs/dev/ci.md#local-pre-push-checks) lists
+every one and when to run it.
 
 The separate `GQ Logic Tests` context owns the complete GQT corpus. Also run
 `cargo test -p omnigraph-gqt --locked` and
@@ -187,8 +245,17 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
 
 ## Change discipline
 
+- Give every design, RFC and non-trivial change its
+  [contract line](docs/dev/contract.md#citing): the statements it keeps, the
+  gaps it closes, the decisions it settles and the statements it changes. The
+  contract is the target and the code is today's behavior: to change what
+  Omnigraph does, change the contract statement in the same pull request. A change tuned for a different
+  workload revises [the work](docs/dev/workload.md) in the same pull request.
 - Preserve unrelated work in a dirty tree. Never discard user changes.
 - Make the smallest coherent change that closes the behavior and test surface.
+- Never weaken, skip or delete a check to make a change pass. A test, guard,
+  golden or pin changes only when what it guards changes, and the pull request
+  says so.
 - For a bug, reproduce the predicted failure at the tier the regression rule
   below names, then fix the root cause and prove the regression turns green.
 - Query-behavior tests default to `.gqt` logic tests under
@@ -246,4 +313,6 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   published release documents and the bytes they are verified against.
 - Recheck exact flags, environment variables, routes, and constants in source
   before documenting them.
-- Keep this file a map. New deep content goes in its audience-owned guide.
+- Keep this file a map. New deep content goes in its audience-owned guide. A
+  rule belongs here only when a violation is hard to detect or hard to
+  reverse; where a check can catch it, add the check instead.

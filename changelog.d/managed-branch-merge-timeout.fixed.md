@@ -1,0 +1,1 @@
+- The CLI now waits up to 300 seconds for a managed branch merge or dry run. The old 30-second timeout could report unknown effects for a merge that had already published.

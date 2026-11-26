@@ -741,18 +741,23 @@ mod multi_graph_startup {
         // Listing permission reveals availability but grants no data access.
         let (status, _) = json_response(&app, get_request("/graphs/alpha/snapshot", &token)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        let hidden = tokens.identity_token_for("unlisted");
+        // Discovery names a blocked graph to every admitted identity, so one
+        // without the listing permission is told it is unavailable too. Only
+        // an unregistered graph is not found.
+        let unlisted = tokens.identity_token_for("unlisted");
         for id in ["ghost-allowed", "ghost-hidden"] {
-            let (status, _) =
-                json_response(&app, get_request(&format!("/graphs/{id}/snapshot"), &token)).await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            let (status, _) = json_response(
-                &app,
-                get_request(&format!("/graphs/{id}/snapshot"), &hidden),
-            )
-            .await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
+            for credential in [&token, &unlisted] {
+                let (status, _) = json_response(
+                    &app,
+                    get_request(&format!("/graphs/{id}/snapshot"), credential),
+                )
+                .await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            }
         }
+        let (status, _) =
+            json_response(&app, get_request("/graphs/absent/snapshot", &unlisted)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
         let retired = tokens.token(serde_json::json!([{"graph_id":"alpha","actions":["read"]}]));
         let (status, _) = json_response(&app, get_request("/graphs", &retired)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);

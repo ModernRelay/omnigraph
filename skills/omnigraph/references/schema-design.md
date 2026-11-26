@@ -100,9 +100,9 @@ content they report they could not express, or both forced into the same
 awkward shape (see [principle 15](#15-measure-convergence)).
 
 **In Omnigraph:** only some loosening applies in place (enum widening,
-nullable additions, drops); `T` → `T?`, removing a constraint from a property
-that stays and relaxing `@card` are refused like tightening, and both are
-rebuilds. Loose data written in the meantime must be reconciled first. When
+nullable additions, widening a `@card` range, drops); `T` → `T?` and removing
+a constraint from a property that stays are refused like tightening, and both
+are rebuilds. Loose data written in the meantime must be reconciled first. When
 many agents write, lean tight where convergence matters, and add each
 constraint knowing it cannot be removed in place.
 

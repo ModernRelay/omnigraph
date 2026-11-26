@@ -1,6 +1,6 @@
 # Authorization and actors
 
-OmniGraph uses Cedar policy bundles to authorize graph, server, and cluster
+Omnigraph uses Cedar policy bundles to authorize graph, server, and cluster
 configuration actions.
 Policies are declared in `cluster.yaml` and installed by `cluster apply`.
 Servers load applied policies at startup and activate policy changes during
@@ -32,6 +32,12 @@ Graph-scoped actions:
 `GET /graphs/discovery` route: every valid cluster identity can discover all
 applied graph IDs and display names, without gaining permission to read their
 schema or contents. See [signed data credentials](server.md#signed-data-credentials).
+
+On a ready graph, a caller with no graph actions can ask `access` for its
+own empty permission report. An ad-hoc query from that caller receives 403
+before the server reads or parses the request body. Once admitted to the
+graph, the caller gets the usual syntax diagnostics and the server checks
+the permission for the requested operation.
 
 `config_manage` is cluster-scoped. It authorizes configuration changes through
 the identity-authorized cluster API, including stored queries, graph creation,

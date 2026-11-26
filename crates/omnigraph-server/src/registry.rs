@@ -16,13 +16,14 @@ use crate::identity::GraphKey;
 use crate::operations::OperationRuntime;
 use crate::policy::PolicyEngine;
 use crate::queries::QueryRegistry;
+#[cfg(test)]
+use crate::serving::GraphRequest;
 use crate::serving::{
-    GraphRequest, PreparedTransition, ServingEpoch, ServingTransitionError, ServingView,
-    TransitionRecord,
+    PreparedTransition, ServingEpoch, ServingTransitionError, ServingView, TransitionRecord,
 };
 
 /// Fixed engine and effective bindings for one registered graph. Requests use
-/// a [`GraphRequest`] to retain these together with their admitted epoch.
+/// a [`crate::serving::GraphRequest`] to retain these together with their admitted epoch.
 pub struct GraphHandle {
     /// Registry key. In Cluster mode `key.tenant_id` is always `None`.
     pub key: GraphKey,
@@ -164,13 +165,12 @@ pub enum RegistryLookup {
     Gone,
 }
 
-/// Coherent request capture, including the effective bindings required to
-/// authorize disclosure of an unavailable graph.
+#[cfg(test)]
 pub(crate) enum RegistryCapture {
-    Loading(Arc<LoadingGraph>),
+    Loading,
     Ready(GraphRequest),
-    Transitioning(Arc<ServingView>),
-    Blocked(Arc<BlockedGraph>),
+    Transitioning,
+    Blocked,
     Gone,
 }
 
@@ -319,28 +319,49 @@ impl GraphRegistry {
         operations: &OperationRuntime,
         key: &GraphKey,
     ) -> Result<RegistryCapture, ApiError> {
-        self.capture_with_policy(operations, key)
-            .map(|(capture, _)| capture)
+        self.with_current_entry(
+            operations,
+            key,
+            |entry, _| Ok(entry.cloned()),
+            |entry| {
+                Ok(match entry {
+                    Some(GraphEntry::Loading(_)) => RegistryCapture::Loading,
+                    Some(GraphEntry::Ready(view)) => RegistryCapture::Ready(view.capture()?),
+                    Some(GraphEntry::Transitioning(_)) => RegistryCapture::Transitioning,
+                    Some(GraphEntry::Blocked(_)) => RegistryCapture::Blocked,
+                    None => RegistryCapture::Gone,
+                })
+            },
+        )
     }
 
-    pub(crate) fn capture_with_policy(
+    /// Judge policy outside the process and registry locks. Capture the result
+    /// under both locks only while the judged snapshot is still current.
+    pub(crate) fn with_current_entry<T, R>(
         &self,
         operations: &OperationRuntime,
         key: &GraphKey,
-    ) -> Result<(RegistryCapture, Option<Arc<PolicyEngine>>), ApiError> {
-        operations.while_open(|| {
-            let state = locked(&self.state);
-            let capture = match state.snapshot.graphs.get(key) {
-                Some(GraphEntry::Loading(graph)) => RegistryCapture::Loading(Arc::clone(graph)),
-                Some(GraphEntry::Ready(view)) => RegistryCapture::Ready(view.capture()?),
-                Some(GraphEntry::Transitioning(view)) => {
-                    RegistryCapture::Transitioning(Arc::clone(view))
+        judge: impl Fn(Option<&GraphEntry>, Option<&PolicyEngine>) -> Result<T, ApiError>,
+        capture: impl Fn(T) -> Result<R, ApiError>,
+    ) -> Result<R, ApiError> {
+        for _ in 0..3 {
+            let snapshot = self.snapshot_ref();
+            let judged = judge(snapshot.graphs.get(key), snapshot.server_policy.as_deref());
+            let captured = operations.while_open(|| {
+                let state = locked(&self.state);
+                if !Arc::ptr_eq(&state.snapshot, &snapshot) {
+                    return Ok(None);
                 }
-                Some(GraphEntry::Blocked(graph)) => RegistryCapture::Blocked(Arc::clone(graph)),
-                None => RegistryCapture::Gone,
-            };
-            Ok((capture, state.snapshot.server_policy.clone()))
-        })
+                capture(judged?).map(Some)
+            })?;
+            if let Some(result) = captured {
+                return Ok(result);
+            }
+        }
+        Err(ApiError::new(
+            crate::api::ErrorCode::GraphUnavailable,
+            "graph routing changed during request admission",
+        ))
     }
 
     /// Install one startup result, or the complete strict-startup batch. The
@@ -1141,7 +1162,7 @@ mod tests {
             pending_registry
                 .capture(&operations, &handles[0].key)
                 .unwrap(),
-            RegistryCapture::Loading(_)
+            RegistryCapture::Loading
         ));
         assert!(pending_registry.list().is_empty());
         let foreign = Arc::new(LoadingGraph {
@@ -1411,7 +1432,7 @@ mod tests {
         let transition = prepared.close().unwrap();
         assert!(matches!(
             registry.capture(&operations, &alpha.key).unwrap(),
-            RegistryCapture::Transitioning(_)
+            RegistryCapture::Transitioning
         ));
         assert!(matches!(
             registry.get(&alpha.key),
@@ -1507,7 +1528,7 @@ mod tests {
         for key in [&alpha.key, &beta.key] {
             assert!(matches!(
                 registry.capture(&operations, key).unwrap(),
-                RegistryCapture::Transitioning(_)
+                RegistryCapture::Transitioning
             ));
         }
         let peer_epoch = captured(&registry, &operations, &peer.key).epoch();
@@ -2048,6 +2069,69 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_policy_swap_during_admission_invalidates_the_old_decision() {
+        let dir = TempDir::new().unwrap();
+        let handle = build_handle("alpha", dir.path()).await;
+        let registry = Arc::new(GraphRegistry::from_handles(vec![Arc::clone(&handle)]).unwrap());
+        let operations = OperationRuntime::new();
+        let RegistryLookup::Ready(view) = registry.get(&handle.key) else {
+            panic!("alpha is ready");
+        };
+        let policy = Arc::new(
+            PolicyEngine::load_server_from_source(
+                "version: 1\ngroups:\n  admins: [admin]\nrules:\n  - id: list\n    allow:\n      actors: {group: admins}\n      actions: [graph_list]\n",
+            )
+            .unwrap(),
+        );
+        let (judging, judging_started) = std::sync::mpsc::channel::<()>();
+        let (swapped, swap_landed) = std::sync::mpsc::channel::<()>();
+        let swapper = {
+            let registry = Arc::clone(&registry);
+            let operations = operations.clone();
+            std::thread::spawn(move || {
+                judging_started
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a judgement started");
+                operations
+                    .while_open(|| -> Result<(), ApiError> {
+                        let mut state = locked(&registry.state);
+                        let mut next = state.snapshot.with_graphs(state.snapshot.graphs.clone());
+                        next.server_policy = Some(policy);
+                        state.snapshot = Arc::new(next);
+                        Ok(())
+                    })
+                    .unwrap();
+                swapped.send(()).unwrap();
+            })
+        };
+        let judgements = std::cell::Cell::new(0);
+        let captured = registry.with_current_entry(
+            &operations,
+            &handle.key,
+            |_, server_policy| {
+                judgements.set(judgements.get() + 1);
+                if judgements.get() == 1 {
+                    judging.send(()).unwrap();
+                    swap_landed
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("the swap lands while neither lock is held");
+                }
+                if server_policy.is_some() {
+                    return Err(ApiError::forbidden("permission changed"));
+                }
+                Ok(())
+            },
+            |()| view.capture(),
+        );
+        swapper.join().unwrap();
+        assert!(
+            matches!(captured, Err(ref error) if error.status() == axum::http::StatusCode::FORBIDDEN)
+        );
+        assert_eq!(judgements.get(), 2);
+        assert_eq!(view.request_count(), 0);
+    }
+
     #[tokio::test]
     async fn prepared_drop_releases_scheduling_capacity_and_closed_drop_stays_closed() {
         let dir = TempDir::new().unwrap();
@@ -2069,7 +2153,7 @@ mod tests {
         drop(transition);
         assert!(matches!(
             registry.capture(&operations, &handle.key).unwrap(),
-            RegistryCapture::Transitioning(_)
+            RegistryCapture::Transitioning
         ));
         assert!(matches!(
             registry.prepare_same_view(&operations, &handle.key, transition_deadline()),
@@ -2161,7 +2245,7 @@ mod tests {
                 drop(request);
                 waiting.await.unwrap();
             }
-            RegistryCapture::Transitioning(_) => transition.wait_requests().await.unwrap(),
+            RegistryCapture::Transitioning => transition.wait_requests().await.unwrap(),
             _ => panic!("close/capture changed graph identity or startup state"),
         }
         transition.resume_same_view().unwrap();

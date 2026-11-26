@@ -1,5 +1,3 @@
-- Branches gain a [writer epoch][writer-epoch-guide]: once a program embedding
-  the engine claims a branch, other processes' writes get 409 `writer_fenced`.
-  New graphs are storage format 17; older binaries refuse them.
+- An embedded program can claim a format-17 branch (`claim_branch_writer`) so no stale process lands a write on it; other writers, server and CLI too, get 409 `writer_fenced`. See [writer epoch][writer-epoch-guide].
 
 [writer-epoch-guide]: ../docs/user/operations/troubleshooting.md#writer-epoch

@@ -610,6 +610,20 @@ async fn served_records_preserve_absence_and_reject_mixed_evidence() {
 }
 
 #[tokio::test]
+async fn a_deployment_receipt_does_not_validate_under_reset_rebuild() {
+    let mut r = served_record().await;
+    r.run.run_spec.protocol.reset = ResetMode::Rebuild;
+    r.run.run_spec.cache_condition.process = ProcessLifecycle::FreshPerRepetition;
+    r.run.run_spec.cache_condition.engine = EnginePreparation::PreparationOnly;
+    rehash_record(&mut r);
+    let refusal = crate::gqt_record::validate(&r).unwrap_err().message;
+    assert!(
+        refusal.contains("a deployment receipt") && refusal.contains("reset: rebuild"),
+        "{refusal}"
+    );
+}
+
+#[tokio::test]
 async fn embedded_record_keys_match_base_shape() {
     let record = serde_json::to_value(authority_fixture().await).unwrap();
     for field in ["machine", "backend", "fixture", "dataset_cache_hit"] {
@@ -1302,6 +1316,8 @@ val: I64
             server_receipt_sha256: Some(input.receipt.digest().unwrap()),
             client_peak_rss_bytes: None,
             base_manifest_sha256: None,
+            server_executable_sha256: None,
+            concurrent: None,
         }
     }
 
@@ -1708,6 +1724,8 @@ exit 0
             server_receipt_sha256: Some(server_receipt_sha256),
             client_peak_rss_bytes: None,
             base_manifest_sha256: None,
+            server_executable_sha256: None,
+            concurrent: None,
         }
     }
 

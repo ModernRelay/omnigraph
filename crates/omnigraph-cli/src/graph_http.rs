@@ -14,6 +14,29 @@ use crate::helpers::MissingCredential;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The total time one managed JSON request may take, connection and receipt
+/// included. A self-hosted transport sets no deadline of its own, whichever
+/// the request asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestDeadline {
+    /// Thirty seconds: reads, mutations and control writes.
+    Standard,
+    /// Three hundred seconds: work whose time grows with the data it moves
+    /// or compares rather than with the request, which is a load, and a
+    /// merge or its preview by either route.
+    Data,
+}
+
+impl RequestDeadline {
+    /// The managed bound of a request of this kind.
+    pub(crate) const fn managed(self) -> Duration {
+        match self {
+            Self::Standard => Duration::from_secs(30),
+            Self::Data => Duration::from_secs(300),
+        }
+    }
+}
+
 /// The schemes of a server address. `http` and `https` reach the server over
 /// TCP; `unix` carries the same HTTP/1.1 protocol over a Unix-domain socket.
 const SERVER_SCHEMES: [&str; 3] = ["http", "https", "unix"];
@@ -273,6 +296,8 @@ impl std::error::Error for ApiContractError {}
 /// Never derive it from a graph URL: a proxy prefix may itself contain `graphs`.
 #[derive(Clone)]
 pub(crate) struct GraphHttpClient {
+    /// Whether requests carry the managed deadlines of [`RequestDeadline`].
+    managed: bool,
     operator_transport: Option<crate::operator_transport::CapturedTransport>,
     client: reqwest::Client,
     transport: ServerTransport,
@@ -370,7 +395,7 @@ impl GraphHttpClient {
         let builder = if managed {
             builder
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(30))
+                .timeout(RequestDeadline::Standard.managed())
         } else {
             builder
         };
@@ -386,6 +411,7 @@ impl GraphHttpClient {
         let _ = health_url.set_username("");
         let _ = health_url.set_password(None);
         Ok(Self {
+            managed,
             client: Self::build(&transport, managed, operator_transport.as_ref())?,
             operator_transport,
             transport,
@@ -440,6 +466,7 @@ impl GraphHttpClient {
     /// inheriting the managed JSON request's total thirty-second deadline.
     pub(crate) fn blob_delivery(&self) -> Result<Self> {
         Ok(Self {
+            managed: false,
             client: Self::build(&self.transport, false, self.operator_transport.as_ref())?,
             operator_transport: self.operator_transport.clone(),
             transport: self.transport.clone(),
@@ -454,9 +481,24 @@ impl GraphHttpClient {
     /// A request to `url`, composed under this client's root with
     /// [`crate::helpers::remote_url`].
     pub(crate) fn request(&self, method: Method, url: String) -> Result<RequestBuilder> {
+        self.request_within(method, url, RequestDeadline::Standard)
+    }
+
+    /// [`Self::request`] bounded by `deadline` on a managed transport.
+    pub(crate) fn request_within(
+        &self,
+        method: Method,
+        url: String,
+        deadline: RequestDeadline,
+    ) -> Result<RequestBuilder> {
         let url = self.transport.http_url(&url)?;
         self.validate_scope(&url)?;
-        Ok(self.client.request(method, url))
+        let request = self.client.request(method, url);
+        Ok(if self.managed {
+            request.timeout(deadline.managed())
+        } else {
+            request
+        })
     }
 
     pub(crate) async fn send(&self, request: RequestBuilder) -> Result<Response> {

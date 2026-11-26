@@ -2092,6 +2092,36 @@ async fn cached_and_zero_cache_sessions_share_store_registry_not_metadata_cache(
     assert_eq!(cached.version().version, control.version().version);
 }
 
+/// Lance 13 `Dataset::create_branch` commits the branch's tree through a
+/// `CommitBuilder` it hands no session, so the commit, its existence probe of
+/// the new location and the dataset it returns run on `Session::default()`, a
+/// registry the graph did not build. Fence: "Bound branch create". Goes red at
+/// the bump whose `create_branch` keeps the source's session; the fence's
+/// workaround and the ref protocol's gap close there.
+#[tokio::test]
+async fn create_branch_commits_its_tree_on_a_default_session_lance_13() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("create-branch-session.lance");
+    let uri = path.to_str().unwrap();
+    drop(fresh_dataset(uri).await);
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    let session = Arc::new(Session::new(0, 0, Arc::clone(&registry)));
+    let mut main = DatasetBuilder::from_uri(uri)
+        .with_session(Arc::clone(&session))
+        .load()
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&main.session().store_registry(), &registry));
+
+    let version = main.version().version;
+    let branch = main.create_branch("feature", version, None).await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&branch.session(), &session)
+            && !Arc::ptr_eq(&branch.session().store_registry(), &registry),
+        "Lance's create_branch now commits on the source's session: drop the bound-branch-create workaround"
+    );
+}
+
 // --- Guard 2b: RFC-024 public physical-ref incarnation surfaces -----------
 //
 // RFC-024 may activate durable table heads only if a public, backend-portable

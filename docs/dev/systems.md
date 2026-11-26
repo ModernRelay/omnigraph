@@ -414,7 +414,7 @@ This paper is an analytical synthesis of selected literature and documentation. 
 
 The practical output is nevertheless concrete. A system comparison should identify the required observations, the implementation responsibilities that preserve them, and the workloads under which the resulting service meets its targets. Category names remain useful as shorthand after those facts are available. Decoupling can improve several outcomes by changing the available designs; coordination requirements remain conditional on the semantics and assumptions of the work.
 
-The framework also provides a disciplined way to investigate agents as knowledge workers. Their operation policies may adapt to previous results, revise intermediate conclusions, retain evidence, and coordinate concurrent changes. Those behaviors can be represented as changes to W and C before proposing new infrastructure. The subsequent research question is which additional contracts and operating envelopes these workloads require from shared knowledge systems.
+The framework also provides a disciplined way to investigate agents as knowledge workers. Their operation policies may adapt to previous results, revise intermediate conclusions, retain evidence, and coordinate concurrent changes. Those behaviors can be represented as changes to W and C before proposing new infrastructure. The subsequent research question is which additional contracts and operating envelopes these workloads require from shared knowledge systems. Omnigraph's own answer is [the contract](contract.md), organized by operation, and its dated workload hypothesis, [the work](workload.md).
 
 ## Appendix A. Terminology expansion
 
