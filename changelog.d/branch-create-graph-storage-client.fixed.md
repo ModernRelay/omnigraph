@@ -1,1 +1,1 @@
-- `branch create` probes its new branch through the graph's own storage client, so a served graph's request policy and storage target apply to it as to every other request.
+- On a format-18 graph, `branch create` probes its new branch through the graph's own storage client, so a served graph's request policy and storage target apply to it as to every other request.

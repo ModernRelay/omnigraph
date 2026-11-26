@@ -1,1 +1,0 @@
-- A merge into `main` is no longer refused with `conflict` when a branch is created or deleted while it runs.
