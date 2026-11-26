@@ -1437,13 +1437,29 @@ impl ObjectStorageAdapter {
 
     fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
-        let (store, retrying) = s3_clients(&location.bucket, root_uri, scope.is_some())?;
+        Self::s3_from_builder(
+            s3_bucket_builder(&location.bucket),
+            location.bucket,
+            root_uri,
+            scope,
+        )
+    }
+
+    /// The one `s3://` adapter construction ([`s3_clients_from`]), whether
+    /// `builder` was captured or read from the environment: a scoped adapter
+    /// reads through a retrying client and writes single-attempt, whatever
+    /// retry `builder` carries; an unscoped one keeps `builder`'s retry.
+    fn s3_from_builder(
+        builder: AmazonS3Builder,
+        bucket: String,
+        root_uri: &str,
+        scope: Option<StorageIoScope>,
+    ) -> Result<Self> {
+        let (store, retrying) = s3_clients_from(builder, root_uri, scope.is_some())?;
         Ok(Self::remote(
             store,
             retrying,
-            UriCodec::S3 {
-                bucket: location.bucket,
-            },
+            UriCodec::S3 { bucket },
             scope,
         ))
     }
@@ -1663,7 +1679,9 @@ impl ObjectStorageAdapter {
                     None => adapter,
                 })
             }
-            StorageKind::S3 => Self::s3_read_through(base_uri, root_uri, scope).await,
+            StorageKind::S3 => {
+                Self::s3_read_through(base_uri, root_uri, scope, s3_bucket_builder).await
+            }
             StorageKind::Azure | StorageKind::Gcs => Err(StorageError::backend(
                 StorageFailureKind::Configuration,
                 format!("read-through storage needs a local or s3 clone root, got '{root_uri}'"),
@@ -1671,13 +1689,17 @@ impl ObjectStorageAdapter {
         }
     }
 
-    /// The S3 instance of [`Self::durable_read_through`]: both clients from the
-    /// standard `AWS_*` environment (one endpoint by construction), the base's
-    /// index from one listing, the mount named by the clone root's bucket and prefix.
+    /// The S3 instance of [`Self::durable_read_through`]: both clients from
+    /// `bucket_builder` (the standard `AWS_*` environment, so one endpoint by
+    /// construction), the base's index from one listing, the mount named by the
+    /// clone root's bucket and prefix. Under a scope the open reads the root
+    /// as the adapter will: its reads retry and its marker write is a
+    /// single-attempt mutation of the scope.
     async fn s3_read_through(
         base_uri: &str,
         root_uri: &str,
         scope: Option<StorageIoScope>,
+        bucket_builder: impl Fn(&str) -> AmazonS3Builder,
     ) -> Result<Self> {
         let root = parse_s3_uri(root_uri)?;
         let base = parse_s3_uri(base_uri)?;
@@ -1691,13 +1713,20 @@ impl ObjectStorageAdapter {
                 ),
             ));
         }
-        let base_store = s3_store(&base.bucket, base_uri, |builder| builder)?;
-        let (layer, retrying) = s3_clients(&root.bucket, root_uri, scope.is_some())?;
+        let base_store = build_s3_store(bucket_builder(&base.bucket), base_uri)?;
+        let (layer, retrying) =
+            s3_clients_from(bucket_builder(&root.bucket), root_uri, scope.is_some())?;
+        let opener = match (&scope, &retrying) {
+            (Some(scope), Some(retrying)) => {
+                scope.wrap_object_stores(Arc::clone(retrying), Arc::clone(&layer))
+            }
+            _ => Arc::clone(&layer),
+        };
         let mount = s3_clone_mount(
             base_store,
             base_uri,
             base_key,
-            layer.as_ref(),
+            opener.as_ref(),
             root_uri,
             root_key,
         )
@@ -3239,18 +3268,29 @@ fn s3_bucket_builder(bucket: &str) -> AmazonS3Builder {
 }
 
 /// The client of `bucket`, built from the `AWS_*` environment as `configure`
-/// leaves it. In a test or a DST build a simulated bucket that answers to the
-/// name is the client, and nothing is built.
+/// leaves it ([`build_s3_store`]), for a test that reads a bucket beside the
+/// adapter under test.
+#[cfg(any(test, feature = "test-util"))]
 fn s3_store(
     bucket: &str,
     root_uri: &str,
     configure: impl FnOnce(AmazonS3Builder) -> AmazonS3Builder,
 ) -> Result<Arc<DynObjectStore>> {
+    build_s3_store(configure(s3_bucket_builder(bucket)), root_uri)
+}
+
+/// The client `builder` describes, whether its configuration was captured or
+/// read from the environment. In a test or a DST build a simulated bucket that
+/// answers to the bucket `builder` names is the client, and nothing is built.
+fn build_s3_store(builder: AmazonS3Builder, root_uri: &str) -> Result<Arc<DynObjectStore>> {
     #[cfg(any(test, feature = "dst"))]
-    if let Some(simulated) = simulated_bucket::bucket(simulated_bucket::Provider::S3, bucket) {
+    if let Some(simulated) = builder
+        .get_config_value(&object_store::aws::AmazonS3ConfigKey::Bucket)
+        .and_then(|bucket| simulated_bucket::bucket(simulated_bucket::Provider::S3, &bucket))
+    {
         return Ok(simulated);
     }
-    match configure(s3_bucket_builder(bucket)).build() {
+    match builder.build() {
         Ok(store) => Ok(Arc::new(store)),
         Err(err) => Err(StorageError::backend(
             classify_object_store_error(&err),
@@ -3262,16 +3302,25 @@ fn s3_store(
 /// The clients of one `s3://` root: the store its reads and writes go to and,
 /// when `scoped`, a second client with bounded retries for its reads, the
 /// first then single-attempt (`ObjectStorageAdapter::with_scope_and_retrying`).
-fn s3_clients(
-    bucket: &str,
+/// They come from a configured `builder`, the one construction every `s3://`
+/// adapter and clone uses, captured or not: [`remote_clients`] over
+/// [`build_s3_store`]. A scoped root's reads retry by
+/// [`scoped_read_retry_config`] and its writes are single-attempt whatever
+/// `builder` carries; an unscoped root keeps `builder`'s own retry.
+fn s3_clients_from(
+    builder: AmazonS3Builder,
     root_uri: &str,
     scoped: bool,
 ) -> Result<(Arc<DynObjectStore>, Option<Arc<DynObjectStore>>)> {
     remote_clients(scoped, |retry| {
-        s3_store(bucket, root_uri, |builder| match retry {
-            Some(retry) => builder.with_retry(retry),
-            None => builder,
-        })
+        let builder = builder.clone();
+        build_s3_store(
+            match retry {
+                Some(retry) => builder.with_retry(retry),
+                None => builder,
+            },
+            root_uri,
+        )
     })
 }
 
@@ -4183,6 +4232,275 @@ mod tests {
             served
         });
         (endpoint, server)
+    }
+
+    /// One exchange a scripted server expects: the method of its request, and
+    /// the raw response it writes back, or `None` for a request it never
+    /// answers, holding the connection until the client gives up.
+    pub(crate) type Exchange = (&'static str, Option<Vec<u8>>);
+
+    /// Serves `exchanges` in order, one connection each, closing it after the
+    /// answer; returns how many requests it received.
+    pub(crate) fn spawn_scripted_server(
+        exchanges: Vec<Exchange>,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local scripted server");
+        listener
+            .set_nonblocking(true)
+            .expect("configure local scripted server");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("local server address")
+        );
+        let server = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            for (method, response) in exchanges {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return served;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("scripted server accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("configure blocking scripted connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("configure scripted server read timeout");
+                let mut request = [0_u8; 16 * 1024];
+                let mut request_len = 0;
+                while !request[..request_len]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+                {
+                    let read = stream
+                        .read(&mut request[request_len..])
+                        .expect("read local scripted request");
+                    assert!(read != 0, "scripted request ended before its headers");
+                    request_len += read;
+                }
+                assert!(
+                    request[..request_len].starts_with(format!("{method} ").as_bytes()),
+                    "expected a real object-store {method}, got {:?}",
+                    String::from_utf8_lossy(&request[..request_len])
+                );
+                served += 1;
+                let Some(response) = response else {
+                    // A stall: wait for the client to close the connection.
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(30)))
+                        .expect("configure scripted stall");
+                    let mut rest = [0_u8; 1024];
+                    while matches!(stream.read(&mut rest), Ok(read) if read > 0) {}
+                    continue;
+                };
+                stream
+                    .write_all(&response)
+                    .expect("write scripted response");
+                stream.flush().expect("flush scripted response");
+            }
+            served
+        });
+        (endpoint, server)
+    }
+
+    /// One raw object response; `range` adds a `Content-Range` header.
+    pub(crate) fn object_response(
+        status: u16,
+        range: Option<&str>,
+        length: usize,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let range = range.map_or(String::new(), |range| {
+            format!("Content-Range: bytes {range}\r\n")
+        });
+        let mut response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {length}\r\n{range}ETag: \"e\"\r\nLast-Modified: Mon, 23 Nov 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// Serves one HEAD answer per entry of `statuses`, in order, and returns
+    /// how many it served.
+    fn spawn_head_server(statuses: Vec<u16>) -> (String, tokio::task::JoinHandle<usize>) {
+        spawn_scripted_server(
+            statuses
+                .into_iter()
+                .map(|status| ("HEAD", Some(object_response(status, None, 0, b""))))
+                .collect(),
+        )
+    }
+
+    fn scoped_test_adapter(endpoint: String) -> ObjectStorageAdapter {
+        let builder = AmazonS3Builder::new()
+            .with_bucket_name("test-bucket")
+            .with_region("us-east-1")
+            .with_access_key_id("test-access-key")
+            .with_secret_access_key("test-secret-key")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_retry(single_attempt_retry_config());
+        ObjectStorageAdapter::s3_from_builder(
+            builder,
+            "test-bucket".into(),
+            "s3://test-bucket/root",
+            Some(StorageIoScope::new()),
+        )
+        .expect("scoped S3 adapter")
+    }
+
+    /// A body that ends early fails while streaming. The scoped read client's
+    /// retry resumes it with a range request validated by ETag
+    /// (object_store's retrying get stream), so a full read answers from the
+    /// rest. That is the case Lance's outer download retry
+    /// (`download_retry_count`) covers for its own reads; this adapter
+    /// inherits it from its read client instead of repeating it.
+    #[tokio::test]
+    async fn a_scoped_s3_full_read_resumes_a_body_that_ends_early() {
+        let truncated = || object_response(200, None, 5, b"he");
+        let rest = || object_response(206, Some("2-4/5"), 3, b"llo");
+        for read in ["read_text", "read_text_if_exists"] {
+            let (endpoint, server) =
+                spawn_scripted_server(vec![("GET", Some(truncated())), ("GET", Some(rest()))]);
+            let adapter = scoped_test_adapter(endpoint);
+            let uri = "s3://test-bucket/root/object";
+            let text = match read {
+                "read_text" => adapter.read_text(uri).await.map(Some),
+                _ => adapter.read_text_if_exists(uri).await,
+            }
+            .unwrap_or_else(|error| panic!("{read}: a resumed read answers: {error}"));
+            assert_eq!(text.as_deref(), Some("hello"), "{read}");
+            assert_eq!(server.await.expect("scripted server"), 2, "{read}");
+        }
+    }
+
+    /// A failure that repeats on every read is answered at once: a denied
+    /// read is not retried, and bytes that are not text fail after one read.
+    #[tokio::test]
+    async fn a_scoped_s3_full_read_does_not_retry_a_failure_that_repeats() {
+        for (response, kind) in [
+            (
+                object_response(403, None, 0, b""),
+                StorageFailureKind::Configuration,
+            ),
+            (
+                object_response(200, None, 2, b"\xff\xfe"),
+                StorageFailureKind::Permanent,
+            ),
+        ] {
+            // One response only: a retry would find no server and fail with
+            // another class, which the class check below refuses.
+            let (endpoint, server) = spawn_scripted_server(vec![("GET", Some(response))]);
+            let adapter = scoped_test_adapter(endpoint);
+            let error = adapter
+                .read_text("s3://test-bucket/root/object")
+                .await
+                .expect_err("the read fails");
+            assert_eq!(error.failure_kind(), kind, "{error}");
+            assert_eq!(server.await.expect("scripted server"), 1, "{error}");
+        }
+    }
+
+    /// A scoped `s3://` adapter reads through its retrying client whatever
+    /// retry its builder carries: a captured binding's builder and the
+    /// environment's go through the same construction.
+    #[tokio::test]
+    async fn a_scoped_s3_adapter_retries_its_reads_whatever_its_builder_carries() {
+        let (endpoint, server) = spawn_head_server(vec![503, 200]);
+        let adapter = scoped_test_adapter(endpoint);
+        assert!(
+            adapter
+                .exists("s3://test-bucket/root/object")
+                .await
+                .expect("a retried read answers")
+        );
+        assert_eq!(server.await.expect("head server"), 2);
+    }
+
+    /// An empty `ListObjectsV2` answer.
+    fn empty_listing() -> Vec<u8> {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test-bucket</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#;
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// A scoped `s3://` clone open reads its root as the adapter it returns
+    /// does: every read retries a transient answer, and its one write, the
+    /// mutable creation marker, is single-attempt. The base is a simulated
+    /// bucket; the root is a scripted server, and its key overlaps the base's
+    /// so the open also asks whether the two buckets are one.
+    #[tokio::test]
+    async fn a_scoped_s3_clone_open_retries_its_reads_and_not_its_marker_write() {
+        let base = simulated_bucket::SimulatedBucket::new(simulated_bucket::Provider::S3);
+        let _names = base.answer_to(&["scoped-clone-open-base"]).unwrap();
+        base.put(
+            &ObjectPath::from("graph/object"),
+            PutPayload::from_static(b"base"),
+        )
+        .await
+        .unwrap();
+        let unavailable = || object_response(503, None, 0, b"");
+        let absent = || object_response(404, None, 0, b"");
+        // The open's requests to the root, in order.
+        let open = || {
+            vec![
+                ("HEAD", Some(absent())),       // the base's object, in the root's bucket
+                ("HEAD", Some(absent())),       // graph/__clone/created
+                ("GET", Some(empty_listing())), // anything under graph/
+                ("GET", Some(empty_listing())), // graph/__clone/deleted/
+                ("PUT", Some(object_response(200, None, 0, b""))), // graph/__clone/created
+            ]
+        };
+        // A 503 before each request in turn: a read answers on its retry, the
+        // marker write fails on its one attempt and is not sent again.
+        for failing in 0..open().len() {
+            let mut exchanges = open();
+            let method = exchanges[failing].0;
+            exchanges.insert(failing, (method, Some(unavailable())));
+            let (endpoint, server) = spawn_scripted_server(exchanges);
+            let builder = move |bucket: &str| {
+                AmazonS3Builder::new()
+                    .with_bucket_name(bucket)
+                    .with_region("us-east-1")
+                    .with_access_key_id("test-access-key")
+                    .with_secret_access_key("test-secret-key")
+                    .with_endpoint(endpoint.clone())
+                    .with_allow_http(true)
+            };
+            let opened = ObjectStorageAdapter::s3_read_through(
+                "s3://scoped-clone-open-base/graph",
+                "s3://test-bucket/graph",
+                Some(StorageIoScope::new()),
+                builder,
+            )
+            .await;
+            let served = server.await.expect("scripted server");
+            if method == "PUT" {
+                let error = opened
+                    .map(|_| ())
+                    .expect_err("the marker write is not retried");
+                assert_eq!(served, failing + 1, "{error}");
+            } else {
+                opened.unwrap_or_else(|error| panic!("a 503 on {method} #{failing}: {error}"));
+                assert_eq!(served, open().len() + 1, "{method} #{failing}");
+            }
+        }
     }
 
     async fn exhausted_s3_status_error(status: u16) -> object_store::Error {
