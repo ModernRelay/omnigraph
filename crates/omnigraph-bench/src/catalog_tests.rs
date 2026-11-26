@@ -95,6 +95,10 @@ fn defaults_and_explicit_null_resolve_before_identity() {
     ] {
         config.scenarios[0].deadline_seconds = deadline;
         config.scenarios[0].repetitions = Some(2);
+        assert_eq!(
+            config.scenarios[0].deadline_seconds(&config.defaults),
+            expected
+        );
         let changed = changed(&catalog, &config).unwrap();
         let suite = changed.resolve(None, None).unwrap();
         let plan = suite.runs[0].case.gqt().unwrap();
@@ -107,6 +111,17 @@ fn defaults_and_explicit_null_resolve_before_identity() {
             plan.planned_sha256
         );
     }
+    config.defaults.deadline_seconds = None;
+    config.scenarios[0].deadline_seconds = None;
+    assert_eq!(
+        config.scenarios[0].deadline_seconds(&config.defaults),
+        Some(60),
+        "no deadline at either level is the built-in sixty seconds"
+    );
+    let changed = changed(&catalog, &config).unwrap();
+    let suite = changed.resolve(None, None).unwrap();
+    let plan = suite.runs[0].case.gqt().unwrap();
+    assert_eq!(plan.definition.protocol.deadline_seconds, Some(60));
 }
 
 #[test]

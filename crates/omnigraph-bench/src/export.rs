@@ -344,9 +344,7 @@ pub async fn export(
                     .as_ref()
                     .map(|step| step.text.as_str()),
                 repetitions: Some(effective_repetitions(catalog, scenario, &workload_path)?),
-                deadline_seconds: scenario
-                    .deadline_seconds
-                    .unwrap_or(catalog.definition.defaults.deadline_seconds.unwrap_or(None)),
+                deadline_seconds: scenario.deadline_seconds(&catalog.definition.defaults),
                 protocol_json: Some(canonical_json(&scenario.protocol, "protocol")?),
                 fixture_kind: Some(fixture_kind),
             };
@@ -441,7 +439,7 @@ pub async fn export(
             invocation_id: invocation_id.clone(),
             record_sha256: record_sha256.clone(),
             object_relative_path: format!("records/{record_sha256}.json"),
-            pointer_relative_path: format!("invocations/{invocation_id}"),
+            pointer_relative_path: format!("records/{record_sha256}.json"),
             newly_published: false,
         };
         let point = any_point_row(&record)?;
@@ -729,13 +727,20 @@ mod tests {
         let store_path = directory.path().join("store");
         std::fs::create_dir(&store_path).unwrap();
         let store = FixtureStore::open(store_path.to_str().unwrap()).unwrap();
-        store.put_record(&record).await.unwrap();
+        let put = store.put_record(&record).await.unwrap();
         let catalog = public_catalog();
 
         let mut jsonl = Vec::new();
         let summary = export(&store, std::slice::from_ref(&catalog), &mut jsonl)
             .await
             .unwrap();
+        let record_object = format!("records/{}.json", put.record_sha256);
+        let text = String::from_utf8(jsonl.clone()).unwrap();
+        assert!(
+            text.contains(&format!("\"archive_object\":\"{record_object}\""))
+                && text.contains(&format!("\"archive_pointer\":\"{record_object}\"")),
+            "a store record is its own pointer: {text}"
+        );
         assert_eq!((summary.records, summary.runs, summary.points), (1, 1, 1));
         assert_eq!(summary.catalogs, 1);
         assert_eq!(

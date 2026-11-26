@@ -1717,6 +1717,8 @@ fn projection_export_reports_on_the_stream_its_rows_do_not_use() {
     }
 
     let rows = directory.path().join("rows.jsonl");
+    let previous = b"{\"type\":\"Catalog\",\"id\":\"previous\"}\n";
+    fs::write(&rows, previous).expect("a previous export");
     let output = export(&[
         "--store",
         store,
@@ -1727,9 +1729,10 @@ fn projection_export_reports_on_the_stream_its_rows_do_not_use() {
     let failure: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("with --out the report is on stdout");
     assert_eq!(failure["error"]["code"], "export_record_unreadable");
-    assert!(
-        fs::read(&rows).expect("the --out file").is_empty(),
-        "an export that stops writes no row"
+    assert_eq!(
+        fs::read(&rows).expect("the --out file"),
+        previous,
+        "an export that stops leaves the --out file as it was"
     );
 
     let empty = directory.path().join("empty");

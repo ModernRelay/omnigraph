@@ -614,6 +614,12 @@ omnigraph query --target s3://bucket/bench/main/graph \
   --params '{"scenario": "branch-merge-d50-process-cold"}'
 ```
 
+`--out <file>` takes the rows in place of stdout and is written whole, once,
+when the export succeeds; an export that stops leaves the file as it was. A run
+row's `archive_object` and `archive_pointer` both name the store's record,
+`records/<sha256>.json`: the store writes no pointer objects, so a record is its
+own pointer.
+
 The rows are graph JSONL in the loader's envelope, every node first and every
 edge after, and the schema's keys say what each row is: a `Scenario` and a
 `Suite` are their names, a `Workload` is its bytes, a `Fixture` its file or

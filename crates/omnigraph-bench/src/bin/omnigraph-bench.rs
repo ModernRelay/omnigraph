@@ -635,7 +635,7 @@ enum ProjectionCommand {
         /// A catalog, repeatable: a benchmarks.yaml or the directory holding one; none means records alone.
         #[arg(long, value_name = "DIR|FILE")]
         catalog: Vec<PathBuf>,
-        /// Write the rows to this file; the summary then goes to stdout instead of stderr.
+        /// Write the rows to this file, whole and only when the export succeeds; the summary then goes to stdout instead of stderr.
         #[arg(long)]
         out: Option<PathBuf>,
         /// Emit the summary as JSON.
@@ -1092,9 +1092,11 @@ async fn run_export(
     };
     let summary = match &out {
         Some(path) => {
-            let file = match fs::File::create(path) {
-                Ok(file) => file,
-                Err(error) => {
+            let mut rows = Vec::new();
+            let summary =
+                omnigraph_bench::export::export(&fixture_store, &catalogs, &mut rows).await;
+            if summary.is_ok() {
+                if let Err(error) = fs::write(path, &rows) {
                     return report.diagnostic(
                         Diagnostic::error(
                             "export_write_failed",
@@ -1104,19 +1106,6 @@ async fn run_export(
                         json,
                     );
                 }
-            };
-            let mut writer = std::io::BufWriter::new(file);
-            let summary =
-                omnigraph_bench::export::export(&fixture_store, &catalogs, &mut writer).await;
-            if let Err(error) = writer.flush() {
-                return report.diagnostic(
-                    Diagnostic::error(
-                        "export_write_failed",
-                        "out",
-                        format!("{}: {error}", path.display()),
-                    ),
-                    json,
-                );
             }
             summary
         }
