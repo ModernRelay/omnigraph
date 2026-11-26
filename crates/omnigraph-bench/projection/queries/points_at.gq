@@ -1,0 +1,13 @@
+query points_at($scenario: String, $factor: String, $value: String) {
+    match {
+        $s: Scenario { name: $scenario }
+        $s defines $p
+        $l: Level { factor: $factor, value: $value }
+        $p has $l
+    }
+    return {
+        $p.point_id as point
+        $p.point_name as point_name
+    }
+    order { point asc }
+}

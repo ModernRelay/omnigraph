@@ -115,6 +115,14 @@ impl Scenario {
         self.repetitions.or(defaults.repetitions).unwrap_or(5)
     }
 
+    /// The deadline this scenario runs under: its own, else the defaults',
+    /// else sixty seconds; an explicit null at either level is no deadline.
+    pub fn deadline_seconds(&self, defaults: &Defaults) -> Option<u64> {
+        self.deadline_seconds
+            .or(defaults.deadline_seconds)
+            .unwrap_or(Some(60))
+    }
+
     /// The case as one experiment: the scenario names what is measured, the
     /// run's `environment` names where, and the reset level follows it
     /// unless the protocol overrides say otherwise. The catalog's defaults
@@ -154,10 +162,7 @@ impl Scenario {
             if restored { value } else { None }
         }
         let protocol = Protocol {
-            deadline_seconds: self
-                .deadline_seconds
-                .or(defaults.deadline_seconds)
-                .unwrap_or(Some(60)),
+            deadline_seconds: self.deadline_seconds(defaults),
             attribution: self
                 .protocol
                 .attribution
