@@ -72,4 +72,6 @@ needs `--yes`, as for any non-local target. Every other write on cloud storage
 server, whose lock and policy guard a served graph; for a graph a server
 serves, write through that server. `changes poll` and `changes baseline` are
 reads, but an inline `s3://` graph refuses them too: follow its change feed
-through a server.
+through a server. A graph shallow clone is the exception: under
+`--base s3://BASE` its inline `s3://` clone root takes these writes and both
+change-feed commands (see `--base` in the [CLI reference](../cli/reference.md)).
