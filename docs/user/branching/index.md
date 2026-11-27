@@ -93,7 +93,7 @@ A new branch name holds letters and digits (`é` too), `.`, `-`, `_` and `/`, in
 non-empty segments, with no `..` or final `.`; create refuses others by name.
 Live names must not be path prefixes of one another (`review`, `review/alice`);
 `main` is reserved. Deleting a parent keeps its descendants. A segment ending in
-`.` and a ULID (`.01M8EF3NW9Q574XBHNVE3Z54A9`) is reserved; `release.1.2` is fine.
+`.` and an upper-case ULID (`.01M8EF3NW9Q574XBHNVE3Z54A9`) is reserved; `release.1.2` is fine.
 
 A branch name is used exactly as written, never trimmed: `main ` does not name
 `main`. A name that is empty, has leading or trailing whitespace, or contains a
