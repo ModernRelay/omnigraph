@@ -272,8 +272,12 @@ omnigraph commit list --target $REPO --branch main --json        # history
 > ID`, and before restarting the server release the lock the direct write
 > keeps: once that write has finished and its I/O has settled, read its
 > `lock_id` from `cluster status --target ROOT --json`, then
-> `cluster force-unlock <LOCK_ID> --target ROOT`. Data commands refuse an
-> inline cloud URI; an `s3://` root reaches only cluster and maintenance
-> commands, except a graph shallow clone: `--base s3://BASE` with an inline
-> `s3://` clone root reaches graph reads and writes, and every reopen of the
-> clone passes the same `--base`.
+> `cluster force-unlock <LOCK_ID> --target ROOT`. An inline `s3://` graph (no
+> `--graph`) serves the direct reads and `init`, `schema apply` and `load`; the
+> reads and `load` also take an `s3://` cluster root with `--graph`, and such a
+> `load` takes the cluster's admission lock and keeps it;
+> `mutate`, `branch create|delete|merge`, `commit publish|drop`,
+> `blob put|clear` and `changes` on cloud storage go through a server. A graph
+> shallow clone, `--base s3://BASE` with an inline `s3://` clone root, also
+> reaches graph reads and writes, and every reopen of the clone passes the
+> same `--base`.

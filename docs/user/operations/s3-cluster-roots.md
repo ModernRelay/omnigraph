@@ -68,6 +68,10 @@ described above. A reader
 takes no lock and writes nothing. `load --mode overwrite` against an S3 graph
 needs `--yes`, as for any non-local target. Every other write on cloud storage
 (`mutate`, `branch create`, `branch delete`, `branch merge`, `commit publish`,
-`commit drop`, `blob put`, `blob clear`, `changes`) reaches it through a
+`commit drop`, `blob put`, `blob clear`) reaches it through a
 server, whose lock and policy guard a served graph; for a graph a server
-serves, write through that server.
+serves, write through that server. `changes poll` and `changes baseline` are
+reads, but an inline `s3://` graph refuses them too: follow its change feed
+through a server. A graph shallow clone is the exception: under
+`--base s3://BASE` its inline `s3://` clone root takes these writes and both
+change-feed commands (see `--base` in the [CLI reference](../cli/reference.md)).
