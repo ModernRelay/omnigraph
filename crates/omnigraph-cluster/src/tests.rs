@@ -601,6 +601,60 @@ fn embedding_provider_config_accepts_provider_resources_and_graph_refs() {
 }
 
 #[test]
+fn embedding_provider_model_must_match_recorded_embed_models() {
+    let dir = fixture();
+    let schema = format!(
+        "{SCHEMA}\nnode Doc {{\n    slug: String @key\n    body: String\n    embedding: Vector(4) @embed(\"body\", model=\"space-a\")\n    unrecorded: Vector(4)? @embed(\"body\")\n}}\n"
+    );
+    fs::write(dir.path().join("people.pg"), schema).unwrap();
+
+    write_mock_embedding_cluster(dir.path(), "space-a");
+    let matching = validate_config_dir(dir.path());
+    assert!(matching.ok, "{:?}", matching.diagnostics);
+
+    // The recorded model is refused at plan time, not at the first text
+    // nearest(); a field that records no model is not judged.
+    write_mock_embedding_cluster(dir.path(), "space-b");
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    let mismatches = out
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "embedding_model_mismatch")
+        .collect::<Vec<_>>();
+    assert_eq!(mismatches.len(), 1, "{:?}", out.diagnostics);
+    assert_eq!(mismatches[0].path, "graphs.knowledge.embedding_provider");
+    assert!(
+        mismatches[0].message.contains("Doc.embedding")
+            && mismatches[0].message.contains("'space-a'")
+            && mismatches[0].message.contains("'space-b'"),
+        "{}",
+        mismatches[0].message
+    );
+
+    // A provider default counts as the resolved model.
+    let config = fs::read_to_string(dir.path().join(CLUSTER_CONFIG_FILE)).unwrap();
+    fs::write(
+        dir.path().join(CLUSTER_CONFIG_FILE),
+        config.replace(
+            "      kind: mock\n      model: space-b\n",
+            "      kind: gemini\n      api_key: ${GEMINI_API_KEY}\n",
+        ),
+    )
+    .unwrap();
+    let defaulted = validate_config_dir(dir.path());
+    assert!(
+        defaulted
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "embedding_model_mismatch"
+                && d.message.contains("'gemini-embedding-2'")),
+        "{:?}",
+        defaulted.diagnostics
+    );
+}
+
+#[test]
 fn embedding_provider_config_rejects_bad_refs_and_inline_secrets() {
     let dir = fixture();
     fs::write(

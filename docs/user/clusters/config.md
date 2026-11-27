@@ -126,6 +126,13 @@ during live deployment preflight for affected graphs. `cluster validate`,
 `plan`, and direct apply do not resolve it. Vector dimensions remain part of
 the graph schema.
 
+When a bound graph's schema records a model with `@embed(..., model = "...")`,
+the provider must resolve to exactly that model, its own `model` or its
+`kind`'s default. Validation, `plan` and apply refuse a mismatch with
+`embedding_model_mismatch`, rather than leaving the first text `nearest` to
+fail. A `mock` profile without `model` is not checked, because its model comes
+from the serving process's environment.
+
 See [Embeddings](../search/embeddings.md) for provider behavior.
 
 ## External Blob references

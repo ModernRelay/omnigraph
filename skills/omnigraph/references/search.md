@@ -266,7 +266,10 @@ are `OMNIGRAPH_EMBED_DEADLINE_MS`, `OMNIGRAPH_EMBED_TIMEOUT_MS`,
 
 For a served graph, declare a named provider under `providers.embedding` in
 `cluster.yaml` and bind it with `graphs.<id>.embedding_provider`. API keys must
-be `${ENV_VAR}` references and are resolved by the server at startup. Generated
+be `${ENV_VAR}` references and are resolved by the server at startup. If the
+schema records `@embed(..., model=...)`, `cluster validate`, `plan` and apply
+refuse a bound provider that resolves to another model
+(`embedding_model_mismatch`). Generated
 vectors are finite, nonzero, and L2-normalized.
 
 A full-text call can fail with HTTP `409` before any scan.

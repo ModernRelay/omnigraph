@@ -1,0 +1,1 @@
+- `cluster validate`, `plan` and apply refuse a graph whose bound embedding provider resolves to a model other than one its schema records with `@embed(..., model = "...")`, reporting `embedding_model_mismatch`. Before, the mismatch surfaced only when the first text `nearest` was refused.
