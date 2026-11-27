@@ -18,6 +18,7 @@ pub mod archive;
 pub mod branch_merge;
 pub mod case;
 pub mod catalog;
+pub mod check;
 pub mod counting;
 pub mod dataset_cache;
 pub mod dataset_identity;

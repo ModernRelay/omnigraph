@@ -933,6 +933,9 @@ pub(crate) fn check_read_expect(
         QueryExpect::Error { needle } => {
             check_error_expect(observer, needle, outcome, succeeded).map_err(fail)
         }
+        QueryExpect::Succeeds => outcome
+            .map(drop)
+            .map_err(|e| fail(format!("{failed}: {e}"))),
     }
 }
 
@@ -956,7 +959,7 @@ async fn query(
                 QueryExpect::Error { needle } => {
                     Err(fail(format!("error does not contain \"{needle}\": {e}")))
                 }
-                QueryExpect::Rows { .. } => Err(fail(e)),
+                QueryExpect::Rows { .. } | QueryExpect::Succeeds => Err(fail(e)),
             };
         }
     };
@@ -1409,6 +1412,9 @@ async fn branch_read(
             check_error_expect(observer, needle, outcome, &format!("`{name}` succeeded"))
                 .map_err(fail)
         }
+        QueryExpect::Succeeds => outcome
+            .map(drop)
+            .map_err(|e| fail(format!("`{name}` failed: {e}"))),
     }
 }
 

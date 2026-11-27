@@ -30,7 +30,16 @@ target/release/omnigraph-bench run local-fast \
 
 Use `list fixtures`, `list workloads` and `list scenarios` to discover inputs;
 `show NAME` reports effective settings and `show --workload FILE` lists operation
-ordinals. `init --help` explains config generation. All support JSON output.
+ordinals. `check NAME` runs every step of a suite's or a scenario's workload on
+a graph built from its fixture without its seed rows and loads (the schema, the
+declared branches with their recipes, the fixture's own steps minus every `load
+csv`), the data expectations of both relaxed (rows, counts, outcomes, plans and
+shapes ignored, `error:` expects kept): the proof that an entry parses, compiles,
+plans and executes, in seconds and before any fixture is built; exit 1 names
+each scenario that did not. The workload's own loads run. A step whose success
+needs the seed (an edge between seeded nodes, an `error:` the data causes, a
+`bind` on a write that matches nothing) fails under `check` and is the run's to
+prove. `init --help` explains config generation. All support JSON output.
 `cache status NAME` and paginated `cache list` are read-only: `present` validates
 published evidence, while `--verify` audits bytes before reporting `cached`.
 Missing sources and absent cache entries remain distinct. See `help config`,
@@ -829,8 +838,8 @@ printed first, per ref (the table, or one line per ref under `--json`), since
 they are already in the store. `--at` runs catalog scenarios only, never
 a legacy case file, and conflicts with `--archive` and `--product`.
 
-`--catalog <dir | file>`, repeatable on `run`, `report`, `show`, `list` and
-`cache status`, reads several catalogs in one call (a directory means its
+`--catalog <dir | file>`, repeatable on `run`, `report`, `show`, `check`, `list`
+and `cache status`, reads several catalogs in one call (a directory means its
 `benchmarks.yaml`): a name resolves in the first catalog that declares it as a
 suite or a scenario, `run` and `report` use that catalog, `show` names it as
 `config`, and `list` prints every catalog (`--json`: `{"catalogs": [...]}`, one

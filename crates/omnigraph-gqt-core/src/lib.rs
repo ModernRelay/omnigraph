@@ -647,6 +647,9 @@ enum QueryExpect {
     Error {
         needle: String,
     },
+    /// The read must succeed; its rows are not compared. Never parsed: the
+    /// form [`Case::relax_data_expectations`] gives a `Rows` expect.
+    Succeeds,
 }
 
 #[derive(Debug)]
@@ -2425,7 +2428,7 @@ fn unbound(name: &str) -> CaseError {
 fn missing_shape(step: &Step) -> CaseError {
     let line = match step.read_expect() {
         Some(QueryExpect::Rows { span, .. }) => span.start_line,
-        Some(QueryExpect::Error { .. }) | None => 0,
+        Some(QueryExpect::Error { .. } | QueryExpect::Succeeds) | None => 0,
     };
     CaseError::new(
         CaseErrorCode::MissingShape,
@@ -4496,7 +4499,7 @@ async fn run_query_step(
                 QueryExpect::Error { needle } => {
                     Err(fail(format!("error does not contain \"{needle}\": {e}")))
                 }
-                QueryExpect::Rows { .. } => Err(fail(e)),
+                QueryExpect::Rows { .. } | QueryExpect::Succeeds => Err(fail(e)),
             };
         }
     };
@@ -4612,6 +4615,9 @@ async fn run_query_step(
         QueryExpect::Error { needle } => {
             check_error_expect(observer, needle, outcome, "the query succeeded").map_err(fail)
         }
+        QueryExpect::Succeeds => outcome
+            .map(drop)
+            .map_err(|e| fail(format!("query failed: {e}"))),
     }
 }
 
@@ -4859,6 +4865,9 @@ async fn run_branch_read_step(
             &format!("`{statement}` succeeded"),
         )
         .map_err(fail),
+        QueryExpect::Succeeds => outcome
+            .map(drop)
+            .map_err(|e| fail(format!("`{statement}` failed: {e}"))),
     }
 }
 
@@ -4913,6 +4922,9 @@ fn check_synthetic_expect<E: std::fmt::Display>(
             &format!("`{statement}` succeeded"),
         )
         .map_err(fail),
+        QueryExpect::Succeeds => outcome
+            .map(drop)
+            .map_err(|e| fail(format!("`{statement}` failed: {e}"))),
     }
 }
 
@@ -5757,6 +5769,27 @@ pub async fn seed_case(
     Ok(())
 }
 
+/// The fixture's structure on a fresh store without its seed: the indices a
+/// traversal pin needs, then the declared branches forked from the empty
+/// head, each with its recipe rows as [`Branches::load`] writes them. For a
+/// run that proves a workload executes on a graph without its seed.
+pub async fn branch_case(
+    session: &Session,
+    fixture: &Fixture,
+    needs_indices: bool,
+) -> Result<(), String> {
+    if needs_indices {
+        session
+            .ensure_indices_as(None)
+            .await
+            .map_err(|e| format!("ensure_indices failed: {e}"))?;
+    }
+    if let Some(branches) = &fixture.branches {
+        branches.load(session).await?;
+    }
+    Ok(())
+}
+
 /// Executes the parsed steps and returns the current session, including any restart replacement.
 pub fn execute_steps<'a, H: ExecutionHost, O: Observer>(
     case: &'a Case,
@@ -6069,6 +6102,7 @@ fn read_expect_evidence(expect: &QueryExpect) -> Value {
             serde_json::json!({"kind": "rows", "ordered": ordered, "rows_jsonl": body_raw, "shape": format!("{:?}", shape.lines)})
         }
         QueryExpect::Error { needle } => serde_json::json!({"kind": "error", "contains": needle}),
+        QueryExpect::Succeeds => serde_json::json!({"kind": "succeeds"}),
     }
 }
 
@@ -6102,6 +6136,82 @@ fn bless_rewrite(
     }
     std::fs::write(path, splice_lines(&original, span, lines))
         .map_err(|e| format!("bless: cannot write case: {e}"))
+}
+
+impl Case {
+    /// Keep only what holds on any data: a read expect of rows becomes "the
+    /// read succeeds", an `affected:` count and a merge `outcome:` become
+    /// `ok`, and the plan, shape, expand and reference-engine checks are
+    /// dropped; an `error:` expect stays. For a run that proves a workload
+    /// parses, compiles, plans and executes on an empty graph.
+    pub fn relax_data_expectations(&mut self) {
+        let steps = self.items.iter_mut().flat_map(|item| match item {
+            Item::Step(step) => std::slice::from_mut(step).iter_mut(),
+            Item::Loop { steps, .. } => steps.iter_mut(),
+        });
+        for step in steps {
+            match step {
+                Step::Query(query) => {
+                    relax_read_expect(&mut query.expect);
+                    query.plan = None;
+                    query.expects_expand = false;
+                    query.same_as_v1 = false;
+                }
+                Step::Mutate(mutate) => {
+                    if matches!(mutate.expect, MutateExpect::Affected { .. }) {
+                        mutate.expect = MutateExpect::Ok;
+                    }
+                    mutate.plan = None;
+                }
+                Step::List(list) => relax_read_expect(&mut list.expect),
+                Step::Show(show) => relax_read_expect(&mut show.expect),
+                Step::BranchRead(read) => relax_read_expect(&mut read.expect),
+                Step::Control(control) => match &mut control.write {
+                    ControlWrite::Merge { expect, plan, .. } => {
+                        if matches!(expect, MergeExpect::Outcome(_)) {
+                            *expect = MergeExpect::Write(WriteExpect::Ok);
+                        }
+                        *plan = None;
+                    }
+                    ControlWrite::Load { plan, .. } => *plan = None,
+                    ControlWrite::Create { .. }
+                    | ControlWrite::Delete { .. }
+                    | ControlWrite::Publish { .. }
+                    | ControlWrite::Drop { .. } => {}
+                },
+                Step::Load(_) | Step::Settings(_) | Step::Restart { .. } | Step::Concurrent(_) => {}
+            }
+        }
+    }
+
+    /// Remove every `load csv` step and every generated `--- load` step, so a
+    /// fixture builds its schema, branches and writes without its data; a
+    /// loop left with no step goes with them.
+    pub fn drop_loads(&mut self) {
+        let is_load = |step: &Step| {
+            matches!(
+                step,
+                Step::Load(_)
+                    | Step::Control(ControlStep {
+                        write: ControlWrite::Load { .. },
+                        ..
+                    })
+            )
+        };
+        self.items.retain_mut(|item| match item {
+            Item::Step(step) => !is_load(step),
+            Item::Loop { steps, .. } => {
+                steps.retain(|step| !is_load(step));
+                !steps.is_empty()
+            }
+        });
+    }
+}
+
+fn relax_read_expect(expect: &mut QueryExpect) {
+    if matches!(expect, QueryExpect::Rows { .. }) {
+        *expect = QueryExpect::Succeeds;
+    }
 }
 
 impl Step {
