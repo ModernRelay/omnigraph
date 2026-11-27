@@ -811,12 +811,24 @@ holds the branch's writer epoch skips the probe on its handle's bound branch, so
 nothing there catches another process's delete of that branch until a publish of
 the holder loads it ([writes](writes.md#writer-epoch)).
 
+Callers that overlap on one held view share a probe (`probe_flights`, keyed by
+the held and main `__manifest` images and the branch). A caller takes only the
+answer of a probe that started after it arrived (`read:2`): one that arrives
+while a probe is in flight waits for the next, which starts when the running
+one ends and serves every caller that arrived meanwhile. A flight runs while
+any caller waits on it, and an error goes to one caller; the others probe
+again on their own.
+
 **Owners:** `omnigraph-catalog`
 `freshness_probe_asks_for_the_next_version_by_name` (V1 and V2 paths on an
 ordered store: HEADs and no listing, the listing past two versions, the
 listing's `NotFound` for a removed `__manifest`); engine
 `lifecycle::write_preparation_manifest_read_failures_carry_before_effect_evidence`
-(a write on a warm handle refuses before effects when `__manifest` is gone)
+(a write on a warm handle refuses before effects when `__manifest` is gone);
+in-source `probe_flights::tests` (the sharing rule, cancellation and errors);
+engine `warm_read_cost::overlapping_warm_reads_share_a_probe_that_started_after_them`
+and `concurrent_warm_queries_share_freshness_probes` (overlapping warm reads
+share probes and see a commit acknowledged before they began)
 
 ### Local manifest identity
 

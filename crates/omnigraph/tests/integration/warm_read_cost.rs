@@ -17,7 +17,7 @@ use omnigraph::instrumentation::{ProbedStores, QueryIoProbes, with_query_io_prob
 use omnigraph::loader::LoadMode;
 use omnigraph_catalog::TAIL_MAX_COMMITS;
 
-use crate::helpers::cost::{cost_harness, last_manifest_reads, measure};
+use crate::helpers::cost::{ProbeHeadGate, cost_harness, last_manifest_reads, measure};
 use crate::helpers::{
     MUTATION_QUERIES, TEST_QUERIES, TEST_SCHEMA, Traversal, commit_many, count_rows,
     first_column_sorted, init_and_load, mixed_params, mutate_branch, mutate_main, params, session,
@@ -213,6 +213,209 @@ async fn external_commit_observed_by_warm_reader() {
         before + 1,
         "warm reader must observe an external commit"
     );
+}
+
+/// Reads that overlap on one warm handle share one freshness probe, and a read
+/// that began after a commit was acknowledged sees it while a probe that
+/// started before the commit is still in flight: the later reads wait for the
+/// next probe instead of taking the running one's answer. Each read probing on
+/// its own fails the sharing assertions; a read taking the running probe's
+/// answer fails the visibility one.
+// contract: read:2
+#[tokio::test]
+async fn overlapping_warm_reads_share_a_probe_that_started_after_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap().to_string();
+    let gate = ProbeHeadGate::default();
+    let probes_run = Arc::new(AtomicU64::new(0));
+    let probes = QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(gate.clone()) as _),
+        probe_count: Arc::clone(&probes_run),
+        ..Default::default()
+    };
+    with_query_io_probes(
+        probes,
+        Box::pin(async move {
+            // The reader's `__manifest` store is gated from its open; the
+            // writer's is not, and it commits on a task without the probes.
+            let reader = Omnigraph::open(&uri).await.unwrap();
+            let old_head = reader.resolve_snapshot("main").await.unwrap();
+            let before = probes_run.load(Ordering::SeqCst);
+
+            gate.close();
+            let mut first = Box::pin(reader.resolve_snapshot("main"));
+            for _ in 0..10_000 {
+                if gate.held() == 2 {
+                    break;
+                }
+                assert!(futures::poll!(&mut first).is_pending());
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert_eq!(
+                gate.held(),
+                2,
+                "the first read's probe asked for v and v + 1"
+            );
+
+            let new_head = tokio::spawn(async move {
+                mutate_main(
+                    &writer,
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", "after_probe_start")], &[("$age", 42)]),
+                )
+                .await
+                .unwrap();
+                writer.resolve_snapshot("main").await.unwrap()
+            })
+            .await
+            .unwrap();
+            assert_ne!(new_head, old_head);
+
+            // Every later read arrives after the acknowledgement, while the
+            // first read's probe is still held.
+            let mut later: Vec<_> = (0..8)
+                .map(|_| Box::pin(reader.resolve_snapshot("main")))
+                .collect();
+            for _ in 0..16 {
+                for read in &mut later {
+                    assert!(futures::poll!(read).is_pending());
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                gate.held(),
+                2,
+                "a read arriving while a probe is in flight starts none of its own"
+            );
+
+            gate.open();
+            assert_eq!(
+                first.await.unwrap(),
+                old_head,
+                "the first read's probe asked before the commit"
+            );
+            for read in later {
+                assert_eq!(
+                    read.await.unwrap(),
+                    new_head,
+                    "a read sees every commit acknowledged before it began"
+                );
+            }
+            assert_eq!(
+                probes_run.load(Ordering::SeqCst) - before,
+                2,
+                "the first read's probe and one shared by the eight later reads"
+            );
+        }),
+    )
+    .await;
+}
+
+/// Many concurrent warm queries against a slow store ask `__manifest` far
+/// fewer times than there are queries, and all answer the same head.
+#[tokio::test]
+async fn concurrent_warm_queries_share_freshness_probes() {
+    const READS: u64 = 32;
+    let dir = tempfile::tempdir().unwrap();
+    let _writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap().to_string();
+    let gate = ProbeHeadGate::with_delay(std::time::Duration::from_millis(200));
+    let probes_run = Arc::new(AtomicU64::new(0));
+    let probes = QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(gate.clone()) as _),
+        probe_count: Arc::clone(&probes_run),
+        ..Default::default()
+    };
+    with_query_io_probes(
+        probes,
+        Box::pin(async move {
+            let reader = session(Omnigraph::open(&uri).await.unwrap());
+            let no_params = params(&[]);
+            let query = || {
+                reader.query_with_head(
+                    ReadTarget::branch("main"),
+                    TEST_QUERIES,
+                    "total_people",
+                    &no_params,
+                )
+            };
+            let (warm, head) = query().await.unwrap();
+            let before = probes_run.load(Ordering::SeqCst);
+            let outcomes = futures::future::join_all((0..READS).map(|_| query())).await;
+            let probes = probes_run.load(Ordering::SeqCst) - before;
+            for outcome in outcomes {
+                let (rows, read_head) = outcome.unwrap();
+                assert_eq!(read_head, head);
+                assert_eq!(
+                    rows.concat_batches().unwrap(),
+                    warm.concat_batches().unwrap(),
+                    "every query answers from the same head"
+                );
+            }
+            assert!(
+                probes * 4 <= READS,
+                "{READS} overlapping warm queries ran {probes} probes"
+            );
+        }),
+    )
+    .await;
+}
+
+/// Store requests and read latency of overlapping warm queries against a
+/// store whose `__manifest` version HEADs each take 20 ms, at 1, 16 and 64
+/// concurrent queries. Evidence for the probe-sharing change, not a gate.
+#[tokio::test]
+#[ignore = "instrument: overlapping warm reads against a slow __manifest store"]
+async fn instrument_overlapping_warm_reads_on_a_slow_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let _writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap().to_string();
+    let gate = ProbeHeadGate::with_delay(std::time::Duration::from_millis(20));
+    let probes = QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(gate.clone()) as _),
+        ..Default::default()
+    };
+    with_query_io_probes(
+        probes,
+        Box::pin(async move {
+            let reader = session(Omnigraph::open(&uri).await.unwrap());
+            let no_params = params(&[]);
+            let query = || async {
+                let start = std::time::Instant::now();
+                reader
+                    .query_with_head(
+                        ReadTarget::branch("main"),
+                        TEST_QUERIES,
+                        "total_people",
+                        &no_params,
+                    )
+                    .await
+                    .unwrap();
+                start.elapsed()
+            };
+            query().await;
+            for readers in [1usize, 16, 64] {
+                for round in 0..5 {
+                    let heads = gate.heads();
+                    let start = std::time::Instant::now();
+                    let mut latencies =
+                        futures::future::join_all((0..readers).map(|_| query())).await;
+                    let wall = start.elapsed();
+                    latencies.sort();
+                    println!(
+                        "readers={readers} round={round} version_heads={} wall_ms={:.1} p50_ms={:.1} max_ms={:.1}",
+                        gate.heads() - heads,
+                        wall.as_secs_f64() * 1e3,
+                        latencies[readers / 2].as_secs_f64() * 1e3,
+                        latencies[readers - 1].as_secs_f64() * 1e3,
+                    );
+                }
+            }
+        }),
+    )
+    .await;
 }
 
 /// On a bound branch its process holds, a warm read binds the installed

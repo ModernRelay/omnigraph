@@ -1,0 +1,1 @@
+- Overlapping reads on one branch share a `__manifest` freshness probe: far fewer store requests, for up to one extra probe round trip of wait, and every read still sees each earlier commit.
