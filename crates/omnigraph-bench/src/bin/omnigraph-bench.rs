@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 mod bench_cli;
 use std::collections::BTreeMap;
 use std::fs;
@@ -63,6 +64,8 @@ enum Command {
     List(bench_cli::ListArgs),
     /// Inspect a scenario's effective settings or a workload's operation ordinals.
     Show(bench_cli::ShowArgs),
+    /// Run every step of a suite's or a scenario's workload on a graph built from its fixture without its seed and loads (declared branches keep their recipes), rows ignored: the entry parses, compiles, plans and executes.
+    Check(bench_cli::CheckArgs),
     /// Inspect cache contents without creating, restoring or changing them.
     Cache {
         #[command(subcommand)]
@@ -704,6 +707,7 @@ async fn main() -> ExitCode {
     match cli.command {
         Command::List(args) => bench_cli::list(args),
         Command::Show(args) => bench_cli::show(args),
+        Command::Check(args) => Box::pin(bench_cli::check(args)).await,
         Command::Cache { command } => bench_cli::cache(command),
         Command::Init(args) => bench_cli::init(args),
         Command::Help(args) => bench_cli::help(args),
