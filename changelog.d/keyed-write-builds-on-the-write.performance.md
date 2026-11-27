@@ -1,0 +1,1 @@
+- A keyed write (merge load, keyed insert, branch merge) builds its join on the rows it writes, not on the whole table, so a small write into a large table uses less memory.
