@@ -87,7 +87,7 @@ also have a single-property shorthand.
 | `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `@src` and `@dst`. |
 | `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
 | `@range(p, min..max)` | node | Restricts a numeric property, or each element of a numeric list, to an inclusive range; either bound may be omitted. Values compare with the bounds exactly at any magnitude, and a decimal bound on an integer property admits the integers on its side: `@range(n, -2.5..2.5)` admits -2 through 2. |
-| `@check(p, "regex")` | node | Requires a String property to match the expression. |
+| `@check(p, "regex")` | node | Requires a String property to match the expression. A list property is refused: `@range` is the constraint that bounds each element. |
 | `@card(min..max)` | edge | Bounds how many edges of the type start at each source node; omit `max` for an unbounded range, as in `@card(1..)`. The default is unbounded from zero. See [Edge cardinality](#edge-cardinality). |
 
 `@range(p, ..10)` supplies only a maximum, and `@range(p, 10..)` supplies
@@ -118,6 +118,13 @@ one schema change, then add the properties back without it; dropping a
 property discards its stored values. A constraint that also names another
 property or `@src`/`@dst` cannot be removed in place: rebuild the graph
 without it.
+
+Earlier releases also admitted `@check` on a list property, and no write
+checked it. A graph that already declares one still opens, and its writes stay
+unchecked, but reapplying that source is refused at admission, as is every
+`cluster apply` of a deployment that contains the graph. To remove the
+constraint, drop the property in one schema change, then add it back without
+it; dropping a property discards its stored values.
 
 Current automatic property indexes are created for single-property node declarations:
 orderable scalars and enums receive a scalar index, free-text Strings receive a

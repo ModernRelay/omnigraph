@@ -701,6 +701,48 @@ age: I32
 }
 
 #[test]
+fn test_reject_check_on_list_property() {
+    // `@check` on a `[String]` property was admitted but never enforced: the
+    // write path matches the pattern against one String column, which a list
+    // column is not, so every row passed unexamined. Admission now refuses the
+    // shape instead of accepting a constraint that cannot run.
+    let listed = r#"
+node Doc {
+slug: String @key
+tags: [String]
+@check(tags, "^ok$")
+}
+"#;
+    let error = parse_schema_diagnostic(listed).expect_err("list @check admits no check");
+    assert_eq!(
+        error.to_string(),
+        "parse error: @check is not supported on list property Doc.tags"
+    );
+
+    // A graph that already holds the member keeps opening: the persisted
+    // contract path skips the new refusal, like the body-level `@unique` one.
+    assert!(parse_persisted_schema_contract(listed).is_ok());
+
+    // The scalar spelling the constraint is for still parses and is kept.
+    let scalar = r#"
+node Doc {
+slug: String @key
+code: String
+@check(code, "^ok$")
+}
+"#;
+    let schema = parse_schema(scalar).unwrap();
+    match &schema.declarations[0] {
+        SchemaDecl::Node(node) => assert!(
+            node.constraints
+                .iter()
+                .any(|c| matches!(c, Constraint::Check { property, .. } if property == "code"))
+        ),
+        other => panic!("expected Node, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_parse_edge_cardinality() {
     let input = r#"
 node Person { name: String }

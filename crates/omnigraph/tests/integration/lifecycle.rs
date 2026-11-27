@@ -695,6 +695,71 @@ node Document {
 }
 
 #[tokio::test]
+async fn historical_list_check_opens_and_ends_by_dropping_its_property() {
+    // `@check` on a `[String]` property was admitted but never enforced: the
+    // value check reads one String column. New admission refuses it; a graph
+    // that already holds one still opens, and dropping the property is the
+    // only way to remove the constraint, since constraint removal in place
+    // is not a supported apply.
+    const BASE_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    tags: [String]?
+}
+"#;
+    const CHECK_TAGS: &str = r#"
+node Document {
+    title: String @key
+    tags: [String]?
+    @check(tags, "^ok$")
+}
+"#;
+    const WITHOUT_TAGS: &str = r#"
+node Document {
+    title: String @key
+}
+"#;
+    const REFUSAL: &str = "@check is not supported on list property Document.tags";
+
+    let rejected_dir = tempfile::tempdir().unwrap();
+    let error = match Omnigraph::init(rejected_dir.path().to_str().unwrap(), CHECK_TAGS).await {
+        Ok(_) => panic!("new init must refuse: {REFUSAL}"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains(REFUSAL), "{error}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BASE_SCHEMA).await.unwrap();
+    let accepted = db.catalog().bound_schema_ir().unwrap().clone();
+    drop(db);
+    let historical_ir = resolve_schema_ir(&accepted, &compile_persisted_shape(CHECK_TAGS))
+        .unwrap()
+        .schema_ir;
+    publish_schema_contract_row(uri, CHECK_TAGS, &historical_ir).await;
+
+    let db = Omnigraph::open(uri)
+        .await
+        .unwrap_or_else(|error| panic!("historically admitted schema must open: {error}"));
+    assert_eq!(db.schema_source().as_str(), CHECK_TAGS);
+
+    let error = db
+        .apply_schema(CHECK_TAGS)
+        .await
+        .expect_err("reapplying source that keeps the member is refused at admission");
+    assert!(error.to_string().contains(REFUSAL), "{error}");
+    assert_eq!(db.schema_source().as_str(), CHECK_TAGS);
+
+    db.apply_schema(WITHOUT_TAGS)
+        .await
+        .expect("dropping the property @check names removes the constraint");
+    db.apply_schema(BASE_SCHEMA)
+        .await
+        .expect("the property comes back without the constraint");
+    assert_eq!(db.schema_source().as_str(), BASE_SCHEMA);
+}
+
+#[tokio::test]
 async fn open_reads_existing_graph() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();

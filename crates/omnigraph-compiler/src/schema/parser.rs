@@ -1318,6 +1318,17 @@ fn validate_type_constraints(
                         type_name, property
                     ))
                 })?;
+                // A list is refused rather than bounded element by element as
+                // `@range` is: the write path matches the pattern against one
+                // String column, so a `[String]` member admitted here would
+                // never be checked. Earlier releases admitted that member, so a
+                // persisted contract keeps it and its graph still opens.
+                if prop.prop_type.list && mode == ConstraintValidationMode::Admission {
+                    return Err(CompilerError::Parse(format!(
+                        "@check is not supported on list property {}.{}",
+                        type_name, property
+                    )));
+                }
                 if prop.prop_type.scalar != ScalarType::String {
                     return Err(CompilerError::Parse(format!(
                         "@check on {}.{} requires String type, got {}",
