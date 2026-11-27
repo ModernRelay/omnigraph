@@ -33,7 +33,7 @@ export OMNIGRAPH_AZURE_SERVER_BEARER_TOKEN='replace-me'
 # Local, non-destructive checks: input shape plus `az bicep build`.
 deploy/azure/deploy.sh validate \
   --bundle ./company-brain \
-  --server-image ghcr.io/modernrelay/omnigraph-server@sha256:<digest>
+  --server-image docker.io/modernrelay/omnigraph-server@sha256:<digest>
 
 # Creates the foundation, imports the server image, builds an immutable bundle
 # image, proves managed-identity image/Blob readiness, runs
@@ -46,7 +46,7 @@ deploy/azure/deploy.sh deploy \
   --container omnigraph \
   --cluster-prefix clusters/company-brain \
   --bundle ./company-brain \
-  --server-image ghcr.io/modernrelay/omnigraph-server@sha256:<digest> \
+  --server-image docker.io/modernrelay/omnigraph-server@sha256:<digest> \
   --evidence-out ./azure-deployment-evidence.json
 ```
 
