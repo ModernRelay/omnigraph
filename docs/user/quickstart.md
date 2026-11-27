@@ -113,8 +113,13 @@ omnigraph load --data benchmark.jsonl --mode append \
 omnigraph query sources_for_claim --query queries.gq \
   --params '{"claim":"lower-latency"}' \
   --branch review/add-benchmark --target ./graph.omni
-omnigraph branch merge review/add-benchmark --into main --target ./graph.omni
+omnigraph branch merge review/add-benchmark --into main --delete-branch \
+  --target ./graph.omni
 ```
+
+A merge keeps its source branch. `--delete-branch` deletes it after the merge.
+`omnigraph schema apply` needs `main` to be the only branch, and a deleted
+branch also lets `omnigraph cleanup` reclaim the files it kept.
 
 See [branches & commits](branching/index.md) and [merging](branching/merge.md).
 

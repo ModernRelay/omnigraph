@@ -232,6 +232,11 @@ omnigraph schema plan --schema next.pg --target ./graph.omni
 omnigraph schema apply --schema next.pg --target ./graph.omni
 ```
 
+Apply needs `main` to be the graph's only branch, and refuses while any other
+branch exists. A merge keeps its source branch, so merge with
+`omnigraph branch merge <name> --into main --delete-branch`, or delete a merged
+branch with `omnigraph branch delete <name>`, before applying.
+
 Supported changes include adding types, adding nullable properties, renaming
 nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, making a nullable property required, adding
