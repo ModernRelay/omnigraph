@@ -1,0 +1,1 @@
+- Reads that arrive together on one branch share one `__manifest` freshness probe. No read waits on an earlier probe, and each still sees every commit made before it began.

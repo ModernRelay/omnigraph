@@ -423,8 +423,10 @@ impl GraphCoordinator {
         omnigraph_catalog::has_branch_rows(self.manifest.main_manifest())
     }
 
+    /// The latest incarnation of the bound branch's `__manifest`. Concurrent
+    /// callers on this coordinator and its captures share one probe that
+    /// started after each of them arrived; each probe that runs is counted.
     pub(crate) async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
-        crate::instrumentation::record_probe();
         self.manifest.probe_latest_incarnation().await
     }
 

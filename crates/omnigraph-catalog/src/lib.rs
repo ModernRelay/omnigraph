@@ -58,6 +58,7 @@ pub mod migrations;
 // `LanceNamespace` impls are retained only to validate the contract in tests.
 #[cfg(any(test, feature = "test-util"))]
 pub mod namespace;
+mod probe_flights;
 pub mod publisher;
 #[cfg(feature = "test-util")]
 pub mod read_executor;
@@ -978,12 +979,14 @@ pub struct CapturedManifestProbe {
     /// The main the branch resolved through, whose rows answer the lifetime
     /// without a request; `None` on main.
     main: Option<Dataset>,
+    /// Shared with the coordinator this probe was captured from.
+    flights: Arc<ManifestProbeFlights>,
 }
 
 impl CapturedManifestProbe {
     pub async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
-        crate::instrumentation::record_probe();
-        probe_dataset_latest_incarnation(
+        probe_latest_incarnation_shared(
+            &self.flights,
             &self.dataset,
             self.active_branch.as_deref(),
             self.main.as_ref(),
@@ -1002,6 +1005,76 @@ impl CapturedManifestProbe {
     pub fn captured(&self) -> &ManifestIncarnation {
         &self.captured
     }
+}
+
+/// The flights of one coordinator's freshness probes and of every capture
+/// of it, by the exact view probed.
+pub(crate) type ManifestProbeFlights =
+    probe_flights::ProbeFlights<ManifestProbeKey, ManifestIncarnation, OmniError>;
+
+/// Everything a freshness probe reads before it asks the store: the held
+/// `__manifest` image (its location, version and identity), the branch it
+/// probes for, and the main image whose rows answer a branch's lifetime. Two
+/// probes with one key ask the store the same question and interpret the
+/// answer the same way, so concurrent callers with one key may share one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ManifestProbeKey {
+    held: ManifestImage,
+    active_branch: Option<String>,
+    main: Option<ManifestImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ManifestImage {
+    uri: String,
+    native_branch: Option<String>,
+    version: u64,
+    e_tag: Option<String>,
+    timestamp_nanos: u128,
+}
+
+impl ManifestImage {
+    fn of(dataset: &Dataset) -> Self {
+        Self {
+            uri: dataset.uri().to_string(),
+            native_branch: dataset.manifest().branch.clone(),
+            version: dataset.version().version,
+            e_tag: dataset.manifest_location().e_tag.clone(),
+            timestamp_nanos: dataset.manifest().timestamp_nanos,
+        }
+    }
+}
+
+/// [`probe_dataset_latest_incarnation`] through `flights`: callers that
+/// overlap on one held view share a probe that started after each of them
+/// arrived (`read:2`), so a commit acknowledged before a caller began is in
+/// its answer. Each probe that runs is counted once.
+async fn probe_latest_incarnation_shared(
+    flights: &ManifestProbeFlights,
+    dataset: &Dataset,
+    active_branch: Option<&str>,
+    main: Option<&Dataset>,
+) -> Result<ManifestIncarnation> {
+    let key = ManifestProbeKey {
+        held: ManifestImage::of(dataset),
+        active_branch: active_branch.map(str::to_string),
+        main: main.map(ManifestImage::of),
+    };
+    let dataset = dataset.clone();
+    let active_branch = active_branch.map(str::to_string);
+    let main = main.cloned();
+    flights
+        .probe(key, move || {
+            let dataset = dataset.clone();
+            let active_branch = active_branch.clone();
+            let main = main.clone();
+            async move {
+                crate::instrumentation::record_probe();
+                probe_dataset_latest_incarnation(&dataset, active_branch.as_deref(), main.as_ref())
+                    .await
+            }
+        })
+        .await
 }
 
 /// The latest attached version of `dataset`'s location (main or the branch
@@ -1584,6 +1657,9 @@ pub struct ManifestCoordinator {
     /// The block registry rows that version's hot fragment holds.
     registry: Arc<LineageRegistry>,
     history: HistoryCache,
+    /// The freshness probes callers of this coordinator and of its captures
+    /// are waiting on, shared so overlapping callers share one.
+    probe_flights: Arc<ManifestProbeFlights>,
 }
 
 /// The history block an addressable commit id names; `None` for any other id.
@@ -1744,6 +1820,7 @@ impl ManifestCoordinator {
             buffer: Arc::clone(&self.buffer),
             registry: Arc::clone(&self.registry),
             history: self.history.clone(),
+            probe_flights: Arc::clone(&self.probe_flights),
         }
     }
 
@@ -1808,6 +1885,7 @@ impl ManifestCoordinator {
             buffer: Arc::new(buffer),
             registry: Arc::new(registry),
             history: HistoryCache::default(),
+            probe_flights: Arc::default(),
         }
     }
 
@@ -2341,6 +2419,7 @@ impl ManifestCoordinator {
             active_branch: self.active_branch.clone(),
             captured: self.incarnation(),
             main: self.main.clone(),
+            flights: Arc::clone(&self.probe_flights),
         }
     }
 
@@ -3140,8 +3219,12 @@ impl ManifestCoordinator {
     /// branches can be deleted and recreated with the same version, e_tag, and
     /// timestamp when both lifetimes fork the same source; the native branch
     /// identifier is therefore part of the freshness result as well.
+    ///
+    /// Concurrent callers on one held view share one probe that started after
+    /// each of them arrived (`probe_flights`).
     pub async fn probe_latest_incarnation(&self) -> Result<ManifestIncarnation> {
-        probe_dataset_latest_incarnation(
+        probe_latest_incarnation_shared(
+            &self.probe_flights,
             &self.dataset,
             self.active_branch.as_deref(),
             self.main.as_ref(),

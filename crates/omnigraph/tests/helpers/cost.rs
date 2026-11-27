@@ -1130,3 +1130,167 @@ pub fn assert_sweep_delete_requests_flat_in_files(curve: &[CleanupSweepCost]) {
         "freed files must share delete requests: {curve:?}"
     );
 }
+
+/// A `__manifest` store that slows or holds its version HEADs, the requests a
+/// freshness probe makes, so a test can keep a probe in flight. Each HEAD is
+/// answered by the store first, then takes `delay`; a HEAD that arrives while
+/// the gate holds new requests then waits until the gate opens: a held probe
+/// answers what the store held when it asked.
+#[derive(Debug, Clone)]
+pub struct ProbeHeadGate(Arc<ProbeHeadGateState>);
+
+#[derive(Debug)]
+struct ProbeHeadGateState {
+    open: tokio::sync::watch::Sender<bool>,
+    hold_new: std::sync::atomic::AtomicBool,
+    delay: std::time::Duration,
+    heads: AtomicU64,
+    held: AtomicU64,
+}
+
+impl ProbeHeadGate {
+    /// An open gate whose version HEADs each take `delay` more.
+    pub fn with_delay(delay: std::time::Duration) -> Self {
+        Self(Arc::new(ProbeHeadGateState {
+            open: tokio::sync::watch::Sender::new(true),
+            hold_new: std::sync::atomic::AtomicBool::new(false),
+            delay,
+            heads: AtomicU64::new(0),
+            held: AtomicU64::new(0),
+        }))
+    }
+
+    /// Hold every version HEAD that arrives from now until [`Self::open`].
+    pub fn close(&self) {
+        self.0.open.send_replace(false);
+        self.0.hold_new.store(true, Ordering::SeqCst);
+    }
+
+    /// Let HEADs that arrive from now pass; those already held stay held
+    /// until [`Self::open`].
+    pub fn stop_holding(&self) {
+        self.0.hold_new.store(false, Ordering::SeqCst);
+    }
+
+    /// Release every held HEAD and hold no new one.
+    pub fn open(&self) {
+        self.0.hold_new.store(false, Ordering::SeqCst);
+        self.0.open.send_replace(true);
+    }
+
+    /// Version HEADs answered by the store so far.
+    pub fn heads(&self) -> u64 {
+        self.0.heads.load(Ordering::SeqCst)
+    }
+
+    /// Version HEADs answered and waiting on the closed gate now.
+    pub fn held(&self) -> u64 {
+        self.0.held.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for ProbeHeadGate {
+    fn default() -> Self {
+        Self::with_delay(std::time::Duration::ZERO)
+    }
+}
+
+impl WrappingObjectStore for ProbeHeadGate {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
+    }
+
+    fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        Arc::new(ProbeHeadGateStore {
+            target,
+            gate: self.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ProbeHeadGateStore {
+    target: Arc<dyn ObjectStore>,
+    gate: ProbeHeadGate,
+}
+
+impl fmt::Display for ProbeHeadGateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ProbeHeadGateStore({})", self.target)
+    }
+}
+
+fn is_manifest_version_object(location: &Path) -> bool {
+    let path = location.as_ref();
+    path.contains("__manifest") && path.contains("_versions/") && path.ends_with(".manifest")
+}
+
+#[async_trait]
+impl ObjectStore for ProbeHeadGateStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        let head = options.head && is_manifest_version_object(location);
+        let result = self.target.get_opts(location, options).await;
+        if head {
+            let state = &self.gate.0;
+            state.heads.fetch_add(1, Ordering::SeqCst);
+            if !state.delay.is_zero() {
+                tokio::time::sleep(state.delay).await;
+            }
+            let mut open = state.open.subscribe();
+            if state.hold_new.load(Ordering::SeqCst) && !*open.borrow_and_update() {
+                state.held.fetch_add(1, Ordering::SeqCst);
+                let _ = open.wait_for(|open| *open).await;
+                state.held.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OSResult<()> {
+        self.target.copy_opts(from, to, options).await
+    }
+}
