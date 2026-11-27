@@ -446,6 +446,14 @@ fn graph_vocabulary_help_exposes_only_canonical_export_selection() {
     );
     assert!(!uri_help.contains("az://"), "{uri_help}");
 
+    // A lost `--if-commit` race exits 4 on both transports.
+    let mutate_help = stdout_string(&output_success(cli().arg("mutate").arg("--help")));
+    assert!(
+        mutate_help.contains("A lost race exits 4, against a server or embedded"),
+        "{mutate_help}"
+    );
+    assert!(!mutate_help.contains("1 embedded"), "{mutate_help}");
+
     // Members are the organization's active members; nothing enrolls them.
     let cluster_help = stdout_string(&output_success(cli().arg("cluster").arg("--help")));
     assert!(
