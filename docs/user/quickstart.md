@@ -1,9 +1,12 @@
 # Quickstart
 
 This walks the core loop end to end: define a schema, initialize a graph, load
-data, query it, and use a branch. It uses a local file-backed graph. CLI direct
-targets support local files only; access hosted graphs through a registered
-server or managed target. See [operator configuration](cli/targets.md).
+data, query it, and use a branch. It uses a local file-backed graph. A
+registered direct target supports local files only, and an inline `s3://` graph
+serves the direct reads, `init`, `schema apply` and `load`
+([inline S3 graphs](operations/s3-cluster-roots.md#inline-s3-graphs)); access
+other hosted graphs through a registered server or managed target. See
+[operator configuration](cli/targets.md).
 
 [Install](install.md) the `omnigraph` CLI first.
 
