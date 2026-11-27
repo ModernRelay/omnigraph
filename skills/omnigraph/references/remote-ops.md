@@ -122,7 +122,9 @@ route.
   operator and do not retry. A process another one replaced can answer reads
   from before the claim until a write of its own is refused.
 - `branch_exists` (HTTP `409`): `branch create` named a branch that exists, a
-  not-ready one included. Pick another name, or `branch delete` the holder.
+  not-ready one included, or a name that is a `/`-path ancestor or descendant
+  of a live or not yet retired branch (`review` blocks `review/x`, and
+  `review/x` blocks `review`). Pick another name, or `branch delete` the holder.
 - `branch_deleted` (HTTP `409`): the branch was deleted under the operation,
   or its retirement is pending after an interrupted delete. Nothing was
   written; `branch list --detailed` shows `deleted (retirement pending)`, and
