@@ -158,6 +158,11 @@ including writer ownership transfer and authentication. The
 [deployment guide](docs/user/deployment.md) covers containers and object stores;
 Azure writers require its admission wrapper.
 
+To try a hosted server without setting up storage, a community
+[Railway template](https://railway.com/deploy/omnigraph) runs the published
+`omnigraph-server` image with a local cluster on a volume and a generated
+bearer token for an operator actor; deploy graphs to it with `cluster apply`.
+
 The applied cluster policy must grant the authenticated operator `config_manage`.
 Schema changes also require `read` and `schema_apply` on the affected graphs.
 With those grants and a server target named `production`, deploy local edits:
