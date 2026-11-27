@@ -314,7 +314,7 @@ code rather than the message text.
 
 | Code | Meaning |
 |---|---|
-| `OG-MF-103` | Add a required property to a populated type. |
+| `OG-MF-103` | Add a required property to an existing type, whether or not it holds rows. |
 | `OG-MF-104` | Make a property required while a stored row holds a null (reported by `schema apply`). |
 | `OG-MF-106` | Change a property's type, including enum narrowing or renaming. |
 | `OG-MF-107` | Add an edge type with a non-zero `@card` minimum from an existing node type. |
