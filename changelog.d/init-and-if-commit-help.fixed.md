@@ -1,0 +1,1 @@
+- `omnigraph init --help` names the inline `s3://` graph address it accepts, and `mutate --help` says a lost `--if-commit` race exits 4 embedded as well as served.

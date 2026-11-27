@@ -1385,8 +1385,8 @@ impl GraphClient {
     /// `expected_head` is the `--if-commit` compare-and-swap precondition:
     /// the write runs only if the branch head commit still equals it. A
     /// mismatch preserves typed precondition details on both transports.
-    /// The command boundary reserves exit 4 for verified remote refusals
-    /// without earlier whole-command effects.
+    /// The command boundary reserves exit 4 for verified refusals, served or
+    /// embedded, without earlier whole-command effects.
     ///
     /// A `--set` value travels in the `settings` field of `POST /mutate`.
     #[allow(clippy::too_many_arguments)]

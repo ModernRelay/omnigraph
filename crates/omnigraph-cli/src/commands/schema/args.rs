@@ -5,8 +5,8 @@ use std::path::PathBuf;
 pub(crate) struct InitArgs {
     #[arg(long)]
     pub(crate) schema: PathBuf,
-    /// Local graph path or `file://` URI. Inline access supports local
-    /// storage only; a graph in a cluster is created by `cluster apply`.
+    /// Local graph path, `file://` URI or inline `s3://` graph address; a
+    /// graph in a cluster is created by `cluster apply`.
     pub(crate) uri: Option<String>,
     /// Replace orphan schema artifacts only after proving that the URI
     /// has no `__manifest`. Without this flag, init refuses a URI that
