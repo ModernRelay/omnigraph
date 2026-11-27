@@ -1,0 +1,131 @@
+# issue: 925
+# red_on: d20eba74; 3 updates on a keyed/@unique row fail with false @unique violation, stale pending versions cause a silent lost update on `where age > 30`, and unkeyed multi-updates double affected counts.
+# notes: Read-your-writes within one mutation must see only the latest pending version of each row.
+# notes: Covers 3+ updates on @key/@unique, insert + 2 upserts, silent lost-update predicate check,
+# notes: partial-batch eviction across two rows, unkeyed multi-update affected counts, and real @unique refusal.
+# notes: Repeated updates are statements over one group's selection, each seeing the version the one before wrote. A later group re-selecting a type an earlier group changed is refused (`T91`), so the lost-update form publishes nothing.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    email: String @key
+    handle: String @unique
+    age: I64?
+    flag: Bool?
+    score: F64?
+}
+node Note {
+    label: String
+    step: I64
+}
+
+--- seed
+{"type":"Person","data":{"email":"a@x","handle":"alice","age":10}}
+{"type":"Person","data":{"email":"c@x","handle":"carol","age":10}}
+{"type":"Note","data":{"label":"n1","step":0}}
+
+--- mutate
+query three_updates_same_keyed_row() {
+    match { $p: Person } where $p.email = "a@x"
+    update $p set { score: 1.0 }
+    update $p set { score: 2.0 }
+    update $p set { score: 3.0 }
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- mutate
+query insert_then_two_updates() {
+    insert Person { email: "b@x", handle: "bob", age: 15 }
+    upsert Person { email: "b@x", score: 1.5 }
+    upsert Person { email: "b@x", score: 2.5 }
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- mutate
+query stale_pending_version_must_not_match_later_where() {
+    match { $x: Person } where $x.email = "a@x"
+    update $x set { age: 35 }
+    match { $x2: Person } where $x2.email = "a@x"
+    update $x2 set { age: 20 }
+    match { $x3: Person } where $x3.age > 30
+    update $x3 set { flag: true }
+}
+
+--- expect error: T91: `stale_pending_version_must_not_match_later_where`: group 2 selects on type `Person`, which an earlier group of the write changes
+
+--- mutate
+query age_twice() {
+    match { $p: Person } where $p.email = "a@x"
+    update $p set { age: 35 }
+    update $p set { age: 20 }
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+query partial_batch_eviction_preserves_untouched_sibling() {
+    match { $p: Person, $a: Person } where $p.age <= 20 and $a.email = "a@x"
+    update $p set { score: 10.0 }
+    update $a set { score: 11.0 }
+    update $p set { flag: false }
+}
+
+--- expect affected: nodes=7 edges=0
+
+--- query
+query check_people() {
+    match { $p: Person }
+    return { $p.email, $p.handle, $p.age, $p.flag, $p.score }
+}
+
+--- expect unordered
+{"p.email":"a@x","p.handle":"alice","p.age":20,"p.flag":false,"p.score":11.0}
+{"p.email":"b@x","p.handle":"bob","p.age":15,"p.flag":false,"p.score":10.0}
+{"p.email":"c@x","p.handle":"carol","p.age":10,"p.flag":false,"p.score":10.0}
+
+--- expect shape
+p.email: String
+p.handle: String
+p.age: I64?
+p.flag: Bool?
+p.score: F64?
+
+--- mutate
+query unkeyed_four_updates_count_accurately() {
+    match { $n: Note } where $n.label = "n1"
+    update $n set { step: 1 }
+    update $n set { step: 2 }
+    update $n set { step: 3 }
+    update $n set { step: 4 }
+}
+
+--- expect affected: nodes=4 edges=0
+
+--- query
+query check_note() {
+    match { $n: Note }
+    return { $n.label, $n.step }
+}
+
+--- expect unordered
+{"n.label":"n1","n.step":4}
+
+--- expect shape
+n.label: String
+n.step: I64
+
+--- mutate
+query real_unique_collision_across_distinct_rows_still_refuses() {
+    match { $a: Person, $b: Person } where $a.email = "a@x" and $b.email = "b@x"
+    update $a set { handle: "taken" }
+    update $b set { handle: "taken" }
+}
+
+--- expect error: @unique violation

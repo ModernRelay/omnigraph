@@ -633,6 +633,12 @@ target/release/omnigraph-bench projection list-points \
   --root .bench/projection --limit 100
 ```
 
+The same schema fills a graph of your own: `projection schema` prints it,
+`projection export --store <store> --catalog <dir>` emits the store's records
+and the catalogs' declarations as graph JSONL for `omnigraph load --mode replace`,
+and the stored queries under `crates/omnigraph-bench/projection/queries/`
+read it (the harness README, §The results graph).
+
 Projection responses are bounded pages. When `next_cursor` is present, pass
 that JSON value to the next command with `--cursor`; the cursor remains pinned
 to the immutable generation from which the first page was read. The archive

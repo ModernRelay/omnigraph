@@ -1055,7 +1055,7 @@ jobs:
       # comparison).
       - name: Build the GQ 2 GQT runner and CLI
         env:
-          GQ_2_SOURCE_COMMIT: d3a354e79255760287612c0c62237f64bcd5d8a2
+          GQ_2_SOURCE_COMMIT: 64b3b2f3917b6c146a60e5445f6ead158a572b02
         run: |
           set -euo pipefail
           gq2_source="$RUNNER_TEMP/omnigraph-gq-2"

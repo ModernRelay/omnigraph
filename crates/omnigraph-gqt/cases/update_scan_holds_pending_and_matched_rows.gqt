@@ -1,0 +1,85 @@
+# issue: none
+# notes: An update's scan holds the type's pending rows and the matched copies it rewrites at once, and both count toward the 8,192 `keyed entities` allowance.
+# notes: The rewrite then replaces each matched row's pending version, so repeated updates of the same rows hold their count, not a multiple of it.
+# notes: Each update is a statement over one group's selection of every row. Three updates of all 4,096 rows are admitted: each later scan holds 4,096 pending and 4,096 matched rows, exactly 8,192.
+# notes: With 4,097 rows the second update's scan holds 8,194 and is refused, though the rows it would leave pending are still 4,097; nothing is written.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    slug: String @key
+    n: I64
+}
+
+--- seed generate: v1 seed: 0
+tables:
+  - kind: node
+    name: Item
+    rows: 4096
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: item-, width: 4}
+      n: {kind: ordinal, start: 0, step: 1}
+
+--- mutate
+query update_every_row_three_times() {
+    match { $i: Item } where $i.n >= 0
+    update $i set { n: 1 }
+    update $i set { n: 2 }
+    update $i set { n: 3 }
+}
+
+--- expect affected: nodes=12288 edges=0
+
+--- query
+query values_after_three_updates() {
+    match { $i: Item }
+    return { $i.n, count($i) as rows }
+}
+
+--- expect unordered
+{"i.n": 3, "rows": 4096}
+
+--- expect shape
+i.n: I64
+rows: I64
+
+--- load generate: v1 seed: 0 mode: insert
+tables:
+  - kind: node
+    name: Item
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: extra-, width: 1}
+      n: {kind: ordinal, start: 0, step: 1}
+
+--- expect ok
+
+--- mutate
+query update_every_row_twice() {
+    match { $i: Item } where $i.n >= 0
+    update $i set { n: 4 }
+    update $i set { n: 5 }
+}
+
+--- expect error: keyed entities for node:Item
+
+--- query
+query values_after_refusal() {
+    match { $i: Item }
+    return { $i.n, count($i) as rows }
+}
+
+--- expect unordered
+{"i.n": 0, "rows": 1}
+{"i.n": 3, "rows": 4096}
+
+--- expect shape
+i.n: I64
+rows: I64

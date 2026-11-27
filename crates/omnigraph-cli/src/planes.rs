@@ -201,6 +201,44 @@ pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
     )
 }
 
+/// The commands that may name an `s3://` graph inline as direct storage: the
+/// reads the embedded client serves, which take no lock and change nothing a
+/// server guards, and the three writes that create and fill a graph nobody
+/// serves (`init`, `schema apply`, `load`), for a graph whose one writer is a
+/// batch loader, such as a benchmark harness publishing its run records.
+/// Every other write on cloud storage still reaches it through a server:
+/// `mutate`, `branch create|delete|merge`, `commit publish|drop`,
+/// `blob put|clear` and `changes` keep the refusal (`scope::resolve`). With
+/// `--graph` the reads and `load` take a cluster root, as the maintenance set
+/// does; `init` and `schema apply` take no `--graph`.
+pub(crate) fn admits_inline_s3_graph(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Query(_)
+            | Command::Export(_)
+            | Command::Snapshot(_)
+            | Command::Diff(_)
+            | Command::Init(_)
+            | Command::Load(_)
+            | Command::Schema {
+                command: SchemaCommand::Show { .. } | SchemaCommand::Apply { .. }
+            }
+            | Command::Branch {
+                command: BranchCommand::List { .. }
+                    | BranchCommand::Diff { .. }
+                    | BranchCommand::MergeBase { .. }
+            }
+            | Command::Commit {
+                command: CommitCommand::List { .. }
+                    | CommitCommand::Show { .. }
+                    | CommitCommand::Changes { .. }
+            }
+            | Command::Blob {
+                command: BlobCommand::Get { .. } | BlobCommand::Stat { .. }
+            }
+    )
+}
+
 /// The commands that open a direct graph as a shallow clone under `--base`:
 /// the reads and writes the embedded client serves. Maintenance, schema
 /// changes and deployment keep the one root they are given, since what a

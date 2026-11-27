@@ -1437,13 +1437,29 @@ impl ObjectStorageAdapter {
 
     fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
-        let (store, retrying) = s3_clients(&location.bucket, root_uri, scope.is_some())?;
+        Self::s3_from_builder(
+            s3_bucket_builder(&location.bucket),
+            location.bucket,
+            root_uri,
+            scope,
+        )
+    }
+
+    /// The one `s3://` adapter construction ([`s3_clients_from`]), whether
+    /// `builder` was captured or read from the environment: a scoped adapter
+    /// reads through a retrying client and writes single-attempt, whatever
+    /// retry `builder` carries; an unscoped one keeps `builder`'s retry.
+    fn s3_from_builder(
+        builder: AmazonS3Builder,
+        bucket: String,
+        root_uri: &str,
+        scope: Option<StorageIoScope>,
+    ) -> Result<Self> {
+        let (store, retrying) = s3_clients_from(builder, root_uri, scope.is_some())?;
         Ok(Self::remote(
             store,
             retrying,
-            UriCodec::S3 {
-                bucket: location.bucket,
-            },
+            UriCodec::S3 { bucket },
             scope,
         ))
     }
@@ -1663,7 +1679,9 @@ impl ObjectStorageAdapter {
                     None => adapter,
                 })
             }
-            StorageKind::S3 => Self::s3_read_through(base_uri, root_uri, scope).await,
+            StorageKind::S3 => {
+                Self::s3_read_through(base_uri, root_uri, scope, s3_bucket_builder).await
+            }
             StorageKind::Azure | StorageKind::Gcs => Err(StorageError::backend(
                 StorageFailureKind::Configuration,
                 format!("read-through storage needs a local or s3 clone root, got '{root_uri}'"),
@@ -1671,18 +1689,22 @@ impl ObjectStorageAdapter {
         }
     }
 
-    /// The S3 instance of [`Self::durable_read_through`]: both clients from the
-    /// standard `AWS_*` environment (one endpoint by construction), the base's
-    /// index from one listing, the mount named by the clone root's bucket and prefix.
+    /// The S3 instance of [`Self::durable_read_through`]: both clients from
+    /// `bucket_builder` (the standard `AWS_*` environment, so one endpoint by
+    /// construction), the base's index from one listing, the mount named by the
+    /// clone root's bucket and prefix. Under a scope the open reads the root
+    /// as the adapter will: its reads retry and its marker write is a
+    /// single-attempt mutation of the scope.
     async fn s3_read_through(
         base_uri: &str,
         root_uri: &str,
         scope: Option<StorageIoScope>,
+        bucket_builder: impl Fn(&str) -> AmazonS3Builder,
     ) -> Result<Self> {
         let root = parse_s3_uri(root_uri)?;
         let base = parse_s3_uri(base_uri)?;
-        let root_key = s3_clone_prefix(root_uri)?;
-        let base_key = s3_clone_prefix(base_uri)?;
+        let root_key = s3_root_key(root_uri)?;
+        let base_key = s3_root_key(base_uri)?;
         if root.bucket == base.bucket && s3_prefixes_overlap(root_key.as_ref(), base_key.as_ref()) {
             return Err(StorageError::backend(
                 StorageFailureKind::Configuration,
@@ -1691,13 +1713,20 @@ impl ObjectStorageAdapter {
                 ),
             ));
         }
-        let base_store = s3_store(&base.bucket, base_uri, |builder| builder)?;
-        let (layer, retrying) = s3_clients(&root.bucket, root_uri, scope.is_some())?;
+        let base_store = build_s3_store(bucket_builder(&base.bucket), base_uri)?;
+        let (layer, retrying) =
+            s3_clients_from(bucket_builder(&root.bucket), root_uri, scope.is_some())?;
+        let opener = match (&scope, &retrying) {
+            (Some(scope), Some(retrying)) => {
+                scope.wrap_object_stores(Arc::clone(retrying), Arc::clone(&layer))
+            }
+            _ => Arc::clone(&layer),
+        };
         let mount = s3_clone_mount(
             base_store,
             base_uri,
             base_key,
-            layer.as_ref(),
+            opener.as_ref(),
             root_uri,
             root_key,
         )
@@ -3035,7 +3064,10 @@ pub fn normalize_root_uri(uri: &str) -> Result<String> {
             let path = local_path_from_uri(uri)?;
             Ok(normalize_local_path(&path))
         }
-        StorageKind::S3 => Ok(trim_trailing_slashes(uri)),
+        StorageKind::S3 => {
+            s3_root_key(uri)?;
+            Ok(trim_trailing_slashes(uri))
+        }
         StorageKind::Azure => Ok(parse_azure_uri(uri)?.canonical_uri),
         StorageKind::Gcs => Ok(parse_gcs_uri(uri)?.canonical_uri),
     }
@@ -3239,18 +3271,29 @@ fn s3_bucket_builder(bucket: &str) -> AmazonS3Builder {
 }
 
 /// The client of `bucket`, built from the `AWS_*` environment as `configure`
-/// leaves it. In a test or a DST build a simulated bucket that answers to the
-/// name is the client, and nothing is built.
+/// leaves it ([`build_s3_store`]), for a test that reads a bucket beside the
+/// adapter under test.
+#[cfg(any(test, feature = "test-util"))]
 fn s3_store(
     bucket: &str,
     root_uri: &str,
     configure: impl FnOnce(AmazonS3Builder) -> AmazonS3Builder,
 ) -> Result<Arc<DynObjectStore>> {
+    build_s3_store(configure(s3_bucket_builder(bucket)), root_uri)
+}
+
+/// The client `builder` describes, whether its configuration was captured or
+/// read from the environment. In a test or a DST build a simulated bucket that
+/// answers to the bucket `builder` names is the client, and nothing is built.
+fn build_s3_store(builder: AmazonS3Builder, root_uri: &str) -> Result<Arc<DynObjectStore>> {
     #[cfg(any(test, feature = "dst"))]
-    if let Some(simulated) = simulated_bucket::bucket(simulated_bucket::Provider::S3, bucket) {
+    if let Some(simulated) = builder
+        .get_config_value(&object_store::aws::AmazonS3ConfigKey::Bucket)
+        .and_then(|bucket| simulated_bucket::bucket(simulated_bucket::Provider::S3, &bucket))
+    {
         return Ok(simulated);
     }
-    match configure(s3_bucket_builder(bucket)).build() {
+    match builder.build() {
         Ok(store) => Ok(Arc::new(store)),
         Err(err) => Err(StorageError::backend(
             classify_object_store_error(&err),
@@ -3259,19 +3302,51 @@ fn s3_store(
     }
 }
 
+/// Every object key in `bucket` under the key prefix `prefix`, as the bucket
+/// stores it, sorted. No URI is derived, so a test can see the keys every
+/// route wrote, whichever spelling it used. `prefix` is a key, taken literally.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn s3_bucket_keys(bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    let uri = format!("s3://{bucket}/{prefix}");
+    let store = s3_store(bucket, &uri, |builder| builder)?;
+    let prefix = ObjectPath::parse(prefix).map_err(|err| {
+        StorageError::backend(
+            StorageFailureKind::Configuration,
+            format!("invalid s3 key prefix '{prefix}': {err}"),
+        )
+    })?;
+    let mut keys = store
+        .list(Some(&prefix))
+        .map_ok(|meta| meta.location.to_string())
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| storage_backend_error("list", &uri, err))?;
+    keys.sort();
+    Ok(keys)
+}
+
 /// The clients of one `s3://` root: the store its reads and writes go to and,
 /// when `scoped`, a second client with bounded retries for its reads, the
 /// first then single-attempt (`ObjectStorageAdapter::with_scope_and_retrying`).
-fn s3_clients(
-    bucket: &str,
+/// They come from a configured `builder`, the one construction every `s3://`
+/// adapter and clone uses, captured or not: [`remote_clients`] over
+/// [`build_s3_store`]. A scoped root's reads retry by
+/// [`scoped_read_retry_config`] and its writes are single-attempt whatever
+/// `builder` carries; an unscoped root keeps `builder`'s own retry.
+fn s3_clients_from(
+    builder: AmazonS3Builder,
     root_uri: &str,
     scoped: bool,
 ) -> Result<(Arc<DynObjectStore>, Option<Arc<DynObjectStore>>)> {
     remote_clients(scoped, |retry| {
-        s3_store(bucket, root_uri, |builder| match retry {
-            Some(retry) => builder.with_retry(retry),
-            None => builder,
-        })
+        let builder = builder.clone();
+        build_s3_store(
+            match retry {
+                Some(retry) => builder.with_retry(retry),
+                None => builder,
+            },
+            root_uri,
+        )
     })
 }
 
@@ -3302,26 +3377,19 @@ fn s3_prefixes_overlap(a: &str, b: &str) -> bool {
         || b.starts_with(&format!("{a}/"))
 }
 
-/// The key every route of a clone addresses the `s3://` root `uri` by: the one
-/// the adapter and Lance both derive, for the root and for a child of it. A
-/// root they spell differently (a `%` escape, a space, a query) is refused.
-fn s3_clone_prefix(uri: &str) -> Result<ObjectPath> {
-    let one_key = |address: &str| {
-        let url = Url::parse(address).ok()?;
-        let adapter = ObjectPath::parse(s3_object_key(address, &url)).ok()?;
-        let lance = ObjectPath::from_url_path(url.path()).ok()?;
-        (adapter == lance).then_some(adapter)
-    };
+/// The key prefix of the `s3://` root `uri`: its [`s3_object_key`], which is
+/// also the prefix of the key of every child of it. A root whose children
+/// would not lie under its own key (a query, a fragment) is refused.
+fn s3_root_key(uri: &str) -> Result<ObjectPath> {
     let root = trim_trailing_slashes(uri);
-    match (one_key(&root), one_key(&format!("{root}/child"))) {
-        (Some(prefix), Some(child)) if child == prefix.clone().join("child") => Ok(prefix),
-        _ => Err(StorageError::backend(
-            StorageFailureKind::Configuration,
-            format!(
-                "read-through storage needs an s3 root whose path names one key, got '{uri}': it holds a percent escape, a character a URL escapes (a space, a non-ASCII letter), a query, a fragment or an empty segment"
-            ),
-        )),
+    let key = ObjectPath::parse(s3_object_key(&root)?)
+        .map_err(|_| s3_key_refusal(uri, S3KeyRefusal::NoKey))?;
+    let child = ObjectPath::parse(s3_object_key(&format!("{root}/child"))?)
+        .map_err(|_| s3_key_refusal(uri, S3KeyRefusal::NoKey))?;
+    if child != key.clone().join("child") {
+        return Err(s3_key_refusal(uri, S3KeyRefusal::NoKey));
     }
+    Ok(key)
 }
 
 /// The mount of an `s3://` clone over the clients of its two buckets. Keys that
@@ -3389,7 +3457,7 @@ fn parse_s3_uri(uri: &str) -> Result<S3Location> {
     })?;
     Ok(S3Location {
         bucket: bucket.to_string(),
-        key: s3_object_key(uri, &url),
+        key: s3_object_key(uri)?,
     })
 }
 
@@ -3521,11 +3589,159 @@ fn validate_gcs_bucket_name(bucket: &str, diagnostic_uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// The key the `s3://` URI `uri`, parsed as `url`, names: its URL path as
-/// `url` spelled it through 2.5.8, which the store takes literally. From 2.5.9
-/// a `^` is written `%5E`; here it stays a caret, so no `url` release moves an object.
+/// The object key the `s3://` URI `uri` names, the one function every
+/// Omnigraph route derives an S3 key by. Two spellings exist: the adapter's,
+/// the URL path as written (below), and Lance's, the percent-decoded URL path
+/// (`lance-io`'s `extract_path`, which Omnigraph does not route). A URI on
+/// which they differ at it or below it (a character a URL escapes, such as a
+/// space, a non-ASCII letter or a brace; an escape Lance decodes, such as
+/// `%41`; a trailing space), or with a query or a fragment, is refused, so a
+/// root never splits its objects across two prefixes. An escaped dot segment
+/// (`%2e%2e`) is resolved by the URL parser before either key is derived, so
+/// it is a respelling, not a second key. A URI
+/// must also be the one spelling of its key, `s3://<bucket>/<key>` (trailing
+/// slashes aside), so two spellings of one key are never two identities.
 #[doc(hidden)]
-pub fn s3_object_key(uri: &str, url: &Url) -> String {
+pub fn s3_object_key(uri: &str) -> Result<String> {
+    s3_one_key(uri, true)
+}
+
+/// [`s3_object_key`]; `suggest` says whether a refused respelling may name a
+/// replacement, which is itself checked by this function with `suggest` off.
+fn s3_one_key(uri: &str, suggest: bool) -> Result<String> {
+    // Trailing slashes spell a prefix as a directory; they name no other key.
+    let trimmed = trim_trailing_slashes(uri);
+    let (written, lance) = s3_key_pair(uri, &trimmed, false)?;
+    // A URI is also a root: every object below it is named by appending to
+    // it, and the URL parser strips a trailing space or control character
+    // only at the end of the string. `s3://bucket/graph ` names `graph`, and
+    // `graph%20/x` (the adapter) and `graph /x` (Lance) below it, so the keys
+    // of a child are compared as well.
+    let child = format!("{trimmed}/child");
+    let (_, below) = s3_key_pair(uri, &child, true)?;
+    // One key has one spelling. The URL parser resolves dot segments (also
+    // escaped, `%2e%2e`), drops tabs and newlines, and ignores user
+    // information and a port, so each of those spells a key that another,
+    // shorter URI names too; such a spelling is refused rather than kept as a
+    // second identity of the same objects.
+    let bucket = Url::parse(&trimmed)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let canonical = if lance.as_ref().is_empty() {
+        format!("s3://{bucket}")
+    } else {
+        format!("s3://{bucket}/{}", lance.as_ref())
+    };
+    if trimmed != canonical {
+        // A replacement is named only when it is itself one key in one
+        // spelling, at the root and below it, and names the same keys as
+        // this URI does there; otherwise none is.
+        let same_keys = suggest
+            && below == lance.clone().join("child")
+            && s3_one_key(&canonical, false).ok().as_deref() == Some(lance.as_ref())
+            && s3_one_key(&format!("{canonical}/child"), false)
+                .ok()
+                .as_deref()
+                == Some(below.as_ref());
+        return Err(s3_key_refusal(
+            uri,
+            S3KeyRefusal::Respelled {
+                canonical: same_keys.then_some(canonical.as_str()),
+            },
+        ));
+    }
+    Ok(written)
+}
+
+/// The adapter's key and Lance's for `address` (the URI `uri`, or a child of
+/// it when `below`), refused unless both exist and are one key.
+fn s3_key_pair(uri: &str, address: &str, below: bool) -> Result<(String, ObjectPath)> {
+    let url = Url::parse(address).map_err(|err| {
+        StorageError::backend(
+            StorageFailureKind::Configuration,
+            format!("invalid s3 uri '{}': {err}", redacted_storage_uri(uri)),
+        )
+    })?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(s3_key_refusal(uri, S3KeyRefusal::NoKey));
+    }
+    let written = s3_key_as_written(address, &url);
+    let lance = ObjectPath::from_url_path(url.path())
+        .map_err(|_| s3_key_refusal(uri, S3KeyRefusal::NoKey))?;
+    if ObjectPath::parse(&written).ok().as_ref() != Some(&lance) {
+        return Err(s3_key_refusal(
+            uri,
+            S3KeyRefusal::TwoKeys {
+                adapter: &written,
+                lance: lance.as_ref(),
+                below,
+            },
+        ));
+    }
+    Ok((written, lance))
+}
+
+/// Why an `s3://` URI names no one key.
+enum S3KeyRefusal<'a> {
+    /// A query, a fragment, an empty path segment or an escape that decodes
+    /// to no text, at the URI or below it. No spelling names its objects.
+    NoKey,
+    /// The adapter's spelling and Lance's are two keys, for the URI itself
+    /// or, when `below`, for an object below it.
+    TwoKeys {
+        adapter: &'a str,
+        lance: &'a str,
+        below: bool,
+    },
+    /// One key in another spelling: `canonical` is the one spelling, when it
+    /// names the same keys at the root and below it.
+    Respelled { canonical: Option<&'a str> },
+}
+
+fn s3_key_refusal(uri: &str, refusal: S3KeyRefusal<'_>) -> StorageError {
+    // The URI as the caller wrote it, a tab or a newline made visible, since
+    // the refusal is about its spelling; a URI with credentials, a query or a
+    // fragment is shown redacted instead.
+    let secret = Url::parse(uri).map_or(true, |url| {
+        !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+    });
+    let uri = if secret {
+        redacted_storage_uri(uri)
+    } else {
+        uri.escape_debug().to_string()
+    };
+    let why = match refusal {
+        S3KeyRefusal::NoKey => "a query, a fragment, an empty path segment or an escape that decodes to no text, at it or below it, names no key, so no spelling names its objects; use a prefix of plain characters".to_string(),
+        S3KeyRefusal::TwoKeys {
+            adapter,
+            lance,
+            below,
+        } => format!(
+            "Omnigraph would store {} under the key '{adapter}' and Lance under '{lance}'; a character a URL escapes (a space, a non-ASCII letter, a brace, a quote), an escape Lance decodes (`%41`, `%20`, `%2F`) or a space at the end of the path has two spellings, so use a path without them",
+            if below { "an object below it" } else { "its objects" }
+        ),
+        S3KeyRefusal::Respelled {
+            canonical: Some(canonical),
+        } => format!(
+            "it is another spelling of '{canonical}' (a dot segment, a port, user information, or a tab or newline the URL parser drops), and one key has one spelling; use that one"
+        ),
+        S3KeyRefusal::Respelled { canonical: None } => "the URL parser rewrites it (a dot segment, a port, user information, or a tab or newline it drops), and no one spelling names the same objects at it and below it; use a prefix of plain characters".to_string(),
+    };
+    StorageError::backend(
+        StorageFailureKind::Configuration,
+        format!("an s3 path must name one object key, got '{uri}': {why}"),
+    )
+}
+
+/// The key the `s3://` URI `uri`, parsed as `url`, names as written: its URL
+/// path as `url` spelled it through 2.5.8, which the store takes literally.
+/// From 2.5.9 a `^` is written `%5E`; here it stays a caret, so no `url`
+/// release moves an object.
+fn s3_key_as_written(uri: &str, url: &Url) -> String {
     let path = url.path().trim_start_matches('/');
     let tilde_for_caret = uri
         .contains('^')
@@ -4183,6 +4399,275 @@ mod tests {
             served
         });
         (endpoint, server)
+    }
+
+    /// One exchange a scripted server expects: the method of its request, and
+    /// the raw response it writes back, or `None` for a request it never
+    /// answers, holding the connection until the client gives up.
+    pub(crate) type Exchange = (&'static str, Option<Vec<u8>>);
+
+    /// Serves `exchanges` in order, one connection each, closing it after the
+    /// answer; returns how many requests it received.
+    pub(crate) fn spawn_scripted_server(
+        exchanges: Vec<Exchange>,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local scripted server");
+        listener
+            .set_nonblocking(true)
+            .expect("configure local scripted server");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("local server address")
+        );
+        let server = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            for (method, response) in exchanges {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return served;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("scripted server accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("configure blocking scripted connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("configure scripted server read timeout");
+                let mut request = [0_u8; 16 * 1024];
+                let mut request_len = 0;
+                while !request[..request_len]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+                {
+                    let read = stream
+                        .read(&mut request[request_len..])
+                        .expect("read local scripted request");
+                    assert!(read != 0, "scripted request ended before its headers");
+                    request_len += read;
+                }
+                assert!(
+                    request[..request_len].starts_with(format!("{method} ").as_bytes()),
+                    "expected a real object-store {method}, got {:?}",
+                    String::from_utf8_lossy(&request[..request_len])
+                );
+                served += 1;
+                let Some(response) = response else {
+                    // A stall: wait for the client to close the connection.
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(30)))
+                        .expect("configure scripted stall");
+                    let mut rest = [0_u8; 1024];
+                    while matches!(stream.read(&mut rest), Ok(read) if read > 0) {}
+                    continue;
+                };
+                stream
+                    .write_all(&response)
+                    .expect("write scripted response");
+                stream.flush().expect("flush scripted response");
+            }
+            served
+        });
+        (endpoint, server)
+    }
+
+    /// One raw object response; `range` adds a `Content-Range` header.
+    pub(crate) fn object_response(
+        status: u16,
+        range: Option<&str>,
+        length: usize,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let range = range.map_or(String::new(), |range| {
+            format!("Content-Range: bytes {range}\r\n")
+        });
+        let mut response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Length: {length}\r\n{range}ETag: \"e\"\r\nLast-Modified: Mon, 23 Nov 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// Serves one HEAD answer per entry of `statuses`, in order, and returns
+    /// how many it served.
+    fn spawn_head_server(statuses: Vec<u16>) -> (String, tokio::task::JoinHandle<usize>) {
+        spawn_scripted_server(
+            statuses
+                .into_iter()
+                .map(|status| ("HEAD", Some(object_response(status, None, 0, b""))))
+                .collect(),
+        )
+    }
+
+    fn scoped_test_adapter(endpoint: String) -> ObjectStorageAdapter {
+        let builder = AmazonS3Builder::new()
+            .with_bucket_name("test-bucket")
+            .with_region("us-east-1")
+            .with_access_key_id("test-access-key")
+            .with_secret_access_key("test-secret-key")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .with_retry(single_attempt_retry_config());
+        ObjectStorageAdapter::s3_from_builder(
+            builder,
+            "test-bucket".into(),
+            "s3://test-bucket/root",
+            Some(StorageIoScope::new()),
+        )
+        .expect("scoped S3 adapter")
+    }
+
+    /// A body that ends early fails while streaming. The scoped read client's
+    /// retry resumes it with a range request validated by ETag
+    /// (object_store's retrying get stream), so a full read answers from the
+    /// rest. That is the case Lance's outer download retry
+    /// (`download_retry_count`) covers for its own reads; this adapter
+    /// inherits it from its read client instead of repeating it.
+    #[tokio::test]
+    async fn a_scoped_s3_full_read_resumes_a_body_that_ends_early() {
+        let truncated = || object_response(200, None, 5, b"he");
+        let rest = || object_response(206, Some("2-4/5"), 3, b"llo");
+        for read in ["read_text", "read_text_if_exists"] {
+            let (endpoint, server) =
+                spawn_scripted_server(vec![("GET", Some(truncated())), ("GET", Some(rest()))]);
+            let adapter = scoped_test_adapter(endpoint);
+            let uri = "s3://test-bucket/root/object";
+            let text = match read {
+                "read_text" => adapter.read_text(uri).await.map(Some),
+                _ => adapter.read_text_if_exists(uri).await,
+            }
+            .unwrap_or_else(|error| panic!("{read}: a resumed read answers: {error}"));
+            assert_eq!(text.as_deref(), Some("hello"), "{read}");
+            assert_eq!(server.await.expect("scripted server"), 2, "{read}");
+        }
+    }
+
+    /// A failure that repeats on every read is answered at once: a denied
+    /// read is not retried, and bytes that are not text fail after one read.
+    #[tokio::test]
+    async fn a_scoped_s3_full_read_does_not_retry_a_failure_that_repeats() {
+        for (response, kind) in [
+            (
+                object_response(403, None, 0, b""),
+                StorageFailureKind::Configuration,
+            ),
+            (
+                object_response(200, None, 2, b"\xff\xfe"),
+                StorageFailureKind::Permanent,
+            ),
+        ] {
+            // One response only: a retry would find no server and fail with
+            // another class, which the class check below refuses.
+            let (endpoint, server) = spawn_scripted_server(vec![("GET", Some(response))]);
+            let adapter = scoped_test_adapter(endpoint);
+            let error = adapter
+                .read_text("s3://test-bucket/root/object")
+                .await
+                .expect_err("the read fails");
+            assert_eq!(error.failure_kind(), kind, "{error}");
+            assert_eq!(server.await.expect("scripted server"), 1, "{error}");
+        }
+    }
+
+    /// A scoped `s3://` adapter reads through its retrying client whatever
+    /// retry its builder carries: a captured binding's builder and the
+    /// environment's go through the same construction.
+    #[tokio::test]
+    async fn a_scoped_s3_adapter_retries_its_reads_whatever_its_builder_carries() {
+        let (endpoint, server) = spawn_head_server(vec![503, 200]);
+        let adapter = scoped_test_adapter(endpoint);
+        assert!(
+            adapter
+                .exists("s3://test-bucket/root/object")
+                .await
+                .expect("a retried read answers")
+        );
+        assert_eq!(server.await.expect("head server"), 2);
+    }
+
+    /// An empty `ListObjectsV2` answer.
+    fn empty_listing() -> Vec<u8> {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test-bucket</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#;
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// A scoped `s3://` clone open reads its root as the adapter it returns
+    /// does: every read retries a transient answer, and its one write, the
+    /// mutable creation marker, is single-attempt. The base is a simulated
+    /// bucket; the root is a scripted server, and its key overlaps the base's
+    /// so the open also asks whether the two buckets are one.
+    #[tokio::test]
+    async fn a_scoped_s3_clone_open_retries_its_reads_and_not_its_marker_write() {
+        let base = simulated_bucket::SimulatedBucket::new(simulated_bucket::Provider::S3);
+        let _names = base.answer_to(&["scoped-clone-open-base"]).unwrap();
+        base.put(
+            &ObjectPath::from("graph/object"),
+            PutPayload::from_static(b"base"),
+        )
+        .await
+        .unwrap();
+        let unavailable = || object_response(503, None, 0, b"");
+        let absent = || object_response(404, None, 0, b"");
+        // The open's requests to the root, in order.
+        let open = || {
+            vec![
+                ("HEAD", Some(absent())),       // the base's object, in the root's bucket
+                ("HEAD", Some(absent())),       // graph/__clone/created
+                ("GET", Some(empty_listing())), // anything under graph/
+                ("GET", Some(empty_listing())), // graph/__clone/deleted/
+                ("PUT", Some(object_response(200, None, 0, b""))), // graph/__clone/created
+            ]
+        };
+        // A 503 before each request in turn: a read answers on its retry, the
+        // marker write fails on its one attempt and is not sent again.
+        for failing in 0..open().len() {
+            let mut exchanges = open();
+            let method = exchanges[failing].0;
+            exchanges.insert(failing, (method, Some(unavailable())));
+            let (endpoint, server) = spawn_scripted_server(exchanges);
+            let builder = move |bucket: &str| {
+                AmazonS3Builder::new()
+                    .with_bucket_name(bucket)
+                    .with_region("us-east-1")
+                    .with_access_key_id("test-access-key")
+                    .with_secret_access_key("test-secret-key")
+                    .with_endpoint(endpoint.clone())
+                    .with_allow_http(true)
+            };
+            let opened = ObjectStorageAdapter::s3_read_through(
+                "s3://scoped-clone-open-base/graph",
+                "s3://test-bucket/graph",
+                Some(StorageIoScope::new()),
+                builder,
+            )
+            .await;
+            let served = server.await.expect("scripted server");
+            if method == "PUT" {
+                let error = opened
+                    .map(|_| ())
+                    .expect_err("the marker write is not retried");
+                assert_eq!(served, failing + 1, "{error}");
+            } else {
+                opened.unwrap_or_else(|error| panic!("a 503 on {method} #{failing}: {error}"));
+                assert_eq!(served, open().len() + 1, "{method} #{failing}");
+            }
+        }
     }
 
     async fn exhausted_s3_status_error(status: u16) -> object_store::Error {
@@ -6652,16 +7137,27 @@ mod tests {
     fn s3_key_keeps_a_caret_as_written() {
         for (uri, key) in [
             ("s3://bucket/a^b/x", "a^b/x"),
-            ("s3://bucket/a%5Eb^c", "a%5Eb^c"),
-            ("s3://bucket/a%5eb^c", "a%5eb^c"),
-            ("s3://bucket/x^/../y^z~^", "y^z~^"),
+            ("s3://bucket/y^z~^", "y^z~^"),
         ] {
             assert_eq!(parse_s3_uri(uri).unwrap().key, key, "{uri}");
         }
+        // Lance decodes `%5E` to a caret, so the escape spelling names a
+        // second key for one path, and a dot segment is a second spelling of
+        // one key; both are refused (#1527).
+        for uri in [
+            "s3://bucket/a%5Eb^c",
+            "s3://bucket/a%5eb^c",
+            "s3://bucket/x^/../y^z~^",
+        ] {
+            let text = parse_s3_uri(uri).expect_err("no one key").to_string();
+            assert!(text.contains("must name one object key"), "{uri}: {text}");
+        }
     }
 
-    /// A `url` release that spells one more character differently moves an
-    /// object under such a path; this test fails first.
+    /// A `url` release that spells one more character differently would move
+    /// an object under such a path; this test fails first. A character the
+    /// URL escapes is refused, since Lance stores it decoded (#1527); every
+    /// other printable character is a key as written.
     #[test]
     fn s3_key_spelling_is_fixed_for_printable_ascii() {
         for byte in b' '..=b'~' {
@@ -6669,23 +7165,248 @@ mod tests {
             if matches!(character, '/' | '?' | '#') {
                 continue;
             }
-            let spelled = match character {
-                ' ' => "%20".to_string(),
-                '"' => "%22".to_string(),
-                '<' => "%3C".to_string(),
-                '>' => "%3E".to_string(),
-                '`' => "%60".to_string(),
-                '{' => "%7B".to_string(),
-                '}' => "%7D".to_string(),
-                other => other.to_string(),
-            };
-            assert_eq!(
-                parse_s3_uri(&format!("s3://bucket/a{character}b"))
-                    .unwrap()
-                    .key,
-                format!("a{spelled}b"),
-                "{character:?}"
+            let uri = format!("s3://bucket/a{character}b");
+            if matches!(character, ' ' | '"' | '<' | '>' | '`' | '{' | '}') {
+                let text = parse_s3_uri(&uri).expect_err("no one key").to_string();
+                assert!(
+                    text.contains("must name one object key"),
+                    "{character:?}: {text}"
+                );
+            } else {
+                assert_eq!(
+                    parse_s3_uri(&uri).unwrap().key,
+                    format!("a{character}b"),
+                    "{character:?}"
+                );
+            }
+        }
+    }
+
+    /// #1527 (second review): the URL parser strips a space or control
+    /// character only at the end of a string, so `s3://bucket/graph ` names
+    /// `graph` alone and two keys below it (`graph%20/x`, `graph /x`): the
+    /// objects an earlier release wrote there are split. Every route refuses
+    /// it as a split below the root and names no replacement.
+    #[tokio::test]
+    async fn s3_root_that_splits_below_itself_is_refused_with_no_replacement_issue_1527() {
+        for (uri, adapter, lance) in [
+            ("s3://bucket/graph ", "graph%20/child", "graph /child"),
+            ("s3://bucket/graph  ", "graph%20%20/child", "graph  /child"),
+            (
+                "s3://bucket/a/graph \t",
+                "a/graph%20/child",
+                "a/graph /child",
+            ),
+        ] {
+            let mut texts = vec![
+                parse_s3_uri(uri).expect_err("adapter key").to_string(),
+                s3_object_key(uri).expect_err("one key").to_string(),
+                normalize_root_uri(uri).expect_err("root").to_string(),
+                s3_root_key(uri).expect_err("root key").to_string(),
+                ObjectStorageAdapter::s3_from_root_uri(uri)
+                    .map(|_| ())
+                    .expect_err("adapter")
+                    .to_string(),
+            ];
+            texts.push(
+                ObjectStorageAdapter::durable_read_through("s3://bucket/base", uri)
+                    .await
+                    .map(|_| ())
+                    .expect_err("clone root")
+                    .to_string(),
             );
+            for text in texts {
+                assert!(
+                    text.contains(&format!(
+                        "an object below it under the key '{adapter}' and Lance under '{lance}'"
+                    )) && !text.contains("another spelling of"),
+                    "{uri:?}: {text}"
+                );
+            }
+        }
+        // A control character at the end names no key below the root.
+        let text = s3_object_key("s3://bucket/graph\u{1}")
+            .expect_err("no key below")
+            .to_string();
+        assert!(
+            text.contains("names no key") && !text.contains("another spelling of"),
+            "{text}"
+        );
+    }
+
+    /// #1527 (second review): a refusal names a replacement only when the
+    /// replacement is itself one key in one spelling and names the keys the
+    /// refused spelling named, at the root and below it, where an earlier
+    /// release wrote its objects. Checked over every decoration of a few keys.
+    #[test]
+    fn s3_refusal_names_only_a_replacement_with_the_same_keys_issue_1527() {
+        let mut uris = Vec::new();
+        for key in ["graph", "a/b", "c^1/g", "x~[y]"] {
+            for (before, after) in [
+                ("", " "),
+                ("", "  "),
+                ("", "\t"),
+                ("", "\n"),
+                ("", " \t"),
+                ("", "\t "),
+                ("", "\u{1}"),
+                ("", "/."),
+                ("", "/x/.."),
+                ("", "/%2e"),
+                ("", "/z/%2e%2e"),
+                ("x/../", ""),
+                ("./", ""),
+                ("%2e/", ""),
+                ("a/%2e%2e/", ""),
+                ("a/.%2E/", ""),
+                ("\t", ""),
+                ("x/../", " "),
+                ("./", "/."),
+            ] {
+                uris.push(format!("s3://bucket/{before}{key}{after}"));
+                uris.push(format!("s3://user:pw@bucket/{before}{key}{after}"));
+                uris.push(format!("s3://bucket:9000/{before}{key}{after}"));
+            }
+        }
+        let mut named = 0;
+        for uri in &uris {
+            let Err(error) = s3_object_key(uri) else {
+                panic!("{uri:?} is not its key's one spelling, yet was accepted");
+            };
+            let text = error.to_string();
+            let Some(rest) = text.split("another spelling of '").nth(1) else {
+                continue;
+            };
+            let replacement = rest.split('\'').next().unwrap();
+            named += 1;
+            let trimmed = trim_trailing_slashes(uri);
+            let (_, root) = s3_key_pair(uri, &trimmed, false)
+                .unwrap_or_else(|e| panic!("{uri:?} named {replacement} with no root key: {e}"));
+            let (old_adapter, below) = s3_key_pair(uri, &format!("{trimmed}/child"), true)
+                .unwrap_or_else(|e| {
+                    panic!("{uri:?} named {replacement} though it splits below: {e}")
+                });
+            assert_eq!(old_adapter, below.as_ref(), "{uri:?}");
+            assert_eq!(
+                s3_object_key(replacement).unwrap(),
+                root.as_ref(),
+                "{uri:?}"
+            );
+            assert_eq!(normalize_root_uri(replacement).unwrap(), replacement);
+            assert_eq!(
+                s3_object_key(&format!("{replacement}/child")).unwrap(),
+                below.as_ref(),
+                "{uri:?}"
+            );
+        }
+        assert!(named > uris.len() / 3, "{named} of {}", uris.len());
+    }
+
+    /// #1527 (review): one key has one spelling. The URL parser resolves dot
+    /// segments (escaped too), drops tabs and newlines, and ignores user
+    /// information and a port, so each of these named the
+    /// objects of `s3://bucket/cluster` under a second root identity. Every
+    /// route refuses them, and the refusal names the one spelling.
+    #[test]
+    fn s3_uri_that_respells_a_key_is_refused_by_every_route_issue_1527() {
+        for uri in [
+            "s3://bucket/a/../cluster",
+            "s3://bucket/a/%2e%2e/cluster",
+            "s3://bucket/a/.%2E/cluster",
+            "s3://bucket/./cluster",
+            "s3://bucket/%2e/cluster",
+            "s3://bucket/cluster/.",
+            "s3://bucket/cluster/x/..",
+            "s3://bucket/clu\tster",
+            "s3://bucket/clu\nster",
+            "s3://user:secret@bucket/cluster",
+            "s3://bucket:9000/cluster",
+        ] {
+            for text in [
+                parse_s3_uri(uri).expect_err("adapter key").to_string(),
+                s3_object_key(uri).expect_err("one key").to_string(),
+                normalize_root_uri(uri).expect_err("root").to_string(),
+                s3_root_key(uri).expect_err("root key").to_string(),
+                ObjectStorageAdapter::s3_from_root_uri(uri)
+                    .map(|_| ())
+                    .expect_err("adapter")
+                    .to_string(),
+            ] {
+                assert!(
+                    text.contains("must name one object key")
+                        && text.contains("another spelling of 's3://bucket/cluster'")
+                        && !text.contains("secret"),
+                    "{uri:?}: {text}"
+                );
+            }
+        }
+        let text = s3_object_key("s3://bucket/a/%2e%2e/cluster")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("got 's3://bucket/a/%2e%2e/cluster'"),
+            "{text}"
+        );
+        assert_eq!(s3_object_key("s3://bucket/cluster").unwrap(), "cluster");
+        assert_eq!(s3_object_key("s3://bucket/cluster//").unwrap(), "cluster");
+        assert_eq!(
+            normalize_root_uri("s3://bucket/cluster/").unwrap(),
+            "s3://bucket/cluster"
+        );
+    }
+
+    /// #1527: every route derives one key for an `s3://` URI or refuses it.
+    /// A spelling Lance decodes to another key (an escape such as `%41`, also a
+    /// dot escaped inside a segment, a space, a non-ASCII letter, a brace) is
+    /// refused as two keys by the adapter, by root
+    /// normalization and by the clone open alike, so two roots that differ
+    /// only in escaping are never two sets of keys.
+    #[test]
+    fn s3_uri_whose_lance_key_differs_is_refused_by_every_route_issue_1527() {
+        for uri in [
+            "s3://bucket/my data/root",
+            "s3://bucket/my%20data/root",
+            "s3://bucket/\u{e9}t\u{e9}/root",
+            "s3://bucket/%C3%A9t%C3%A9/root",
+            "s3://bucket/a%41b",
+            "s3://bucket/{x}/root",
+            "s3://bucket/50%25off",
+            "s3://bucket/a%2eb",
+            "s3://bucket/root?x",
+            "s3://bucket/root#f",
+        ] {
+            for text in [
+                parse_s3_uri(uri).expect_err("adapter key").to_string(),
+                s3_object_key(uri).expect_err("one key").to_string(),
+                normalize_root_uri(uri).expect_err("root").to_string(),
+                s3_root_key(uri).expect_err("root key").to_string(),
+                ObjectStorageAdapter::s3_from_root_uri(uri)
+                    .map(|_| ())
+                    .expect_err("adapter")
+                    .to_string(),
+            ] {
+                // The upgrade guide keys its recovery on this: a refusal that
+                // names two keys is a split; a query or fragment names none.
+                let case = if uri.contains(['?', '#']) {
+                    "names no key"
+                } else {
+                    "and Lance under"
+                };
+                assert!(
+                    text.contains("must name one object key") && text.contains(case),
+                    "{uri:?}: {text}"
+                );
+            }
+        }
+        // The spelling both routes agree on is accepted, unchanged.
+        for (uri, key) in [
+            ("s3://bucket/aAb", "aAb"),
+            ("s3://bucket/a%zz", "a%zz"),
+            ("s3://bucket/c^1/g", "c^1/g"),
+            ("s3://bucket/my-data_1.x/root", "my-data_1.x/root"),
+        ] {
+            assert_eq!(s3_object_key(uri).unwrap(), key, "{uri:?}");
+            assert_eq!(normalize_root_uri(uri).unwrap(), uri, "{uri:?}");
         }
     }
 
@@ -7341,7 +8062,6 @@ mod tests {
             ("s3://bucket", "s3://bucket/clone"),
             ("s3://bucket/graph/", "s3://bucket/graph"),
             ("s3://bucket/graph//", "s3://bucket/graph/clone/"),
-            ("s3://bucket/graph", "s3://bucket/graph/./clone"),
             ("s3://bucket/graph", "s3://bucket"),
         ] {
             let text = ObjectStorageAdapter::durable_read_through(base, root)
@@ -7361,12 +8081,16 @@ mod tests {
             ("s3://bucket/graph/sub", "s3://bucket/graph//sub/"),
             ("s3://bucket//graph", "s3://bucket/graph/clone"),
             ("s3://bucket/graph", "s3://bucket/graph?clone"),
+            ("s3://bucket/graph", "s3://bucket/graph/./clone"),
         ] {
             let text = ObjectStorageAdapter::durable_read_through(base, root)
                 .await
                 .expect_err("a root with two spellings")
                 .to_string();
-            assert!(text.contains("names one key"), "{base} and {root}: {text}");
+            assert!(
+                text.contains("must name one object key"),
+                "{base} and {root}: {text}"
+            );
         }
         assert!(!s3_prefixes_overlap("graph", "graphs"));
         assert!(!s3_prefixes_overlap("a/graph", "b/graph"));
@@ -7374,7 +8098,7 @@ mod tests {
 
     /// GQT cannot name its store's root, and only an `s3://` clone has this prefix.
     #[test]
-    fn s3_clone_prefix_keeps_a_caret_as_written() {
+    fn s3_root_key_keeps_a_caret_as_written() {
         for (uri, key) in [
             ("s3://bucket/graph", "graph"),
             ("s3://bucket/a/b//", "a/b"),
@@ -7384,11 +8108,9 @@ mod tests {
             ("s3://bucket/a|b*c", "a|b*c"),
             ("s3://bucket/a%zz", "a%zz"),
             ("s3://bucket/100%", "100%"),
-            ("s3://bucket/graph/../other", "other"),
-            ("s3://bucket/graph\n", "graph"),
             ("s3://bucket", ""),
         ] {
-            assert_eq!(s3_clone_prefix(uri).unwrap().as_ref(), key, "{uri:?}");
+            assert_eq!(s3_root_key(uri).unwrap().as_ref(), key, "{uri:?}");
         }
         for uri in [
             "s3://bucket/c%41",
@@ -7406,9 +8128,11 @@ mod tests {
             "s3://bucket/child?x",
             "s3://bucket//clone",
             "s3://bucket/a//b",
+            "s3://bucket/graph/../other",
+            "s3://bucket/graph\n",
         ] {
-            let text = s3_clone_prefix(uri).expect_err("no one key").to_string();
-            assert!(text.contains("names one key"), "{uri:?}: {text}");
+            let text = s3_root_key(uri).expect_err("no one key").to_string();
+            assert!(text.contains("must name one object key"), "{uri:?}: {text}");
         }
     }
 

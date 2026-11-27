@@ -1,2 +1,3 @@
-- An empty list `[]` takes its element type from its context, so it can be
-  assigned to any list property; with no context it is refused with `T7`.
+- `[]` takes its element type from any context, not only an assigned list
+  property: the other side of a comparison or `in`, `if` or `coalesce`. With
+  no context it is refused (`T7`).

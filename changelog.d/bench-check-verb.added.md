@@ -1,0 +1,1 @@
+- `omnigraph-bench check <suite|scenario>` runs each scenario's workload on a graph built from its fixture without its data (no seed rows, no `load csv`), rows ignored; exit 1 names each that did not run.

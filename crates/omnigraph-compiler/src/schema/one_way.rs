@@ -41,7 +41,7 @@ fn release_order(release: &str) -> [u64; 3] {
 
 /// The release that ships GQ 3, the first to read every construct of
 /// today's rows.
-const GQ_3_RELEASE: &str = "0.17.0";
+const GQ_3_RELEASE: &str = "0.18.0";
 
 /// One property declaration as the one-way rows read it: its syntax, before
 /// any desugaring that would forget how it was written (an explicit `l2`
@@ -362,7 +362,7 @@ mod tests {
             OneWayRow {
                 id: "declared_implements",
                 description: "a node that implements an interface",
-                first_release: "0.18.0",
+                first_release: "0.19.0",
                 matches: OneWayMatch::Declaration(|d| d.kind == "node" && !d.implements.is_empty()),
                 before: "",
                 after: "",
@@ -370,7 +370,7 @@ mod tests {
             OneWayRow {
                 id: "edge_into_doc",
                 description: "an edge into `Doc`",
-                first_release: "0.18.0",
+                first_release: "0.19.0",
                 matches: OneWayMatch::Declaration(|d| {
                     d.endpoints.as_ref().is_some_and(|(_, to)| to == "Doc")
                 }),
@@ -405,7 +405,7 @@ mod tests {
         // The note names the latest release among the matches.
         assert_eq!(
             one_way_note(found.iter().map(|c| c.first_release.as_str())).unwrap(),
-            "binaries before 0.18.0 refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored"
+            "binaries before 0.19.0 refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored"
         );
         assert_eq!(one_way_note([]), None);
     }
@@ -471,7 +471,7 @@ edge Cites: Doc -> Doc { note: String? @index }
         assert!(found.iter().all(|c| c.first_release == GQ_3_RELEASE));
         assert_eq!(
             one_way_note(found.iter().map(|c| c.first_release.as_str())).unwrap(),
-            "binaries before 0.17.0 refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored"
+            "binaries before 0.18.0 refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored"
         );
     }
 }

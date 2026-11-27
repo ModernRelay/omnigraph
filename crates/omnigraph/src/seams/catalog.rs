@@ -94,6 +94,7 @@ omnigraph_seams::catalog! {
     crate::exec::merge::BRANCH_MERGE_BETWEEN_DELETE_CHUNKS,
     crate::exec::merge::BRANCH_MERGE_POST_AUTHORITY_CAPTURE,
     crate::exec::merge::BRANCH_MERGE_POST_CANDIDATE_VALIDATION,
+    crate::exec::merge::BRANCH_MERGE_POST_INPUT_TAGS_PRE_PROBE,
     crate::exec::merge::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
     crate::exec::merge::BRANCH_MERGE_POST_TABLE_EFFECT,
     crate::exec::merge::BRANCH_MERGE_PRE_RETURN,

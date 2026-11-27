@@ -39,20 +39,38 @@ use crate::cli::CliLoadMode;
 use crate::command_outcome::{EngineWrite as _, EngineWriteError};
 #[cfg(test)]
 use crate::graph_http::ApiContractError;
-use crate::graph_http::GraphHttpClient;
+use crate::graph_http::{GraphHttpClient, RequestDeadline};
 use crate::helpers::{
     ContradictoryReply, PreconditionFailedCli, apply_bearer_token, branch_statement_change_request,
     branch_statement_query_request, missing_credential, precondition_failed_cli,
-    query_params_from_json, remote_json_bounded, remote_no_content, remote_response_json_bounded,
-    remote_url, resolve_actor_with_config, select_named_query,
+    query_params_from_json, remote_json_bounded, remote_json_bounded_within, remote_no_content,
+    remote_response_json_bounded, remote_url, resolve_actor_with_config, select_named_query,
 };
 use crate::operator::InvocationConfig;
 use crate::targets::{ResolvedTarget, TargetBinding};
 
 const MANAGED_LOAD_REQUEST_LIMIT: usize = 32 * 1024 * 1024;
-// Managed load transport has its own longer bounded receipt wait.
-// Managed queries and mutations share a thirty-second total request deadline.
-const MANAGED_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A merge compares both sides since their base, so its time grows with what
+/// they changed. Every merge request, published or previewed, through the
+/// dedicated route or a GQ statement, gets the data deadline (#1457).
+const MERGE_DEADLINE: RequestDeadline = RequestDeadline::Data;
+
+/// The deadline of a GQ branch write sent to `/mutate`.
+fn branch_write_deadline(write: &BranchWrite) -> RequestDeadline {
+    match write {
+        BranchWrite::Merge { .. } => MERGE_DEADLINE,
+        BranchWrite::Create { .. } | BranchWrite::Delete { .. } => RequestDeadline::Standard,
+    }
+}
+
+/// The deadline of a GQ branch read sent to `/query`.
+fn branch_read_deadline(read: &BranchRead) -> RequestDeadline {
+    match read {
+        BranchRead::MergeDryRun { .. } => MERGE_DEADLINE,
+        BranchRead::Diff { .. } | BranchRead::MergeBase { .. } => RequestDeadline::Standard,
+    }
+}
 
 /// A success response must describe the merge that was submitted. A receipt
 /// cannot be recovered by reading a mutable HEAD after receiving bad evidence.
@@ -159,16 +177,7 @@ fn read_managed_load_data(path: &str) -> Result<String> {
     String::from_utf8(bytes).map_err(|_| eyre!("managed load input must be valid UTF-8"))
 }
 
-fn load_request(
-    request: reqwest::RequestBuilder,
-    data: String,
-    managed: bool,
-) -> reqwest::RequestBuilder {
-    let request = if managed {
-        request.timeout(MANAGED_LOAD_TIMEOUT)
-    } else {
-        request
-    };
+fn load_request(request: reqwest::RequestBuilder, data: String) -> reqwest::RequestBuilder {
     request
         .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
         .body(data)
@@ -1329,14 +1338,14 @@ impl GraphClient {
                 }
                 let request = load_request(
                     apply_bearer_token(
-                        http.request(
+                        http.request_within(
                             Method::POST,
                             remote_url(base_url, &["load", "ndjson"], &query)?,
+                            RequestDeadline::Data,
                         )?,
                         token.as_deref(),
                     ),
                     data,
-                    response_limit.is_some(),
                 );
                 // One attempt only. A lost response may follow a committed
                 // load or a created branch; neither can be replayed blindly.
@@ -1501,7 +1510,7 @@ impl GraphClient {
             } => {
                 let mut request = branch_statement_change_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
-                let output: ChangeOutput = remote_json_bounded(
+                let output: ChangeOutput = remote_json_bounded_within(
                     http,
                     Method::POST,
                     remote_url(base_url, &["mutate"], &[])?,
@@ -1509,6 +1518,7 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
+                    branch_write_deadline(&write),
                 )
                 .await?;
                 if let BranchWrite::Merge {
@@ -1952,7 +1962,7 @@ impl GraphClient {
             } => {
                 let mut request = branch_statement_query_request(query_source);
                 request.settings = Self::remote_settings(settings)?;
-                remote_json_bounded(
+                remote_json_bounded_within(
                     http,
                     Method::POST,
                     remote_url(base_url, &["query"], &[])?,
@@ -1960,6 +1970,7 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
+                    branch_read_deadline(&read),
                 )
                 .await
             }
@@ -2416,7 +2427,7 @@ impl GraphClient {
                 response_limit,
                 ..
             } => {
-                remote_json_bounded(
+                remote_json_bounded_within(
                     http,
                     Method::POST,
                     remote_url(base_url, &["branches", "merge"], &[])?,
@@ -2431,6 +2442,7 @@ impl GraphClient {
                     token.as_deref(),
                     None,
                     *response_limit,
+                    MERGE_DEADLINE,
                 )
                 .await?
             }
@@ -3977,11 +3989,17 @@ mod tests {
                     "affected_edges": 0, "actor_id": "principal:alice", "commit": commit
                 });
                 if form == "branch" {
-                    reply["query_name"] = json!("branch merge");
+                    // A branch create publishes no graph commit: the server
+                    // answers `commit: null` with the `created` outcome.
+                    reply["branch"] = json!("review");
+                    reply["query_name"] = json!("branch create");
                     reply["affected_nodes"] = json!(0);
+                    reply["commit"] = Value::Null;
                     reply["outcome"] = json!({
-                        "kind": "merged", "source": "review", "target": "main",
-                        "merge": "fast_forward"
+                        "kind": "created",
+                        "from": "main",
+                        "name": "review",
+                        "from_commit_id": "head-before"
                     });
                 }
                 let server = IntentApiFixture::graph_with_response_delay(
@@ -4007,11 +4025,10 @@ mod tests {
                         "branch" => (
                             client
                                 .branch_write_statement(
-                                    "branch merge review into main",
-                                    BranchWrite::Merge {
-                                        source: "review".into(),
-                                        into: Some("main".into()),
-                                        as_commit: false,
+                                    "branch create review from main",
+                                    BranchWrite::Create {
+                                        name: "review".into(),
+                                        from: Some(BranchCreateFrom::Branch("main".into())),
                                     },
                                     &[],
                                     &mut std::io::sink(),
@@ -4058,7 +4075,18 @@ mod tests {
                     if !expect_timeout {
                         let result = result.unwrap_or_else(|error| panic!("{form}: {error}"));
                         assert!(started.elapsed() >= std::time::Duration::from_secs(10));
-                        assert_eq!(serde_json::to_value(result.commit).unwrap(), commit);
+                        if form == "branch" {
+                            assert!(result.commit.is_none(), "{form}");
+                            assert_eq!(
+                                serde_json::to_value(&result.outcome).unwrap(),
+                                json!({
+                                    "kind": "created", "from": "main", "name": "review",
+                                    "from_commit_id": "head-before"
+                                })
+                            );
+                        } else {
+                            assert_eq!(serde_json::to_value(result.commit).unwrap(), commit);
+                        }
                         assert_eq!(result.actor_id.as_deref(), Some("principal:alice"));
                     } else {
                         let error =
@@ -4468,24 +4496,275 @@ mod tests {
                 .to_string()
                 .contains("32 MiB")
         );
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap();
-        for (managed, expected) in [
-            (true, Some(std::time::Duration::from_secs(300))),
-            (false, None),
+        let request = load_request(
+            reqwest::Client::new().post("https://data.example"),
+            "{}\n".into(),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request.headers()[reqwest::header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        assert_eq!(request.body().unwrap().as_bytes(), Some(b"{}\n".as_slice()));
+    }
+
+    /// One deadline policy: the managed transport bounds each request by
+    /// its kind, a self-hosted one by none, and every merge request, published
+    /// or previewed by either route, is of the data kind (#1457).
+    #[test]
+    fn managed_request_deadline_follows_its_kind_and_every_merge_is_data_issue_1457() {
+        use std::time::Duration;
+        let url = || "https://data.example/graphs/knowledge/query".to_owned();
+        for (http, deadline, expected) in [
+            (
+                GraphHttpClient::managed("https://data.example").unwrap(),
+                RequestDeadline::Standard,
+                Some(Duration::from_secs(30)),
+            ),
+            (
+                GraphHttpClient::managed("https://data.example").unwrap(),
+                RequestDeadline::Data,
+                Some(Duration::from_secs(300)),
+            ),
+            (
+                GraphHttpClient::new("https://data.example").unwrap(),
+                RequestDeadline::Data,
+                None,
+            ),
+            (
+                GraphHttpClient::new("https://data.example").unwrap(),
+                RequestDeadline::Standard,
+                None,
+            ),
         ] {
-            let request = load_request(http.post("https://data.example"), "{}\n".into(), managed)
+            let request = http
+                .request_within(Method::POST, url(), deadline)
+                .unwrap()
                 .build()
                 .unwrap();
-            assert_eq!(request.timeout().copied(), expected);
-            assert_eq!(
-                request.headers()[reqwest::header::CONTENT_TYPE],
-                "application/x-ndjson"
-            );
-            assert_eq!(request.body().unwrap().as_bytes(), Some(b"{}\n".as_slice()));
+            assert_eq!(request.timeout().copied(), expected, "{deadline:?}");
         }
+        // `request` is the standard kind, and Blob delivery keeps no deadline.
+        let managed = GraphHttpClient::managed("https://data.example").unwrap();
+        let request = managed
+            .request(Method::POST, url())
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.timeout().copied(), Some(Duration::from_secs(30)));
+        let blob = managed.blob_delivery().unwrap();
+        let request = blob
+            .request_within(Method::GET, url(), RequestDeadline::Data)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.timeout(), None);
+
+        assert_eq!(MERGE_DEADLINE, RequestDeadline::Data);
+        let into = Some("main".to_owned());
+        for (write, expected) in [
+            (
+                BranchWrite::Merge {
+                    source: "review".into(),
+                    into: into.clone(),
+                    as_commit: false,
+                },
+                RequestDeadline::Data,
+            ),
+            (
+                BranchWrite::Merge {
+                    source: "review".into(),
+                    into: into.clone(),
+                    as_commit: true,
+                },
+                RequestDeadline::Data,
+            ),
+            (
+                BranchWrite::Create {
+                    name: "review".into(),
+                    from: None,
+                },
+                RequestDeadline::Standard,
+            ),
+            (
+                BranchWrite::Delete {
+                    name: "review".into(),
+                },
+                RequestDeadline::Standard,
+            ),
+        ] {
+            assert_eq!(branch_write_deadline(&write), expected, "{write:?}");
+        }
+        for (read, expected) in [
+            (
+                BranchRead::MergeDryRun {
+                    source: "review".into(),
+                    into: into.clone(),
+                },
+                RequestDeadline::Data,
+            ),
+            (
+                BranchRead::MergeBase {
+                    source: "review".into(),
+                    into: into.clone(),
+                },
+                RequestDeadline::Standard,
+            ),
+            (
+                BranchRead::Diff {
+                    sides: omnigraph_compiler::query::file::BranchDiffSides::Branch {
+                        source: "review".into(),
+                        into,
+                    },
+                    page: Default::default(),
+                },
+                RequestDeadline::Standard,
+            ),
+        ] {
+            assert_eq!(branch_read_deadline(&read), expected, "{read:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "nightly: waits out the real 30 s managed deadline for four merge forms"]
+    async fn managed_branch_merge_outlives_the_thirty_second_deadline_issue_1457() {
+        // The server answers each merge, published or previewed, through the
+        // dedicated route or a GQ statement, at 30.25 s: past the standard
+        // thirty seconds and well inside the data deadline every merge gets.
+        // Before #1457 the CLI gave up at 30 s, so a published merge was
+        // reported with unknown effects and a preview failed.
+        let commit = json!({
+            "graph_commit_id": "head-after", "graph_branch": "main",
+            "graph_manifest_version": 7, "parent_commit_id": "head-before",
+            "merged_parent_commit_id": "head-source",
+            "actor_id": "principal:alice", "created_at": 12345,
+            "published": true, "kind": "published", "root_commit_id": null
+        });
+        futures::future::join_all(
+            ["route", "route-dry-run", "statement", "statement-dry-run"]
+                .into_iter()
+                .map(|form| {
+                    let reply = match form {
+                        "route" => json!({
+                            "source": "review", "target": "main", "outcome": "merged",
+                            "commit": commit, "actor_id": "principal:alice"
+                        }),
+                        "route-dry-run" => json!({
+                            "source": "review", "target": "main", "outcome": "merged",
+                            "commit": null, "actor_id": "principal:alice", "dry_run": true
+                        }),
+                        "statement" => json!({
+                            "branch": "main", "query_name": "branch merge",
+                            "affected_nodes": 0, "affected_edges": 0,
+                            "actor_id": "principal:alice", "commit": commit,
+                            "outcome": {
+                                "kind": "merged", "source": "review", "target": "main",
+                                "merge": "fast_forward"
+                            }
+                        }),
+                        _ => json!({
+                            "query_name": "branch merge dry run",
+                            "target": {"branch": null, "snapshot": null},
+                            "row_count": 1, "columns": ["source", "target", "outcome"],
+                            "rows": [{"source": "review", "target": "main", "outcome": "merged"}]
+                        }),
+                    };
+                    let server = IntentApiFixture::graph_with_response_delay(
+                        vec![IntentReply::json(200, reply)],
+                        std::time::Duration::from_millis(30_250),
+                    );
+                    let client = crate::operator_routing::test_transport_scope_sync(
+                        &[&server.origin],
+                        || {
+                            GraphClient::managed(
+                                &server.origin,
+                                "knowledge",
+                                crate::credential_sources::test_credential(
+                                    &server.origin,
+                                    "data-credential",
+                                ),
+                            )
+                        },
+                    )
+                    .unwrap();
+                    let commit = commit.clone();
+                    // Finish synchronous client setup before join_all polls requests.
+                    async move {
+                        let started = std::time::Instant::now();
+                        let (result, path) = match form {
+                            "route" | "route-dry-run" => (
+                                client
+                                    .branch_merge(
+                                        "review",
+                                        "main",
+                                        false,
+                                        false,
+                                        form == "route-dry-run",
+                                        &[],
+                                        &mut std::io::sink(),
+                                    )
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/branches/merge",
+                            ),
+                            "statement" => (
+                                client
+                                    .branch_write_statement(
+                                        "branch merge review into main",
+                                        BranchWrite::Merge {
+                                            source: "review".into(),
+                                            into: Some("main".into()),
+                                            as_commit: false,
+                                        },
+                                        &[],
+                                        &mut std::io::sink(),
+                                    )
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/mutate",
+                            ),
+                            _ => (
+                                client
+                                    .branch_read_statement(
+                                        "branch merge review into main dry run",
+                                        BranchRead::MergeDryRun {
+                                            source: "review".into(),
+                                            into: Some("main".into()),
+                                        },
+                                        &[],
+                                    )
+                                    .await
+                                    .map(|output| serde_json::to_value(output).unwrap()),
+                                "/graphs/knowledge/query",
+                            ),
+                        };
+                        let elapsed = started.elapsed();
+                        let output = result.unwrap_or_else(|error| {
+                            panic!(
+                                "{form} answered at 30.25 s was cut off after {elapsed:?}: {error}"
+                            )
+                        });
+                        assert!(elapsed >= std::time::Duration::from_secs(30), "{form}");
+                        match form {
+                            "route" | "statement" => assert_eq!(output["commit"], commit),
+                            "route-dry-run" => {
+                                assert_eq!(output["dry_run"], true);
+                                assert_eq!(output["commit"], Value::Null);
+                            }
+                            _ => assert_eq!(output["rows"][0]["outcome"], "merged"),
+                        }
+                        let requests = server.workflow_requests();
+                        assert_eq!(requests.len(), 1, "{form} must not be retried");
+                        assert_eq!(requests[0].path, path);
+                        if form == "route-dry-run" {
+                            assert_eq!(requests[0].body["dry_run"], true);
+                        }
+                        server.assert_complete();
+                    }
+                }),
+        )
+        .await;
     }
 
     fn content_range_headers(value: &'static str) -> reqwest::header::HeaderMap {

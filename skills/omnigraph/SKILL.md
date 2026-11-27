@@ -5,7 +5,7 @@ license: MIT (see LICENSE at repo root)
 compatibility: Covers the current Omnigraph CLI and server, using HTTP contract 0.14. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
   author: ModernRelay
-  version: "0.16.1"
+  version: "0.17.2"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
@@ -204,7 +204,7 @@ backend. `--config DIR` is source input only.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
 - Server: `--target production --graph knowledge`; the registered target owns endpoint and one auth provider.
 - Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
-- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup --graph` while the server is stopped. Each direct writer on the root takes the admission lock. A converged local or S3 `cluster apply` releases it after its writes settle. Maintenance and an unconverged writable apply retain admission. If release is unconfirmed, compare the apply's admission ID with the current `lock_id` in `cluster status --json`. Only force-unlock a matching lock after its writer has stopped and its I/O has settled. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
+- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup --graph` while the server is stopped. Each direct writer on the root takes the admission lock. A converged local or S3 `cluster apply` releases it after its writes settle. Maintenance and an unconverged writable apply retain admission. If release is unconfirmed, compare the apply's admission ID with the current `lock_id` in `cluster status --json`. Only force-unlock a matching lock after its writer has stopped and its I/O has settled. An inline `s3://` graph (no `--graph`) also serves the direct reads (`query`, `export`, `snapshot`, `diff`, `schema show`, `branch list|diff|merge-base`, `commit list|show|changes`, `blob get|stat`) and the writes that create and fill a graph nobody serves (`init`, `schema apply`, `load`); `mutate`, `branch create|delete|merge`, `commit publish|drop`, `blob put|clear` and `changes` on cloud storage go through a server. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
@@ -306,10 +306,11 @@ A graph's bytes live in one of four URI families, two of them previews:
 - **Azure Blob storage preview** — `az://container/prefix`. Reads and Azurite qualification are available, but Azure is not production-supported; every write or maintenance process must be launched through the root-scoped `omnigraph-azure-admission` wrapper.
 - **Google Cloud Storage preview** — `gs://bucket/prefix`, through the embedded Rust API only: cluster roots, CLI targets and servers refuse it. Configure with `GOOGLE_*` variables only; an unprefixed Google option name such as `BEARER_TOKEN` or `SERVICE_ACCOUNT` is refused.
 
-Direct CLI targets are local, with one exception: a stopped S3 cluster accepts
+Direct CLI targets are local, with two exceptions: a stopped S3 cluster accepts
 an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger`
-and the maintenance commands with `--graph` (see
-[S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)); the CLI
+and the maintenance commands with `--graph`, and a graph nobody serves accepts
+an inline `s3://` graph for the direct reads and for `init`, `schema apply` and
+`load` (see [S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)); the CLI
 then reads `AWS_REGION` (or `AWS_DEFAULT_REGION`) and endpoint variables from its environment. Otherwise,
 for cloud-backed graphs, use a registered server or managed target; the server
 owns storage credentials. Keep development credentials in a git-ignored
@@ -319,7 +320,7 @@ owns storage credentials. Keep development credentials in a git-ignored
 set -a && source .env.omni && set +a
 ```
 
-Direct `init`/`load` write local storage, and direct **`cluster apply`** writes a local or inline `s3://` cluster root, without an HTTP server. A served `load` or `cluster apply` sends the request to `omnigraph-server`, which performs the writes with its storage credentials. A managed `cluster apply --target NAME --plan PREVIEW_ID` is submitted through the profile’s control plane. A serving process needs read-write storage access for served data-plane writes. Validate with `curl http://127.0.0.1:8080/readyz` (HTTP 200, `ready: true`; `/healthz` only proves the process is alive), then `omnigraph snapshot --target <name> --graph <id> --json`.
+Direct `init`/`schema apply`/`load` write local storage or an inline `s3://` graph, and direct **`cluster apply`** writes a local or inline `s3://` cluster root, without an HTTP server. A served `load` or `cluster apply` sends the request to `omnigraph-server`, which performs the writes with its storage credentials. A managed `cluster apply --target NAME --plan PREVIEW_ID` is submitted through the profile’s control plane. A serving process needs read-write storage access for served data-plane writes. Validate with `curl http://127.0.0.1:8080/readyz` (HTTP 200, `ready: true`; `/healthz` only proves the process is alive), then `omnigraph snapshot --target <name> --graph <id> --json`.
 
 ## Project Layout
 

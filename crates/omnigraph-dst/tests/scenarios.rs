@@ -32,6 +32,26 @@ use omnigraph::loader::LoadMode;
 use omnigraph::settings::SessionSettings;
 use omnigraph::storage::{ObjectStorageAdapter, StorageAdapter};
 
+/// The test binary's global subscriber, installed before any test runs: it
+/// enables nothing and keeps every callsite's process-wide cached interest
+/// dynamic, so `trace::capture_trace` records every event its thread emits,
+/// whichever thread hit the callsite first
+/// ([log capture](../../../docs/dev/testing.md#log-capture)).
+#[ctor::ctor(unsafe)]
+fn keep_callsite_interest_dynamic() {
+    use tracing::subscriber::{Interest, NoSubscriber};
+    use tracing_subscriber::filter::dynamic_filter_fn;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    // No registry: a span closed outside its own subscriber's scope releases
+    // its parent through this one, which must ignore an id it never issued.
+    let keeper = NoSubscriber::new()
+        .with(dynamic_filter_fn(|_, _| false).with_callsite_filter(|_| Interest::sometimes()));
+    // Nothing else runs before `main`, so the global default is unset; a
+    // constructor must not panic, so a refusal is ignored, not unwrapped.
+    let _ = tracing::subscriber::set_global_default(keeper);
+}
+
 fn session(db: Omnigraph) -> Session {
     Session::from_defaults(Arc::new(db), SessionSettings::default())
 }

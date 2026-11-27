@@ -373,7 +373,32 @@ pub(crate) async fn remote_json_bounded<T: DeserializeOwned>(
     expected_commit: Option<&str>,
     response_limit: Option<usize>,
 ) -> Result<T> {
-    let request = apply_bearer_token(client.request(method, url)?, bearer_token);
+    remote_json_bounded_within(
+        client,
+        method,
+        url,
+        body,
+        bearer_token,
+        expected_commit,
+        response_limit,
+        crate::graph_http::RequestDeadline::Standard,
+    )
+    .await
+}
+
+/// [`remote_json_bounded`] under `deadline` on a managed transport.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remote_json_bounded_within<T: DeserializeOwned>(
+    client: &crate::graph_http::GraphHttpClient,
+    method: Method,
+    url: String,
+    body: Option<Value>,
+    bearer_token: Option<&str>,
+    expected_commit: Option<&str>,
+    response_limit: Option<usize>,
+    deadline: crate::graph_http::RequestDeadline,
+) -> Result<T> {
+    let request = apply_bearer_token(client.request_within(method, url, deadline)?, bearer_token);
     let request = if let Some(commit_id) = expected_commit {
         request.header(
             omnigraph_api_types::GRAPH_COMMIT_PRECONDITION_HEADER,

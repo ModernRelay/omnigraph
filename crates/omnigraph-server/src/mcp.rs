@@ -10,8 +10,8 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json, Router};
 use omnigraph_mcp::{
-    AdmissionError, ChangeFilters, Host, HostError, Pending, ProtocolError, ResourceOutput,
-    ResourceRequest, ToolCall, ToolRequest, ToolResult, change_query,
+    AdmissionError, ChangeFilters, Encoded, Host, HostError, Pending, ProtocolError,
+    ResourceOutput, ResourceRequest, ToolCall, ToolRequest, change_query,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -25,8 +25,8 @@ use crate::serving::GraphRequest;
 use crate::workload::IngressLease;
 use crate::{ApiError, AppState, AuthenticatedActor, GraphId, GraphKey};
 
-pub use omnigraph_mcp::McpSettings;
 pub(crate) use omnigraph_mcp::REQUEST_BYTES;
+pub use omnigraph_mcp::{McpSettings, ReadBudget};
 const RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
 
 /// Whether `path` is protected-resource metadata: the root document or the
@@ -69,6 +69,7 @@ pub(crate) fn router(state: AppState) -> Router<AppState> {
         state.mcp_settings().clone(),
         resource_url.as_deref(),
         crate::api::build::reported_version(env!("CARGO_PKG_VERSION")),
+        crate::api::build::docs_revision(env!("CARGO_PKG_VERSION")).as_deref(),
     )
     .route_layer(middleware::from_fn_with_state(
         state.clone(),
@@ -217,7 +218,7 @@ impl Host for ServerHost {
     }
 
     fn error(&self, error: ProtocolError, write: bool) -> HostError {
-        project_error(protocol_error(error, write), write)
+        project_error(protocol_error(error, write))
     }
 
     fn start_tool(
@@ -225,7 +226,7 @@ impl Host for ServerHost {
         context: Admitted,
         request: ToolRequest,
         permit: OwnedSemaphorePermit,
-    ) -> Pending<ToolResult> {
+    ) -> Pending<Encoded> {
         let host = self.clone();
         let actor = context.actor.clone();
         let input = context.input.clone();
@@ -281,25 +282,17 @@ fn host_error(mut error: ApiError, write: bool) -> HostError {
     if write && (error.completion_uncertain() || error.code == ErrorCode::ResultTooLarge) {
         error = error.after_owned_write();
     }
-    project_error(error, write)
+    project_error(error)
 }
 
-fn project_error(error: ApiError, write: bool) -> HostError {
+fn project_error(error: ApiError) -> HostError {
     let output = error.into_output();
     let status = output
         .http_status()
         .and_then(|status| StatusCode::from_u16(status).ok());
-    HostError::from_output(status, &output).unwrap_or_else(|failure| {
-        let mut error = protocol_error(failure, write);
-        if write {
-            error = error.after_owned_write();
-        }
-        let output = error.into_output();
-        let status = output
-            .http_status()
-            .and_then(|status| StatusCode::from_u16(status).ok());
-        HostError::from_output(status, &output).expect("fixed MCP refusal fits the result bound")
-    })
+    // A body too large to send is replaced by the protocol layer with this
+    // host's `result_too_large` refusal for the same call.
+    HostError::from_output(status, &output)
 }
 
 /// MCP refusals use the server's one error-code and disposition registry.
@@ -331,14 +324,21 @@ fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
             ErrorCode::DeadlineExceeded,
             "The read exceeded its 30 second deadline.",
         ),
-        ProtocolError::ResultTooLarge | ProtocolError::InvalidResult => {
-            let error = if matches!(error, ProtocolError::ResultTooLarge) {
-                ApiError::new(
+        ProtocolError::ResultTooLarge
+        | ProtocolError::ReadOverBudget(_)
+        | ProtocolError::InvalidResult => {
+            let error = match error {
+                ProtocolError::ResultTooLarge => ApiError::new(
                     ErrorCode::ResultTooLarge,
                     "The result exceeds 1 MiB; use a narrower stored query.",
-                )
-            } else {
-                ApiError::internal("could not encode MCP result")
+                ),
+                ProtocolError::ReadOverBudget(budget) => ApiError::new(
+                    ErrorCode::ResultTooLarge,
+                    format!(
+                        "The result exceeds the {budget} read budget, so none of it was sent. Narrow the read and run it again: add filters, lower `limit`, return fewer properties, or use a narrower stored query."
+                    ),
+                ),
+                _ => ApiError::internal("could not encode MCP result"),
             };
             if write {
                 error.after_owned_write()
@@ -349,13 +349,47 @@ fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
     }
 }
 
-fn bounded_result<T: Serialize>(value: &T) -> Result<ToolResult, ApiError> {
-    omnigraph_mcp::bounded_result(value).map_err(|error| protocol_error(error, false))
+/// A successful `graphs` result. `setup` appears only on a successful empty
+/// list and only when the operator configured `--mcp-setup-url`; the HTTP
+/// discovery output stays unchanged.
+#[derive(Serialize)]
+struct McpGraphsOutput {
+    #[serde(flatten)]
+    discovery: crate::api::GraphDiscoveryOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    setup: Option<McpSetupHint>,
+}
+
+#[derive(Serialize)]
+struct McpSetupHint {
+    message: &'static str,
+    url: String,
+}
+
+const SETUP_MESSAGE: &str = "No graph is visible to you yet. The user can create one on this page; creation happens there, not through these tools.";
+
+fn graphs_output(
+    discovery: crate::api::GraphDiscoveryOutput,
+    setup_url: Option<&str>,
+) -> McpGraphsOutput {
+    let setup = setup_url
+        .filter(|_| discovery.graphs.is_empty())
+        .map(|url| McpSetupHint {
+            message: SETUP_MESSAGE,
+            url: url.to_owned(),
+        });
+    McpGraphsOutput { discovery, setup }
+}
+
+/// A handler's DTO, encoded under the memory cap; the protocol layer judges
+/// its complete size by what the call did.
+fn bounded_result<T: Serialize>(value: &T) -> Result<Encoded, ApiError> {
+    Ok(Encoded::new(value))
 }
 
 /// One tool call's work, in its own allocation.
 type ToolFuture<'a> =
-    std::pin::Pin<Box<dyn Future<Output = Result<ToolResult, ApiError>> + Send + 'a>>;
+    std::pin::Pin<Box<dyn Future<Output = Result<Encoded, ApiError>> + Send + 'a>>;
 
 /// Build one tool call's future on the heap, in a frame of its own. A single
 /// future over every tool would be as large as the largest handler's, and the
@@ -368,19 +402,27 @@ type ToolFuture<'a> =
 fn boxed<'a, F, Fut>(start: F) -> ToolFuture<'a>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<ToolResult, ApiError>> + Send + 'a,
+    Fut: Future<Output = Result<Encoded, ApiError>> + Send + 'a,
 {
     Box::pin(start())
 }
 
 impl ServerHost {
+    /// The MCP `graphs` listing, for the tool and the `omnigraph://graphs`
+    /// resource alike: discovery plus the setup link on an empty list.
+    async fn graphs(&self, actor: AuthenticatedActor) -> Result<McpGraphsOutput, ApiError> {
+        let discovery = self.discover(actor).await?;
+        let setup_url = self.state.mcp_settings().setup_url.as_deref();
+        Ok(graphs_output(discovery, setup_url))
+    }
+
     async fn execute(
         &self,
         request: ToolRequest,
         actor: AuthenticatedActor,
         input: IngressLease,
         graph: McpGraphRequest,
-    ) -> Result<ToolResult, ApiError> {
+    ) -> Result<Encoded, ApiError> {
         // Reserve write ingress before decoding arguments, matching HTTP
         // admission and preserving refusal precedence.
         let ingress = if request.is_write() {
@@ -402,7 +444,7 @@ impl ServerHost {
                 boxed(|| async { bounded_result(&handlers::server_health().await.0) }).await
             }
             ToolCall::Graphs => {
-                boxed(move || async move { bounded_result(&self.discover(actor).await?) }).await
+                boxed(move || async move { bounded_result(&self.graphs(actor).await?) }).await
             }
             ToolCall::Schema(args) => {
                 boxed(move || async move {
@@ -426,7 +468,14 @@ impl ServerHost {
             }
             ToolCall::Query(args) => {
                 boxed(move || async move {
-                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let (handle, actor) = self.graph_with_grant(
+                        &args.graph,
+                        actor,
+                        &graph,
+                        handlers::GraphGrant::for_query(
+                            args.query.is_none() && args.name.is_some(),
+                        ),
+                    )?;
                     let Some(query) = args.query else {
                         // A stored read, as `omnigraph query NAME` runs it.
                         let name = args.name.ok_or_else(|| {
@@ -488,9 +537,13 @@ impl ServerHost {
             }
             ToolCall::Access(args) => {
                 boxed(move || async move {
-                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let access = handlers::GraphAccess::capture(
+                        &self.state,
+                        graph_key(&args.graph)?,
+                        Some(&actor),
+                    )?;
                     let output = handlers::access_body(
-                        &handle,
+                        &access,
                         Some(&actor),
                         crate::api::AccessQuery {
                             branch: args.branch,
@@ -679,8 +732,15 @@ impl ServerHost {
             }
             ToolCall::Mutate(args) => {
                 boxed(move || async move {
+                    let (handle, actor) = self.graph_with_grant(
+                        &args.graph,
+                        actor,
+                        &graph,
+                        handlers::GraphGrant::for_query(
+                            args.query.is_none() && args.name.is_some(),
+                        ),
+                    )?;
                     let ingress = write_ingress()?;
-                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
                     let precondition = args
                         .if_graph_commit
                         .as_deref()
@@ -767,8 +827,8 @@ impl ServerHost {
             }
             ToolCall::Load(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let request = request_body(json!({
                         "branch": args.branch,
                         "from": args.from,
@@ -789,8 +849,8 @@ impl ServerHost {
             }
             ToolCall::BlobsClear(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let query = request_body(json!({
                         "entity": args.entity,
                         "type": args.r#type,
@@ -823,8 +883,8 @@ impl ServerHost {
             }
             ToolCall::BranchesCreate(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let output = handlers::server_branch_create(
                         state(),
                         Extension(handle),
@@ -843,8 +903,8 @@ impl ServerHost {
             }
             ToolCall::BranchesDelete(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let output = handlers::server_branch_delete(
                         state(),
                         Extension(handle),
@@ -861,8 +921,8 @@ impl ServerHost {
             }
             ToolCall::BranchesMerge(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let request = request_body(json!({
                         "source": args.source,
                         "target": args.target,
@@ -881,8 +941,8 @@ impl ServerHost {
             }
             ToolCall::CommitsPublish(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     let output = handlers::server_commit_publish(
                         state(),
                         Extension(handle),
@@ -899,8 +959,8 @@ impl ServerHost {
             }
             ToolCall::CommitsDrop(args) => {
                 boxed(move || async move {
-                    let ingress = write_ingress()?;
                     let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let ingress = write_ingress()?;
                     handlers::server_commit_drop(
                         state(),
                         Extension(handle),
@@ -929,7 +989,7 @@ impl ServerHost {
     ) -> Result<(&'static str, String), ApiError> {
         match resource {
             ResourceRequest::Graphs => {
-                Ok(("application/json", pretty(&self.discover(actor).await?)?))
+                Ok(("application/json", pretty(&self.graphs(actor).await?)?))
             }
             ResourceRequest::Schema(name) => {
                 let (handle, actor) = self.graph(&name, actor, &graph)?;
@@ -950,17 +1010,34 @@ impl ServerHost {
         }
     }
 
-    /// The caller's actor and the graphs it may use, as `GET /graphs/discovery`
-    /// lists them.
+    /// Graph ids and names. An identity credential uses `GET /graphs/discovery`,
+    /// which admits every identity; any other credential uses `GET /graphs`
+    /// under the `graph_list` action, narrowed to the same two fields.
     async fn discover(
         &self,
         actor: AuthenticatedActor,
     ) -> Result<crate::api::GraphDiscoveryOutput, ApiError> {
-        Ok(
-            handlers::server_graphs_discovery(State(self.state.clone()), Some(Extension(actor)))
-                .await?
-                .0,
-        )
+        let state = State(self.state.clone());
+        if actor.is_identity() {
+            return Ok(
+                handlers::server_graphs_discovery(state, Some(Extension(actor)))
+                    .await?
+                    .0,
+            );
+        }
+        let listed = handlers::server_graphs_list(state, Some(Extension(actor)))
+            .await?
+            .0;
+        Ok(crate::api::GraphDiscoveryOutput {
+            graphs: listed
+                .graphs
+                .into_iter()
+                .map(|graph| crate::api::GraphDiscoveryEntry {
+                    display_name: graph.graph_id.clone(),
+                    graph_id: graph.graph_id,
+                })
+                .collect(),
+        })
     }
 
     /// A write reserves write ingress for its argument bytes, as the write's
@@ -979,10 +1056,22 @@ impl ServerHost {
         actor: AuthenticatedActor,
         graph: &McpGraphRequest,
     ) -> Result<(GraphRequest, AuthenticatedActor), ApiError> {
-        let id = GraphId::try_from(name.to_string())
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        let handle =
-            handlers::resolve_registered_graph(&self.state, &GraphKey::cluster(id), Some(&actor))?;
+        self.graph_with_grant(name, actor, graph, handlers::GraphGrant::AnyAction)
+    }
+
+    fn graph_with_grant(
+        &self,
+        name: &str,
+        actor: AuthenticatedActor,
+        graph: &McpGraphRequest,
+        grant: handlers::GraphGrant,
+    ) -> Result<(GraphRequest, AuthenticatedActor), ApiError> {
+        let handle = handlers::resolve_registered_graph(
+            &self.state,
+            &graph_key(name)?,
+            Some(&actor),
+            grant,
+        )?;
         if graph.set(handle.clone()).is_err() {
             return Err(ApiError::internal(
                 "MCP request selected its graph more than once",
@@ -991,6 +1080,13 @@ impl ServerHost {
         Ok((handle, actor))
     }
 }
+
+fn graph_key(name: &str) -> Result<GraphKey, ApiError> {
+    GraphId::try_from(name)
+        .map(GraphKey::cluster)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
 fn pretty<T: Serialize>(value: &T) -> Result<String, ApiError> {
     serde_json::to_string_pretty(value)
         .map_err(|_| ApiError::internal("could not encode MCP resource"))
@@ -1057,11 +1153,12 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
+    /// The body a refusal's tool result carries, `{"error", "status"}`.
     fn error_body(error: HostError) -> Value {
-        let result = error.into_tool_result();
-        assert_eq!(result.is_error, Some(true));
-        assert!(serde_json::to_vec(&result).unwrap().len() <= omnigraph_mcp::RESULT_BYTES);
-        let body = result.structured_content.unwrap();
+        let mut body = json!({"error": error.body().cloned().expect("the body encodes")});
+        if let Some(status) = error.status() {
+            body["status"] = json!(status.as_u16());
+        }
         assert!(body.get("outcome_unknown").is_none(), "{body}");
         body
     }
@@ -1070,7 +1167,7 @@ mod tests {
     fn a_write_whose_wait_ends_first_reports_an_unknown_outcome() {
         let unknown = json!({"effects": "unknown", "action": "reconcile"});
         for refusal in [ProtocolError::Cancelled, ProtocolError::Deadline] {
-            let body = error_body(project_error(protocol_error(refusal, true), true));
+            let body = error_body(project_error(protocol_error(refusal, true)));
             assert_eq!(body["status"], 500, "{body}");
             assert_eq!(body["error"]["code"], "outcome_unknown", "{body}");
             assert_eq!(body["error"]["disposition"], unknown, "{body}");
@@ -1177,7 +1274,7 @@ mod tests {
                     "retry",
                 ),
             ] {
-                let body = error_body(project_error(protocol_error(refusal, write), write));
+                let body = error_body(project_error(protocol_error(refusal, write)));
                 assert_eq!(body["status"], json!(status), "{body}");
                 assert_eq!(body["error"]["code"], code, "{body}");
                 assert_eq!(
@@ -1191,8 +1288,13 @@ mod tests {
             (ProtocolError::Cancelled, "cancelled", "retry"),
             (ProtocolError::Deadline, "deadline_exceeded", "retry"),
             (ProtocolError::ResultTooLarge, "result_too_large", "fix"),
+            (
+                ProtocolError::ReadOverBudget(omnigraph_mcp::ReadBudget::DEFAULT),
+                "result_too_large",
+                "fix",
+            ),
         ] {
-            let body = error_body(project_error(protocol_error(refusal, false), false));
+            let body = error_body(project_error(protocol_error(refusal, false)));
             assert!(body.get("status").is_none(), "{body}");
             assert_eq!(body["error"]["code"], code, "{body}");
             assert_eq!(
@@ -1204,40 +1306,65 @@ mod tests {
     }
 
     #[test]
+    fn graphs_adds_a_setup_link_only_to_a_successful_empty_list_when_configured() {
+        let empty = || crate::api::GraphDiscoveryOutput { graphs: Vec::new() };
+        let one = crate::api::GraphDiscoveryOutput {
+            graphs: vec![crate::api::GraphDiscoveryEntry {
+                graph_id: "brain".into(),
+                display_name: "brain".into(),
+            }],
+        };
+        let url = "https://example.com/setup";
+        let with_setup = serde_json::to_value(graphs_output(empty(), Some(url))).unwrap();
+        assert_eq!(with_setup["graphs"], json!([]));
+        assert_eq!(with_setup["setup"]["url"], json!(url));
+        assert_eq!(with_setup["setup"]["message"], json!(SETUP_MESSAGE));
+        let listed = serde_json::to_value(graphs_output(one, Some(url))).unwrap();
+        assert!(listed.get("setup").is_none());
+        let unconfigured = serde_json::to_value(graphs_output(empty(), None)).unwrap();
+        assert_eq!(unconfigured, json!({"graphs": []}));
+    }
+
+    #[test]
+    fn a_read_over_budget_names_the_budget_and_how_to_narrow() {
+        let budget = omnigraph_mcp::ReadBudget::new(128 * 1024).unwrap();
+        let error = protocol_error(ProtocolError::ReadOverBudget(budget), false);
+        assert_eq!(error.code, ErrorCode::ResultTooLarge);
+        let output = serde_json::to_value(error.into_output()).unwrap();
+        let message = output["error"].as_str().unwrap_or_default().to_owned();
+        assert!(message.contains("128 KiB read budget"), "{message}");
+        assert!(message.contains("Narrow the read"), "{message}");
+        assert!(message.contains("`limit`"), "{message}");
+    }
+
+    /// A DTO or an error body past the memory cap is not kept: the protocol
+    /// layer, which judges every complete response, replaces it with this
+    /// host's `result_too_large` refusal for the same call, which a write
+    /// must reconcile.
+    #[test]
     fn oversized_tool_results_and_error_bodies_preserve_write_effects() {
-        // The first DTO fits by itself, but not with the SDK's text copy.
-        // The second exceeds even the DTO bound. Both are call errors, so a
-        // write whose receipt cannot be delivered must be reconciled.
-        for length in [
-            omnigraph_mcp::RESULT_BYTES * 3 / 4,
-            omnigraph_mcp::RESULT_BYTES + 1,
-        ] {
-            let value = json!({"text": "x".repeat(length)});
-            for write in [false, true] {
-                let disposition = if write {
-                    json!({"effects": "unknown", "action": "reconcile"})
-                } else {
-                    json!({"effects": "none", "action": "fix"})
-                };
-                for error in [
-                    bounded_result(&value).unwrap_err(),
-                    // The refusal itself has to fit the complete result too.
-                    ApiError::bad_request("x".repeat(length)),
-                ] {
-                    let body = error_body(host_error(error, write));
-                    assert!(body.get("status").is_none(), "{body}");
-                    assert_eq!(body["error"]["code"], "result_too_large", "{body}");
-                    assert_eq!(body["error"]["disposition"], disposition, "{body}");
-                }
-                // The protocol's final response-size check uses the same
-                // server projection as a handler's bounded DTO conversion.
-                let body = error_body(project_error(
-                    protocol_error(ProtocolError::ResultTooLarge, write),
-                    write,
-                ));
-                assert_eq!(body["error"]["code"], "result_too_large", "{body}");
-                assert_eq!(body["error"]["disposition"], disposition, "{body}");
-            }
+        let over = omnigraph_mcp::RESULT_BYTES + 1;
+        assert!(
+            Encoded::new(&json!({"text": "x".repeat(over)}))
+                .as_value()
+                .is_none()
+        );
+        for write in [false, true] {
+            let disposition = if write {
+                json!({"effects": "unknown", "action": "reconcile"})
+            } else {
+                json!({"effects": "none", "action": "fix"})
+            };
+            let refused = host_error(ApiError::bad_request("x".repeat(over)), write);
+            assert!(refused.body().is_none());
+            assert_eq!(refused.status(), Some(StatusCode::BAD_REQUEST));
+            let body = error_body(project_error(protocol_error(
+                ProtocolError::ResultTooLarge,
+                write,
+            )));
+            assert!(body.get("status").is_none(), "{body}");
+            assert_eq!(body["error"]["code"], "result_too_large", "{body}");
+            assert_eq!(body["error"]["disposition"], disposition, "{body}");
         }
     }
 

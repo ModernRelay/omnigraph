@@ -3996,6 +3996,150 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value_
     );
 }
 
+/// Repeated writes of one entity in one write keep one pending version:
+/// sixteen updates of one row stay one pending entity, below
+/// `KEYED_WRITE_MAX_ROWS` where the copies once doubled past it; a Blob row
+/// rewritten four times retains one version's payload; and a load, whose
+/// input is a set, still refuses a key it repeats and a `@unique` value two
+/// keys share, writing nothing.
+#[tokio::test]
+async fn issue_925_multi_update_keeps_one_pending_version_and_preserves_load_semantics() {
+    const SCHEMA: &str = r#"
+node Item {
+    label: String
+    step: I64
+}
+node Doc {
+    slug: String @key
+    tag: String @unique
+    note: String?
+    body: Blob?
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
+
+    db.load_jsonl(
+        concat!(
+            r#"{"type":"Item","data":{"label":"solo","step":0}}"#,
+            "\n",
+            r#"{"type":"Doc","data":{"slug":"d1","tag":"t1","note":"v0","body":"base64:AQIDBA=="}}"#,
+            "\n",
+        ),
+        LoadMode::Replace,
+    )
+    .await
+    .unwrap();
+
+    // 1. Sixteen updates of one unkeyed row, statements over one group's
+    //    selection: with every version kept, the kth statement read 2^(k-2)
+    //    copies and the fifteenth passed `keyed entities for node:Item`
+    //    (16,384 > 8,192). One version stays pending, and each statement
+    //    updates the row once.
+    let mut updates = String::from(
+        "query sixteen_updates() {\n    match { $i: Item } where $i.label = \"solo\"\n",
+    );
+    for step in 1..=16 {
+        updates.push_str(&format!("    update $i set {{ step: {step} }}\n"));
+    }
+    updates.push_str("}\n");
+    let res = db
+        .mutate(
+            "main",
+            &updates,
+            "sixteen_updates",
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("16 sequential updates on one row must stay within keyed entity cap");
+    assert_eq!(res.affected_nodes, 16);
+    assert_eq!(count_rows(&db, "node:Item").await, 1);
+
+    // 2. A Blob row inserted and then rewritten four times in one write, under
+    //    a `write_max_bytes` that holds two copies of its payload but not the
+    //    five versions written: each `upsert` keeps the pending version's
+    //    Blob and replaces that version, so the retained payload is one
+    //    copy, the write is admitted and the Blob is stored unchanged.
+    let blob_payload = vec![0x5Au8; 1024];
+    use base64::Engine as _;
+    let b64 = format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(&blob_payload)
+    );
+    let blob_query = r#"set write_max_bytes = 3072;
+query four_blob_updates($b: Blob) {
+    insert Doc { slug: "d2", tag: "t2", note: "n0", body: $b }
+    upsert Doc { slug: "d2", note: "n1" }
+    upsert Doc { slug: "d2", note: "n2" }
+    upsert Doc { slug: "d2", note: "n3" }
+    upsert Doc { slug: "d2", note: "n4" }
+}"#;
+    let blob_res = db
+        .mutate(
+            "main",
+            blob_query,
+            "four_blob_updates",
+            &params(&[("$b", &b64)]),
+        )
+        .await
+        .expect("4 rewrites of a pending Blob row must not multiply retained payload bytes");
+    assert_eq!(blob_res.affected_nodes, 5);
+    let stored_blob = read_managed_blob_bytes(
+        &db,
+        ReadTarget::branch("main"),
+        node_blob_cell("Doc", "d2", "body"),
+    )
+    .await;
+    assert_eq!(&stored_blob[..], &blob_payload[..]);
+
+    // 3. Loads do not take the statement fold: a key repeated in one load's
+    //    input is refused in `insert` and in `replace` mode alike, and so is a
+    //    `@unique` value shared by two keys. None of them writes a row.
+    for (label, mode, rows, refusal) in [
+        (
+            "insert load with a repeated key",
+            LoadMode::Insert,
+            [
+                r#"{"type":"Doc","data":{"slug":"dup","tag":"u1"}}"#,
+                r#"{"type":"Doc","data":{"slug":"dup","tag":"u2"}}"#,
+            ],
+            "@unique violation on Doc.slug: value 'dup'",
+        ),
+        (
+            "replace load with a repeated key",
+            LoadMode::Replace,
+            [
+                r#"{"type":"Doc","data":{"slug":"rep","tag":"r1","note":"first"}}"#,
+                r#"{"type":"Doc","data":{"slug":"rep","tag":"r2","note":"last"}}"#,
+            ],
+            "@unique violation on Doc.slug: value 'rep'",
+        ),
+        (
+            "replace load with one @unique value on two keys",
+            LoadMode::Replace,
+            [
+                r#"{"type":"Doc","data":{"slug":"m1","tag":"shared"}}"#,
+                r#"{"type":"Doc","data":{"slug":"m2","tag":"shared"}}"#,
+            ],
+            "@unique violation on Doc.tag: value 'shared'",
+        ),
+    ] {
+        let error = db
+            .load_jsonl(&format!("{}\n{}\n", rows[0], rows[1]), mode)
+            .await
+            .expect_err(label)
+            .to_string();
+        assert!(error.contains(refusal), "{label} must fail loudly: {error}");
+    }
+    assert_eq!(
+        count_rows(&db, "node:Doc").await,
+        2,
+        "no refused load wrote a row: only d1 and d2 remain"
+    );
+}
+
 /// One `delete` of two rows on one node table: both rows are gone and the
 /// manifest version advances by 1. Two delete groups on one type are
 /// refused (`T91`, every group selects on the write's one snapshot), so the

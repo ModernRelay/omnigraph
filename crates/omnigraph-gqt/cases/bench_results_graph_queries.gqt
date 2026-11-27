@@ -1,0 +1,548 @@
+# issue: none
+# notes: The benchmark results graph as omnigraph-bench's projection/schema.pg declares it, with its ten stored queries run as written: a catalog with one suite and one scenario on one fixture and one workload, the scenario's first point measured twice on two revisions by one machine, a second point of the same scenario whose spec differs in its queries and its deadline, and a second case name whose one run measures the first point. The series answers in time order with each run's commit and holds the runs recorded under its own name alone, the suite walks to its scenario and its runs, a revision answers the runs built from it, the suite's scenarios name their workload and fixture, the four queries without parameters give a page every series, every suite's members, every scenario's facts and every run's harness and machine, and the two level queries answer one point's levels and the scenario's points at one level.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Catalog {
+    catalog_id: String @key
+    path: String
+    digest: String
+    scenario_count: U32
+}
+
+node Suite {
+    name: String @key
+    catalog_id: String
+}
+
+node Scenario {
+    name: String @key
+    measured_step_ordinal: U32?
+    measured_step: String?
+    repetitions: U32?
+    deadline_seconds: U64?
+    protocol_json: String?
+    fixture_kind: String?
+}
+
+node Fixture {
+    fixture_id: String @key
+    kind: String
+    path: String?
+    definition_json: String
+}
+
+node Workload {
+    workload_id: String @key
+    path: String
+    sha256: String
+}
+
+node Revision {
+    sha: String @key
+}
+
+node Machine {
+    machine_fingerprint: String @key
+    label: String?
+    os_name: String?
+    os_version: String?
+    kernel_version: String?
+    architecture: String?
+    cpu_model: String?
+    logical_cores: U32?
+    physical_cores: U32?
+    total_memory_bytes: U64?
+}
+
+node Campaign {
+    dispatch_id: String @key
+    trust: String
+    reason: String?
+    suite: String?
+    started_unix_ms: U64?
+    finished_unix_ms: U64?
+    exit_code: I64?
+    failed_stage: String?
+}
+
+node BenchmarkPoint {
+    point_id: String @key
+    point_name: String
+    point_identity_version: U32
+    scenario: String
+    run_spec_json: String
+}
+
+node BenchmarkRun {
+    invocation_id: String @key
+    record_sha256: String @unique
+    archive_object: String @unique
+    archive_pointer: String @unique
+    session_id: String
+    invoked_at_unix_ms: U64
+    case_id: String
+    case_digest: String
+    sut_evidence: String
+    package_version: String
+    source_commit: String
+    source_tree_dirty: Bool
+    build_profile: String
+    build_opt_level: String
+    debug_assertions: Bool
+    target_triple: String?
+    rustc_version: String?
+    build_declared_release_lto: String?
+    build_declared_release_codegen_units: U32?
+    build_declared_release_strip: Bool?
+    build_cargo_encoded_rustflags_present: Bool?
+    build_release_profile_environment_overrides_supported: Bool?
+    build_effective_codegen_options_proved: Bool
+    worker_executable_sha256: String?
+    sut_fingerprint: String
+    sut_json: String
+    client_build_json: String?
+    client_machine_json: String?
+    machine_fingerprint: String?
+    machine_format_version: U32?
+    machine_os_name: String?
+    machine_os_version: String?
+    machine_kernel_version: String?
+    machine_architecture: String?
+    machine_cpu_model: String?
+    machine_logical_cores: U32?
+    machine_physical_cores: U32?
+    machine_total_memory_bytes: U64?
+    machine_resource_control_json: String?
+    machine_scheduling_json: String?
+    machine_resource_limits_json: String?
+    machine_label: String?
+    backend_evidence: String
+    backend_fingerprint: String
+    backend_json: String
+    fixture_manifest_sha256: String?
+    fixture_logical_sha256: String
+    fixture_physical_sha256: String?
+    acquisition_status: String
+    claim_eligible: Bool
+    terminal_failed_repetition: U32?
+    terminal_stage: String?
+    terminal_code: String?
+    requested_repetitions: U32
+    observed_repetitions: U32
+    min_us: U64
+    p50_us: U64
+    max_us: U64
+    p95_us: U64?
+    p95_supported: Bool
+    wall_evidence: String
+    floor_multiplier_millis: U32
+    lance_data_plane_logical_calls_min: U64?
+    lance_data_plane_logical_calls_p50: U64?
+    lance_data_plane_logical_calls_max: U64?
+    control_plane_logical_calls_min: U64?
+    control_plane_logical_calls_p50: U64?
+    control_plane_logical_calls_max: U64?
+    logical_counts_presence_json: String
+    physical_counts_presence_json: String
+}
+
+edge Measures: BenchmarkRun -> BenchmarkPoint @card(1..1) {
+    @unique(@src, @dst)
+}
+
+edge Declares: Catalog -> Scenario {
+    @key(@src, @dst)
+}
+
+edge Groups: Suite -> Scenario {
+    @key(@src, @dst)
+}
+
+edge Uses: Scenario -> Fixture @card(0..1) {
+    @unique(@src, @dst)
+}
+
+edge Executes: Scenario -> Workload @card(0..1) {
+    @unique(@src, @dst)
+}
+
+edge Defines: Scenario -> BenchmarkPoint {
+    @key(@src, @dst)
+}
+
+edge Ran: BenchmarkRun -> Scenario @card(0..1) {
+    @key(@src, @dst)
+}
+
+edge Built: BenchmarkRun -> Revision {
+    @unique(@src, @dst)
+}
+
+edge MeasuredBy: BenchmarkRun -> Revision {
+    @unique(@src, @dst)
+}
+
+edge Hosted: Machine -> BenchmarkRun {
+    @unique(@src, @dst)
+}
+
+edge Produced: Campaign -> BenchmarkRun {
+    @unique(@src, @dst)
+}
+
+node Level {
+    factor: String
+    value: String
+    @key(factor, value)
+}
+
+edge Has: BenchmarkPoint -> Level {
+    @key(@src, @dst)
+}
+
+--- seed
+{"type":"Catalog","data":{"catalog_id":"cat-1","path":"benchmarks/benchmarks.yaml","digest":"cat-1","scenario_count":1}}
+{"type":"Suite","data":{"name":"regression","catalog_id":"cat-1"}}
+{"type":"Scenario","data":{"name":"branch-merge-d50","measured_step_ordinal":3,"measured_step":"branch merge w0 into main","repetitions":5,"protocol_json":"{}","fixture_kind":"file"}}
+{"type":"Fixture","data":{"fixture_id":"fx-1","kind":"file","path":"fixtures/branches_16.gqt","definition_json":"{\"path\":\"fixtures/branches_16.gqt\"}"}}
+{"type":"Workload","data":{"workload_id":"wl-1","path":"workloads/merge_one.gqt","sha256":"wl-1"}}
+{"type":"Revision","data":{"sha":"aaaa0001"}}
+{"type":"Revision","data":{"sha":"bbbb0002"}}
+{"type":"Revision","data":{"sha":"cccc0003"}}
+{"type":"Machine","data":{"machine_fingerprint":"m-1","label":"c8gd.2xlarge","os_name":"linux","architecture":"aarch64","cpu_model":"Neoverse-V2","logical_cores":8}}
+{"type":"BenchmarkPoint","data":{"point_id":"pt-1","point_name":"gqt-cold-pt1","point_identity_version":1,"scenario":"gqt-v1","run_spec_json":"{}"}}
+{"type":"BenchmarkPoint","data":{"point_id":"pt-2","point_name":"gqt-cold-pt2","point_identity_version":1,"scenario":"gqt-v1","run_spec_json":"{}"}}
+{"type":"Level","data":{"factor":"protocol.deadline_seconds","value":"60"}}
+{"type":"Level","data":{"factor":"protocol.deadline_seconds","value":"90"}}
+{"type":"Level","data":{"factor":"protocol.reset","value":"clone"}}
+{"type":"Level","data":{"factor":"queries_sha256","value":"q-1"}}
+{"type":"Level","data":{"factor":"queries_sha256","value":"q-2"}}
+{"type":"BenchmarkRun","data":{"invocation_id":"inv-1","record_sha256":"rec-1","archive_object":"records/rec-1.json","archive_pointer":"invocations/inv-1","session_id":"s-1","invoked_at_unix_ms":1000,"case_id":"branch-merge-d50","case_digest":"case-1","sut_evidence":"product-binary","package_version":"0.17.0","source_commit":"aaaa0001","source_tree_dirty":false,"build_profile":"release","build_opt_level":"3","debug_assertions":false,"build_effective_codegen_options_proved":true,"sut_fingerprint":"sut-1","sut_json":"{}","backend_evidence":"worker-observed","backend_fingerprint":"be-1","backend_json":"{}","fixture_logical_sha256":"fl-1","acquisition_status":"complete","claim_eligible":true,"requested_repetitions":5,"observed_repetitions":5,"min_us":95,"p50_us":100,"max_us":110,"p95_supported":false,"wall_evidence":"directional","floor_multiplier_millis":1,"logical_counts_presence_json":"{}","physical_counts_presence_json":"{}"}}
+{"type":"BenchmarkRun","data":{"invocation_id":"inv-2","record_sha256":"rec-2","archive_object":"records/rec-2.json","archive_pointer":"invocations/inv-2","session_id":"s-2","invoked_at_unix_ms":2000,"case_id":"branch-merge-d50","case_digest":"case-1","sut_evidence":"product-binary","package_version":"0.17.0","source_commit":"bbbb0002","source_tree_dirty":false,"build_profile":"release","build_opt_level":"3","debug_assertions":false,"build_effective_codegen_options_proved":true,"sut_fingerprint":"sut-2","sut_json":"{}","backend_evidence":"worker-observed","backend_fingerprint":"be-1","backend_json":"{}","fixture_logical_sha256":"fl-1","acquisition_status":"complete","claim_eligible":true,"requested_repetitions":5,"observed_repetitions":5,"min_us":85,"p50_us":90,"max_us":99,"p95_supported":false,"wall_evidence":"directional","floor_multiplier_millis":1,"logical_counts_presence_json":"{}","physical_counts_presence_json":"{}"}}
+{"type":"Scenario","data":{"name":"branch-merge-alias"}}
+{"type":"BenchmarkRun","data":{"invocation_id":"inv-3","record_sha256":"rec-3","archive_object":"records/rec-3.json","archive_pointer":"invocations/inv-3","session_id":"s-3","invoked_at_unix_ms":3000,"case_id":"branch-merge-alias","case_digest":"case-1","sut_evidence":"product-binary","package_version":"0.17.0","source_commit":"bbbb0002","source_tree_dirty":false,"build_profile":"release","build_opt_level":"3","debug_assertions":false,"build_effective_codegen_options_proved":true,"sut_fingerprint":"sut-2","sut_json":"{}","backend_evidence":"worker-observed","backend_fingerprint":"be-1","backend_json":"{}","fixture_logical_sha256":"fl-1","acquisition_status":"complete","claim_eligible":true,"requested_repetitions":5,"observed_repetitions":5,"min_us":65,"p50_us":70,"max_us":80,"p95_supported":false,"wall_evidence":"directional","floor_multiplier_millis":1,"logical_counts_presence_json":"{}","physical_counts_presence_json":"{}"}}
+{"edge":"Declares","from":"cat-1","to":"branch-merge-d50","data":{}}
+{"edge":"Groups","from":"regression","to":"branch-merge-d50","data":{}}
+{"edge":"Uses","id":"uses:branch-merge-d50","from":"branch-merge-d50","to":"fx-1","data":{}}
+{"edge":"Executes","id":"executes:branch-merge-d50","from":"branch-merge-d50","to":"wl-1","data":{}}
+{"edge":"Defines","from":"branch-merge-d50","to":"pt-1","data":{}}
+{"edge":"Defines","from":"branch-merge-d50","to":"pt-2","data":{}}
+{"edge":"Defines","from":"branch-merge-alias","to":"pt-1","data":{}}
+{"edge":"Ran","from":"inv-1","to":"branch-merge-d50","data":{}}
+{"edge":"Ran","from":"inv-2","to":"branch-merge-d50","data":{}}
+{"edge":"Ran","from":"inv-3","to":"branch-merge-alias","data":{}}
+{"edge":"Has","from":"pt-1","to":"[\"protocol.deadline_seconds\",\"60\"]","data":{}}
+{"edge":"Has","from":"pt-1","to":"[\"protocol.reset\",\"clone\"]","data":{}}
+{"edge":"Has","from":"pt-1","to":"[\"queries_sha256\",\"q-1\"]","data":{}}
+{"edge":"Has","from":"pt-2","to":"[\"protocol.deadline_seconds\",\"90\"]","data":{}}
+{"edge":"Has","from":"pt-2","to":"[\"protocol.reset\",\"clone\"]","data":{}}
+{"edge":"Has","from":"pt-2","to":"[\"queries_sha256\",\"q-2\"]","data":{}}
+{"edge":"Measures","id":"measures:inv-1","from":"inv-1","to":"pt-1","data":{}}
+{"edge":"Measures","id":"measures:inv-2","from":"inv-2","to":"pt-1","data":{}}
+{"edge":"Measures","id":"measures:inv-3","from":"inv-3","to":"pt-1","data":{}}
+{"edge":"Built","id":"built:inv-1","from":"inv-1","to":"aaaa0001","data":{}}
+{"edge":"Built","id":"built:inv-2","from":"inv-2","to":"bbbb0002","data":{}}
+{"edge":"Built","id":"built:inv-3","from":"inv-3","to":"bbbb0002","data":{}}
+{"edge":"MeasuredBy","id":"measured_by:inv-1","from":"inv-1","to":"cccc0003","data":{}}
+{"edge":"MeasuredBy","id":"measured_by:inv-2","from":"inv-2","to":"cccc0003","data":{}}
+{"edge":"MeasuredBy","id":"measured_by:inv-3","from":"inv-3","to":"cccc0003","data":{}}
+{"edge":"Hosted","id":"hosted:inv-1","from":"m-1","to":"inv-1","data":{}}
+{"edge":"Hosted","id":"hosted:inv-2","from":"m-1","to":"inv-2","data":{}}
+{"edge":"Hosted","id":"hosted:inv-3","from":"m-1","to":"inv-3","data":{}}
+
+--- query
+query series_for_scenario($scenario: String) {
+    match {
+        $s: Scenario,
+        $r ran $s,
+        $r measures $p,
+        $r built $c,
+    }
+    where $s.name = $scenario
+    return {
+        $s.name as scenario,
+        $p.point_name as point,
+        $c.sha as commit,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.min_us as min_us,
+        $r.p50_us as p50_us,
+        $r.max_us as max_us,
+        $r.observed_repetitions as repetitions,
+        $r.claim_eligible as claim_eligible
+    }
+    order { invoked_at_unix_ms }
+}
+--- params
+{"scenario": "branch-merge-d50"}
+--- expect ordered
+{"scenario": "branch-merge-d50", "point": "gqt-cold-pt1", "commit": "aaaa0001", "invoked_at_unix_ms": 1000, "min_us": 95, "p50_us": 100, "max_us": 110, "repetitions": 5, "claim_eligible": true}
+{"scenario": "branch-merge-d50", "point": "gqt-cold-pt1", "commit": "bbbb0002", "invoked_at_unix_ms": 2000, "min_us": 85, "p50_us": 90, "max_us": 99, "repetitions": 5, "claim_eligible": true}
+--- expect shape
+scenario: String
+point: String
+commit: String
+invoked_at_unix_ms: U64
+min_us: U64
+p50_us: U64
+max_us: U64
+repetitions: U32
+claim_eligible: Bool
+
+--- query
+query suite_series($suite: String) {
+    match {
+        $u: Suite,
+        $u groups $s,
+        $r ran $s,
+        $r built $c,
+    }
+    where $u.name = $suite
+    return {
+        $s.name as scenario,
+        $c.sha as commit,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.p50_us as p50_us,
+        $r.claim_eligible as claim_eligible
+    }
+    order { scenario, invoked_at_unix_ms }
+}
+--- params
+{"suite": "regression"}
+--- expect ordered
+{"scenario": "branch-merge-d50", "commit": "aaaa0001", "invoked_at_unix_ms": 1000, "p50_us": 100, "claim_eligible": true}
+{"scenario": "branch-merge-d50", "commit": "bbbb0002", "invoked_at_unix_ms": 2000, "p50_us": 90, "claim_eligible": true}
+--- expect shape
+scenario: String
+commit: String
+invoked_at_unix_ms: U64
+p50_us: U64
+claim_eligible: Bool
+
+--- query
+query runs_for_commit($sha: String) {
+    match {
+        $c: Revision,
+        $r built $c,
+        $r measures $p,
+        $r ran $s,
+    }
+    where $c.sha = $sha
+    return {
+        $s.name as scenario,
+        $p.point_name as point,
+        $r.invocation_id as invocation_id,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.p50_us as p50_us,
+        $r.acquisition_status as acquisition_status,
+        $r.claim_eligible as claim_eligible
+    }
+    order { scenario, invoked_at_unix_ms }
+}
+--- params
+{"sha": "bbbb0002"}
+--- expect ordered
+{"scenario": "branch-merge-alias", "point": "gqt-cold-pt1", "invocation_id": "inv-3", "invoked_at_unix_ms": 3000, "p50_us": 70, "acquisition_status": "complete", "claim_eligible": true}
+{"scenario": "branch-merge-d50", "point": "gqt-cold-pt1", "invocation_id": "inv-2", "invoked_at_unix_ms": 2000, "p50_us": 90, "acquisition_status": "complete", "claim_eligible": true}
+--- expect shape
+scenario: String
+point: String
+invocation_id: String
+invoked_at_unix_ms: U64
+p50_us: U64
+acquisition_status: String
+claim_eligible: Bool
+
+--- query
+query scenarios_in_suite($suite: String) {
+    match {
+        $u: Suite,
+        $u groups $s,
+        $s executes $w,
+        $s uses $f,
+    }
+    where $u.name = $suite
+    return {
+        $s.name as scenario,
+        $s.measured_step as measured_step,
+        $w.path as workload,
+        $f.kind as fixture_kind
+    }
+    order { scenario }
+}
+--- params
+{"suite": "regression"}
+--- expect ordered
+{"scenario": "branch-merge-d50", "measured_step": "branch merge w0 into main", "workload": "workloads/merge_one.gqt", "fixture_kind": "file"}
+--- expect shape
+scenario: String
+measured_step: String?
+workload: String
+fixture_kind: String
+
+--- query
+query all_series() {
+    match {
+        $s: Scenario,
+        $r ran $s,
+        $r measures $p,
+        $r built $c,
+    }
+    return {
+        $s.name as scenario,
+        $p.point_name as point,
+        $c.sha as commit,
+        $r.invocation_id as invocation_id,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.min_us as min_us,
+        $r.p50_us as p50_us,
+        $r.max_us as max_us,
+        $r.observed_repetitions as repetitions,
+        $r.acquisition_status as acquisition_status,
+        $r.claim_eligible as claim_eligible
+    }
+    order { scenario, invoked_at_unix_ms }
+}
+--- expect ordered
+{"scenario": "branch-merge-alias", "point": "gqt-cold-pt1", "commit": "bbbb0002", "invocation_id": "inv-3", "invoked_at_unix_ms": 3000, "min_us": 65, "p50_us": 70, "max_us": 80, "repetitions": 5, "acquisition_status": "complete", "claim_eligible": true}
+{"scenario": "branch-merge-d50", "point": "gqt-cold-pt1", "commit": "aaaa0001", "invocation_id": "inv-1", "invoked_at_unix_ms": 1000, "min_us": 95, "p50_us": 100, "max_us": 110, "repetitions": 5, "acquisition_status": "complete", "claim_eligible": true}
+{"scenario": "branch-merge-d50", "point": "gqt-cold-pt1", "commit": "bbbb0002", "invocation_id": "inv-2", "invoked_at_unix_ms": 2000, "min_us": 85, "p50_us": 90, "max_us": 99, "repetitions": 5, "acquisition_status": "complete", "claim_eligible": true}
+--- expect shape
+scenario: String
+point: String
+commit: String
+invocation_id: String
+invoked_at_unix_ms: U64
+min_us: U64
+p50_us: U64
+max_us: U64
+repetitions: U32
+acquisition_status: String
+claim_eligible: Bool
+
+--- query
+query suite_members() {
+    match {
+        $u: Suite,
+        $u groups $s,
+    }
+    return {
+        $u.name as suite,
+        $s.name as scenario
+    }
+    order { suite, scenario }
+}
+--- expect ordered
+{"suite": "regression", "scenario": "branch-merge-d50"}
+--- expect shape
+suite: String
+scenario: String
+
+--- query
+query scenario_facts() {
+    match {
+        $s: Scenario,
+        $s executes $w,
+        $s uses $f,
+    }
+    return {
+        $s.name as scenario,
+        $s.measured_step as measured_step,
+        $s.repetitions as repetitions,
+        $w.path as workload,
+        $w.sha256 as workload_sha256,
+        $f.kind as fixture_kind,
+        $f.path as fixture
+    }
+    order { scenario }
+}
+--- expect ordered
+{"scenario": "branch-merge-d50", "measured_step": "branch merge w0 into main", "repetitions": 5, "workload": "workloads/merge_one.gqt", "workload_sha256": "wl-1", "fixture_kind": "file", "fixture": "fixtures/branches_16.gqt"}
+--- expect shape
+scenario: String
+measured_step: String?
+repetitions: U32?
+workload: String
+workload_sha256: String
+fixture_kind: String
+fixture: String?
+
+--- query
+query run_hosts() {
+    match {
+        $r: BenchmarkRun,
+        $r measuredBy $h,
+        $m hosted $r,
+    }
+    return {
+        $r.invocation_id as invocation_id,
+        $h.sha as harness,
+        $m.label as machine,
+        $m.cpu_model as cpu_model,
+        $m.architecture as architecture,
+        $m.logical_cores as logical_cores
+    }
+    order { invocation_id }
+}
+--- expect ordered
+{"invocation_id": "inv-1", "harness": "cccc0003", "machine": "c8gd.2xlarge", "cpu_model": "Neoverse-V2", "architecture": "aarch64", "logical_cores": 8}
+{"invocation_id": "inv-2", "harness": "cccc0003", "machine": "c8gd.2xlarge", "cpu_model": "Neoverse-V2", "architecture": "aarch64", "logical_cores": 8}
+{"invocation_id": "inv-3", "harness": "cccc0003", "machine": "c8gd.2xlarge", "cpu_model": "Neoverse-V2", "architecture": "aarch64", "logical_cores": 8}
+--- expect shape
+invocation_id: String
+harness: String
+machine: String?
+cpu_model: String?
+architecture: String?
+logical_cores: U32?
+
+--- query
+query point_levels($point: String) {
+    match {
+        $p: BenchmarkPoint,
+        $p has $l,
+    }
+    where $p.point_id = $point
+    return {
+        $l.factor as factor,
+        $l.value as value
+    }
+    order { factor }
+}
+--- params
+{"point": "pt-2"}
+--- expect ordered
+{"factor": "protocol.deadline_seconds", "value": "90"}
+{"factor": "protocol.reset", "value": "clone"}
+{"factor": "queries_sha256", "value": "q-2"}
+--- expect shape
+factor: String
+value: String
+
+--- query
+query points_at($scenario: String, $factor: String, $value: String) {
+    match {
+        $s: Scenario,
+        $s defines $p,
+        $l: Level,
+        $p has $l,
+    }
+    where $s.name = $scenario and $l.factor = $factor and $l.value = $value
+    return {
+        $p.point_id as point,
+        $p.point_name as point_name
+    }
+    order { point }
+}
+--- params
+{"scenario": "branch-merge-d50", "factor": "protocol.deadline_seconds", "value": "90"}
+--- expect ordered
+{"point": "pt-2", "point_name": "gqt-cold-pt2"}
+--- expect shape
+point: String
+point_name: String

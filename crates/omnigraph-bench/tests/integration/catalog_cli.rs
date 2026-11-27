@@ -183,7 +183,7 @@ fn human_and_machine_help_need_no_catalog_or_cache() {
     let help = run(directory.path(), &["help", "--json"], true);
     assert_eq!(help["value"]["config_version"], 2);
     let commands = help["value"]["commands"]["subcommands"].as_array().unwrap();
-    for name in ["list", "show", "run", "cache", "init", "help"] {
+    for name in ["list", "show", "check", "run", "cache", "init", "help"] {
         assert!(commands.iter().any(|c| c["name"] == name));
     }
     assert!(
@@ -817,6 +817,121 @@ fn the_catalog_names_no_environment_and_no_twin() {
     assert!(workloads.is_empty(), "{workloads:?}");
 }
 
+/// `check` on an empty graph of the fixture's schema: a workload that compiles
+/// passes with its rows ignored; one naming a property the schema lacks fails
+/// with the step and the compiler's error.
+#[test]
+fn check_runs_a_workload_on_an_empty_graph_and_names_the_step_that_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    copy_pair(directory.path());
+    let read = fs::read_to_string(directory.path().join("workloads/tiny_read.gqt")).unwrap();
+    fs::write(
+        directory.path().join("workloads/broken_read.gqt"),
+        read.replace("$i.val as val", "$i.nope as val"),
+    )
+    .unwrap();
+    for (workload, name) in [
+        ("workloads/tiny_read.gqt", "custom"),
+        ("workloads/broken_read.gqt", "broken"),
+    ] {
+        run(
+            directory.path(),
+            &[
+                "init",
+                "--fixture",
+                "fixtures/tiny_graph.gqt",
+                "--workload",
+                workload,
+                "--step",
+                "1",
+                "--name",
+                name,
+                "--output",
+                &format!("{name}.yaml"),
+                "--json",
+            ],
+            true,
+        );
+    }
+    let checked = run(
+        directory.path(),
+        &["check", "custom", "--catalog", "custom.yaml", "--json"],
+        true,
+    );
+    assert_eq!(checked["ok"], true, "{checked}");
+    assert_eq!(
+        checked["value"]["scenarios"][0]["status"], "ok",
+        "{checked}"
+    );
+    assert_eq!(checked["value"]["scenarios"][0]["steps"], 2, "{checked}");
+    let failed = run(
+        directory.path(),
+        &["check", "broken", "--catalog", "broken.yaml", "--json"],
+        false,
+    );
+    assert_eq!(failed["ok"], false, "{failed}");
+    assert_eq!(
+        failed["diagnostics"][0]["code"], "scenario_failed",
+        "{failed}"
+    );
+    assert_eq!(failed["diagnostics"][0]["path"], "broken", "{failed}");
+    let message = failed["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("step 1 (query)") && message.contains("nope"),
+        "{failed}"
+    );
+    assert_eq!(
+        failed["value"]["scenarios"][0]["status"], "failed",
+        "{failed}"
+    );
+    assert_eq!(failed["value"]["scenarios"][0]["steps"], 2, "{failed}");
+}
+/// `check` relaxes what depends on the data and drops the fixture's loads: a
+/// fixture loading from a path that does not exist and a workload whose rows,
+/// shape and `affected:` count are wrong check `ok`.
+#[test]
+fn check_relaxes_data_expectations_and_drops_the_fixture_loads() {
+    let directory = tempfile::tempdir().unwrap();
+    copy_pair(directory.path());
+    let fixture = fs::read_to_string(directory.path().join("fixtures/tiny_graph.gqt")).unwrap()
+        + "\n--- mutate\nload csv \"file:///nonexistent/check/items.csv\" into node:Item mode insert header\n--- expect ok\n";
+    fs::write(directory.path().join("fixtures/loading_graph.gqt"), fixture).unwrap();
+    let workload = fs::read_to_string(directory.path().join("workloads/tiny_read.gqt"))
+        .unwrap()
+        .replace("{\"key\":\"a\",\"val\":1}", "{\"key\":\"zzz\",\"val\":0}")
+        .replace("key: String\nval: I64", "key: I64\nval: String")
+        + "\n--- mutate\nquery add() { insert Item { key: \"c\", val: 3 } }\n--- expect affected: nodes=42 edges=3\n";
+    fs::write(directory.path().join("workloads/wrong_read.gqt"), workload).unwrap();
+    run(
+        directory.path(),
+        &[
+            "init",
+            "--fixture",
+            "fixtures/loading_graph.gqt",
+            "--workload",
+            "workloads/wrong_read.gqt",
+            "--step",
+            "1",
+            "--name",
+            "relaxed",
+            "--output",
+            "relaxed.yaml",
+            "--json",
+        ],
+        true,
+    );
+    let checked = run(
+        directory.path(),
+        &["check", "relaxed", "--catalog", "relaxed.yaml", "--json"],
+        true,
+    );
+    assert_eq!(checked["ok"], true, "{checked}");
+    assert_eq!(
+        checked["value"]["scenarios"][0]["status"], "ok",
+        "{checked}"
+    );
+    assert_eq!(checked["value"]["scenarios"][0]["steps"], 3, "{checked}");
+}
 /// Two catalogs on one call: a name resolves in the first that declares it,
 /// `show` names that catalog, `list --json` answers one inventory per catalog.
 #[test]

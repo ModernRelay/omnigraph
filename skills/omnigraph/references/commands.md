@@ -41,7 +41,7 @@ prints the exact flags of the installed binary.
 | `commit` | `list` `show` `changes` `publish` `drop` | Read history; publish or drop an unpublished commit |
 | `changes` | `poll` `baseline` | Follow a branch's change feed |
 | `schema` | `show` `plan` `apply` `upgrade-system-columns` | Read, plan or apply a schema; respell legacy system columns |
-| `graphs` | `list` | Say who you are and list the graphs you hold any permission on; `--catalog` lists every graph |
+| `graphs` | `list` | List the graphs a multi-graph server serves |
 | `init` | — | Create a graph from a `.pg` schema |
 | `upgrade` | — | Convert a standalone graph's storage offline |
 | `optimize` | — | Compact data and reconcile declared indexes on `main` |
@@ -58,7 +58,7 @@ prints the exact flags of the installed binary.
 | `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
 | `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
-| `access` | — | Say which actions a graph's policy grants you, graph-wide and on a branch |
+| `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
 | `mcp` | — | Relay an agent's stdio MCP to an existing server or managed target's `/mcp`, bound to one graph; read-only tools unless `--write` |
 | `studio` | — | Open Omnigraph Studio on an existing server target through an `omnigraph-studio://open` link, and print the link |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
@@ -188,19 +188,14 @@ baseline recovery, see [`changes.md`](changes.md).
 
 ```bash
 omnigraph graphs list --target <name> --json
-omnigraph graphs list --target <name> --catalog --json
 ```
 
-Names your actor (on stderr; `--json` carries `actor_id` and `client_id`) and
-lists the ids and names of the graphs the credential holds any permission on,
-available or not, with any credential and no permit; an empty list means it
-holds none. Any other registered graph answers `graph not found`; `access`
-says what you may do on a listed one. An older server's listing, which states
-no `visibility`, is reported as `unfiltered`: it lists every graph and names
-no caller.
-Remote servers only (rejects local URIs). `--catalog` lists every graph with its
-`state` and root instead, and needs `graph_list` from a cluster-scoped policy
-bundle, on managed targets too. See [`server-policy.md`](server-policy.md).
+Lists the graphs a multi-graph server serves, with each graph's `state`. Remote
+servers only (rejects local URIs); a cluster-scoped policy bundle must grant
+`graph_list`, on managed targets too. `--discovery` returns only graph ids and
+names to an identity credential and needs no `graph_list`; pass it explicitly,
+since the CLI never infers it from the target or credential. See
+[`server-policy.md`](server-policy.md).
 
 ## Schema
 
@@ -453,12 +448,9 @@ omnigraph config validate --json
 omnigraph access --target production --branch main --json
 ```
 
-`access` reports the server-resolved actor and allowed graph actions on a graph
-you hold some permission on; a served graph you hold none on answers 404, as it
-does on every route. The identity check for any credential, with no separate
-`whoami` command, is `graphs list --json` on a served target: its `actor_id`
-(and `client_id` for an OAuth client) name who you are even when you may do
-nothing. Direct targets use `--as` or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
+`access` reports the server-resolved actor and allowed graph actions; it is the
+identity check, with no separate `whoami` command. Direct targets use `--as`
+or no actor. JSON uses `protocol: 2` and `actor_id`, null without an actor;
 update scripts that read protocol 1's `actor`. Managed targets use their issued resource identity. See
 [access scope and policy semantics](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/cli/targets.md#what-you-may-do-at-a-target).
 
@@ -549,16 +541,20 @@ identities use different targets. There is no `--auth` selector or last-used ide
 
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
-`optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
+`optimize`/`index build`/`index rebuild`/`cleanup --graph`, an inline `s3://`
+graph for the direct reads and `init`/`schema apply`/`load`, both with region
 and endpoint captured from the environment
 ([S3 cluster roots](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/operations/s3-cluster-roots.md)),
 and a graph shallow clone: `--base URI` opens a direct graph target over the
 graph at `URI` (reads fall through to the base, writes land in the target, the
 base is never written) for `query`, `mutate`, `load`, `branch`, `commit`,
 `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`; an inline
-`s3://` clone root with an `s3://` base is admitted there, each with a path free
-of empty inner segments and percent escapes (a space or a non-ASCII letter is written
-as one). Nothing in the target
+`s3://` clone root with an `s3://` base is admitted there. Every `s3://` root,
+clone, base or cluster, needs a path free of empty inner segments, queries and
+percent escapes (a space, a brace or a non-ASCII letter is written as one), and
+must be the one spelling `s3://<bucket>/<key>` (no dot segment, port, user
+information or trailing space); any other path is refused before any request,
+and the refusal names a replacement only when one names the same objects. Nothing in the target
 records its base, so every reopen passes the same `--base`; a clone root opened
 without it is refused. `--stats PATH` writes one JSON document per invocation
 with the logical object-store calls, the exit code and the peak resident set.
@@ -625,7 +621,7 @@ its `status`, the booted applied digest, ledger revision/CAS, the registered,
 ready, loading and blocked graph counts and shutdown grace. It returns `503`
 while a graph is still loading, when a nonempty inventory has no ready graph,
 and once draining starts. Readiness is not proof that every configured graph
-is healthy; authorized `graphs list --target NAME --catalog --json` on a registered target returns one
+is healthy; authorized `graphs list --target NAME --json` on a registered target returns one
 `graphs` list with each graph's `state` and `action`, blocked graphs included.
 
 ## Organization Administration

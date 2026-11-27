@@ -262,8 +262,6 @@ impl OperationRuntime {
         R: Send + 'static,
         F: Future<Output = OwnedResult<T>> + Send + 'static,
     {
-        use tracing::instrument::WithSubscriber as _;
-
         {
             let mut state = locked(&self.inner.state);
             if state.closed {
@@ -277,68 +275,81 @@ impl OperationRuntime {
             reservation: Some(Box::new(reservation)),
         };
         let (sender, receiver) = oneshot::channel();
-        // A span retains its subscriber, but entering it does not install that
-        // subscriber for Span::current() or events on a detached task.
-        tokio::spawn(
-            async move {
-                // The write runs as its request's submitted write: an error it
-                // translates follows it, as its waiter judges it, and logs the
-                // status it answers with.
-                let operation = SUBMITTED_WRITE.scope(
-                    std::cell::Cell::new(true),
-                    AssertUnwindSafe(operation).catch_unwind(),
+        spawn_operation("write", async move {
+            // The write runs as its request's submitted write: an error it
+            // translates follows it, as its waiter judges it, and logs the
+            // status it answers with.
+            let operation = SUBMITTED_WRITE.scope(
+                std::cell::Cell::new(true),
+                AssertUnwindSafe(operation).catch_unwind(),
+            );
+            let OwnedResult { result, uncertain } = match operation.await {
+                Ok(result) => result,
+                Err(_) => OwnedResult {
+                    result: Err(ApiError::internal(
+                        "owned write panicked; effects are unknown and require reconciliation",
+                    )),
+                    uncertain: true,
+                },
+            };
+            // Mark the error as its waiter receives it, so the log below
+            // records the status its response sends.
+            let result = result.map_err(ApiError::after_owned_write);
+            // Process containment and completion uncertainty are distinct:
+            // scoped storage uncertainty leaves admission open, but remains
+            // an uncertain outcome in telemetry.
+            let telemetry_uncertain =
+                uncertain || result.as_ref().is_err_and(ApiError::completion_uncertain);
+            crate::telemetry::operation_finished("write", result.is_ok(), telemetry_uncertain);
+            // A known result carries its reservation through pending delivery.
+            // Consumption releases admission before the handler can respond;
+            // abandonment destroys the output before releasing its ownership.
+            // Uncertainty closes admission before its result is observable.
+            // An owned write whose outcome is unknown is logged once,
+            // whether or not it contains the process. The failure's class
+            // was logged in this request's span when the engine error was
+            // mapped.
+            if let Err(error) = &result
+                && error.completion_uncertain()
+            {
+                tracing::error!(
+                    status = %error.status(),
+                    contained = uncertain,
+                    "owned write ended without a definite outcome"
                 );
-                let OwnedResult { result, uncertain } = match operation.await {
-                    Ok(result) => result,
-                    Err(_) => OwnedResult {
-                        result: Err(ApiError::internal(
-                            "owned write panicked; effects are unknown and require reconciliation",
-                        )),
-                        uncertain: true,
-                    },
-                };
-                // Mark the error as its waiter receives it, so the log below
-                // records the status its response sends.
-                let result = result.map_err(ApiError::after_owned_write);
-                // Process containment and completion uncertainty are distinct:
-                // scoped storage uncertainty leaves admission open, but remains
-                // an uncertain outcome in telemetry.
-                let telemetry_uncertain =
-                    uncertain || result.as_ref().is_err_and(ApiError::completion_uncertain);
-                crate::telemetry::operation_finished("write", result.is_ok(), telemetry_uncertain);
-                // A known result carries its reservation through pending delivery.
-                // Consumption releases admission before the handler can respond;
-                // abandonment destroys the output before releasing its ownership.
-                // Uncertainty closes admission before its result is observable.
-                // An owned write whose outcome is unknown is logged once,
-                // whether or not it contains the process. The failure's class
-                // was logged in this request's span when the engine error was
-                // mapped.
-                if let Err(error) = &result
-                    && error.completion_uncertain()
-                {
-                    tracing::error!(
-                        status = %error.status(),
-                        contained = uncertain,
-                        "owned write ended without a definite outcome"
-                    );
-                }
-                let owner = if uncertain {
-                    owner.finish(true);
-                    None
-                } else {
-                    Some(owner)
-                };
-                let _ = sender.send(WriteDelivery {
-                    result: Some(result),
-                    owner,
-                });
             }
-            .instrument(crate::telemetry::operation_span("write"))
-            .with_current_subscriber(),
-        );
+            let owner = if uncertain {
+                owner.finish(true);
+                None
+            } else {
+                Some(owner)
+            };
+            let _ = sender.send(WriteDelivery {
+                result: Some(result),
+                owner,
+            });
+        });
         Ok(OwnedResponse(receiver))
     }
+}
+
+/// Spawns an owned operation's detached task in its `native.operation` span,
+/// under the subscriber of the request that submits it. A span retains its
+/// subscriber, but entering it does not install that subscriber for
+/// `Span::current()` or events on a detached task, so the task carries it.
+///
+/// The span closes inside the task's last poll, still under that subscriber.
+/// Closed when the runtime drops the finished task, outside it, the span would
+/// release its parent, the request's span, through the runtime thread's
+/// subscriber, and under any other subscriber the request's span would never
+/// close.
+fn spawn_operation(kind: &'static str, task: impl Future<Output = ()> + Send + 'static) {
+    use tracing::instrument::WithSubscriber as _;
+
+    let task = task.instrument(crate::telemetry::operation_span(kind));
+    // Not redundant: awaiting `task` drops it inside this block's last poll.
+    #[allow(clippy::redundant_async_block)]
+    tokio::spawn(async move { task.await }.with_current_subscriber());
 }
 
 pub(crate) struct StartupOwner {
@@ -490,41 +501,34 @@ impl ReadObserver {
         R: Send + 'static,
         F: Future<Output = Result<T, ApiError>> + Send + 'static,
     {
-        use tracing::instrument::WithSubscriber as _;
-
         let (sender, receiver) = oneshot::channel();
         let response_observer = self.clone();
         let callers_probes = omnigraph::instrumentation::capture_query_io_probes();
-        tokio::spawn(
-            async move {
-                let _observer = self;
-                let _reservation = reservation;
-                let operation = async move {
-                    match callers_probes {
-                        Some(probes) => {
-                            omnigraph::instrumentation::with_query_io_probes(probes, operation)
-                                .await
-                        }
-                        None => operation.await,
+        spawn_operation("read", async move {
+            let _observer = self;
+            let _reservation = reservation;
+            let operation = async move {
+                match callers_probes {
+                    Some(probes) => {
+                        omnigraph::instrumentation::with_query_io_probes(probes, operation).await
                     }
-                };
-                let result = scope_request(async move {
-                    // Catch completed future Drop panics too.
-                    #[allow(clippy::redundant_async_block)]
-                    let result = AssertUnwindSafe(async move { operation.await })
-                        .catch_unwind()
-                        .await
-                        .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
-                    result.map_err(ApiError::with_request_facts)
-                })
-                .await;
-                crate::telemetry::operation_finished("read", result.is_ok(), false);
-                // No result history: an absent waiter drops the result here.
-                let _ = sender.send(result);
-            }
-            .instrument(crate::telemetry::operation_span("read"))
-            .with_current_subscriber(),
-        );
+                    None => operation.await,
+                }
+            };
+            let result = scope_request(async move {
+                // Catch completed future Drop panics too.
+                #[allow(clippy::redundant_async_block)]
+                let result = AssertUnwindSafe(async move { operation.await })
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                result.map_err(ApiError::with_request_facts)
+            })
+            .await;
+            crate::telemetry::operation_finished("read", result.is_ok(), false);
+            // No result history: an absent waiter drops the result here.
+            let _ = sender.send(result);
+        });
         OwnedReadResponse {
             receiver,
             _observer: response_observer,
@@ -890,6 +894,57 @@ mod tests {
                     assert!(runtime.wait_logical_owners().await);
                 });
         });
+    }
+
+    /// An owned operation's span closes under the subscriber of the request
+    /// that submitted it, so the request's span closes too, when that
+    /// subscriber is installed for the request's future only and the runtime
+    /// drops each finished task outside it.
+    #[tokio::test]
+    async fn an_owned_operation_closes_its_request_span_under_its_subscriber_issue_1560() {
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Clone, Default)]
+        struct Closed(Arc<Mutex<Vec<&'static str>>>);
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Closed {
+            fn on_close(&self, id: tracing::Id, cx: Context<'_, S>) {
+                self.0.lock().unwrap().push(cx.span(&id).unwrap().name());
+            }
+        }
+
+        let closed = Closed::default();
+        // Held past the request, so the registry's teardown closes nothing.
+        let subscriber =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(closed.clone()));
+        let runtime = OperationRuntime::new();
+        async {
+            async {
+                runtime
+                    .submit((), async { Ok::<_, ApiError>(()).into() })
+                    .unwrap()
+                    .result()
+                    .await
+                    .unwrap();
+                runtime
+                    .try_observe()
+                    .unwrap()
+                    .spawn_read((), async { Ok::<_, ApiError>(()) })
+                    .result()
+                    .await
+                    .unwrap();
+            }
+            .instrument(tracing::info_span!("request"))
+            .await;
+        }
+        .with_subscriber(subscriber.clone())
+        .await;
+        assert_eq!(
+            *closed.0.lock().unwrap(),
+            ["native.operation", "native.operation", "request"]
+        );
+        drop(subscriber);
     }
 
     #[tokio::test]

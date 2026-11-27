@@ -284,23 +284,16 @@ last chooses consistency over availability [K17, ch. 9].
 
 **E6. It is checked.** The server resolves the caller from its token; a client
 cannot name itself. The server checks every action against the installed
-policy. Listing graphs needs no permission, states its rule
-(`visibility: granted`), names the actor the caller resolves to, and returns
-exactly the registered graphs on which the caller holds some permission, for
-any action on any branch, or every registered graph to a holder of
-`graph_list`, whatever their availability. A registered graph is listed
-exactly when its routes do not answer `graph not found`: every other one,
-ready or not, gets the refusal an unknown graph gets, whole. A listed graph's
-subresources can still be not found, and a caller is refused only the actions
-it lacks on a graph it lists. The built-in `og_catalog` is not a registered
-graph: it is never listed and keeps its own authorization.
-The engine checks every write when a policy is installed, before the first
-lasting effect, so a denied write changes nothing. A direct CLI write to
-a cluster graph uses that cluster's policy. Reads through the engine or the
+policy. An admitted identity can discover every registered graph's ID and
+display name. Its access report describes the actions its credential may
+perform on a ready graph, including an empty set. The engine checks every
+write against the installed policy before the first lasting effect, so a
+denied write changes nothing. A direct CLI write to a cluster graph uses
+that cluster's policy. Reads through the engine or the
 direct CLI are not checked `D9`, and a direct or embedded caller states its
-own actor. A served graph with no policy denies every authenticated request,
-unless the operator lets static tokens read it. An operator can also start a
-server with no authentication. Both choices are logged at startup. A policy
+own actor. A served graph with no policy denies authenticated graph data
+operations, unless the operator lets static tokens read it. An operator can
+also start a server with no authentication. Both choices are logged at startup. A policy
 change binds the requests admitted after it; a request already admitted
 finishes under the policy it was admitted with. The CLI,
 HTTP and MCP share one list of operations, one set of error codes and one

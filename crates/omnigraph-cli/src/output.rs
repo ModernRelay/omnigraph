@@ -2544,13 +2544,13 @@ mod tests {
         let distance = omnigraph_compiler::schema::one_way::OneWayConstruct {
             construct: "vector_distance".to_string(),
             description: "an explicit `distance` on a Vector, `l2` included".to_string(),
-            first_release: "0.17.0".to_string(),
+            first_release: "0.18.0".to_string(),
             type_name: "Doc".to_string(),
             property: Some("emb".to_string()),
             line: 1,
             column: 30,
         };
-        let one_way = "one-way: Doc.emb (line 1, column 30): an explicit `distance` on a Vector, `l2` included; first read by 0.17.0\nbinaries before 0.17.0 refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored\n";
+        let one_way = "one-way: Doc.emb (line 1, column 30): an explicit `distance` on a Vector, `l2` included; first read by 0.18.0\nbinaries before 0.18.0 refuse the whole graph after this apply, until an apply stores none of these constructs or the backup taken before the upgrade is restored\n";
         for (plan, expected) in [
             (
                 SchemaMigrationPlan {

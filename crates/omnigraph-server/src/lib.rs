@@ -39,7 +39,7 @@ pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, AuthenticatedActor, GraphKey, ResolvedActor, Scope, TenantId};
-pub use mcp::McpSettings;
+pub use mcp::{McpSettings, ReadBudget};
 pub use registry::{
     BlockedGraph, GraphEntry, GraphHandle, GraphRegistry, InsertError, LoadingGraph,
     RegistryLookup, RegistrySnapshot, StartupFailure,
@@ -2727,17 +2727,6 @@ mod api_error_tests {
                 assert_eq!(lines.len(), 1, "{message}: {logs}");
                 assert!(lines[0].contains(&format!("status={sent}")), "{logs}");
             };
-        // Tracing caches a log site's interest when the site is first hit, and
-        // a concurrent test reaching it under no subscriber caches it as never.
-        // Hit both sites first, so installing each capture below rebuilds it.
-        drop(failure());
-        let _ = OperationRuntime::default()
-            .submit((), async {
-                OwnedResult::from(Err::<(), _>(ApiError::internal("first")))
-            })
-            .unwrap()
-            .result()
-            .await;
 
         let read = test_log_capture::Capture::default();
         let logs = tracing::subscriber::set_default(read.subscriber("warn"));
@@ -3750,6 +3739,26 @@ pub(crate) mod test_log_capture {
 
     use tracing_subscriber::EnvFilter;
 
+    /// The test binary's global subscriber, installed before any test runs:
+    /// it enables nothing and keeps every callsite's process-wide cached
+    /// interest dynamic, so each event asks its own thread's subscriber and a
+    /// capture never loses one to a callsite another thread cached as never
+    /// ([log capture](../../../docs/dev/testing.md#log-capture)).
+    #[ctor::ctor(unsafe)]
+    fn keep_callsite_interest_dynamic() {
+        use tracing::subscriber::{Interest, NoSubscriber};
+        use tracing_subscriber::filter::dynamic_filter_fn;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        // No registry: a span closed outside its own subscriber's scope releases
+        // its parent through this one, which must ignore an id it never issued.
+        let keeper = NoSubscriber::new()
+            .with(dynamic_filter_fn(|_, _| false).with_callsite_filter(|_| Interest::sometimes()));
+        // Nothing else runs before `main`, so the global default is unset; a
+        // constructor must not panic, so a refusal is ignored, not unwrapped.
+        let _ = tracing::subscriber::set_global_default(keeper);
+    }
+
     #[derive(Clone, Default)]
     pub(crate) struct Capture(Arc<Mutex<Vec<u8>>>);
 
@@ -3807,6 +3816,25 @@ pub(crate) mod test_log_capture {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A capture receives an event from a callsite that another thread, with
+    /// no subscriber, hit first. Run alone, without the global subscriber
+    /// above, that thread caches the callsite as never and the event is lost.
+    #[test]
+    fn a_capture_receives_a_callsite_another_thread_registered_first_issue_1560() {
+        fn emit() {
+            tracing::warn!("callsite first registered on another thread");
+        }
+        let capture = Capture::default();
+        let _logs = tracing::subscriber::set_default(capture.subscriber("warn"));
+        std::thread::spawn(emit).join().unwrap();
+        emit();
+        let logs = capture.output();
+        assert!(
+            logs.contains("callsite first registered on another thread"),
+            "{logs:?}"
+        );
     }
 }
 
@@ -4054,6 +4082,16 @@ pub fn build_app(state: AppState) -> Router {
             resolve_graph_handle,
         ))
     });
+    let access = guarded(
+        &state,
+        http_operations::graph_access().into_router(),
+        |routes| {
+            routes.route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                resolve_graph_access,
+            ))
+        },
+    );
 
     // Management endpoints (`GET /graphs`) live alongside the per-graph
     // router. They go through bearer auth but NOT through
@@ -4086,7 +4124,10 @@ pub fn build_app(state: AppState) -> Router {
     // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
     let protected: Router<AppState> = Router::new()
         .nest(CATALOGUE_ROUTE_PREFIX, catalogue)
-        .nest(handlers::CLUSTER_PATH_PREFIX, per_graph_protected)
+        .nest(
+            handlers::CLUSTER_PATH_PREFIX,
+            per_graph_protected.merge(access),
+        )
         .merge(management)
         .merge(deployments);
 

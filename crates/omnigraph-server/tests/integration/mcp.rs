@@ -6,7 +6,7 @@ use std::task::Poll;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Method, Request, StatusCode};
-use futures::StreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use omnigraph_server::AppState;
 use omnigraph_server::api::{HTTP_API_CONTRACT, HTTP_API_CONTRACT_HEADER};
 use serde_json::{Value, json};
@@ -183,6 +183,46 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
     let key = omnigraph_server::GraphKey::cluster(
         omnigraph_server::GraphId::try_from("default").unwrap(),
     );
+    // This admitted identity has no graph grants. Its access report describes
+    // the named branch without opening it, and the response owns no graph lease.
+    let mut held = Vec::new();
+    for branch in ["main", "absent"] {
+        let expected = json!({
+            "actor_id":"principal:stable_bob","client_id":"oauth-client","graph_id":"default",
+            "graph_wide":[],"branch":branch,"target_branch":null,"actions":[]
+        });
+        for (request, mcp) in [
+            (
+                get_request(&format!("/graphs/default/access?branch={branch}"), &bob),
+                false,
+            ),
+            (
+                rpc(
+                    Some(&bob),
+                    "tools/call",
+                    json!({"name":"access","arguments":{"graph":"default","branch":branch}}),
+                ),
+                true,
+            ),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let chunks: Vec<Bytes> = response
+                .into_body()
+                .into_data_stream()
+                .try_collect()
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&chunks.concat()).unwrap();
+            let report = if mcp {
+                &body["result"]["structuredContent"]
+            } else {
+                &body
+            };
+            assert_eq!(report, &expected);
+            held.extend(chunks);
+        }
+    }
     let transition = state
         .prepare_same_view(
             &key,
@@ -191,29 +231,27 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         .unwrap()
         .close()
         .unwrap();
-    // `graphs` names the graphs each identity can read, available or not:
-    // the ones it is told are unavailable below, never the ones it is told
-    // are not found.
-    let discovered = call(&app, &alice, "graphs", json!({})).await;
-    assert_eq!(
-        discovered["result"]["structuredContent"],
-        json!({"visibility":"granted","actor_id":"principal:stable_alice","client_id":"oauth-client","graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"loading","display_name":"loading"}]})
-    );
+    transition.wait_requests().await.unwrap();
+    drop(held);
     let discovered = call(&app, &bob, "graphs", json!({})).await;
     assert_eq!(
         discovered["result"]["structuredContent"],
-        json!({"visibility":"granted","actor_id":"principal:stable_bob","client_id":"oauth-client","graphs":[]})
+        json!({"graphs":[{"graph_id":"blocked","display_name":"blocked"},{"graph_id":"default","display_name":"default"},{"graph_id":"invalid-config","display_name":"invalid-config"},{"graph_id":"invalid-policy","display_name":"invalid-policy"},{"graph_id":"loading","display_name":"loading"}]})
     );
+    // Discovery names each registered graph to an admitted identity, so no
+    // route answers one of them as missing: it is unavailable, whatever the
+    // identity may do on it. Only an unregistered graph is not found.
     for (credential, graph, expected) in [
         (&alice, "blocked", 503),
-        (&bob, "blocked", 404),
+        (&bob, "blocked", 503),
         (&alice, "loading", 503),
-        (&bob, "loading", 404),
+        (&bob, "loading", 503),
         (&alice, "default", 503),
-        (&bob, "default", 404),
-        (&alice, "invalid-policy", 404),
-        (&alice, "invalid-config", 404),
+        (&bob, "default", 503),
+        (&alice, "invalid-policy", 503),
+        (&bob, "invalid-config", 503),
         (&alice, "unknown", 404),
+        (&bob, "unknown", 404),
     ] {
         let result = call(&app, credential, "queries", json!({"graph":graph})).await;
         assert_eq!(result["result"]["isError"], true);
@@ -231,8 +269,15 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
             assert_eq!(native["code"], "graph_unavailable");
             assert_eq!(result["result"]["structuredContent"]["error"], native);
         }
+        let (status, native) = json_response(
+            &app,
+            get_request(&format!("/graphs/{graph}/access"), credential),
+        )
+        .await;
+        assert_eq!(status.as_u16(), expected);
+        let report = call(&app, credential, "access", json!({"graph":graph})).await;
+        assert_refusal(&report, status, &native);
     }
-    transition.wait_requests().await.unwrap();
     transition.resume_same_view().unwrap();
     // The whole catalog, stored mutations included, as the route lists it.
     let catalog = call(&app, &alice, "queries", json!({"graph":"default"})).await;
@@ -249,10 +294,9 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         catalog["result"]["structuredContent"],
         http_get(&app, "/graphs/default/queries", &alice).await
     );
-    // bob holds no grant on the graph, so it does not exist for him.
     let denied = call(&app, &bob, "queries", json!({"graph":"default"})).await;
     assert_eq!(denied["result"]["isError"], true);
-    assert_eq!(denied["result"]["structuredContent"]["status"], 404);
+    assert_eq!(denied["result"]["structuredContent"]["status"], 403);
     let read = call(
         &app,
         &alice,
@@ -778,8 +822,7 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
         assert_eq!(read["result"]["structuredContent"], native);
     }
 
-    // An actor that can read no branch of the graph does not see it: the
-    // route's not-found refusal, in the shared envelope.
+    // A denied actor gets the route's refusal in the shared envelope.
     for (tool, arguments) in [
         ("schema", json!({"graph":"default"})),
         (
@@ -790,12 +833,12 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
         let denied = call(&app, &bob, tool, arguments).await;
         assert_eq!(denied["result"]["isError"], true, "{denied}");
         assert_eq!(
-            denied["result"]["structuredContent"]["status"], 404,
+            denied["result"]["structuredContent"]["status"], 403,
             "{denied}"
         );
         assert_eq!(
             denied["result"]["structuredContent"]["error"]["code"],
-            "not_found"
+            "forbidden"
         );
     }
 
@@ -922,9 +965,8 @@ async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
     assert!(names.iter().any(|name| name == "query"), "{names:?}");
     assert!(names.iter().any(|name| name == "mutate"), "{names:?}");
 
-    // Tokens are not scoped to graphs, so a graph without a policy grants
-    // nothing, and does not exist for the token: `read` and every other action
-    // are not found.
+    // Tokens are not scoped to graphs, so a graph without a policy refuses
+    // `read` as it refuses every other action.
     let read = call(
         &app,
         "secret",
@@ -933,7 +975,7 @@ async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
     )
     .await;
     assert_eq!(read["result"]["isError"], true, "{read}");
-    assert_eq!(read["result"]["structuredContent"]["status"], 404, "{read}");
+    assert_eq!(read["result"]["structuredContent"]["status"], 403, "{read}");
 
     let before = manifest_dataset_version(&graph).await;
     let refused = call(
@@ -945,8 +987,8 @@ async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
     .await;
     assert_eq!(refused["result"]["isError"], true, "{refused}");
     let content = &refused["result"]["structuredContent"];
-    assert_eq!(content["status"], 404, "{refused}");
-    assert_eq!(content["error"]["code"], "not_found", "{refused}");
+    assert_eq!(content["status"], 403, "{refused}");
+    assert!(content.to_string().contains("default-deny"), "{refused}");
     assert_eq!(manifest_dataset_version(&graph).await, before);
 }
 
@@ -954,6 +996,7 @@ async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
 async fn static_token_server_serves_mcp_without_oauth_discovery() {
     let mut settings = omnigraph_server::McpSettings::default();
     settings.allowed_hosts = vec!["graphs.internal:8080".into()];
+    settings.setup_url = Some("https://example.com/setup".into());
     let (_temp, app) = static_token_app(settings).await;
 
     let response = app
@@ -1014,19 +1057,17 @@ async fn static_token_server_serves_mcp_without_oauth_discovery() {
             "{origin}"
         );
     }
-    // A static token lists the graphs it can read, as the native listing
-    // does, with no `graph_list` permit; the catalog still needs one.
+    // A static token is not an identity, so `graphs` asks `GET /graphs`,
+    // whose `graph_list` action only a server-scoped policy grants. A refused
+    // listing carries the native error even with a setup page configured.
     let graphs = call(&app, "secret", "graphs", json!({})).await;
-    assert_eq!(graphs["result"]["isError"], false, "{graphs}");
-    let (status, native) = json_response(&app, get_request("/graphs/discovery", "secret")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(graphs["result"]["structuredContent"], native);
-    assert_eq!(
-        native,
-        json!({"visibility":"granted","actor_id":"default","graphs":[{"graph_id":"default","display_name":"default"}]})
-    );
-    let (status, _) = json_response(&app, get_request("/graphs", "secret")).await;
+    let (status, native) = json_response(&app, get_request("/graphs", "secret")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        graphs["result"]["structuredContent"],
+        json!({"status": 403, "error": native}),
+        "{graphs}"
+    );
     let schema = call(&app, "secret", "schema", json!({"graph":"default"})).await;
     assert_eq!(schema["result"]["isError"], false, "{schema}");
 }
@@ -1463,7 +1504,7 @@ async fn mcp_resources_read_graphs_schema_and_branches_under_policy() {
 
     // Policy decides, and an unknown resource is not found.
     let denied = read(bob, "omnigraph://graphs/default/schema").await;
-    assert_eq!(denied["error"]["data"]["status"], 404, "{denied}");
+    assert_eq!(denied["error"]["data"]["status"], 403, "{denied}");
     for uri in [
         "omnigraph://graphs/unknown/schema",
         "omnigraph://graphs/default/secrets",
@@ -1670,9 +1711,8 @@ async fn mcp_write_tools_are_conditional_and_policy_gated() {
         json!({"graph":"default","query":insert,"params":{"name":"Ivy"}}),
     )
     .await;
-    // bob holds no grant, so the graph does not exist for him.
     assert_eq!(
-        denied["result"]["structuredContent"]["status"], 404,
+        denied["result"]["structuredContent"]["status"], 403,
         "{denied}"
     );
     let allowed = call(
@@ -1697,11 +1737,12 @@ const DOCUMENTS: &str = r#"{"type":"Document","data":{"title":"readme","content"
 {"type":"Document","data":{"title":"empty"}}"#;
 
 /// `default` may do everything the tools below need, `reader` may read and
-/// invoke stored queries but change nothing, `stranger` may do nothing.
+/// invoke stored queries, `invoker` may only invoke, and `stranger` has no graph grants.
 const OPERATIONS_POLICY: &str = r#"version: 1
 groups:
   writers: ["default"]
   readers: ["reader"]
+  invokers: ["reader", "invoker"]
 rules:
   - id: writers-data
     allow:
@@ -1722,9 +1763,9 @@ rules:
       actors: {group: readers}
       actions: [read]
       branch_scope: any
-  - id: readers-invoke
+  - id: invoke
     allow:
-      actors: {group: readers}
+      actors: {group: invokers}
       actions: [invoke_query]
 "#;
 
@@ -1759,6 +1800,7 @@ async fn operations_app(settings: omnigraph_server::McpSettings) -> (tempfile::T
     let tokens = [
         ("default", "secret"),
         ("reader", "reader-secret"),
+        ("invoker", "invoker-secret"),
         ("stranger", "stranger-secret"),
     ];
     let state = AppState::open_single_with_queries(
@@ -2131,7 +2173,6 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
 
     // Policy decides each tool exactly as it decides the route. The proposal
     // is live, written at main's current head, so its 404 is the denial's.
-    // The stranger holds no grant, so the graph does not exist for it.
     let pending = propose("Uma").await;
     let pending = pending.as_str();
     let head = main_head(&app).await;
@@ -2144,49 +2185,58 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
     let drop_uri = format!("/graphs/default/commits/{pending}");
     let get = |uri: &str, token: &str| http_request(Method::GET, uri, token, &[], None);
     for (token, tool, arguments, request, expected) in [
+        // Graph admission refuses a caller with no graph action. A caller who
+        // can invoke queries reaches the individual routes and their read checks.
         (
             "stranger-secret",
             "diff",
             json!({"graph":"default","from":"main","to":"main"}),
             get("/graphs/default/diff?from=main&to=main", "stranger-secret"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "invoker-secret",
+            "diff",
+            json!({"graph":"default","from":"main","to":"main"}),
+            get("/graphs/default/diff?from=main&to=main", "invoker-secret"),
             StatusCode::NOT_FOUND,
         ),
         (
-            "stranger-secret",
+            "invoker-secret",
             "branches_diff",
             json!({"graph":"default","source":"main"}),
             get(
                 "/graphs/default/branches/diff?source=main",
-                "stranger-secret",
+                "invoker-secret",
             ),
-            StatusCode::NOT_FOUND,
+            StatusCode::FORBIDDEN,
         ),
         (
-            "stranger-secret",
+            "invoker-secret",
             "branches_merge_base",
             json!({"graph":"default","source":"main"}),
             get(
                 "/graphs/default/branches/merge-base?source=main",
-                "stranger-secret",
+                "invoker-secret",
             ),
-            StatusCode::NOT_FOUND,
+            StatusCode::FORBIDDEN,
         ),
         (
-            "stranger-secret",
+            "invoker-secret",
             "commits_list",
             json!({"graph":"default","listing":"unpublished"}),
             get(
                 "/graphs/default/commits?listing=unpublished",
-                "stranger-secret",
+                "invoker-secret",
             ),
-            StatusCode::NOT_FOUND,
+            StatusCode::FORBIDDEN,
         ),
         (
-            "stranger-secret",
+            "invoker-secret",
             "blobs_stat",
             blob_cell("notes"),
-            get(&blob_uri("notes"), "stranger-secret"),
-            StatusCode::NOT_FOUND,
+            get(&blob_uri("notes"), "invoker-secret"),
+            StatusCode::FORBIDDEN,
         ),
         (
             "reader-secret",
@@ -2278,4 +2328,258 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
             .any(|commit| commit["graph_commit_id"] == pending),
         "a denied control leaves the proposal in place: {unpublished}"
     );
+}
+
+/// The read budget and setup link, end to end: the budget applies to
+/// successful reads and graph-backed resources only, so a 403, a write
+/// receipt and a stale `if_graph_commit` 412 larger than it still arrive
+/// whole, and a broad read is refused naming it.
+#[tokio::test]
+async fn mcp_read_budget_and_setup_link_apply_end_to_end() {
+    const BUDGET: usize = 256;
+    let mut settings = omnigraph_server::McpSettings::default();
+    settings.read_budget = omnigraph_server::ReadBudget::new(BUDGET).unwrap();
+    settings.setup_url = Some("https://example.com/setup".into());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    std::fs::write(
+        &policy_path,
+        "version: 1\ngroups:\n  writers: [default]\n  readers: [reader]\nrules:\n  \
+         - id: writers\n    allow:\n      actors: { group: writers }\n      actions: [read, change]\n      branch_scope: any\n  \
+         - id: readers\n    allow:\n      actors: { group: readers }\n      actions: [read]\n      branch_scope: any\n",
+    )
+    .unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![
+            ("default".to_string(), "secret".to_string()),
+            ("reader".to_string(), "reader-secret".to_string()),
+        ],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap()
+    .with_mcp_settings(settings);
+    let app = omnigraph_server::build_app(state);
+    let size = |result: &Value| serde_json::to_vec(&result["result"]).unwrap().len();
+
+    let text = instructions(&app, "secret").await;
+    assert!(
+        text.contains("A read's result is limited to 256 bytes"),
+        "{text}"
+    );
+    assert!(text.contains("returns a `setup` link"), "{text}");
+    assert!(!text.contains("https://example.com/setup"), "{text}");
+
+    // A read over the budget is refused, naming the budget and how to
+    // narrow the read.
+    let read = call(
+        &app,
+        "secret",
+        "query",
+        json!({"graph":"default","query":"query n() { match { $p: Person } return { $p.name, $p.age } }"}),
+    )
+    .await;
+    assert_eq!(read["result"]["isError"], true, "{read}");
+    let refusal = &read["result"]["structuredContent"]["error"];
+    assert_eq!(refusal["code"], "result_too_large", "{read}");
+    assert_eq!(
+        refusal["disposition"],
+        json!({"effects": "none", "action": "fix"}),
+        "{read}"
+    );
+    let message = refusal["error"].as_str().unwrap();
+    assert!(message.contains("256 bytes read budget"), "{read}");
+    assert!(message.contains("Narrow the read"), "{read}");
+    // So is a graph-backed resource; the compiled-in references are not.
+    let (_, schema) = json_response(
+        &app,
+        rpc(
+            Some("secret"),
+            "resources/read",
+            json!({"uri":"omnigraph://graphs/default/schema"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        schema["error"]["data"]["error"]["code"], "result_too_large",
+        "{schema}"
+    );
+    let (_, reference) = json_response(
+        &app,
+        rpc(
+            Some("secret"),
+            "resources/read",
+            json!({"uri":"omnigraph://best-practices/queries"}),
+        ),
+    )
+    .await;
+    assert!(size(&reference) > BUDGET, "{reference}");
+
+    // A 403 larger than the budget arrives whole: the reader may not write.
+    let head = main_head(&app).await;
+    let insert = "query add($name: String) { insert Person { name: $name, age: 7 } }";
+    let forbidden = call(
+        &app,
+        "reader-secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Mallory"}}),
+    )
+    .await;
+    assert!(size(&forbidden) > BUDGET, "{forbidden}");
+    let refusal = &forbidden["result"]["structuredContent"];
+    assert_eq!(refusal["status"], 403, "{forbidden}");
+    assert_eq!(refusal["error"]["code"], "forbidden", "{forbidden}");
+    assert_eq!(main_head(&app).await, head);
+
+    // A write receipt larger than the budget arrives whole.
+    let written = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Eve"},"if_graph_commit":head}),
+    )
+    .await;
+    assert_eq!(written["result"]["isError"], false, "{written}");
+    assert!(size(&written) > BUDGET, "{written}");
+
+    // So does the stale conditional write's 412, which says nothing was
+    // written.
+    let stale = call(
+        &app,
+        "secret",
+        "mutate",
+        json!({"graph":"default","query":insert,"params":{"name":"Frank"},"if_graph_commit":head}),
+    )
+    .await;
+    assert!(size(&stale) > BUDGET, "{stale}");
+    let refusal = &stale["result"]["structuredContent"];
+    assert_eq!(refusal["status"], 412, "{stale}");
+    assert_eq!(refusal["error"]["code"], "precondition_failed", "{stale}");
+    assert_eq!(
+        refusal["error"]["disposition"],
+        json!({"effects": "none", "action": "refresh"}),
+        "{stale}"
+    );
+}
+
+/// A served read past the default budget, and one past the 1 MiB memory cap
+/// as well, are both refused naming the 96 KiB read budget and how to narrow
+/// the read; a read within it arrives whole. The rows are 30,000-character
+/// names, selected by age.
+#[tokio::test]
+async fn mcp_a_read_past_the_budget_or_the_cap_is_refused_naming_the_budget() {
+    let schema = std::fs::read_to_string(fixture("test.pg")).unwrap();
+    let rows: String = (0..40)
+        .map(|age| {
+            let name = format!("{age:02}{}", "x".repeat(30_000));
+            format!(
+                "{}\n",
+                json!({"type": "Person", "data": {"name": name, "age": age}})
+            )
+        })
+        .collect();
+    let temp = init_graph_with_schema_and_data(&schema, &rows).await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    std::fs::write(&policy_path, permit_all_policy_yaml(&["default"])).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        graph.to_string_lossy().to_string(),
+        vec![("default".to_string(), "secret".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap()
+    .with_mcp_settings(omnigraph_server::McpSettings::default());
+    let app = omnigraph_server::build_app(state);
+    let query =
+        "query n($below: I32) { match { $p: Person } where $p.age < $below return { $p.name } }";
+    let read = |below: i32| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "secret",
+                "query",
+                json!({"graph": "default", "query": query, "params": {"below": below}}),
+            )
+            .await
+        }
+    };
+    let size = |result: &Value| serde_json::to_vec(&result["result"]).unwrap().len();
+
+    // One row fits the budget, its text copy included.
+    let one = read(1).await;
+    assert_eq!(one["result"]["isError"], false, "{}", size(&one));
+    assert_eq!(one["result"]["structuredContent"]["row_count"], 1);
+    assert!(size(&one) <= 96 * 1024, "{}", size(&one));
+
+    // Two rows pass the budget; forty pass the 1 MiB cap while the DTO is
+    // encoded. Both are refused the same way, naming the budget.
+    for below in [2, 40] {
+        let refused = read(below).await;
+        assert_eq!(refused["result"]["isError"], true, "{below}");
+        let error = &refused["result"]["structuredContent"]["error"];
+        assert_eq!(error["code"], "result_too_large", "{error}");
+        assert_eq!(
+            error["disposition"],
+            json!({"effects": "none", "action": "fix"}),
+            "{error}"
+        );
+        let message = error["error"].as_str().unwrap();
+        assert!(message.contains("96 KiB read budget"), "{message}");
+        assert!(message.contains("Narrow the read"), "{message}");
+        assert!(size(&refused) < 4096, "{}", size(&refused));
+    }
+}
+
+/// The tool and resource offer setup when the registry is empty. An identity
+/// without graph permissions still discovers the populated registry.
+#[tokio::test]
+async fn mcp_setup_link_appears_only_on_an_empty_listing() {
+    let mut settings = omnigraph_server::McpSettings::default();
+    settings.setup_url = Some("https://example.com/setup".into());
+    let (temp, populated, _) = fixture_app_with(settings.clone()).await;
+    let empty = AppState::new_multi(
+        Vec::new(),
+        Vec::new(),
+        None,
+        omnigraph_server::workload::WorkloadController::with_defaults(),
+        None,
+    )
+    .unwrap()
+    .with_oidc_identity_trust(trust(temp.path()))
+    .with_mcp_settings(settings);
+    let bearer = token("bob", RESOURCE);
+    for (app, listed) in [
+        (omnigraph_server::build_app(empty), false),
+        (populated, true),
+    ] {
+        let graphs = call(&app, &bearer, "graphs", json!({})).await;
+        assert_eq!(graphs["result"]["isError"], false, "{graphs}");
+        let listing = &graphs["result"]["structuredContent"];
+        let names = listing["graphs"].as_array().unwrap();
+        assert_eq!(!names.is_empty(), listed, "{graphs}");
+        if listed {
+            assert!(listing.get("setup").is_none(), "{graphs}");
+        } else {
+            assert_eq!(
+                listing["setup"]["url"], "https://example.com/setup",
+                "{graphs}"
+            );
+        }
+        let (_, read) = json_response(
+            &app,
+            rpc(
+                Some(&bearer),
+                "resources/read",
+                json!({"uri":"omnigraph://graphs"}),
+            ),
+        )
+        .await;
+        let text = read["result"]["contents"][0]["text"].as_str().unwrap();
+        let resource: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(&resource, listing, "{read}");
+    }
 }

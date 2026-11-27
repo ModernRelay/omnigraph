@@ -1,45 +1,43 @@
 # Upgrading Omnigraph
 
 Normal open accepts storage formats v14 to v18 and never migrates a graph: a v14 or v15 branch
-is stamped v16 at its first publish, and only the [storage upgrade](#storage-upgrade) stamps an
-existing graph v17 or v18. A standalone
-graph at v8 or v9 (release 0.11.x) or at v13 is converted in place by that offline upgrade. A graph at any other
-format, and every cluster-managed graph below v14, is refused and takes the
-[export/import rebuild](#rebuild) with the binary that wrote the graph.
+is stamped v16 at its first publish, and only the offline [storage upgrade](#storage-upgrade)
+stamps an existing graph v17 or v18, or converts a standalone graph at v8 or v9 (release 0.11.x)
+or at v13 in place. A graph at any other format, and every cluster-managed graph below v14, is
+refused and takes the [export/import rebuild](#rebuild) with the binary that wrote the graph.
 
-For an upgrade from 0.15.0, check your graph format, access policies and maintenance scripts against the [0.16.0 upgrade actions](../../releases/v0.16.0-overview.md#upgrade-actions).
-Start with the [0.13 → 0.14 checklist](upgrade-0.14.md) for fleet,
-CLI configuration, HTTP/MCP, and client compatibility changes.
+When upgrading to 0.17.1, upgrade the CLI and server together. Check your [S3 root](#s3-roots-that-name-two-keys).
+Replace 0.17.0’s `graphs list --catalog` with `graphs list`. An admitted identity can use [`graphs list --discovery`](../cli/managed-data.md#discover-graphs) for names only.
+
+- From 0.16.x, also check your graph format and MCP integrations against the [0.17.0 upgrade actions](../../releases/v0.17.0.md#upgrade-actions).
+- From 0.15.0, also check access policies and maintenance scripts against the [0.16.0 upgrade actions](../../releases/v0.16.0-overview.md#upgrade-actions).
+- From 0.13, start with the [0.13 → 0.14 checklist](upgrade-0.14.md) for fleet, CLI configuration, HTTP/MCP, and client compatibility changes.
 
 ## Query language (GQ 3)
 
-This release parses GQ 3 only: a stored query or `.gq` file written for an
-earlier release fails to compile, and [Upgrading queries to GQ
-3](../queries/upgrading-to-gq3.md) maps each older form to its GQ 3 form. Validate stored queries with the new binary first (`omnigraph queries validate`), rewrite the failing ones from their printed fixes (`omnigraph lint --fix` applies them), and apply the rewritten registry in the same step as the binary switch, since an older server cannot load the new syntax ([procedure](../queries/upgrading-to-gq3.md#stored-queries-at-upgrade)). Each declaration of a stored file is available on its own: one that fails is unavailable with its own diagnostic, one that calls it is unavailable naming it, and the rest of the file serves. `omnigraph version` and `/healthz` report the GQ language version (`gq_language`, `3.0`); a binary that reports none is a GQ language 2 build.
+This release parses GQ 3 only: a stored query or `.gq` file written for an earlier release fails to compile, and [Upgrading queries to GQ 3](../queries/upgrading-to-gq3.md) maps each older form to its GQ 3 form. Validate stored queries with the new binary first (`omnigraph queries validate`), rewrite the failing ones from their printed fixes (`omnigraph lint --fix` applies them), and apply the rewritten registry in the same step as the binary switch, since an older server cannot load the new syntax ([procedure](../queries/upgrading-to-gq3.md#stored-queries-at-upgrade)). Each declaration of a stored file is available on its own: one that fails is unavailable with its own diagnostic, one that calls it is unavailable naming it, and the rest of the file serves. `omnigraph version` and `/healthz` report the GQ language version (`gq_language`, `3.0`); a binary that reports none is a GQ language 2 build.
 
 A schema apply that stores a [one-way construct](../queries/upgrading-to-gq3.md#schemas), which `schema plan` and `cluster plan` name first with the first release that reads it, makes every binary before that release refuse the whole graph until a later apply stores none of those constructs, where the schema allows the change, or the backup is restored. After `index rebuild --kind full-text` it refuses full-text reads, and its own `index rebuild --kind full-text` restores them; `index build` and `optimize` never recommend it.
 
 ## Storage upgrade
 
-`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v18 in place, and stamps a v14 to v17 graph to v18 in place by the route `stamp-v14-to-v18`: one metadata-only commit per live branch still below v18, main first, then the branch ref files removed, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again. From v18 a branch exists as an entry of `main`'s catalog, which `main`'s commit records for every branch the graph holds (`work.rows_written`), and the ref files under `_refs/branches/` are gone once the run completes (`work.refs_unlinked`); see [branching](../branching/index.md).
+`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v18 in place, and stamps a v14 to v17 graph to v18 in place by the route `stamp-v14-to-v18`: one metadata-only commit per live branch still below v18, main first, then the branch ref files removed, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again. From v18 a branch exists as an entry of `main`'s catalog, which `main`'s commit records for every branch the graph holds, with one retired row for each retired ref (a deleted branch whose commits are kept, or a 0.11.x schema-apply lock that a finished apply or the upgrade retired), so `work.rows_written` counts both and can be larger than the branch count, and the ref files under `_refs/branches/` are gone once the run completes (`work.refs_unlinked`); see [branching](../branching/index.md).
 Branches, commit ids, commit history and table data are kept; no table row is
 rewritten. Only main builds from 2026-10-01 to 2026-10-04 wrote v13.
 
-Graphs at v14 or v15 already open in 0.14; an offline stamp is not a prerequisite
-for ordinary reads and writes. The first ordinary 0.14 publication stamps that
-branch v16, including in a cluster. Opening the graph or running a no-op does not
-advance the stamp. `as commit`, `commit
-publish` and `commit drop` refuse a branch still at v14; `as unattached branch`
-refuses a branch still at v14 or v15. A standalone graph can use the offline
-command before using those features. Cluster graphs must first have an ordinary
+Graphs at v14 or v15 already open in 0.14; an offline stamp is not a prerequisite for
+ordinary reads and writes. The first ordinary 0.14 publication stamps that branch v16,
+including in a cluster. Opening the graph or running a no-op does not advance the stamp.
+`as commit`, `commit publish` and `commit drop` refuse a branch still at v14; `as
+unattached branch` refuses a branch still at v14 or v15. A standalone graph can use the
+offline command before using those features. Cluster graphs must first have an ordinary
 0.14 publication on the affected branch; `upgrade` cannot stamp cluster graphs.
 
-A v16 graph, written by 0.14.x or 0.15.0, and a v17 graph, written by 0.16.0, open as they
-are and their branches stay at their format: no publication stamps a branch v17 or v18. Only `omnigraph upgrade` does, with
-every process on the graph stopped. A binary that serves up to v17 then refuses
-the graph, so upgrade every binary first. A graph this binary creates is born
-at v18. A cluster graph created by an earlier binary stays at its format, since
-`upgrade` cannot stamp cluster graphs.
+A v16 graph, written by 0.14.x or 0.15.0, and a v17 graph, written by 0.16.0, open as they are and
+their branches stay at their format: no publication stamps a branch v17 or v18. Only `omnigraph
+upgrade` does, with every process on the graph stopped. A binary that serves up to v17 then refuses
+the graph, so upgrade every binary first. A graph this binary creates is born at v18. A cluster
+graph created by an earlier binary stays at its format, since `upgrade` cannot stamp cluster graphs.
 
 The explicit `omnigraph upgrade` command is offline, and it cannot verify that itself:
 
@@ -73,15 +71,15 @@ anything under `__history/`.
 | `recovery_required` | the graph is pending or holds leftover recovery files; follow `recovery.action` | 1 |
 
 The report's `work` object counts what the run read and writes: `live_refs`,
-`retired_refs` (deleted branches whose commits are kept), `orphan_writers`,
+`retired_refs` (deleted branches whose commits are kept, and 0.11.x schema-apply
+locks that a finished apply or the upgrade retired), `orphan_writers`,
 `legacy_commits`, `bookkeeping_versions`, `absent_parents`, `data_files`,
-`id_shards`, `writer_shards`, `schema_contents`, `census_reads`,
-`census_cells`, `legacy_bytes` and `table_opens` (the tables of a v8 or v9
-graph opened to compare their columns with the root schema objects). A
-resumed run that finds the legacy objects complete reads no history again and
-reports `retired_refs`, `orphan_writers`, `bookkeeping_versions`,
-`schema_contents`, `census_reads`, `census_cells`, `legacy_bytes` and
-`table_opens` as zero.
+`id_shards`, `writer_shards`, `schema_contents`, `census_reads`, `census_cells`,
+`legacy_bytes` and `table_opens` (the tables of a v8 or v9 graph opened to compare
+their columns with the root schema objects). A resumed run that finds the legacy
+objects complete reads no history again and reports `retired_refs`,
+`orphan_writers`, `bookkeeping_versions`, `schema_contents`, `census_reads`,
+`census_cells`, `legacy_bytes` and `table_opens` as zero.
 
 | Finding | Names | What to do |
 |---|---|---|
@@ -198,6 +196,13 @@ For the historical v0.10-to-v0.9 rollback, including `external_blobs` state,
 follow the [tagged rollback procedure](https://github.com/ModernRelay/omnigraph/blob/v0.10.0/docs/user/operations/upgrade.md#cluster-state-and-rollback)
 with those binaries. It is not a downgrade path from v0.14.
 
+## S3 roots that name two keys
+
+If the refusal names two keys for an `s3://` root, an earlier release split the root’s objects between them.
+Export each graph with that release and [rebuild](#rebuild) it under a plain prefix.
+If the refusal names another spelling, finish any outstanding deployment with the earlier release, then use that spelling.
+If it gives no replacement, choose a plain prefix.
+
 ## What an export/import rebuild preserves
 
 This table describes rebuilding a graph at a new URI for a graph-format change,
@@ -237,24 +242,21 @@ If the graph's generation is newer than the binary, upgrade the binary instead.
 ## System-column upgrade (legacy spellings)
 
 `omnigraph schema upgrade-system-columns --target <graph>` respells a standalone graph's
-legacy system columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`).
-It needs a graph that normal open accepts. The respelling
-changes no storage layout and publishes the replacement contract with the
-renamed table references in one new graph commit. Columns are renamed by field id: no table
-rows are rewritten, indexes survive, and data and existing history/commit IDs are preserved;
-`--check` runs the preflight and writes nothing; `--json` prints the report.
-The preflight refuses a graph with any non-main branch (merge what you need,
-then delete the branches: a merge alone leaves the source live) and a
-property whose name starts with `_` (rename it with `@rename_from` first),
-naming every offender under `system_columns_preflight`. Edge constraints
-such as `@unique(src, dst)` become `@unique(@src, @dst)`. Stop every server
-serving the graph and retain a verified backup first. Concurrent graph movement
-can refuse the attempt; stop writers and rerun from a fresh capture.
-There is no reverse operation. A run interrupted before it publishes changes nothing: rerun
-it. Once publication succeeds, fresh read-only and read-write opens use the
-accepted schema; a rerun reports `already_current`. A graph that
-already spells `__id`/`__src`/`__dst` reports `already_current`;
-cluster-managed graphs are refused.
+legacy system columns in place (`id`/`src`/`dst` to `__id`/`__src`/`__dst`). It needs a
+graph that normal open accepts. The respelling changes no storage layout and publishes the
+replacement contract with the renamed table references in one new graph commit. Columns are
+renamed by field id: no table rows are rewritten, indexes survive, and data and existing
+history/commit IDs are preserved; `--check` runs the preflight and writes nothing; `--json`
+prints the report. The preflight refuses a graph with any non-main branch (merge what you
+need, then delete the branches: a merge alone leaves the source live) and a property whose
+name starts with `_` (rename it with `@rename_from` first), naming every offender under
+`system_columns_preflight`. Edge constraints such as `@unique(src, dst)` become
+`@unique(@src, @dst)`. Stop every server serving the graph and retain a verified backup
+first. Concurrent graph movement can refuse the attempt; stop writers and rerun from a fresh
+capture. There is no reverse operation. A run interrupted before it publishes changes
+nothing: rerun it. Once publication succeeds, fresh read-only and read-write opens use the
+accepted schema; a rerun reports `already_current`. A graph that already spells
+`__id`/`__src`/`__dst` reports `already_current`; cluster-managed graphs are refused.
 
 ## Rebuild
 
@@ -310,11 +312,10 @@ At minimum:
 Embeddings are copied as stored vectors; they are not regenerated. If the model
 changed, re-embed after the import.
 
-External Blob references require the target graph's allow-list to admit the
-same sources. A direct-store CLI has no cluster allow-list and therefore cannot
-admit new external references. Rebuild such data through a configured cluster
-server or an embedded host that installs the policy. See
-[Blob values](../blobs.md).
+External Blob references require the target graph's allow-list to admit the same
+sources. A direct-store CLI has no cluster allow-list and therefore cannot admit
+new external references. Rebuild such data through a configured cluster server
+or an embedded host that installs the policy. See [Blob values](../blobs.md).
 
 ## Cluster cutover
 

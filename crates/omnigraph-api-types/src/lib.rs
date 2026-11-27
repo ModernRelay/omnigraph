@@ -108,6 +108,26 @@ pub mod build {
         }
     }
 
+    /// The repository revision whose documentation a build of `package`
+    /// links: the release tag of a stable build, the commit of any other
+    /// stamped build, and none for a local or source build, which cannot
+    /// name a revision that has its pages.
+    pub fn docs_revision(package: &str) -> Option<String> {
+        revision(package, RELEASE_CHANNEL, SOURCE_COMMIT)
+    }
+
+    pub(crate) fn revision(
+        package: &str,
+        channel: Option<&str>,
+        commit: Option<&str>,
+    ) -> Option<String> {
+        match (channel, commit) {
+            (Some("stable"), Some(_)) => Some(format!("v{package}")),
+            (_, Some(commit)) => Some(commit.to_owned()),
+            (_, None) => None,
+        }
+    }
+
     /// The internal-schema stamp of a graph this build creates, the highest
     /// it writes.
     pub const INTERNAL_SCHEMA_WRITES: u32 =
@@ -4020,16 +4040,6 @@ pub struct GraphListOutput {
     pub graphs: Vec<GraphInfo>,
 }
 
-/// Which graphs a discovery listing names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum GraphVisibility {
-    /// Exactly the registered graphs on which the caller holds some
-    /// permission, or every graph for a `graph_list` holder: a registered
-    /// graph is listed exactly when its routes do not answer `graph not found`.
-    Granted,
-}
-
 /// A graph's existence, without storage, schema, data, or serving metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -4039,24 +4049,10 @@ pub struct GraphDiscoveryEntry {
     pub display_name: String,
 }
 
-/// `GET /graphs/discovery`: who the caller is, and the graphs it holds any
-/// permission on.
+/// Authenticated minimal inventory from `GET /graphs/discovery`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GraphDiscoveryOutput {
-    /// The rule the listing follows; a server always sends it. A body without
-    /// it comes from an older release, whose listing is not filtered and
-    /// names no caller.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub visibility: Option<GraphVisibility>,
-    /// The actor the credential resolves to. Absent only on a server that runs
-    /// without authentication.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor_id: Option<String>,
-    /// The OAuth client the credential was issued to, when it is a verified
-    /// OIDC access token. Opaque text the client chose: render it escaped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
     pub graphs: Vec<GraphDiscoveryEntry>,
 }
 
@@ -4094,49 +4090,6 @@ mod tests {
             let read: ParamDescriptor = serde_json::from_str(wire).unwrap();
             assert_eq!(read.default, default, "{wire}");
         }
-    }
-
-    /// Both upgrade directions of the discovery body. A 0.16 client decodes
-    /// discovery with `deny_unknown_fields` and only `graphs`, so it refuses a
-    /// body that states its rule: client and server upgrade together. This
-    /// client reads a 0.16 body, which states no rule, as one with no rule,
-    /// never as a server without authentication.
-    #[test]
-    fn discovery_body_crosses_releases_in_one_direction_only() {
-        use super::{GraphDiscoveryEntry, GraphDiscoveryOutput, GraphVisibility};
-        use serde::Deserialize;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        #[allow(dead_code)]
-        struct Release016Discovery {
-            graphs: Vec<GraphDiscoveryEntry>,
-        }
-        let current = serde_json::to_value(GraphDiscoveryOutput {
-            visibility: Some(GraphVisibility::Granted),
-            actor_id: Some("principal:alice".into()),
-            client_id: None,
-            graphs: vec![],
-        })
-        .unwrap();
-        assert_eq!(
-            current,
-            serde_json::json!({"visibility":"granted","actor_id":"principal:alice","graphs":[]})
-        );
-        assert!(serde_json::from_value::<Release016Discovery>(current).is_err());
-        let legacy: GraphDiscoveryOutput = serde_json::from_value(
-            serde_json::json!({"graphs":[{"graph_id":"a","display_name":"a"}]}),
-        )
-        .unwrap();
-        assert_eq!(legacy.visibility, None);
-        assert_eq!(legacy.actor_id, None);
-        // `granted` is the only rule on the wire; a client's own name for a
-        // body without one is not.
-        assert!(
-            serde_json::from_value::<GraphDiscoveryOutput>(
-                serde_json::json!({"visibility":"unfiltered","graphs":[]})
-            )
-            .is_err()
-        );
     }
 
     /// Every code says what it means and whether a server sends it, under
@@ -4264,6 +4217,25 @@ mod tests {
         assert_eq!(versioned("0.14.0", Some("stable"), Some(commit)), "0.14.0");
         assert_eq!(versioned("0.14.0", None, Some(commit)), "0.14.0");
         assert_eq!(versioned("0.14.0", None, None), "0.14.0");
+    }
+
+    #[test]
+    fn docs_links_name_the_release_tag_the_commit_or_nothing() {
+        use super::build::revision;
+        let commit = "9c2b3679e8f66062252e7ed6270a9478b4b77413";
+        assert_eq!(
+            revision("0.16.1", Some("stable"), Some(commit)).as_deref(),
+            Some("v0.16.1")
+        );
+        assert_eq!(
+            revision("0.16.1", Some("edge"), Some(commit)).as_deref(),
+            Some(commit)
+        );
+        assert_eq!(
+            revision("0.16.1", None, Some(commit)).as_deref(),
+            Some(commit)
+        );
+        assert_eq!(revision("0.16.1", None, None), None);
     }
 
     #[test]

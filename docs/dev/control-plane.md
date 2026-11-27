@@ -383,7 +383,21 @@ hold from an earlier unacknowledged completion.
 Scoped stores hold two clients. Reads and fresh immutable writes go to one
 with Lance's own bounded transport and AIMD retries; conditional requests and
 mutable keys go to one that makes a single attempt, so their owners see every
-attempt. Scoped control adapters keep three read retries within three minutes.
+attempt. Scoped control adapters split the same way, whatever builds them: an
+`s3://` root from the environment or from a captured binding (one
+construction, `ObjectStorageAdapter::s3_from_builder`), a `gs://` or Azure
+root, and a scoped `s3://` clone open's requests to the clone root (its reads
+and its marker write). A clone's base is read through an S3 client with
+`object_store`'s default retry policy (ten retries within the same 180
+seconds), scoped or not. The scoped retrying client retries at most three
+times, after a 5xx, 429 or 408 answer, a connection failure, or a timeout of a
+safe or idempotent request; a decode or unclassified transport error is never
+retried. `object_store` 0.14.2 compares the time since the first attempt with
+180 seconds after each failure, before the backoff sleep: once more than 180
+seconds have passed it returns the error, and otherwise it sleeps (at most 15
+seconds) and sends the next attempt. A retry can therefore start after 180
+seconds, and the budget bounds neither when the last attempt starts nor how
+long the request takes.
 Local Lance uses its object-store file provider so direct file writes cannot
 bypass the scope. Embedded defaults and Azure serving clients are unchanged; the
 automatic scoped shutdown path applies only to local and S3 roots.
@@ -560,55 +574,30 @@ reachability is outside the serving request path. The profile boundary and
 applied-policy ownership are described in
 [Identity credentials and applied policy authorization](../rfcs/2026-09-09-identity-credentials-and-applied-policy.md).
 
-`VisibleGraphs` in `crates/omnigraph-server/src/handlers.rs` decides which
-graphs a caller may know exist, with one predicate: the caller holds some grant
-on the graph (`PolicyEngine::may_act_on_graph`: any graph action on some
-branch) or holds the server-scoped `graph_list`. The Cedar request context
-carries only whether a branch is named and whether it is protected, never its
-name, so one protected and one unprotected branch decide every branch exactly.
-The server's no-policy states (open mode, default deny, policy-less reads,
-signed credentials) apply as they do to every request. An invalid graph policy
-or configuration grants nothing. Every surface that names a graph applies the
-predicate, so a graph is listed exactly when it is not answered as unknown:
+`GET /graphs/discovery` accepts only the verified identity profile and returns IDs and display names for every graph in the current
+serving registry (loading, ready, transitioning or blocked), as last installed
+by boot or a deployment activation. It neither scans storage nor discloses availability, paths, policy,
+schema, or query definitions. It needs no policy membership. The separate
+`GET /graphs` uses the same registry with a `graph_list` gate and returns one
+list containing runtime availability, sanitized failure and action. Neither inventory synthesizes graph
+entries from the boot witness. Discovery still discloses no availability.
 
-- `GET /graphs/discovery` (CLI `graphs list`, MCP `graphs` and
-  `omnigraph://graphs`) returns its rule (`visibility: granted`), the caller's
-  `actor_id` and `client_id` and the IDs and display names of the visible
-  graphs in the current serving registry
-  (loading, ready, transitioning or blocked), as last installed by boot or a
-  deployment activation, for any credential. It neither scans storage nor
-  discloses availability, paths, policy, schema, or query definitions. It logs
-  one summary line per listing, not a policy decision per graph.
-- HTTP and MCP graph resolution judge visibility on a registry snapshot with
-  no lock held, then take the process and registry locks in their usual order
-  and, only if that snapshot is still current, resolve absence, the judgement
-  and any evaluation error. A hidden graph therefore answers as an absent one
-  in every admission state, closed included. A swap in between is judged
-  again; one capture makes at most three judgements, the first included, which
-  bounds its synchronous policy work, and then refuses as an unknown graph, so
-  sustained registry churn can give a visible graph a transient
-  `graph not found`. Only then is a serving view's graph-epoch lease taken, so
-  a hidden graph takes no request ownership, counts toward no drain, and never
-  holds up a swap; a hidden probe still costs its judgements, which a missing
-  graph does not. A graph that is not
-  visible, ready or not, answers exactly as an unknown graph, `graph not
-  found`. The built-in `og_catalog` is not in the registry; its catalogue
-  policy authorizes it separately. A visible loading, blocked or transitioning graph
-  yields 503; a visible ready graph reaches its route, whose own authorization
-  decides the action.
-
-`GET /graphs`, the catalog, uses the same registry behind a `graph_list` gate
-and returns one list containing every graph's root, runtime availability,
-sanitized failure and action. Neither inventory synthesizes graph entries from
-the boot witness. Availability booleans describe the runtime, not a policy
-grant; route authorization still applies to ready graphs.
+HTTP and MCP graph resolution atomically capture a serving view with its graph-epoch lease. A loading, blocked or
+transitioning graph yields 503 to a caller that may know the graph exists: an
+admitted identity, which discovery names it to, a holder of some grant on the
+graph (`PolicyEngine::may_act_on_graph`, the predicate that admits a data request
+to a ready graph), or a holder of management `graph_list`. Any other caller gets
+the unknown graph's 404. A graph policy or configuration refused at startup
+grants nothing, so it discloses the graph only to an identity or a `graph_list` holder.
+Availability booleans describe the runtime, not a policy grant; route
+authorization still applies to ready graphs.
 
 The CLI's versioned keychain cache verifies endpoint and identity bindings before
 replacement. Unsupported caches refuse without automatic replacement. The provider-native client acquires missing/expired identity
 credentials before an operation using the selected managed target.
-Both managed and standalone targets list the graphs the credential holds a permission on, or the catalog
-when `graphs list --catalog` is requested; the CLI never infers routing from an
-arbitrary bearer token's unverified shape.
+Both managed and standalone targets request the
+ordinary graph catalog unless `graphs list --discovery` is requested; the CLI never
+infers routing from an arbitrary bearer token's unverified shape.
 
 A replica reports what it booted from on `GET /readyz` (RFC 0049): the
 applied `config_digest` as `booted_serving_digest`, the ledger revision and
@@ -756,6 +745,16 @@ enums are exhaustive, so an external exhaustive match must add the relevant
 arm when upgrading. Preserving existing constructors and direct storage-holder
 behavior does not remove that source compatibility requirement.
 
+MCP hosts implement `omnigraph_mcp::Host`. `start_tool` answers
+`Encoded::new(&dto)`, which encodes the DTO under the 1 MiB memory cap and
+replaces `bounded_result`; `HostError::from_output` wraps an error body and
+cannot fail. Neither judges size: the protocol crate does, and replaces an
+answer past its limit with `Host::error`'s refusal for the call. `router` takes
+the build's documentation revision (`build::docs_revision`, or `None` to link
+no guide page), and `McpSettings::resolve` takes the setup URL (`None` when
+unset). `ProtocolError` is exhaustive and adds `ReadOverBudget(ReadBudget)`:
+project it as `result_too_large`, naming the budget.
+
 In-process hosts that assemble `AppState` and call its existing
 `with_data_token_trust` method continue to own their graph/root binding. Use
 the managed settings loader when the library should validate the applied
@@ -795,9 +794,10 @@ or token expiry. The exact format and limits are in
 The server mounts `/mcp` whenever it has a bearer credential source: static
 tokens, signed data tokens or OIDC. OIDC additionally enables
 `/.well-known/oauth-protected-resource` and the metadata path advertised in the
-authentication challenge. `/mcp` lists every tool; the only MCP boot setting is the
-allowed-host list (`--mcp-allowed-host`). Every invocation uses the same
-handlers and policy as HTTP.
+authentication challenge. `/mcp` lists every tool; its boot settings are the
+allowed-host list (`--mcp-allowed-host`) and the setup page an empty `graphs`
+listing offers (`--mcp-setup-url`). Every invocation uses the same handlers and
+policy as HTTP.
 A registered resource or listed tool is never a permission grant.
 
 `omnigraph-mcp` owns the SDK integration, tool/resource catalog, settings,
@@ -806,6 +806,9 @@ owns authentication, OAuth metadata, handler dispatch and admission, retaining
 execution ownership when the caller stops waiting. It also supplies the canonical
 `ApiError` projection for protocol refusals and handler failures, including the
 unknown-effect disposition when an admitted write's result cannot be delivered.
-The protocol crate wraps these bodies without a second error-code registry.
+The protocol crate wraps these bodies without a second error-code registry, and
+judges the size of every complete response in one place: a successful read by
+the read budget, a write's result or a refusal by the 1 MiB cap, replacing an
+answer past its limit with the adapter's refusal for the same call.
 Both transports share one listener and serving lifecycle. The supported tools
 and limits live in the [MCP guide](../user/operations/mcp.md).

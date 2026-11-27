@@ -14,6 +14,107 @@ const EXPECT_OK: &str = "--- expect ok\n";
 
 const GENERATED_PERSON: &str = "tables:\n  - kind: node\n    name: Person\n    rows: 1\n    commits: 1\n    columns:\n      name: {kind: key, prefix: person-, width: 3}\n";
 
+/// `source_policy`: one embedded-only base per directory a `load csv` reads by
+/// URI, a base inside another dropped, `None` without a URI source, and a
+/// `file://` directory that does not exist refused with the source named.
+#[test]
+fn source_policy_is_one_base_per_source_directory_with_nested_bases_dropped() {
+    let load = |source: &str| {
+        format!(
+            "--- mutate\nload csv \"{source}\" into node:Person mode insert header\n{EXPECT_OK}"
+        )
+    };
+    let text = format!(
+        "{HDR}{SCHEMA}{SEED}{}{}{}{}",
+        load("s3://bucket/data/people.csv"),
+        load("s3://bucket/data/more/people2.csv"),
+        load("s3://bucket/data/people3.csv"),
+        load("s3://other/x.csv"),
+    );
+    let case = parse_case("sources", &text).unwrap();
+    assert_eq!(
+        case.load_sources(),
+        [
+            "s3://bucket/data/people.csv",
+            "s3://bucket/data/more/people2.csv",
+            "s3://bucket/data/people3.csv",
+            "s3://other/x.csv",
+        ]
+    );
+    let policy = case
+        .source_policy()
+        .unwrap()
+        .expect("four URI sources give a policy");
+    let bases: Vec<&str> = policy.bases().iter().map(|base| base.uri()).collect();
+    assert_eq!(bases, ["s3://bucket/data/", "s3://other/"]);
+    let none = parse_case("no_sources", &format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}")).unwrap();
+    assert!(none.source_policy().unwrap().is_none());
+    let missing = parse_case(
+        "missing",
+        &format!(
+            "{HDR}{SCHEMA}{SEED}{}",
+            load("file:///definitely/not/a/directory/x.csv")
+        ),
+    )
+    .unwrap();
+    let refused = missing.source_policy().unwrap_err();
+    assert!(
+        refused.contains("file:///definitely/not/a/directory/x.csv"),
+        "{refused}"
+    );
+}
+
+/// `source_policy` cuts after the path's last `/`, never inside the authority:
+/// sibling directories sharing a prefix stay apart, a pathless source is refused,
+/// and one `file://` directory under two spellings (a symlink) is one base.
+#[test]
+fn source_policy_cuts_segments_refuses_a_pathless_uri_and_canonicalizes_file_directories() {
+    let load = |source: &str| {
+        format!(
+            "--- mutate\nload csv \"{source}\" into node:Person mode insert header\n{EXPECT_OK}"
+        )
+    };
+    let siblings = parse_case(
+        "siblings",
+        &format!(
+            "{HDR}{SCHEMA}{SEED}{}{}{}{}",
+            load("s3://b/data/x.csv"),
+            load("s3://b/data2/y.csv"),
+            load("s3://b/data-x/z.csv"),
+            load("s3://b/data/sub/w.csv"),
+        ),
+    )
+    .unwrap();
+    let policy = siblings.source_policy().unwrap().unwrap();
+    let bases: Vec<&str> = policy.bases().iter().map(|base| base.uri()).collect();
+    assert_eq!(bases, ["s3://b/data-x/", "s3://b/data/", "s3://b/data2/"]);
+    let pathless = parse_case(
+        "pathless",
+        &format!("{HDR}{SCHEMA}{SEED}{}", load("s3://bucket")),
+    )
+    .unwrap();
+    let refused = pathless.source_policy().unwrap_err();
+    assert!(refused.contains("the URI has no path"), "{refused}");
+    let real = tempfile::tempdir().unwrap();
+    let holder = tempfile::tempdir().unwrap();
+    let link = holder.path().join("alias");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+    let aliased = parse_case(
+        "aliased",
+        &format!(
+            "{HDR}{SCHEMA}{SEED}{}{}",
+            load(&format!("file://{}/a.csv", real.path().display())),
+            load(&format!("file://{}/b.csv", link.display())),
+        ),
+    )
+    .unwrap();
+    let policy = aliased
+        .source_policy()
+        .expect("one directory under two spellings is one base, not an overlap refusal")
+        .unwrap();
+    assert_eq!(policy.bases().len(), 1, "{:?}", policy.bases());
+}
+
 #[test]
 fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
     let text = format!(

@@ -161,21 +161,16 @@ pub(crate) async fn run_graphs(
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     match command {
-        // `discovery` is the deprecated spelling of the default listing.
-        GraphsCommand::List {
-            json,
-            catalog,
-            discovery: _,
-        } => {
+        GraphsCommand::List { json, discovery } => {
             let client =
                 GraphClient::registry_from_target(scope.operator, scope.target, stderr).await?;
-            if catalog {
-                let payload = client.list_graphs().await?;
-                output::write_graphs_list(&payload, json, stdout)?;
+            if discovery {
+                let payload = client.discover_graphs().await?;
+                output::write_graphs_discovery(&payload, json, stdout)?;
                 return Ok(Completion::success());
             }
-            let payload = client.discover_graphs().await?;
-            output::write_graphs_discovery(&payload, json, stdout, stderr)?;
+            let payload = client.list_graphs().await?;
+            output::write_graphs_list(&payload, json, stdout)?;
         }
     }
     Ok(Completion::success())

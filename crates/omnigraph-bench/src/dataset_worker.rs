@@ -756,11 +756,22 @@ pub(crate) async fn build_dataset(
     use omnigraph_gqt_core::{PlainHost, case_session, execute_steps, seed_case};
     let (session, case, registered_identity) = match &plan.dataset {
         DatasetRecipe::Gqt { source } => {
-            let case = source.parse()?;
+            let mut case = source.parse()?;
+            case.materialize_csv_fixtures(scratch)?;
             let fixture = case.fixture.as_ref().ok_or("dataset requires schema")?;
             let db = Omnigraph::init(uri, &fixture.schema)
                 .await
                 .map_err(|e| e.to_string())?;
+            let db = match case.source_policy()? {
+                Some(policy) => {
+                    let db = db
+                        .with_external_blob_policy(policy.clone())
+                        .map_err(|e| format!("fixture source policy: {e}"))?;
+                    case.external_blob_policy = Some(policy);
+                    db
+                }
+                None => db,
+            };
             let session = case_session(db, &case)?;
             seed_case(&session, fixture, plan.needs_indices).await?;
             (session, case, None)

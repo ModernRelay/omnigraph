@@ -9,6 +9,7 @@ use clap::{Args, CommandFactory, Subcommand, ValueEnum};
 use omnigraph_bench::catalog::{
     self, Catalog, ConfigV2, Defaults, FixtureInput, ProtocolOverrides, Scenario,
 };
+use omnigraph_bench::check::{PointCheck, check_point};
 use omnigraph_bench::dataset_cache::{self, CacheInspection, CacheState, SourceAvailability};
 use omnigraph_bench::discovery;
 use omnigraph_bench::gqt_case::{self, GqtFixture, MeasuredStep};
@@ -52,6 +53,13 @@ pub struct ShowArgs {
     /// Inspect parser operation ordinals/text in this cwd-relative GQT file.
     #[arg(long, conflicts_with_all = ["config", "catalog"])]
     pub workload: Option<PathBuf>,
+    #[command(flatten)]
+    pub catalog: CatalogArgs,
+}
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    /// A suite or a scenario of the selected catalogs.
+    pub name: String,
     #[command(flatten)]
     pub catalog: CatalogArgs,
 }
@@ -179,9 +187,13 @@ pub fn load_for(args: &CatalogArgs, selector: Option<&str>) -> Result<Catalog, V
         format!("unknown suite or scenario '{name}' in {paths}"),
     ))
 }
+/// The JSON a failed catalog command reports, for a caller that picks the stream.
+pub fn failure_report(diagnostics: &[Diagnostic]) -> Value {
+    json!({"cli_output_version":1,"ok":false,"diagnostics":diagnostics})
+}
 pub fn failure(diagnostics: Vec<Diagnostic>, json_output: bool) -> ExitCode {
     if json_output {
-        print_json_success(&json!({"cli_output_version":1,"ok":false,"diagnostics":diagnostics}));
+        print_json_success(&failure_report(&diagnostics));
         ExitCode::FAILURE
     } else {
         print_diagnostics(&diagnostics)
@@ -287,6 +299,102 @@ pub fn list(args: ListArgs) -> ExitCode {
         success(&json!({"catalogs": inventories}), true)
     } else {
         success(&inventories.swap_remove(0), true)
+    }
+}
+
+/// One scenario under `check`: `ok`, `failed` with the step and its error,
+/// or `skipped` with the reason.
+#[derive(Debug, Serialize)]
+struct CheckedScenario {
+    id: String,
+    status: &'static str,
+    steps: usize,
+    detail: Option<String>,
+}
+
+/// Every scenario of a suite, or one scenario, run on a graph built from its
+/// fixture without its data (the schema, the declared branches and the
+/// fixture's own steps minus every `load csv`, no seed rows) with the data
+/// expectations relaxed: the proof that the entry parses, compiles, plans
+/// and executes, before any fixture is built. Exit 1 names every scenario
+/// that did not.
+pub async fn check(args: CheckArgs) -> ExitCode {
+    let json_output = args.catalog.json;
+    let catalog = match load_for(&args.catalog, Some(&args.name)) {
+        Ok(catalog) => catalog,
+        Err(e) => return failure(e, json_output),
+    };
+    let ids = match catalog.selection(Some(&args.name)) {
+        Ok(ids) => ids,
+        Err(e) => return failure(e, json_output),
+    };
+    let mut checked = Vec::with_capacity(ids.len());
+    for id in &ids {
+        checked.push(check_scenario(&catalog, id).await);
+    }
+    let diagnostics: Vec<Diagnostic> = checked
+        .iter()
+        .filter(|scenario| scenario.status == "failed")
+        .map(|scenario| {
+            Diagnostic::error(
+                "scenario_failed",
+                &scenario.id,
+                scenario.detail.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    if json_output {
+        let value = json!({"catalog": catalog.path, "selection": args.name, "scenarios": checked});
+        if diagnostics.is_empty() {
+            return success(&value, true);
+        }
+        print_json_success(
+            &json!({"cli_output_version":1,"ok":false,"value":value,"diagnostics":diagnostics}),
+        );
+        return ExitCode::FAILURE;
+    }
+    for scenario in &checked {
+        let detail = scenario
+            .detail
+            .as_deref()
+            .map_or_else(String::new, |detail| {
+                format!(": {}", detail.replace('\n', "; "))
+            });
+        println!(
+            "{:<8}{}  {} step(s){detail}",
+            scenario.status, scenario.id, scenario.steps
+        );
+    }
+    println!(
+        "{} scenario(s), {} finding(s)",
+        checked.len(),
+        diagnostics.len()
+    );
+    if diagnostics.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        print_diagnostics(&diagnostics)
+    }
+}
+
+async fn check_scenario(catalog: &Catalog, id: &str) -> CheckedScenario {
+    let verdict = |status: &'static str, steps: usize, detail: Option<String>| CheckedScenario {
+        id: id.to_string(),
+        status,
+        steps,
+        detail,
+    };
+    let points = match catalog.points(id) {
+        Ok(points) => points,
+        Err(diagnostics) => {
+            let messages: Vec<String> = diagnostics.into_iter().map(|d| d.message).collect();
+            return verdict("failed", 0, Some(messages.join("; ")));
+        }
+    };
+    match check_point(&points.plans[0]).await {
+        PointCheck::Ok { steps } => verdict("ok", steps, None),
+        PointCheck::Skipped { reason } => verdict("skipped", 0, Some(reason)),
+        PointCheck::Failed { steps, detail } => verdict("failed", steps, Some(detail)),
     }
 }
 
@@ -615,10 +723,10 @@ pub fn help(args: HelpArgs) -> ExitCode {
         return success(
             &json!({"config_version":catalog::CONFIG_VERSION,"cli_output_version":1,"runner_output_version":RUNNER_OUTPUT_VERSION,
                 "commands":command_schema(&command),
-                "required_combinations": {"show":"exactly one of NAME or --workload; --workload conflicts with --config", "run":"NAME or config run list; --dataset/--queries overrides require a legacy YAML case path", "init":"--fixture, --workload, --step and --output", "served_run":"--server requires --graph and --server-receipt; --network-position (same-host, same-region, remote; default same-host) is a level of the point; --server-token-env names an optional credential environment variable; all selected scenarios must match one receipt and have a served door; explicit --dataset/--queries pairs refuse --server; served runs refuse --no-build and --fixture; for run, --dataset-cache is the client scratch root", "owned_server_run":"--server-product requires a local --store and refuses --server, --backend, an s3:// store and a local route; --server-product=<path> names the server binary and the bare flag takes omnigraph-server beside the product binary; under --at the flag is bare and every ref is <ref>=<path>; a measured block runs at most 64 sessions"},"config_help":CONFIG_HELP,"cache_help":CACHE_HELP,
+                "required_combinations": {"show":"exactly one of NAME or --workload; --workload conflicts with --config", "check":"NAME, a suite or a scenario; its fixture is a GQT file with a schema, a registered fixture is skipped", "run":"NAME or config run list; --dataset/--queries overrides require a legacy YAML case path", "init":"--fixture, --workload, --step and --output", "served_run":"--server requires --graph and --server-receipt; --network-position (same-host, same-region, remote; default same-host) is a level of the point; --server-token-env names an optional credential environment variable; all selected scenarios must match one receipt and have a served door; explicit --dataset/--queries pairs refuse --server; served runs refuse --no-build and --fixture; for run, --dataset-cache is the client scratch root", "owned_server_run":"--server-product requires a local --store and refuses --server, --backend, an s3:// store and a local route; --server-product=<path> names the server binary and the bare flag takes omnigraph-server beside the product binary; under --at the flag is bare and every ref is <ref>=<path>; a measured block runs at most 64 sessions"},"config_help":CONFIG_HELP,"cache_help":CACHE_HELP,
                 "output":{"inspection":"cli_output_version=1, ok, value, diagnostics","execution":"runner_output_version=2 with archive/partial-failure evidence","errors":"severity, code, path, message; JSON stdout only"},
-                "effects":{"help/list/show/cache":"read-only; no database execution","init":"creates one new YAML file","run/dataset":"embedded builds, restores or executes; served reads an already provisioned graph without reset; run may publish to an explicitly selected archive"},
-                "examples":["omnigraph-bench list fixtures --json","omnigraph-bench list workloads --json","omnigraph-bench list scenarios --json","omnigraph-bench show tiny-read --json","omnigraph-bench run tiny-read","omnigraph-bench run --config benchmarks/custom.example.yaml","omnigraph-bench cache status tiny-read --json"]
+                "effects":{"help/list/show/cache":"read-only; no database execution","check":"embedded: per scenario a graph in a temporary directory built from the fixture without its data (schema, branches, the fixture's steps minus load csv), the workload's steps run on it with the data expectations relaxed; nothing is cached, recorded or kept","init":"creates one new YAML file","run/dataset":"embedded builds, restores or executes; served reads an already provisioned graph without reset; run may publish to an explicitly selected archive"},
+                "examples":["omnigraph-bench list fixtures --json","omnigraph-bench list workloads --json","omnigraph-bench list scenarios --json","omnigraph-bench show tiny-read --json","omnigraph-bench check tiny-read","omnigraph-bench run tiny-read","omnigraph-bench run --config benchmarks/custom.example.yaml","omnigraph-bench cache status tiny-read --json"]
             }),
             true,
         );

@@ -1236,9 +1236,25 @@ graphs:
 "#
         )
     };
+    // An empty segment names no key and a dot segment respells one, so
+    // either root is itself refused (#1527) before any base is compared.
+    for root in ["s3://assets/a//cluster", "s3://assets/a/../cluster"] {
+        fs::write(dir.path().join(CLUSTER_CONFIG_FILE), config(root)).unwrap();
+        let outcome = load_desired(dir.path());
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "invalid_storage_root"),
+            "{root}: {:?}",
+            outcome.diagnostics
+        );
+    }
+    // A backslash is a key character of its one spelling, which a base URI
+    // cannot express.
     fs::write(
         dir.path().join(CLUSTER_CONFIG_FILE),
-        config("s3://assets/a//cluster"),
+        config("s3://assets/a\\b/cluster"),
     )
     .unwrap();
     let outcome = load_desired(dir.path());
@@ -3366,11 +3382,11 @@ async fn plan_embeds_migration_preview_for_schema_update() {
         .collect();
     assert_eq!(
         named,
-        [("full_text_index", "Person", Some("bio"), "0.17.0")]
+        [("full_text_index", "Person", Some("bio"), "0.18.0")]
     );
     assert_eq!(
         migration.one_way_note,
-        omnigraph_compiler::schema::one_way::one_way_note(["0.17.0"])
+        omnigraph_compiler::schema::one_way::one_way_note(["0.18.0"])
     );
 
     // Text that keeps the accepted identity plans no step: the plan names it

@@ -1,0 +1,11 @@
+query suite_members() {
+    match {
+        $u: Suite,
+        $u groups $s,
+    }
+    return {
+        $u.name as suite,
+        $s.name as scenario
+    }
+    order { suite, scenario }
+}

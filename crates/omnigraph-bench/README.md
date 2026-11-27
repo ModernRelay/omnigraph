@@ -30,7 +30,16 @@ target/release/omnigraph-bench run local-fast \
 
 Use `list fixtures`, `list workloads` and `list scenarios` to discover inputs;
 `show NAME` reports effective settings and `show --workload FILE` lists operation
-ordinals. `init --help` explains config generation. All support JSON output.
+ordinals. `check NAME` runs every step of a suite's or a scenario's workload on
+a graph built from its fixture without its seed rows and loads (the schema, the
+declared branches with their recipes, the fixture's own steps minus every `load
+csv`), the data expectations of both relaxed (rows, counts, outcomes, plans and
+shapes ignored, `error:` expects kept): the proof that an entry parses, compiles,
+plans and executes, in seconds and before any fixture is built; exit 1 names
+each scenario that did not. The workload's own loads run. A step whose success
+needs the seed (an edge between seeded nodes, an `error:` the data causes, a
+`bind` on a write that matches nothing) fails under `check` and is the run's to
+prove. `init --help` explains config generation. All support JSON output.
 `cache status NAME` and paginated `cache list` are read-only: `present` validates
 published evidence, while `--verify` audits bytes before reporting `cached`.
 Missing sources and absent cache entries remain distinct. See `help config`,
@@ -134,6 +143,20 @@ held through all repetitions and final cleanup. APFS requires forced clonefile;
 qualified XFS uses verified plain copies. Both restore the exact original
 active path so Lance shallow-branch references remain valid. Relocatable
 entries also use this conservative stable-path policy.
+
+A fixture's own `load csv` steps read under a policy the build installs from the
+fixture: every `--- csv` section is written beside the build and read through one
+`file://` base, and every source spelled as a URI (`file://`, `s3://`) is
+allowed through an embedded-only base over its directory, one per directory, a
+base inside another dropped; a `--- restart` inside the fixture reopens with the
+same policy. An `s3://` source is read with the credentials the build's child
+process can see, the machine's instance role, since that process's environment
+carries no `AWS_*` variable. The build trusts the fixture's sources the way it trusts its
+schema, and a source's bytes are not part of the recipe's identity: a changed
+file under the same URI is the catalog author's to version (the lab keeps each
+dataset version under its own prefix with its digest). A graph the engine
+serves keeps its own policy, and the GQT runner installs only the `--- csv`
+base, so a corpus case still pins what a graph without a policy refuses.
 
 `dataset build <dataset.gqt>` builds without a measured workload. Optional
 `--queries <queries.gqt>` contributes index requirements; `dataset build
@@ -590,6 +613,79 @@ root and rebuilding it.
 Query callers choose fixed, parameterized names; arbitrary GQ text is not
 accepted. The projection may be deleted at any time and rebuilt without losing
 evidence.
+
+### The results graph
+
+The same schema serves a graph of your own, wherever `omnigraph` can address
+one. `projection/schema.pg` is the file; `projection/queries/*.gq` are the
+stored queries beside it (`series_for_scenario`, `suite_series`,
+`runs_for_commit`, `scenarios_in_suite`, and without parameters `all_series`,
+`suite_members`, `scenario_facts`, `run_hosts`, the four a rendered page reads,
+and for a point's spec `point_levels` and `points_at`; `projection queries`
+prints them as one GQ file), and the harness emits rows for them from a
+store's records and the catalogs that declared them:
+
+```bash
+target/release/omnigraph-bench projection schema > schema.pg
+omnigraph init s3://bucket/bench/main/graph --schema schema.pg
+target/release/omnigraph-bench projection export \
+  --store s3://bucket/bench/main \
+  --catalog benchmarks --catalog catalogs/private \
+  | omnigraph load --target s3://bucket/bench/main/graph --mode replace --data /dev/stdin
+omnigraph query --target s3://bucket/bench/main/graph \
+  --query projection/queries/series_for_scenario.gq series_for_scenario \
+  --params '{"scenario": "branch-merge-d50-process-cold"}'
+```
+
+`--out <file>` takes the rows in place of stdout and is written whole, once,
+when the export succeeds; an export that stops leaves the file as it was. A run
+row's `archive_object` and `archive_pointer` both name the store's record,
+`records/<sha256>.json`: the store writes no pointer objects, so a record is its
+own pointer.
+
+The rows are graph JSONL in the loader's envelope, every node first and every
+edge after, and the schema's keys say what each row is: a `Scenario` and a
+`Suite` are their names, a `Workload` is its bytes, a `Fixture` its file or
+declaration, a `Revision` a commit, a `Machine` its fingerprint, a
+`BenchmarkRun` its invocation, and a `BenchmarkPoint` the digest of its run's
+spec. A scenario edited in the catalog stays one node carrying the new
+declaration, and what was measured stays apart on the points: a change to the
+spec (the queries, the measured step, the dataset, the protocol) is a new
+point under the same name, and a change to the repetitions alone is the same
+point, each run with its own count. A point's spec is also written as `Level`
+rows, one per field (`protocol.reset` is `clone`), so a query holds any of
+them fixed: `points_at` answers a scenario's points at one level, and
+`point_levels` one point's spec, which tells two points apart. A case name the
+records hold and no catalog declares is still a `Scenario`, with no
+declaration, so its runs stay in the series. Each run `ran` the scenario its
+record names, so two case names that measure one point keep their own runs.
+A second export of the same store under `--mode replace` changes nothing. A
+replace load replaces a row and deletes none: a scenario taken out of a suite
+stays in it, and a scenario the last export did not declare keeps the
+workload and fixture of its last declaration. Its facts are empty when the
+records still hold its name, since the export writes that name's row with no
+declaration; with no record under its name the export writes no row for it,
+and its whole last declaration stays. A fresh
+export loaded into a new graph holds neither; `--mode overwrite` replaces
+only the types its rows carry. One scenario name declared differently by two
+of the catalogs stops the export. The catalog's structure is the graph's:
+`Catalog` declares `Scenario`, `Suite` groups it, it `uses` a `Fixture` and
+`executes` a `Workload` and `defines` the `BenchmarkPoint` the runs measure;
+a run `ran` its `Scenario`, is `built` from a `Revision`, `measuredBy` the
+harness's, and a `Machine` `hosted` it. `Campaign` and `Produced` are a lab's to load
+beside these rows; the harness emits none. A scenario's `repetitions` are the
+ones the harness runs when the command line names none: the entry's, else its
+workload's `--- bench` section's, else the catalog's default. A legacy record
+is skipped and counted, and so is a record no format of this harness parses,
+such as one an older harness wrote; a record whose bytes do not hash to its
+name stops the export, and so do two records of one invocation
+(`export_invocation_conflict`, which names both objects, since the graph
+keys a run by its invocation); an export that stops writes no row. A run whose record names no product commit (a product
+binary that states none, measured without `--at`) has no `Built` edge, so
+`series_for_scenario`, `suite_series`, `runs_for_commit` and `all_series` do
+not return it; the summary counts those runs. The summary line names every
+count. With no `--out` the rows are on stdout, so the summary and a failure's
+report go to stderr, under `--json` too; with `--out` both are on stdout.
 For `declared-deployment` rows (`sut_evidence` and `backend_evidence`), the
 build, machine and backend columns hold the receipt's declared values, and the
 observed client is in `client_build_json` and `client_machine_json`.
@@ -742,8 +838,8 @@ printed first, per ref (the table, or one line per ref under `--json`), since
 they are already in the store. `--at` runs catalog scenarios only, never
 a legacy case file, and conflicts with `--archive` and `--product`.
 
-`--catalog <dir | file>`, repeatable on `run`, `report`, `show`, `list` and
-`cache status`, reads several catalogs in one call (a directory means its
+`--catalog <dir | file>`, repeatable on `run`, `report`, `show`, `check`, `list`
+and `cache status`, reads several catalogs in one call (a directory means its
 `benchmarks.yaml`): a name resolves in the first catalog that declares it as a
 suite or a scenario, `run` and `report` use that catalog, `show` names it as
 `config`, and `list` prints every catalog (`--json`: `{"catalogs": [...]}`, one

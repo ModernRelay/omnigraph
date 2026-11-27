@@ -23,10 +23,10 @@ Machine results remain on stdout.
 A registered direct target declares `scope: graph` or `scope: root`; a root or
 server requires `--graph` or its own `default_graph` for graph operations. No
 request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs, plus
-[S3 cluster roots](../operations/s3-cluster-roots.md) for deployment, recovery and maintenance commands. Register remote
-endpoints; other cloud-direct and catalogue targets are unsupported. Use `./name` for a
+an `s3://` address in two cases: a [cluster root](../operations/s3-cluster-roots.md) for the deployment, recovery and maintenance commands, and a [graph](../operations/s3-cluster-roots.md#inline-s3-graphs) for the direct reads and for `init`, `schema apply` and `load`.
+Register remote endpoints; every other cloud-direct address, `az://` included, and catalogue targets are unsupported. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
-`init --schema graph.pg` takes the graph URI positionally (`./graph.omni`) or with `--target`.
+`init --schema graph.pg` takes the graph URI positionally (`./graph.omni`) or with `--target`, and refuses both together.
 
 `--base URI` opens a direct graph target as a graph shallow clone of the graph
 at `URI`: a read falls through to the base where the target has no object of its
@@ -36,10 +36,9 @@ standard `AWS_*` environment, and the clone's `s3://` prefix is named inline as
 the target, the one inline `s3://` graph the CLI admits); a target that contains
 its base, or lies inside it, is refused, also when the two `s3://` bucket names
 address one bucket or the target's bucket holds a copy of the base under the
-base's key. An `s3://` target or base whose path holds an empty inner segment, a
-percent escape or a character other than `^` that a URL writes as one (`%41`, a
-space, a non-ASCII letter) is refused too: it names no one object key. The
-option applies to `query`, `mutate`, `load`, `branch`, `commit`, `changes`,
+base's key. An `s3://` target or base must name one object key in one
+spelling, as every `s3://` root must ([storage](../clusters/config.md#storage)).
+The option applies to `query`, `mutate`, `load`, `branch`, `commit`, `changes`,
 `diff`, `snapshot`, `export`, `blob` and `schema show`; maintenance and schema
 changes keep the one root they are given. A fresh target directory or prefix is
 a new clone; the same target again shows the clone's own state. Nothing in the
@@ -81,7 +80,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `index build` | Build a branch's missing declared indexes and refresh lagging scalar and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
 | `index rebuild --kind full-text` | Replace full-text indexes on one branch, after which a binary before GQ 3 refuses full-text reads until its own rebuild; `rebuild-full-text-indexes` is its deprecated spelling | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
-| `graphs list` | Name your actor and list the graphs the credential holds any permission on; `--catalog` lists every graph with its state and root (`graph_list`) | served |
+| `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list` | List stored queries: a cluster root's registry (`--graph` narrows it to one graph), or one served graph's catalog, whose `--json` is the body of `GET /graphs/{id}/queries` | cluster or served |
 | `queries validate` | Type-check a cluster's applied query registry | cluster |
 | `cluster validate/plan/apply/...` | Operate self-hosted declarative state; [deployment/recovery flags](../clusters/index.md) | config, server, explicit root |
@@ -94,7 +93,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `config validate` | Validate the whole operator file offline | local |
 | `config rename-profile/rename-target/recover-rename` | Rename local bindings while preserving custody, or finish an interrupted rename ([syntax](targets.md#rename-registrations-and-profiles)) | local |
 | `config recover-operations --source DIR` | Preserve legacy folder lifecycle evidence; no operation submission | profile, local evidence |
-| `access` | Say which actions a graph's policy grants you, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)); on a served graph you hold no permission on it answers not found, and `graphs list --json` names who you are | direct, server or managed |
+| `access` | Say who you are at a target and which actions its policy grants, graph-wide and on a branch ([access](targets.md#what-you-may-do-at-a-target)) | direct, server or managed |
 | `mcp` | Relay an agent's stdio MCP to the target's `/mcp` with its resource credential, bound to one graph; write tools need `--write` ([stdio agents](../operations/mcp.md#connect-a-stdio-agent)) | server or managed |
 | `studio` | Open Omnigraph Studio on a server target through an `omnigraph-studio://open` link and print it; no request or credential; `--json` adds the `binding` and `home` digests ([Open Studio](studio.md)) | server |
 | `alias` | Invoke a personal stored-query alias bound to one target | served |

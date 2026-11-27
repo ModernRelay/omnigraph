@@ -2199,8 +2199,7 @@ query insert_person($name: String, $age: I32) {
 ///   1. Build a converged cluster serving one graph `alpha` with a
 ///      server-scoped policy granting `act-admin` the `graph_list` action.
 ///   2. Spawn the server with `--target` + a bearer-token map.
-///   3. `omnigraph graphs list [--catalog] --target <url>` (admin token, which
-///      holds `graph_list`) — expect `alpha` in the catalog and the listing.
+///   3. `omnigraph graphs list --target <url>` (admin token) — expect `alpha`.
 ///   4. Addressing the server via `--target <url>` with NO `--graph` errors and
 ///      lists the candidate graphs (RFC-011 D7).
 ///
@@ -2230,29 +2229,23 @@ fn graphs_list_against_multi_graph_server() {
         )],
     );
 
-    // `graphs list --catalog` lists `alpha`, and so does the listing: a
-    // `graph_list` holder may know every graph.
-    for (catalog, expected) in [(true, vec!["alpha"]), (false, vec!["alpha"])] {
-        let mut command = cli();
-        command
+    // `graphs list` lists `alpha`.
+    let payload = parse_stdout_json(&output_success(
+        cli()
             .envs(server.credential("admin-token"))
             .arg("graphs")
             .arg("list")
             .arg("--target")
             .fixture_target(&server.base_url)
-            .arg("--json");
-        if catalog {
-            command.arg("--catalog");
-        }
-        let payload = parse_stdout_json(&output_success(&mut command));
-        let ids: Vec<&str> = payload["graphs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|g| g["graph_id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids, expected, "catalog {catalog}");
-    }
+            .arg("--json"),
+    ));
+    let ids: Vec<&str> = payload["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["graph_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["alpha"]);
 
     // Target resolution requires explicit graph selection without discovering
     // a candidate or changing the destination from the server inventory.

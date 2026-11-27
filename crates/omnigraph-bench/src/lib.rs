@@ -18,6 +18,7 @@ pub mod archive;
 pub mod branch_merge;
 pub mod case;
 pub mod catalog;
+pub mod check;
 pub mod counting;
 pub mod dataset_cache;
 pub mod dataset_identity;
@@ -26,6 +27,7 @@ pub mod dataset_worker;
 pub mod discovery;
 pub mod driver;
 pub mod environment;
+pub mod export;
 pub mod fixture_reference;
 #[doc(hidden)]
 #[cfg(test)]

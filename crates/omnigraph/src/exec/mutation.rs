@@ -3117,8 +3117,8 @@ impl Omnigraph {
                     let updated = rows_that_change(&matched, updated, &resolved, row_values)?;
                     let updated_schema = updated.schema();
                     // A refused row rewrite takes the patch, so admission
-                    // never depends on the mode (`append_batch` refuses before
-                    // it stages anything). This is the one decision over the
+                    // never depends on the mode (`append_successors` refuses
+                    // before it stages anything). This is the one decision over the
                     // final batch, assignments applied: the scan's descriptor
                     // check and trial account only stop early, to skip payload
                     // reads and to bound the rows held while they are built,
@@ -3126,12 +3126,8 @@ impl Omnigraph {
                     // (`pending_resource_usage`) and charge the same
                     // `write_batch_bytes`. `UpdateRowsOverBudget` in the DST
                     // storage-cost golden pins this path's cost.
-                    match staging.append_batch(
-                        &table_key,
-                        updated_schema,
-                        PendingMode::Upsert,
-                        updated,
-                    ) {
+                    match staging.append_successors(&table_key, updated_schema, updated, id_column)
+                    {
                         Err(OmniError::ResourceLimitExceeded { .. }) => {
                             stage_patch(staging, vec![matched])?;
                         }

@@ -139,21 +139,27 @@ pub(crate) fn resolve(
             .as_deref()
             .is_some_and(|base| base.starts_with("s3://"))
         && planes::admits_base(&cli.command);
+    let inline_s3_graph =
+        inline && selection.starts_with("s3://") && planes::admits_inline_s3_graph(&cli.command);
     let inline_s3 = inline
         && selection.starts_with("s3://")
-        && (planes::admits_inline_s3_root(&cli.command) || inline_s3_clone);
+        && (planes::admits_inline_s3_root(&cli.command) || inline_s3_clone || inline_s3_graph);
     if inline
         && !inline_s3
         && (crate::graph_http::server_scheme(selection).is_some()
             || selection.contains("://") && !selection.starts_with("file://"))
     {
-        bail!("inline access supports local storage only; configure a server or managed target");
+        bail!(
+            "inline access supports local storage only for this command; configure a server or \
+             managed target (an inline s3:// address serves the direct reads, init, schema apply \
+             and load, and the stopped-writer cluster and maintenance commands)"
+        );
     }
     let mut target = if inline {
         let binding = {
             let root =
                 init_uri.is_none() && (planes::root_input(&cli.command) || cli.graph.is_some());
-            if inline_s3 && !inline_s3_clone && !root {
+            if inline_s3 && !inline_s3_clone && !inline_s3_graph && !root {
                 return Err(targets::refusal(
                     "target_invalid",
                     "an inline s3:// target is a cluster root; select its graph with --graph",
@@ -766,13 +772,27 @@ defaults: {target: local, profile: work}
             }
         }
         for args in [
-            vec!["query", "-e", "q", "--graph", "knowledge", "--target", root],
-            vec!["snapshot", "--graph", "knowledge", "--target", root],
-            vec!["branch", "list", "--graph", "knowledge", "--target", root],
-            vec!["schema", "show", "--graph", "knowledge", "--target", root],
+            vec![
+                "mutate",
+                "-e",
+                "q",
+                "--graph",
+                "knowledge",
+                "--target",
+                root,
+            ],
+            vec![
+                "branch",
+                "create",
+                "feature",
+                "--graph",
+                "knowledge",
+                "--target",
+                root,
+            ],
             vec!["cluster", "observe", "--target", root],
             vec!["policy", "validate", "--target", root],
-            vec!["init", "s3://bucket/graph", "--schema", "schema.pg"],
+            vec!["init", "az://container/graph", "--schema", "schema.pg"],
             vec![
                 "optimize",
                 "--graph",
@@ -859,6 +879,125 @@ defaults: {target: local, profile: work}
             let message = error.to_string();
             assert!(
                 message.contains(refusal) || message.contains("requires AWS_REGION"),
+                "{args:?}: {error}"
+            );
+        }
+    }
+
+    /// The direct reads, `init`, `schema apply` and `load` take an inline
+    /// `s3://` graph (a cluster root with `--graph`); every other write and
+    /// every `az://` address keeps the refusal.
+    #[test]
+    fn inline_s3_graph_is_admitted_for_direct_reads_init_schema_apply_and_load() {
+        let (dir, input) = fixture();
+        let graph = "s3://bucket/bench/main/graph";
+        let commit = "01K00000000000000000000000";
+        for args in [
+            vec!["query", "-e", "q", "--target", graph],
+            vec!["export", "--target", graph],
+            vec!["snapshot", "--target", graph],
+            vec!["diff", "--from", "main", "--to", "pr/1", "--target", graph],
+            vec!["schema", "show", "--target", graph],
+            vec!["branch", "list", "--target", graph],
+            vec!["branch", "diff", "pr/1", "--target", graph],
+            vec!["branch", "merge-base", "pr/1", "--target", graph],
+            vec!["commit", "list", "--target", graph],
+            vec!["commit", "show", commit, "--target", graph],
+            vec!["commit", "changes", commit, "--target", graph],
+            vec![
+                "blob",
+                "stat",
+                "node",
+                "BenchmarkRun",
+                "run-1",
+                "record",
+                "--target",
+                graph,
+            ],
+            vec![
+                "load",
+                "--mode",
+                "merge",
+                "--data",
+                "rows.jsonl",
+                "--target",
+                graph,
+            ],
+            vec![
+                "schema",
+                "apply",
+                "--schema",
+                "schema.pg",
+                "--target",
+                graph,
+            ],
+            vec!["init", graph, "--schema", "schema.pg"],
+        ] {
+            let parsed =
+                parse_from(std::iter::once("omnigraph").chain(args.iter().copied())).unwrap();
+            assert!(
+                planes::admits_inline_s3_graph(&parsed.cli.command),
+                "{args:?}"
+            );
+            match selected(&args, &input, dir.path()) {
+                Ok(target) => assert!(
+                    matches!(
+                        target.unwrap().binding,
+                        TargetBinding::DirectGraph { ref uri, provider: StorageProvider::S3 { .. } }
+                            if uri.starts_with(graph)
+                    ),
+                    "{args:?}"
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        error
+                            .downcast_ref::<targets::TargetError>()
+                            .is_some_and(|e| e.code == "target_invalid")
+                            && !message.contains("local storage only")
+                            && !message.contains("cluster root"),
+                        "{args:?}: only the ambient AWS capture may refuse an admitted address: {message}"
+                    );
+                }
+            }
+        }
+        let root = "s3://bucket/cluster";
+        match selected(
+            &["query", "-e", "q", "--graph", "results", "--target", root],
+            &input,
+            dir.path(),
+        ) {
+            Ok(target) => assert!(
+                matches!(
+                    target.unwrap().binding,
+                    TargetBinding::DirectRoot { ref uri, provider: StorageProvider::S3 { .. }, .. }
+                        if uri.starts_with(root)
+                ),
+                "with --graph an inline s3:// address is a cluster root"
+            ),
+            Err(error) => assert!(error.to_string().contains("requires AWS_REGION"), "{error}"),
+        }
+        for args in [
+            vec!["mutate", "-e", "q", "--target", graph],
+            vec!["branch", "create", "pr/1", "--target", graph],
+            vec!["branch", "delete", "pr/1", "--target", graph],
+            vec!["branch", "merge", "pr/1", "--target", graph],
+            vec!["commit", "publish", commit, "--target", graph],
+            vec!["commit", "drop", commit, "--target", graph],
+            vec!["query", "-e", "q", "--target", "az://container/graph"],
+            vec![
+                "load",
+                "--mode",
+                "merge",
+                "--data",
+                "rows.jsonl",
+                "--target",
+                "az://container/graph",
+            ],
+        ] {
+            let error = selected(&args, &input, dir.path()).unwrap_err();
+            assert!(
+                error.to_string().contains("local storage only"),
                 "{args:?}: {error}"
             );
         }

@@ -5810,6 +5810,30 @@ fn overwrite_load_against_non_local_scope_refuses_without_yes() {
             .arg("--json"),
     );
     let output = parse_stdout_json(&output);
+    let error = output["error"].as_str().unwrap();
+    assert!(
+        error.contains(
+            "refusing destructive `load --mode overwrite` against non-local target \
+             s3://fake-bucket/g.omni without confirmation"
+        ),
+        "an admitted inline s3:// graph is refused by the consent gate, not the address rule: {error}"
+    );
+    assert_eq!(output["disposition"]["effects"], "none");
+    assert!(
+        bucket.requests().is_empty(),
+        "the consent refusal runs before any storage request"
+    );
+    let output = output_failure(
+        s3().arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(fixture("test.jsonl"))
+            .arg("--target")
+            .arg("az://fake-container/g.omni")
+            .arg("--json"),
+    );
+    let output = parse_stdout_json(&output);
     assert!(
         output["error"]
             .as_str()

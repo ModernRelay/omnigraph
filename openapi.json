@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.16.1"
+    "version": "0.17.2"
   },
   "paths": {
     "/.well-known/oauth-protected-resource": {
@@ -1415,8 +1415,8 @@
         "tags": [
           "management"
         ],
-        "summary": "The catalog: every graph currently registered with this server, with its\nroot and availability, including graphs the caller cannot read.",
-        "description": "Cedar-gated by the server-level policy via the `graph_list` action\nagainst `Omnigraph::Server::\"root\"`. The graphs a caller may use are\nlisted without a permit by `GET /graphs/discovery`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
+        "summary": "List every graph currently registered with this server.",
+        "description": "Cedar-gated by the server-level policy via the `graph_list` action\nagainst `Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
         "operationId": "listGraphs",
         "parameters": [
           {
@@ -1443,7 +1443,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The catalog: every registered graph, with its root and availability",
+            "description": "List of registered graphs",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1635,8 +1635,6 @@
         "tags": [
           "management"
         ],
-        "summary": "Who the caller is and which registered graphs it holds any permission on:\neach graph whose policy grants it some action on some branch, or every\ngraph for a `graph_list` holder, whatever the graph's availability. Any\ncredential may ask; one with no permission anywhere gets an empty list.\n`visibility: granted` states that rule: a registered graph is listed\nexactly when its routes do not answer `graph not found`, the refusal an\nunknown graph gets. A listed graph's subresources can still be not found,\nand `GET /graphs/{graph_id}/access` says what the caller may do on it. The\nbuilt-in `og_catalog` is not a registered graph: it is never listed and\nkeeps its own authorization.",
-        "description": "Returns the rule, the resolved actor and OAuth client, and graph ids and\ndisplay names only, from the server's current registry: no roots,\navailability, schema or policy. It evaluates every registered graph's\npolicy, bounded by the registry. The catalog (`GET /graphs`, `graph_list`)\nholds every graph with its availability and root.",
         "operationId": "discoverGraphs",
         "parameters": [
           {
@@ -1663,7 +1661,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The listing rule (`visibility: granted`), the caller's actor, and the registered graphs it holds any permission on; `og_catalog` is never listed",
+            "description": "Authenticated minimal graph inventory",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1732,7 +1730,7 @@
             }
           },
           "403": {
-            "description": "Credential not admitted",
+            "description": "Identity credential required",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1802,27 +1800,6 @@
           },
           "412": {
             "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
-            "headers": {
-              "Omnigraph-Http-Api": {
-                "schema": {
-                  "type": "string",
-                  "enum": [
-                    "0.14"
-                  ]
-                },
-                "description": "Supported Omnigraph HTTP API contract."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal failure (code `internal`) before a successful response",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -15901,41 +15878,16 @@
       },
       "GraphDiscoveryOutput": {
         "type": "object",
-        "description": "`GET /graphs/discovery`: who the caller is, and the graphs it holds any\npermission on.",
+        "description": "Authenticated minimal inventory from `GET /graphs/discovery`.",
         "required": [
           "graphs"
         ],
         "properties": {
-          "actor_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The actor the credential resolves to. Absent only on a server that runs\nwithout authentication."
-          },
-          "client_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The OAuth client the credential was issued to, when it is a verified\nOIDC access token. Opaque text the client chose: render it escaped."
-          },
           "graphs": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/GraphDiscoveryEntry"
             }
-          },
-          "visibility": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/GraphVisibility",
-                "description": "The rule the listing follows; a server always sends it. A body without\nit comes from an older release, whose listing is not filtered and\nnames no caller."
-              }
-            ]
           }
         },
         "additionalProperties": false
@@ -16014,13 +15966,6 @@
           "invalid_external_blob_policy",
           "open_failed",
           "invalid_stored_queries"
-        ]
-      },
-      "GraphVisibility": {
-        "type": "string",
-        "description": "Which graphs a discovery listing names.",
-        "enum": [
-          "granted"
         ]
       },
       "HealthOutput": {

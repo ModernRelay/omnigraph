@@ -1,0 +1,22 @@
+query all_series() {
+    match {
+        $s: Scenario,
+        $r ran $s,
+        $r measures $p,
+        $r built $c,
+    }
+    return {
+        $s.name as scenario,
+        $p.point_name as point,
+        $c.sha as commit,
+        $r.invocation_id as invocation_id,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.min_us as min_us,
+        $r.p50_us as p50_us,
+        $r.max_us as max_us,
+        $r.observed_repetitions as repetitions,
+        $r.acquisition_status as acquisition_status,
+        $r.claim_eligible as claim_eligible
+    }
+    order { scenario, invoked_at_unix_ms }
+}

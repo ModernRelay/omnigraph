@@ -2,7 +2,11 @@
 //! (thread-scoped, no timestamps, no ANSI — nothing benignly time-varying in
 //! the text) and locate the first REAL divergence between two logs.
 //! Thread-scoped capture is sufficient because the whole universe — including
-//! Lance's inlined compute under deterministic mode — runs on one thread.
+//! Lance's inlined compute under deterministic mode — runs on one thread. A
+//! test binary that calls it installs the global subscriber that keeps
+//! callsite interest dynamic, as `tests/scenarios.rs` does, or a callsite
+//! another thread hit first can drop lines from one log of a pair
+//! ([log capture](../../../docs/dev/testing.md#log-capture)).
 
 /// Run `f` under a thread-scoped TRACE subscriber; return its result + log.
 pub fn capture_trace<T>(f: impl FnOnce() -> T) -> (T, String) {

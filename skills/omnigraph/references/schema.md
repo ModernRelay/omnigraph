@@ -120,7 +120,7 @@ graph's schema file with no graph commit: `cluster plan` marks it
 
 **One-way constructs.** A binary re-parses the stored schema on every open, so
 once an apply stores one of these, every binary before the release that first
-reads it (0.17.0 for each of these) refuses the whole graph
+reads it (0.18.0 for each of these) refuses the whole graph
 until a later apply stores none of them or a backup taken before the upgrade
 is restored: an explicit `distance` on a Vector (`l2` included), `@index` on a
 List property,

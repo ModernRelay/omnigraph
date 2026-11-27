@@ -233,6 +233,14 @@ impl AuthenticatedActor {
         }
     }
 
+    /// An admitted identity profile carries no graph-action ceiling. Applied
+    /// policy still authorizes each graph operation independently.
+    pub(crate) fn is_identity(&self) -> bool {
+        matches!(
+            self.data_token,
+            Some(VerifiedDataToken::Identity(_) | VerifiedDataToken::Oidc { .. })
+        )
+    }
     pub(crate) fn cluster_static(actor_id: Arc<str>) -> Self {
         Self {
             actor: ResolvedActor::cluster_static(actor_id),

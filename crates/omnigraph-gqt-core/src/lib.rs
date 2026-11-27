@@ -693,6 +693,9 @@ enum QueryExpect {
     Error {
         needle: String,
     },
+    /// The read must succeed; its rows are not compared. Never parsed: the
+    /// form [`Case::relax_data_expectations`] gives a `Rows` expect.
+    Succeeds,
 }
 
 #[derive(Debug)]
@@ -2535,7 +2538,7 @@ fn unbound(name: &str) -> CaseError {
 fn missing_shape(step: &Step) -> CaseError {
     let line = match step.read_expect() {
         Some(QueryExpect::Rows { span, .. }) => span.start_line,
-        Some(QueryExpect::Error { .. }) | None => 0,
+        Some(QueryExpect::Error { .. } | QueryExpect::Succeeds) | None => 0,
     };
     CaseError::new(
         CaseErrorCode::MissingShape,
@@ -4110,6 +4113,85 @@ impl Case {
         );
         Ok(())
     }
+
+    /// Every `load csv` source spelled as a URI, in step order; a `--- csv`
+    /// section's name once [`Case::materialize_csv_fixtures`] rewrote it.
+    pub fn load_sources(&self) -> Vec<&str> {
+        self.items
+            .iter()
+            .flat_map(|item| match item {
+                Item::Step(step) => std::slice::from_ref(step).iter(),
+                Item::Loop { steps, .. } => steps.iter(),
+            })
+            .filter_map(|step| match step {
+                Step::Control(ControlStep {
+                    write: ControlWrite::Load { stmt, .. },
+                    ..
+                }) if stmt.source.contains("://") => Some(stmt.source.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The external Blob policy a build of this case's own sources needs: the
+    /// `--- csv` base [`Case::materialize_csv_fixtures`] recorded, plus one
+    /// embedded-only base per directory a `load csv` step reads by URI, a
+    /// `file://` directory in its canonical spelling (so one directory under
+    /// two spellings is one base). A base inside another is dropped, since a
+    /// policy refuses two that overlap. `None` when the case has neither a
+    /// `--- csv` section nor a URI source. For a builder that trusts the case's sources, such as a
+    /// benchmark fixture build, which installs it on the first handle and sets
+    /// it as [`Case::external_blob_policy`] so a `--- restart` reopens with
+    /// it; the GQT runner installs only the `--- csv` base, so a case still
+    /// pins what a graph without a policy refuses.
+    pub fn source_policy(&self) -> Result<Option<omnigraph::ExternalBlobPolicy>, String> {
+        let mut bases = self
+            .external_blob_policy
+            .as_ref()
+            .map_or_else(Vec::new, |policy| policy.bases().to_vec());
+        for source in self.load_sources() {
+            let directory = source_directory(source)?;
+            let base = omnigraph::ExternalBlobBase::new(
+                &directory,
+                omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .map_err(|error| format!("`load csv \"{source}\"`: {error}"))?;
+            bases.push(base);
+        }
+        if bases.is_empty() {
+            return Ok(None);
+        }
+        bases.sort_by(|left, right| left.uri().cmp(right.uri()));
+        bases.dedup_by(|later, kept| later.uri().starts_with(kept.uri()));
+        omnigraph::ExternalBlobPolicy::allow(bases)
+            .map(Some)
+            .map_err(|error| format!("source policy: {error}"))
+    }
+}
+
+/// The directory a `load csv` URI source reads from, as a base URI ending in
+/// `/`: cut after the last `/` past the authority (a query holding `/` cuts
+/// there); a `file://` directory canonical, so two spellings are one base and a missing one is refused.
+fn source_directory(source: &str) -> Result<String, String> {
+    let authority_end = source
+        .find("://")
+        .map(|at| at + "://".len())
+        .ok_or_else(|| format!("`load csv \"{source}\"`: not a URI"))?;
+    let path_cut = source[authority_end..]
+        .rfind('/')
+        .map(|at| authority_end + at + 1)
+        .ok_or_else(|| format!("`load csv \"{source}\"`: the URI has no path"))?;
+    let directory = &source[..path_cut];
+    let Some(local) = directory.strip_prefix("file://") else {
+        return Ok(directory.to_string());
+    };
+    let canonical = std::path::Path::new(local)
+        .canonicalize()
+        .map_err(|error| format!("`load csv \"{source}\"`: {error}"))?;
+    let canonical = canonical
+        .to_str()
+        .ok_or_else(|| format!("`load csv \"{source}\"`: the directory is not UTF-8"))?;
+    Ok(format!("file://{}/", canonical.trim_end_matches('/')))
 }
 
 fn normalize_number(n: &serde_json::Number) -> String {
@@ -4617,7 +4699,7 @@ async fn run_query_step(
                 QueryExpect::Error { needle } => {
                     Err(fail(format!("error does not contain \"{needle}\": {e}")))
                 }
-                QueryExpect::Rows { .. } => Err(fail(e)),
+                QueryExpect::Rows { .. } | QueryExpect::Succeeds => Err(fail(e)),
             };
         }
     };
@@ -4772,6 +4854,9 @@ async fn run_query_step(
             }
             Ok(())
         }
+        QueryExpect::Succeeds => outcome
+            .map(drop)
+            .map_err(|e| fail(format!("query failed: {e}"))),
     }
 }
 
@@ -5212,6 +5297,9 @@ async fn run_branch_read_step(
             &format!("`{statement}` succeeded"),
         )
         .map_err(fail),
+        QueryExpect::Succeeds => outcome
+            .map(drop)
+            .map_err(|e| fail(format!("`{statement}` failed: {e}"))),
     }
 }
 
@@ -5266,6 +5354,9 @@ fn check_synthetic_expect<E: std::fmt::Display + 'static>(
             &format!("`{statement}` succeeded"),
         )
         .map_err(fail),
+        QueryExpect::Succeeds => outcome
+            .map(drop)
+            .map_err(|e| fail(format!("`{statement}` failed: {e}"))),
     }
 }
 
@@ -6109,6 +6200,27 @@ pub async fn seed_case(
     Ok(())
 }
 
+/// The fixture's structure on a fresh store without its seed: the indices a
+/// traversal pin needs, then the declared branches forked from the empty
+/// head, each with its recipe rows as [`Branches::load`] writes them. For a
+/// run that proves a workload executes on a graph without its seed.
+pub async fn branch_case(
+    session: &Session,
+    fixture: &Fixture,
+    needs_indices: bool,
+) -> Result<(), String> {
+    if needs_indices {
+        session
+            .ensure_indices_as(None)
+            .await
+            .map_err(|e| format!("ensure_indices failed: {e}"))?;
+    }
+    if let Some(branches) = &fixture.branches {
+        branches.load(session).await?;
+    }
+    Ok(())
+}
+
 /// Executes the parsed steps and returns the current session, including any restart replacement.
 pub fn execute_steps<'a, H: ExecutionHost, O: Observer>(
     case: &'a Case,
@@ -6428,6 +6540,7 @@ fn read_expect_evidence(expect: &QueryExpect) -> Value {
             serde_json::json!({"kind": "rows", "ordered": ordered, "rows_jsonl": body_raw, "shape": format!("{:?}", shape.lines)})
         }
         QueryExpect::Error { needle } => serde_json::json!({"kind": "error", "contains": needle}),
+        QueryExpect::Succeeds => serde_json::json!({"kind": "succeeds"}),
     }
 }
 
@@ -6461,6 +6574,87 @@ fn bless_rewrite(
     }
     std::fs::write(path, splice_lines(&original, span, lines))
         .map_err(|e| format!("bless: cannot write case: {e}"))
+}
+
+impl Case {
+    /// Keep only what holds on any data: a read expect of rows becomes "the
+    /// read succeeds", an `affected:` count and a merge `outcome:` become
+    /// `ok`, and the plan, shape, expand and reference-engine checks are
+    /// dropped; an `error:` expect stays. For a run that proves a workload
+    /// parses, compiles, plans and executes on an empty graph.
+    pub fn relax_data_expectations(&mut self) {
+        let steps = self.items.iter_mut().flat_map(|item| match item {
+            Item::Step(step) => std::slice::from_mut(step).iter_mut(),
+            Item::Loop { steps, .. } => steps.iter_mut(),
+        });
+        for step in steps {
+            match step {
+                Step::Query(query) => {
+                    relax_read_expect(&mut query.expect);
+                    query.plan = None;
+                    query.expects_expand = false;
+                    query.reference_skipped =
+                        Some("the run proves the workload executes on an empty graph".into());
+                }
+                Step::Mutate(mutate) => {
+                    if matches!(mutate.expect, MutateExpect::Affected { .. }) {
+                        mutate.expect = MutateExpect::Ok;
+                    }
+                    mutate.plan = None;
+                }
+                Step::List(list) => relax_read_expect(&mut list.expect),
+                Step::Show(show) => relax_read_expect(&mut show.expect),
+                Step::BranchRead(read) => relax_read_expect(&mut read.expect),
+                Step::Control(control) => match &mut control.write {
+                    ControlWrite::Merge { expect, plan, .. } => {
+                        if matches!(expect, MergeExpect::Outcome(_)) {
+                            *expect = MergeExpect::Write(WriteExpect::Ok);
+                        }
+                        *plan = None;
+                    }
+                    ControlWrite::Load { plan, .. } => *plan = None,
+                    ControlWrite::Create { .. }
+                    | ControlWrite::Delete { .. }
+                    | ControlWrite::Publish { .. }
+                    | ControlWrite::Drop { .. } => {}
+                },
+                Step::Load(_)
+                | Step::Settings(_)
+                | Step::Restart { .. }
+                | Step::Concurrent(_)
+                | Step::ApplySchema(_) => {}
+            }
+        }
+    }
+
+    /// Remove every `load csv` step and every generated `--- load` step, so a
+    /// fixture builds its schema, branches and writes without its data; a
+    /// loop left with no step goes with them.
+    pub fn drop_loads(&mut self) {
+        let is_load = |step: &Step| {
+            matches!(
+                step,
+                Step::Load(_)
+                    | Step::Control(ControlStep {
+                        write: ControlWrite::Load { .. },
+                        ..
+                    })
+            )
+        };
+        self.items.retain_mut(|item| match item {
+            Item::Step(step) => !is_load(step),
+            Item::Loop { steps, .. } => {
+                steps.retain(|step| !is_load(step));
+                !steps.is_empty()
+            }
+        });
+    }
+}
+
+fn relax_read_expect(expect: &mut QueryExpect) {
+    if matches!(expect, QueryExpect::Rows { .. }) {
+        *expect = QueryExpect::Succeeds;
+    }
 }
 
 impl Step {

@@ -1150,26 +1150,11 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         "header.{}.signature",
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
-    // `graphs list` names the caller and the graphs it holds a permission
-    // on; `--catalog` asks for the full registry with each graph's state and
-    // root. The deprecated `--discovery` is accepted and selects the default
-    // listing. A listing without `visibility` comes from an older server: it is
-    // reported as `unfiltered`, never as a server without authentication.
-    for (catalog, json_output, discovery, legacy) in [
-        (false, false, false, false),
-        (false, true, false, false),
-        (true, false, false, false),
-        (true, true, false, false),
-        (false, true, true, false),
-        (false, false, false, true),
-        (false, true, false, true),
-    ] {
-        let reply = if catalog {
-            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"apply_correction_or_restart"}]})
-        } else if legacy {
+    for (discovery, json_output) in [(false, false), (false, true), (true, true)] {
+        let reply = if discovery {
             serde_json::json!({"graphs":[{"graph_id":"alpha","display_name":"alpha"}]})
         } else {
-            serde_json::json!({"visibility":"granted","actor_id":"principal:alice","graphs":[{"graph_id":"alpha","display_name":"alpha"}]})
+            serde_json::json!({"graphs":[{"graph_id":"alpha","uri":"file:///private/alpha","state":"ready","read_available":true,"write_available":true,"action":"none"},{"graph_id":"beta","uri":"file:///private/beta","state":"blocked","read_available":false,"write_available":false,"failure":"open_failed","action":"apply_correction_or_restart"}]})
         };
         let server = IntentApiFixture::graph(vec![IntentReply::json(200, reply.clone())]);
         let operator = KeyedServer::new(&server.origin);
@@ -1182,41 +1167,25 @@ fn explicit_graph_discovery_preserves_jwt_shaped_static_catalog_and_skips_contex
         if json_output {
             command.arg("--json");
         }
-        if catalog {
-            command.arg("--catalog");
-        }
         if discovery {
             command.arg("--discovery");
         }
         let output = output_success(&mut command);
         if json_output {
             let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
-            let mut expected = reply.clone();
-            if legacy {
-                expected["visibility"] = serde_json::json!("unfiltered");
-            }
-            assert_eq!(actual, expected);
-        } else if catalog {
+            assert_eq!(actual, reply);
+        } else {
             assert_eq!(
                 stdout_string(&output),
                 "alpha\tready\tfile:///private/alpha\nbeta\tblocked\tfile:///private/beta\n"
             );
-        } else {
-            assert_eq!(stdout_string(&output), "alpha\n");
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if legacy {
-                assert!(stderr.contains("predates the filtered listing"), "{stderr}");
-                assert!(!stderr.contains("without authentication"), "{stderr}");
-            } else {
-                assert!(stderr.contains("as principal:alice"), "{stderr}");
-            }
         }
         assert_eq!(
             server.workflow_requests()[0].path,
-            if catalog {
-                "/graphs"
-            } else {
+            if discovery {
                 "/graphs/discovery"
+            } else {
+                "/graphs"
             }
         );
         assert_eq!(

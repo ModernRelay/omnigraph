@@ -1,0 +1,1 @@
+- A scoped S3 adapter built from a captured binding now retries a write to a fresh immutable key, as other scoped stores do. Conditional writes and writes to mutable keys still make one attempt.

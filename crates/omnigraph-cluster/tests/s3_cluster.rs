@@ -474,3 +474,198 @@ async fn object_storage_offline_deployment(root: &str) {
     force_unlock_storage_root(root, &lock).await.unwrap();
     adapter.delete_prefix(root).await.unwrap();
 }
+
+/// A plain key prefix of its own under the test bucket, for a test that names
+/// roots below it and lists every key they wrote; None to skip.
+fn s3_run_prefix(suite: &str) -> Option<(String, String)> {
+    let bucket = env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
+    Some((bucket, format!("cluster-e2e/{suite}-{}", Ulid::new())))
+}
+
+/// Every key under `prefix`, listed with no URI derived, so a key written
+/// under either spelling of a root shows.
+async fn bucket_keys(bucket: &str, prefix: &str) -> Vec<String> {
+    omnigraph_storage::s3_bucket_keys(bucket, prefix)
+        .await
+        .unwrap()
+}
+
+async fn delete_keys(bucket: &str, prefix: &str) {
+    let adapter = omnigraph_storage::storage_for_uri(&format!("s3://{bucket}/{prefix}")).unwrap();
+    adapter
+        .delete_prefix(&format!("s3://{bucket}/{prefix}"))
+        .await
+        .unwrap();
+}
+
+/// The refusal of a root whose key Lance spells another way, from config
+/// validation before any request.
+fn assert_root_refused(applied: &Result<DeploymentLookup, omnigraph_cluster::Diagnostic>) {
+    let text = format!("{applied:?}");
+    assert!(
+        matches!(applied, Err(diagnostic) if diagnostic.code == "invalid_storage_root")
+            && text.contains("must name one object key"),
+        "{text}"
+    );
+}
+
+/// #1527: an `s3://` root whose path Lance decodes to another key (a space, a
+/// non-ASCII letter, a brace, a percent escape) would put the cluster's
+/// ledger, lock and bundles under one prefix and the graph's tables under the
+/// other, so a removal deleted nothing. Such a root is refused before any
+/// request: nothing is written under either spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_cluster_root_with_two_keys_is_refused_before_any_write_issue_1527() {
+    let Some((bucket, prefix)) = s3_run_prefix("two-keys") else {
+        eprintln!("skipping s3 cluster e2e: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let caller = DeploymentCaller::storage_owner(Some("act-admin".into()));
+    for spelling in ["my data", "\u{e9}t\u{e9}", "a%41b", "50%25off", "{x}"] {
+        let root = format!("s3://{bucket}/{prefix}/{spelling}/root");
+        let dir = tempfile::tempdir().unwrap();
+        write_cluster_fixture(dir.path(), &root, SCHEMA_V1);
+        let validate = validate_config_dir(dir.path());
+        assert!(
+            !validate.ok
+                && validate
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "invalid_storage_root"),
+            "{spelling:?}: {:?}",
+            validate.diagnostics
+        );
+        let applied = apply_deployment(dir.path(), None, &caller, |_, _, _| {}).await;
+        assert_root_refused(&applied);
+        let direct = Omnigraph::init(&format!("{root}/graphs/direct.omni"), SCHEMA_V1)
+            .await
+            .map(|_| ())
+            .expect_err("a graph opened outside a cluster takes the same rule")
+            .to_string();
+        assert!(
+            direct.contains("must name one object key") && direct.contains("and Lance under"),
+            "{spelling:?}: {direct}"
+        );
+        assert_eq!(
+            bucket_keys(&bucket, &prefix).await,
+            Vec::<String>::new(),
+            "{spelling:?}"
+        );
+    }
+    // A space at the end of a root: the URL parser strips it from the root
+    // alone, and keeps it as `%20` (adapter) and ` ` (Lance) below it. The
+    // refusal names the split below and no replacement, which would address
+    // another prefix.
+    let trailing = format!("s3://{bucket}/{prefix}/trailing ");
+    let direct = Omnigraph::init(&trailing, SCHEMA_V1)
+        .await
+        .map(|_| ())
+        .expect_err("a root that splits below itself")
+        .to_string();
+    assert!(
+        direct.contains("an object below it under the key")
+            && !direct.contains("another spelling of"),
+        "{direct}"
+    );
+    assert_eq!(bucket_keys(&bucket, &prefix).await, Vec::<String>::new());
+}
+
+/// #1527: two roots that differ only in spelling were two cluster identities
+/// over one set of keys. An escape (`a%41b`) split the objects across two
+/// prefixes; a dot segment, escaped or not, named `aAb`'s own ledger under a
+/// second root string. Every other spelling is refused, so the bucket holds
+/// one cluster under one prefix and one identity.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_cluster_roots_that_differ_only_in_spelling_do_not_collide_issue_1527() {
+    let Some((bucket, prefix)) = s3_run_prefix("escaping") else {
+        eprintln!("skipping s3 cluster e2e: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let plain = format!("s3://{bucket}/{prefix}/aAb");
+    let first = tempfile::tempdir().unwrap();
+    write_cluster_fixture(first.path(), &plain, SCHEMA_V1);
+    deploy_fixture(first.path(), &plain).await;
+
+    let caller = DeploymentCaller::storage_owner(Some("act-admin".into()));
+    for spelling in ["a%41b", "x/%2e%2e/aAb", "x/../aAb", "./aAb", "aAb/."] {
+        let other = format!("s3://{bucket}/{prefix}/{spelling}");
+        let second = tempfile::tempdir().unwrap();
+        write_cluster_fixture(second.path(), &other, SCHEMA_V1);
+        let applied = apply_deployment(second.path(), None, &caller, |_, _, _| {}).await;
+        assert_root_refused(&applied);
+        let status = deployment_status(&other, None, &caller).await;
+        assert!(
+            format!("{status:?}").contains("must name one object key"),
+            "{spelling:?}: status reads the ledger under another identity: {status:?}"
+        );
+    }
+
+    let keys = bucket_keys(&bucket, &prefix).await;
+    let outside: Vec<_> = keys
+        .iter()
+        .filter(|key| !key.starts_with(&format!("{prefix}/aAb/")))
+        .collect();
+    assert!(outside.is_empty(), "keys outside the one root: {outside:?}");
+    assert!(
+        keys.iter()
+            .any(|key| key == &format!("{prefix}/aAb/__cluster/state.json")),
+        "{keys:?}"
+    );
+    delete_keys(&bucket, &prefix).await;
+}
+
+/// #1527: on a root the adapter and Lance spell as one key, removing a graph
+/// deletes every key under its root, as the bucket lists them, and the graph
+/// can be declared again. The root holds characters the adapter keeps as
+/// written (a caret, a tilde, brackets, a bar), so it is not a plain prefix.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_cluster_graph_removal_deletes_every_key_and_declares_again_issue_1527() {
+    let Some((bucket, prefix)) = s3_run_prefix("removal") else {
+        eprintln!("skipping s3 cluster e2e: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let spelling = "c^1~[x]|y";
+    let root = format!("s3://{bucket}/{prefix}/{spelling}");
+    let graph_keys = format!("{prefix}/{spelling}/graphs/knowledge.omni/");
+    let dir = tempfile::tempdir().unwrap();
+    write_cluster_fixture(dir.path(), &root, SCHEMA_V1);
+    let created = deploy_fixture(dir.path(), &root).await;
+    let keys = bucket_keys(&bucket, &prefix).await;
+    assert!(
+        keys.iter().any(|key| key.starts_with(&graph_keys)),
+        "{keys:?}"
+    );
+    let outside: Vec<_> = keys
+        .iter()
+        .filter(|key| !key.starts_with(&format!("{prefix}/{spelling}/")))
+        .collect();
+    assert!(outside.is_empty(), "keys outside the one root: {outside:?}");
+
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        format!("version: 1\nstorage: {root}\ngraphs: {{}}\n"),
+    )
+    .unwrap();
+    let deleted = deploy_fixture(dir.path(), &root).await;
+    assert!(matches!(
+        &deleted.graphs["knowledge"],
+        omnigraph_cluster::GraphDeploymentResult::Deleted { .. }
+    ));
+    let left: Vec<_> = bucket_keys(&bucket, &prefix)
+        .await
+        .into_iter()
+        .filter(|key| key.starts_with(&graph_keys))
+        .collect();
+    assert!(left.is_empty(), "graph keys left after removal: {left:?}");
+
+    write_cluster_fixture(dir.path(), &root, SCHEMA_V1);
+    let again = deploy_fixture(dir.path(), &root).await;
+    assert_ne!(created.id, again.id);
+    assert!(
+        bucket_keys(&bucket, &prefix)
+            .await
+            .iter()
+            .any(|key| key.starts_with(&graph_keys))
+    );
+    delete_keys(&bucket, &prefix).await;
+}

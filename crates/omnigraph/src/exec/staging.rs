@@ -124,7 +124,8 @@ pub(crate) struct MutationStaging {
     pub(crate) paths: HashMap<String, StagedTablePath>,
     /// In-memory accumulated batches per table (insert/update path).
     pub(crate) pending: HashMap<String, PendingTable>,
-    /// Monotonic retained-batch accounting, updated only by `append_batch`.
+    /// Retained-batch accounting over every table's pending batches, kept by
+    /// `append_batch` and `upsert_statement_batch`.
     pending_bytes: u64,
     pending_payload_bytes: u64,
     write_budget: WriteBudget,
@@ -317,29 +318,15 @@ impl MutationStaging {
         )
     }
 
-    fn append(
-        &mut self,
+    /// Refuse a batch that cannot join the table's accumulator: overwrite
+    /// mixed with an additive mode, a column patch beside another write, or a
+    /// schema that differs from the batches already pending.
+    fn check_accumulable(
+        &self,
         table_key: &str,
-        schema: SchemaRef,
         mode: PendingMode,
-        batch: RecordBatch,
-        supersede_by: Option<&str>,
+        batch: &RecordBatch,
     ) -> Result<()> {
-        if batch.num_rows() == 0 && mode != PendingMode::Overwrite {
-            // No-op for additive modes. For Overwrite, an empty batch is
-            // observable: it means "replace this table with zero rows".
-            return Ok(());
-        }
-        // If we've already accumulated a batch on this table, the new
-        // batch's schema MUST match the existing accumulator's schema.
-        // The mismatch case in practice is a blob-bearing table that
-        // sees an `insert` (full schema, blob columns included) and
-        // then an `update` whose `apply_assignments` output omits
-        // unassigned blob columns (subset schema). Concat-time and
-        // MemTable-construction errors would catch this later, but
-        // surfacing it at the offending `append_batch` call gives the
-        // caller a clearer point of failure attached to the specific
-        // op that introduced the drift.
         if let Some(existing) = self.pending.get(table_key) {
             if existing.mode == PendingMode::Overwrite || mode == PendingMode::Overwrite {
                 if existing.mode != mode {
@@ -370,6 +357,33 @@ impl MutationStaging {
                 )));
             }
         }
+        Ok(())
+    }
+
+    fn append(
+        &mut self,
+        table_key: &str,
+        schema: SchemaRef,
+        mode: PendingMode,
+        batch: RecordBatch,
+        supersede_by: Option<&str>,
+    ) -> Result<()> {
+        if batch.num_rows() == 0 && mode != PendingMode::Overwrite {
+            // No-op for additive modes. For Overwrite, an empty batch is
+            // observable: it means "replace this table with zero rows".
+            return Ok(());
+        }
+        // If we've already accumulated a batch on this table, the new
+        // batch's schema MUST match the existing accumulator's schema.
+        // The mismatch case in practice is a blob-bearing table that
+        // sees an `insert` (full schema, blob columns included) and
+        // then an `update` whose `apply_assignments` output omits
+        // unassigned blob columns (subset schema). Concat-time and
+        // MemTable-construction errors would catch this later, but
+        // surfacing it at the offending `append_batch` call gives the
+        // caller a clearer point of failure attached to the specific
+        // op that introduced the drift.
+        self.check_accumulable(table_key, mode, &batch)?;
         // The earlier versions this batch supersedes leave the image before
         // its row and byte ceilings are checked, and only once every check
         // has passed does the image change.
@@ -384,10 +398,30 @@ impl MutationStaging {
             (None, Some(existing)) => existing.batches.as_slice(),
             (None, None) => &[],
         };
+        // The operation's retained bytes and Blob payload with this table's
+        // pending batches replaced by what remains of them: a superseded
+        // version leaves both totals as it leaves the image, so a later write
+        // of one entity counts once.
+        let (retained_bytes, retained_payload) = match (&remaining, self.pending.get(table_key)) {
+            (Some(remaining), Some(existing)) => (
+                replace_share(
+                    self.pending_bytes,
+                    bytes_of(&existing.batches)?,
+                    bytes_of(remaining)?,
+                    "pending keyed byte count",
+                )?,
+                replace_share(
+                    self.pending_payload_bytes,
+                    payload_of(&existing.batches)?,
+                    payload_of(remaining)?,
+                    "pending Blob payload byte count",
+                )?,
+            ),
+            _ => (self.pending_bytes, self.pending_payload_bytes),
+        };
         let batch_usage = crate::table_store::write_batch_bytes(&batch)?;
         let batch_bytes = batch_usage.rows;
-        let pending_payload_bytes = self
-            .pending_payload_bytes
+        let pending_payload_bytes = retained_payload
             .checked_add(batch_usage.payload)
             .ok_or_else(|| {
                 OmniError::manifest_internal("pending Blob payload byte count overflow")
@@ -407,9 +441,9 @@ impl MutationStaging {
                 "decoded blob input bytes per operation",
                 pending_payload_bytes,
             )?;
-            retained_keyed_bytes(self.pending_bytes, batch_bytes, self.write_budget)?
+            retained_keyed_bytes(retained_bytes, batch_bytes, self.write_budget)?
         } else {
-            self.pending_bytes
+            retained_bytes
                 .checked_add(batch_bytes)
                 .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))?
         };
@@ -1523,6 +1557,25 @@ fn bytes_of(batches: &[RecordBatch]) -> Result<u64> {
             .checked_add(batch_bytes)
             .ok_or_else(|| OmniError::manifest_internal("pending keyed byte count overflow"))
     })
+}
+
+fn payload_of(batches: &[RecordBatch]) -> Result<u64> {
+    batches.iter().try_fold(0_u64, |bytes, batch| {
+        let batch_payload = crate::table_store::write_batch_bytes(batch)?.payload;
+        bytes
+            .checked_add(batch_payload)
+            .ok_or_else(|| OmniError::manifest_internal("pending Blob payload byte count overflow"))
+    })
+}
+
+/// `total` with one table's share `old` replaced by `new`. `total` sums every
+/// table's pending batches, so it holds `old`; a total below it is a broken
+/// account, refused rather than clamped.
+fn replace_share(total: u64, old: u64, new: u64, what: &str) -> Result<u64> {
+    total
+        .checked_sub(old)
+        .and_then(|others| others.checked_add(new))
+        .ok_or_else(|| OmniError::manifest_internal(format!("{what} out of range")))
 }
 
 fn id_values<'a>(batch: &'a RecordBatch, id_column: &str) -> Result<&'a StringArray> {
