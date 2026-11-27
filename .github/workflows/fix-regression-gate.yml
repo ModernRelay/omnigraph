@@ -46,12 +46,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # The head as data only. `refs/pull/N/head` resolves for fork PRs too.
+      # Fetch the commit used by the diff below. The live PR ref may point elsewhere.
       - name: Fetch the pull request head
         if: github.event_name == 'pull_request_target'
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git fetch --no-tags origin "$HEAD_SHA"
 
       - name: Check closed issues carry regressions
         if: github.event_name == 'pull_request_target'
