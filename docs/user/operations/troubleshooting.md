@@ -89,11 +89,12 @@ the request it answered by the first row that matches:
 
 A refusal's own action follows its code: `recover` for a recovery intent or a
 full-text index to build, `retry` for `too_many_requests`,
-`service_unavailable`, `graph_unavailable` and `request_timeout`, `fix` for
-`unauthorized`, `bad_request`, `api_contract_mismatch`, `actor_mismatch`,
-`not_found`, `method_not_allowed`, `unattached_cannot_publish`,
-`branch_start_refusal`, `payload_too_large`, `unsupported_media_type` and
-`range_not_satisfiable`, and
+`service_unavailable`, `graph_unavailable`, `request_timeout`, `cancelled` and
+`deadline_exceeded`, `fix` for
+`unauthorized`, `not_admitted`, `bad_request`, `api_contract_mismatch`,
+`actor_mismatch`, `not_found`, `method_not_allowed`, `unattached_cannot_publish`,
+`branch_start_refusal`, `payload_too_large`, `unsupported_media_type`,
+`range_not_satisfiable` and `result_too_large`, and
 `refresh` for the rest: `forbidden`, `precondition_failed`, `conflict`,
 `writer_fenced`, `branch_exists`, `branch_deleted`, `branch_not_ready`,
 `external_blob_source`, `change_feed_gap` and `internal`. A write the server
