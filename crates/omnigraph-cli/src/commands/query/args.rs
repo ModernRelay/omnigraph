@@ -93,7 +93,7 @@ pub(crate) struct MutateArgs {
     pub(crate) branch: Option<String>,
     /// Compare-and-swap: run only while the branch head still equals this commit id
     /// (from `omnigraph query --json` or `omnigraph commit list`). A lost race exits
-    /// 4 against a server, 1 embedded; --json prints `precondition_failure`.
+    /// 4, against a server or embedded; --json prints `precondition_failure`.
     #[arg(long = "if-commit", value_name = "COMMIT_ID")]
     pub(crate) if_commit: Option<String>,
     /// Session setting for this invocation (repeatable): `name=value` in
