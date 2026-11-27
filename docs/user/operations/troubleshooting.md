@@ -98,7 +98,8 @@ full-text index to build, `retry` for `too_many_requests`,
 `refresh` for the rest: `forbidden`, `precondition_failed`, `conflict`,
 `writer_fenced`, `branch_exists`, `branch_deleted`, `branch_not_ready`,
 `external_blob_source`, `change_feed_gap` and `internal`. A write the server
-could not settle answers `500`.
+could not settle answers `500`. `cancelled`, `deadline_exceeded` and
+`result_too_large` come only from [MCP](mcp.md) and carry no HTTP status.
 
 The CLI reports the server's disposition when that request was the command's
 only effectful one, and otherwise its own account of the whole command, so a
