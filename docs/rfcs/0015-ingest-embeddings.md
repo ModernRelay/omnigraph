@@ -7,265 +7,219 @@ implementation: not-started
 authors:
   - OmniGraph maintainers
 created: 2026-06-21
-updated: 2026-08-23
+updated: 2026-11-21
 discussion: null
 supersedes: []
 superseded_by: []
-blocked_on: []
+blocked_on:
+  - "GQ 3 (PR #1302, implementation PR #1316): the encoding recipe descriptor and its hash, which the row fingerprint uses"
 ---
 
 # RFC 0015: Ingest-time `@embed` reconciliation
 
-**Tickets:** `iss-ingest-embed` (umbrella); relates to RFC 0012 (embedding client),
-invariant 7 (indexes are derived state)
-
-> Evidence tags: **[S]** verified in v0.7.1 source (`file:line`), **[U]** verified
-> against an external system, **[D]** documented behavior. Unmarked = design intent.
+Contract: keeps E1, E2, E4, E7, read:11, write:3; changes Boundary
+("Outside the commit"); bears on D17.
 
 ## Summary
 
-`@embed("source_text", model="…")` records *which* String property seeds a
-Vector column and with *which* model, but **does not embed at write time** — the
-loader and mutation paths never call the embedder, and stored vectors must be
-supplied in the load data or pre-filled by the offline `omnigraph embed` file
-pipeline ([embeddings.md:92](../user/search/embeddings.md) [D]).
+`@embed("source", model = "…")` declares a derivation: the vector is the
+embedding of the record's source text in one embedding space. Nothing in the
+engine computes it. Vectors arrive in load data, usually from the offline
+`omnigraph embed` file pipeline, and nothing notices when the source text
+changes afterwards ([embeddings](../user/search/embeddings.md)).
 
-This RFC closes that gap **without putting a network call on the write path.**
-An embedding is *derived physical state* — the same class as an index — so it is
-materialized by a **reconciler**, not inline: `load`/`mutate` store the source
-text and leave the dependent vector **pending** (NULL); an `ensure_embeddings`
-reconciler (sibling of today's `ensure_indices`) embeds the pending rows in
-batches from manifest state, with bounded retry. A not-yet-embedded row is
-queryable by traversal/filter immediately and becomes a `nearest()` hit once
-materialized — documented partial coverage, exactly as for a deferred index.
-
-This is invariant 7 applied to embeddings, and it is the design the Postgres
-ecosystem converged on (Timescale pgai Vectorizer, Supabase pgmq) [U].
+This RFC makes the engine converge every `@embed` vector to its declaration
+without putting a provider call on the write path. Each row records a
+fingerprint of what its vector was computed from: the field's encoding recipe
+hash (GQ 3) plus a digest of the source value. A row is **current** when its
+fingerprint equals the one its present source and recipe would produce, and
+**stale** otherwise, which covers a first insert, a source edit, a supplied
+vector of unknown origin and a recipe change with one predicate. An explicit
+`embed --graph` operation embeds stale rows in batches and publishes them as
+ordinary commits.
 
 ## Motivation
 
-The natural request — "embed automatically when I add data" — has one obvious
-implementation (embed inline during `mutate`/`load`) that is **wrong for this
-codebase on three independent counts**:
+1. **Silent staleness.** Updating a source property leaves its vector in
+   place, and a `nearest` then ranks the row by text it no longer contains.
+   Fill-missing in `omnigraph embed` cannot see it, because a stale vector is
+   not missing.
+2. **Generation lives outside the graph.** Backfill is export, embed a file,
+   reload: it bypasses branch policy, the actor on the commit and the head
+   the caller read.
+3. **Inline embedding is the wrong fix.** Embedding during `mutate` or `load`
+   is a synchronous, network-bound, fallible step on the write path, which
+   the deny-list forbids in the same terms as inline index rebuilds, and it
+   makes write availability depend on the provider's.
 
-1. **It is on the deny-list.** [invariants.md](../dev/invariants.md) forbids
-   "synchronous inline vector/FTS index rebuilds on the write path." An
-   embedding is the same shape (expensive, network-bound, derivable). The
-   deny-list does not distinguish "build the index" from "compute the value the
-   index covers."
-2. **It blows the write-path cost contract.** RFC 0013 (and its
-   [write protocol](../dev/writes.md)) is making the
-   write path O(1) and failure-bounded. A per-row embedding call is
-   O(network-latency) and fallible — a single-row `mutate` would block on a
-   model round-trip (the latency that makes this unacceptable for interactive
-   mutations).
-3. **It couples a logical write to a flaky external service.** Per pgai's stated
-   rule: *"primary data-modification operations (INSERT/UPDATE/DELETE) should not
-   be dependent on the embedding operation, otherwise the application is down
-   every time the endpoint is slow or fails"* [U]. That is invariant 7's "a
-   physical operation must never fail a logical one," verbatim from the field.
+Prior art splits three ways: bring your own vector (pgvector, Qdrant, today's
+`omnigraph embed`), synchronous inline (HelixDB, Weaviate vectorizers, LanceDB
+embedding registry) and asynchronous materialization (Timescale pgai
+Vectorizer, Supabase with pgmq). Omnigraph keeps the first and adopts the
+third without its queue: the work is derivable from accepted state, so a
+reconciler suffices (deny-list: no job queue for manifest-derived work).
 
-### Prior art (the three patterns)
+## User and operational behavior
 
-| Pattern | Who | Fit |
-|---|---|---|
-| **Pre-embed / BYO vector** | raw pgvector, Qdrant, Milvus (classic), Atlas, Cloudflare Vectorize | omnigraph already has this — the `omnigraph embed` *file* pipeline. Keep it. |
-| **Synchronous-inline at write** | **HelixDB** (`AddV(Embed(content), …)`) [U], Weaviate vectorizers, Milvus 2.5 functions, Pinecone integrated inference, LanceDB embedding registry | Blocks the write; fine for bulk-batched, bad for single-row mutations. **HelixDB — the closest analog — took this path and inherited the latency.** Forbidden here by the deny-list. |
-| **Async materialization / reconciler** | **Timescale pgai Vectorizer**, Supabase (trigger → `pgmq` → worker) [U] | The write enqueues; a batched, retrying worker embeds and writes back; "a delay may occur before [vectors] become available." **= invariant 7. Recommended.** |
-
-"Lazy on read" is not a fourth option: the ANN index needs the vector *present*
-to index it, so you cannot defer the vector itself to query time without giving
-up the index. The reconciler is "lazy relative to the write, eager relative to
-search" — which is precisely invariant 7's partial-coverage licence.
+- `load` and `mutate` are unchanged in cost and never call a provider. They
+  store the source and any supplied vector, and they write the row's
+  fingerprint (below). A supplied vector is the writer's claim that it is in
+  the field's space; the fingerprint records which source and recipe it claims.
+- A new operation, `omnigraph embed --graph <uri> [--branch b] [--type T]
+  [--vector T.p] [--limit n]`, embeds stale rows and publishes one commit per
+  batch on the branch, with its actor, under the `change` policy action. A
+  served cluster exposes it as a recorded operation, like remote `optimize`.
+- `index status` (and its served equivalent) reports, per `@embed` field, the
+  count of current, stale and missing vectors.
+- A stale row keeps its old vector and stays a `nearest` candidate until it
+  is re-embedded. A row with no vector is not a `nearest` candidate, as today.
+- The offline file pipeline stays for seeding. It writes fingerprints into its
+  output so a loaded file is current.
 
 ## Design
 
-### Embeddings are derived state, keyed off `@embed`
+### The fingerprint
 
-`@embed("source", model)` declares a derivation: `Vector_col = embed(source_col)`
-[D]. That makes the vector column *physical, rebuildable, source-derived* state —
-identical in kind to an index. The whole design follows from treating it that way.
+GQ 3 defines three typed descriptors whose hashes are derived views: the
+encoding recipe (the space: model revision plus record and query encoding
+choices), the field representation, and the query encoding. Hashes are per
+field only.
 
-### Write path: store source, leave the vector pending (NULL)
+The row fingerprint is `recipe_hash || sha256(source value bytes)`. It uses
+the recipe hash, not the field-representation hash, because a distance or
+analyzer change rebuilds an index but leaves vectors current. A null or empty
+source has no fingerprint, and its vector must be null.
 
-`load`/`mutate` are **unchanged in cost**: they write the source text and any
-caller-supplied vector. They do **not** call the embedder. A row whose `@embed`
-source is present but whose vector is NULL is *pending*. The write path's only
-new behavior is **staleness invalidation** (see §"Staleness"): when a write
-touches an `@embed` *source* column, it clears (NULLs) the dependent vector so
-the reconciler re-embeds. Clearing a column is write-local and cheap (no
-network).
+Storage: one system column per `@embed` target, `__embed_fp_<property id>`,
+`FixedSizeBinary(64)`, nullable, keyed by stable property identity so a rename
+keeps it (invariant 6). It is written by every door that writes the target or
+its source:
 
-This reuses the exact shape already in `table_ops.rs`: an untrainable Vector
-column (all-NULL today) is isolated as a `PendingIndex` rather than aborting the
-build [S]; here the *rows* are pending, tracked the same way.
+| Writer | Fingerprint written |
+|---|---|
+| `load` or `mutate` setting the source and the vector | the supplied pair's fingerprint |
+| `load` or `mutate` setting the source only | null (stale) |
+| `mutate` setting the vector only | the fingerprint for the row's stored source |
+| `embed --graph` | the fingerprint it embedded |
 
-### The reconciler: `ensure_embeddings`
+The engine never clears a vector on a source edit. Clearing would remove the
+row from `nearest` until the next run; keeping the old vector degrades more
+gently and the stale count makes the lag visible.
 
-A sibling of `ensure_indices`
-(`db/omnigraph/table_ops.rs`, materialized in `optimize.rs` [S]):
+### The operation
 
-1. For each `@embed`-annotated `(table, vector_col, source_col, model)`, scan for
-   **pending rows**: `vector_col IS NULL AND source_col IS NOT NULL`. Cost is
-   bounded by *pending rows*, not history (invariant 15).
-2. Embed the source texts **in batches** via a new
-   `EmbeddingClient::embed_documents(&[&str]) -> Vec<Vec<f32>>` (see §"Required
-   new mechanics"), honoring the existing retry/backoff
-   (`OMNIGRAPH_EMBED_RETRY_*`, `embedding.rs:18` [S]) and the recorded model.
-3. Write the vectors back via the normal staged-write + manifest publish path
-   (an `update` keyed on row id). Then fold the now-trainable vector column into
-   its index via the existing `ensure_indices` pass — embeddings unblock the
-   deferred vector index automatically.
-4. A model mismatch (recorded model ≠ resolved client model) **refuses loudly**,
-   reusing the query-path same-space validation that already exists [D].
+1. Capture one snapshot of the branch (invariant 3). For each selected field,
+   resolve the recipe from the accepted schema and refuse when the bound
+   provider does not resolve it (cluster apply already refuses a model or
+   dimension mismatch).
+2. Scan for rows whose fingerprint is null or differs from
+   `recipe_hash || sha256(source)`, bounded by `--limit` and a per-run memory
+   ceiling. The cost is the stale rows plus one pass over the fingerprint and
+   source columns, never history.
+3. Embed in batches with the provider's batch endpoint, outside every writer
+   gate, under the existing deadline, retry and backoff settings.
+4. Publish each batch as one commit. Before writing a row, recheck its source
+   digest against the head at publish. A row whose source changed since the
+   snapshot is skipped, stays stale and is picked up by the next run. The
+   batch never overwrites a concurrent edit (`write:3`), and it never holds a
+   gate while waiting on the provider.
+5. Report per field: embedded, skipped as concurrently changed, failed, and
+   still stale.
 
-**Trigger (decision §A):** start **explicit** — `ensure_embeddings` runs inside
-`optimize` and as a new `omnigraph embed --graph <scope>` mode (the file
-pipeline gains a graph target). This matches how indexes already reconcile
-(operator/cron-triggered, no background loop). A **background loop** (pgai's
-every-5-min worker [U]) is the eventual convergence, specified as a follow-up,
-not built first.
+Only `embed --graph` calls a provider. A provider failure ends the run with
+the committed batches kept and an exact count of what remains stale; reads
+and writes are unaffected.
 
-### Staleness (decision §C)
+### Kind of operation
 
-A source-text `update` must re-embed. Two options:
+The operation changes property values, so it is a `write` under the
+contract, not `maintain`: its commits carry an actor, appear in the change
+feed, merge like other writes, and are checked against policy (E6). It is not
+physical state. The vector it writes changes `nearest` answers, which `E7`
+forbids for `maintain`.
 
-- **Recommended — NULL-on-source-change.** When a write touches an `@embed`
-  source column, clear the dependent vector. Then *one* universal pending
-  predicate (`vector IS NULL AND source IS NOT NULL`) covers both first-insert
-  and post-update, with no per-row bookkeeping. Cost: the write path must know
-  the `@embed` dependency (a catalog lookup it already has) and clear a column.
-- *Alternative — embedded-from marker.* Store the source version/hash the vector
-  was derived from; the reconciler re-embeds rows whose
-  `_row_last_updated_at_version` (`lance_version_columns` [S]) exceeds it. No
-  write-path coupling, but adds a per-row marker column.
+### Model or recipe change
 
-### Read semantics (decision §B)
+Changing a field's recipe makes every row stale at once. Rows still carrying
+the old recipe's vectors are in another space, so a text `nearest` on that
+field skips rows whose fingerprint names another recipe, and reports
+`exhaustive: false` while any are skipped. A vector `nearest` is the caller's
+claim about the space and is unaffected.
 
-A pending row is **present and queryable** by traversal/filter/scalar predicates
-immediately; it is simply **not yet a `nearest()` hit.** This is invariant 7
-partial coverage, surfaced — not silent:
+## Invariants
 
-- Expose a **pending-embedding count** (per table/column) via `status`/`optimize`
-  output, so operators see the backlog.
-- Provide an **explicit synchronous opt-in** for the rare read-after-write-on-
-  vectors case — e.g. `omnigraph embed --graph --wait` or a `mutate` flag that
-  runs `ensure_embeddings` for the touched rows before returning (opt-in only;
-  never the default, never on the hot path).
+- **2 and 4:** each batch is one manifest publication.
+- **3:** one snapshot per run, revalidated per batch at publish.
+- **7:** vectors are not physical state, so this is not index reconciliation.
+  Freshness is timeliness, as the contract classifies values derived by a
+  pipeline.
+- **11:** batches, retries, the deadline, memory and the scan are bounded.
+  Provider failure is an explicit, counted outcome.
+- **Deny-list:** no provider call on a content write, no queue (the stale
+  predicate over accepted state is the work list), no background scheduler
+  (`maintain:1`; a managed scheduler, if any, calls the explicit operation).
 
-## Required new mechanics
+## Compatibility and reversibility
 
-| Mechanic | Today | Needed |
-|---|---|---|
-| **Batch embed** | `embed_document_text(&str)` / `embed_query_text(&str)` are one-string-per-call (`embedding.rs:248,252` [S]) | Add `embed_documents(&[&str]) -> Result<Vec<Vec<f32>>>` (provider batch endpoint where available; chunked sequential fallback). pgai treats batch as load-bearing for throughput/rate-limits [U]. |
-| **Pending-row scan** | `PendingIndex` tracks declared-but-unbuilt *indexes* (`table_ops.rs` [S]) | A row-level pending scan (`vector IS NULL AND source IS NOT NULL`) per `@embed` column. |
-| **`@embed` dependency in the write path** | `@embed` is a catalog annotation consumed at query typecheck/lint [D] | The loader/mutation must read it to NULL-on-source-change (decision §C). |
-| **Graph-target embed** | `omnigraph embed` is file→file [D] | `omnigraph embed --graph <scope>` runs the reconciler against a live graph. |
+The fingerprint column is a storage-format addition behind a format bump:
+older binaries refuse the graph, as for any newer format. Existing rows start
+with a null fingerprint, so a graph upgraded from an older format reports
+every vector stale until it is re-embedded or a fingerprint backfill
+(`embed --graph --adopt`) records the current recipe for vectors the operator
+asserts are current. Removing the feature later drops one column per field.
 
-The provider client, model-identity recording, same-space validation, and
-retry/backoff already exist (RFC 0012) — this is write-path + reconciler
-integration, not a new subsystem.
+## Alternatives
 
-## Invariants & deny-list check
+- **NULL on source change** (this RFC's earlier draft). One predicate,
+  `vector IS NULL AND source IS NOT NULL`, with no new column, but every
+  source edit removes the row from `nearest` until the next run, a recipe
+  change cannot be detected per row, and a supplied vector's origin is never
+  checked.
+- **Lance `_row_last_updated_at_version` against a stored embed version.**
+  Needs no hash, but any update to the row makes it stale, and it reads
+  linear Lance history, which `__manifest` owns (invariant 12).
+- **Inline synchronous embedding.** On the deny-list.
+- **Embed on read.** A vector index needs the vector present.
 
-- **7 (indexes are derived state):** this *is* an instance — embeddings converge
-  from manifest/source state, never extend the critical write path; reads are
-  correct (just not vector-ranked) under partial coverage.
-- **Deny-list "synchronous inline vector/FTS index rebuilds on the write path":**
-  obeyed by construction — embedding is off the write path.
-- **9 (integrity failures are loud):** a model mismatch or an embed failure on
-  the reconciler is surfaced (pending count, typed error), not a placeholder
-  vector.
-- **13 (operational failures bounded/observable):** the reconciler's embed calls
-  are batched, retry-bounded, and report a pending backlog; a flaky provider
-  degrades vector-search freshness, never write availability.
-- **2/3 (manifest-atomic, one snapshot):** unchanged — the reconciler's write-back
-  is an ordinary staged write + manifest publish.
+## Evidence and tests
 
-## Cost contract
-
-- **Write path:** unchanged — O(1), no embedder call (the NULL-on-source-change
-  clear is a local column write). Assert in `write_cost.rs` that a `mutate`
-  touching an `@embed` source performs **zero** embedding round-trips.
-- **Reconciler:** O(pending rows), batched; flat in history depth (it scans by
-  the pending predicate, not the version chain).
-
-## Testing
-
-- **Write-path-clean:** a `mutate`/`load` into an `@embed` table issues no
-  embedder call and leaves the vector NULL (mock client asserts zero invocations).
-- **Reconcile fills:** `ensure_embeddings` embeds the pending rows, the vector
-  column becomes non-NULL, and the deferred vector index then builds.
-- **Staleness:** updating the source NULLs the vector; the next reconcile
-  re-embeds; updating a *non-source* property does **not**.
-- **Read partial coverage:** a pending row is returned by a traversal/filter
-  query but not by `nearest()`; the pending count is reported.
-- **Model mismatch refuses** on the reconciler (reuse the query-path validation).
-- **Batch:** `embed_documents` over N texts maps 1:1 to N output vectors in order;
-  a mid-batch provider error is retry-bounded and reported, not silently dropped.
-- Mock provider throughout (no network in CI), mirroring the existing embedding
-  tests.
+- A `mutate` or `load` into an `@embed` type makes zero provider calls (mock
+  provider counter), and the DST storage-cost golden records the added
+  fingerprint write.
+- Source edit: the fingerprint goes null, the old vector stays, the run
+  re-embeds it; an edit to another property leaves it current.
+- A concurrent source edit during a run is skipped and stays stale.
+- A recipe change makes all rows stale; text `nearest` skips them and reports
+  not exhaustive.
+- A supplied matching pair loads current; a supplied vector without its
+  source digest loads stale.
+- Batching: N texts map to N vectors in order; a mid-batch provider error is
+  retried within bounds, then reported, with earlier batches committed.
+- Policy: the run is refused without `change` on the branch.
 
 ## Rollout
 
-1. **PR 1 — `embed_documents` batch method** + reconciler-internal use. Pure
-   addition to the client.
-2. **PR 2 — `ensure_embeddings` reconciler** + `optimize` integration + the
-   pending-row scan. Read-only effect until something is pending.
-3. **PR 3 — `omnigraph embed --graph`** (graph target for the existing CLI) +
-   the pending-count surface in `status`/`optimize`.
-4. **PR 4 — write-path staleness** (NULL-on-source-change) + the
-   `--wait`/synchronous opt-in. This is the only write-path touch; lands last,
-   behind the reconciler that consumes its output.
-5. *(follow-up)* background reconciler loop (pgai-style), if/when operators want
-   automatic freshness without a cron.
+1. Batch embedding in the client (`embed_documents`), used by the file
+   pipeline (after PR #952).
+2. GQ 3's recipe descriptor and hash (PR #1316).
+3. The fingerprint column, the format bump and the write-path rules.
+4. `embed --graph`, the stale counts in `index status`, the served operation.
+5. Text `nearest` skipping other-recipe rows.
 
-PRs 1–3 deliver "add data, then reconcile, then it's searchable" with **no
-write-path change at all**; PR 4 adds automatic staleness + the opt-in.
+## Unresolved questions
 
-## Drawbacks & alternatives
+- Should a served cluster schedule `embed --graph` (control-plane DEC-08-76
+  scheduling), or stay operator-triggered like `optimize`?
+- A per-tenant budget for provider tokens beside CPU, memory and storage.
+- Chunking long sources into several vectors is out of scope: one source
+  property, one vector.
 
-- **Read-after-write delay on vectors.** The cost of keeping writes fast: a
-  freshly-mutated node is not a `nearest()` hit until reconciled. Mitigated by
-  the pending-count surface and the synchronous opt-in. This is the same
-  trade-off pgai ships and documents [U].
-- **Explicit-trigger first** means freshness depends on `optimize`/cron cadence,
-  not seconds. Accepted as the lower-liability start (matches index reconcile);
-  the background loop is the convergence.
-- **Rejected — synchronous inline (HelixDB regime).** The latency and
-  failure-coupling this RFC exists to avoid; on the deny-list.
-- **Rejected — embed-on-read (lazy).** Doesn't fit a vector column the ANN index
-  must contain.
+## Decision log
 
-## Reversibility
-
-High. The vector column, `@embed` annotation, and on-disk format are unchanged;
-the reconciler is additive. The one observable contract change (a pending window
-before vectors are searchable) is the documented partial-coverage semantics, and
-the synchronous opt-in covers callers that cannot tolerate it.
-
-## Open questions / decisions to ratify
-
-- **§A Trigger model:** explicit (`optimize` + `omnigraph embed --graph`) first,
-  background loop later — confirm the staged approach.
-- **§B Read-after-write:** ratify the "present but not vector-searchable until
-  reconciled" contract + the synchronous opt-in shape.
-- **§C Staleness signal:** NULL-on-source-change (recommended) vs embedded-from
-  marker.
-- **Batching granularity / provider limits:** max batch size + handling a
-  provider's per-request token cap (chunk within `embed_documents`).
-- **Chunking:** pgai also *chunks* long source text before embedding [U]. Out of
-  scope here (one source property → one vector), but note it as a future
-  extension if long-text columns appear.
-
-## Relationship to prior work
-
-- **RFC 0012 (embedding provider config):** provides the client, model identity,
-  same-space validation, retry/backoff this RFC consumes. RFC 0015 is the
-  write-path/reconciler integration RFC 0012 deferred.
-- **Invariant 7 / the deferred-vector-index path** (`table_ops.rs`
-  `PendingIndex`, `optimize.rs` [S]): the mechanism this extends from
-  index-coverage to row-level embedding coverage.
-- **RFC 0013 (write-path latency) / step 3b:** the cost-and-failure-bounding
-  contract that makes synchronous inline embedding unacceptable and the
-  reconciler necessary.
+- 2026-06-21: drafted with NULL-on-source-change as the recommended staleness
+  signal and the reconciler inside `optimize`.
+- 2026-11-21: revised. A per-row fingerprint of the GQ 3 recipe hash plus a
+  source digest replaces NULL-on-source-change, as agreed with the GQ 3 RFC
+  (per-field hashes stay per field; the row record belongs here). The
+  operation is a `write`, not part of `optimize`, because it changes
+  answers. Blocked on GQ 3's recipe descriptor.
