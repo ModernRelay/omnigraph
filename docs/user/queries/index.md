@@ -71,7 +71,8 @@ regardless of the supplied value. An `F32` property storing `0.1` therefore
 differs from the `F64` literal `0.1`, while `0.5` compares exactly. These rules
 also apply to list membership and mutation predicates, whether a filter runs
 in a scan or in memory. Mixed signed and `U64` values compare without losing
-integer precision.
+integer precision. A number literal may carry a leading minus (`-1`, `-0.5`); an integer
+literal takes any value from `-9223372036854775808` to `18446744073709551615` (`T3` beyond).
 
 | `x` | `y` | `x and y` | `x or y` |
 |---|---|---|---|

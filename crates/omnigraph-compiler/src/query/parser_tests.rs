@@ -2569,8 +2569,8 @@ fn handwritten_query_diagnostics_locate_the_refused_token() {
             Q005,
         ),
         (
-            "query q() { match { $p: Person } return { 99999999999999999999999 as n } }",
-            "99999999999999999999999",
+            "query q() { match { $p: Person } return { 9999999999999999999999999999999999999999 as n } }",
+            "9999999999999999999999999999999999999999",
             Q005,
         ),
         (
@@ -2650,4 +2650,74 @@ fn deeply_nested_sources_are_refused_before_the_grammar_recurses() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+/// A minus signs a literal, never a count and never a projection juxtaposed on
+/// one line without a comma; refusals a `.gqt` case cannot pin, since a body
+/// that does not parse makes the case invalid.
+#[test]
+fn a_minus_signs_a_literal_never_a_count() {
+    let integer = parse_filter_of("$p.age = -1");
+    let (left, op, right) = comparison(&integer);
+    assert_eq!(*left, prop("p", "age"));
+    assert_eq!(op, CompOp::Eq);
+    assert_eq!(*right, int(-1));
+    let float = parse_filter_of("$p.score < -0.5");
+    let (_, op, right) = comparison(&float);
+    assert_eq!(op, CompOp::Lt);
+    assert_eq!(*right, Expr::Literal(Literal::Float(-0.5)));
+    for source in [
+        "query q() { match { $p: Person } return { $p.name, -1 as d } }",
+        "query q() { match { $p: Person } return {\n    $p.name\n    -1 as d\n} }",
+    ] {
+        let qf = parse_query(source).unwrap_or_else(|error| panic!("{source}: {error}"));
+        assert_eq!(qf.single_decl().return_clause.len(), 2, "{source}");
+    }
+    for (source, token, code) in [
+        (
+            "query q() { match { $p: Person } return { $p.name } limit -1 }",
+            "-1",
+            Q001,
+        ),
+        (
+            "query q() { match { $p: Person $p knows{-1,2} $f } return { $p.name } }",
+            "-1",
+            Q001,
+        ),
+        ("set ann_nprobes = -1;", "-1", Q001),
+        (
+            "query q($v: Vector(-1)) { match { $p: Person } return { $p.name } }",
+            "-1",
+            Q001,
+        ),
+        ("branch diff a to b limit -1", "-1", Q001),
+        (
+            "query q() { match { $p: Person $p.age = - 1 } return { $p.name } }",
+            "- 1",
+            Q001,
+        ),
+        (
+            "query q() { match { $p: Person $p.age = -$f.age } return { $p.name } }",
+            "-$f",
+            Q001,
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name, $p.age -1 as d } }",
+            "-1 as",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name, $p.age-1 as d } }",
+            "-1 as",
+            Q005,
+        ),
+    ] {
+        let diagnostic = parse_query_diagnostic(source).unwrap_err();
+        assert_eq!(diagnostic.code, code, "{source}: {diagnostic}");
+        assert_eq!(
+            diagnostic.position,
+            Some(Position::at(source, source.find(token).unwrap())),
+            "{source}"
+        );
+    }
 }

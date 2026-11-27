@@ -1,0 +1,159 @@
+# issue: 1279
+# red_on: 64b3b2f3; the case is invalid before the fix: every section with a minus `does not parse: parse error: expected operand` (or `expected not_expr`, `expected literal`) at the sign, since no number literal carries one.
+# notes: A number literal may carry a leading minus: an integer or a float, in a read filter, a list, a projection,
+# notes: an insert assignment, an update assignment and a mutation `where`. The lab's SNB suite inserts a Comment
+# notes: whose `I64 @key` is `-1`; the seed holds one such row so the read pins the value before any write.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Comment {
+    pk: I64 @key
+    score: F64?
+    delta: I32?
+    text: String?
+}
+
+--- seed
+{"type":"Comment","data":{"pk":-1,"text":"seeded negative key"}}
+{"type":"Comment","data":{"pk":0,"text":"zero"}}
+{"type":"Comment","data":{"pk":7,"text":"seven"}}
+
+--- query
+query negative_key_filter() {
+    match {
+        $c: Comment
+        $c.pk = -1
+    }
+    return { $c.text }
+}
+
+--- expect unordered
+{"c.text": "seeded negative key"}
+
+--- expect shape
+c.text: String?
+
+--- query
+set engine = v2;
+query negative_literals_in_the_plan() {
+    match {
+        $c: Comment
+        $c.pk = -1 or $c.score < -0.5
+    }
+    return { $c.text }
+}
+
+--- expect unordered
+{"c.text": "seeded negative key"}
+
+--- expect shape
+c.text: String?
+
+--- expect plan
+type -1: I64
+type -0.5: F64
+
+--- query
+query negative_literals_projected() {
+    match {
+        $c: Comment
+        $c.pk < 0
+    }
+    return { $c.pk, -2 as shift, -0.5 as weight }
+}
+
+--- expect unordered
+{"c.pk": -1, "shift": -2, "weight": -0.5}
+
+--- expect shape
+c.pk: I64
+shift: I64
+weight: F64
+
+--- mutate
+query insert_negative_values() {
+    insert Comment { pk: -5, score: -1.5, delta: -3, text: "inserted" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query inserted_values_read_back() {
+    match {
+        $c: Comment
+        $c.pk = -5
+    }
+    return { $c.score, $c.delta }
+}
+
+--- expect unordered
+{"c.score": -1.5, "c.delta": -3}
+
+--- expect shape
+c.score: F64?
+c.delta: I32?
+
+--- mutate
+query update_to_a_negative_float() {
+    update Comment set { score: -0.25 } where pk = -5
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query updated_value_read_back() {
+    match {
+        $c: Comment
+        $c.score < -0.1
+    }
+    return { $c.pk, $c.score }
+}
+
+--- expect unordered
+{"c.pk": -5, "c.score": -0.25}
+
+--- expect shape
+c.pk: I64
+c.score: F64?
+
+--- query
+query negative_members_of_a_list() {
+    match {
+        $c: Comment
+        $c.pk in [-1, -5, 100]
+    }
+    return { $c.pk }
+}
+
+--- expect unordered
+{"c.pk": -1}
+{"c.pk": -5}
+
+--- expect shape
+c.pk: I64
+
+--- mutate
+query delete_below_a_negative_bound() {
+    delete Comment where pk < -1
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query survivors() {
+    match { $c: Comment }
+    return { $c.pk }
+}
+
+--- expect unordered
+{"c.pk": -1}
+{"c.pk": 0}
+{"c.pk": 7}
+
+--- expect shape
+c.pk: I64

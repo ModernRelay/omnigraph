@@ -772,10 +772,27 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                                     }
                                 }
                                 Rule::return_clause => {
+                                    let mut previous: Option<(bool, usize)> = None;
                                     for proj in section.into_inner() {
                                         match proj.as_rule() {
                                             Rule::kw_distinct => distinct = true,
                                             Rule::projection => {
+                                                let span = proj.as_span();
+                                                let start_line = span.start_pos().line_col().0;
+                                                let text = proj.as_str().trim_end();
+                                                if let Some((false, line)) = previous
+                                                    && line == start_line
+                                                    && text.starts_with('-')
+                                                {
+                                                    return Err(query_error_at(
+                                                        "a signed number directly after a projection on the same line: GQ has no arithmetic, so it would start a new projection; write a comma before it or put it on its own line",
+                                                        &proj,
+                                                    ));
+                                                }
+                                                previous = Some((
+                                                    text.ends_with(','),
+                                                    start_line + text.matches('\n').count(),
+                                                ));
                                                 return_clause.push(parse_projection(proj)?);
                                             }
                                             _ => {}
@@ -1564,12 +1581,12 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
         Rule::string_lit => Ok(Literal::String(parse_string_lit(&inner)?)),
-        Rule::integer => {
-            let n: i64 = inner
+        Rule::int_lit => {
+            let n: i128 = inner
                 .as_str()
                 .parse()
                 .map_err(|e| query_error_at(format!("invalid integer: {}", e), &inner))?;
-            Ok(Literal::Integer(i128::from(n)))
+            Ok(Literal::Integer(n))
         }
         Rule::float_lit => {
             let f: f64 = inner
