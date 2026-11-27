@@ -215,15 +215,17 @@ async fn external_commit_observed_by_warm_reader() {
     );
 }
 
-/// Reads that overlap on one warm handle share one freshness probe, and a read
-/// that began after a commit was acknowledged sees it while a probe that
-/// started before the commit is still in flight: the later reads wait for the
-/// next probe instead of taking the running one's answer. Each read probing on
-/// its own fails the sharing assertions; a read taking the running probe's
-/// answer fails the visibility one.
+/// Reads that overlap on one warm handle share one freshness probe, a read
+/// that began after a commit was acknowledged sees it, and no read waits on a
+/// probe that started before it arrived. The first read's probe is stalled in
+/// its requests after the store answered; a commit lands; eight later reads
+/// then finish on one probe of their own while the first is still stalled.
+/// Later reads taking the stalled probe's answer fail the visibility
+/// assertion; later reads waiting on it never finish; each read probing on its
+/// own fails the sharing one. Fix regression for issue 1577.
 // contract: read:2
 #[tokio::test]
-async fn overlapping_warm_reads_share_a_probe_that_started_after_them() {
+async fn overlapping_warm_reads_share_a_probe_that_started_after_them_issue_1577() {
     let dir = tempfile::tempdir().unwrap();
     let writer = init_and_load(&dir).await;
     let uri = dir.path().to_str().unwrap().to_string();
@@ -257,6 +259,7 @@ async fn overlapping_warm_reads_share_a_probe_that_started_after_them() {
                 2,
                 "the first read's probe asked for v and v + 1"
             );
+            gate.stop_holding();
 
             let new_head = tokio::spawn(async move {
                 mutate_main(
@@ -274,20 +277,21 @@ async fn overlapping_warm_reads_share_a_probe_that_started_after_them() {
             assert_ne!(new_head, old_head);
 
             // Every later read arrives after the acknowledgement, while the
-            // first read's probe is still held.
-            let mut later: Vec<_> = (0..8)
-                .map(|_| Box::pin(reader.resolve_snapshot("main")))
-                .collect();
-            for _ in 0..16 {
-                for read in &mut later {
-                    assert!(futures::poll!(read).is_pending());
-                }
-                tokio::task::yield_now().await;
+            // first read's probe is still stalled, and finishes without it.
+            let later =
+                futures::future::join_all((0..8).map(|_| reader.resolve_snapshot("main"))).await;
+            for read in later {
+                assert_eq!(
+                    read.unwrap(),
+                    new_head,
+                    "a read sees every commit acknowledged before it began"
+                );
             }
+            assert_eq!(gate.held(), 2, "the first read's probe is still stalled");
             assert_eq!(
-                gate.held(),
+                probes_run.load(Ordering::SeqCst) - before,
                 2,
-                "a read arriving while a probe is in flight starts none of its own"
+                "the first read's probe and one shared by the eight later reads"
             );
 
             gate.open();
@@ -295,18 +299,6 @@ async fn overlapping_warm_reads_share_a_probe_that_started_after_them() {
                 first.await.unwrap(),
                 old_head,
                 "the first read's probe asked before the commit"
-            );
-            for read in later {
-                assert_eq!(
-                    read.await.unwrap(),
-                    new_head,
-                    "a read sees every commit acknowledged before it began"
-                );
-            }
-            assert_eq!(
-                probes_run.load(Ordering::SeqCst) - before,
-                2,
-                "the first read's probe and one shared by the eight later reads"
             );
         }),
     )

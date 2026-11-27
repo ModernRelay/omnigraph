@@ -195,3 +195,6 @@ InsertAfterOptimize          l.put        calls=6
 WriterClaim                  l.get        calls=2
 WriterClaim                  l.list       calls=2
 WriterClaim                  l.put        calls=3
+ReadWarmLookupSequential4    l.get        calls=8
+ReadWarmLookupOverlapping4   l.get        calls=5
+ReadWarmLookupOverlapping16  l.get        calls=17

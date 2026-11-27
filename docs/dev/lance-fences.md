@@ -812,12 +812,13 @@ nothing there catches another process's delete of that branch until a publish of
 the holder loads it ([writes](writes.md#writer-epoch)).
 
 Callers that overlap on one held view share a probe (`probe_flights`, keyed by
-the held and main `__manifest` images and the branch). A caller takes only the
-answer of a probe that started after it arrived (`read:2`): one that arrives
-while a probe is in flight waits for the next, which starts when the running
-one ends and serves every caller that arrived meanwhile. A flight runs while
-any caller waits on it, and an error goes to one caller; the others probe
-again on their own.
+the held and main `__manifest` images and the branch). The caller that creates
+a probe yields to the scheduler once before the probe asks the store, and
+callers that arrive in that window join it; a caller that arrives after it started starts its own at once,
+so a caller takes only the answer of a probe that asked after it arrived
+(`read:2`) and never waits on one that started before. A flight runs while any
+caller waits on it, and an error goes to one caller; the others probe again on
+their own.
 
 **Owners:** `omnigraph-catalog`
 `freshness_probe_asks_for_the_next_version_by_name` (V1 and V2 paths on an
@@ -826,9 +827,12 @@ listing's `NotFound` for a removed `__manifest`); engine
 `lifecycle::write_preparation_manifest_read_failures_carry_before_effect_evidence`
 (a write on a warm handle refuses before effects when `__manifest` is gone);
 in-source `probe_flights::tests` (the sharing rule, cancellation and errors);
-engine `warm_read_cost::overlapping_warm_reads_share_a_probe_that_started_after_them`
+engine `warm_read_cost::overlapping_warm_reads_share_a_probe_that_started_after_them_issue_1577`
 and `concurrent_warm_queries_share_freshness_probes` (overlapping warm reads
-share probes and see a commit acknowledged before they began)
+share probes, see a commit acknowledged before they began and never wait
+on a stalled earlier probe); the DST storage-cost golden's
+`ReadWarmLookupSequential4`, `ReadWarmLookupOverlapping4` and
+`ReadWarmLookupOverlapping16` rows (probe requests flat in overlapping reads)
 
 ### Local manifest identity
 

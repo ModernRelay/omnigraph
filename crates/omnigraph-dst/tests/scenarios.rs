@@ -3220,6 +3220,86 @@ fn warm_read_cost_rows(replay: &str) -> String {
     rows
 }
 
+/// The labels [`OverlappingWarmReadCost`] measures, in order.
+const OVERLAPPING_WARM_READ_LABELS: [&str; 3] = [
+    "ReadWarmLookupSequential4",
+    "ReadWarmLookupOverlapping4",
+    "ReadWarmLookupOverlapping16",
+];
+
+/// Warm keyed lookups on one handle's bound branch, as a served graph meets
+/// them: four one after another, then four and sixteen issued together on the
+/// universe's seeded current-thread runtime. Reads issued together all reach
+/// the freshness probe before the first one's probe asks the store (its
+/// creator yields once first), so they share it; reads one after another each
+/// pay their own.
+/// The two batch sizes show the probe requests flat in the number of
+/// overlapping reads.
+struct OverlappingWarmReadCost;
+
+impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
+    for OverlappingWarmReadCost
+{
+    type Output = ();
+
+    async fn run(&self, resources: &mut omnigraph_dst::memory::MemoryStorage, _workload_seed: u64) {
+        omnigraph_dst::cost::set_label("_overlapping_read_setup");
+        let writer = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        writer
+            .load_jsonl(TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        let reader = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        let alice = serde_json::json!([{"p.name": "Alice", "p.age": 30}]);
+        assert_eq!(WarmReadCost::lookup(&reader).await, alice);
+
+        omnigraph_dst::cost::set_label(OVERLAPPING_WARM_READ_LABELS[0]);
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            answers.push(WarmReadCost::lookup(&reader).await);
+        }
+        for (label, reads) in OVERLAPPING_WARM_READ_LABELS[1..].iter().zip([4, 16]) {
+            omnigraph_dst::cost::set_label(label);
+            answers.extend(
+                futures::future::join_all((0..reads).map(|_| WarmReadCost::lookup(&reader))).await,
+            );
+        }
+
+        omnigraph_dst::cost::set_label("_overlapping_read_verify");
+        assert_eq!(answers.len(), 4 + 4 + 16);
+        for rows in &answers {
+            assert_eq!(rows, &alice);
+        }
+    }
+}
+
+fn overlapping_warm_read_cost_rows(replay: &str) -> String {
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-overlapping-warm-read-cost-{replay}"),
+        &OverlappingWarmReadCost,
+        &OVERLAPPING_WARM_READ_LABELS,
+    )
+}
+
 /// The labels [`GraphIndexRetentionCost`] measures, in order.
 const GRAPH_INDEX_RETENTION_LABELS: [&str; 5] = [
     "CsrHopCold",
@@ -4750,6 +4830,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&vector_index_recovery_cost_rows("a"));
     table.push_str(&carried_write_cost_rows("a"));
     table.push_str(&writer_claim_cost_rows("a"));
+    table.push_str(&overlapping_warm_read_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -4770,6 +4851,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&vector_index_recovery_cost_rows("b"));
     table2.push_str(&carried_write_cost_rows("b"));
     table2.push_str(&writer_claim_cost_rows("b"));
+    table2.push_str(&overlapping_warm_read_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"

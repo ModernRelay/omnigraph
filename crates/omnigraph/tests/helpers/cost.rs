@@ -1133,14 +1133,16 @@ pub fn assert_sweep_delete_requests_flat_in_files(curve: &[CleanupSweepCost]) {
 
 /// A `__manifest` store that slows or holds its version HEADs, the requests a
 /// freshness probe makes, so a test can keep a probe in flight. Each HEAD is
-/// answered by the store first, then takes `delay`, then waits while the gate
-/// is closed: a held probe answers what the store held when it asked.
+/// answered by the store first, then takes `delay`; a HEAD that arrives while
+/// the gate holds new requests then waits until the gate opens: a held probe
+/// answers what the store held when it asked.
 #[derive(Debug, Clone)]
 pub struct ProbeHeadGate(Arc<ProbeHeadGateState>);
 
 #[derive(Debug)]
 struct ProbeHeadGateState {
     open: tokio::sync::watch::Sender<bool>,
+    hold_new: std::sync::atomic::AtomicBool,
     delay: std::time::Duration,
     heads: AtomicU64,
     held: AtomicU64,
@@ -1151,17 +1153,28 @@ impl ProbeHeadGate {
     pub fn with_delay(delay: std::time::Duration) -> Self {
         Self(Arc::new(ProbeHeadGateState {
             open: tokio::sync::watch::Sender::new(true),
+            hold_new: std::sync::atomic::AtomicBool::new(false),
             delay,
             heads: AtomicU64::new(0),
             held: AtomicU64::new(0),
         }))
     }
 
+    /// Hold every version HEAD that arrives from now until [`Self::open`].
     pub fn close(&self) {
         self.0.open.send_replace(false);
+        self.0.hold_new.store(true, Ordering::SeqCst);
     }
 
+    /// Let HEADs that arrive from now pass; those already held stay held
+    /// until [`Self::open`].
+    pub fn stop_holding(&self) {
+        self.0.hold_new.store(false, Ordering::SeqCst);
+    }
+
+    /// Release every held HEAD and hold no new one.
     pub fn open(&self) {
+        self.0.hold_new.store(false, Ordering::SeqCst);
         self.0.open.send_replace(true);
     }
 
@@ -1245,7 +1258,7 @@ impl ObjectStore for ProbeHeadGateStore {
                 tokio::time::sleep(state.delay).await;
             }
             let mut open = state.open.subscribe();
-            if !*open.borrow_and_update() {
+            if state.hold_new.load(Ordering::SeqCst) && !*open.borrow_and_update() {
                 state.held.fetch_add(1, Ordering::SeqCst);
                 let _ = open.wait_for(|open| *open).await;
                 state.held.fetch_sub(1, Ordering::SeqCst);
