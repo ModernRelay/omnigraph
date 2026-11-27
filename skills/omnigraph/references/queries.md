@@ -38,7 +38,7 @@ omnigraph lint --query queries/signals.gq --target ./graph.omni
 Lint returns:
 - `"status": "ok"` — all queries passed
 - `"errors": N` — count of type errors (exit 1 when nonzero)
-- `"warnings": N` — count of per-query warnings (such as a mutation that declares no params) plus `L201` warnings (a nullable property that no update query sets)
+- `"warnings": N` — count of per-query warnings in `results[].warnings` (such as a mutation that declares no params) plus `L201` findings in `findings` (a nullable property that no update query sets)
 - `"infos": N` — count of info findings
 
 Run lint after every `.gq` or `.pg` edit. Wire into precommit.
