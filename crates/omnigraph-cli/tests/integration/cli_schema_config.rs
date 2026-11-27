@@ -433,20 +433,18 @@ fn graph_vocabulary_help_exposes_only_canonical_export_selection() {
         "{cleanup_help}"
     );
 
-    // Inline init addresses local storage only; cloud URIs refuse.
+    // Inline init addresses local storage or an inline `s3://` graph; other
+    // cloud URIs refuse.
     let init_help = stdout_string(&output_success(cli().arg("init").arg("--help")));
     let uri_help = init_help
         .lines()
         .find(|line| line.trim_start().starts_with("[URI]"))
         .unwrap_or_else(|| panic!("[URI] missing from init --help:\n{init_help}"));
     assert!(
-        uri_help.contains("Local graph path or `file://` URI"),
+        uri_help.contains("Local graph path, `file://` URI or inline `s3://` graph address"),
         "{uri_help}"
     );
-    assert!(
-        !uri_help.contains("s3://") && !uri_help.contains("az://"),
-        "{uri_help}"
-    );
+    assert!(!uri_help.contains("az://"), "{uri_help}");
 
     // Members are the organization's active members; nothing enrolls them.
     let cluster_help = stdout_string(&output_success(cli().arg("cluster").arg("--help")));
