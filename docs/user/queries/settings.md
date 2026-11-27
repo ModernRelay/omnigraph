@@ -173,7 +173,7 @@ error: unknown value `fast` for setting `merge_lineage`; expected one of off, on
 set traversal = csr;                      (likewise reset traversal; and show traversal;)
 error: unknown setting `traversal`; expected one of engine, rrf_plan, merge_lineage, change_lineage, ann_nprobes, stage_write_concurrency, traversal_work_limit, write_max_bytes, load_source_max_bytes, query_memory_bytes, history_release_bytes, explain_dump_dir
 set ann_nprobes = "many";
-error: setting `ann_nprobes` takes an integer of at least 0, got a string
+error: setting `ann_nprobes` takes an integer of at least 0, got a string `many`
 set stage_write_concurrency = 0;
 error: setting `stage_write_concurrency` takes an integer in 1..=64, got 0
 set stage_write_concurrency = 64;        (in an HTTP request)
