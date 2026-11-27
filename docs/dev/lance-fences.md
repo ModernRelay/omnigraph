@@ -74,6 +74,25 @@ restriction at the bump whose stamp is the commit's own version.
 `cases/branch_review_across_a_fast_forward_on_the_source.gqt`,
 `integration/changes.rs::commit_changes_feed_and_diff_across_a_fast_forward_report_the_source_rows`
 
+### Keyed write merge-insert plan
+
+Keyed writes (`TableStore::stage_keyed_write`) invoke Lance's `MergeInsertJob`
+with materialized batches through `execute_uncommitted_batches`, never a
+one-shot stream (`forbidden_apis.rs` pins the call). Lance wraps batches in a
+`MemTable` with exact statistics, which reach DataFusion's join selection under
+dedupe `Fail`, so a write smaller than the table is the hash join's collected
+build side and the table is probed (`CollectLeft`). Memory for the join scales
+with the write size rather than the table size, avoiding unbounded target table
+buffering (invariant 11). A write past DataFusion's 1 MiB collect threshold
+(a keyed write chunk may hold up to 32 MiB of vectors or text) is partitioned,
+and the build side follows `should_swap_join_order`, which compares row counts
+because Lance reports no byte size for the table, so the write must still build
+(`Partitioned Left`).
+
+**Owners:**
+`lance_surface_guards.rs::keyed_write_batch_source_is_the_merge_join_build_side_issue_1379`,
+`table_store.rs`, `forbidden_apis.rs`
+
 ## Search and filters
 
 ### KNN result order
