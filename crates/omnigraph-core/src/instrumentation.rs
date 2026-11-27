@@ -2105,29 +2105,76 @@ pub use control_dataset::{current_control_dataset, retain_control_dataset};
 /// Open a table pin (RFC 0067): a pin without a staged version opens its
 /// target, a staged pin above `last_linear_version` opens its detached
 /// version, and any older pin keeps the v10 twin rule for historical rows.
+/// Lance resolves every version this opens.
 pub async fn open_pinned_dataset(
     uri: &str,
     target_version: u64,
-    staged_version: Option<u64>,
-    transaction_uuid: Option<&str>,
-    last_linear_version: Option<u64>,
+    pin: &crate::metadata::TableVersionMetadata,
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    let Some(staged) = staged_version else {
-        return open_dataset(uri, VersionResolution::At(target_version), session, wrapper).await;
-    };
-    if last_linear_version.is_some_and(|last| target_version > last) {
-        return open_dataset(uri, VersionResolution::At(staged), session, wrapper).await;
-    }
-    match open_dataset(
+    open_pin(uri, target_version, pin, None, session, wrapper).await
+}
+
+/// [`open_pinned_dataset`] at the manifest object the pin's writer recorded
+/// (`TableVersionMetadata::recorded_manifest`), on a statement session of its
+/// own that caches nothing, for an open that keeps no read cache (a read
+/// pinned to a commit). The open reads the manifest without first asking the
+/// store for its size. The dataset reports the recorded identity (size and
+/// ETag), not the store's, so it is never a witness
+/// (`TableVersionMetadata::witnesses`); an open that checks a pin's identity
+/// goes through [`open_pinned_dataset`]. No manifest outlives the open, so a version `cleanup` reclaims is
+/// read from the store again and fails as
+/// [`OmniError::HistoricalVersionReclaimed`]: an open on a session that
+/// caches metadata must not take the recorded location, because Lance keeps
+/// a manifest whose size it knows, and no public call evicts it.
+pub async fn open_pinned_dataset_at_recorded_manifest(
+    uri: &str,
+    target_version: u64,
+    pin: &crate::metadata::TableVersionMetadata,
+    registry: Arc<lance::io::ObjectStoreRegistry>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    let session = crate::lance_access::statement_session(registry, 0, 0);
+    let recorded = pin.recorded_manifest();
+    open_pin(
         uri,
-        VersionResolution::At(target_version),
-        session,
-        wrapper.clone(),
+        target_version,
+        pin,
+        recorded.as_ref(),
+        Some(&session),
+        wrapper,
     )
     .await
-    {
+}
+
+async fn open_pin(
+    uri: &str,
+    target_version: u64,
+    pin: &crate::metadata::TableVersionMetadata,
+    recorded: Option<&crate::lance_clone::RecordedManifest>,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    let staged_version = pin.staged_version();
+    let transaction_uuid = pin.transaction_uuid();
+    let last_linear_version = pin.last_linear_version();
+    let open = |version: u64, wrapper: Option<Arc<dyn WrappingObjectStore>>| {
+        open_dataset_with(
+            uri,
+            VersionResolution::At(version),
+            recorded,
+            session,
+            wrapper,
+        )
+    };
+    let Some(staged) = staged_version else {
+        return open(target_version, wrapper).await;
+    };
+    if last_linear_version.is_some_and(|last| target_version > last) {
+        return open(staged, wrapper).await;
+    }
+    match open(target_version, wrapper.clone()).await {
         Ok(dataset) => {
             let ours = crate::staging::StagedTransactionIdentity::recorded_by(&dataset)
                 .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
@@ -2140,7 +2187,7 @@ pub async fn open_pinned_dataset(
                 staged,
                 "pin target carries a foreign or unreadable transaction; resolving the staged version"
             );
-            open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+            open(staged, wrapper).await
         }
         Err(error @ OmniError::HistoricalVersionReclaimed { .. }) => {
             let latest = open_dataset(uri, VersionResolution::Latest, session, wrapper.clone())
@@ -2148,22 +2195,13 @@ pub async fn open_pinned_dataset(
                 .version()
                 .version;
             if latest < target_version {
-                match open_dataset(uri, VersionResolution::At(staged), session, wrapper.clone())
-                    .await
-                {
+                match open(staged, wrapper.clone()).await {
                     Ok(dataset) => return Ok(dataset),
                     Err(OmniError::HistoricalVersionReclaimed { .. }) => {}
                     Err(other) => return Err(other),
                 }
             }
-            match open_dataset(
-                uri,
-                VersionResolution::At(target_version),
-                session,
-                wrapper.clone(),
-            )
-            .await
-            {
+            match open(target_version, wrapper.clone()).await {
                 Ok(dataset) => {
                     let ours = crate::staging::StagedTransactionIdentity::recorded_by(&dataset)
                         .is_some_and(|identity| Some(identity.uuid.as_str()) == transaction_uuid);
@@ -2176,7 +2214,7 @@ pub async fn open_pinned_dataset(
                         staged,
                         "pin target carries a foreign or unreadable transaction; resolving the staged version"
                     );
-                    open_dataset(uri, VersionResolution::At(staged), session, wrapper).await
+                    open(staged, wrapper).await
                 }
                 Err(OmniError::HistoricalVersionReclaimed { .. }) => Err(error),
                 Err(other) => Err(other),
@@ -2207,35 +2245,57 @@ pub async fn open_dataset(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    load_recorded(uri, version, session, wrapper)
-        .await?
-        .map_err(|error| match error {
-            // Only the two shapes cleanup/drop legitimately leaves behind for a
-            // pinned historical read count as reclaimed history:
-            //   - VersionNotFound: the dataset exists, that version was GC'd.
-            //   - DatasetNotFound: the whole dataset directory is gone (a dropped
-            //     table's history fully GC'd).
-            // A bare NotFound is NOT a cleanup shape: it is a live manifest
-            // referencing a missing object — corruption or an object-store
-            // inconsistency — so it must stay loud rather than be masked as a benign
-            // retention gap (which the change feed would surface as a 410 "reset via
-            // baseline"). Residual: this cannot tell a corrupt CURRENT table's
-            // DatasetNotFound from a legitimately dropped historical table's; that
-            // needs caller context (whether the version is the table's current one),
-            // and the baseline handshake the gap points to still fails loudly on
-            // genuine current-state loss.
-            lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
-                if matches!(version, VersionResolution::At(_)) =>
-            {
-                OmniError::HistoricalVersionReclaimed {
-                    published_dataset_version: match version {
-                        VersionResolution::At(version) => version,
-                        VersionResolution::Latest => 0,
-                    },
-                }
+    open_dataset_with(uri, version, None, session, wrapper).await
+}
+
+/// [`open_dataset`], resolving a pinned version to the manifest object its
+/// registration recorded when `recorded` is that version's own path.
+async fn open_dataset_with(
+    uri: &str,
+    version: VersionResolution,
+    recorded: Option<&crate::lance_clone::RecordedManifest>,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    let loaded = match load_recorded(uri, version, recorded, session, wrapper.clone()).await? {
+        // Lance reports a manifest that is missing at a known size as an IO
+        // error, not as the not-found it reports when it looks the manifest up
+        // (`Dataset::load_manifest`), so a failed open through the recorded
+        // location is repeated through Lance's own resolution: every failure
+        // keeps the class an open without it gets, reclaimed history included.
+        // A failure the recorded location cannot cause (throttling, a timeout,
+        // auth) therefore costs a second full open, with the store's own
+        // retries, and `record_open` counts both.
+        Err(_) if recorded.is_some() => load_recorded(uri, version, None, session, wrapper).await?,
+        loaded => loaded,
+    };
+    loaded.map_err(|error| match error {
+        // Only the two shapes cleanup/drop legitimately leaves behind for a
+        // pinned historical read count as reclaimed history:
+        //   - VersionNotFound: the dataset exists, that version was GC'd.
+        //   - DatasetNotFound: the whole dataset directory is gone (a dropped
+        //     table's history fully GC'd).
+        // A bare NotFound is NOT a cleanup shape: it is a live manifest
+        // referencing a missing object — corruption or an object-store
+        // inconsistency — so it must stay loud rather than be masked as a benign
+        // retention gap (which the change feed would surface as a 410 "reset via
+        // baseline"). Residual: this cannot tell a corrupt CURRENT table's
+        // DatasetNotFound from a legitimately dropped historical table's; that
+        // needs caller context (whether the version is the table's current one),
+        // and the baseline handshake the gap points to still fails loudly on
+        // genuine current-state loss.
+        lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
+            if matches!(version, VersionResolution::At(_)) =>
+        {
+            OmniError::HistoricalVersionReclaimed {
+                published_dataset_version: match version {
+                    VersionResolution::At(version) => version,
+                    VersionResolution::Latest => 0,
+                },
             }
-            error => OmniError::storage(error),
-        })
+        }
+        error => OmniError::storage(error),
+    })
 }
 
 /// [`open_dataset`] at exactly `version`, resolving only that version (no
@@ -2251,7 +2311,7 @@ pub async fn open_dataset_at_version(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    load_recorded(uri, VersionResolution::At(version), session, wrapper)
+    load_recorded(uri, VersionResolution::At(version), None, session, wrapper)
         .await?
         .map_err(OmniError::storage)
 }
@@ -2263,7 +2323,7 @@ pub async fn open_dataset_if_present(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Option<Dataset>> {
-    match load_recorded(uri, VersionResolution::Latest, session, wrapper).await? {
+    match load_recorded(uri, VersionResolution::Latest, None, session, wrapper).await? {
         Ok(dataset) => Ok(Some(dataset)),
         Err(lance::Error::DatasetNotFound { .. }) => Ok(None),
         Err(error) => Err(OmniError::storage(error)),
@@ -2277,10 +2337,11 @@ pub async fn open_dataset_if_present(
 async fn load_recorded(
     uri: &str,
     version: VersionResolution,
+    recorded: Option<&crate::lance_clone::RecordedManifest>,
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<std::result::Result<Dataset, lance::Error>> {
-    let builder = dataset_builder(uri, version, session, &wrapper).await?;
+    let builder = dataset_builder(uri, version, recorded, session, &wrapper).await?;
     let dataset = match builder.load().await {
         Ok(dataset) => dataset,
         Err(error) => return Ok(Err(error)),
@@ -2300,6 +2361,7 @@ async fn load_recorded(
 async fn dataset_builder(
     uri: &str,
     version: VersionResolution,
+    recorded: Option<&crate::lance_clone::RecordedManifest>,
     session: Option<&Arc<lance::session::Session>>,
     wrapper: &Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<DatasetBuilder> {
@@ -2316,10 +2378,14 @@ async fn dataset_builder(
     if let Some(wrapper) = wrapper {
         store_params.object_store_wrapper = Some(wrapper.clone());
     }
-    let handler =
-        crate::lance_clone::configured_commit_handler(uri, &Some(store_params.clone()), None)
-            .await
-            .map_err(OmniError::storage)?;
+    let params = Some(store_params.clone());
+    let handler = match (version, recorded) {
+        (VersionResolution::At(_), Some(recorded)) => {
+            crate::lance_clone::pinned_commit_handler(uri, &params, recorded.clone()).await
+        }
+        _ => crate::lance_clone::configured_commit_handler(uri, &params, None).await,
+    }
+    .map_err(OmniError::storage)?;
     Ok(builder
         .with_store_params(store_params)
         .with_commit_handler(handler))

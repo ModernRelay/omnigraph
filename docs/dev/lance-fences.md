@@ -835,6 +835,65 @@ absent tokens and unrecognized representations are unchanged.
 `acknowledged_publisher_reuses_metadata_in_each_fresh_probe`,
 `publisher_reuses_only_its_exact_bounded_published_rows`
 
+### Pinned manifest resolution
+
+Lance 13 resolves a detached version with no size or ETag
+(`default_resolve_version`), so `Dataset::load_manifest` opens the object
+without a size (on an object store, a HEAD before the read), and a later read
+of its transaction section through that location asks again. A registration
+records the manifest's path, size and ETag when its version is written, and a
+manifest object is written once with a put-if-absent and never rewritten.
+
+An open that keeps no read cache
+(`instrumentation::open_pinned_dataset_at_recorded_manifest`, behind
+`open_dataset_entry_at_recorded_manifest`: a read pinned to a commit) owns a
+session that caches nothing and installs `lance_clone::pinned_commit_handler`,
+whose `resolve_version_location` returns that recorded location
+(`TableVersionMetadata::recorded_manifest`) for the one version whose V2
+manifest path the recorded path ends with at a path-component boundary;
+another version, dataset, branch or naming scheme, and a row without both size
+and ETag, resolve through Lance.
+
+Lance keeps the resolved location on the dataset, so a dataset opened this way
+reports the recorded size and ETag, not the store's, and passes the pin's
+witness check (`TableVersionMetadata::witnesses`) for any ETag the row holds.
+The change feed's and the Blob read's re-opens of a named branch, which make
+that check, open through `open_dataset_entry` instead, where a detached
+version reports no ETag and the transaction uuid decides. Only those re-opens
+make it: a table on no named branch cannot be deleted and recreated at its
+path, its manifest is written once, and the pinned open already checks a
+twin's transaction, so `TableStore::open_at_entry_verified` and `read_blob_at`
+check nothing there. `RecordedManifest`,
+`pinned_commit_handler` and `recorded_manifest` are crate-private to
+`omnigraph-core`, and the catalog opener to `omnigraph-catalog`; the core
+opener stays `pub` for the catalog, so
+`forbidden_apis.rs::recorded_manifest_open_call_counts_are_pinned` pins its
+one caller.
+
+An open on a session that caches metadata (the handle cache,
+`TableStore::open_at_entry`) never takes the recorded location either:
+`Dataset::get_manifest` caches a manifest whose size it knows, no public call
+evicts it, and a cached manifest would answer for a version `cleanup`
+reclaimed. Lance's trailing-magic check catches a wrong size. A manifest
+missing at a known size fails as `lance::Error::IO` rather than
+`DatasetNotFound`, so `instrumentation::open_dataset` repeats a failed
+recorded open through Lance's resolution, and reclaimed history keeps
+`HistoricalVersionReclaimed`; the repeat follows every failure, so one the
+recorded location cannot cause (throttling, a timeout, auth) costs a second
+full open with the store's own retries. Keep the handler while Lance's
+resolver needs a request to learn a manifest's size.
+
+**Owners:**
+`lance_clone::tests::pinned_open_resolves_the_recorded_manifest_issue_1250`
+(no HEAD, nothing cached across opens, a stale size, an old row, the recorded
+ETag the opened dataset reports, and the IO error a missing manifest gets at a
+known size), `forbidden_apis.rs::recorded_manifest_open_call_counts_are_pinned`
+(the opener's one caller),
+`point_in_time.rs::historical_read_of_reclaimed_version_is_typed` (the
+repeat), `write_cost_s3.rs::pinned_read_sends_no_manifest_head_on_s3_issue_1250`
+(on demand against an S3 store), the `ReadPinnedHop` rows of the DST
+storage-cost golden
+
 ### Packed catalog record
 
 Since stamp v12 the `__manifest` record fields are one `Struct` column with

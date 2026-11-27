@@ -1,0 +1,1 @@
+- A read pinned to a commit no longer asks the store for each table manifest's size before reading it, so it sends one request fewer per table it opens.

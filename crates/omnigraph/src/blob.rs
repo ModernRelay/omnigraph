@@ -1519,14 +1519,19 @@ impl Omnigraph {
                     cell.type_name, cell.property
                 )));
             }
-        }
-        if !entry.version_metadata.witnesses(&dataset) {
-            return Err(OmniError::blob_integrity(format!(
-                "selected dataset for {} type '{}' opened a different Lance manifest incarnation at published dataset version {}",
-                entity_label(cell.entity),
-                cell.type_name,
-                expected_table_version
-            )));
+            // Only a named-branch re-open, through Lance's resolution, is a witness.
+            // Like the change feed (`TableStore::open_at_entry_verified`), a read of a
+            // table on no named branch makes no check: its path carries its incarnation,
+            // its manifest is written once, and `open_pin` already checks a twin's
+            // transaction. Its open at a commit also reports the pin's own identity.
+            if !entry.version_metadata.witnesses(&dataset) {
+                return Err(OmniError::blob_integrity(format!(
+                    "selected dataset for {} type '{}' opened a different Lance manifest incarnation at published dataset version {}",
+                    entity_label(cell.entity),
+                    cell.type_name,
+                    expected_table_version
+                )));
+            }
         }
 
         let field = dataset.schema().field(&cell.property).ok_or_else(|| {
