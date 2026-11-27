@@ -3912,6 +3912,85 @@ impl Case {
         );
         Ok(())
     }
+
+    /// Every `load csv` source spelled as a URI, in step order; a `--- csv`
+    /// section's name once [`Case::materialize_csv_fixtures`] rewrote it.
+    pub fn load_sources(&self) -> Vec<&str> {
+        self.items
+            .iter()
+            .flat_map(|item| match item {
+                Item::Step(step) => std::slice::from_ref(step).iter(),
+                Item::Loop { steps, .. } => steps.iter(),
+            })
+            .filter_map(|step| match step {
+                Step::Control(ControlStep {
+                    write: ControlWrite::Load { stmt, .. },
+                    ..
+                }) if stmt.source.contains("://") => Some(stmt.source.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The external Blob policy a build of this case's own sources needs: the
+    /// `--- csv` base [`Case::materialize_csv_fixtures`] recorded, plus one
+    /// embedded-only base per directory a `load csv` step reads by URI, a
+    /// `file://` directory in its canonical spelling (so one directory under
+    /// two spellings is one base). A base inside another is dropped, since a
+    /// policy refuses two that overlap. `None` when the case has neither a
+    /// `--- csv` section nor a URI source. For a builder that trusts the case's sources, such as a
+    /// benchmark fixture build, which installs it on the first handle and sets
+    /// it as [`Case::external_blob_policy`] so a `--- restart` reopens with
+    /// it; the GQT runner installs only the `--- csv` base, so a case still
+    /// pins what a graph without a policy refuses.
+    pub fn source_policy(&self) -> Result<Option<omnigraph::ExternalBlobPolicy>, String> {
+        let mut bases = self
+            .external_blob_policy
+            .as_ref()
+            .map_or_else(Vec::new, |policy| policy.bases().to_vec());
+        for source in self.load_sources() {
+            let directory = source_directory(source)?;
+            let base = omnigraph::ExternalBlobBase::new(
+                &directory,
+                omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+            )
+            .map_err(|error| format!("`load csv \"{source}\"`: {error}"))?;
+            bases.push(base);
+        }
+        if bases.is_empty() {
+            return Ok(None);
+        }
+        bases.sort_by(|left, right| left.uri().cmp(right.uri()));
+        bases.dedup_by(|later, kept| later.uri().starts_with(kept.uri()));
+        omnigraph::ExternalBlobPolicy::allow(bases)
+            .map(Some)
+            .map_err(|error| format!("source policy: {error}"))
+    }
+}
+
+/// The directory a `load csv` URI source reads from, as a base URI ending in
+/// `/`: cut after the last `/` past the authority (a query holding `/` cuts
+/// there); a `file://` directory canonical, so two spellings are one base and a missing one is refused.
+fn source_directory(source: &str) -> Result<String, String> {
+    let authority_end = source
+        .find("://")
+        .map(|at| at + "://".len())
+        .ok_or_else(|| format!("`load csv \"{source}\"`: not a URI"))?;
+    let path_cut = source[authority_end..]
+        .rfind('/')
+        .map(|at| authority_end + at + 1)
+        .ok_or_else(|| format!("`load csv \"{source}\"`: the URI has no path"))?;
+    let directory = &source[..path_cut];
+    let Some(local) = directory.strip_prefix("file://") else {
+        return Ok(directory.to_string());
+    };
+    let canonical = std::path::Path::new(local)
+        .canonicalize()
+        .map_err(|error| format!("`load csv \"{source}\"`: {error}"))?;
+    let canonical = canonical
+        .to_str()
+        .ok_or_else(|| format!("`load csv \"{source}\"`: the directory is not UTF-8"))?;
+    Ok(format!("file://{}/", canonical.trim_end_matches('/')))
 }
 
 fn normalize_number(n: &serde_json::Number) -> String {

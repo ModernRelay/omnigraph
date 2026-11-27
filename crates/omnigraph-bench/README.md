@@ -144,6 +144,20 @@ qualified XFS uses verified plain copies. Both restore the exact original
 active path so Lance shallow-branch references remain valid. Relocatable
 entries also use this conservative stable-path policy.
 
+A fixture's own `load csv` steps read under a policy the build installs from the
+fixture: every `--- csv` section is written beside the build and read through one
+`file://` base, and every source spelled as a URI (`file://`, `s3://`) is
+allowed through an embedded-only base over its directory, one per directory, a
+base inside another dropped; a `--- restart` inside the fixture reopens with the
+same policy. An `s3://` source is read with the credentials the build's child
+process can see, the machine's instance role, since that process's environment
+carries no `AWS_*` variable. The build trusts the fixture's sources the way it trusts its
+schema, and a source's bytes are not part of the recipe's identity: a changed
+file under the same URI is the catalog author's to version (the lab keeps each
+dataset version under its own prefix with its digest). A graph the engine
+serves keeps its own policy, and the GQT runner installs only the `--- csv`
+base, so a corpus case still pins what a graph without a policy refuses.
+
 `dataset build <dataset.gqt>` builds without a measured workload. Optional
 `--queries <queries.gqt>` contributes index requirements; `dataset build
 <case.yaml>` uses that case's exact union. Indexes are prepared with the seed
