@@ -779,6 +779,64 @@ async fn selected_read_restart_mutation_branch_and_single_load_use_engine_receip
         assert!(sample.merge.is_none());
     }
 }
+/// A fixture's `load csv` steps read under a policy the build installs: a
+/// `--- csv` section written beside the build, a `file://` source, and a second
+/// one after a `--- restart` that reopens with the same policy; all three load.
+#[tokio::test]
+async fn an_authored_fixture_loads_its_csv_sections_and_uri_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let entry = directory.path().canonicalize().unwrap();
+    let sources = entry.join("sources");
+    std::fs::create_dir(&sources).unwrap();
+    std::fs::write(sources.join("more.csv"), "key,val\nc,3\n").unwrap();
+    std::fs::write(sources.join("after.csv"), "key,val\nd,4\n").unwrap();
+    let fixture = format!(
+        "# issue: none\n# notes: Seed rows, a section, a file source and a second one after a restart.\n\n\
+         --- runner\ntimeout_ms: 60000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n\
+         --- schema\nnode Item {{ key: String @key val: I64 }}\n\n\
+         --- seed\n{{\"type\":\"Item\",\"data\":{{\"key\":\"a\",\"val\":1}}}}\n\n\
+         --- csv people.csv\nkey,val\nb,2\n\n\
+         --- mutate\nload csv \"people.csv\" into node:Item mode append header\n--- expect ok\n\n\
+         --- mutate\nload csv \"file://{sources}/more.csv\" into node:Item mode append header\n--- expect ok\n\n\
+         --- restart\n\n\
+         --- mutate\nload csv \"file://{sources}/after.csv\" into node:Item mode append header\n--- expect ok\n",
+        sources = sources.display()
+    );
+    let fixture_path = entry.join("fixture.gqt");
+    std::fs::write(&fixture_path, fixture).unwrap();
+    let plan = DatasetBuildPlan {
+        dataset: DatasetRecipe::Gqt {
+            source: read_source(&fixture_path).unwrap(),
+        },
+        index_queries: None,
+        recipe_sha256: "0".repeat(64),
+        environment: recorded_environment(),
+        reset: crate::case::ResetMode::LocalClonefile,
+        needs_indices: false,
+    };
+    let active = entry.join("active");
+    let scratch = entry.join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let (logical, _) =
+        crate::dataset_worker::build_dataset(&plan, active.to_str().unwrap(), &scratch, None)
+            .await
+            .unwrap();
+    assert!(
+        scratch.join("people.csv").is_file(),
+        "the section is written beside the build"
+    );
+    let main = logical
+        .branches
+        .iter()
+        .find(|branch| branch.name == "main")
+        .unwrap();
+    let items = main
+        .node_tables
+        .iter()
+        .find(|table| table.name == "Item")
+        .unwrap();
+    assert_eq!(items.rows, 4, "{logical:?}");
+}
 /// `repetitions` of `plan` on `kind` as the run loop prepares them: a
 /// restored route gets a verified copy of the frozen template, read-through
 /// an empty `active`. The template's bytes are checked after each one.

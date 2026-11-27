@@ -1,0 +1,1 @@
+- `omnigraph-bench` builds a fixture whose steps `load csv` from a `--- csv` section or a `file://` or `s3://` URI; before, the graph had no external Blob policy and every source was denied.
