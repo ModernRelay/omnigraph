@@ -1,0 +1,257 @@
+# issue: none
+# notes: `optional { p }` keeps every outer row: a row with matches once per
+# notes: match, a row with none once, the names the optional introduces null
+# notes: on it and nullable in the result (`Correlate(R, Union(p,
+# notes: Project(Filter(Env, ¬ exists p), nulls)))`). A `where` after it filters the
+# notes: joined rows, a filter inside it decides only the matches, and a
+# notes: traversal from a name it introduces belongs inside it: written after
+# notes: it, the traversal would drop the rows it pads (`T90`). A write
+# notes: group's selection runs it too. A `let` inside it is a column of its
+# notes: matches: null on a row with none, whatever its value reads.
+# notes: An inline read or a called read holding an `optional` keeps it.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+node City {
+    slug: String @key
+}
+edge WorksAt: Person -> Company
+edge Knows: Person -> Person
+edge LocatedIn: Company -> City
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":25}}
+{"type":"Person","data":{"handle":"cy","name":"Cy","age":41}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Company","data":{"slug":"bolt","name":"Bolt"}}
+{"type":"City","data":{"slug":"oslo"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"ada","to":"bolt"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"Knows","from":"ada","to":"bob"}
+{"edge":"Knows","from":"cy","to":"ada"}
+{"edge":"LocatedIn","from":"acme","to":"oslo"}
+
+--- query
+query employers() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.handle, $c.slug } }
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"bolt","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+c.slug: String?
+
+--- query
+query filtered_inside() { match { $p: Person, optional { $c: Company, $p worksAt $c where $c.slug = "bolt" } } return { $p.handle, $c.name } }
+
+--- expect unordered
+{"c.name":"Bolt","p.handle":"ada"}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+c.name: String?
+
+--- query
+query filtered_after() { match { $p: Person, optional { $c: Company, $p worksAt $c } } where $c is null or $c.slug = "bolt" return { $p.handle, $c.slug } }
+
+--- expect unordered
+{"c.slug":"bolt","p.handle":"ada"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+c.slug: String?
+
+--- query
+query friend_employers() { match { $p: Person, optional { $f: Person, $p knows $f }, $f worksAt $c } return { $p.handle, $f.handle, $c.slug } }
+
+--- expect error: type error: T90: `$f worksAt $c` reads `$f` outside the `optional` that introduces it
+
+--- query
+query friend_employers() { match { $p: Person, optional { $f: Person, $p knows $f, $c: Company, $f worksAt $c } } return { $p.handle, $f.handle, $c.slug } }
+
+--- expect unordered
+{"c.slug":"acme","f.handle":"ada","p.handle":"cy"}
+{"c.slug":"acme","f.handle":"bob","p.handle":"ada"}
+{"c.slug":"bolt","f.handle":"ada","p.handle":"cy"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+f.handle: String?
+c.slug: String?
+
+--- query
+query nested() { match { $p: Person, optional { $c: Company, $p worksAt $c, optional { $t: City, $c locatedIn $t } } } return { $p.handle, $c.slug, $t.slug } }
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada","t.slug":"oslo"}
+{"c.slug":"bolt","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob","t.slug":"oslo"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+c.slug: String?
+t.slug: String?
+
+--- query
+query counted() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.handle, count($c) as employers } }
+
+--- expect unordered
+{"employers":2,"p.handle":"ada"}
+{"employers":1,"p.handle":"bob"}
+{"employers":0,"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+employers: I64
+
+
+--- mutate
+query unemployed_age() {
+  match { $p: Person, optional { $c: Company, $p worksAt $c } } where $c is null
+  update $p set { age: 0 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query ages() { match { $p: Person } return { $p.handle, $p.age } }
+
+--- expect unordered
+{"p.age":36,"p.handle":"ada"}
+{"p.age":25,"p.handle":"bob"}
+{"p.age":0,"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+p.age: I32?
+
+--- query
+query employer_names() {
+    match { $p: Person, optional { $c: Company, $p worksAt $c, let $n = $c.name } }
+    return { $p.handle, $n }
+}
+
+--- expect unordered
+{"n":"Acme","p.handle":"ada"}
+{"n":"Bolt","p.handle":"ada"}
+{"n":"Acme","p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+n: String?
+
+--- query
+query employed_tags() {
+    match { $p: Person, optional { $c: Company, $p worksAt $c, let $tag = concat($p.name, "@"), let $one = 1 } }
+    return { $p.handle, $tag, $one }
+}
+
+--- expect unordered
+{"one":1,"p.handle":"ada","tag":"Ada@"}
+{"one":1,"p.handle":"ada","tag":"Ada@"}
+{"one":1,"p.handle":"bob","tag":"Bob@"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+tag: String?
+one: I64?
+
+--- query
+query acme_or_none() {
+    match {
+        $p: Person,
+        optional { $c: Company, $p worksAt $c, let $n = $c.name where $n = "Acme" },
+        let $label = coalesce($n, "none"),
+    }
+    return { $p.handle, $label }
+}
+
+--- expect unordered
+{"label":"Acme","p.handle":"ada"}
+{"label":"Acme","p.handle":"bob"}
+{"label":"none","p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+label: String
+
+--- query
+query hundred_over_friend_age() {
+    match { $p: Person, optional { $q: Person, $p knows $q, let $r = 100 / $q.age } }
+    return { $p.handle, $r }
+}
+
+--- expect unordered
+{"p.handle":"ada","r":4}
+{"p.handle":"bob"}
+{"p.handle":"cy","r":2}
+
+--- expect shape
+p.handle: String
+r: I32?
+
+--- query
+query employers_through_an_inline_read() {
+    match {
+        from { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p, $c } },
+    }
+    return { $p.handle, $c.slug }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"bolt","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+c.slug: String?
+
+--- query
+query employment() {
+    match { $p: Person, optional { $c: Company, $p worksAt $c } }
+    return { $p, $c }
+}
+query employers_through_a_call() {
+    match { from employment() }
+    return { $p.handle, $c.slug }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"bolt","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+c.slug: String?

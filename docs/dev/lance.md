@@ -155,6 +155,11 @@ its test owners. The rules an unrelated change breaks most easily:
   ([index coverage](lance-fences.md#index-coverage)), and a lagging index is
   rebuilt whole, never extended with a delta segment
   ([index segments](lance-fences.md#index-segments)).
+- No query reads a full-text index; the exact lexical scan answers every
+  lexical call. A segment qualifies only through a certificate whose measured
+  analyzer fingerprint this binary reproduces, so a Lance or analyzer
+  dependency change shows as a refusal, never as different terms
+  ([full-text compatibility](lance-fences.md#full-text-compatibility)).
 - A red `lance_surface_guards` test is a required design review, not a test
   to weaken.
 

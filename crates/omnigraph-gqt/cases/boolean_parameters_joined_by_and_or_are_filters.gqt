@@ -19,9 +19,8 @@ node Person {
 {"type":"Person","data":{"slug":"a"}}
 
 --- query
-set engine = v2;
 query conjunction($a: Bool, $b: Bool) {
-    match { $p: Person  $a and $b }
+    match { $p: Person } where $a and $b
     return { $p.slug }
 }
 
@@ -35,9 +34,8 @@ query conjunction($a: Bool, $b: Bool) {
 p.slug: String
 
 --- query
-set engine = v2;
 query conjunction_with_a_false_side($a: Bool, $b: Bool) {
-    match { $p: Person  $a and $b }
+    match { $p: Person } where $a and $b
     return { $p.slug }
 }
 
@@ -50,9 +48,8 @@ query conjunction_with_a_false_side($a: Bool, $b: Bool) {
 p.slug: String
 
 --- query
-set engine = v2;
 query disjunction($a: Bool, $b: Bool) {
-    match { $p: Person  $a or $b }
+    match { $p: Person } where ($a or $b)
     return { $p.slug }
 }
 

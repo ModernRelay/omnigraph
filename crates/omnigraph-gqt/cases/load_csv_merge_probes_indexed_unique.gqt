@@ -38,7 +38,7 @@ p000008,108
 p000009,109
 
 --- mutate
-load csv "people.csv" into node:Person mode merge header
+load csv "people.csv" into node:Person mode replace header
 --- expect ok
 --- expect plan
 load route: pipeline

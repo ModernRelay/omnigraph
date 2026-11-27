@@ -1,0 +1,128 @@
+# issue: none
+# notes: A node an `optional` introduces is null on the rows where it matched nothing, and a triple
+# notes: from, or to, a null end yields no row. Written outside the `optional`, such a triple would
+# notes: drop those rows and turn the outer join into an inner one, so it is `T90`, whose fix moves
+# notes: it inside the `optional`. Inside an `optional`, a hop that reaches nothing pads the row:
+# notes: a later `optional` from the null node, from it over a range, or to it keeps every outer row,
+# notes: and so does one `optional` of two hops whose first or second hop is missing. First found by
+# notes: the generated engine-equals-reference law (law_engine_reference.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p0: I64?
+}
+edge Rel0: A -> A
+
+--- seed
+{"type":"A","data":{"k":"a","p0":0}}
+{"type":"A","data":{"k":"b","p0":1}}
+{"type":"A","data":{"k":"c"}}
+{"type":"A","data":{"k":"d"}}
+{"type":"A","data":{"k":"e","p0":5}}
+{"edge":"Rel0","from":"a","to":"c","data":{}}
+{"edge":"Rel0","from":"c","to":"b","data":{}}
+{"edge":"Rel0","from":"b","to":"b","data":{}}
+{"edge":"Rel0","from":"e","to":"d","data":{}}
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where $n2.p0 is null }, $n2 $k4:rel0 $n5 }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect error: type error: T90: `$n2 $k4:rel0 $n5` reads `$n2` outside the `optional` that introduces it
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where $n2.p0 is null }, $n2 rel0{1,2} $n5 }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect error: type error: T90: `$n2 rel0{1,2} $n5` reads `$n2` outside the `optional` that introduces it
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where $n2.p0 is null }, $n5 rel0 $n2 }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect error: type error: T90: `$n5 rel0 $n2` reads `$n2` outside the `optional` that introduces it
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where $n2.p0 is null }, optional { $n5: A, $n2 $k4:rel0 $n5 } }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect unordered
+{"a":"a","b":"c","c":"b"}
+{"a":"b"}
+{"a":"c"}
+{"a":"d"}
+{"a":"e","b":"d"}
+
+--- expect shape
+a: String
+b: String?
+c: String?
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where $n2.p0 is null }, optional { $n5: A, $n2 rel0{1,2} $n5 } }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect unordered
+{"a":"a","b":"c","c":"b"}
+{"a":"b"}
+{"a":"c"}
+{"a":"d"}
+{"a":"e","b":"d"}
+
+--- expect shape
+a: String
+b: String?
+c: String?
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2 where $n2.p0 is null }, optional { $n5: A, $n5 rel0 $n2 } }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect unordered
+{"a":"a","b":"c","c":"a"}
+{"a":"b"}
+{"a":"c"}
+{"a":"d"}
+{"a":"e","b":"d","c":"e"}
+
+--- expect shape
+a: String
+b: String?
+c: String?
+
+--- query
+query q() {
+  match { $n1: A, optional { $n2: A, $n1 rel0 $n2, $n5: A, $n2 rel0 $n5 } }
+  return { $n1.k as a, $n2.k as b, $n5.k as c }
+}
+
+--- expect unordered
+{"a":"a","b":"c","c":"b"}
+{"a":"b","b":"b","c":"b"}
+{"a":"c","b":"b","c":"b"}
+{"a":"d"}
+{"a":"e"}
+
+--- expect shape
+a: String
+b: String?
+c: String?

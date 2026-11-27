@@ -5,7 +5,7 @@
 //! frontier and warm CSR; only legacy plans probe index coverage again.
 
 use omnigraph_compiler::ir::{IRExpr, ValidateCheck};
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +94,45 @@ pub const HASH_JOIN_RATIO: u64 = 8;
 /// The hash join holds its build side twice plus the hash table, so the build
 /// side may take at most one part in this many of the memory pool.
 pub const HASH_JOIN_POOL_DIVISOR: u64 = 4;
+
+/// How an exact `bm25` `Score` scores its population. `OnePass` keeps, as
+/// its corpus pass reads the field, each matching document's identity,
+/// token count and alternatives (the match table), scores them after the
+/// pass and gives a row its score by identity. `TwoPass` keeps nothing per
+/// document: the corpus pass counts only the statistics, then the
+/// population's own text is read again by identity and analyzed row by
+/// row. The plan declares `TwoPass` as the fallback of `OnePass`; the run
+/// takes it when the match table would outgrow [`bm25_match_table_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bm25Pass {
+    OnePass,
+    TwoPass,
+}
+
+impl Bm25Pass {
+    /// The side a run may take instead of `self`: `two_pass` under a
+    /// `one_pass`, nothing under a `two_pass`.
+    pub fn declared_fallback(self) -> Option<Self> {
+        match self {
+            Self::OnePass => Some(Self::TwoPass),
+            Self::TwoPass => None,
+        }
+    }
+}
+
+/// The one-pass `bm25`'s match table may hold at most one part in this many
+/// of the memory pool, as a hash join's build side does: past it the score
+/// falls back to its two-pass side.
+pub const BM25_TABLE_POOL_DIVISOR: u64 = 4;
+
+/// The bytes an exact `bm25`'s match table may hold under a query pool of
+/// `pool` bytes, the plan's recorded memory limit: a quarter. The planner
+/// declares it as the `Score` node's `retained_limit`; the operator switches
+/// to its two-pass side when the next matching document would pass it.
+pub fn bm25_match_table_bytes(pool: u64) -> u64 {
+    (pool / BM25_TABLE_POOL_DIVISOR).max(1)
+}
 
 /// A query's return-only columns are fetched by row address for the rows a
 /// root `limit` keeps once the binding's table holds more than this many
@@ -365,19 +404,19 @@ fn bounded_property<'a>(
 ) -> Option<(&'a str, u64)> {
     let (left, op, right) = filter.comparison_parts()?;
     fn constant(expr: &IRExpr) -> bool {
-        match expr {
+        omnigraph_compiler::stack::deep(|| match expr {
             IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
             IRExpr::Cast { expr, .. } => constant(expr),
             _ => false,
-        }
+        })
     }
     fn list_len(expr: &IRExpr, source: &dyn PlanSource) -> Option<usize> {
-        match expr {
+        omnigraph_compiler::stack::deep(|| match expr {
             IRExpr::Literal(Literal::List(items), _) => Some(items.len()),
             IRExpr::Param(name, _) => source.list_parameter_len(name),
             IRExpr::Cast { expr, .. } => list_len(expr, source),
             _ => None,
-        }
+        })
     }
     let of_binding = |expr: &'a IRExpr| match expr {
         IRExpr::PropAccess {
@@ -480,13 +519,20 @@ fn estimate_rows_over(
         | LogicalNode::Sort { input, .. }
         | LogicalNode::Ordered { input, .. }
         | LogicalNode::RowDiff { input, .. }
-        | LogicalNode::TextSearch { input, .. }
-        | LogicalNode::RankFuse { input, .. }
         | LogicalNode::AntiJoin { input, .. }
+        | LogicalNode::OptionalJoin { input, .. }
+        | LogicalNode::TargetCut { input, .. }
+        | LogicalNode::Score { input, .. }
+        | LogicalNode::Let { input, .. }
         | LogicalNode::Aggregate { input, .. } => estimate_rows(plan, *input, source),
         LogicalNode::Limit { input, rows, .. } | LogicalNode::Page { input, rows, .. } => {
             Some(estimate_rows(plan, *input, source)?.min(*rows as u64))
         }
+        LogicalNode::Correlate { .. } => None,
+        // At most every target of every arm.
+        LogicalNode::Fuse { arms, .. } => arms.iter().try_fold(0u64, |total, arm| {
+            Some(total.saturating_add(estimate_rows(plan, arm.input, source)?))
+        }),
         LogicalNode::Nearest { input, k, .. } => {
             let input_rows = estimate_rows(plan, *input, source)?;
             Some(k.map_or(input_rows, |k| k.min(input_rows)))
@@ -496,6 +542,10 @@ fn estimate_rows_over(
                 .saturating_mul(estimate_rows(plan, *right, source)?),
         ),
         LogicalNode::OuterReference { .. } => outer_rows,
+        LogicalNode::Union { left, right, .. } => Some(
+            estimate_rows(plan, *left, source)?
+                .saturating_add(estimate_rows(plan, *right, source)?),
+        ),
         LogicalNode::MergeClassify { .. } => None,
         LogicalNode::CsvSource { spec } => Some(spec.estimated_rows),
         LogicalNode::DeltaSource { spec } => Some(spec.rows),
@@ -993,7 +1043,7 @@ mod cast_bound_tests {
             ty: ty(ScalarType::I64),
         };
         let constant = IRExpr::Cast {
-            expr: Box::new(IRExpr::Literal(Literal::Float(1.0), ty(ScalarType::F64))),
+            expr: Box::new(IRExpr::Literal(Literal::Integer(1), ty(ScalarType::I32))),
             ty: ty(ScalarType::I64),
         };
         let filter = IRExpr::comparison(property.clone(), CompOp::Eq, constant);

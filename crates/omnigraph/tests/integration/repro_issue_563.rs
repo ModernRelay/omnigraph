@@ -51,22 +51,21 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 const RANKED_JOIN_QUERY: &str = r#"
 query recall_join($q: String) {
     match {
-        $c: Chunk
-        $c chunkOfArtifact $a
-        search($c.text, $q)
+      let $pop = { match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where match_terms($c.text, terms($q, mode: any)) return { $c, $a } },
+      from bm25($pop, $c.text, $q) as $score,
     }
     return { $c.slug, $a.slug, $a.name }
-    order { bm25($c.text, $q) }
+    order { $score desc }
     limit 20
 }
 
 query recall_no_join($q: String) {
     match {
-        $c: Chunk
-        search($c.text, $q)
+      let $pop = { match { $c: Chunk } where match_terms($c.text, terms($q, mode: any)) return { $c } },
+      from bm25($pop, $c.text, $q) as $score,
     }
     return { $c.slug }
-    order { bm25($c.text, $q) }
+    order { $score desc }
     limit 20
 }
 "#;
@@ -115,7 +114,7 @@ async fn ranked_read_with_join_returns_top_limit_issue_563() {
             "{{\"type\":\"Chunk\",\"data\":{{\"slug\":\"chunk-{c:05}\",\"text\":\"needle563 {filler}\"}}}}\n"
         ));
         if (c + 1) % LOAD_BATCH_ROWS == 0 || c + 1 == CHUNKS {
-            db.load_jsonl(&chunk_batch, LoadMode::Append).await.unwrap();
+            db.load_jsonl(&chunk_batch, LoadMode::Insert).await.unwrap();
             chunk_batch.clear();
         }
     }
@@ -131,14 +130,14 @@ async fn ranked_read_with_join_returns_top_limit_issue_563() {
             edge_rows += 1;
             // 8,192-keyed-entity write cap: flush well under it.
             if edge_rows == 4_000 {
-                db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
+                db.load_jsonl(&edges, LoadMode::Insert).await.unwrap();
                 edges.clear();
                 edge_rows = 0;
             }
         }
     }
     if edge_rows > 0 {
-        db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
+        db.load_jsonl(&edges, LoadMode::Insert).await.unwrap();
     }
 
     db.ensure_indices_as(None).await.unwrap();

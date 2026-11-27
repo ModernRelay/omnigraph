@@ -31,36 +31,37 @@ edge WorksAt: Person -> Company @card(1..)
 
 --- mutate
 query hire_without_employer() {
-    insert Person { name: "bob" }
+    replace Person { name: "bob" }
 }
 
 --- expect error: @card violation on edge WorksAt: source 'bob' has 0 edges (min 1)
 
 --- mutate
 query hire_two_with_one_employer() {
-    insert Person { name: "bob" }
-    insert Person { name: "carol" }
-    insert WorksAt { from: "carol", to: "acme" }
+    replace Person { name: "bob" }
+    replace Person { name: "carol" }
+    insert WorksAt { @src: "carol", @dst: "acme" }
 }
 
 --- expect error: @card violation on edge WorksAt: source 'bob' has 0 edges (min 1)
 
 --- mutate
 query hire_with_employer() {
-    insert Person { name: "bob" }
-    insert WorksAt { from: "bob", to: "acme" }
+    replace Person { name: "bob" }
+    insert WorksAt { @src: "bob", @dst: "acme" }
 }
 
 --- expect affected: nodes=1 edges=1
 
 --- mutate
 query retitle() {
-    update Person set { title: "cto" } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { title: "cto" }
 }
 
 --- expect affected: nodes=1 edges=0
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Person

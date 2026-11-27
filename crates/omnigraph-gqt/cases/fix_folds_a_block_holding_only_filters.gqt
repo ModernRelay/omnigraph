@@ -1,0 +1,74 @@
+# issue: none
+# notes: GQ 2 text whose blocks hold only filters, or only re-mention the outer binding: each block tests the
+# notes: row it is written on. `lint --fix` writes the scalar the block folds to (`exists` to `coalesce(φ, false)`,
+# notes: `count` to `if(…, 1, 0)`, `sum` to the value as `F64`), and its rewrite answers as GQ 2 did. The hand
+# notes: rewrite is crates/omnigraph-gqt/cases/fix_folds_a_block_holding_only_filters.gqt.
+
+# notes: The hand rewrite of crates/omnigraph-gqt/gq-2/fix_folds_a_block_holding_only_filters.gqt, each step the text `lint --fix
+# notes: --review-fixes` writes for the GQ 2 step: the same rows, which the Cross-Version Comparison
+# notes: checks against GQ 2, and the same typed IR, which the lint-fix GQ 2 proof checks.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Tag {
+    name: String @key
+    count: I32?
+}
+
+--- seed
+{"type":"Tag","data":{"name":"a","count":5}}
+{"type":"Tag","data":{"name":"b","count":1}}
+{"type":"Tag","data":{"name":"c"}}
+
+--- query
+query counted() {
+  match { $t: Tag } where if(coalesce($t.count > 2, false), 1, 0) != 0
+  return { $t.name }
+}
+
+--- expect unordered
+{"t.name":"a"}
+
+--- expect shape
+t.name: String
+
+--- query
+query existing() {
+  match { $t: Tag } where coalesce($t.count > 2, false)
+  return { $t.name }
+}
+
+--- expect unordered
+{"t.name":"a"}
+
+--- expect shape
+t.name: String
+
+--- query
+query summed() {
+  match { $t: Tag } where if(coalesce($t.count > 0, false), cast($t.count, F64), null) > 1
+  return { $t.name }
+}
+
+--- expect unordered
+{"t.name":"a"}
+
+--- expect shape
+t.name: String
+
+--- query
+query rementioned() {
+  match { $t: Tag } where if(($t.name = "b"), 1, 0) > 0
+  return { $t.name }
+}
+
+--- expect unordered
+{"t.name":"b"}
+
+--- expect shape
+t.name: String

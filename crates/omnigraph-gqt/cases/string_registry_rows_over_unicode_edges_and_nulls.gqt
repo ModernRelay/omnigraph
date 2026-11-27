@@ -1,0 +1,257 @@
+# issue: none
+# notes: The registry's String rows (the GQ 3 RFC, section 2). `lower` and `upper` are
+# notes: Unicode case mappings: `ß` uppercases to `SS`, `İ` lowercases to `i` and a
+# notes: combining dot, a word-final capital sigma lowercases to `ς`. `trim`, `ltrim` and
+# notes: `rtrim` strip Unicode whitespace (a no-break space, an em space, a tab), never a
+# notes: zero-width space, which is not whitespace. `length` counts Unicode scalar values,
+# notes: not bytes. `left`, `right` and `substring` count characters too; `substring`'s
+# notes: 1-based window is clipped to the string, so a start at or below zero shortens it
+# notes: and a start past the end is empty. A row is null where any argument is null. A
+# notes: negative count or length is `E5`, and a guard written before the row keeps the
+# notes: rows it refuses out; a type error names the row it cannot take.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node S {
+    k: String @key
+    s: String?
+    n: I64?
+    tags: [String]?
+}
+
+--- seed
+{"type":"S","data":{"k":"ascii","s":"Garden Party","n":3}}
+{"type":"S","data":{"k":"empty","s":"","n":0}}
+{"type":"S","data":{"k":"blank","s":"   ","n":2}}
+{"type":"S","data":{"k":"uniws","s":"  \tmid dle\t  ","n":-1}}
+{"type":"S","data":{"k":"zwsp","s":"​x y​","n":1}}
+{"type":"S","data":{"k":"sharp","s":"Straße","n":5}}
+{"type":"S","data":{"k":"dotted","s":"İstanbul","n":1}}
+{"type":"S","data":{"k":"sigma","s":"ΣΑΣ ΟΔΟΣ","n":4}}
+{"type":"S","data":{"k":"wide","s":"日本語😀ab","n":2,"tags":["x"]}}
+{"type":"S","data":{"k":"nulls"}}
+{"type":"S","data":{"k":"nulln","s":"abc"}}
+
+--- query
+query case_mapping() {
+    match { $x: S }
+    return { $x.k, lower($x.s) as lo, upper($x.s) as up, length(lower($x.s)) as lo_len, length(upper($x.s)) as up_len }
+}
+
+--- expect unordered
+{"lo":"   ","lo_len":3,"up":"   ","up_len":3,"x.k":"blank"}
+{"lo":"","lo_len":0,"up":"","up_len":0,"x.k":"empty"}
+{"lo":"abc","lo_len":3,"up":"ABC","up_len":3,"x.k":"nulln"}
+{"lo":"garden party","lo_len":12,"up":"GARDEN PARTY","up_len":12,"x.k":"ascii"}
+{"lo":"i̇stanbul","lo_len":9,"up":"İSTANBUL","up_len":8,"x.k":"dotted"}
+{"lo":"straße","lo_len":6,"up":"STRASSE","up_len":7,"x.k":"sharp"}
+{"lo":"  \tmid dle\t  ","lo_len":13,"up":"  \tMID DLE\t  ","up_len":13,"x.k":"uniws"}
+{"lo":"σας οδος","lo_len":8,"up":"ΣΑΣ ΟΔΟΣ","up_len":8,"x.k":"sigma"}
+{"lo":"​x y​","lo_len":5,"up":"​X Y​","up_len":5,"x.k":"zwsp"}
+{"lo":"日本語😀ab","lo_len":6,"up":"日本語😀AB","up_len":6,"x.k":"wide"}
+{"x.k":"nulls"}
+
+--- expect shape
+x.k: String
+lo: String?
+up: String?
+lo_len: I64?
+up_len: I64?
+
+--- query
+query trimming() {
+    match { $x: S }
+    return { $x.k, trim($x.s) as t, ltrim($x.s) as lt, rtrim($x.s) as rt, length(trim($x.s)) as t_len }
+}
+
+--- expect unordered
+{"lt":"","rt":"","t":"","t_len":0,"x.k":"blank"}
+{"lt":"","rt":"","t":"","t_len":0,"x.k":"empty"}
+{"lt":"Garden Party","rt":"Garden Party","t":"Garden Party","t_len":12,"x.k":"ascii"}
+{"lt":"Straße","rt":"Straße","t":"Straße","t_len":6,"x.k":"sharp"}
+{"lt":"abc","rt":"abc","t":"abc","t_len":3,"x.k":"nulln"}
+{"lt":"mid dle\t  ","rt":"  \tmid dle","t":"mid dle","t_len":7,"x.k":"uniws"}
+{"lt":"İstanbul","rt":"İstanbul","t":"İstanbul","t_len":8,"x.k":"dotted"}
+{"lt":"ΣΑΣ ΟΔΟΣ","rt":"ΣΑΣ ΟΔΟΣ","t":"ΣΑΣ ΟΔΟΣ","t_len":8,"x.k":"sigma"}
+{"lt":"​x y​","rt":"​x y​","t":"​x y​","t_len":5,"x.k":"zwsp"}
+{"lt":"日本語😀ab","rt":"日本語😀ab","t":"日本語😀ab","t_len":6,"x.k":"wide"}
+{"x.k":"nulls"}
+
+--- expect shape
+x.k: String
+t: String?
+lt: String?
+rt: String?
+t_len: I64?
+
+--- query
+query lengths_and_windows() {
+    match { $x: S }
+    return {
+        $x.k,
+        length($x.s) as len,
+        left($x.s, 2) as l2,
+        right($x.s, 2) as r2,
+        left($x.s, 0) as l0,
+        left($x.s, 100) as l100,
+        right($x.s, 100) as r100,
+        substring($x.s, 2, 3) as s23,
+        substring($x.s, 0, 3) as s03,
+        substring($x.s, -2, 5) as sm25,
+        substring($x.s, 5, 100) as s5,
+        substring($x.s, 100, 2) as s100,
+        substring($x.s, 3, 0) as s30
+    }
+}
+
+--- expect unordered
+{"l0":"","l100":"   ","l2":"  ","len":3,"r100":"   ","r2":"  ","s03":"  ","s100":"","s23":"  ","s30":"","s5":"","sm25":"  ","x.k":"blank"}
+{"l0":"","l100":"","l2":"","len":0,"r100":"","r2":"","s03":"","s100":"","s23":"","s30":"","s5":"","sm25":"","x.k":"empty"}
+{"l0":"","l100":"Garden Party","l2":"Ga","len":12,"r100":"Garden Party","r2":"ty","s03":"Ga","s100":"","s23":"ard","s30":"","s5":"en Party","sm25":"Ga","x.k":"ascii"}
+{"l0":"","l100":"Straße","l2":"St","len":6,"r100":"Straße","r2":"ße","s03":"St","s100":"","s23":"tra","s30":"","s5":"ße","sm25":"St","x.k":"sharp"}
+{"l0":"","l100":"abc","l2":"ab","len":3,"r100":"abc","r2":"bc","s03":"ab","s100":"","s23":"bc","s30":"","s5":"","sm25":"ab","x.k":"nulln"}
+{"l0":"","l100":"  \tmid dle\t  ","l2":"  ","len":13,"r100":"  \tmid dle\t  ","r2":"  ","s03":"  ","s100":"","s23":" \tm","s30":"","s5":"id dle\t  ","sm25":"  ","x.k":"uniws"}
+{"l0":"","l100":"İstanbul","l2":"İs","len":8,"r100":"İstanbul","r2":"ul","s03":"İs","s100":"","s23":"sta","s30":"","s5":"nbul","sm25":"İs","x.k":"dotted"}
+{"l0":"","l100":"ΣΑΣ ΟΔΟΣ","l2":"ΣΑ","len":8,"r100":"ΣΑΣ ΟΔΟΣ","r2":"ΟΣ","s03":"ΣΑ","s100":"","s23":"ΑΣ ","s30":"","s5":"ΟΔΟΣ","sm25":"ΣΑ","x.k":"sigma"}
+{"l0":"","l100":"​x y​","l2":"​x","len":5,"r100":"​x y​","r2":"y​","s03":"​x","s100":"","s23":"x y","s30":"","s5":"​","sm25":"​x","x.k":"zwsp"}
+{"l0":"","l100":"日本語😀ab","l2":"日本","len":6,"r100":"日本語😀ab","r2":"ab","s03":"日本","s100":"","s23":"本語😀","s30":"","s5":"ab","sm25":"日本","x.k":"wide"}
+{"x.k":"nulls"}
+
+--- expect shape
+x.k: String
+len: I64?
+l2: String?
+r2: String?
+l0: String?
+l100: String?
+r100: String?
+s23: String?
+s03: String?
+sm25: String?
+s5: String?
+s100: String?
+s30: String?
+
+--- query
+query null_in_every_position() {
+    match { $x: S } where $x.k in ["nulls", "nulln", "ascii"]
+    return {
+        $x.k,
+        left($x.s, $x.n) as l,
+        right($x.s, $x.n) as r,
+        substring($x.s, $x.n, 2) as s_start,
+        substring($x.s, 1, $x.n) as s_len,
+        substring("abcdef", $x.n, $x.n) as s_both,
+        lower($x.s) as lo,
+        trim($x.s) as t,
+        length($x.s) as len
+    }
+}
+
+--- expect unordered
+{"l":"Gar","len":12,"lo":"garden party","r":"rty","s_both":"cde","s_len":"Gar","s_start":"rd","t":"Garden Party","x.k":"ascii"}
+{"len":3,"lo":"abc","t":"abc","x.k":"nulln"}
+{"x.k":"nulls"}
+
+--- expect shape
+x.k: String
+l: String?
+r: String?
+s_start: String?
+s_len: String?
+s_both: String?
+lo: String?
+t: String?
+len: I64?
+
+--- query
+query left_negative_count() {
+    match { $x: S } return { $x.k, left($x.s, $x.n) as l }
+}
+
+--- expect error: E5
+
+--- query
+query right_negative_count() {
+    match { $x: S } return { $x.k, right($x.s, $x.n) as r }
+}
+
+--- expect error: E5
+
+--- query
+query substring_negative_length() {
+    match { $x: S } return { $x.k, substring($x.s, 1, $x.n) as s }
+}
+
+--- expect error: E5
+
+--- query
+query negative_count_in_where() {
+    match { $x: S } where left($x.s, $x.n) = "Ga"
+    return { $x.k }
+}
+
+--- expect error: E5
+
+--- query
+query guard_before_the_row() {
+    match { $x: S } where $x.n >= 0 and left($x.s, $x.n) = "Gar"
+    return { $x.k }
+}
+
+--- expect unordered
+{"x.k":"ascii"}
+
+--- expect shape
+x.k: String
+
+--- query
+query guard_inside_if() {
+    match { $x: S }
+    return { $x.k, if($x.n >= 0, right($x.s, $x.n), "") as r }
+}
+
+--- expect unordered
+{"r":"  ","x.k":"blank"}
+{"r":"","x.k":"empty"}
+{"r":"","x.k":"nulln"}
+{"r":"","x.k":"nulls"}
+{"r":"","x.k":"uniws"}
+{"r":"ab","x.k":"wide"}
+{"r":"l","x.k":"dotted"}
+{"r":"rty","x.k":"ascii"}
+{"r":"traße","x.k":"sharp"}
+{"r":"ΟΔΟΣ","x.k":"sigma"}
+{"r":"​","x.k":"zwsp"}
+
+--- expect shape
+x.k: String
+r: String
+
+--- query
+query length_over_a_list() {
+    match { $x: S } return { length($x.tags) as n }
+}
+
+--- expect error: T7: `length` counts a String's characters; a list's elements are `size`
+
+--- query
+query lower_over_a_number() {
+    match { $x: S } return { lower($x.n) as v }
+}
+
+--- expect error: T7: `lower` takes a String, got I64?
+
+--- query
+query left_with_a_float_count() {
+    match { $x: S } return { left($x.s, 1.5) as v }
+}
+
+--- expect error: T7: `left`'s count is an I64, I32 or U32, got F64

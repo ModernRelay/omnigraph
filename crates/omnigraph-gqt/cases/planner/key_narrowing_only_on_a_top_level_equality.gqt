@@ -1,0 +1,116 @@
+# issue: none
+# traversal: auto
+# notes: narrow_key walks top-level conjuncts only; a key equality under or/not, a != comparison, or an and nested inside an or is never narrowed, and two key equalities stay a conjunction whichever comes first. A negative literal before the key equality is no term that can fail, so it does not keep the equality out of the scan.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alpha","age":11}}
+{"type":"Person","data":{"slug":"beta","age":22}}
+{"type":"Person","data":{"slug":"gamma","age":33}}
+
+--- query
+query either() {
+    match { $p: Person } where ($p.slug = "alpha" or $p.slug = "beta")
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":11}
+{"p.age":22}
+--- expect shape
+p.age: I32
+--- expect plan
+not pass key_to_id
+
+--- query
+query nested() {
+    match { $p: Person } where (($p.slug = "alpha" and $p.age = 11) or $p.slug = "gamma")
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":11}
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+not pass key_to_id
+
+--- query
+query negated() {
+    match { $p: Person } where not $p.slug = "alpha"
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":22}
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+not pass key_to_id
+
+--- query
+query unequal() {
+    match { $p: Person } where $p.slug != "alpha"
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":22}
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+not pass key_to_id
+
+--- query
+query contradictory() {
+    match { $p: Person } where $p.slug = "alpha" and $p.slug = "beta"
+    return { $p.age }
+}
+--- expect unordered
+
+--- expect shape
+p.age: I32
+
+--- query
+query contradictory_reversed() {
+    match { $p: Person } where $p.slug = "beta" and $p.slug = "alpha"
+    return { $p.age }
+}
+--- expect unordered
+
+--- expect shape
+p.age: I32
+
+--- query
+query repeated() {
+    match { $p: Person } where $p.slug = "alpha" and $p.slug = "alpha"
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":11}
+--- expect shape
+p.age: I32
+--- expect plan
+pass key_to_id
+
+--- query
+query after_a_negative_literal() {
+    match { $p: Person } where $p.age > -1 and $p.slug = "beta"
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":22}
+--- expect shape
+p.age: I32
+--- expect plan
+pass key_to_id

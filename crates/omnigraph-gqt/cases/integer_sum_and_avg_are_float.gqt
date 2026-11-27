@@ -46,7 +46,7 @@ teams: I64
 
 --- expect plan
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
-aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate mean: avg(I64?) exact_integer round_to_nearest -> F64?
 aggregate n: count(Person) count error -> I64?
 aggregate distinct_n: count(distinct Person) count error -> I64?
 aggregate teams: count(distinct String) count error -> I64?
@@ -69,15 +69,13 @@ n: I64
 
 --- expect plan
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
-aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate mean: avg(I64?) exact_integer round_to_nearest -> F64?
 aggregate n: count(Person) count error -> I64?
 
 --- query
 query totals_of_nobody() {
-    match {
-        $p: Person
-        $p.name = "nobody"
-    }
+    match { $p: Person }
+    where $p.name = "nobody"
     return { count($p) as n, sum($p.age) as total, avg($p.age) as mean }
 }
 
@@ -91,7 +89,7 @@ mean: F64?
 
 --- expect plan
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
-aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
+aggregate mean: avg(I64?) exact_integer round_to_nearest -> F64?
 aggregate n: count(Person) count error -> I64?
 
 --- query

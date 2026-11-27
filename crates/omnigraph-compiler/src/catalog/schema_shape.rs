@@ -14,10 +14,12 @@ use sha2::{Digest, Sha256};
 
 use super::schema_ir::{SYSTEM_COLUMNS_LEGACY, SYSTEM_COLUMNS_META, SystemColumns};
 use crate::error::{CompilerError, Result};
+use crate::schema::analysis::FullTextAnalysis;
 use crate::schema::ast::{
     Annotation, Cardinality, Constraint, InterfacePropertyOrigin, PropDecl, SchemaDecl, SchemaFile,
     rename_from_annotation,
 };
+use crate::schema::vector::VectorDistance;
 use crate::types::PropType;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +138,16 @@ pub struct PropertyShape {
     pub annotations: Vec<Annotation>,
     pub property_constraints: Vec<PropertyConstraintShape>,
     pub embed_source: Option<EmbedSourceShape>,
+    /// The analysis its `@index(fulltext, ...)` declares beyond GQ 2's.
+    /// Absent from the serialized shape when GQ 2's, so a GQ 2
+    /// schema keeps its shape hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_text: Option<FullTextAnalysis>,
+    /// The distance a vector declares beyond `l2`. Absent from the
+    /// serialized shape for `l2`, written or omitted, so a GQ 2 schema
+    /// keeps its shape hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<VectorDistance>,
     /// True only when this effective property was written in the node body.
     /// Interface and edge properties are declarations and therefore true.
     pub declared_directly: bool,
@@ -404,7 +416,9 @@ fn property_shape(property: &PropDecl, declared_directly: bool) -> Result<Proper
         .filter_map(|annotation| match annotation.name.as_str() {
             "key" if annotation.value.is_none() => Some(PropertyConstraintShape::Key),
             "unique" if annotation.value.is_none() => Some(PropertyConstraintShape::Unique),
-            "index" if annotation.value.is_none() => Some(PropertyConstraintShape::Index),
+            "index" if crate::schema::analysis::is_property_index_annotation(annotation) => {
+                Some(PropertyConstraintShape::Index)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -431,6 +445,8 @@ fn property_shape(property: &PropDecl, declared_directly: bool) -> Result<Proper
         annotations: canonical_annotations(&property.annotations),
         property_constraints,
         embed_source,
+        full_text: crate::schema::analysis::declared_analysis(&property.annotations),
+        distance: property.distance.and_then(VectorDistance::declared),
         declared_directly,
         satisfies_interface_properties: Vec::new(),
     })

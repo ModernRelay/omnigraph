@@ -1888,7 +1888,7 @@ async fn apply_optimize_table_effects(
     let base = work.initial_snapshot;
     let witness = work.witness;
     let source_bytes = work.source_bytes;
-    let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key);
+    let declared_full_text = super::table_ops::declared_full_text_columns(catalog, &table_key)?;
     fail(&OPTIMIZE_BEFORE_COMPACT)?;
     // Links committed for the table: each moves its published version by one.
     let mut links = 0_u64;
@@ -2058,7 +2058,7 @@ async fn stage_fold_link(
     db: &Omnigraph,
     tip: &crate::storage_layer::SnapshotHandle,
     witness: &crate::table_store::StagingWitness,
-    declared_full_text: &[String],
+    declared_full_text: &[crate::storage_layer::FullTextColumn],
     budget: &crate::table_store::MaintenanceBudget,
     skipped_folds: &mut Vec<(String, String)>,
 ) -> Result<Option<CommittedLink>> {
@@ -2087,7 +2087,7 @@ async fn stage_build_link(
     tip: &crate::storage_layer::SnapshotHandle,
     pending_indexes: &mut Vec<super::PendingIndex>,
     witness: &crate::table_store::StagingWitness,
-    declared_full_text: &[String],
+    declared_full_text: &[crate::storage_layer::FullTextColumn],
     budget: &crate::table_store::MaintenanceBudget,
 ) -> Result<Option<CommittedLink>> {
     fail(&OPTIMIZE_BEFORE_INDEX_LINK)?;
@@ -3420,7 +3420,8 @@ mod tests {
     /// #1384: optimize takes every heavy step of the tables it stages, each
     /// compaction task, index fold and index build, through its run's one
     /// budget of `concurrency.rewrite` steps. Two tables each have one
-    /// compaction task, an identity BTREE to fold and a vector index to build.
+    /// compaction task, an identity and a key BTREE to fold and a vector index
+    /// to build.
     /// The first two steps rendezvous so serialized work times out. A build
     /// outside the shared budget is missing from the step count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3440,7 +3441,7 @@ mod tests {
         db.load_jsonl(
             r#"{"type":"Person","data":{"name":"seed"}}
 {"type":"Company","data":{"name":"seed"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -3450,7 +3451,7 @@ mod tests {
             for type_name in ["Person", "Company"] {
                 db.load_jsonl(
                     &format!("{{\"type\":\"{type_name}\",\"data\":{{\"name\":\"{name}\",\"embedding\":[1.0,2.0]}}}}"),
-                    LoadMode::Merge,
+                    LoadMode::Replace,
                 )
                 .await
                 .unwrap();
@@ -3490,8 +3491,8 @@ mod tests {
         }
         assert_eq!(
             probes.entered(),
-            6,
-            "one compaction task, one fold and one index build per table, each within the budget"
+            8,
+            "one compaction task, two folds (the identity and key BTREEs) and one index build per table, each within the budget"
         );
         assert_eq!(
             probes.peak_in_flight(),
@@ -3513,7 +3514,7 @@ mod tests {
         db.load_jsonl(
             "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\"}}\n\
              {\"type\":\"Company\",\"data\":{\"name\":\"Acme\"}}",
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();

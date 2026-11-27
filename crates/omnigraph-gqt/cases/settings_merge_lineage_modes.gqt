@@ -27,7 +27,7 @@ set merge_lineage = off;
 --- mutate
 set merge_lineage = verify;
 query add() {
-    insert Person { name: "bob", age: 40 }
+    replace Person { name: "bob", age: 40 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -41,7 +41,8 @@ show merge_lineage;
 --- mutate
 reset all;
 query birthday() {
-    update Person set { age: 33 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 33 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -55,7 +56,7 @@ show merge_lineage;
 --- mutate
 set merge_lineage = on;
 query missing_key() {
-    insert Person { age: 99 }
+    replace Person { age: 99 }
 }
 
 --- expect error: T12
@@ -102,28 +103,32 @@ branch create target_verify;
 
 --- mutate branch: source
 query update_source() {
-    update Person set { age: 31 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: target_off
 query update_target() {
-    update Person set { age: 41 } where name = "bob"
+    match { $x: Person } where $x.name = "bob"
+    update $x set { age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: target_on
 query update_target() {
-    update Person set { age: 41 } where name = "bob"
+    match { $x: Person } where $x.name = "bob"
+    update $x set { age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: target_verify
 query update_target() {
-    update Person set { age: 41 } where name = "bob"
+    match { $x: Person } where $x.name = "bob"
+    update $x set { age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0

@@ -12,7 +12,7 @@ node Person {
 {"type":"Person","data":{"name":"alice"}}
 --- mutate
 query propose() as commit {
-    insert Person { name: "bob" }
+    replace Person { name: "bob" }
 }
 --- expect ok
 --- bind commit $c

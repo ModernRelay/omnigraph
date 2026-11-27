@@ -26,14 +26,14 @@ edge Knows: Person -> Person
 
 --- mutate
 query w() {
-    insert Person { id: 500, code: 900 }
-    insert Person { id: 501, code: 901 }
-    insert Knows { from: "500", to: "501" }
+    replace Person { id: 500, code: 900 }
+    replace Person { id: 501, code: 901 }
+    insert Knows { @src: "500", @dst: "501" }
 }
 --- expect ok
 
 --- query
-query n_knows() { match { $a: Person $a knows $b } return { count($b) as n } }
+query n_knows() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n":1}
 

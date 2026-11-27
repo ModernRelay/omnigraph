@@ -1,0 +1,120 @@
+# issue: none
+# notes: An assignment copies a Blob read from its group's row in `update`, `insert`, `upsert` and `replace`: from a node, from an edge
+# notes: whose binding matches two edge types, from a node an `optional` introduces, and under `coalesce` and `if`.
+# notes: The rows the copies select are read back by their other properties, compared with the reference interpreter;
+# notes: the bytes themselves are read back by the engine test `writes.rs::blob_read_from_a_row_copies_the_cell_its_row_selects`.
+# notes: Two rows giving one entity two different Blobs are `E4`, named without their bytes. A String read from a row and
+# notes: assigned to a Blob is the Blob's input spelling, so an external URI there passes the graph's external Blob policy,
+# notes: which this graph's default refuses. A Blob is no read value: a `let` binding one is `T24`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    content: Blob?
+    note: String?
+}
+edge Feeds: Doc -> Doc {
+    content: Blob?
+}
+edge Mirrors: Doc -> Doc {
+    content: Blob?
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","content":"base64:AQID","note":"first"}}
+{"type":"Doc","data":{"slug":"b","content":"base64:BAUG","note":"s3://assets/external/file.bin"}}
+{"type":"Doc","data":{"slug":"c","note":"third"}}
+{"type":"Doc","data":{"slug":"d","content":"base64:BwgJ"}}
+{"edge":"Feeds","from":"a","to":"c","data":{"content":"base64:CgsM"}}
+{"edge":"Mirrors","from":"b","to":"d","data":{"content":"base64:DQ4P"}}
+
+--- mutate
+query copy_across_edges() {
+    match { $s: Doc, $s $e:(feeds | mirrors) $t }
+    update $t set { content: $e.content }
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+query copy_each_statement() {
+    match { $s: Doc } where $s.slug = "a"
+    insert Doc { slug: "a-inserted", content: $s.content, note: $s.note }
+    upsert Doc { slug: "a-upserted", content: $s.content, note: $s.note }
+    replace Doc { slug: "a-replaced", content: $s.content, note: $s.note }
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- mutate
+query copy_through_optional_and_coalesce() {
+    match { $t: Doc, optional { $s: Doc, $s feeds $t } }
+    where $t.slug = "a" or $t.slug = "c"
+    update $t set { content: coalesce($s.content, $t.content), note: concat($t.slug, "-kept") }
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- mutate
+query copy_under_if() {
+    match { $s: Doc, $t: Doc } where $s.slug = "d" and $t.slug = "c"
+    upsert Doc { slug: "d-copy", content: if($s.note is null, $s.content, $t.content), note: "copied" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query copies() {
+    match { $d: Doc }
+    return { $d.slug, $d.note }
+    order { $d.slug }
+}
+
+--- expect ordered
+{"d.slug": "a", "d.note": "a-kept"}
+{"d.slug": "a-inserted", "d.note": "first"}
+{"d.slug": "a-replaced", "d.note": "first"}
+{"d.slug": "a-upserted", "d.note": "first"}
+{"d.slug": "b", "d.note": "s3://assets/external/file.bin"}
+{"d.slug": "c", "d.note": "c-kept"}
+{"d.slug": "d"}
+{"d.slug": "d-copy", "d.note": "copied"}
+
+--- expect shape
+d.slug: String
+d.note: String?
+
+--- mutate
+query two_blobs_for_one_doc() {
+    match { $s: Doc, $t: Doc } where $t.slug = "c" and ($s.slug = "a" or $s.slug = "b")
+    update $t set { content: $s.content }
+}
+
+--- expect error: `two_blobs_for_one_doc`: the rows of statement 1 of group 1 give Doc `c` two different Blob values for `content`
+
+--- mutate
+query string_row_value_is_a_blob_uri() {
+    match { $x: Doc } where $x.slug = "b"
+    update $x set { content: $x.note }
+}
+
+--- expect error: external blob URI 's3://assets/external/file.bin' is not allowed: new external Blob URI ingress is denied for this graph
+
+--- query
+query blob_bound_by_let() {
+    match { $d: Doc, let $b = $d.content }
+    return { $d.slug }
+}
+
+--- expect error: T24: Blob property `d.content` is not a read value

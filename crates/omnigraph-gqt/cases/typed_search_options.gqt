@@ -1,6 +1,9 @@
 # issue: none
 # notes: Supplied search options must fit their API range; only absent options use defaults.
-# notes: Nullable query and option parameters refuse null before search execution.
+# notes: Nullable query and option parameters refuse null before search execution. An `rrf` `k:`
+# notes: parameter is refused outside 1..=1000000 as the read runs, both bounds admitted.
+# notes: The `rrf` arms differ only in repeating the term, since identical arms are a type error; both select the one Doc.
+# notes: A `nearest` window written as a fourth positional argument is `T71`, its fix naming it `k:`.
 
 --- runner
 timeout_ms: 10000
@@ -11,7 +14,7 @@ environments:
 --- schema
 node Doc {
     key: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
     embedding: Vector(2)
 }
 
@@ -19,9 +22,8 @@ node Doc {
 {"type":"Doc","data":{"key":"a","text":"needle","embedding":[1.0,0.0]}}
 
 --- query
-set engine = v2;
 query omitted_nullable_fuzzy_option($edits: I64?) {
-    match { $d: Doc fuzzy($d.text, "needle", $edits) }
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: $edits))
     return { $d.key }
 }
 --- params
@@ -29,31 +31,28 @@ query omitted_nullable_fuzzy_option($edits: I64?) {
 --- expect error: search option must resolve to a non-null integer
 
 --- query
-set engine = v2;
 query negative_fuzzy_option($edits: I64) {
-    match { $d: Doc fuzzy($d.text, "needle", $edits) }
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: $edits))
     return { $d.key }
 }
 --- params
 {"edits":-1}
---- expect error: fuzzy max_edits must fit U32
+--- expect error: T71: `max_edits: -1` is outside 0..=2
 
 --- query
-set engine = v2;
 query oversized_fuzzy_option($edits: U64) {
-    match { $d: Doc fuzzy($d.text, "needle", $edits) }
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: $edits))
     return { $d.key }
 }
 --- params
 {"edits":4294967296}
---- expect error: fuzzy max_edits must fit U32
+--- expect error: T71: `max_edits: 4294967296` is outside 0..=2
 
 --- query
-set engine = v2;
 query null_rrf_option($k: I64?) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
-    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    order { $score desc }
     limit 1
 }
 --- params
@@ -61,35 +60,57 @@ query null_rrf_option($k: I64?) {
 --- expect error: search option must resolve to a non-null integer
 
 --- query
-set engine = v2;
 query zero_rrf_option($k: I64) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
-    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    order { $score desc }
     limit 1
 }
 --- params
 {"k":0}
---- expect error: rrf k must be greater than 0 and fit U32
+--- expect error: rrf k must be an integer in 1..=1000000
 
 --- query
-set engine = v2;
 query oversized_rrf_option($k: U64) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
-    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    order { $score desc }
     limit 1
 }
 --- params
 {"k":4294967296}
---- expect error: rrf k must be greater than 0 and fit U32
+--- expect error: rrf k must be an integer in 1..=1000000
 
 --- query
-set engine = v2;
-query typed_rrf_option($k: U32) {
-    match { $d: Doc }
+query bound_rrf_option($k: I64) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
-    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    order { $score desc }
+    limit 1
+}
+--- params
+{"k":1000001}
+--- expect error: rrf k must be an integer in 1..=1000000, got 1000001
+
+--- query
+query largest_rrf_option($k: I64) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
+    return { $d.key }
+    order { $score desc }
+    limit 1
+}
+--- params
+{"k":1000000}
+--- expect unordered
+{"d.key":"a"}
+--- expect shape
+d.key: String
+
+--- query
+query typed_rrf_option($k: U32) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
+    return { $d.key }
+    order { $score desc }
     limit 1
 }
 --- params
@@ -100,9 +121,8 @@ query typed_rrf_option($k: U32) {
 d.key: String
 
 --- query
-set engine = v2;
 query null_search_query($q: String?) {
-    match { $d: Doc search($d.text, $q) }
+    match { $d: Doc } where match_terms($d.text, terms($q, mode: any))
     return { $d.key }
 }
 --- params
@@ -110,11 +130,10 @@ query null_search_query($q: String?) {
 --- expect error: search query must resolve to a non-null String
 
 --- query
-set engine = v2;
 query null_bm25_query($q: String?) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
     return { $d.key }
-    order { bm25($d.text, $q) }
+    order { $score desc }
     limit 1
 }
 --- params
@@ -122,13 +141,23 @@ query null_bm25_query($q: String?) {
 --- expect error: search query must resolve to a non-null String
 
 --- query
-set engine = v2;
 query null_nearest_query($q: Vector(2)?) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.key }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 1
 }
 --- params
 {"q":null}
 --- expect error: nearest query must resolve to a non-null String or numeric vector
+
+--- query
+query positional_window($q: Vector(2)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, 1) as $distance }
+    return { $d.key }
+}
+
+--- params
+{"q": [1.0, 0.0]}
+
+--- expect error: T71: `nearest`'s window is the option `k:`

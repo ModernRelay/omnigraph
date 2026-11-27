@@ -27,11 +27,11 @@ branch create b
 --- expect ok
 
 --- mutate branch: b
-query add_node() { insert Person { id: 100 } }
+query add_node() { replace Person { id: 100 } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b
-query add_edge() { insert Knows { from: "0", to: "100" } }
+query add_edge() { insert Knows { @src: "0", @dst: "100" } }
 --- expect affected: nodes=0 edges=1
 
 --- mutate
@@ -39,7 +39,7 @@ branch merge b
 --- expect outcome: fast_forward
 
 --- query
-query merged() { match { $a: Person $a knows $b } return { count($b) as n } }
+query merged() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n": 1}
 --- expect shape

@@ -32,7 +32,7 @@ node Person {
 
 const QUERY: &str = r#"
 query find_person($name: String) {
-  match { $p: Person { name: $name } }
+  match { $p: Person } where $p.name = $name
   return { $p.name, $p.age }
 }
 "#;
@@ -99,7 +99,7 @@ async fn offline_fixture() -> tempfile::TempDir {
     session
         .load_jsonl(
             r#"{"type":"Person","data":{"name":"Ada","age":37}}"#,
-            omnigraph::loader::LoadMode::Merge,
+            omnigraph::loader::LoadMode::Replace,
         )
         .await
         .unwrap();

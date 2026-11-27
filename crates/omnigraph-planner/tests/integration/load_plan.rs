@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use omnigraph_compiler::ir::{ValidateCheck, lower_load};
-use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+use omnigraph_compiler::query::file::{LoadStmt, LoadStmtMode, LoadTarget};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{SYSTEM_COLUMNS_V3, build_catalog};
 use omnigraph_planner::optimizer::resolve;
@@ -175,7 +175,7 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
         ]
     );
     let document = explain.to_value();
-    assert_eq!(document["explain_version"], 8);
+    assert_eq!(document["explain_version"], 9);
     assert!(document["logical_plan_initial"].is_object());
     assert_eq!(document["route"], "engine");
     assert_eq!(document["operation"]["kind"], "load");
@@ -497,8 +497,8 @@ fn endpoint_checks_without_consulted_statistics_probe_only_for_an_overwrite() {
     for (mode, source_bytes, expected) in [
         (LoadStmtMode::Overwrite, within, ValidateAccess::Probe),
         (LoadStmtMode::Overwrite, past, ValidateAccess::Probe),
-        (LoadStmtMode::Append, past, ValidateAccess::Scan),
-        (LoadStmtMode::Merge, past, ValidateAccess::Scan),
+        (LoadStmtMode::Insert, past, ValidateAccess::Scan),
+        (LoadStmtMode::Replace, past, ValidateAccess::Scan),
     ] {
         let op = operation(LoadTarget::Edge("Knows".into()), mode, source_bytes);
         let decision = route(&op, &source(), RouteOverride::Registry, &BOUNDS);
@@ -507,7 +507,7 @@ fn endpoint_checks_without_consulted_statistics_probe_only_for_an_overwrite() {
                 (Some(plan), explain)
             }
             (
-                LoadStmtMode::Append | LoadStmtMode::Merge,
+                LoadStmtMode::Insert | LoadStmtMode::Replace,
                 Decision::Executor {
                     reason,
                     explain,

@@ -23,10 +23,7 @@ node Person {
 
 --- query
 query first_five_pairs() {
-    match {
-        $a: Person
-        $b: Person
-    }
+    match { $a: Person, let $bs = { match { $b: Person } return { $b } }, from $bs }
     return { $a.name, $b.name }
     order { $a.rank asc }
     limit 5

@@ -87,7 +87,8 @@ branch create second
 
 --- mutate branch: second
 query age_alice() {
-    update Person set { age: 31 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0

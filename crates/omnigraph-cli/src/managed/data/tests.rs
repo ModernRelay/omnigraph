@@ -1289,13 +1289,13 @@ crate::operator_routing::test_transport_scope(&[&cp_origin], async {
                 "--data",
                 batch.to_str().unwrap(),
                 "--mode",
-                "append",
+                "insert",
                 "--from",
                 "main",
                 "--branch",
                 "review",
             ],
-            "/graphs/knowledge/load/ndjson?branch=review&mode=append&from=main",
+            "/graphs/knowledge/load/ndjson?branch=review&mode=insert&from=main",
         ),
         (
             vec!["commit", "list", "--branch", "main"],
@@ -1320,7 +1320,7 @@ crate::operator_routing::test_transport_scope(&[&cp_origin], async {
                         "review",
                         Some("main"),
                         batch.to_str().unwrap(),
-                        crate::cli::CliLoadMode::Append,
+                        crate::cli::CliLoadMode::Insert,
                         &[],
                         &mut Vec::new(),
                     )
@@ -1583,7 +1583,7 @@ fn managed_load_uses_identity_and_keeps_target_preflight() {
         "--data",
         "batch.jsonl",
         "--mode",
-        "append",
+        "insert",
         "--graph",
         "knowledge",
     ];
@@ -1680,7 +1680,7 @@ async fn managed_data_transport_refuses_redirect_and_bounds_body() {
                                 "main",
                                 None,
                                 batch.path().to_str().unwrap(),
-                                crate::cli::CliLoadMode::Append,
+                                crate::cli::CliLoadMode::Insert,
                                 &[],
                                 &mut Vec::new(),
                             )
@@ -1852,7 +1852,7 @@ async fn managed_data_errors_redact_reflected_credentials_including_precondition
                                 "main",
                                 None,
                                 batch.path().to_str().unwrap(),
-                                crate::cli::CliLoadMode::Append,
+                                crate::cli::CliLoadMode::Insert,
                                 &[],
                                 &mut Vec::new(),
                             )
@@ -1934,7 +1934,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
     std::fs::write(&batch, ndjson).unwrap();
     let commit = json!({"graph_commit_id":"head-load","graph_branch":"review","graph_manifest_version":7,"parent_commit_id":"before","merged_parent_commit_id":null,"actor_id":"principal:alice","created_at":12345,"published":true,
         "kind":"published","root_commit_id":null});
-    let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"append","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"embedding_generation":null,"actor_id":"principal:alice","commit":commit});
+    let reply = json!({"branch":"review","base_branch":"main","branch_created":true,"mode":"insert","nodes":[{"name":"Person","entities_loaded":2}],"edges":[],"total_entities":2,"embedding_generation":null,"actor_id":"principal:alice","commit":commit});
     // This is a real response past the ordinary managed 30-second deadline.
     // The request-construction owner separately pins load's 300-second ceiling.
     let server = IntentApiFixture::graph_with_response_delay(
@@ -1954,7 +1954,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
             "--graph",
             "knowledge",
             "--mode",
-            "append",
+            "insert",
             "--branch",
             "review",
             "--from",
@@ -1967,7 +1967,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
                 "review",
                 Some("main"),
                 batch.to_str().unwrap(),
-                crate::cli::CliLoadMode::Append,
+                crate::cli::CliLoadMode::Insert,
                 &[],
                 &mut Vec::new(),
             )
@@ -1985,7 +1985,7 @@ async fn managed_load_sends_exact_ndjson_and_preserves_the_server_receipt() {
         assert_eq!(requests[0].method, "POST");
         assert_eq!(
             requests[0].path,
-            "/graphs/knowledge/load/ndjson?branch=review&mode=append&from=main"
+            "/graphs/knowledge/load/ndjson?branch=review&mode=insert&from=main"
         );
         assert_eq!(requests[0].headers["content-type"], "application/x-ndjson");
         assert_eq!(
@@ -2017,7 +2017,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                     "review",
                     Some("main"),
                     file.path().to_str().unwrap(),
-                    crate::cli::CliLoadMode::Append,
+                    crate::cli::CliLoadMode::Insert,
                     &[],
                     &mut Vec::new(),
                 )
@@ -2033,7 +2033,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                     "review",
                     Some("main"),
                     file.path().to_str().unwrap(),
-                    crate::cli::CliLoadMode::Append,
+                    crate::cli::CliLoadMode::Insert,
                     &[],
                     &mut Vec::new(),
                 )
@@ -2069,7 +2069,7 @@ async fn managed_load_refuses_local_overflow_before_io_and_never_replays_failed_
                             "review",
                             Some("main"),
                             file.path().to_str().unwrap(),
-                            crate::cli::CliLoadMode::Append,
+                            crate::cli::CliLoadMode::Insert,
                             &[],
                             &mut Vec::new(),
                         )

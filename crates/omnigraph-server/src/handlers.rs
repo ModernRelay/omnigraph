@@ -15,7 +15,7 @@ use omnigraph::Session;
 use omnigraph::db::{BranchCreated, MergeResult, SnapshotId};
 use omnigraph::settings::{ChangeLineage, SettingId, SettingValue};
 use omnigraph_compiler::Literal;
-use omnigraph_compiler::query::ast::{
+use omnigraph_compiler::query::file::{
     BranchStmt, EmptyFile, FileBody, MutationWriteMode, QueryDecl, QueryFile, UnattachedBase,
 };
 use tracing::Instrument;
@@ -73,6 +73,7 @@ pub(crate) async fn server_health() -> Json<HealthOutput> {
         version: crate::api::build::reported_version(SERVER_VERSION),
         internal_schema_version: SERVER_INTERNAL_SCHEMA_VERSION,
         source_version: crate::api::build::SOURCE_COMMIT.map(str::to_string),
+        gq_language: Some(omnigraph_compiler::gq_language_version()),
     })
 }
 
@@ -111,6 +112,15 @@ pub(crate) async fn server_ready(
         .filter(|entry| matches!(entry, GraphEntry::Loading(_)))
         .count();
     let blocked_graph_count = served_graph_count - ready_graph_count - loading_graph_count;
+    let unavailable_query_count = entries
+        .iter()
+        .map(|entry| match entry {
+            GraphEntry::Ready(view) | GraphEntry::Transitioning(view) => {
+                api::unavailable_queries(view.handle()).len()
+            }
+            GraphEntry::Loading(_) | GraphEntry::Blocked(_) => 0,
+        })
+        .sum();
     let ready =
         !draining && loading_graph_count == 0 && (served_graph_count == 0 || ready_graph_count > 0);
     let output = ReadinessOutput {
@@ -134,6 +144,7 @@ pub(crate) async fn server_ready(
         ready_graph_count,
         loading_graph_count,
         blocked_graph_count,
+        unavailable_query_count,
         shutdown_grace_seconds: state.shutdown_grace.as_secs(),
     };
     let status = if ready {
@@ -200,6 +211,12 @@ pub(crate) async fn server_graphs_list(
                 GraphEntry::Blocked(graph) => Some(graph.failure),
             };
             let available = !stopping && matches!(entry, GraphEntry::Ready(_));
+            let unavailable_queries = match &entry {
+                GraphEntry::Ready(view) | GraphEntry::Transitioning(view) => {
+                    api::unavailable_queries(view.handle())
+                }
+                GraphEntry::Loading(_) | GraphEntry::Blocked(_) => Vec::new(),
+            };
             GraphInfo {
                 graph_id: entry.key().graph_id.as_str().to_string(),
                 uri: entry.uri().to_string(),
@@ -226,6 +243,7 @@ pub(crate) async fn server_graphs_list(
                         GraphEntry::Blocked(_) => GraphAvailabilityAction::ApplyCorrectionOrRestart,
                     }
                 },
+                unavailable_queries,
             }
         })
         .collect();
@@ -1038,7 +1056,7 @@ pub(crate) fn access_body(
         (status = 400, description = "Bad request - also returned when the query body contains mutations (use POST /mutate, for write queries), when a control write statement (`branch create`, `branch delete`, `branch merge`) arrives here instead of POST /mutate, when a request target accompanies a branch statement, and when a name or parameters accompany a branch statement", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "A full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required), neither cleared by retrying; or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
+        (status = 409, description = "A full-text index requires explicit rebuilding (full_text_index_rebuild_required), which retrying does not clear; or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 424, description = "A load explain could not probe an allowed external source", body = ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`) before a successful response", body = ErrorOutput),
     ),
@@ -2105,7 +2123,7 @@ pub(crate) async fn run_query(
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
     let query_decl = select_named_query_decl(queries, name)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if !query_decl.mutations.is_empty() {
+    if query_decl.is_mutation() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
             query_decl.name
@@ -2345,7 +2363,7 @@ pub(crate) fn parse_optional_invoke_body(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
-        (status = 409, description = "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required), neither cleared by retrying; or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
+        (status = 409, description = "Stored mutation write-authority conflict, a full-text index requires explicit rebuilding (full_text_index_rebuild_required), which retrying does not clear, the stored query fails to compile under this release (stored_query_unavailable, with its diagnostic), or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)", body = ErrorOutput),
         (status = 413, description = "Stored keyed mutation exceeds the per-commit entity or byte ceiling", body = ErrorOutput),
         (status = 424, description = "A stored mutation could not probe or read an allowed external Blob source", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
@@ -2448,6 +2466,15 @@ async fn invoke_stored_query(
 
     GraphGrant::InvokeQuery.authorize(actor_ref, handle.policy.as_deref())?;
 
+    // A stored query whose source fails to compile under this release is
+    // unavailable: its refusal, never a run (the graph serves the others).
+    if let Some(unavailable) = handle
+        .queries
+        .as_ref()
+        .and_then(|registry| registry.lookup_unavailable(&name))
+    {
+        return Err(ApiError::stored_query_unavailable(unavailable));
+    }
     // Resolve against the per-graph registry (same 404 on a miss).
     let stored = handle
         .queries
@@ -2573,7 +2600,11 @@ pub(crate) async fn server_list_queries(
             .collect(),
         None => Vec::new(),
     };
-    Ok(Json(QueriesCatalogOutput { queries }))
+    let unavailable = api::unavailable_queries(&handle);
+    Ok(Json(QueriesCatalogOutput {
+        queries,
+        unavailable,
+    }))
 }
 
 #[utoipa::path(
@@ -2680,7 +2711,7 @@ async fn run_json_load(
 ) -> std::result::Result<IngestOutput, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let from = request.from;
-    let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
+    let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Replace);
     let actor_arc = actor
         .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
@@ -2739,8 +2770,10 @@ async fn run_json_load(
 /// Compatibility-load NDJSON data through a JSON envelope.
 ///
 /// `data` is NDJSON with one record per line. `mode` controls behavior on
-/// existing entities: `merge` upserts by id (default), `append` strictly inserts
-/// absent ids, and `overwrite` replaces type data. Branch creation is opt-in by
+/// existing entities: `replace` writes each record as the whole entity (default),
+/// `upsert` sets the properties a record names, `insert` creates and refuses
+/// an existing id with `key_conflict`, and `overwrite` replaces type data;
+/// `append` and `merge` are refused with their fix. Branch creation is opt-in by
 /// presence of `from`: with `from` set, a missing `branch` is created from
 /// it; without `from`, `branch` must already exist — a missing branch is a
 /// 404, never an implicit fork. **Destructive** when `mode` is `overwrite`
@@ -2837,7 +2870,7 @@ pub(crate) async fn server_load_ndjson(
     let actor = actor.as_ref().map(|Extension(actor)| actor);
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
     let from = query.from;
-    let mode = query.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
+    let mode = query.mode.unwrap_or(omnigraph::loader::LoadMode::Replace);
 
     authorize_load_scope(&handle, actor, &branch, from.as_deref()).await?;
 
@@ -3796,7 +3829,7 @@ pub(crate) async fn server_commit_publish(
         &session,
         actor_ref,
         ingress,
-        omnigraph_compiler::query::ast::CommitWrite::Publish {
+        omnigraph_compiler::query::file::CommitWrite::Publish {
             graph_commit_id: commit_id,
         },
     )
@@ -3846,7 +3879,7 @@ pub(crate) async fn server_commit_drop(
         &session,
         actor_ref,
         ingress,
-        omnigraph_compiler::query::ast::CommitWrite::Drop {
+        omnigraph_compiler::query::file::CommitWrite::Drop {
             graph_commit_id: commit_id,
         },
     )
@@ -3885,7 +3918,7 @@ pub(crate) fn select_named_query_decl(
 }
 
 pub(crate) fn query_params_from_json(
-    query_params: &[omnigraph_compiler::query::ast::Param],
+    query_params: &[omnigraph_compiler::query::file::Param],
     params_json: Option<&Value>,
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)

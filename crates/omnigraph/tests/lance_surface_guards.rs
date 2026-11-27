@@ -4768,6 +4768,539 @@ async fn nearest_scan_stats_report_partitions_searched_and_ranked() {
     );
 }
 
+// --- Guard: IVF_FLAT and the flat kNN honour the declared distance --------
+//
+// A field's declared distance (`Vector(n, distance = ...)`) is the metric its
+// index is built with and every `nearest` scan sets (`ScanTuning::nearest`).
+// Lance's `cosine` is `1 - dot / (norm * norm)` and its `dot` is `1 - dot`,
+// the RFC's values; an IVF_FLAT index built for either returns them exactly
+// (a cosine index normalizes the stored and query vectors, so powers of two
+// keep every value exact). A zero vector leaves cosine undefined: the cosine
+// index leaves it out (`KeepFiniteVectors` after normalizing) and the flat
+// kNN drops its NaN distance, so the index and the scan agree. An explicit
+// metric other than the index's makes the scan flat (`Scanner::create_plan`),
+// so an index built for another distance is never used.
+
+#[tokio::test]
+async fn ivf_flat_and_flat_knn_score_cosine_and_dot_exactly() {
+    use arrow_array::FixedSizeListArray;
+    use arrow_array::types::{Float32Type, Int32Type};
+    use lance::index::vector::VectorIndexParams;
+    use lance_datafusion::exec::ExecutionSummaryCounts;
+    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
+    use lance_linalg::distance::MetricType;
+    use std::sync::Mutex;
+
+    let vectors: [[f32; 4]; 6] = [
+        [1.0, 1.0, 1.0, 1.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [-2.0, -2.0, -2.0, -2.0],
+        [0.0, 0.0, 0.0, -4.0],
+        [2.0, 2.0, 2.0, 2.0],
+    ];
+    let query = Float32Array::from(vec![1.0_f32; 4]);
+    let cases = [
+        (
+            MetricType::Cosine,
+            vec![(0, 0.0), (1, 0.5), (3, 2.0), (4, 1.5), (5, 0.0)],
+        ),
+        (
+            MetricType::Dot,
+            vec![(0, -3.0), (1, 0.0), (2, 1.0), (3, 9.0), (4, 5.0), (5, -7.0)],
+        ),
+    ];
+    for (metric, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("distances.lance");
+        let uri = uri.to_str().unwrap();
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("vector", DataType::FixedSizeList(item.clone(), 4), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..vectors.len() as i32)),
+                Arc::new(FixedSizeListArray::new(
+                    item,
+                    4,
+                    Arc::new(Float32Array::from(vectors.concat())),
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                enable_stable_row_ids: true,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index_builder(
+                &["vector"],
+                IndexType::Vector,
+                &VectorIndexParams::ivf_flat(1, metric),
+            )
+            .name("vector_idx".to_string())
+            .replace(true)
+            .await
+            .unwrap();
+
+        // The `(id, _distance)` rows of one kNN and whether it searched an
+        // IVF partition.
+        let knn = |metric: MetricType, use_index: bool| {
+            let dataset = &dataset;
+            let query = &query;
+            async move {
+                let summary: Arc<Mutex<Option<ExecutionSummaryCounts>>> =
+                    Arc::new(Mutex::new(None));
+                let sink = summary.clone();
+                let mut scanner = dataset.scan();
+                scanner.nearest("vector", query, vectors.len()).unwrap();
+                scanner.distance_metric(metric);
+                scanner.use_index(use_index);
+                scanner.scan_stats_callback(Arc::new(move |counts| {
+                    *sink.lock().unwrap() = Some(counts.clone());
+                }));
+                let batch = scanner.try_into_batch().await.unwrap();
+                let ids = batch["id"].as_primitive::<Int32Type>();
+                let distances = batch["_distance"].as_primitive::<Float32Type>();
+                let mut rows = (0..batch.num_rows())
+                    .map(|row| (ids.value(row), distances.value(row)))
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(|(id, _)| *id);
+                let searched = summary.lock().unwrap().as_ref().is_some_and(|summary| {
+                    summary.all_counts.contains_key(PARTITIONS_SEARCHED_METRIC)
+                });
+                (rows, searched)
+            }
+        };
+        assert_eq!(
+            knn(metric, true).await,
+            (expected.clone(), true),
+            "{metric:?}: the index scores exactly by its metric"
+        );
+        assert_eq!(
+            knn(metric, false).await,
+            (expected.clone(), false),
+            "{metric:?}: the flat kNN scores the same rows exactly"
+        );
+        // Another explicit metric never uses the index: the scan is flat and
+        // scores by the metric it was asked for.
+        let (l2, searched) = knn(MetricType::L2, true).await;
+        assert!(
+            !searched,
+            "{metric:?}: an L2 scan must not search a {metric:?} index"
+        );
+        assert_eq!(
+            l2,
+            vec![(0, 0.0), (1, 3.0), (2, 4.0), (3, 36.0), (4, 28.0), (5, 4.0)],
+            "{metric:?}"
+        );
+    }
+}
+
+// --- Guard: a profile's filters run in Lance's fixed order ---
+//
+// A full-text profile becomes `InvertedIndexParams` booleans, and Lance 13's
+// `InvertedIndexParams::build` applies them in one order: token length,
+// lowercase, stemmer, stop words, ASCII folding. `english_v1`'s stop list
+// holds each stop word's stem because the stemmer runs first, and folding
+// after stemming keeps `résumés` apart from `resumes`. A Lance release that
+// reorders the filters changes a released profile's tokens and turns this
+// red.
+
+#[test]
+fn inverted_params_lowercase_stem_then_remove_stop_words_then_fold() {
+    use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
+
+    let tokens = |params: &InvertedIndexParams, text: &str| -> Vec<String> {
+        let mut tokenizer: Box<dyn LanceTokenizer> = params.build().unwrap();
+        let mut stream = tokenizer.token_stream_for_doc(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            out.push(stream.token().text.clone());
+        }
+        out
+    };
+    let english = |stop: &str| {
+        InvertedIndexParams::default()
+            .base_tokenizer("simple".to_string())
+            .language("English")
+            .unwrap()
+            .max_token_length(None)
+            .lower_case(true)
+            .stem(true)
+            .remove_stop_words(true)
+            .custom_stop_words(Some(vec![stop.to_string()]))
+            .ascii_folding(true)
+    };
+    // The stop list meets stems: the stem removes `only`, the word does not.
+    assert!(tokens(&english("onli"), "only").is_empty());
+    assert_eq!(tokens(&english("only"), "only"), ["onli"]);
+    // Lowercase comes before the stemmer.
+    assert_eq!(tokens(&english("x"), "RUNNING"), ["run"]);
+    // Folding comes after the stemmer: the accented plural stems to the
+    // accented singular before folding.
+    assert_eq!(tokens(&english("x"), "résumés"), ["resume"]);
+    assert_eq!(tokens(&english("x"), "resumes"), ["resum"]);
+}
+
+// --- Guard: the native configuration is the tokenizer Lance indexes with ---
+//
+// The measured fingerprint a full-text certificate records is the digest of
+// what `InvertedIndexParams::build` emits for a profile's native parameters
+// (`omnigraph_core::fts_analysis::native_params`). That measures the index
+// only while Lance 13's builder tokenizes documents with that tokenizer's
+// document stream (`InvertedIndexBuilder::update_index` calls `params.build()`)
+// and its query path with the same tokenizer's search stream. This guard pins
+// what the tokenizer emits for each profile, a stop word's stem, folding
+// after stemming, no length filter and no NFC included, and that an index
+// built from the parameters holds those tokens and no others: a decomposed
+// accent splits a word in the postings as it does in the tokenizer. A Lance
+// release that tokenizes differently turns this red by name, beside the
+// measured-fingerprint golden.
+
+#[tokio::test]
+async fn native_configuration_tokenizes_as_the_index_builder_does() {
+    use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
+    use omnigraph_compiler::schema::analysis::AnalyzerProfile;
+    use omnigraph_core::fts_analysis::native_params;
+
+    let tokens = |profile: AnalyzerProfile, text: &str| -> Vec<String> {
+        let mut tokenizer: Box<dyn LanceTokenizer> =
+            native_params(profile).unwrap().build().unwrap();
+        let mut paths = Vec::new();
+        for query in [false, true] {
+            let mut stream = if query {
+                tokenizer.token_stream_for_search(text)
+            } else {
+                tokenizer.token_stream_for_doc(text)
+            };
+            let mut out = Vec::new();
+            while stream.advance() {
+                out.push(stream.token().text.clone());
+            }
+            paths.push(out);
+        }
+        assert_eq!(
+            paths[0], paths[1],
+            "{profile} {text:?}: document and query paths"
+        );
+        paths.remove(0)
+    };
+    let long = "x".repeat(41);
+    for (profile, text, expected) in [
+        (
+            AnalyzerProfile::StandardV1,
+            "Runners RUNNING",
+            vec!["runners", "running"],
+        ),
+        (AnalyzerProfile::StandardV1, "Café", vec!["café"]),
+        (
+            AnalyzerProfile::StandardFoldedV1,
+            "Café Œuvre",
+            vec!["cafe", "oeuvre"],
+        ),
+        (
+            AnalyzerProfile::EnglishV1,
+            "Runners were RUNNING",
+            vec!["runner", "run"],
+        ),
+        // `only` stems to `onli`, which the profile's list holds.
+        (
+            AnalyzerProfile::EnglishV1,
+            "only the human beings",
+            vec!["human"],
+        ),
+        (
+            AnalyzerProfile::EnglishV1,
+            "résumés resumes",
+            vec!["resume", "resum"],
+        ),
+        // No length filter, and no NFC: a combining accent splits the word.
+        (
+            AnalyzerProfile::StandardV1,
+            long.as_str(),
+            vec![long.as_str()],
+        ),
+        (
+            AnalyzerProfile::StandardV1,
+            "e\u{301}tude",
+            vec!["e", "tude"],
+        ),
+        (
+            AnalyzerProfile::StandardFoldedV1,
+            "e\u{301}tude",
+            vec!["e", "tude"],
+        ),
+        (
+            AnalyzerProfile::StandardV1,
+            "x\u{2122} vitamin",
+            vec!["x", "vitamin"],
+        ),
+    ] {
+        assert_eq!(tokens(profile, text), expected, "{profile} {text:?}");
+    }
+
+    // The postings hold the tokenizer's tokens: built from the native
+    // parameters over the decomposed text, the index matches `tude` and not
+    // the composed `étude` the profile analyzer would have indexed.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("native.lance");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["decomposed", "composed"])),
+            Arc::new(StringArray::from(vec![
+                "e\u{301}tude one",
+                "\u{e9}tude two",
+            ])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_fts".into()),
+            &native_params(AnalyzerProfile::StandardV1).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+    for (term, expected) in [
+        ("tude", vec!["decomposed"]),
+        ("\u{e9}tude", vec!["composed"]),
+        ("one", vec!["decomposed"]),
+    ] {
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap();
+        scan.full_text_search(FullTextSearchQuery::new(term.into()))
+            .unwrap();
+        let batches: Vec<RecordBatch> = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let ids: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch.column_by_name("id").unwrap().as_string::<i32>();
+                (0..batch.num_rows())
+                    .map(|row| column.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ids, expected, "{term:?}");
+    }
+}
+
+// --- Guard: `distance` scores with the flat kNN's own kernel ---
+//
+// The engine's `distance` operator scores through
+// `DistanceType::arrow_batch_func`, the kernel Lance 13's flat kNN uses
+// (`lance-index` `vector/flat.rs`), so `distance` and an exhaustive `nearest`
+// give one `F32` value per row and order near ties alike. A Lance release
+// whose flat path scores another way turns this red.
+
+#[tokio::test]
+async fn distance_kernel_equals_the_flat_knn_distance_bit_for_bit() {
+    use arrow_array::FixedSizeListArray;
+    use arrow_array::types::{Float32Type, Int32Type};
+    use lance_linalg::distance::MetricType;
+
+    const ROWS: usize = 64;
+    // Not a multiple of the kernels' lane widths, so the tail is summed too.
+    const DIMENSION: usize = 37;
+    let mut state = 0x9e37_79b9_u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state % 2_000) as f32 / 1_000.0 - 1.0
+    };
+    let components: Vec<f32> = (0..ROWS * DIMENSION).map(|_| next()).collect();
+    let query: Vec<f32> = (0..DIMENSION).map(|_| next()).collect();
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let vectors = FixedSizeListArray::new(
+        item.clone(),
+        DIMENSION as i32,
+        Arc::new(Float32Array::from(components)),
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item, DIMENSION as i32),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+            Arc::new(vectors.clone()),
+        ],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("kernel.lance");
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let query = Float32Array::from(query);
+    for metric in [MetricType::L2, MetricType::Cosine, MetricType::Dot] {
+        let kernel = metric.arrow_batch_func()(&query, &vectors).unwrap();
+        let mut scanner = dataset.scan();
+        scanner.nearest("vector", &query, ROWS).unwrap();
+        scanner.distance_metric(metric);
+        scanner.use_index(false);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        let distances = batch["_distance"].as_primitive::<Float32Type>();
+        assert_eq!(batch.num_rows(), ROWS, "{metric:?}");
+        for row in 0..batch.num_rows() {
+            let id = ids.value(row) as usize;
+            assert_eq!(
+                distances.value(row).to_bits(),
+                kernel.value(id).to_bits(),
+                "{metric:?}: row {id}"
+            );
+        }
+    }
+}
+
+// --- Guard: a refined cosine search scores on the stored vectors ---
+//
+// A cosine IVF_FLAT index stores normalized vectors (`lance-index`
+// `vector/ivf.rs`, `NormalizeTransformer`) and searches them under L2. With
+// `refine(1)` Lance re-scores the index's candidates on the stored vectors,
+// so an index-served `_distance` is the flat kNN's value bit for bit and a
+// row's distance does not depend on index coverage.
+
+#[tokio::test]
+async fn refined_cosine_index_search_equals_the_flat_distance_bit_for_bit() {
+    use arrow_array::FixedSizeListArray;
+    use arrow_array::types::{Float32Type, Int32Type};
+    use lance::index::vector::VectorIndexParams;
+    use lance_linalg::distance::MetricType;
+
+    const ROWS: usize = 64;
+    const DIMENSION: usize = 37;
+    let mut state = 0x2545_f491_u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state % 2_000) as f32 / 1_000.0 - 1.0 + 0.0005
+    };
+    let components: Vec<f32> = (0..ROWS * DIMENSION).map(|_| next()).collect();
+    let query = Float32Array::from((0..DIMENSION).map(|_| next()).collect::<Vec<_>>());
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let vectors = FixedSizeListArray::new(
+        item.clone(),
+        DIMENSION as i32,
+        Arc::new(Float32Array::from(components)),
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(item, DIMENSION as i32),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+            Arc::new(vectors.clone()),
+        ],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("cosine.lance");
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index_builder(
+            &["vector"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(1, MetricType::Cosine),
+        )
+        .name("vector_idx".to_string())
+        .replace(true)
+        .await
+        .unwrap();
+    let kernel = MetricType::Cosine.arrow_batch_func()(&query, &vectors).unwrap();
+    let mut scanner = dataset.scan();
+    scanner.nearest("vector", &query, ROWS).unwrap();
+    scanner.distance_metric(MetricType::Cosine);
+    scanner.refine(1);
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch["id"].as_primitive::<Int32Type>();
+    let distances = batch["_distance"].as_primitive::<Float32Type>();
+    assert_eq!(batch.num_rows(), ROWS);
+    for row in 0..batch.num_rows() {
+        let id = ids.value(row) as usize;
+        assert_eq!(
+            distances.value(row).to_bits(),
+            kernel.value(id).to_bits(),
+            "row {id}"
+        );
+    }
+}
+
 // --- Guard: an explicit projection may name `_distance` before `nearest` ---
 //
 // Lance 13 resolves the scoring columns (`_distance`, `_score`) in
@@ -4828,229 +5361,6 @@ async fn nearest_scan_accepts_distance_in_a_projection_set_before_nearest() {
     assert!(
         distances.windows(2).all(|pair| pair[0] <= pair[1]),
         "ascending `_distance`: {distances:?}"
-    );
-}
-
-#[tokio::test]
-async fn fts_scan_accepts_score_in_a_projection_set_before_full_text_search() {
-    use arrow_array::types::Float32Type;
-
-    const ROWS: usize = 12;
-
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().join("score_projection.lance");
-    let uri = uri.to_str().unwrap();
-    let ids: Vec<String> = (0..ROWS).map(|i| format!("d-{i:02}")).collect();
-    let texts: Vec<String> = (0..ROWS)
-        .map(|i| {
-            std::iter::repeat_n("alpha".to_string(), i)
-                .chain(std::iter::once(format!("pad{i}")))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("text", DataType::Utf8, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(ids)),
-            Arc::new(StringArray::from(texts)),
-        ],
-    )
-    .unwrap();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-    let mut dataset = Dataset::write(
-        reader,
-        uri,
-        Some(WriteParams {
-            mode: WriteMode::Create,
-            enable_stable_row_ids: true,
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    dataset
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            None,
-            &InvertedIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
-
-    let mut scanner = dataset.scan();
-    scanner.project(&["id", "_score"]).unwrap();
-    scanner
-        .full_text_search(
-            FullTextSearchQuery::new("alpha".to_string())
-                .with_column("text".to_string())
-                .unwrap(),
-        )
-        .unwrap();
-    let batch = scanner.try_into_batch().await.unwrap();
-
-    assert_eq!(
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| field.name().to_string())
-            .collect::<Vec<_>>(),
-        vec!["id".to_string(), "_score".to_string()],
-        "the explicit projection is the output, scoring column included, text excluded"
-    );
-    assert_eq!(batch.num_rows(), ROWS - 1, "every doc carrying the term");
-    let scores = batch.column(1).as_primitive::<Float32Type>().values();
-    assert!(
-        scores.windows(2).all(|pair| pair[0] >= pair[1]),
-        "descending `_score`: {scores:?}"
-    );
-}
-
-/// The two Lance 13 facts BM25 eligibility placement rests on. Lance scores
-/// the fragments no full-text segment covers flat, counting documents and
-/// tokens over the rows its prefilter admits, so a prefilter changes an
-/// uncovered row's score; with `prefilter(false)` the full-text search
-/// scores the whole corpus and the filter refines its output, so the score is
-/// the unfiltered one. OmniGraph filters a bm25 scan before scoring only under
-/// full coverage (`Eligibility::BeforeScoring`) and runs Lance's postfilter
-/// otherwise. If the first assertion goes red (the flat tail scores from
-/// filter-independent statistics), the placement rule can be dropped.
-#[tokio::test]
-async fn fts_prefilter_changes_unindexed_scores_and_postfilter_keeps_them() {
-    use arrow_array::types::Float32Type;
-
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().join("tail_scores.lance");
-    let uri = uri.to_str().unwrap();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("text", DataType::Utf8, false),
-        Field::new("year", DataType::Int64, false),
-    ]));
-    let batch = |rows: &[(&str, &str, i64)]| {
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(
-                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(
-                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
-                )),
-                Arc::new(arrow_array::Int64Array::from(
-                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
-                )),
-            ],
-        )
-        .unwrap()
-    };
-    let indexed = batch(&[
-        ("d1", "graph engines", 2020),
-        ("d2", "graph search", 2021),
-        ("d3", "databases", 2019),
-    ]);
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(indexed)], schema.clone()),
-        uri,
-        Some(WriteParams {
-            mode: WriteMode::Create,
-            enable_stable_row_ids: true,
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    dataset
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            None,
-            &InvertedIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
-    let tail = batch(&[
-        ("t1", "graph", 2022),
-        (
-            "t2",
-            "graph graph graph graph graph graph graph graph",
-            1990,
-        ),
-    ]);
-    dataset
-        .append(
-            RecordBatchIterator::new(vec![Ok(tail)], schema.clone()),
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                data_storage_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-    let score_of = |batch: &RecordBatch, id: &str| {
-        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
-        let scores = batch
-            .column_by_name("_score")
-            .unwrap()
-            .as_primitive::<Float32Type>();
-        (0..batch.num_rows())
-            .find(|row| ids.value(*row) == id)
-            .map(|row| scores.value(row))
-    };
-    let search = |filter: Option<(&'static str, bool)>| {
-        let dataset = dataset.clone();
-        async move {
-            let mut scanner = dataset.scan();
-            scanner.project(&["id", "_score"]).unwrap();
-            if let Some((filter, prefilter)) = filter {
-                scanner.filter(filter).unwrap();
-                scanner.prefilter(prefilter);
-            }
-            scanner
-                .full_text_search(
-                    FullTextSearchQuery::new("graph".to_string())
-                        .with_column("text".to_string())
-                        .unwrap(),
-                )
-                .unwrap();
-            scanner.try_into_batch().await.unwrap()
-        }
-    };
-    let unfiltered = search(None).await;
-    let prefiltered = search(Some(("year >= 2000", true))).await;
-    let postfiltered = search(Some(("year >= 2000", false))).await;
-    let whole = score_of(&unfiltered, "t1").expect("t1 matches");
-    assert_ne!(
-        score_of(&prefiltered, "t1"),
-        Some(whole),
-        "a prefilter changes the score of a row no full-text segment covers"
-    );
-    assert_eq!(
-        score_of(&postfiltered, "t1"),
-        Some(whole),
-        "a postfilter keeps the whole corpus's score"
-    );
-    assert_eq!(
-        score_of(&postfiltered, "t2"),
-        None,
-        "the postfilter still refines"
-    );
-    assert_eq!(
-        score_of(&prefiltered, "d1"),
-        score_of(&unfiltered, "d1"),
-        "an indexed row scores from the index's statistics either way"
     );
 }
 
@@ -6700,217 +7010,6 @@ async fn stock_lance_nested_clone_preserves_inherited_index_base_issue_7840() {
             .as_primitive::<arrow_array::types::Int32Type>()
             .value(0),
         1
-    );
-}
-
-/// Runtime guard — the rrf prefilter gate's linchpin (PR #587): BM25 scores
-/// come from index-wide statistics (IDF, avgdl), so an id prefilter under
-/// `prefilter(true)` restricts which documents are RANKED but never changes a
-/// surviving document's score, even when the FTS index covers every fragment.
-/// The gate's plan-equivalence claim is derived from exactly this contract.
-///
-/// The fixture is deliberately stats-sensitive where the gate's oracle
-/// fixtures are not: multi-term docs, varying doc lengths, and an eligible
-/// subset whose per-term document frequencies and average length diverge from
-/// the corpus. A Lance regression to filter-dependent scoring (IDF/avgdl
-/// derived from the filtered subset) would move every surviving score and
-/// fail the bit-equality below — a rank-order oracle over symmetric fixtures
-/// cannot see that regression (ragnorc, PR #587 review r1).
-#[tokio::test]
-async fn fts_prefilter_does_not_change_covered_fragment_scores() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().join("guard-fts-prefilter.lance");
-    let uri = uri.to_str().unwrap();
-
-    // (tf_alpha, tf_beta, padding words) per doc. Irregular term profiles and
-    // lengths; d-08/d-09 match neither term but shape the corpus statistics.
-    // The eligible subset below skews both stats channels: alpha is rarer
-    // inside it than in the corpus, and its average length differs.
-    let profiles: [(usize, usize, usize); 10] = [
-        (5, 0, 2),
-        (3, 1, 5),
-        (0, 4, 1),
-        (1, 3, 8),
-        (2, 2, 3),
-        (4, 0, 11),
-        (0, 2, 6),
-        (1, 1, 0),
-        (0, 0, 9),
-        (0, 0, 4),
-    ];
-    let ids: Vec<String> = (0..profiles.len()).map(|i| format!("d-{i:02}")).collect();
-    let texts: Vec<String> = profiles
-        .iter()
-        .enumerate()
-        .map(|(i, &(alpha, beta, pad))| {
-            let mut words: Vec<String> = Vec::new();
-            words.extend(std::iter::repeat_n("alpha".to_string(), alpha));
-            words.extend(std::iter::repeat_n("beta".to_string(), beta));
-            words.extend((0..pad).map(|j| format!("pad{i:02}x{j}")));
-            words.join(" ")
-        })
-        .collect();
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("text", DataType::Utf8, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(ids.clone())),
-            Arc::new(StringArray::from(texts.clone())),
-        ],
-    )
-    .unwrap();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-    let params = WriteParams {
-        mode: WriteMode::Create,
-        enable_stable_row_ids: true,
-        data_storage_version: Some(LanceFileVersion::V2_2),
-        ..Default::default()
-    };
-    let mut dataset = Dataset::write(reader, uri, Some(params)).await.unwrap();
-    // Production shape: inverted index on the text, BTREE on the id (the
-    // gate's `id IN (...)` prefilter resolves through the BTREE).
-    dataset
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            None,
-            &InvertedIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
-    dataset
-        .create_index(
-            &["id"],
-            IndexType::BTree,
-            None,
-            &ScalarIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
-
-    fn scores_by_id(batch: &RecordBatch) -> Vec<(String, f32)> {
-        let ids = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let scores = batch
-            .column_by_name("_score")
-            .expect("an FTS scan autoprojects its `_score` column")
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap();
-        (0..ids.len())
-            .map(|row| (ids.value(row).to_string(), scores.value(row)))
-            .collect()
-    }
-    let fts_query = || {
-        FullTextSearchQuery::new("alpha beta".to_string())
-            .with_column("text".to_string())
-            .unwrap()
-    };
-
-    // Unfiltered ranking over the whole corpus.
-    let mut scan = dataset.scan();
-    scan.full_text_search(fts_query()).unwrap();
-    scan.project(&["id"]).unwrap();
-    let unfiltered: HashMap<String, f32> = scores_by_id(&scan.try_into_batch().await.unwrap())
-        .into_iter()
-        .collect();
-    assert_eq!(unfiltered.len(), 8, "eight docs carry alpha and/or beta");
-
-    // The gate's shape: an id IN-list under prefilter(true). Restricting the
-    // candidates must not re-derive the statistics.
-    let eligible = ["d-00", "d-02", "d-03", "d-05", "d-07"];
-    let mut scan = dataset.scan();
-    scan.full_text_search(fts_query()).unwrap();
-    scan.filter("id IN ('d-00', 'd-02', 'd-03', 'd-05', 'd-07')")
-        .unwrap();
-    scan.prefilter(true);
-    scan.project(&["id"]).unwrap();
-    let filtered = scores_by_id(&scan.try_into_batch().await.unwrap());
-
-    let returned: HashSet<&str> = filtered.iter().map(|(id, _)| id.as_str()).collect();
-    assert_eq!(
-        returned,
-        HashSet::from(eligible),
-        "the prefilter must restrict ranking to exactly the eligible matches \
-         (and all five eligible docs match)"
-    );
-    for (id, filtered_score) in &filtered {
-        let unfiltered_score = unfiltered[id];
-        assert_eq!(
-            filtered_score.to_bits(),
-            unfiltered_score.to_bits(),
-            "prefiltered score for {id} diverged from its unfiltered score \
-             ({filtered_score} vs {unfiltered_score}): BM25 statistics are no \
-             longer index-wide — filter-dependent scoring breaks the rrf \
-             prefilter gate's plan-equivalence claim (exec::query::rrf_prefilter_gate)"
-        );
-    }
-
-    // Stats-sensitivity control: the equality above is only meaningful if
-    // subset-derived statistics WOULD move these scores. A corpus physically
-    // reduced to the eligible docs is exactly what filter-dependent stats
-    // would score against; at least one eligible doc must score differently
-    // there (df and avgdl both shift), or the fixture is too symmetric to
-    // distinguish index-wide from filter-dependent stats and this guard is
-    // vacuous.
-    let subset_uri = dir.path().join("guard-fts-prefilter-subset.lance");
-    let subset_uri = subset_uri.to_str().unwrap();
-    let subset_rows: (Vec<String>, Vec<String>) = ids
-        .iter()
-        .zip(texts.iter())
-        .filter(|(id, _)| eligible.contains(&id.as_str()))
-        .map(|(id, text)| (id.clone(), text.clone()))
-        .unzip();
-    let subset_batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(subset_rows.0)),
-            Arc::new(StringArray::from(subset_rows.1)),
-        ],
-    )
-    .unwrap();
-    let reader = RecordBatchIterator::new(vec![Ok(subset_batch)], schema);
-    let params = WriteParams {
-        mode: WriteMode::Create,
-        enable_stable_row_ids: true,
-        data_storage_version: Some(LanceFileVersion::V2_2),
-        ..Default::default()
-    };
-    let mut subset_dataset = Dataset::write(reader, subset_uri, Some(params))
-        .await
-        .unwrap();
-    subset_dataset
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            None,
-            &InvertedIndexParams::default(),
-            true,
-        )
-        .await
-        .unwrap();
-    let mut scan = subset_dataset.scan();
-    scan.full_text_search(fts_query()).unwrap();
-    scan.project(&["id"]).unwrap();
-    let subset_scores: HashMap<String, f32> = scores_by_id(&scan.try_into_batch().await.unwrap())
-        .into_iter()
-        .collect();
-    assert!(
-        eligible
-            .iter()
-            .any(|id| subset_scores[*id].to_bits() != unfiltered[*id].to_bits()),
-        "every eligible doc scored identically against subset-only statistics — \
-         the fixture cannot detect filter-dependent scoring and this guard is vacuous"
     );
 }
 
@@ -9206,7 +9305,7 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
             .await
             .unwrap(),
     );
-    let merge = omnigraph::loader::LoadMode::Merge;
+    let merge = omnigraph::loader::LoadMode::Replace;
     db.load_with_receipt("main", &row_identity_rows(0..32, 0), merge)
         .await
         .unwrap();
@@ -9281,7 +9380,7 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
 
     db.mutate(
         "main",
-        "query d() { delete Person where name = \"p003\" }",
+        "query d() { match { $x: Person } where $x.name = \"p003\"  delete $x }",
         "d",
         &omnigraph_compiler::ir::ParamMap::new(),
     )
@@ -9766,6 +9865,510 @@ async fn column_patch_keeps_blob_files_row_ids_and_key_index_coverage_issue_1264
             lookup(&kept, id).await,
             vec![(id.clone(), expected)],
             "{id}: the kept index finds the row once, with its patched value"
+        );
+    }
+}
+
+// ─── Scalar index kinds beside BTREE: BITMAP, LABEL_LIST and NGRAM ──────────
+//
+// `@index` builds a BITMAP for an enum or `Bool`, a LABEL_LIST for a list and
+// an NGRAM beside the BTREE of a String (the GQ 3 RFC, section
+// 4, docs/dev/lance.md). The engine pushes the predicates below to Lance
+// unchanged and relies on Lance's scanner returning the scan's rows with or
+// without the index; these guards pin that per kind on a stable-row-ID V2_2
+// table with an unindexed tail fragment, as graph tables are written.
+
+/// A V2_2 table of `id`, an enum-like `status`, a `flag`, a `tags` list and a
+/// free `text`, every value column nullable, with `indexes` built on the first
+/// fragment and a second fragment appended after them.
+async fn scalar_kind_dataset(uri: &str, indexes: &[(&str, IndexType, &str)]) -> Dataset {
+    use arrow_array::builder::{BooleanBuilder, ListBuilder, StringBuilder};
+
+    type Row = (
+        &'static str,
+        Option<&'static str>,
+        Option<bool>,
+        Option<&'static [Option<&'static str>]>,
+        Option<&'static str>,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, true),
+        Field::new("flag", DataType::Boolean, true),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = |rows: &[Row]| {
+        let mut status = StringBuilder::new();
+        let mut flag = BooleanBuilder::new();
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        let mut text = StringBuilder::new();
+        for (_, s, f, t, x) in rows {
+            status.append_option(*s);
+            flag.append_option(*f);
+            match t {
+                Some(items) => {
+                    for item in *items {
+                        tags.values().append_option(*item);
+                    }
+                    tags.append(true);
+                }
+                None => tags.append(false),
+            }
+            text.append_option(*x);
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(status.finish()),
+                Arc::new(flag.finish()),
+                Arc::new(tags.finish()),
+                Arc::new(text.finish()),
+            ],
+        )
+        .unwrap()
+    };
+    let indexed: &[Row] = &[
+        (
+            "r1",
+            Some("active"),
+            Some(true),
+            Some(&[Some("rust"), Some("db")]),
+            Some("Hello World"),
+        ),
+        (
+            "r2",
+            Some("archived"),
+            Some(false),
+            Some(&[Some("go")]),
+            Some("hello there"),
+        ),
+        ("r3", None, None, None, None),
+        ("r4", Some("draft"), Some(true), Some(&[]), Some("a-b c")),
+        (
+            "r5",
+            Some("active"),
+            Some(false),
+            Some(&[None, Some("db")]),
+            Some("café crème"),
+        ),
+        (
+            "r6",
+            Some("archived"),
+            None,
+            Some(&[None]),
+            Some("WORLDWIDE web"),
+        ),
+    ];
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch(indexed))], schema.clone()),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for (column, index_type, name) in indexes {
+        dataset
+            .create_index(
+                &[column],
+                *index_type,
+                Some(name.to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    let tail: &[Row] = &[
+        (
+            "t1",
+            Some("active"),
+            Some(true),
+            Some(&[Some("rust")]),
+            Some("hello world again"),
+        ),
+        ("t2", None, None, None, None),
+    ];
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch(tail))], schema.clone()),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+/// The ids `filter` selects, with and without scalar indexes, and the plan of
+/// the indexed scan.
+async fn scalar_kind_select(
+    dataset: &Dataset,
+    filter: datafusion::prelude::Expr,
+) -> (Vec<String>, Vec<String>, String) {
+    let ids = |use_index: bool| {
+        let filter = filter.clone();
+        async move {
+            let mut scanner = dataset.scan();
+            scanner.project(&["id"]).unwrap();
+            scanner.filter_expr(filter);
+            scanner.use_scalar_index(use_index);
+            let plan = scanner.explain_plan(true).await.unwrap();
+            let batches: Vec<RecordBatch> = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let mut ids: Vec<String> = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch.column_by_name("id").unwrap().as_string::<i32>();
+                    (0..batch.num_rows())
+                        .map(|row| column.value(row).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            ids.sort();
+            (ids, plan)
+        }
+    };
+    let (indexed, plan) = ids(true).await;
+    let (scanned, _) = ids(false).await;
+    (indexed, scanned, plan)
+}
+
+fn scalar_kind_ids(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|id| id.to_string()).collect()
+}
+
+/// A BITMAP index answers equality, inequality, `IN`, ranges, `IS NULL` and a
+/// Boolean test exactly through Lance's sargable parser, keeps null rows out
+/// of `!=` and of a negated equality, and leaves the appended tail to the
+/// scan. The engine builds a BITMAP, not a BTREE, for an enum or `Bool`
+/// property on the strength of this guard.
+#[tokio::test]
+async fn bitmap_answers_equality_ranges_membership_and_nulls_exactly() {
+    use datafusion::prelude::{col, lit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("bitmap.lance");
+    let dataset = scalar_kind_dataset(
+        uri.to_str().unwrap(),
+        &[
+            ("status", IndexType::Bitmap, "status_bitmap"),
+            ("flag", IndexType::Bitmap, "flag_bitmap"),
+        ],
+    )
+    .await;
+    let cases: Vec<(datafusion::prelude::Expr, &str, &[&str])> = vec![
+        (
+            col("status").eq(lit("active")),
+            "status_bitmap",
+            &["r1", "r5", "t1"],
+        ),
+        (
+            col("status").not_eq(lit("active")),
+            "status_bitmap",
+            &["r2", "r4", "r6"],
+        ),
+        (
+            datafusion::prelude::not(col("status").eq(lit("active"))),
+            "status_bitmap",
+            &["r2", "r4", "r6"],
+        ),
+        (
+            col("status").in_list(vec![lit("draft"), lit("archived")], false),
+            "status_bitmap",
+            &["r2", "r4", "r6"],
+        ),
+        (
+            col("status").lt(lit("b")),
+            "status_bitmap",
+            &["r1", "r2", "r5", "r6", "t1"],
+        ),
+        (col("status").is_null(), "status_bitmap", &["r3", "t2"]),
+        (
+            col("status").is_not_null(),
+            "status_bitmap",
+            &["r1", "r2", "r4", "r5", "r6", "t1"],
+        ),
+        (
+            col("flag").eq(lit(true)),
+            "flag_bitmap",
+            &["r1", "r4", "t1"],
+        ),
+        (col("flag").eq(lit(false)), "flag_bitmap", &["r2", "r5"]),
+        (col("flag").not_eq(lit(true)), "flag_bitmap", &["r2", "r5"]),
+        (col("flag").is_null(), "flag_bitmap", &["r3", "r6", "t2"]),
+    ];
+    for (filter, index, expected) in cases {
+        let (indexed, scanned, plan) = scalar_kind_select(&dataset, filter.clone()).await;
+        assert_eq!(
+            indexed,
+            scalar_kind_ids(expected),
+            "{filter} through the index"
+        );
+        assert_eq!(
+            scanned, indexed,
+            "{filter}: the index must select the scan's rows"
+        );
+        assert!(
+            plan.contains(index),
+            "{filter} must be served by `{index}`:\n{plan}"
+        );
+    }
+}
+
+/// A LABEL_LIST index answers `array_has(list, value)` exactly, the
+/// membership the engine pushes for `value in $x.list`: a list holding a null
+/// item still matches its other items, a null or empty list never matches,
+/// and a negated membership keeps the null list out. A null needle is not
+/// answered by the index (Lance leaves it to the scan). The appended tail is
+/// scanned.
+#[tokio::test]
+async fn label_list_answers_list_membership_exactly_and_never_matches_a_null() {
+    use datafusion::functions_nested::expr_fn::array_has;
+    use datafusion::prelude::{col, lit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("label_list.lance");
+    let dataset = scalar_kind_dataset(
+        uri.to_str().unwrap(),
+        &[("tags", IndexType::LabelList, "tags_label_list")],
+    )
+    .await;
+    let cases: Vec<(datafusion::prelude::Expr, bool, &[&str])> = vec![
+        (array_has(col("tags"), lit("rust")), true, &["r1", "t1"]),
+        (array_has(col("tags"), lit("db")), true, &["r1", "r5"]),
+        (array_has(col("tags"), lit("missing")), true, &[]),
+        (
+            datafusion::prelude::not(array_has(col("tags"), lit("db"))),
+            true,
+            &["r2", "r4", "r6", "t1"],
+        ),
+        (
+            array_has(
+                col("tags"),
+                lit(datafusion::scalar::ScalarValue::Utf8(None)),
+            ),
+            false,
+            &[],
+        ),
+    ];
+    for (filter, uses_index, expected) in cases {
+        let (indexed, scanned, plan) = scalar_kind_select(&dataset, filter.clone()).await;
+        assert_eq!(
+            indexed,
+            scalar_kind_ids(expected),
+            "{filter} through the index"
+        );
+        assert_eq!(
+            scanned, indexed,
+            "{filter}: the index must select the scan's rows"
+        );
+        assert_eq!(
+            plan.contains("tags_label_list"),
+            uses_index,
+            "{filter}: index use\n{plan}"
+        );
+    }
+}
+
+/// Lance 13's NGRAM prepper (`TEXT_PREPPER`) lowercases a value and then
+/// ASCII-folds it, so a character that lowercases to itself and folds to
+/// capitals yields a trigram with capitals: `x™` prepares to `xTM`.
+/// `ngram_to_token` maps only lowercase letters and
+/// digits, and maps a capital with wrapping `u8` arithmetic: a release build
+/// wraps, alike when it builds the index and when it searches it, and Lance
+/// rechecks every candidate, so rows stay exact; a debug build's overflow
+/// checks and `debug_assert!` panic. The workspace builds lance-index's
+/// arithmetic as a release build does (`Cargo.toml`), so the index builds
+/// over such values here and `contains` returns the scan's rows. When the
+/// first assertion goes red, the prepper folds before lowercasing: drop that
+/// profile override.
+#[tokio::test]
+async fn ngram_maps_a_folded_capital_trigram_by_wrapping() {
+    use datafusion::functions::expr_fn::contains;
+    use datafusion::prelude::{col, lit};
+    use lance_index::scalar::ngram::{NGRAM_TOKENIZER, TEXT_PREPPER};
+    use lance_tokenizer::TokenStream;
+
+    let prepared = |text: &str| -> Vec<String> {
+        let mut prepper = TEXT_PREPPER.clone();
+        let mut tokenizer = NGRAM_TOKENIZER.clone();
+        let mut out = Vec::new();
+        let mut raw = prepper.token_stream(text);
+        while raw.advance() {
+            let mut trigrams = tokenizer.token_stream(&raw.token().text);
+            while trigrams.advance() {
+                out.push(trigrams.token().text.clone());
+            }
+        }
+        out
+    };
+    assert_eq!(prepared("x\u{2122}"), ["xTM"]);
+    assert_eq!(prepared("d\u{2122}n"), ["dTM", "TMn"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("ngram_capitals.lance");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["r1", "r2", "r3"])),
+            Arc::new(StringArray::from(vec![
+                Some("x\u{2122} vitamin"),
+                Some("brand\u{2122}name"),
+                Some("plain xtm text"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::NGram,
+            Some("text_ngram".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    for (needle, expected) in [
+        ("x\u{2122} vit", &["r1"][..]),
+        ("d\u{2122}n", &["r2"][..]),
+        ("xtm", &["r3"][..]),
+    ] {
+        let (indexed, scanned, plan) =
+            scalar_kind_select(&dataset, contains(col("text"), lit(needle))).await;
+        assert_eq!(indexed, scalar_kind_ids(expected), "contains `{needle}`");
+        assert_eq!(scanned, indexed, "contains `{needle}`");
+        assert!(
+            plan.contains("text_ngram"),
+            "contains `{needle}` probes the index:\n{plan}"
+        );
+    }
+}
+
+/// An NGRAM index answers `contains(text, needle)` with a candidate superset:
+/// it indexes the lowercased, ASCII-folded alphanumeric trigrams of each value,
+/// so a needle that differs from the value only in case or accents is a
+/// candidate, and Lance rechecks every candidate with the case-sensitive
+/// `contains`. A needle of fewer than three characters is not sent to the
+/// index. A null value never matches, and a negated `contains` is not
+/// answered by the index.
+///
+/// The defect the engine works around: a needle of three or more characters
+/// with no alphanumeric trigram (`a-b`, `o W`) is sent to the index, which
+/// yields no token and answers "at least nothing"; Lance's filtered read then
+/// reads only that guaranteed set and returns no row of an indexed fragment,
+/// where the scan returns the matches. The engine pushes such a needle as
+/// `replace(text, needle, '') != text` (`engine::scan`), which no index parser
+/// answers and which returns the scan's rows. When the first half of the
+/// second loop goes red, Lance rechecks that result: drop the rewrite.
+#[tokio::test]
+async fn ngram_returns_a_case_folded_superset_that_lance_rechecks() {
+    use datafusion::functions::expr_fn::{contains, replace};
+    use datafusion::prelude::{col, lit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("ngram.lance");
+    let dataset = scalar_kind_dataset(
+        uri.to_str().unwrap(),
+        &[("text", IndexType::NGram, "text_ngram")],
+    )
+    .await;
+    let cases: Vec<(datafusion::prelude::Expr, bool, &[&str])> = vec![
+        (contains(col("text"), lit("World")), true, &["r1"]),
+        (contains(col("text"), lit("world")), true, &["t1"]),
+        (contains(col("text"), lit("WORLD")), true, &["r6"]),
+        (contains(col("text"), lit("hello")), true, &["r2", "t1"]),
+        (contains(col("text"), lit("cafe")), true, &[]),
+        (contains(col("text"), lit("café")), true, &["r5"]),
+        (contains(col("text"), lit("zzz")), true, &[]),
+        (contains(col("text"), lit("lo")), false, &["r1", "r2", "t1"]),
+        (
+            datafusion::prelude::not(contains(col("text"), lit("hello"))),
+            false,
+            &["r1", "r4", "r5", "r6"],
+        ),
+    ];
+    for (filter, uses_index, expected) in cases {
+        let (indexed, scanned, plan) = scalar_kind_select(&dataset, filter.clone()).await;
+        assert_eq!(
+            indexed,
+            scalar_kind_ids(expected),
+            "{filter} through the index"
+        );
+        assert_eq!(
+            scanned, indexed,
+            "{filter}: the index must select the scan's rows"
+        );
+        assert_eq!(
+            plan.contains("text_ngram"),
+            uses_index,
+            "{filter}: index use\n{plan}"
+        );
+    }
+    for (needle, expected) in [("a-b", &["r4"][..]), ("o W", &["r1"][..])] {
+        let (indexed, scanned, plan) =
+            scalar_kind_select(&dataset, contains(col("text"), lit(needle))).await;
+        assert_eq!(
+            scanned,
+            scalar_kind_ids(expected),
+            "contains `{needle}` by the scan"
+        );
+        assert!(
+            plan.contains("text_ngram"),
+            "contains `{needle}` reaches the index:\n{plan}"
+        );
+        assert!(
+            indexed.is_empty(),
+            "Lance 13 drops every indexed row for a trigram-less needle `{needle}`; got {indexed:?}"
+        );
+        let rewritten = replace(col("text"), lit(needle), lit("")).not_eq(col("text"));
+        let (indexed, scanned, plan) = scalar_kind_select(&dataset, rewritten.clone()).await;
+        assert_eq!(
+            indexed,
+            scalar_kind_ids(expected),
+            "{rewritten} through the index"
+        );
+        assert_eq!(scanned, indexed, "{rewritten}");
+        assert!(
+            !plan.contains("text_ngram"),
+            "{rewritten} uses no index:\n{plan}"
         );
     }
 }

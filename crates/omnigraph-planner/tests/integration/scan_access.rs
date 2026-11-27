@@ -2,9 +2,10 @@
 use crate::fixture_bounds;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::task::noop_waker;
-use omnigraph_compiler::ir::{IRExpr, IROp, IRProjection, QueryIR};
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IRProjection};
+use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::{ExprType, SYSTEM_COLUMNS_V3, ScalarType};
+use omnigraph_planner::read_shape::{PatternStep, ReadShape};
 use omnigraph_planner::*;
 use std::future::Future;
 use std::sync::Arc;
@@ -75,6 +76,7 @@ fn answer() -> ScanAccess {
     ScanAccess::IndexProbe {
         query: IndexQuery::Search {
             index: "identity".into(),
+            family: "btree".into(),
             column: "__id".into(),
             search: "__id = a".into(),
         },
@@ -129,23 +131,30 @@ fn prop(binding: &str) -> IRExpr {
         },
     }
 }
-fn query(two: bool) -> QueryIR {
-    let scan = |binding: &str| IROp::NodeScan {
-        variable: binding.into(),
-        type_name: "Doc".into(),
-        filters: vec![IRExpr::comparison(
-            prop(binding),
-            CompOp::Eq,
-            IRExpr::Literal(Literal::String("a".into()), prop(binding).ty().clone()),
-        )],
+fn query(two: bool) -> ReadShape {
+    let scan = |binding: &str| {
+        [
+            PatternStep::NodeScan {
+                variable: binding.into(),
+                type_name: "Doc".into(),
+            },
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
+                    prop(binding),
+                    CompOp::Eq,
+                    IRExpr::Literal(Literal::String("a".into()), prop(binding).ty().clone()),
+                ),
+                fails: false,
+            },
+        ]
     };
-    QueryIR {
+    ReadShape {
         name: "probe".into(),
         params: vec![],
         pipeline: if two {
-            vec![scan("a"), scan("b")]
+            [scan("a"), scan("b")].concat()
         } else {
-            vec![scan("a")]
+            scan("a").to_vec()
         },
         return_exprs: vec![IRProjection {
             expr: prop("a"),
@@ -156,9 +165,13 @@ fn query(two: bool) -> QueryIR {
         distinct: false,
         order_by: vec![],
         limit: None,
+        limit_param: None,
+        written_columns: Vec::new(),
+        made_up: Default::default(),
+        work: Default::default(),
     }
 }
-fn prepared(query: &QueryIR, source: &ProbeSource) -> Decision {
+fn prepared(query: &ReadShape, source: &ProbeSource) -> Decision {
     let decision = route(
         &Operation::Query(Box::new(query.clone())),
         source,
@@ -221,9 +234,7 @@ fn each_access_variant_maps_to_one_scanner_flag() {
     assert_eq!(answer().use_scalar_index(), Some(true));
     for runtime in [
         RuntimeInput::Nearest,
-        RuntimeInput::FullText,
         RuntimeInput::EligibleIds,
-        RuntimeInput::SearchFilter,
         RuntimeInput::JoinFilter,
         RuntimeInput::DynamicExpression,
     ] {
@@ -271,7 +282,6 @@ fn failure_and_cancellation_publish_no_partial_plan() {
 fn runtime_absent_and_uncovering_catalogs_skip_split_and_replay_keeps_legacy_default() {
     let mut source = source();
     for reason in [
-        RuntimeInput::SearchFilter,
         RuntimeInput::EligibleIds,
         RuntimeInput::JoinFilter,
         RuntimeInput::DynamicExpression,

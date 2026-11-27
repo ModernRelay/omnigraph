@@ -11,7 +11,7 @@ environments:
 --- schema
 node Chunk {
     slug: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
 }
 
 node Artifact {
@@ -36,13 +36,15 @@ edge ChunkOfArtifact: Chunk -> Artifact
 --- query
 query recall_two_terms($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $a: Artifact
-        $c chunkOfArtifact $a
-        search($c.text, $q1)
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $a: Artifact,
+      $c chunkOfArtifact $a,
     }
+    where match_terms($c.text, terms($q1, mode: any))
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 1
 }
 
@@ -57,18 +59,20 @@ c.slug: String
 
 --- expect plan
 expand $c $a: selection named [ChunkOfArtifact out]
-rank fuse row tiebreak [$a.@id]
+fuse $c: arms [bm25, bm25]
 
 --- query
 query recall_alternation($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $a: Artifact
-        $c (chunkOfArtifact | chunkOfArtifact) $a
-        search($c.text, $q1)
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $a: Artifact,
+      $c (chunkOfArtifact | chunkOfArtifact) $a,
     }
+    where match_terms($c.text, terms($q1, mode: any))
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 1
 }
 
@@ -83,19 +87,21 @@ c.slug: String
 
 --- expect plan
 expand $c $a: selection alternation [ChunkOfArtifact out]
-rank fuse row tiebreak [$a.@id]
+fuse $c: arms [bm25, bm25]
 expand $c $a: mode indexed_scan ran indexed_scan
 
 --- query
 query recall_wildcard($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $a: Artifact
-        $c * $a
-        search($c.text, $q1)
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $a: Artifact,
+      $c * $a,
     }
+    where match_terms($c.text, terms($q1, mode: any))
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 1
 }
 
@@ -110,5 +116,5 @@ c.slug: String
 
 --- expect plan
 expand $c $a: selection wildcard [ChunkOfArtifact out]
-rank fuse row tiebreak [$a.@id]
+fuse $c: arms [bm25, bm25]
 expand $c $a: mode indexed_scan ran indexed_scan

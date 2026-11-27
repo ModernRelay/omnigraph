@@ -1,0 +1,127 @@
+# issue: 1279
+# red_on: d225a85db: `$a.size = 18446744073709551615` and `insert Account { …, size: 18446744073709551615 }` fail to parse with `invalid integer: number too large to fit in target type`, because an integer literal is read through an `i64`, while a `U64` parameter accepts the same value.
+# notes: A negative number assigned to a property is a literal of its type too (it was `not a constant` at the engine).
+# notes: An integer literal is read into the exact carrier and typed by its context with the existing range checks, so a `U64` literal above the `I64` range is written as a parameter's value is.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Account {
+    slug: String @key
+    size: U64?
+    balance: I64?
+    sizes: [U64]?
+}
+
+--- seed
+{"type":"Account","data":{"slug":"a","size":1,"balance":-250}}
+
+--- mutate
+query insert_max() {
+    replace Account { slug: "b", size: 18446744073709551615, balance: -9223372036854775808, sizes: [1, 18446744073709551615] }
+}
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query update_above_i64() {
+    match { $a: Account } where $a.slug = "a"
+    update $a set { size: 9223372036854775808, balance: -5 }
+}
+--- expect affected: nodes=1 edges=0
+
+--- query
+query equals_max() {
+    match { $a: Account } where $a.size = 18446744073709551615
+    return { $a.slug, $a.size, $a.balance, $a.sizes }
+}
+--- expect unordered
+{"a.slug":"b","a.size":18446744073709551615,"a.balance":-9223372036854775808,"a.sizes":[1,18446744073709551615]}
+--- expect shape
+a.slug: String
+a.size: U64?
+a.balance: I64?
+a.sizes: [U64]?
+
+--- query
+query below_max() {
+    match { $a: Account } where $a.size < 18446744073709551615
+    return { $a.slug, $a.size }
+}
+--- expect unordered
+{"a.slug":"a","a.size":9223372036854775808}
+--- expect shape
+a.slug: String
+a.size: U64?
+
+--- query
+query negative_assigned() {
+    match { $a: Account } where $a.balance < -1
+    return { $a.slug, $a.balance }
+}
+--- expect unordered
+{"a.slug":"a","a.balance":-5}
+{"a.slug":"b","a.balance":-9223372036854775808}
+--- expect shape
+a.slug: String
+a.balance: I64?
+
+--- query
+query in_list() {
+    match { $a: Account } where $a.size in [9223372036854775808, 18446744073709551615]
+    return { $a.slug }
+}
+--- expect unordered
+{"a.slug":"a"}
+{"a.slug":"b"}
+--- expect shape
+a.slug: String
+
+--- query
+query member_of_list_property() {
+    match { $a: Account } where 18446744073709551615 in $a.sizes
+    return { $a.slug }
+}
+--- expect unordered
+{"a.slug":"b"}
+--- expect shape
+a.slug: String
+
+--- query
+query i64_minimum() {
+    match { $a: Account } where $a.balance = -9223372036854775808
+    return { $a.slug }
+}
+--- expect unordered
+{"a.slug":"b"}
+--- expect shape
+a.slug: String
+
+--- query
+query mixed_signs() {
+    match { $a: Account } where $a.size in [-1, 18446744073709551615]
+    return { $a.slug }
+}
+--- expect error: T53
+
+--- query
+query above_u64() {
+    match { $a: Account } where $a.size = 18446744073709551616
+    return { $a.slug }
+}
+--- expect error: invalid integer: `18446744073709551616` is above the largest U64
+
+--- query
+query above_i64_against_i64() {
+    match { $a: Account } where $a.balance = 9223372036854775808
+    return { $a.slug }
+}
+--- expect error: T3

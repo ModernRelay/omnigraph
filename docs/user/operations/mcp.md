@@ -216,9 +216,10 @@ The user can still supply a graph id for other tools. The `initialize` instructi
 `graphs` to `schema`, then to `query` with a stored read's `name` or its own GQ source.
 
 - `queries` lists every stored query with its typed parameters (`name`,
-  `kind`, `nullable`, plus `item_kind` for lists and `vector_dim` for
-  vectors). An entry with `mutation: true` is a stored mutation, which
-  `mutate` runs.
+  `kind`, `nullable`, `default` when one is declared, `null` included, plus
+  `item_kind` for lists and `vector_dim` for vectors); a parameter with
+  neither `nullable` nor a `default` is required. An entry with `mutation: true` is a stored
+  mutation, which `mutate` runs.
 - `query` refuses stored mutations; `mutate` runs them.
 - `commits_list` takes `listing`: `history` (the default), `unpublished` for
   proposals written `as commit` that await `commits_publish`, or `unattached`
@@ -244,8 +245,8 @@ The user can still supply a graph id for other tools. The `initialize` instructi
 
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
-| `mutate` | `graph`, `query`, optional `name`, `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/mutate`, or `/mutate/if-graph-commit` with `if_graph_commit` | `change`; a branch statement takes its branch action |
-| `mutate`, stored | `graph`, `name`, optional `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/queries/{query_name}`, or `/queries/{query_name}/if-graph-commit` with `if_graph_commit` | `invoke_query`, then `change` |
+| `mutate` | `graph`, `query`, optional `name`, `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/mutate`, or `/mutate/if-graph-commit` with `if_graph_commit` | `change`, and `read` when the write has a `match`; a branch statement takes its branch action |
+| `mutate`, stored | `graph`, `name`, optional `params`, `branch`, `if_graph_commit` | `POST /graphs/{graph_id}/queries/{query_name}`, or `/queries/{query_name}/if-graph-commit` with `if_graph_commit` | `invoke_query`, then `change` (and `read` when the write has a `match`) |
 | `load` | `graph`, `mode`, `data`, optional `branch`, `from` | `POST /graphs/{graph_id}/load` | `change`, plus `branch_create` when `from` creates the branch |
 | `blobs_clear` | `graph`, `entity`, `type`, `id`, `property`, optional `branch`, `if_match` | `DELETE /graphs/{graph_id}/blob` | `change` |
 | `branches_create` | `graph`, `name`, optional `from`, `from_commit` | `POST /graphs/{graph_id}/branches` | `branch_create` |

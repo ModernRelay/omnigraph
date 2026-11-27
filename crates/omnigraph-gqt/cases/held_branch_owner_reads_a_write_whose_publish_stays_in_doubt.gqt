@@ -30,7 +30,7 @@ action: fail
 scope: next_step
 
 --- mutate
-query add_bob() { insert Person { name: "bob" } }
+query add_bob() { replace Person { name: "bob" } }
 --- expect error: outcome is in doubt
 
 --- query
@@ -42,7 +42,7 @@ query landed_write_is_read() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- mutate
-query add_carol() { insert Person { name: "carol" } }
+query add_carol() { replace Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
 
 --- query

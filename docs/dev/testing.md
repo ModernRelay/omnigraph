@@ -41,8 +41,12 @@ in [lance.md](lance.md).
 | An HTTP route, authentication, MCP or OpenAPI | `crates/omnigraph-server/tests/`, by public route. Never test a server promise only through the engine facade | [Server and CLI ownership](test-ownership.md#server-and-cli-ownership) |
 | A CLI command, its output or its delivery | `crates/omnigraph-cli/tests/`, by plane | [Server and CLI ownership](test-ownership.md#server-and-cli-ownership) |
 | A storage stamp, an upgrade or a predecessor binary | CLI `integration/crossversion_upgrade.rs`, engine `db/upgrade/tests.rs` | [Predecessor binaries](#predecessor-binaries), [cross-version tests](test-ownership.md#cross-version-rebuild-and-storage-upgrade), [support matrix](versioning.md#storage-upgrade-support-matrix) |
-| A bound plan reproducing its run | `integration/engine_v2_plan_replay.rs`, `engine_v2_scrubbed_replay.rs` | [Plan replay](test-ownership.md#plan-replay) |
+| A bound plan reproducing its run | `integration/plan_replay.rs`, `scrubbed_replay.rs` | [Plan replay](test-ownership.md#plan-replay) |
+| The core IR's semantics: an operator, a lowered form, a lexical rule | `crates/omnigraph-reference`, updated in the same change; GQT compares every read step on the direct engine with it | [Test layout](test-ownership.md#test-layout), [GQT README](../../crates/omnigraph-gqt/README.md#reference-comparison) |
+| A law over generated schemas, graphs and reads | The law's owner, with its nightly twin | [Generated laws](test-ownership.md#generated-laws) |
+| How the respelled corpus answers against GQ 2 | `scripts/cross-version.py` and `crates/omnigraph-gqt/cross-version.tsv` | [Cross-version comparison](test-ownership.md#cross-version-comparison) |
 | What an operation reads or writes in storage | The DST golden and the engine `integration/*_cost.rs` curve tests | [DST storage-cost golden](#dst-storage-cost-golden) |
+| The tokens an analyzer profile emits | The full-text fingerprint golden, never refreshed alone | [Full-text fingerprint golden](test-ownership.md#full-text-fingerprint-golden) |
 | Wall time or memory | `omnigraph-bench`; evidence, never a pass/fail assertion | [Benchmark harness](test-ownership.md#benchmark-harness) |
 
 Loose integration suites of a crate are modules of one

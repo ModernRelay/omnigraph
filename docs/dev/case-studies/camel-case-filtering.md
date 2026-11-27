@@ -18,7 +18,7 @@ node SourceDocument {
 
 ```gq
 query find($repoName: String) {
-  match { $d: SourceDocument { repoName: $repoName } }
+  match { $d: SourceDocument } where $d.repoName = $repoName
   return { $d.repoName }
 }
 ```

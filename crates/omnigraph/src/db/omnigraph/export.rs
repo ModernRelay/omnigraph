@@ -172,18 +172,18 @@ pub(super) async fn entity_at(
 
 pub(super) async fn export_jsonl(
     db: &Omnigraph,
-    branch: &str,
+    target: impl Into<ReadTarget>,
     type_names: &[String],
 ) -> Result<String> {
     let mut out = Vec::new();
-    export_jsonl_to_writer(db, branch, type_names, &mut out).await?;
+    export_jsonl_to_writer(db, target, type_names, &mut out).await?;
     String::from_utf8(out)
         .map_err(|err| OmniError::manifest(format!("export produced invalid UTF-8: {}", err)))
 }
 
 pub(super) async fn export_jsonl_to_writer<W: Write>(
     db: &Omnigraph,
-    branch: &str,
+    target: impl Into<ReadTarget>,
     type_names: &[String],
     writer: &mut W,
 ) -> Result<()> {
@@ -197,7 +197,9 @@ pub(super) async fn export_jsonl_to_writer<W: Write>(
             actual: 2,
         }
     })?;
-    let (resolved, catalog) = db.capture_read_view(ReadTarget::branch(branch)).await?;
+    // A read like any other: at an explicit commit, the current schema as
+    // that commit holds it.
+    let (resolved, catalog) = db.capture_query_view(target).await?;
     let selected_tables = export_type_keys(&resolved.snapshot, type_names)?;
     let mut emit =
         |chunk: Vec<u8>| std::future::ready(writer.write_all(&chunk).map_err(OmniError::from));

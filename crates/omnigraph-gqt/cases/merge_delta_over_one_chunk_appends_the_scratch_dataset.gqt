@@ -22,7 +22,7 @@ branch create work
 
 --- expect ok
 
---- load generate: v1 seed: 7 mode: append branch: work
+--- load generate: v1 seed: 7 mode: insert branch: work
 tables:
   - kind: node
     name: Person
@@ -35,7 +35,7 @@ tables:
 --- expect ok
 
 --- mutate
-query add_bob() { insert Person { name: "bob", v: 1 } }
+query add_bob() { replace Person { name: "bob", v: 1 } }
 
 --- expect affected: nodes=1 edges=0
 

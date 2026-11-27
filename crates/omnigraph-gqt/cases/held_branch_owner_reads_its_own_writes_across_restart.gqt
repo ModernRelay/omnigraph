@@ -36,14 +36,14 @@ p.name: String
 
 --- mutate
 query add_bob() {
-    insert Person { name: "bob", age: 40 }
+    replace Person { name: "bob", age: 40 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- query
 query bob_by_key() {
-    match { $p: Person { name: "bob" } }
+    match { $p: Person } where $p.name = "bob"
     return { $p.name, $p.age }
 }
 
@@ -71,7 +71,7 @@ p.name: String
 
 --- mutate
 query add_carol() {
-    insert Person { name: "carol", age: 50 }
+    replace Person { name: "carol", age: 50 }
 }
 
 --- expect affected: nodes=1 edges=0

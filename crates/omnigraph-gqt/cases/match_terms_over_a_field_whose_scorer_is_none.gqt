@@ -1,0 +1,31 @@
+# issue: none
+# notes: `scorer = "none"` on a full-text index allows matching: `match_terms` over the field answers. A ranking call on it
+# notes: is `T87` (the GQ 3 RFC, section 4, Errors), which the refusal table (`tests/integration/law_refusals.rs`) pins.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    body: String @index(fulltext, analyzer = "english_v1", scorer = "none")
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","body":"running shoes"}}
+{"type":"Doc","data":{"slug":"d2","body":"walking boots"}}
+
+--- query
+query matched($q: String) { match { $d: Doc } where match_terms($d.body, terms($q, mode: any)) return { $d.slug } }
+
+--- params
+{"q": "run"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String

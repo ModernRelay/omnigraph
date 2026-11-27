@@ -1,0 +1,141 @@
+# issue: none
+# notes: An edge binding returned whole is its edge object: `@id`, `@src`, `@dst`, then `@type` where the binding can match more than one edge type, then the properties the binding declares (those every selected type declares with one type) other than Blob and Vector, a null property left out as a node object leaves it. An edge an `optional` introduces is a null object where the `optional` matched nothing. The result column is spelled `edge <types>` in the plan's result columns and the shape section.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+}
+edge Knows: Person -> Person {
+    since: I32?
+    note: String?
+    weight: Vector(2)?
+    payload: Blob?
+}
+edge Likes: Person -> Person {
+    since: I32
+    score: F64?
+}
+
+--- seed
+{"type":"Person","data":{"handle":"ada"}}
+{"type":"Person","data":{"handle":"bob"}}
+{"type":"Person","data":{"handle":"cy"}}
+{"edge":"Knows","id":"ada->bob","from":"ada","to":"bob","data":{"since":2001,"note":"met","weight":[1.0,2.0]}}
+{"edge":"Knows","id":"bob->cy","from":"bob","to":"cy","data":{}}
+{"edge":"Likes","id":"ada->cy","from":"ada","to":"cy","data":{"since":2010,"score":0.5}}
+
+--- query
+query knows_edges() { match { $p: Person, $p $k:knows $q } return { $p.handle, $k } }
+
+--- expect unordered
+{"p.handle":"ada","k":{"@id":"ada->bob","@src":"ada","@dst":"bob","since":2001,"note":"met"}}
+{"p.handle":"bob","k":{"@id":"bob->cy","@src":"bob","@dst":"cy"}}
+
+--- expect shape
+p.handle: String
+k: edge Knows
+
+--- expect plan
+result columns [p.handle: String, k: edge Knows]
+
+--- query
+query either_edge() { match { $p: Person, $p $k:(knows | likes) $q } return { $q.handle, $k } order { $k } }
+
+--- expect ordered
+{"q.handle":"bob","k":{"@id":"ada->bob","@src":"ada","@dst":"bob","@type":"Knows","since":2001}}
+{"q.handle":"cy","k":{"@id":"bob->cy","@src":"bob","@dst":"cy","@type":"Knows"}}
+{"q.handle":"cy","k":{"@id":"ada->cy","@src":"ada","@dst":"cy","@type":"Likes","since":2010}}
+
+--- expect shape
+q.handle: String
+k: edge Knows|Likes
+
+--- expect plan
+result columns [q.handle: String, k: edge Knows|Likes]
+
+--- query
+query edge_scan() { match { $k: Knows } return { $k } }
+
+--- expect unordered
+{"k":{"@id":"ada->bob","@src":"ada","@dst":"bob","since":2001,"note":"met"}}
+{"k":{"@id":"bob->cy","@src":"bob","@dst":"cy"}}
+
+--- expect shape
+k: edge Knows
+
+--- query
+query optional_edge() { match { $p: Person, optional { $q: Person, $p $k:likes $q } } return { $p.handle, $k } }
+
+--- expect unordered
+{"p.handle":"ada","k":{"@id":"ada->cy","@src":"ada","@dst":"cy","since":2010,"score":0.5}}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+k: edge Likes?
+
+--- expect plan
+result columns [p.handle: String, k: edge Likes?]
+
+--- query
+query distinct_edges() { match { $p: Person, $p $k:knows $q } return distinct { $k } }
+
+--- expect unordered
+{"k":{"@id":"ada->bob","@src":"ada","@dst":"bob","since":2001,"note":"met"}}
+{"k":{"@id":"bob->cy","@src":"bob","@dst":"cy"}}
+
+--- expect shape
+k: edge Knows
+
+--- query
+query counted_per_edge() { match { $p: Person, $p $k:knows $q } return { $k, count($q) as n } }
+
+--- expect unordered
+{"k":{"@id":"ada->bob","@src":"ada","@dst":"bob","since":2001,"note":"met"},"n":1}
+{"k":{"@id":"bob->cy","@src":"bob","@dst":"cy"},"n":1}
+
+--- expect shape
+k: edge Knows
+n: I64
+
+--- query
+query drawn_from_an_inline_read() { match { $p: Person, from { match { $q: Person, $p $k:knows $q } return { $k } } } return { $p.handle, $k } }
+
+--- expect unordered
+{"p.handle":"ada","k":{"@id":"ada->bob","@src":"ada","@dst":"bob","since":2001,"note":"met"}}
+{"p.handle":"bob","k":{"@id":"bob->cy","@src":"bob","@dst":"cy"}}
+
+--- expect shape
+p.handle: String
+k: edge Knows
+
+--- query
+query undirected() { match { $p: Person, $p $k:<knows> $q } where $p.handle = "bob" return { $q.handle, $k } }
+
+--- expect unordered
+{"q.handle":"ada","k":{"@id":"ada->bob","@src":"ada","@dst":"bob","since":2001,"note":"met"}}
+{"q.handle":"cy","k":{"@id":"bob->cy","@src":"bob","@dst":"cy"}}
+
+--- expect shape
+q.handle: String
+k: edge Knows
+
+--- expect plan
+result columns [q.handle: String, k: edge Knows]
+
+--- query
+query from_a_union() { match { from union({ match { $a: Person, $b: Person, $a $k:knows $b } where $a.handle = "ada" return { $k } }, { match { $a: Person, $b: Person, $a $k:knows $b } where $b.handle = "cy" return { $k } }) } return { $k } }
+
+--- expect unordered
+{"k":{"@id":"ada->bob","@src":"ada","@dst":"bob","since":2001,"note":"met"}}
+{"k":{"@id":"bob->cy","@src":"bob","@dst":"cy"}}
+
+--- expect shape
+k: edge Knows

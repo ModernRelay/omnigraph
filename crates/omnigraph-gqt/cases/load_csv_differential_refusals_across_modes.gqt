@@ -42,12 +42,12 @@ load csv "dup_key.csv" into node:Person mode overwrite header
 --- expect error: @unique violation on Person.id: value 'p9'
 
 --- mutate
-load csv "dup_key.csv" into node:Person mode append header
+load csv "dup_key.csv" into node:Person mode insert header
 
 --- expect error: @unique violation on Person.id: value 'p9'
 
 --- mutate
-load csv "dup_key.csv" into node:Person mode merge header
+load csv "dup_key.csv" into node:Person mode replace header
 
 --- expect error: @unique violation on Person.id: value 'p9'
 
@@ -61,12 +61,12 @@ load csv "bad_enum.csv" into node:Person mode overwrite header
 --- expect error: invalid enum value 'zzz' for Person.kind
 
 --- mutate
-load csv "bad_enum.csv" into node:Person mode append header
+load csv "bad_enum.csv" into node:Person mode insert header
 
 --- expect error: invalid enum value 'zzz' for Person.kind
 
 --- mutate
-load csv "bad_enum.csv" into node:Person mode merge header
+load csv "bad_enum.csv" into node:Person mode replace header
 
 --- expect error: invalid enum value 'zzz' for Person.kind
 
@@ -80,12 +80,12 @@ load csv "orphan.csv" into edge:Knows mode overwrite header
 --- expect error: 'p9' not found in Person
 
 --- mutate
-load csv "orphan.csv" into edge:Knows mode append header
+load csv "orphan.csv" into edge:Knows mode insert header
 
 --- expect error: 'p9' not found in Person
 
 --- mutate
-load csv "orphan.csv" into edge:Knows mode merge header
+load csv "orphan.csv" into edge:Knows mode replace header
 
 --- expect error: 'p9' not found in Person
 
@@ -95,12 +95,12 @@ p8,,a
 p9,,b
 
 --- mutate
-load csv "null_unique.csv" into node:Person mode append header
+load csv "null_unique.csv" into node:Person mode insert header
 
 --- expect ok
 
 --- mutate
-load csv "null_unique.csv" into node:Person mode merge header
+load csv "null_unique.csv" into node:Person mode replace header
 
 --- expect ok
 
@@ -134,12 +134,12 @@ from,to,w
 p1,p3,2
 
 --- mutate
-load csv "second_edge.csv" into edge:Knows mode append header
+load csv "second_edge.csv" into edge:Knows mode insert header
 
 --- expect error: @card violation on edge Knows: source 'p1' has 2 edges (max 1)
 
 --- mutate
-load csv "second_edge.csv" into edge:Knows mode merge header
+load csv "second_edge.csv" into edge:Knows mode replace header
 
 --- expect error: @card violation on edge Knows: source 'p1' has 2 edges (max 1)
 
@@ -150,11 +150,7 @@ load csv "second_edge.csv" into edge:Knows mode overwrite header
 
 --- query
 query replaced_edges() {
-    match {
-        $a: Person
-        $b: Person
-        $a knows $b
-    }
+    match { $a: Person, $b: Person, $a knows $b }
     return { $a.id, $b.id }
 }
 

@@ -1,0 +1,1 @@
+- Every read runs under `read_work_limit` (default 100,000,000): the rows its expansions and joins produce, a product's pairs and a hop range's neighbors. Exceeding it fails with a typed error.

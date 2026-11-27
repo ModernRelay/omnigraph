@@ -9,55 +9,384 @@
 A query runs against one resolved `ReadTarget`:
 
 1. Resolve the branch or graph snapshot once.
-2. Parse and type-check `.gq` source against that snapshot's accepted catalog.
-3. Lower the checked query to typed IR, keeping the declaration and its
-   checked query beside it (`CheckedRead`).
+2. Parse and type-check `.gq` source against that snapshot's accepted catalog
+   into the typed core IR (`ir::core`).
+3. Shape the core read for the planner (`omnigraph_planner::read_shape`): the
+   pattern of scans, expansions, filters and correlated blocks, its return
+   items, order, limit and the ranking a `from nearest/bm25/rrf` draws. A
+   `let` is a column computed once where it was written (`PatternStep::Let`,
+   below), and every read of its name reads that column; a `from` over an
+   inline read with no group, order or cut adds the inner pattern's facts,
+   its unreturned names renamed apart, and each value it returns that is not
+   already a column becomes a `let` of the enclosing scope. A ranking that is the read's only
+   element, its score leading the `order` in its direction and its `nearest`
+   window the `limit`, stays the leading key today's ranked scan runs. Any
+   other ranking is a `PatternStep::Rank` over its population: `nearest`
+   lowers to its ranked scan with `RankScope::Window`, a `Sort` by distance
+   then the target's identity, and a `TargetCut` that keeps every row of the
+   first `k` targets; the elements and `where` after it are steps above the
+   cut, which selects over the whole relation, so the placement law moves no
+   conjunct below it (law 2). The overfetch ladder fills the cut's `k`
+   targets, read from its `selected_targets` counter, instead of the read's
+   `limit`. `bm25` has no window. An `rrf` is a `PatternStep::Fuse` whose
+   arms are pipelines of their own, each the steps its ranking takes standing
+   alone (`Shaper::ranking_steps`): a `nearest` arm's window over its own
+   population with the arm's own `k`, an exact `Score` step, or an inline
+   read's uncorrelated `Correlate` whose `order` ranks the arm (see
+   [Fusion](#fusion-one-operator-over-any-ranked-arm)). A ranking that is
+   not the read's root (beside another component, correlated on an outer
+   name, a second ranking, inside an inline read, an `optional` or a `union`
+   arm, or over a population with its own aggregate, `distinct`, `order` or
+   `limit`) is the core's `Correlate` over it, drawn as a read of its own
+   (`Shaper::ranking_read`): a `PatternStep::Correlate` whose inner steps are
+   its population's, then the exact `Score` of each row (a `nearest`'s
+   distance included), whose columns are the population's and the score, and
+   whose `InnerRead::window` (a `nearest`'s `k`, `TargetWindow`) keeps the
+   rows of the first `k` distinct targets in distance-then-identity order,
+   cut per outer row by `CorrelateExec` when the read is correlated, so the
+   population is the ranking's relation and the cut is its own. Plan
+   acceptance requires such a read to end on the window binding's exact
+   distance and to order by it, then the binding's identity. A non-root
+   `nearest` is evaluated exactly, every row of its population scored; an
+   `rrf` there is a `Correlate` over its `Fuse` step. An `rrf` whose arms
+   read the enclosing scope is that `Correlate` correlated on the outer rows
+   over a `Fuse` partitioned per outer row (`PatternStep::Fuse`'s
+   `outer_var`): each arm starts from the outer rows, as a correlated
+   union's arms do, and is a correlated read (`Shaper::correlated_arm`)
+   yielding each outer row's rows in the arm's rank order, its window cut
+   per outer row; `FuseExec` ranks from 1 and fuses within each partition of
+   the read's tag and carries the tag, so the read joins every outer row to
+   its own targets. Plan acceptance requires the fusion to be partitioned
+   exactly when its read is correlated and each partitioned arm to be such
+   a read ordered by its score, then the target's identity. An `optional { p }` (the core's `Correlate(R,
+   Union(p, Project(Filter(Env, ¬ exists p), nulls)))`, `p` stored once and
+   shared by both arms, so nested optionals grow the term and every walk
+   over it linearly) is a `PatternStep::Optional`
+   placed after the scope's bindings and traversals and before its filters
+   and blocks: its own pattern placed over the outer row, and the logical
+   and physical `OptionalJoin` over an `OuterReference`; a traversal from a
+   name it introduces expands after it, and one from the column of a
+   correlated `from` (a `union`, or an inline read with its own group or
+   cut) after that `from` and before the optionals written after it, which
+   read its ends as outer columns; its inner tree is a scope of its own
+   for the placement law, `$x is null` over a reference tests the
+   identity column, and plan acceptance requires one `OptionalJoin` per
+   written optional testing its own conjuncts inside its inner tree and
+   nowhere else. A `let` inside it is a column its own steps compute, which
+   the `OptionalJoin` pads null on a row with no match; one whose value is a
+   column the optional does not compute (an outer column, a parameter, a
+   constant) is a column after it, `if(<a node it binds> is not null, value,
+   null)`, so it is null on a row with no match whatever it reads. A node
+   it introduces, returned whole, is a nullable node type
+   (`ExprType::Node`'s `nullable`, the type checker's own column type) whose
+   object the projection marks null where its identity is null; the plan's
+   result columns, the executed schema and the compiler's inferred schema
+   agree on the flag. An edge returned whole is the RFC's edge object,
+   `Catalog::edge_object_members` (`@id`, `@src`, `@dst`, `@type` where
+   the binding selects several types, then the properties every selected
+   type declares, Blob and Vector left out), read from the binding's own
+   columns; the plan's result node declares it under `edge <types>` beside
+   the node objects. A `from union(…)` whose arms read no outer name is a
+   `PatternStep::Union` placed first, each arm its own pipeline from nothing
+   with its unreturned names renamed apart, and the logical and physical
+   `Union` (a new node kind: no existing one emits the rows of two
+   pipelines) folded from the left; each arm is a scope of its own for filter
+   placement, and the union's columns are its bindings'. When an arm returns
+   a value or groups, orders or cuts its rows, every arm is an uncorrelated
+   `PatternStep::Correlate` returning its columns under the first arm's
+   names, its values columns of one `values` binding all arms share, which
+   the union binds beside its references. A union's reference columns are
+   nodes or edges, an edge column carrying its edge's columns as a node
+   column does. A union whose arms
+   read the enclosing scope is the pattern of a correlated
+   `PatternStep::Correlate` returning its references and its values: its
+   `PatternStep::Union`
+   names the `outer_var` each arm starts from, the first arm from the read's
+   `OuterReference` and the others from leaves of their own over the same
+   slot, which `OuterReferenceExec` reads without emptying, and `UnionExec`
+   carries the outer rows' tag both arms hold.
+   An inline read returning an outer name under another name binds that
+   name to the outer reference, which every later read of it, a triple's
+   end and a nested scope's outer names included, reads in its place.
+   A called read's `limit $k` bound to an argument computed in the caller's
+   scope is the read's `InnerRead::limit_expr`, which `CorrelateExec`
+   evaluates on each outer row (once, uncorrelated) as that row's cut,
+   refusing a value that is no count.
+   A `from` over an inline read (or a call) with its own aggregate,
+   `distinct`, `order` or `limit` (the core's `Correlate` over its `Group`,
+   `Order` and `Cut`) is a `PatternStep::Correlate`, placed beside the
+   scope's `optional`s: its pattern placed as its own scope from the outer
+   names it reads, its unreturned names renamed apart, a returned reference
+   bound under its column's name and a returned value a column of the read's
+   `values` binding (`values.n`). The logical and physical `Correlate` are a
+   new node kind: no existing one groups, orders or cuts per outer row. With
+   an outer name read, its inner tree's leaf is an `OuterReference`;
+   without one it runs once and a `CrossJoin` joins it to the elements
+   before it. Its inner tree is a scope of its own for the placement law,
+   and plan acceptance requires one `Correlate` per such read, returning the
+   same read and testing its pattern's conjuncts inside its inner tree.
+   A block read as a value (in a `let`, as a return item, compared with
+   another block's value, or under `or` or `not`) is the same step: the
+   core's `Correlate(R, Group(p, [], [agg]))` as a read grouped by no key,
+   its names renamed apart, whose one value column the block's column names
+   (a row count is `count(true)`), so a `count` over no match is `0`; a
+   filter over block values reads those columns. A block compared in a
+   top-level conjunct with a value of the outer row stays an `AntiJoin`.
+   A read returning only values that reads a name a traversal from an
+   `optional`'s names binds is placed after that traversal.
+   A `from name(args)` (`Call`) is its body read as an inline read: the
+   body's own names are renamed apart first and only then each parameter is
+   replaced by its argument, so an argument reading a caller's variable is
+   never captured by a name the body binds; a binding filter that then reads
+   a caller's column joins the scope's filters. A call adds no plan node.
+   An edge-type binding `$k: E` (the `Scan` of an edge type) is the single
+   hop over `E` from a scan of its source type with `$k` bound, both ends
+   fresh names whose identities tie after every named binding's.
+   A `from distance(rel, $x.f, q)` (the core's exact `Score`) is always
+   drawn as a step: its population placed first, then a
+   `PatternStep::Score`, the logical and physical `Score` (a new node kind:
+   no existing one appends a per-row score without an index or a cut), then
+   the elements and `where` after it; its `order` and `limit` are the read's
+   own `Sort` and `Limit` over the `_distance` column, and the node selects
+   over the whole relation for the placement law, so no conjunct moves below
+   it. Binding resolves its query vector by node id as it does a `nearest`
+   scan's, and plan acceptance requires one `Score` per written `distance`
+   over the same binding, property and query.
+   A `from bm25(rel, $x.f, q)` is drawn the same way, a `Score` of kind
+   `bm25`: its query is the `match_terms(field, terms(…))` predicate the score
+   retains, so its rows are the matches and its column `<binding>._score`
+   (`F64`), read by the identity column the node adds to its reads. Every
+   full-text field has a profile (`english_v1` where its index names none),
+   so every `match_terms` is a `Filter` or `Let` operand and every `bm25` a
+   `Score`, both answered by the exact lexical scan (below): a call read as a
+   value in `return`, `order` or an aggregate (a block's included) is the
+   column of a `PatternStep::Let` the shaper makes up for it after the
+   pattern (`Shaper::lexical_columns`), which the projection, the sort and
+   the aggregate read; nothing derives
+   a choice between an exact and a native path. A lexical predicate reads its
+   binding's identity, not its field (`optimizer::reads_of_expr`), since the
+   scan reads the field from the table, and so does a `bm25` `Score`, whose
+   rows take their scores by identity. Plan acceptance requires each `Score`
+   of kind `bm25` to retain the `match_terms` of its own field (predicate
+   retention), to score a type that declares a full-text index with the
+   `bm25_v1` scorer (scoring corpus), and every `F64` `_score` the read
+   returns, orders by or filters on to come from one (score origin). The
+   planner reads no full-text index coverage for these nodes. An `rrf` arm
+   over `bm25` is that same `Score` over the arm's population. A plan whose
+   one ranking is such a `Score` reports the ranking
+   `bm25`, always exhaustive (`ranking::planned_ranking`).
+   Every `let` whose value is not already a single column, a parameter or a
+   constant, and every such value an inline read returns, is
+   `PatternStep::Let`, then the logical and physical `Let`: the value
+   computed once on every row of the elements before it, appended as the
+   `value` column (`shape::read::LET_VALUE`) of a binding the shaper makes up
+   for it (`Shapedl<n>_<name>`), which every read of the name reads as a
+   property of that binding, so no read copies the value and a chain of
+   `let`s that each read the one before twice compiles in linear work. The
+   shaper records where the `let` was written among the scope's facts and
+   places the facts before it, the `Let`, then the rest; the type checker
+   writes every `where` conjunct of the scope above it. The `Let` carries its
+   binding for the placement law, so a conjunct that reads its column runs
+   above it, and it declares that it can fail exactly when its value can, so
+   the law moves nothing below one that can (A3) and moves a conjunct that
+   reads other columns past one that cannot. Plan acceptance requires one
+   `Let` per such value, computing the same expression, and `if` and
+   `coalesce` evaluate an argument only on the rows that select it. A block
+   that can fail under a guard (`and`, `or`, `if`, `coalesce`) reads its
+   guard from a column of the outer row: each operand of a chain guards the
+   operands after it as one guard of its own, and the column for a block's
+   guards reads the column the block before it computed and adds the guards
+   since, so a chain of guarded blocks computes each guard once.
+   The shaper is the compiler's
+   (`omnigraph_compiler::shape`), and the type checker runs it on every
+   declaration it accepts: a term it does not lower (`Fix`) is refused at
+   type check with
+   `T86`, at the construct and naming the programme stage that adds it, so
+   the planner never refuses a checked read. A term that still arrives
+   unlowered is the planner's `P006`, an internal error and a defect.
 4. Gather the planning inputs once: bound parameters (`now()` among them),
-   constants folded to their values, statistics, settings and the index
-   facts the full-text coverage of every ranked property is derived from.
+   constants folded to their values (a `limit $k`, which the shape records as
+   `limit_param`, takes its bound count here, so the plan's cut is that count
+   and a replay folds the count its own value table binds; a `nearest`
+   window `k: $k`, a ranking step's `window_param`, takes its count, at
+   least 1, the same way), statistics, settings and index facts.
 5. Plan the query and accept the plan (see [Plan acceptance](#plan-acceptance)).
 6. Bind the accepted plan's values and execute it against the same snapshot.
 7. Serialize result batches at the calling boundary.
 
-Type checking constructs a complete `CheckedReadQuery` or
-`CheckedMutationQuery`. Its private fields retain typed expressions, scopes,
-parameter declarations and operation metadata. Each input expression and
-literal payload is resolved once per successful checking invocation, including
-null members of literal lists. Equal expressions at different source locations
-are separate occurrences.
+Every caller parses through one front door, `parse_query`: the nesting bound,
+then the one grammar (`query/syntax/grammar.pest`). The type checker
+(`query/check/`) types each declaration into one core term, places every
+filter after the last binder of a variable it names, and binds every
+expression (`check/bind.rs`): system columns to their physical names,
+comparisons and membership through `ir::coerce`, which stores the explicit
+casts of invariant 9, literal-only nodes folded. The planner, the engine,
+result-schema inference (`check::result::result_schema`) and every header
+consumer (server, CLI, cluster, MCP, lint, the operation descriptor) read that
+core term; nothing re-derives types from the text.
 
-Lowering and result-schema inference consume the checked value and read its
-retained types. Callers use the same accepted catalog for checking, lowering
-and schema inference. Lowering still inserts comparison casts, folds constants
-and substitutes search scores; validation of the resulting IR remains fallible.
-The compiler's occurrence tests check resolution counts independently and
-assert that lowering and schema inference perform no further resolution.
+A compile returns every independent refusal of its earliest refusing stage:
+parsing, then name resolution and typing (`T83`, `T81` and `T86` among the
+latter). Parsing recovers at element, item, assignment, argument, parameter,
+`where`, statement and declaration boundaries (`query/syntax/recover.rs`):
+the grammar has no recovery, so a lexical scan of balanced brackets finds
+the unit holding a grammar refusal, which is replaced byte for byte by
+spaces or by a placeholder the grammar accepts there, and the text is parsed
+again; the builder records a refusal at the same boundaries and builds on.
+The type checker records a refusal at every element, conjunct, item, key,
+statement, assignment and operand of every scope of the declaration, and
+gives the refused construct the error type (`check::E::Recorded`): the names
+it would bind are of that type, a construct reading one is of it too and
+passes every check unreported, and a block, `optional` or inline read
+holding a refusal is of it as a whole. In a product, a refused element joins
+the components it names and passes; a refused conjunct passes the key-pin
+check; a `from` whose `as` alone is refused (`T85`) still draws its
+relation. `T86` reads the term of what typed, which holds no construct of
+the error type: removing a construct removes structure and never makes the
+rest unlowered, so a `T86` found there stands beside the other refusals.
+
+Each scope's elements form components (`check/components.rs`): a binding, a
+triple, an `optional` or a `from` joins the components of every variable it
+binds or reads; a `let` value stands for the variables it reads, and the
+`where` with its blocks joins nothing. Two components multiply their rows by
+the `Correlate` of an inner term with no free variables, a product, which the
+type checker admits only when every component but one is key-pinned, a
+single node binding whose `@key` columns, or whose `@id`, a top-level `where`
+conjunct equates with a literal or a parameter (a component of two or more
+elements, or of a triple, an `optional` or a correlated `from`, never is);
+otherwise it refuses with `T81`, whose fix text names the triple when
+exactly one edge type joins the two and whose suggestion, for review, writes
+the second component as a named relation drawn with `from`, which keeps the
+product's rows (the triple alone where no named relation can be written). A `from` that reads nothing of its
+scope is that product written out and admitted. The rule is the type
+checker's alone: the shaper flattens a named relation's inline read into the
+enclosing pattern, so the product it plans, a `CrossJoin` or a
+`ContainsJoin`, is the one the two bindings written side by side planned.
+
+A block and an inline read are inner scopes (`check/mod.rs`, `Scope::block`
+and `Scope::inner`): a name read from the enclosing scope correlates, and a
+name new to the scope is introduced by a binding element anywhere in it. After
+a scope's elements are typed, every end a triple introduced that no binding of
+the scope binds is `T84`, at the first triple naming one, with one suggestion
+inserting each binding before the triple that first names it, typed as the
+triple resolved that end (the edge's declared end type). A binding inside a
+block of an outer name is `T68`; its suggestion drops the binding, and a block
+whose only element is such a binding of the same type becomes its predicate in
+the block's place (`coalesce(…, false)` when the predicate can be null, as a
+probe typing the block with the re-mention correlating reports); a full-text
+call is a Boolean operand and never null, so a block filtering on one becomes
+`not (match_terms(…))`. The inserted binding makes the triple's
+ends both bound, so the core term is the derived form's `Scan` and `Expand` to
+a fresh column with the identity `Filter`; the shaper reads that filter as the
+triple between the two bindings and places the binding from the bound end, so
+the plan is the one the unbound triple planned. An `optional { }` is an inner
+scope too (the scope's `block` and `optional` flags), so the same rule and
+fixes hold inside it, and its new names enter the enclosing scope nullable; an
+`optional` whose only element is a re-mention keeps every row and introduces
+no name, so its `T68` carries no edit. A triple of that enclosing scope that
+reads one of those nullable names is `T90` (`optional_triple`), since its
+`Expand` yields no row for a null end; one suggestion per `optional` moves
+every such triple into it, with the triples that read what it introduces and a
+binding for each new name, and offers no edit when a moved triple reads a name
+bound after the `optional`. An inner scope reads such a name by correlating;
+the shaper types a triple closing on it, inside a later `optional` or a
+block, as nullable by the type the scope's `Env` leaf carries. A declaration's own `match` keeps a
+triple's ends introduced by the triple.
+
+A triple's written order is its direction (`check/mod.rs`, `reversed_triple`).
+`resolve_traversal` still resolves each member's `Direction` from the end
+types; when every member of a named edge or a selection (an alternation or a
+wildcard, whose members are every edge between its end types) resolves to
+`In`, the triple is `T82` at its element span, whose two end ranges the parser
+records (`element_span`), and the suggestion swaps them. The swapped triple
+types to the same edge selection from the same bound end, except where both
+ends are bound: the semi-join `Expand` then starts at the written source, so
+the core term's orientation flips while the shaper's plan stays the same. An
+undirected triple, a selection with at least one member resolved `Out` and a
+selection with no member are not refused.
+
+A ranked `from` names its score with `as` (`check/mod.rs`, `drawn_rel`). The
+ranking's term carries the written name as its `out` (`Score`, `ApproxTopK`,
+and `Fuse`, whose `out` the core added for it), and the shaper reads the score
+through that name, so a score plans the same under any name. The rule reads
+the relation's type, not its term: the checker's `Rel` records the column of
+the unnamed score it carries (`score`), which a ranking function's result sets
+and a `let` bound to one keeps, and which every other relation, an inline read
+returning a named score included, leaves empty. An unnamed score's column
+takes a name no population column has, so it never collides with one. A `from`
+over a relation carrying one without `as` is `T85`, the suggestion
+inserting `as $distance` or `as $score` after the relation, whose byte range
+the parser records on the `from`'s element span, and an `as` on a `from` whose
+relation carries none is `T85` with the `as` removed. A ranking in a `union` arm or a
+ranking's population is projected to its population's columns, since a score
+there has no name; an `rrf` arm is read whole, and the shaper writes it as an
+arm pipeline of its own (`PatternStep::Fuse`), as fusion keeps only the
+target and the fused score.
+
+A write body checks to `CoreWrite`: groups of clauses and their sinks. The
+engine's `exec/write_plan.rs` lowers each group in one of two forms. A group
+whose clauses are a scan of its statements' target, filtered by predicates a
+staged scan evaluates (no search predicate, arithmetic or registry call), and
+whose assignments read no row lowers to staged statements: an `update` or
+`delete` takes the predicate and reads it together with the statements staged
+before it, an `insert` after one runs once per matched row, and an `insert`
+with no clauses runs once. Every other group lowers its selection to a read
+shaped by `read_shape` and run by the engine (`engine::execute_selection`)
+against the write's captured snapshot and catalog, with the `now()` the write
+bound: it returns per row the `@id` of each `update` or `delete` variable and
+each assignment value that reads the row; a `Blob` read from the row is
+returned as the identity of the node or edge whose cell it copies (with the
+edge type where the binding matches several, and each `if` condition), and
+`exec/blob_copy.rs` reads the chosen cells at the same snapshot
+([Blob internals](blob.md#copying-a-blob-from-a-row)). The statement then
+stages the typed membership `id in [ids]` with those values per entity, and an
+`insert` runs once per row; two values for one entity and property through one
+statement's rows are `E4`. Every group selects on the write's snapshot, so
+the type checker refuses a group whose selection reads a table an earlier
+group writes (`T91`); a selection the read shaper refuses is not lowered, and
+since the write shaper is the compiler's too, the type checker would refuse it
+with `T86`. Such a write publishes once, through the same staging.
 
 The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current
 branch reads may reuse version-keyed derived state.
 
-A historical read plans against the current accepted catalog. Its tables bind
-by table identity (`Snapshot::bind_catalog_aliases`) and its properties by the
-stable property id each physical column persists as
-`omnigraph.stable_property_id` (`stored_field` in `engine/typed_value.rs`,
-behind every scan, hydration and edge read). The binding records each table
-whose pinned version differs from the live one (`Snapshot::contract_covers`);
-only there can the column of a property's name hold another lifetime. On such
-a table a property refuses when that column carries another id (a same-name
-re-add), when the id sits under an earlier name (a rename since) or nowhere
-(an addition since), and when the column carries no id (written before 0.10),
-as Blob reads do. Crossing a rename is not supported.
+A read at an earlier commit (a query, or an export through
+`export_jsonl_at`) sees the schema accepted
+at that commit, through stable identities (the GQ 3 RFC, A2), and one place
+decides its shape before planning: `Omnigraph::bind_historical_schema`, behind
+`capture_query_view` and `run_query_at`. Its tables bind by table identity
+(`Snapshot::bind_catalog_aliases`). When the commit recorded its schema, the
+catalog the read type-checks against is the current one restricted to the
+property identities that schema declares (`Catalog::at_commit`), under their
+current names: a whole node expands to the properties the commit holds, and
+naming one it does not hold, added since or dropped and added again as a new
+identity, is `T6` naming the commit. The shape is fixed before the plan is
+bound, so the bound plan records it and a replay at the same commit
+recompiles to it. Every table then opens under that catalog's property view
+(`Snapshot::set_property_views`): the opened version's columns are renamed in
+memory by the stable property id each persists as
+`omnigraph.stable_property_id`, the metadata-only change a Lance column
+rename commits, so a property renamed since reads under its current name, and
+a column carrying any other id (a dropped property's, which may share a
+current name) is hidden. `stored_field` in `engine/typed_value.rs`, behind
+every scan, hydration and edge read, still checks each consumed column's id;
+on a table whose pinned version differs from the live one
+(`Snapshot::contract_covers`) a column with no id (written before 0.10) is
+refused, as Blob reads do. A commit that recorded no schema (a version
+written before the contract lived in `__manifest`) is read under the current
+schema, and a property it does not hold refuses when the read reaches it.
+Blob reads keep their own identity fences ([Blob](blob.md)).
 
 Stable code owners:
 
 | Concern | Owner |
 |---|---|
-| Parser, type checker, lowering | `crates/omnigraph-compiler/src/query/`, `src/ir/` |
+| Parser, type checker, core IR | `crates/omnigraph-compiler/src/query/`, `src/ir/` |
+| Read shape (the core read as the planner reads it) | `crates/omnigraph-planner/src/read_shape.rs` |
 | Read doors | `crates/omnigraph/src/exec/query_doors.rs` |
 | Plan acceptance | `crates/omnigraph-planner/src/validate/` |
-| Plan lowering, operators and context (engine v2) | `crates/omnigraph/src/engine/` |
-| Frozen engine v1, the GQT test reference | `crates/omnigraph-reference-engine/` |
+| Plan lowering, operators and context | `crates/omnigraph/src/engine/` |
 | Lance scan boundary | `crates/omnigraph/src/table_store.rs` |
 | Topology build/cache | `crates/omnigraph/src/graph_index/`, `runtime_cache.rs` |
 | Mutation orchestration | `crates/omnigraph/src/exec/mutation.rs` |
@@ -65,6 +394,74 @@ Stable code owners:
 | Loader | `crates/omnigraph/src/loader/mod.rs` |
 
 Avoid line-number links in documentation; these modules are the stable owners.
+
+## Deep queries
+
+Compiling a read builds a term and expressions linear in its text. The core
+term stores each subterm once: an `optional`'s pattern, which its desugaring
+both returns and tests for absence, is one node both arms of its `Union`
+share, and the plan budget charges it once (`Term::size`), while a `Call`'s
+body is still charged at every call site, as the RFC's `Call` rule expands
+it. Every walk over the
+term visits a stored node once (`Term::any_node`, `Term::stored_nodes`; the
+binder binds a shared node once). A `let` is a column, never copied into its
+reads; a block's guard is a column a later guard reads; the shaper probes an
+inline read's own scope for an `optional` or a `union` without shaping the
+reads nested in it. `crates/omnigraph-compiler/src/query/check/tests/compile_growth.rs`
+holds the work to that: term nodes, expression nodes and compile steps grow
+by the same amount per unit of each construct family. The padding row of an
+`optional` (`Project(…, nulls)`) names one column per column its pattern
+adds, so its width follows the relation's, and nested optionals pad a
+quadratic number of columns in their depth, counted apart.
+
+### The plan budget
+
+A declaration's plan budget, `@budget(plan = n)` or `DEFAULT_PLAN_BUDGET`
+(32,768), bounds the work of turning it into a plan. One meter
+(`omnigraph_compiler::budget::PlanWork`) counts that work in one unit, charged
+as it happens, and the work stops at the first charge past the budget with
+`T70`, so a refused declaration costs at most twice its budget beyond reading
+its source. The type checker charges every term node it builds (a shared
+`Call` body or a named relation again at each later site or draw, walked by
+`Term::weight` no further than the budget left), every expression node those
+nodes hold, every expression it types, each scope's copy of the names around
+it (`Ctx::inner_scope`) and each scope's read of its pattern
+(`SyntaxSize`, also stopped at the budget left). The last two grow with
+nesting depth and with a long run of `optional`s or blocks, as the copying
+does. The shaper charges each term node it visits and the expression nodes it
+copies. The planner resumes the meter from `ReadShape::work`
+(`source::QueryWork`) and charges each shape step it resolves, the shape's
+size for each pass, and each state a plan search explores
+(`QueryWork::explore`: today one join order per pattern block, the written
+one). Every charge is a function of the declaration and the schema, so the
+bound plan records the work (`Assumptions::plan_work`) and a replay's compile
+must charge the same. `T70` names the construct whose work grew and how much
+it charged, and advises no larger budget. A declared budget above the
+session's `plan_budget_limit` is `T89` before anything is charged.
+`compile_growth.rs` holds a refusal to twice the budget in every kind, and the
+planner's `query_plan.rs` the planning share.
+
+A query may nest 2,048 levels of brackets, `case`s and prefix operators and
+build an expression 16,384 levels deep (`query::depth`, `Q006`). Every walk
+that recurses once per level of an expression or a term (the parser's tree
+builder and span lookup, the type checker, binding, the shaper, the planner
+and plan acceptance, constant folding, engine evaluation, display and the
+reference interpreter) enters each level through `stack::deep`, which grows
+the stack on the heap (`stacker`) when less than `stack::RED_ZONE` remains;
+the expression types' `Clone`, `PartialEq`, `Hash` and `Debug` go through it
+too, and their `Drop` takes a deep tree apart on a heap stack. The generated
+parser recurses on its own, so a parse runs on a stack sized from the
+source's nesting (`stack::with_room`, `depth::GRAMMAR_BYTES_PER_LEVEL`). The
+server's and the CLI's threads keep the platform's default stacks. A thread
+whose platform reports a stack larger than any real one (`ulimit -s
+unlimited` reports the main thread's as running to the next mapping) spends
+only `stack::UNTRUSTED_BUDGET` of it before growing. DataFusion, Lance and
+derived traits of mirror types recurse without the guard, so a predicate
+deeper than `stack::MAX_HANDED_OFF_DEPTH` (256 levels, the expression depth
+a query could reach before the bounds rose) is not pushed into a scan, where
+the engine's own `Filter` evaluates it, is outside plan acceptance's exact
+fragment, and explain writes its typed tree to that depth, the nodes below
+marked `elided`.
 
 ## Traversal and joins
 
@@ -123,7 +520,7 @@ no key is in, which only a long list pays for). It preserves incoming row/rank o
 deterministic edge tie-break. An indexed hop (`graph.rs::scan_neighbor_map`)
 holds each probe batch under its own `expand probe batch` charge only while it
 interns that batch's endpoints. A probe batch can be a slice of a larger decode
-buffer, and the pool charges the buffer by capacity. A correlated block (`not { ... }`,
+buffer, and the pool charges the buffer by capacity. A correlated block (`not exists { ... }`,
 `exists { ... }`, `count { ... } > 2`, `sum($d.size) { ... } > 100`) is one
 anti-join over its typed inner pipeline, keeping each outer row by a
 `SubqueryPredicate` on the aggregate of its matches.
@@ -133,9 +530,9 @@ are flat Arrow batches, not a factorized representation: an `Expand` copies
 an input row's columns into every output row that row produces. What bounds
 multi-hop fan-out is:
 
-- deferred bindings: the compiler's IR lowering gives at most one binding of
-  each connected pattern a `NodeScan`: the binding the leading search order
-  ranks, else the first declared (`scan_root`). `Expand` introduces the rest,
+- deferred bindings: the read shape gives at most one binding of each
+  connected pattern a `NodeScan`: the binding the ranking ranks, else the
+  first bound (`read_shape.rs`, `place`). `Expand` introduces the rest,
   in either direction, so connected bindings never become a cross join closed
   by a filter;
 - bounded streaming: every `Expand` emits chunks of at most
@@ -143,7 +540,15 @@ multi-hop fan-out is:
   downstream `Limit` that stops reading cancels the producer (the `Expand` row
   of [the operator table](#v2-plan-lowering-one-node-one-operator));
 - narrow rows: `projection_pushdown` reads only the columns the tree uses
-  before destination rows are repeated per edge, and `late_materialization`
+  before destination rows are repeated per edge, and drops a traversal end's
+  dependent scan when nothing reads more of that binding than its identity
+  (`count($t)`, a block's `$x: Person` bound only to reach the edge): the
+  `Expand` carries the end's `__id`, every edge's end exists at the snapshot
+  (`write:6`, `merge:3`) and is of the end's type, so the scan would add one
+  row per row and no column anything reads; plan validation accepts the
+  `Expand` as that binding's read (`no scan <Type> as $var` in a `.gqt` plan),
+  and a block's key-set tree and the bulk CSR check run without the scan
+  too. `late_materialization`
   moves return-only columns to a `HydrateColumns` node above a root `Limit` in
   a plan without an `Aggregate` ([filters and pushdown](#filters-and-pushdown));
 - set semantics: an unbound traversal returns each endpoint pair once, and
@@ -186,9 +591,7 @@ destination scans, bytes or elapsed time. Memory, scratch and cancellation remai
 separate. Neither fallback nor released memory refunds work.
 
 Replay validates complete member pins, finite bounds, budget policy and counter
-presence. It also checks each RankFuse arm against the complete canonical
-downstream identity-key list; missing, reordered or duplicate saved keys refuse
-before execution. Historical wildcard refusal checks both captured provenance and live
+presence. Historical wildcard refusal checks both captured provenance and live
 wildcard expansions. A selected dataset absent from the captured snapshot fails
 when opened; empty input need not open it. Bound plans use a versioned envelope
 and require regeneration when the stored version is unsupported.
@@ -273,7 +676,7 @@ correlated one from the outer input's estimate), records `anti_join_rows($x)`,
 and lowers the `key_set` tree only when it produces fewer rows; an unknown
 estimate keeps `correlated`. Each hop is priced at its edge type's average
 degree, so a hub root is under-priced: with a tiny outer side, `key_set` can
-read every edge of the hub, bounded by that root's neighbourhood and never by
+read every edge of the hub, bounded by that root's neighborhood and never by
 the outer rows. The recorded estimates make such a choice visible. The logical
 plan keeps the correlated tree as the block's meaning; the strategy is the
 physical `AntiJoin`'s `strategy` and the GQT line `anti join $x: key_set`. Plan
@@ -288,49 +691,93 @@ outer binding (the correlation binding included: its identity is the key,
 never a read column), when no binding is bounded, and under a
 `traversal_work_limit`. The bulk CSR degree check needs a filter-free
 destination, so its shapes never have a bounded binding and stay correlated.
+A block's right side may read the outer row's columns: the operator evaluates
+it over the outer batch and compares each outer row's aggregate (its key's,
+under `key_set`) with its own value; the bulk CSR check takes only a constant
+right side.
 
 ## Filters and pushdown
 
-A read query runs on engine v2, from a plan. The session setting `engine`
-(`omnigraph_compiler::settings::Engine`, the Session settings RFC) keeps one
-value, `v2`, and refuses `v1` as an unknown value. The doors
+A read query runs from a plan. The doors
 (`Session::query`, `query_with_head`, `run_query_at` in
 `exec/query_doors.rs`) plan every read through `engine::execute_query`. A
 query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user
 error on execute, the error `explain_query` gives for it.
 
-Engine v1, the executor v2 replaced, is the crate
-`omnigraph-reference-engine` (`publish = false`). Its source and the compiler's
-`ir::untyped` read IR are frozen and pinned by the crate's `tests/frozen.rs`;
-it depends on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and
-third-party crates only, so it is
-independent of the production engine and planner in either direction; the
-compiler, core and catalog crates are shared. `omnigraph-gqt` is its one dependent: it
-installs `ReferenceEngine` on a session copy through
-`Session::with_read_executor` (the `ReadExecutor` trait in
-`omnigraph_catalog::read_executor`, both under the `test-util` feature) to run
-a step's `--- expect same as v1` comparison. Only this reference door converts
-the compiled query with `QueryIR::erase` into `ir::untyped`; erasure is one-way,
-and engine v2 keeps the compiler's normal IR. It answers `not { ... }` blocks
-only among the correlated blocks, and refuses count predicates and a string
-`nearest` argument. A defect is fixed on v2, never in the reference.
+Where a `where` conjunct runs is decided by one law, applied once, in the
+planner's `placement` module (`crates/omnigraph-planner/src/placement.rs`,
+the `predicate_pushdown` pass on a query plan; the GQ 3 RFC states it after
+`where`'s written-order passage in section 2). The type checker writes every
+conjunct of a scope after the scope's elements, in written order, each a
+`Filter` with one typed fact computed once, `fails`: whether it can fail where
+it is evaluated (arithmetic, or a block it reads as a value that can fail). It
+writes the same fact on every element that can fail: a `let`, a `from`, an
+`optional` and a block read as a value. The shaper keeps that order and those
+facts (`PatternStep::Filter { fails }` and the `fails` of `AntiJoin`,
+`Optional` and `Correlate`), and the logical plan carries them on `Filter`,
+`AntiJoin`, `OptionalJoin` and `Correlate`; no other layer decides what can
+fail. A conjunct that cannot fail moves down from where it is written into the
+scan of the one binding it reads (`ScanSpec.filter`, a `Predicate::Gq`, when
+`QuerySource::filter_pushable` accepts it; the dependent scan that hydrates an
+expansion destination included), or to just above the lowest node whose
+passing inputs do not carry every binding it reads. It never moves below a
+node that can fail, so the conjuncts written before the scope's first one that
+can fail are the ones that move, and that one and every one after it keep their
+written order above every element. A node that selects rows within a group (a
+`limit`, a sort with a fetch, a ranking's `TargetCut`, a `Nearest`, a `Score`,
+and later `shortest`) declares its group key, and a conjunct crosses it only
+when every binding it reads belongs to that key; each of today's declares an
+empty key, a selection over the whole relation, which a conjunct reading a
+column never crosses. Every logical node declares these facts in one
+exhaustive method (`LogicalNode::declares`: whether it can fail, its group key,
+the inputs a conjunct may pass into, the binding a scan absorbs), and the law
+reads only that, never a node's kind. An inner scope (a block's, an
+`optional`'s or a correlated read's pattern, a union's or a fusion's arm) is no
+node's passing input, so a conjunct never moves into one; its own conjuncts
+are placed by the same law within it. A conjunct that holds a `match_terms`
+stays where it is written. Adjacent conjuncts that cannot fail are one `Filter`
+node before and after the moves; a node holding a conjunct that can fail is
+never merged with one that cannot, and lowering puts only a node of conjuncts
+that cannot fail into a `CrossJoin`'s own filters, so the join never runs a
+later conjunct before one that can fail. Plan acceptance holds the plan to the
+law independently (`validate/placement.rs`): it reads each scope's conjuncts
+and their facts from the checked core read, not from the shape or the
+optimizer, and refuses a plan that tests a conjunct written at or after the
+scope's first one that can fail in a scan, below an element of its scope, or
+before a conjunct written ahead of it.
 
-Filter placement is a planner decision, the `predicate_pushdown` pass
-on a query plan (`place_query_filters`, per scope: the top-level tree and
-each correlated block's inner tree on its own): a search filter moves to the scan of
-its field's binding; a scalar filter on exactly one binding that
-`QuerySource::filter_pushable` accepts moves to that binding's scan
-(`ScanSpec.filter`, a `Predicate::Gq` carrying the `IRFilter`), including
-the dependent scan that hydrates an expansion destination; a
-filter on two bindings, one the scanner cannot lower, or one on an outer
-binding inside a negation stays an in-memory `Filter` node where the query
-wrote it. A scan with a
+A scan with a
 SQL-string filter inspects its planned filter for full-text demand (a
 `contains_tokens` call); full-text index coverage
-(`FullTextIndexRebuildRequired`) is checked only when a full-text query or a
-`contains_tokens` demand is present. A scan with no full-text query, no
+(`FullTextIndexRebuildRequired`) is checked only when a native full-text query
+or a `contains_tokens` demand is present. A scan with no full-text query, no
 SQL-string filter and no `contains_tokens` call in its typed filters skips
 both.
+
+A pushed filter reaches Lance unchanged, and Lance's scanner picks the index
+for each conjunct from the pinned manifest's index section.
+`plan_source/scan_access.rs::inspect` reads that choice off the physical plan
+Lance builds and records it as the scan's `access`: `index_probe` with an
+`index_query` whose leaves name the index, its family (`btree`, `bitmap`,
+`label_list`, `ngram`, or Lance's own name for one the engine did not build),
+the column and the search Lance runs for the conjunct, and the `residual` the
+indexed branch still applies; the planner's index facts
+(`plan_source/indexes.rs`) classify each index by the same family. A BTREE
+answers `=`, `in`, ranges and `starts_with`, a BITMAP (an enum or `Bool`) `=`,
+`!=`, `in`, ranges and `is null`, and a LABEL_LIST (a list) `value in
+$x.list`, all exactly. An NGRAM (a String `@index`) answers `contains` with candidates
+that Lance rechecks with the whole pushed filter. A needle of fewer than three
+characters never reaches it; one of three or more with no alphanumeric trigram
+makes Lance 13 drop every match of an indexed fragment, so
+`scan::string_contains_to_df_expr` pushes it as `replace(text, needle, '') !=
+text`, which no index answers ([Lance alignment](lance.md), the NGRAM row). A
+fragment no segment covers is read with the whole filter, so index presence,
+kind and coverage change cost, never rows. `ir_expr_to_df_expr` expresses no
+registry call (`lower`, `abs`, `cast`, …), so a conjunct holding one is never
+pushed: Lance indexes columns, not expressions, and its text query parser
+takes a bare column only, so `contains(lower($x.f), $q)` stays a `Filter`
+above the scan while `contains($x.f, $q)` probes the NGRAM
+(`cases/planner/function_of_a_column_is_answered_by_the_scan.gqt`).
 
 String-built SQL is retained only at explicitly documented compatibility
 seams. The camel-case regression and its two-parser boundary are recorded in
@@ -340,23 +787,25 @@ Column projection is the second pushdown dimension, the
 `projection_pushdown` pass described below.
 
 Before a query runs, `accept_query`
-(`engine/plan_source.rs`) hands the compiled `QueryIR` to the planner as
-`Operation::Query`: `resolve_query` folds the `IROp` pipeline into a logical
-tree (one `TableScan` per `match` binding, `CrossJoin` for a second binding with no edge, `Expand`, `Filter`, `AntiJoin` with its inner
+(`engine/plan_source.rs`) hands the compiled read shape (`ReadShape`) to the
+planner as `Operation::Query`: `resolve_query` folds its pattern steps into a logical
+tree (one `TableScan` per `match` binding, `CrossJoin` for a second
+binding with no edge, `Expand`, `Filter`, `AntiJoin` with its inner
 tree over an `OuterReference` leaf standing for the enclosing rows, a leading
-search function as `Nearest`, `TextSearch` or `RankFuse`, then `Projection`
+`nearest` as `Nearest`, a `Fuse` over its arm subtrees,
+then `Projection`
 or `Aggregate`, with a `Projection` above `Aggregate` for Boolean expressions
 over aggregates, followed by `Sort` and `Limit`); the logical passes rewrite it
 (`predicate_pushdown` above, `aggregate_pushdown`, `projection_pushdown`); the
 planner lowers it into a `PhysicalPlan` without consulting the registry. The
-lowering is one-to-one except for ranking: a logical `Nearest` or
-`TextSearch` becomes the `ranked` access path of its binding's physical
+lowering is one-to-one except for ranking: a logical `Nearest` becomes the
+`ranked` access path of its binding's physical
 `Scan` (no node of its own) and the score key the physical `Sort` leads with,
-and a logical `RankFuse` becomes a physical `RankFuse` over two copies of the
-pipeline subtree, one per arm, each with its own ranked `Scan`; the fusion
-appends the fused score as `<primary binding>._rrf` (`F64`) and the physical
-`Sort` above leads with it, then the remaining keys, then the binding ids,
-so `Limit` cuts rows and never fused entities (RFC 0047 §Total order). Before planning, the engine reads destination dataset file sizes
+and a logical `Fuse` becomes a physical `Fuse` over its lowered arm subtrees
+([Fusion](#fusion-one-operator-over-any-ranked-arm)); the fusion appends the
+fused score as `<target>._rrf` (`F64`), and the read's own `order` sorts the
+fused rows like any other column, so `Limit` cuts rows after the read's
+order and tie rule. Before planning, the engine reads destination dataset file sizes
 from pinned Lance manifests for the hash-join byte estimate. If the row ratio
 allows a hash join but whole-table bytes reject it, the engine reads per-column
 compressed sizes from Lance metadata and plans with those statistics. Sparse
@@ -367,7 +816,13 @@ never scans query data. Ordinary execution builds no explain JSON or structural 
 await scan-access finalization, accept; it additionally renders the explain
 document from that planning run. Finalization
 first narrows safe single-String-key predicates, then records Lance's static
-probe or sequential choice. A
+probe or sequential choice. A scan whose pushed filter equates the identity
+column with a literal (the narrowed key's derived equality, or a written one)
+gives Lance that conjunct alone and rechecks the others on the row it returns
+(`table_store::split_identity_probe`), so it probes the identity index and
+never a second index holding the same values; the access reports the
+recheck as its residual. The write path's committed scans (an update's
+match, a delete's ids) split their filter the same way. A
 lowering error is a planner defect surfaced as an error, never a fallback to
 a hand-written sequence. `projection_pushdown` writes each scan and expansion destination projection
 from what the whole tree reads through its binding: the key always, and `id`
@@ -392,10 +847,10 @@ the sort orders by alias) leaves its binding's physical scan, which reads
 each such binding's table and columns, and the return projection below carries
 the binding's row address as `^binding` (`ROW_ADDRESS_PREFIX`) instead of the
 column. The pass fires when the root is a `Limit` of `K > 0` rows, the plan
-has no `Aggregate`, and the binding's scan is unique and unranked, or is one
-of the two ranked arm scans of a `RankFuse`, which the pass rewrites together
-so the arms carry ids, scores and the row address into the fusion (a lone
-ranked scan keeps its columns); a binding
+has no `Aggregate`, `Union`, `Fuse`, `OptionalJoin`, `Score`, `Let` or
+`Correlate`, and the binding's scan is unique and unranked (a ranked scan
+keeps its columns; a fusion's arms each scan the target, so none is
+unique); a binding
 whose scan row estimate (the manifest row count, one row
 under a key equality) is at most `HYDRATE_ROW_RATIO` (4) times `K` keeps its
 columns. A scan below a limit reads more rows than the limit keeps whenever a
@@ -426,25 +881,35 @@ node lowers to exactly one operator, so the lowered tree has the plan's shape
 node for node; every operator is omnigraph's own (`engine/operators/`, backed
 by `engine/scan.rs`, `engine/graph.rs`, `engine/expr.rs` and
 `engine/search.rs`) except the aggregate, which is DataFusion's
-`AggregateExec` over GQ expressions:
+`AggregateExec` over GQ expressions. `engine/expr.rs` computes the string,
+numeric, `size` and `cast` registry rows in `engine/scalar_rows.rs`, on the
+Arrow or DataFusion kernel whose semantics match the RFC's or on a GQ kernel
+where none does (its module documentation lists each), with GQ's null and
+error rules (`E1`, `E3`, `E5`, `E6`) checked before the kernel; the
+reference interpreter's `registry.rs` states each row independently:
 
 | `PhysicalNode` | Operator | Provider |
 |---|---|---|
 | `MetadataCount` | `MetadataCountExec`: exact live-row count from the pinned dataset, with the single output row charged to the query pool | omnigraph |
-| `Scan` | `ScanExec`: `execute_node_scan` with the projection and pushed filters read off the `ScanSpec`, the schema declared before running. A `ranked` scan runs under a `SearchMode` built from its `RankedAccess` (the index, the ranked property, the query argument), the bound plan's value table (the query vector by node id, the parameters) and the pass's `Pass` (the overfetch rung, the gate's eligible set), so Lance ranks while scanning and appends `_distance` or `_score`. A scan whose `ScanSpec` carries a `runtime_filter` marker holds a `RuntimeFilterSlot` its `ContainsJoin` fills before the scan executes, and takes the closed `RuntimeFilter` enum from it (`TextContainsAny` its one variant). Every unranked table read (no `ranked` access, so no search mode), marked or not, is a pipeline operator (`operators/scan/pipelined.rs`): it reads Lance batches of at most `lance_batch_rows(batch_bytes)` rows under the byte target `batch_bytes` (Lance 13 decodes whichever bound is smaller; the explicit row bound takes precedence over the `LANCE_DEFAULT_BATCH_SIZE` fallback), `PIPELINED_READAHEAD` (2) batches decoded ahead and at most `PIPELINED_IO_BUFFER_BYTES` (64 MiB) fetched ahead, both outside the pool; it holds each batch as `v2 scan input`, sieves it when a join left a filter (a batch kept whole or emptied is a slice of itself; a mixed selection is copied only once the batch's `v2 scan batch` charge admits the copy) and releases the input, and kept batches gather under one `v2 scan batch` charge until they reach the session's batch rows (the rows of a `Limit` directly over the scan's projection, when one is there) or the byte target, then leave as one batch held until the consumer takes it: Lance reads a batch per fragment, and a per-batch consumer (an indexed hop's lookup) would otherwise pay once per fragment. The table is never held whole, and a consumer that stops (a `Limit`) stops the read. When that `Limit` sits directly over the projection of a read with no pushed filter, no full-text query and no runtime-filter marker, its rows also reach Lance as `Scanner::limit`: with no filter and no ordering Lance plans only the fragments that hold the first live rows, from the manifest's row and deletion counts (`Scanner::plan_scan_range`), instead of opening up to `fragment_readahead` fragments before the stream is dropped. A filtered read keeps the early stop alone, since Lance pushes no limit through a filter; only a marked scan records `runtime_filter_rows_read` (every row it reads, an inert scan's too), `runtime_filter_rows_dropped` and `runtime_filter_inert`. A ranked scan and its ANN ladder is a breaker through `execute_node_scan`, which collects its batches; a dependent scan reads one slice of its input at a time; all of them build the Lance scanner through one `NodeRead`, and read `_rowaddr` when the plan defers a return column of their binding | omnigraph |
+| `Scan` | `ScanExec`: `execute_node_scan` with the projection and pushed filters read off the `ScanSpec`, the schema declared before running. A `ranked` scan runs under a `SearchMode` built from its `RankedAccess` (the index, the ranked property, the query argument), the bound plan's value table (the query vector by node id, the parameters) and the pass's `Pass` (the overfetch rung, the gate's eligible set), so Lance ranks while scanning and appends `_distance`. A scan whose `ScanSpec` carries a `runtime_filter` marker holds a `RuntimeFilterSlot` its `ContainsJoin` fills before the scan executes, and takes the closed `RuntimeFilter` enum from it (`TextContainsAny` its one variant). Every unranked table read (no `ranked` access, so no search mode), marked or not, is a pipeline operator (`operators/scan/pipelined.rs`): it reads Lance batches of at most `lance_batch_rows(batch_bytes)` rows under the byte target `batch_bytes` (Lance 13 decodes whichever bound is smaller; the explicit row bound takes precedence over the `LANCE_DEFAULT_BATCH_SIZE` fallback), `PIPELINED_READAHEAD` (2) batches decoded ahead and at most `PIPELINED_IO_BUFFER_BYTES` (64 MiB) fetched ahead, both outside the pool; it holds each batch as `v2 scan input`, sieves it when a join left a filter (a batch kept whole or emptied is a slice of itself; a mixed selection is copied only once the batch's `v2 scan batch` charge admits the copy) and releases the input, and kept batches gather under one `v2 scan batch` charge until they reach the session's batch rows (the rows of a `Limit` directly over the scan's projection, when one is there) or the byte target, then leave as one batch held until the consumer takes it: Lance reads a batch per fragment, and a per-batch consumer (an indexed hop's lookup) would otherwise pay once per fragment. The table is never held whole, and a consumer that stops (a `Limit`) stops the read. When that `Limit` sits directly over the projection of a read with no pushed filter, no full-text query and no runtime-filter marker (no read plan has that shape now, since a read's `limit` cuts the tie rule's `Sort`), its rows also reach Lance as `Scanner::limit`: with no filter and no ordering Lance plans only the fragments that hold the first live rows, from the manifest's row and deletion counts (`Scanner::plan_scan_range`), instead of opening up to `fragment_readahead` fragments before the stream is dropped. A filtered read keeps the early stop alone, since Lance pushes no limit through a filter; only a marked scan records `runtime_filter_rows_read` (every row it reads, an inert scan's too), `runtime_filter_rows_dropped` and `runtime_filter_inert`. A ranked scan and its ANN ladder is a breaker through `execute_node_scan`, which collects its batches; a dependent scan reads one slice of its input at a time; all of them build the Lance scanner through one `NodeRead`, and read `_rowaddr` when the plan defers a return column of their binding | omnigraph |
 | `HashJoin` | `HashJoinExec`: the build (a table `ScanExec` of the destination with the pushed filters and projection) drained under the query pool and hashed on `<binding>.<id>`, the traversal (`probe`) joined in its own order, one `take` per side per probe batch, output charged as `hash join output`; the declared `id_lookup` fallback is a branch of the same operator (below); the first probe batch is read before the build, so an empty probe executes nothing on the build | omnigraph |
-| `RankFuse` | `RankFuseExec` over its two arm subtrees, each lowered once with its own ranked `Scan`; the operator ranks each arm by its score column, the fused binding's id and planner-declared downstream row keys before fusing. Selected edge keys place concrete type before id. Fusion identifies and scores the fused node by its id, emits every arm row with the fused sum in `<binding>._rrf` (`F64`) and neither sorts nor cuts: the `Sort fetch N` above orders and the `Limit` cuts rows; body `fuse_arms` | omnigraph |
+| `Fuse` | `FuseExec` (`operators/fuse.rs`) over its arm subtrees, each lowered once as the plan its ranking runs standing alone, whose rows arrive in the arm's rank order: the arms are drained one after another in written order, and in each a target takes the next rank at its first row, adding `weight / (k + rank)` (the plan's `k`, 60 when absent, bound and checked in `1..=1000000` when lowered; the plan's `weights`, 1.0 when absent) to its fused score, summed in written order in `F64`. One row leaves per target any arm selected, the target's columns from the first arm that selected it and the fused score as `<target>._rrf`, and it neither sorts nor cuts. Every arm row and every fused target is charged to `read_work_limit`, and the held arm rows and per-target state to the query pool (`FuseExec`) | omnigraph |
 | `CrossJoin` | `CrossJoinExec`: the left input collected under the query pool, every left row paired with each right batch, output charged as `cross join output`; an empty left executes nothing on the right. The node's `filters` (conjuncts over both bindings) run in the join; every pair goes through one `PairBuffer`, which charges each right batch's row-size scratch before it grows it, filters the held pairs into a kept batch when it holds the session's batch size of pairs, when their estimated bytes reach the producer's batch bytes, and at each right batch's end, and sends the kept batches as one output once their rows reach the batch size or their bytes the batch bytes (the rest at the end), so an output exceeds the batch size by at most one kept batch | omnigraph |
 | `ContainsJoin` | `ContainsJoinExec`: the planner's join for a `Filter` over a `CrossJoin` holding a `$r.x contains $l.y` conjunct whose `$r` is the unranked table `Scan` on the right and whose two properties are text (`optimizer.rs` `filtered_cross_join`, reported as the `join_algorithm` pass; a search order that later ranks that scan takes the marker off again and turns the join back into the `CrossJoin` of its conjuncts, `Lowering::unmark`, since a ranked scan runs under a search mode and no runtime filter); the filter's other conjuncts are the node's `residual`, and the right scan's `ScanSpec` carries `runtime_filter` (`column`, `needle`, `kind` `text_contains_any`), which the engine's lowering turns into the `RuntimeFilterSlot` both operators share; the lowering refuses a plan (a replayed or edited one) whose marked scan's column or needle differs from its `ContainsJoin`'s, or whose marked plain table scan no `ContainsJoin` fills (a marker on any other scan is not read, and that scan reads unfiltered). The left input is collected under the query pool (`contains join left`); the join admits its `PairBuffer`, then fills that slot (a fill first clears any earlier execution's filter) with one Aho-Corasick automaton over the distinct non-empty `y` values, charged once as `runtime filter needles` and shared with the join (the scan is left unfiltered when a value is empty, since that value is in every text, though the join still pairs through the automaton; none, and the join tests every pair, when the pool refuses it; no right execution when every value is null); both operators print `runtime_filter=$r.x contains any($l.y)`, and `ScanExec` sieves each Lance batch through it as the `Scan` row describes (`runtime_filter_rows_read`, `runtime_filter_rows_dropped`, `runtime_filter_inert`; the join's `runtime_filter_needles`). At its first right batch the join builds its needle rows over that same automaton, which the streaming scan may still be sieving through (`contains_join=aho_corasick`; only the row tables are charged, as `contains join needles`): each non-null text pairs only with the left rows of the needles it holds, the pass over a text stopping once every needle is found and checking for cancellation every 4,096 occurrences, and each empty needle's row pairs with each non-null text; when the pool refuses the needle rows it pairs every row. Every pair goes through the same `PairBuffer` as `CrossJoinExec`, which tests only the `residual` conjuncts on the needle-rows path, whose every pair holds the `contains` conjunct by construction, and the `contains` conjunct with them on the every-row path; with the right scan streaming, the join's memory is the left side plus the shared automaton, the needle rows, one right batch and one output batch, beside the producer queue's two batches in flight. `contains_join_matcher` is 1 when the run paired through the needle rows, 0 when the pool refused them, and absent when no right row reached the join; `contains_join_pairs` counts the pairs found for the non-empty needles before the residual conjuncts, beside a matcher of 1 | omnigraph |
-| `Filter` | `FilterExec`: every `IRFilter` of the node as one conjunction over the wide batch (`evaluate_filter`), so a filter over two bindings reads two columns. A later conjunct, and the right side of `and`/`or`, needs only the rows still undecided (`evaluate_filter_where`): with none it does not run, with at most 20% of the batch it runs on those rows alone, gathered over the columns it reads, and above that share it runs on every row. The result equals evaluation on the undecided rows alone, but whether a decided row is evaluated depends on that share, so an operand that can fail on a row's value must take the gathered path at every share | omnigraph |
+| `Let` | `LetExec` (`operators/let_value.rs`): per input batch, the value evaluated over the wide batch (`evaluate_expr`) and appended as the `<binding>.value` column, every row passed through in input order; a failure is the value's typed refusal (`E1`, `E2`, `E3`, `E5`, `E6`) | omnigraph |
+| `Score` | `ScoreExec` (`operators/score.rs`): per input batch, every other column carried and input order kept. Of kind `distance`: the scored binding's vector column read and its distance under the field's declared distance (`l2` the sum of squared differences, `cosine` one minus the cosine, `dot` one minus the dot product; `VectorDistance::evaluate`) to the value table's query vector for this node appended as `<binding>._distance` (`F32`, non-null); a row whose vector is null, or under `cosine` a zero vector, is filtered out (binding refused a zero `cosine` query vector before the run), and a non-finite stored component, query component or result is the typed refusal `E3`. Of kind `bm25`, a switch the node declares (`fallback: two_pass`, `retained_limit` a quarter of the plan's memory limit, `bm25_match_table_bytes`), run as a produced body: on its first poll, before it pulls its input, one streamed pass of the exact lexical scan over the type's whole field corpus (`lexical_scan::bm25`) counts the corpus, its tokens and each query term's document frequency. On the one-pass side it also keeps, for each matching document only, its identity, its token count and its alternatives per query term (one entry per matched term and edit distance, in one list: the match table); after the pass each kept document is scored against the complete statistics and only the identities and their sums stay (`Bm25Scores`), charged to the query's pool for the operator's lifetime like the identities a `match_terms` keeps, never cached or stored. Each input row then takes its score by its binding's identity, which is all the population's scan projects of it. When the next matching document's entries would carry the table past the limit, the pass releases the table and finishes counting the statistics alone (`Bm25Scorer`): the two-pass side. The table's bytes are a sum over the matching documents, so the switch is a function of the plan's memory limit and the data at the snapshot, not of their order or of what else holds the pool; a node that declares no fallback (a saved plan's edit) keeps the table until the pool refuses it. The two-pass side gathers input rows into slices (the table's budget at 1 KiB per identity, 256 to 16,384 rows, `rescan_slice_rows`), reads each slice's distinct identities' text in one `id IN (…)` read of the pinned table, analyzes each value again and scores it with the same sum (`Corpus::total`), so rows, F64 scores and tie order are the one-pass answer; each slice's identities and sums are charged while it is scored and released after. Either side appends `bm25_v1` as `<binding>._score` (`F64`, non-null), checked when a row reads it (`E3`), and filters out a row with none (its value null, token-empty or not matching). The report's `ran` is `one_pass` or `two_pass`. On the one-pass side the field is read and analyzed once, whatever the population, and the memory follows the matches, as a `match_terms`' does; the two-pass side holds nothing per document and reads and analyzes the population's text a second time. A query that analyzes to no term (one of only stop words) matches nothing: the corpus is not read and every row is filtered out, as `match_terms` over it is false and its scan reads nothing. It reads no index, so its rows are equal under every index state; the output batch is charged as `score output` | omnigraph |
+| `Filter` | `FilterExec`: every `IRFilter` of the node as one conjunction over the wide batch (`evaluate_filter`), so a filter over two bindings reads two columns. A later conjunct, and the right side of `and`/`or`, needs only the rows still undecided (`evaluate_filter_where`): with none it does not run, with at most 20% of the batch it runs on those rows alone, gathered over the columns it reads, and above that share it runs on every row. The result equals evaluation on the undecided rows alone, but whether a decided row is evaluated depends on that share, so an operand that can fail on a row's value must take the gathered path at every share. A full-text call in a conjunct reads a Boolean membership column the operator adds to each batch while it evaluates (`engine/lexical.rs`, `LexicalColumns`): before the plan is lowered, `LexicalMembers::resolve` runs each such call once as the scan's own full-text query (`scan::build_fts_query`; `match_terms` is Lance's zero-edit match query with `Operator::And` for `mode: all` and `Operator::Or` for `mode: any`) over its node type's whole table at the pinned snapshot, with no filter, charged as `full-text membership` for the query's lifetime, and a row is true when its identity is among the matches, so a null document is false and the answer does not depend on index coverage. A `match_terms` over a field whose index declares an analyzer profile is answered instead by the exact lexical scan (`engine/lexical_scan.rs`), which reads no index: it streams the field and the identity at the pinned snapshot, normalizes each value to NFC, tokenizes it with the profile's own Lance pipeline (`InvertedIndexParams::build`), and keeps an identity when every (`all`) or some (`any`) distinct analyzed query term has a stored term within the edit budget (a banded Levenshtein over Unicode scalar values, `bounded_edits`). The same scan reads each exact `bm25` `Score`'s field corpus once for its `bm25_v1` statistics (its size, token total and per-term document frequency) and scores each matching document after the pass, and the `Score` operator gives each row of its population its score by identity, or on its two-pass side from the row's own text read again (`Bm25Scores`, `Bm25Scorer::rescore`, `Corpus::total_of`: `libm::log1p` IDF, checked `u64` counts, terms in ascending UTF-8 order, `E1` on overflow, `E3` when a row reads a score that is not finite and positive). Query bytes (64 KiB), distinct query terms (1,024) and value bytes (16 MiB) are bounded before and after NFC (`ResourceLimitExceeded`), every analyzed token and term comparison is charged to `read_work_limit`, and a bound edit budget outside `0..=2` or a query with no analyzed term is `T71` or `T20`. `LetExec` reads a call in a `let` the same way, and `projection_pushdown` reads the identity of each binding such a call searches | omnigraph |
 | `Expand` | `ExpandExec`: an unbudgeted named unbound single hop uses one vectorized walk per input batch (`operators/single_hop.rs`); unbudgeted named multi-hop drains its input into the BFS breaker `execute_expand`. Budgeted expansions, including selected multi-hop, consume fixed source windows through `SourceWindows`. Bound edges use the bounded pair producer, spillable pair ordering and incremental hydration within each input batch or budgeted source window. Output chunks contain at most 256 rows (`expand_pairs` counts pairs handed on); dropping the stream at a downstream `Limit` cancels the producer | omnigraph |
+| `Union` | `UnionExec` over its two arms: both drained, every row of each kept under the columns of the union's bindings (`<binding>.<column>`) in the left arm's order, matched by name in the right arm; the arms' other columns stay behind | omnigraph |
+| `OptionalJoin` | `OptionalJoinExec` over the outer plan and the lowered inner plan, whose leaf is an `OuterReference`: the outer rows are drained and tagged, the inner plan runs over `OuterReferenceExec` under the same `TaskContext` as a correlated block's does, every inner row leaves without its tag, and each outer row no inner row names leaves once with every column the inner tree adds null (the core's `Correlate(R, Union(p, Project(Filter(Env, ¬ exists p), nulls)))`) | omnigraph |
+| `Correlate` | `CorrelateExec` over the lowered inner plan and, correlated, the outer plan, whose rows are drained and tagged for the inner plan's `OuterReference` as an `OptionalJoin`'s are; the read's group is a DataFusion `AggregateExec` the lowering builds over the inner rows (grouped by the outer tag, each key, a reference by its identity, with each group's first row, which carries a reference key's columns), fed from its own slot; each value column is evaluated on every row of the read, then the rows are sorted by the tag, the keys and the tie rule (the read's reference identities, then its group's value keys) and cut per tag; each outer row leaves once per row of its read, and a read grouped by no key adds its empty-input row (`count` 0, every other aggregate null) for an outer row it has none for | omnigraph |
 | `AntiJoin` | `AntiJoinMaskExec` over the outer plan and the lowered inner plan. `correlated`: the bulk CSR degree mask when the predicate counts rows and the inner is one single-hop, filter-free, unbound expand over the `OuterReference`; else the outer rows are tagged, the inner plan runs over `OuterReferenceExec` under the same `TaskContext`, each inner batch folds into `SubqueryAggregate` per outer row as it streams, without being held, and the predicate applies to the folded rows. `key_set`: the outer rows are drained, each distinct `<outer_var>.<id>` gets one `SubqueryAggregate` group, the inner plan (no outer leaf) streams and each batch folds into its key's group (an inner key no outer row holds into a discarded group) without being held, and each outer row takes its key's verdict, a null key that of no matches | omnigraph |
-| `OuterReference` | `OuterReferenceExec`: the leaf of an `AntiJoin`'s inner tree, standing for the enclosing rows; lowering refuses one outside an `AntiJoin` inner tree. | omnigraph |
-| `Projection` | `ProjectionExec` over `GqProjectionExpr` per return expression, output charged as `projection output`; above an aggregate it evaluates Boolean expressions over aggregate leaves and group keys, resolving each `AliasRef` by its input column name and emitting the public return columns in written order; when a `Sort` consumes it, every column the sort reads and every declared tie-break metadata column follow the return columns under the hidden prefix `~`, which the sort drops; under a `HydrateColumns` it skips the deferred return items and carries each deferred binding's `_rowaddr` as `^binding` | omnigraph |
+| `OuterReference` | `OuterReferenceExec`: the leaf of a correlated inner tree (an `AntiJoin`'s, an `OptionalJoin`'s or a correlated `Correlate`'s), standing for the enclosing rows; lowering refuses one outside such a tree. | omnigraph |
+| `Projection` | `ProjectionExec` over `GqProjectionExpr` per return expression, output charged as `projection output`; above an aggregate it evaluates Boolean expressions over aggregate leaves and group keys, resolving each `AliasRef` by its input column name and emitting the public return columns in written order; when a `Sort` consumes it, every column the sort reads, every computed key no return item computes (evaluated here, under its text) and every declared tie-break metadata column follow the return columns under the hidden prefix `~`, which the sort drops; under a `HydrateColumns` it skips the deferred return items and carries each deferred binding's `_rowaddr` as `^binding` | omnigraph |
 | `HydrateColumns` | `HydrateExec` (`operators/hydrate.rs`): per input batch, in chunks planned from the costliest output row seen (its decoded row and its copy; four rows first), the distinct `^binding` addresses of each binding, sorted and grouped by fragment, read from its pinned table through `FileFragment::open` and `FragmentReader::take` with the deferred columns' projection and one row per decode task. Each decoded row is copied at its own size through `WorkMemory::take_once` (charged as `hydrate fetch`; Lance's row can slice a buffer of the whole read) before the fetch waits for the next, at most `ROWS_IN_FLIGHT` (8) rows decoding at once and `FRAGMENTS_AHEAD` (4) fragments' reads scheduled ahead. A fragment whose data files are in the table's own base is read in one coalesced request through an engine `ScanScheduler`, whose I/O buffer, a quarter of the bound, is reserved for the operator's life as `hydrate read-ahead`; a fragment holding a file Lance reaches through a `base_id`, for which Lance 13 opens its own scheduler unless a per-base cache is supplied, is read one row per request and counted as `single_row_reads` (only a table fork created before v11 holds one; a graph branch's writes stay in the table's own base). An address the table does not hold is an integrity error. The rows are copied to every output row that names them through `WorkMemory::interleave_once`, which admits each copy (one per output row, so a row a join repeats is copied per repetition; a null address costs a null row) as `hydrate output` before Arrow builds it. The bound is `hydrate_chunk_bytes(pool)` (an eighth of the query pool, the node's declared `retained_limit`): the read-ahead reservation, then the decoded rows and their copies within the rest. A fetch stops once its decoded rows pass half of that rest, and the window is planned again from the widest row decoded; a chunk whose copies would exceed it keeps a prefix halved until they fit, the rest starting the next chunk. So the operator holds at most the bound and the row that crosses it, with at most `ROWS_IN_FLIGHT` rows decoded and not yet charged, and Lance's read-ahead past its buffer is at most the request at the head of its queue, which Lance may coalesce from many rows' ranges (up to its maximum I/O size, 16 MiB by default), so the read-ahead share is soft. A chunk is charged as `hydrate chunk`, keeps only its output once built, and is sent as it is built; `hydrated_rows` counts the rows and the `peak_chunk_bytes` gauge records the most one chunk held, every decoded row included | omnigraph |
-| `Sort` | `SortExec`: with a `fetch`, a streaming top-k (every input batch merged into the retained best `fetch` rows and released, so the pool holds one batch and `fetch` rows at a time); without one, the whole input held under the query pool (no spill) and sorted once. Keys are `lexsort_to_indices` over the node's `order_by`, `nulls_first = !descending`, then the metadata columns of the node's declared `tiebreak`, ascending; the `~` columns are dropped on the way out. The planner (`optimizer::sort_tiebreak`) declares identity columns in binding-name order, with selected bound-edge type before its ID. Each metadata key already explicitly ordered is omitted independently; group rows and a `return` whose every expression is an order key need no hidden ties; `projection_pushdown` reads an id only for a declared tie-break, a traversal, a dependent scan, an anti-join, a ranked scan or an expression naming `@id`. The planner writes a search order's score key (`$d._score desc`, `$d._distance asc`) first and the query's plain keys after it, with the limit as `fetch`; a fusion plans one `Sort` above it, led by `<binding>._rrf desc`, and none inside an arm; an aggregate under a search order plans a `Sort` only when the query writes further order keys (those keys, then the group keys) | omnigraph |
-| `Limit` (`Page` in explain JSON) | `LimitExec`: passes batches and cuts the last one at the bound; a limit of zero executes nothing below it | omnigraph |
-| `Aggregate` | `AggregateExec` (`Single`) with the group keys and aggregate arguments as `GqProjectionExpr`s over the wide batch (the compiler stores `AggSignature`, the planner selects `AggregateSpec`, and lowering executes it; integer `sum` uses a `Decimal128(38,0)` accumulator and converts the total once to `Float64`; `avg` and floating-point `sum` use `Float64`); `count($v)` counts the identity column; DataFusion emits group keys before aggregate leaves. An upper `Projection` computes the public results from those columns; without one, `run_plan` restores return order through `lower::in_order` | DataFusion |
+| `Sort` | `SortExec`: with a `fetch`, a streaming top-k (every input batch merged into the retained best `fetch` rows and released, so the pool holds one batch and `fetch` rows at a time); without one, the whole input held under the query pool (no spill) and sorted once. Keys are `lexsort_to_indices` over the node's `order_by` (a written key that is a reference arrives as its identity: the shaper's `reference_key` writes `$x.@id`, with `@type` first for an edge over several types, and over group rows a returned node's object, whose first member is `@id`; an inline read's own `order` gets the same identity keys, `reference_identity`), each key's written `nulls first` or `nulls last`, else `nulls_first = !descending` (`IROrdering::places_nulls_first`), then the metadata columns of the node's declared `tiebreak`, ascending; the `~` columns are dropped on the way out. The planner (`optimizer::tie_rule`, then `sort_tiebreak`) declares the tie rule: every named binding's identity in column order, the order the pattern binds it (a traversal's destination before its edge, a selected bound edge's type before its ID), then in column order a correlated read's or a union's value columns (`values.column`, a tie-break key the sort resolves like an identity) and the identities of names the lowering made up (anonymous ends, an inlined read's unreturned bindings, which stand for the values that read computes from them); a correlated read's own tie rule counts its unreturned bindings where they are bound. Each metadata key already explicitly ordered is omitted independently; a `return` whose every expression is an order key needs no hidden ties; group rows append none but are sorted by every group key the query did not write (`with_group_keys`: bare nodes first, then values, each in column order). A `limit` with no `order` plans this sort with no written key, over pattern rows and group rows alike, so it reads every row below it; `projection_pushdown` reads an id only for a declared tie-break, a traversal, a dependent scan, an anti-join, a ranked scan or an expression naming `@id`. The planner writes a search order's score key (`$d._score desc`, `$d._distance asc`) first and the query's plain keys after it, with the limit as `fetch`; a fusion adds no score key, so the read's own `order` sorts the fused rows (an arm ranked by a score sorts its own rows; see [Fusion](#fusion-one-operator-over-any-ranked-arm)), and over group rows a search leads no key: with no written key and no `limit` the groups leave unordered (`sort_keys`) | omnigraph |
+| `Limit` (`Page` in explain JSON) | `LimitExec`: passes batches and cuts the last one at the bound; a limit of zero executes nothing below it unless an expression below it can fail (`PhysicalPlan::can_fail_below`), when it pulls its input to the end and keeps no row, so a failing return item, order key or filter refuses the read under `limit 0` as under any other limit (the core computes them on every row before the cut); a `Sort` with a fetch of zero does the same | omnigraph |
+| `Aggregate` | `AggregateExec` (`Single`) with the group keys and aggregate arguments as `GqProjectionExpr`s over the wide batch (the compiler stores `AggSignature`, the planner selects `AggregateSpec`, and lowering executes it; integer `sum` and `avg` use the exact 128-bit accumulator (`ExactIntegerUdaf`, `ExactIntegerAvgUdaf`) and convert once to `Float64`; a float `sum` or `avg` uses `Float64`; `collect` uses `CollectUdaf`, the `list` accumulator, which keeps each batch's non-null values as an owned copy, sorts them in the value order (dropping repeats under `distinct`) when it folds or emits, and reports their bytes as its size, so `AggregateExec` reserves them in the query pool and a list past `query_memory_bytes` refuses the read; a keyless correlated group pads an outer row with no inner rows with `count`'s 0 and `collect`'s empty list, and a `collect` block in `where` is read as a value, never folded by a `SubqueryPredicate`; `stddev` and `percentile` hold their values in the same accumulator and finish them in `F64` on GQ kernels over the values sorted in the value order (`collect_aggregate.rs`), so the answer does not depend on arrival order, `percentile`'s bound fraction is checked as the plan is lowered (`E5`), and their blocks are read as values too); `count($v)` counts the identity column (`expr::identity_column`: a node's or an edge's id, and for an edge over several types its type and id joined by a NUL, whose type column `projection_pushdown` then reads); DataFusion emits group keys before aggregate leaves. An upper `Projection` computes the public results from those columns; without one, `run_plan` restores return order through `lower::in_order` | DataFusion |
 
 A traversal's destination is reached one of two ways, chosen when the
 planner lowers a `TableScan` with an input (pass `access_path`). `id_lookup`
@@ -493,7 +958,7 @@ New output that exceeds the pool is refused with the typed
 `query_memory_bytes` error before downstream consumption. `AggregateExec`
 reserves its own state through DataFusion's pool and may spill.
 
-A ranked `ScanExec`, `AntiJoinMaskExec` and `RankFuseExec` build a complete
+A ranked `ScanExec`, `AntiJoinMaskExec` and `FuseExec` build a complete
 output batch before emitting it in `batch_size` slices; multi-hop `ExpandExec`
 retains its frontier and visited sets but emits its pairs in chunks of at
 most 256 as the walk finds them. Their `WorkMemory` reservations use the
@@ -512,7 +977,7 @@ At most 256 pairs are emitted per slice. Destination ids are copied from
 the CSR dictionary only for that slice; source columns use one Arrow `take`
 of the input batch, with both allocations charged per slice. An indexed start (`mode=indexed_scan`) runs one
 `key IN (batch ids)` scan per input batch into a per-batch interner and
-neighbour map, and the #533 policy is evaluated between input batches over
+neighbor map, and the #533 policy is evaluated between input batches over
 the rows seen so far, switching the remaining batches to the CSR. The
 multi-hop BFS in `graph.rs` drains the frontier, walks every hop with
 `visited`/`seen_dst` sets, and emits each chunk of at most 256 pairs as it
@@ -671,6 +1136,60 @@ are lowered only at execution ([explain-load.md](../user/queries/explain-load.md
 Destination hydration uses the planned projection; edge-property attach
 retains its complete property projection.
 
+### Store requests GQ 3 adds over GQ 2
+
+The cross-version job measures every step both versions run under the
+simulation (`scripts/cross-version.py --measure`). After the dropped end scans
+above, three mechanisms still make some steps issue more store requests than
+GQ 2's text did, all on the simulation's one-fragment tables, where a
+fixed per-read cost is not repaid; none adds stored state, and fixing any of
+them would choose an access path by table size, a statistic the planner does
+not read (invariants deny-list), or change Lance:
+
+- An index probe where GQ 2 scanned. A key equality, `in` list or
+  String `@index` predicate probes its BTREE (or NGRAM) whatever the table's
+  size, a fixed rule; GQ 2 could not use a String key's index there. The
+  probe reads the index's root and one page (two requests), which exceeds the
+  one data file GQ 2's scan read. At more than a few fragments the probe
+  reads fewer objects than the scan, and its cost grows with the index depth,
+  not the table.
+- A page reread by concurrent index searches. Several searches of one filter
+  (the arms of an `or`, an `in` list's values, an NGRAM's trigrams) run at
+  once and each misses the same uncached page, since Lance 13's
+  `search_missing_pages` reads outside its cache's loader; each search reads
+  it once. The rereads are bounded by the number of searches, not by rows.
+- A filter pushed where GQ 2 filtered in memory. A respelled read that
+  tests a key equality at the top level pushes it into the scan, and Lance's
+  heuristic late materialization reads the filter column, then fetches the
+  other projected columns (`__id`) of the matching rows: on a one-fragment
+  file that is a second request for it.
+
+Writes respelled for the one-snapshot rule (a group selecting on another
+type) read that type's table too, which GQ 2's sequential text did not.
+
+### A `limit` without `order`
+
+A `limit` with no `order` cuts the tie rule's order (`read:1`), so it plans
+the `Sort` with no written key and the limit as its `fetch`: a streaming
+top-k over every qualifying row, keyed by identity, holding `fetch` rows, with
+the other return columns hydrated for those rows alone. It reads every row
+below it, where GQ 2 stopped its scan at the first rows; its cost is a
+sorted `limit`'s, and it grows with the qualifying rows, not with `fetch`.
+Measured 2026-11-21 with release CLIs and `--stats` on the migration matrix's
+100,000-document corpus (median of five runs, local filesystem, 2 CPUs),
+`limit 10` returning two columns:
+
+| Read | GQ 2 | GQ 3 |
+|---|---|---|
+| scan, no `order` | 24.3 ms | 72.5 ms |
+| scan, `order { $d.year desc }` | 75.5 ms | 81.9 ms |
+| `where $d.year > 2005`, no `order` | 26.6 ms | 88.1 ms |
+| `where $d.year > 2005`, `order { $d.year desc }` | 77.4 ms | 89.9 ms |
+
+Peak RSS was 269 to 276 MB for GQ 2 and 282 to 283 MB for GQ 3 in every
+row: the top-k holds ten rows. A read that wants the first rows cheaply and
+can name them orders by an indexed key or narrows them in `where`.
+
 ## V2 plan lowering: one node, one operator
 
 The planner owns the walk from a `PhysicalPlan` to operators.
@@ -697,10 +1216,11 @@ fields stay hand-written and are named in
 `crates/omnigraph-planner/tests/physical_node_matches.rs`, which parses the
 crate and refuses a default arm beside named kinds and a match over kinds at
 any other site; the `Lower` walk, the engine's lowering and the catalogue
-golden (`@Operator`) then report the behaviour the new kind still owes. Two calls are not one per node:
-`anti_join_outer` runs between the outer and the inner tree of an `AntiJoin`,
-and `finish` runs once with the lowered root. A `RankFuse` has two input
-subtrees, one per arm, and the walk lowers each once; a subtree reached
+golden (`@Operator`) then report the behavior the new kind still owes. Two calls are not one per node:
+`correlate_outer` runs between the outer and the inner tree of an `AntiJoin`,
+an `OptionalJoin` or a correlated `Correlate`,
+and `finish` runs once with the lowered root. A `Fuse` has one input
+subtree per arm, and the walk lowers each once, in written order; a subtree reached
 twice is refused before any method runs. The `hash_join` method receives the
 probe and the build lowered, with the build scan's `ScanSpec` in its
 `HashJoinFields`, so the fallback lookup reads the same filters and projection.
@@ -736,9 +1256,9 @@ is how a `nearest()` over a string query reads `unavailable`. A bound plan
 serializes through planner-owned mirror types (`mirror.rs`) and reads back
 equal (`omnigraph-planner/tests/integration/bound_plan.rs`); the `SearchMode` of a
 ranked scan is built from the plan node, the value table and the pass, never
-from the `QueryIR`.
+from the read shape.
 
-Nothing reads the `QueryIR` after acceptance returns, and the types say so:
+Nothing reads the read shape after acceptance returns, and the types say so:
 `execute(accepted: AcceptedBoundPlan, context: &EngineContext)` (`engine/mod.rs`)
 is the run, and `EngineContext` holds the snapshot, the catalog, the graph-index
 handle and a load plan's facts, each data and not a decision: no session setting and no environment
@@ -800,31 +1320,38 @@ during synchronous optimization. Async scan
 - Every switch the run may take is declared on the node whose operator
   takes it, as the planned choice plus the allowed alternative: `fallback:
   id_lookup` on a `HashJoin` (a join whose plan declares none lets a build
-  refusal propagate), and `mode` plus `ExpandPolicy` on an `Expand`
+  refusal propagate), `fallback: two_pass` on a `bm25` `Score` (taken when
+  its match table would pass its `retained_limit`, a quarter of the plan's
+  memory limit), and `mode` plus `ExpandPolicy` on an `Expand`
   (`Costed { inputs }` may take the other mode, `Pinned`, `Budgeted` and `Uncosted` may not; explain prints `alternatives`). The operator sets its `switch` gauge
   metric to the side it took, and the report says which side ran:
   `Attempt.ran` is `true` / `false` (polled or not) on an operator without a
-  choice, and on `HashJoinExec` and `ExpandExec` the side taken (`hash_join`
-  / `id_lookup`, `csr` / `indexed_scan`, the mode the traversal ended on);
+  choice, and on `HashJoinExec`, `ExpandExec` and a `bm25` `ScoreExec` the
+  side taken (`hash_join` / `id_lookup`, `csr` / `indexed_scan`, the mode the
+  traversal ended on, `one_pass` / `two_pass`);
   an operator with a declared switch that polled but took no side (an empty
-  probe) reports `true`. The GQT lines `hash join $d ran id_lookup` and `expand … : mode csr ran
-  csr` read it from the report of the same run, joined by node `id`.
-- A pre-pass is a `Prefilter` on the node it serves: `RankFuse.prefilter`
-  feeds the `bm25` arms' scans, `RankedAccess.prefilter` on a standalone
-  `nearest` scan feeds that scan. It names the ranked type, the required
-  first hops (the top-level `Expand`s leaving the ranked binding with
-  `min_hops > 0`; the planner computes the shape fence) and the scan ids it feeds. `rrf_prefilter_gate` and
-  `nearest_prefilter_gate` (`engine/search.rs`) take the descriptor and the
-  policy, read the store (FTS coverage, adjacency, corpus size) and write the
+  probe) reports `true`. The GQT lines `hash join $d ran id_lookup`, `expand … : mode csr ran
+  csr` and `score $d: bm25 ran two_pass` read it from the report of the same run, joined by node `id`.
+- A pre-pass is a `Prefilter` on the scan it serves: `RankedAccess.prefilter`
+  on a `nearest` scan, standing alone or a fusion arm's, feeds that scan. It
+  names the ranked type, the required first hops (the top-level `Expand`s of
+  the scan's own pipeline leaving the ranked binding with `min_hops > 0`)
+  and the scan ids it feeds. `nearest_prefilter_gate` (`engine/search.rs`)
+  takes the descriptor and the policy, reads the store (adjacency, corpus
+  size) and writes the
   eligible set into the `Pass` keyed by node id; a descriptor with no
   admissible hop records the shape fallback. A scan the gate
   proved empty yields no rows itself, so the tree above it runs over nothing.
 - The overfetch ladder is `RankedAccess.overfetch`, a list of `OverfetchRung`
   (`Wider { factor, k }` steps up to the ceiling, then `Exact`) the planner
-  writes for a standalone `nearest` with a limit. `execute` takes only rungs
+  writes for a `nearest` with a limit or a window. `execute` takes only rungs
   from that list, in order, skipping a `Wider` rung whose `k` already covers
-  the type; a rerun's report `rung` is the index of the declared rung it took
-  (1 is the first rerun), so a report names only declared choices. Whether
+  the type; with one `nearest` scan a rerun's report `rung` is the index of
+  the declared rung it took (1 is the first rerun), so a report names only
+  declared choices. A fusion's `nearest` arms each climb their own list: a
+  rerun advances every arm whose window is short after a full scan, and its
+  report `rung` is the highest rung an arm took, or the previous rung plus
+  one when that is higher, so no two passes share one. Whether
   the return aggregates (no ladder) is the `Aggregate` node, and the limit is
   the `Limit` at the root.
 
@@ -868,8 +1395,8 @@ in the node's input order, and no operator stands in the tree without a node.
 What connects nodes is inside the operators:
 memory charges live in the operator that allocates (`WorkMemory` in the hash
 join, the cross join, the projection and the sort), the id-lookup fallback is
-a branch of `HashJoinExec`, the arm sorts of `rrf()` are inside
-`RankFuseExec`, and the columns a `Sort` reads travel from the `Projection`
+a branch of `HashJoinExec`, a fusion's ranks are counted inside `FuseExec`
+over arms whose own plans order them, and the columns a `Sort` reads travel from the `Projection`
 below it under the hidden prefix `~` and leave in the sort. A return node
 inside an `AntiJoin` inner tree is refused. The one DataFusion operator left
 in a read tree is `AggregateExec`; it emits its group keys before its
@@ -888,7 +1415,7 @@ plan's, and writes one report row per node from the node's operator's own
 |---|---|---|
 | `operator` | `ScanExec`, `HashJoinExec`, … | The one operator the node built. |
 | `status` | `executed` | A stream of the operator was polled. |
-| `status` | `skipped` | The operator is in the tree and no stream of it was polled: the build scan of a hash join behind an empty probe, the right subtree of a cross join behind an empty left, everything under a `Limit` of zero rows or a `Sort` with a fetch of zero, an `AntiJoin` inner tree the bulk check answered without. |
+| `status` | `skipped` | The operator is in the tree and no stream of it was polled: the build scan of a hash join behind an empty probe, the right subtree of a cross join behind an empty left, everything under a `Limit` of zero rows or a `Sort` with a fetch of zero when no expression there can fail, an `AntiJoin` inner tree the bulk check answered without. |
 | `attempts` | `rung`, `ran`, `actual_rows`, `drained` | One entry per pass: `rung` 0 is the first pass and each rerun of the overfetch ladder appends one whose `rung` names the declared rung it took (`RankedAccess.overfetch[rung - 1]`); `ran` is `true` / `false` (polled or not), or on the operator of a declared switch the side that ran (`hash_join`, `id_lookup`, `csr`, `indexed_scan`); `actual_rows` is the operator's `output_rows` metric; `drained` is `true` or `false` for an omnigraph operator (its stream reached its end or not) and `null` for a DataFusion operator (`AggregateExec`), whose end no counter observes; `actual_rows` is complete only when `drained` is `true`, a lower bound otherwise. |
 
 An operator pass that spilled also adds one entry to the report's `spill`
@@ -920,13 +1447,11 @@ report. Every node of the physical explain JSON carries its `id`, the key the
 report rows use, and the key the `ran` lines of a case's `--- expect plan`
 read ([test ownership](test-ownership.md#plan-replay)).
 
-
-
 ## Plan acceptance
 
 Every read reaches execution through one door: `accept_query` plans the query
-and the planner's validator checks the plan against what the checked
-declaration requires; only that check constructs an `AcceptedPlan`, whose
+and the planner's validator checks the plan against what the read shape of
+the checked declaration requires; only that check constructs an `AcceptedPlan`, whose
 fields are private, and `bind` and `execute` take nothing else. The ordinary
 run, `Session::explain_query`, the `explain` statement and the inspected run
 share the path, so explain validates exactly what a run validates and reports
@@ -935,29 +1460,33 @@ the outcome as `validation.scope`.
 Acceptance first checks that the plan is well formed: aggregate
 specifications against their typed signatures
 (`aggregate::validate_aggregate_specs`), every node's output schema against
-what its operator derives (`output::validate_output_schemas`), a fusion's
-row keys (`optimizer::validate_rank_fuse_row_tiebreaks`), and each table's
-catalogue source (`source::validate_catalogue_sources`). Execution keeps
+what its operator derives (`output::validate_output_schemas`), and each
+table's catalogue source (`source::validate_catalogue_sources`). Execution keeps
 only the checks that need the snapshot or the bound values
 (`validate_traversal_admission`, `typed_value::validate_plan_values`).
 
-The requirements come from the compiler's typed lowering of the checked
-declaration (`AcceptInput.ir`), checked first against the declaration's
-counts of traversals, blocks, return items, order keys and limit. Every
-`QueryIR` expression carries its type and every conversion is an explicit
+The requirements come from the read shape of the checked core term
+(`AcceptInput.ir`): its bindings, traversals, blocks, return items, order
+keys and limit. Every
+read-shape expression carries its type and every conversion is an explicit
 `Cast`, so acceptance compares expressions with their types. For a split
 aggregate return, `validate/returns.rs` checks a `Projection` directly above
 `Aggregate` or `MetadataCount`: group keys, return-item names, order and
 types, and each aggregate operand reached through an `AliasRef` must match
-the typed lowering. Ambiguous or unused intermediate columns are refused.
-The declaration supplies only which return items and order key are the
-written score calls. The checks: binding identity and traversal
+the read shape. Ambiguous or unused intermediate columns are refused.
+The read shape supplies which return items and order keys read the score
+column. The checks: binding identity and traversal
 identity (endpoints, edge selection, direction, endpoint types, hop bounds),
-search identity and its declared approximation, eligibility in both
-directions (every lowered conjunct is tested, checked per `rrf` arm since
-each arm copies the match, and every tested conjunct is a lowered one, a
+search identity, eligibility in both
+directions (every lowered conjunct is tested, and every tested conjunct is a lowered one, a
 constant `true`, or the identity equality key narrowing derives through
-`AcceptInput.keys`), correlated blocks, the exact projection and the origin
+`AcceptInput.keys`), the region of every conjunct (each is tested in the
+`optional`, `union` arm, correlated read or side of a `nearest` window's
+`TargetCut` that writes it, and in no other: `validate::requirements::Region`;
+each `optional` and correlated read is its own region, numbered in written
+order within the region that holds it, so a conjunct moved between two
+sibling `optional`s over one binding is refused),
+correlated blocks, the exact projection and the origin
 of every projected score, order and cut, late materialization
 (`HydrateColumns`), and the policies the plan declares for its search.
 Every node declares its count cut (`PhysicalNode::row_cut`, a match over
@@ -965,11 +1494,13 @@ every variant: a `Limit`'s or `Page`'s rows, a `Sort`'s `fetch`, a ranked
 scan's candidate cap; a fusion and a hydration cut nothing), and the
 validator justifies each one by its position: the root `Limit` and the final
 `Sort` (below the root `Limit`, its projections and a hydration) at the
-query's `limit`, and a ranked scan's cap as its declared policy sets it. Any
-other cut, a capped sort below the final one or a cut in a correlated
-block's tree, is refused as `row cut`. The order check recomputes the root's
+query's `limit`, and a ranked scan's cap as its declared policy sets it (a
+window's scan at its `k`). A `TargetCut` counts targets, not rows, and must
+keep exactly the query's window `k`, and a windowed scope must have one; its own uncapped `Sort` orders no row
+the query returns. Any other cut, a capped sort below the final one or a cut
+in a correlated block's tree, is refused as `row cut`. The order check recomputes the root's
 order from the operators (`optimizer::derived_order`, typed `OrderKey`s):
-a fusion's sort leads with `<binding>._rrf` descending, a search-ordered
+a search-ordered
 aggregate's or a `return distinct`'s with its remaining keys and then every
 group key it did not write (group rows take no identity tie-break), and the planner's tie-break omissions that are comparator
 equivalences are accepted: a key already in the comparator, every key when
@@ -977,14 +1508,13 @@ the query returns only order keys or constants, and identities of bindings
 the query does not name (anonymous endpoints, cycle temps) after every named
 one.
 
-A query of one binding, Boolean/integer/String eligibility, an optional
-leading `bm25()` over a String property, direct property sort keys, a limit
-and a projection of properties and the selected score is a member of the
-exact fragment (`validate/subset.rs`). For a member the optimizer records the
+A query of one binding, Boolean/integer/String eligibility, direct property
+sort keys, a limit and a projection of properties is a member of the exact
+fragment (`validate/subset.rs`). For a member the optimizer records the
 rules it applies (`AbsorbScanFilter`, `PruneScanColumns`, `Lower`,
-`RankBm25Scan`, `HydrateReturnColumns`, `NarrowKey`) over arena references;
+`HydrateReturnColumns`, `NarrowKey`) over arena references;
 the validator rebuilds the canonical chain
-`Limit(Sort(Project([Search](Filter(Scan)))))` from the typed lowering,
+`Limit(Sort(Project(Filter(Scan))))` from the typed lowering,
 re-applies every rule against its precondition and requires the result to
 equal the plan. The
 checker's arena keeps only each role's current node, releasing a replaced one
@@ -999,50 +1529,69 @@ design keeps its diagnostic and is a bad request. The replay door
 source and name, the scope, the schema digest, the bound plan and a member's
 derivation. It checks the byte limit and the envelope's versions before
 decoding the plan, refuses another schema and a dataset the plan did not pin
-as conflicts, re-establishes every full-text coverage fact the plan records
-from the pinned snapshot, recompiles the query, and accepts the plan again; a
-recorded fact the snapshot contradicts, or a plan that fails a check
-(well-formedness included), is invalid evidence, a bad request.
-
-Full-text coverage is derived from the index facts the planner reads for the
-pinned dataset (`FullTextCoverage::of_table`): `absent` without an inverted
-index on the column, `full` only when every inverted segment there reports a
-known coverage of every fragment, `partial` otherwise; a table version with no
-fragment, and a type the snapshot does not hold, are `full`. Resolution reads
-the coverage of every property a full-text call names
-(`optimizer::full_text_targets`: `search`, `fuzzy` and `match_text` in any
-filter, `bm25` in the leading order key or an `rrf()` arm) and refuses
-`absent` with `FullTextIndexRequired`, the typed 409; an untrained segment is
-`partial`, since it carries the analyzer. Acceptance refuses a plan that
-records no coverage, or `absent`, for a call it makes, and replay derives
-every recorded coverage again from the pinned dataset.
+as conflicts, recompiles the query, and accepts the plan again; a plan that
+fails a check (well-formedness included) is invalid evidence, a bad request.
+Every `bm25` is the exact lexical scan's `Score`, which reads no full-text
+index, so no query is refused for a full-text index's state.
 
 ## Search and rank
 
 `nearest`, text search/BM25, and reciprocal-rank fusion are first-class
 execution concepts. Rank and score remain columns through downstream
-operations; traversal or projection must not silently discard them. RRF
-executes its sources independently against the same graph snapshot and fuses
-their ordered results.
+operations; traversal or projection must not silently discard them. A fusion
+runs each arm as its own subtree against the same graph snapshot and fuses
+their ordered rows ([Fusion](#fusion-one-operator-over-any-ranked-arm)).
 
-A ranking is always a root scan. Lowering roots the traversal component that
-holds the ranked binding (both arms' binding for an `rrf()`) at that binding,
-whatever the declaration order; a ranked binding only a traversal introduces
-gets a `NodeScan` of its checked type. The type checker refuses an `rrf()`
-whose arms rank two bindings one traversal connects (`T59`). The planner's
-`rank` therefore treats a ranked dependent scan, a hash join's build side, or
-fusion arms one traversal connects as a lowering defect, an internal error.
+A `nearest` ranking is always a root scan of its pipeline. Lowering roots the
+traversal component that holds the ranked binding at that binding, whatever
+the declaration order; a ranked binding only a traversal introduces gets a
+`NodeScan` of its checked type. The planner's `rank` therefore treats a
+ranked dependent scan or a hash join's build side as a lowering defect, an
+internal error.
 
-BM25 scans have no candidate cap. The final ordering applies the score,
-secondary keys and every binding's identity before the query limit; a full
-candidate window cannot prove that it contains the leading tied identities.
-A BM25 scan declares where it applies its eligibility (its pushed filter, a
-gate's eligible set and the members of its search predicates):
-`before_scoring`, Lance's prefilter, only when the property's full-text index
-covers every fragment at the pinned version, a fact the plan records in
-`Assumptions.full_text`; `after_scoring`, Lance's postfilter, otherwise.
-Lance scores uncovered fragments flat from statistics over the rows its
-prefilter admits, so filtering before scoring there would change scores.
+### Fusion: one operator over any ranked arm
+
+`rrf(arm, …)` is the core's `Fuse` (the GQ 3 RFC, section 4,
+Fusion). The shaper writes `PatternStep::Fuse` with 2 to 16 `FuseArm`s, each
+a pipeline from nothing and its `ArmRank`: `nearest` (the arm's steps end on
+its `Rank` window, the steps `Shaper::ranking_steps` writes for the same
+`nearest` standing alone), `distance` and `bm25` (an exact `Score` step),
+`ordered` (an inline read with an `order`, one uncorrelated `Correlate`) and
+`rrf` (a nested `Fuse`). Every arm binds the target under one name; the names
+an arm binds without returning are renamed apart. The elements and `where`
+after the `from` are steps over the fused targets.
+
+`resolve_pipeline` folds each arm and puts it in rank order
+(`optimizer::ranked_arm`): a `nearest` arm's `TargetCut` over its window's
+`Sort` (distance, then the target's identity) and an ordered arm's
+`Correlate` (its keys, then its tie rule) already are; an exact score's or a
+nested fusion's rows get a `Sort` by the score in its kind's direction, then
+the target's identity. The logical and physical `Fuse` hold the arm inputs
+with their ranks, the target, `k` and `weights`; the arms after the first are
+collected sides. A filter written after the fusion never moves into an arm,
+and each arm's own filters are its own scope's. A fusion reads its target
+whole in every arm (`node_reads`), since the target leaves with the columns
+of the first arm that selected it; late materialization does not hydrate
+above a fusion. `FuseExec` counts the ranks from arrival order, so it never
+re-derives an arm's order, and charges every arm row and fused target to the
+read's work budget and its held state to the query pool.
+
+Acceptance checks a fused read scope by scope (`Requirements::check_scope`):
+the read's own requirements over the nodes above the fusion, where the
+fusion binds the target, and each arm's requirements, derived from the arm's
+steps as a read with no return, order or limit, over that arm's subtree:
+bindings, traversals, eligibility, blocks, scores, its search (a `nearest`
+window's scan, cap, ladder and probe policy as standing alone) and its cuts.
+`check_fusion` requires one outermost `Fuse` of the written target, `k` and
+`weights`, its arms in written order with their written ranks, and each arm's
+rows in rank order (`check_arm_order`); a nested fusion is checked as an arm
+of its own. Each `nearest` arm's pre-pass is judged within its arm
+(`scope_root`).
+
+An exact `bm25` scores every match of its population and has no candidate
+cap. The final ordering applies the score, secondary keys and every binding's
+identity before the query limit; a full candidate window cannot prove that it
+contains the leading tied identities.
 
 A `nearest` scan carries a probe cap per index delta (the `ann_nprobes`
 session setting, `request` scope, default 20, `0` is no cap; the process
@@ -1064,22 +1613,21 @@ after later operators reruns with `k` times 4, then times 16, seeded with the
 probe cap that filled the previous pass, then once more exact (`k` = the
 type's row count, no probe cap), so a short answer is never served while
 survivors exist; aggregate returns never overfetch. Before either, `nearest_prefilter_gate` runs the pre-pass the plan declares
-(`RankedAccess.prefilter`) for a standalone `nearest` constrained by a traversal and
-pushes the eligible ids into the scan as an `id IN (...)` prefilter; an empty
-eligible set proves the answer empty and runs no scan (`Prefilter.on_empty`).
-The `rrf` gate is answer-preserving (its set over-approximates the
-survivors) and prefilters its bm25 arms only under the recorded full
-coverage (`Prefilter.coverage_admits`); the nearest gate is answer-changing
-by design (it ranks the eligible entities exactly instead of the global
-window's survivors). Acceptance checks that every hop of a pre-pass is a
+(`RankedAccess.prefilter`) for each `nearest` constrained by a traversal of its
+pipeline, a fusion arm's included, and pushes the eligible ids into the scan
+as an `id IN (...)` prefilter; an empty eligible set proves that scan's rows
+empty and runs no scan: the whole answer of a
+`nearest` standing alone, one arm's rows under a fusion. The gate is
+answer-changing by design (it ranks the eligible entities exactly instead of
+the global window's survivors). Acceptance checks that every hop of a pre-pass is a
 required first hop of the query. The execution report records each gate's
 verdict with the counts it read and each probe attempt per overfetch rung
 (`search` decisions), and a replay must record the same.
 
 A ranked read reports its ranking (`QueryResult::ranking`). The planner
 derives what the accepted plan says of it (`omnigraph_planner::planned_ranking`):
-the search function of the one ranked `Scan` in the query's order or of the
-`RankFuse`, the return columns of the root's return list (a `return
+the search function of the one ranked `Scan` in the query's order or
+window, or of the `Fuse`, the return columns of the root's return list (a `return
 distinct`'s `Aggregate`) that read the ranking's `_distance`, `_score` or
 `_rrf` column on the ranked binding, and the ranked `nearest` scans; a stored
 property of a score column's name on a schema older than the reservation is
@@ -1087,7 +1635,8 @@ no score column. The run supplies `exhaustive`: each `nearest` scan's
 `ScanReport::exact` says whether its last attempt in the pass whose rows the
 read returns ranked exactly (proven empty, flat, every partition of the
 IVF_FLAT index searched, or every admitted row returned, none at `+inf`).
-`engine::execute` attaches the ranking after the run from that pass's reports,
+A fusion is exhaustive when every `nearest` scan of its arms is, each over its
+own population; its exact arms always are. `engine::execute` attaches the ranking after the run from that pass's reports,
 so every door, replay included, reports the same ranking for one run, and
 `read_output` renders it as the envelope's `ranking`. Every vector index the
 engine builds is IVF_FLAT (`forbidden_apis.rs::vector_indexes_are_ivf_flat`),
@@ -1108,7 +1657,8 @@ A named mutation is parsed, checked, and lowered against one captured
 `MutationTarget`; execution reads that namespace directly. Binding completes
 and validates every stored parameter declaration before any statement runs,
 including unused declarations and mutations matching no rows. Missing required
-parameters are refused; omitted nullable parameters bind to null. Expected-head
+parameters are refused; an omitted parameter binds to its declared default,
+or to null when it is nullable and declares none. Expected-head
 checks run before parameter validation, and the request clock is sampled once
 across retries.
 
@@ -1226,7 +1776,8 @@ second durability path. See [ingestion.md](ingestion.md).
 ## Validation
 
 Mutation, Load, and branch merge use the catalog-derived validation owner in
-`crates/omnigraph/src/validate.rs`. It covers value constraints, uniqueness,
+`crates/omnigraph/src/validate.rs`. It covers value constraints (`@range`,
+`@check`, enum membership, and no zero vector in a `cosine` field), uniqueness,
 edge referential integrity, and cardinality against the operation's pinned base
 plus its complete delta. A physical index may accelerate a probe but may never
 be a validation prerequisite.

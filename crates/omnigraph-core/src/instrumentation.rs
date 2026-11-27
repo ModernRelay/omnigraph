@@ -215,15 +215,6 @@ pub struct QueryIoProbes {
     pub manifest_stores: ProbedStores,
     pub history_stores: ProbedStores,
     pub table_stores: ProbedStores,
-    /// Uncapped retries taken after a capped BM25 scan under-filled. Engine
-    /// v2's BM25 scans carry no cap, so no engine path records one and the
-    /// count stays 0.
-    pub bm25_uncapped_retries: Arc<AtomicU64>,
-    /// Rows returned by BM25-ranked scans, summed over scans (capped and
-    /// uncapped passes alike). Lets a test pin the cap's MAGNITUDE — a factor
-    /// regression changes this count while every result assertion still
-    /// passes.
-    pub bm25_scan_rows: Arc<AtomicU64>,
     /// Rescans taken at the scan site after a maximum-bounded nearest scan
     /// returned fewer than `k` rows with partitions left unsearched (the
     /// probe ladder in `execute_node_scan`). Every scan of a nearest target
@@ -274,17 +265,10 @@ pub struct QueryIoProbes {
     /// of the type. Says nothing about whether the pass filled `limit`; a
     /// scan that was not full never reaches it.
     pub ann_exact_passes: Arc<AtomicU64>,
-    /// Plan verdicts recorded by the rrf prefilter gate
-    /// (`execute_rrf_fusion`), one per rrf execution in scope order. The
-    /// gate's two plans are answer-identical by design, so a gate that
-    /// silently always falls back to postfilter passes every result-level
-    /// test — admission and fence tests assert on this probe instead.
-    pub rrf_gate_verdicts: Arc<Mutex<Vec<RrfGateVerdict>>>,
     /// Plan verdicts recorded by the nearest prefilter gate
     /// (`nearest_prefilter_gate`), one per standalone `nearest` query whose
     /// pipeline holds a top-level Expand leaving the ranked variable (a plain
-    /// nearest records none), in scope order; same record shape as the rrf
-    /// gate's. The prefiltered plan returns at least as many rows as the
+    /// nearest records none), in scope order. The prefiltered plan returns at least as many rows as the
     /// unfiltered one when no operator above the Expand drops eligible rows
     /// (the relation is `nearest_prefilter_gate`'s doc), and the same rows on
     /// a single-partition fixture, so a gate that silently always falls back
@@ -303,21 +287,22 @@ pub struct QueryIoProbes {
     /// Misses of `ReadCaches::compiled_queries`, counted in
     /// `Omnigraph::compile_named_query`.
     pub query_compiles: Arc<AtomicU64>,
-    /// Full-text validations entered (`TableStore::validate_full_text_demand`):
-    /// scans with a full-text query, a SQL-string filter, or a `contains_tokens`
-    /// demand in a typed filter; other scans record nothing.
+    /// Full-text validations entered (`dataset_index::validate_full_text_demand`):
+    /// a scan with a SQL-string filter, or with a `contains_tokens` demand in
+    /// its typed filter. No query reads a full-text index, so a lexical
+    /// query's exact scan, like every other scan, records nothing.
     pub fts_validations: Arc<AtomicU64>,
 }
 
-/// The two candidate plans of the rrf prefilter gate. Over FTS-index-covered
-/// data and up to BM25 score ties they are answer-identical — the eligible-set
-/// cardinality decides cost only (`execute_rrf_fusion`'s gate).
+/// The two plans of a `nearest` scan's prefilter gate: the scan ranks only
+/// the eligible ids the traversal's required first hops admit, or the whole
+/// type before the traversal filters the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RrfGatePlan {
-    /// Selective plan: the uncapped bm25 arms rank only the traversal's
-    /// eligible ids (`id IN (...)` under `prefilter(true)`).
+    /// Selective plan: the scan ranks only the traversal's eligible ids
+    /// (`id IN (...)` under `prefilter(true)`).
     Prefilter,
-    /// Broad plan: the uncapped corpus-wide arms (v0.9 rrf semantics).
+    /// Broad plan: the scan ranks the whole type.
     Postfilter,
 }
 
@@ -328,25 +313,21 @@ pub enum RrfGateFallback {
     /// Eligible set too large for the ratio or absolute-id-count threshold.
     Threshold,
     /// Query shape outside the admission table (no top-level Expand
-    /// constrains the ranked variable, the ranked variable is an Expand dst,
-    /// arms target different variables, or no bm25 arm exists).
+    /// constrains the ranked variable, or the ranked variable is an Expand
+    /// dst).
     Shape,
-    /// The ranked table's FTS index does not cover every fragment, so a
-    /// prefilter mask could change BM25 scores (filter-dependent scoring of
-    /// uncovered fragments) — a correctness fence, never overridden.
-    Coverage,
     /// The graph index could not be built or is misaligned; a query must
     /// never fail because an optimization could not start.
     BuildErr,
-    /// The eligible set is empty: the postfilter plan yields the same empty
-    /// join and `IN ()` edge semantics never arise (correctness fence).
+    /// The eligible set is empty: no row survives the traversal, and `IN ()`
+    /// edge semantics never arise (correctness fence).
     EmptyEligible,
     /// The setting `rrf_plan = force_postfilter` chose.
     Forced,
 }
 
-/// One rrf prefilter-gate decision, recorded via the `rrf_gate_verdicts`
-/// probe. `eligible`/`corpus` are `None` when the gate fell back before
+/// One prefilter-gate decision of a `nearest` scan, recorded via the
+/// `ann_prefilter_verdicts` probe. `eligible`/`corpus` are `None` when the gate fell back before
 /// counting (forced postfilter, shape, coverage, build error).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RrfGateVerdict {
@@ -391,7 +372,7 @@ tokio::task_local! {
     static QUERY_MEMORY_LIMIT: u64;
 }
 
-/// Run `fut` with the engine v2 read route's memory pool capped at `bytes`
+/// Run `fut` with the read route's memory pool capped at `bytes`
 /// for every query it runs. Test-only entry point; nothing in production
 /// sets it, so the pool takes its constant.
 pub async fn with_query_memory_limit<F>(bytes: u64, fut: F) -> F::Output
@@ -732,35 +713,6 @@ impl Drop for QueryBlockingWorkGuard {
             }
         }
     }
-}
-
-#[cfg(debug_assertions)]
-tokio::task_local! {
-    static RRF_GATE_SUBSET_DROP: Option<String>;
-}
-
-/// RED CONTROL ONLY: drop `id` from the rrf prefilter gate's materialized
-/// eligible-id set for the scope of `fut` — a deliberate violation of the
-/// gate's superset rule (single owner: `engine::search::rrf_prefilter_gate`'s
-/// invariant doc; a subset changes answers). The differential oracle uses
-/// this to prove its equivalence relation can turn red: dropping one
-/// surviving id MUST make the forced-prefilter and forced-postfilter
-/// answers differ, or the oracle is vacuous. `cfg(debug_assertions)`: an
-/// answer-corrupting API must not exist in release binaries — dev-profile
-/// test runs (where the red control lives) keep it.
-#[cfg(debug_assertions)]
-pub async fn with_rrf_gate_subset_drop<F>(id: String, fut: F) -> F::Output
-where
-    F: std::future::Future,
-{
-    RRF_GATE_SUBSET_DROP.scope(Some(id), fut).await
-}
-
-/// The scoped subset-drop red control active for this task, if any. `None`
-/// in production (no scope installed).
-#[cfg(debug_assertions)]
-pub fn rrf_gate_subset_drop() -> Option<String> {
-    RRF_GATE_SUBSET_DROP.try_with(|m| m.clone()).ok().flatten()
 }
 
 tokio::task_local! {
@@ -1236,18 +1188,6 @@ pub fn record_in_memory_filter() {
     let _ = current(|p| p.in_memory_filters.fetch_add(1, Ordering::Relaxed));
 }
 
-/// Record one uncapped retry after a capped BM25 scan under-filled. No-op when
-/// no probes are installed (production).
-pub fn record_bm25_uncapped_retry() {
-    let _ = current(|p| p.bm25_uncapped_retries.fetch_add(1, Ordering::Relaxed));
-}
-
-/// Record `rows` returned by one BM25-ranked scan. No-op when no probes are
-/// installed (production).
-pub fn record_bm25_scan_rows(rows: u64) {
-    let _ = current(|p| p.bm25_scan_rows.fetch_add(rows, Ordering::Relaxed));
-}
-
 /// Record the requested ANN maximum of a nearest scan (zero = none). No-op
 /// when no probes are installed.
 pub fn record_ann_probe_budget(maximum: Option<usize>) {
@@ -1306,19 +1246,6 @@ pub fn record_ann_overfetch() {
 /// installed.
 pub fn record_ann_exact_pass() {
     let _ = current(|p| p.ann_exact_passes.fetch_add(1, Ordering::Relaxed));
-}
-
-/// Record one rrf prefilter-gate verdict. No-op when no probes are installed
-/// (production).
-pub fn record_rrf_gate_verdict(verdict: RrfGateVerdict) {
-    let _ = current(|p| {
-        // Push through a poisoned lock: dropping verdicts after an unrelated
-        // panic would fail a fence test's `len() == 1` assert confusingly.
-        p.rrf_gate_verdicts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(verdict);
-    });
 }
 
 /// Probe-only: the projection a NodeScan hands to `Scanner::project`.
@@ -1532,6 +1459,12 @@ pub struct MergeWriteProbes {
     /// statement that reaches `open_table_for_mutation`). A statement refused
     /// while its assignments resolve must leave this at zero.
     pub mutation_table_open_calls: Arc<AtomicU64>,
+    /// Membership predicates (`id in [ids]`) a mutation statement built from
+    /// its group's selection rows, one per evaluated chunk of ids, and the
+    /// most ids one of them carried: a statement over many selected
+    /// entities must evaluate bounded predicates, not one list of them all.
+    pub selection_membership_predicates: Arc<AtomicU64>,
+    pub selection_membership_max_ids: Arc<AtomicU64>,
     /// Blob payload values a rewrite consumed while rebuilding descriptor rows
     /// into a logical source (a keyed write or a branch merge), or that
     /// export, a change image or an entity read rendered: one per managed
@@ -1646,6 +1579,12 @@ impl MergeWriteProbes {
     }
     pub fn mutation_table_open_calls(&self) -> u64 {
         self.mutation_table_open_calls.load(Ordering::Relaxed)
+    }
+    pub fn selection_membership_predicates(&self) -> u64 {
+        self.selection_membership_predicates.load(Ordering::Relaxed)
+    }
+    pub fn selection_membership_max_ids(&self) -> u64 {
+        self.selection_membership_max_ids.load(Ordering::Relaxed)
     }
     pub fn blob_payload_read_calls(&self) -> u64 {
         self.blob_payload_read_calls.load(Ordering::Relaxed)
@@ -1886,6 +1825,17 @@ pub fn record_stage_vector_index() {
 pub fn record_mutation_table_open() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.mutation_table_open_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one membership predicate a mutation statement built from its
+/// selection rows, carrying `ids` ids. No-op in production.
+pub fn record_selection_membership(ids: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.selection_membership_predicates
+            .fetch_add(1, Ordering::Relaxed);
+        p.selection_membership_max_ids
+            .fetch_max(ids as u64, Ordering::Relaxed);
     });
 }
 

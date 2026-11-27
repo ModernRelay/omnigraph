@@ -15,9 +15,10 @@ node Document {
 
 `Blob` cannot be a key, unique member, index, embed source, or list member.
 Schema parsing rejects those combinations. Blob properties also cannot be
-projected, filtered, ordered, or aggregated in `.gq` (`T24: Blob property … is
-not available as a .gq read value`), and a bare node projection
-(`return { $p }`) silently omits them.
+projected, filtered, ordered, aggregated, bound by `let` or tested with
+`is null` in `.gq` (`T24: Blob property `p.content` is not a read value`), and
+a bare node projection (`return { $p }`) silently omits them. The one place
+`.gq` reads a Blob is an assignment that copies it from the row (below).
 
 Write input uses one String representation:
 
@@ -49,6 +50,18 @@ Omnigraph creates: a bare URI would reload as the whole object, so export
 refuses it. Change-feed images, the change-feed baseline and entity reads by id
 describe it as `{"uri", "offset", "length"}` instead; such a baseline does not
 reload with `load`.
+
+An assignment may copy a Blob read from its group's row, in `update`,
+`insert`, `upsert` and `replace`:
+`match { $f: Document, $t: Document } where $f.slug = $a and $t.slug = $b
+update $t set { content: $f.content }`, also as a branch of `if` or an
+argument of `coalesce` beside a Blob parameter or `null`. Each row writes the
+cell it names at the write's snapshot: managed bytes are copied, a null cell
+writes null, and an external whole-object reference is written as its URI, so
+the graph's external Blob policy must admit its source and the write copies
+its bytes. A stored ranged reference is refused. The copied bytes count toward
+`write_max_bytes` before any is read; two rows giving one entity different
+Blobs are `E4`.
 
 An `update` never reads the old value of a Blob it assigns, and a null assigned
 to a nullable Blob clears it. An update that assigns no Blob and is its
@@ -89,7 +102,7 @@ in a stored URI.
 Ownership depends on the write:
 
 - `load --mode overwrite` preserves an allowed external reference;
-- insert, update, append/merge load, and branch merge copy allowed source bytes
+- insert, upsert, replace, update, keyed loads, and branch merge copy allowed source bytes
   into graph-managed storage;
 - a previously stored external reference remains readable if new external
   ingress is later disabled, and exportable when it names its whole object.

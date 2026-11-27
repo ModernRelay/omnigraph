@@ -13,7 +13,7 @@ branch create feature
 --- expect ok
 
 --- mutate branch: feature
-query add() { insert Person { name: "dave" } }
+query add() { replace Person { name: "dave" } }
 --- expect affected: nodes=1 edges=0
 
 --- query

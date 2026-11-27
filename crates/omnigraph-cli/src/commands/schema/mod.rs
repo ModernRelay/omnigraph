@@ -13,6 +13,7 @@ use crate::targets::ResolvedTarget;
 pub(crate) mod args;
 mod init;
 pub(crate) mod lint;
+mod lint_fix;
 
 pub(crate) use args::{InitArgs, LintArgs, SchemaCommand};
 pub(crate) use init::run_init;
@@ -75,6 +76,8 @@ pub(crate) async fn plan_schema(
         supported: plan.supported,
         step_count: plan.steps.len(),
         steps: &plan.steps,
+        one_way_constructs: &plan.one_way_constructs,
+        one_way_note: plan.one_way_note.clone(),
     };
     if json {
         write_json(&output, stdout)?;

@@ -32,14 +32,14 @@ branch create s
 
 --- mutate branch: s
 query link_on_s() {
-    insert Knows { from: "a", to: "c", since: 1 }
+    replace Knows { @src: "a", @dst: "c", since: 1 }
 }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate
 query link_on_main() {
-    insert Knows { from: "a", to: "c", since: 1 }
+    replace Knows { @src: "a", @dst: "c", since: 1 }
 }
 
 --- expect affected: nodes=0 edges=1
@@ -51,10 +51,7 @@ branch merge s
 
 --- query
 query bound_edges() {
-    match {
-        $p: Person
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
     return { $p.name, $f.name, $w.since }
 }
 
@@ -68,10 +65,7 @@ w.since: I32
 
 --- query
 query edge_count() {
-    match {
-        $p: Person
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
     return { count($w.since) as n }
 }
 

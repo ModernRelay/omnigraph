@@ -47,6 +47,55 @@ jobs:
       - name: Run the slow cases
         run: cargo run -p omnigraph-gqt --locked --bin omnigraph-gqt -- crates/omnigraph-gqt/cases_slow
 
+      # The two-version law runs the GQ 2 CLI of the commit `ci.yml`
+      # pins as GQ_2_SOURCE_COMMIT (scripts/cross-version.py --self-test
+      # holds the two pins equal).
+      - name: Build the GQ 2 CLI
+        env:
+          GQ_2_SOURCE_COMMIT: 64b3b2f3917b6c146a60e5445f6ead158a572b02
+        run: |
+          set -euo pipefail
+          gq2_source="$RUNNER_TEMP/omnigraph-gq-2"
+          gq2_cli="$RUNNER_TEMP/omnigraph-gq-2-cli"
+          git fetch --no-tags --depth=1 origin "$GQ_2_SOURCE_COMMIT"
+          git worktree add --detach "$gq2_source" "$GQ_2_SOURCE_COMMIT"
+          (cd "$gq2_source" && cargo build --locked --package omnigraph-cli --bin omnigraph \
+            --target-dir "$RUNNER_TEMP/gq-2-target")
+          cp "$RUNNER_TEMP/gq-2-target/debug/omnigraph" "$gq2_cli"
+          test -x "$gq2_cli"
+          rm -rf "$RUNNER_TEMP/gq-2-target"
+          echo "OMNIGRAPH_GQ_2_BIN=$gq2_cli" >> "$GITHUB_ENV"
+
+      # The generated laws at nightly breadth (docs/dev/test-ownership.md, Generated
+      # laws), enrolled by exact name; a name that did not run and pass fails.
+      - name: Run the generated laws at nightly breadth
+        env:
+          OMNIGRAPH_REQUIRE_GQ_2: '1'
+        run: |
+          set -euo pipefail
+          names=(
+            law_canonical_forms::generated_reads_keep_one_plan_under_the_listed_rewrites_at_nightly_breadth
+            law_engine_reference::engine_equals_reference_on_generated_reads_at_nightly_breadth
+            law_engine_reference::engine_equals_reference_on_generated_placements_at_nightly_breadth
+            law_index_cost::generated_index_paths_are_cheaper_than_their_scans_at_nightly_breadth
+            law_refusal_soundness::every_refusal_resting_on_a_claim_about_every_graph_holds_it_at_nightly_breadth
+            law_refusals::every_misprinted_generated_read_is_repaired_to_the_read_at_nightly_breadth
+            law_scalar_evaluators::scalar_evaluators_agree_on_generated_expressions_at_nightly_breadth
+            law_search::search_answers_hold_under_every_index_state_and_the_rrf_formula_at_nightly_breadth
+            law_two_versions::gq_2_and_gq_3_answer_generated_reads_alike_at_nightly_breadth
+          )
+          cargo test -p omnigraph-gqt --locked --test integration -- --ignored --exact "${names[@]}" 2>&1 | tee target/gqt-laws.log
+          for name in "${names[@]}"; do
+            grep -Fx "test $name ... ok" target/gqt-laws.log
+          done
+
+      # Every direct-engine case under all four physical layouts (the gate
+      # runs a and b); crates/omnigraph-gqt/README.md, Physical layouts.
+      - name: Run every case under each physical layout
+        env:
+          OMNIGRAPH_GQT_LAYOUTS: a,b,c,d
+        run: cargo test -p omnigraph-gqt --locked --test gq_layout_tests
+
       - name: Validate full benchmark datasets
         run: |
           cargo run -p omnigraph-gqt --locked --bin omnigraph-gqt -- \

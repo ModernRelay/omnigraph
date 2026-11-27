@@ -23,13 +23,13 @@ node Chunk { slug: String @key n: I64 }
 
 --- concurrent measured
 writer x${W}: query put() { insert Chunk { slug: "w${worker}", n: ${W} } }
-reader: query seed_row() { match { $c: Chunk { slug: "seed" } } return { $c.n } }
+reader: query seed_row() { match { $c: Chunk } where $c.slug = "seed" return { $c.n } }
 --- expect
 writer: ok
 reader: ok
 
 --- query
-query rows_at($k: I64) { match { $c: Chunk { n: $k } } return { $c.slug, $c.n } }
+query rows_at($k: I64) { match { $c: Chunk } where $c.n = $k return { $c.slug, $c.n } }
 --- params
 {"k": ${W}}
 --- expect unordered

@@ -753,7 +753,6 @@ pub(crate) async fn build_dataset(
     binding: Option<&str>,
 ) -> Result<(DatasetLogicalV1, Option<String>), String> {
     use omnigraph::db::Omnigraph;
-    use omnigraph_compiler::settings::Engine;
     use omnigraph_gqt_core::{PlainHost, case_session, execute_steps, seed_case};
     let (session, case, registered_identity) = match &plan.dataset {
         DatasetRecipe::Gqt { source } => {
@@ -773,7 +772,7 @@ pub(crate) async fn build_dataset(
                 }
                 None => db,
             };
-            let session = case_session(db, &case, Engine::V2)?;
+            let session = case_session(db, &case)?;
             seed_case(&session, fixture, plan.needs_indices).await?;
             (session, case, None)
         }
@@ -811,7 +810,6 @@ pub(crate) async fn build_dataset(
             let session = case_session(
                 Omnigraph::open(uri).await.map_err(|e| e.to_string())?,
                 &case,
-                Engine::V2,
             )?;
             if plan.needs_indices {
                 session

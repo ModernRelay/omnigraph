@@ -6,7 +6,7 @@
 
 use color_eyre::eyre::{Result, bail};
 use omnigraph_api_types::{branch_statement_refusals, query_file_refusals};
-use omnigraph_compiler::query::ast::{
+use omnigraph_compiler::query::file::{
     BranchRead, BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, EmptyFile, FileBody,
     LoadStmt, MutationWriteMode, QueryFile, SettingStmt, show_statement_name,
 };
@@ -376,7 +376,7 @@ mod tests {
         );
         // A child snapshot's recorded branch is not the request's main default.
         let child =
-            "query q() as unattached branch on \"base-id\" { insert Person { name: \"new\" } }";
+            "query q() as unattached branch on \"base-id\" { replace Person { name: \"new\" } }";
         assert_eq!(
             prepare_mutation(QueryInput::Supplied(child), envelope(), true)
                 .unwrap()

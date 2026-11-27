@@ -18,8 +18,8 @@ node Chunk { slug: String @key }
 {"type":"Chunk","data":{"slug":"seed"}}
 
 --- concurrent
-w1: query add_a() { insert Chunk { slug: "a" } }
-w2: query add_b() { insert Chunk { slug: "b" } }
+w1: query add_a() { replace Chunk { slug: "a" } }
+w2: query add_b() { replace Chunk { slug: "b" } }
 --- expect
 w1: ok
 w2: ok

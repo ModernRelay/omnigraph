@@ -336,6 +336,47 @@ owned) is reclaimed by `cleanup`.
 
 ## Mutation and Load
 
+A mutation runs its groups in order, one keyed statement per sink
+(`omnigraph-compiler` `shape/write.rs` owns the rule). A group's `match …
+where` selects the rows its statements run over, evaluated once, before the
+group's first statement. When the selection is a scan of the statements'
+target filtered by predicates a staged scan evaluates, and the group's one
+`update` or `delete` is its first statement, that statement takes the
+predicate as its selection, read together with the groups staged before it,
+and an `insert` after it stages one row per row it matched. Every other group with
+a selection, a group of two or more `update` or `delete` statements included,
+runs it as a read that the read planner shapes, against the snapshot the
+write captured: the read returns, per row, the identity of each `update` or
+`delete` variable and the value of each assignment that reads the row, the
+statement then selects exactly those identities, and an `insert` stages one
+row per row. A `delete` evaluates the identities 8,192 at a time
+(`PROBE_CHUNK_KEYS`), one membership predicate per chunk, so no predicate it
+scans grows with the selection. An `update` stages at least one row per
+identity, so one selecting more entities than one table stages (8,192,
+`KEYED_WRITE_MAX_ROWS`) is refused before its table opens, and its one
+predicate holds at most that many. An `insert` with no selection stages one
+row. An `insert` statement opens its table once, however many rows it stages,
+and admits each row to the staging, row and byte limits included, as it builds
+it. The selection read's pool and read-work budget outlive its run for as
+long as the write keeps its rows (`engine::SelectionRead`): the kept rows, the
+identity and value maps an `update` or `delete` builds from them and the value
+map an `insert` builds per row are charged to that pool, and each statement's
+pass over the rows charges one unit of `read_work_limit` per row, so a
+selection whose derived state outgrows `query_memory_bytes` or
+`read_work_limit` is refused as the read itself would be. Every group selects
+on the write's snapshot, never on the effects earlier groups staged (the GQ 3
+RFC, section 2), so a group whose selection reads a table an earlier group of
+the write changes is refused at type check (`T91`,
+`shape::write::earlier_group_change`); a staged scan and a selection read
+therefore select the same rows. An assignment that reads a Blob from a row
+is lowered to the cells it copies (`shape::write::BlobValue`): the selection
+read returns each source node's or edge's identity (and its type where an
+edge binding matches several), the `if` conditions that choose among them,
+and `exec/blob_copy.rs` reads the chosen cells at the same snapshot, one
+selection batch at a time ([Blob internals](blob.md#copying-a-blob-from-a-row)).
+Statements of one group see the keyed effects of the statements before them:
+the pending rows hold one current version per id.
+
 `MutationStaging` accumulates read-your-writes batches and delete predicates
 in memory. It performs all type, value, uniqueness, endpoint, cardinality, and
 resource validation before staging. `stage_all` opens each touched table at
@@ -438,7 +479,7 @@ the current head before any effect. A table it only read keeps its moved pin;
 a staged table goes through Lance's `TransactionRebase` over those commits
 (`table_store::rebase_staged_write`), records the current pin as its read
 version, and commits detached there, so the compaction stays and the table's
-history stays one chain. An insert, an append and an overwrite carry; an
+history stays one chain. An insert, an `insert` load and an overwrite carry; an
 update, delete or upsert of a row in a fragment a rewrite replaced is a
 conflict Lance reports, and the attempt is sent back, as one overtaken by a
 row change is. So is one whose chain cannot be read: the links before a
@@ -489,7 +530,7 @@ makes every request for the exclusive side wait (a branch create, a schema
 apply and a system-column upgrade among them), and the schema gate is fair: while such a
 request waits, new shared requests wait behind it, so writers on every branch
 wait too. Each wait lasts one preparation, as a branch merge's planning under
-the same permit already does. For a large merge load on object storage that
+the same permit already does. For a large `replace` load on object storage that
 can be seconds.
 
 Optimize captures its write authority before it takes the shared schema,
@@ -553,19 +594,20 @@ branch, and the explicit full-text rebuild) follows the same protocol: it
 opens each productive table at its pin, stages the complete BTREE/FTS/vector
 batch before the gates, commits every batch as a detached version of the pin
 and publishes the pins once. For `ensure_indices` one table's batch holds the
-declared indexes the table lacks and a whole rebuild of each BTREE or vector
-index whose coverage lags (`TableStore::stage_index_reconciliation`), the two
+declared indexes the table lacks and a whole rebuild of each BTREE, BITMAP, LABEL_LIST, NGRAM
+or vector index whose coverage lags (`TableStore::stage_index_reconciliation`), the two
 index links optimize chains after its compaction; full-text coverage stays
 with the explicit rebuild. The tables stage concurrently and share one
 budget (`MaintenanceBudget`): a BTREE build holds `ceil(width / 4)` permits,
 so at most `INDEX_BUILD_CONCURRENCY` (4) run at once, and exactly 4 only when
-the width is a multiple of 4 (2 at width 5, 3 at 6, 7 or 9); a full-text or
-vector build holds all of them and runs alone; and the batches join in table
+the width is a multiple of 4 (2 at width 5, 3 at 6, 7 or 9); a BITMAP,
+LABEL_LIST, NGRAM, full-text or vector build holds all of them and runs alone,
+since the budget overlaps BTREE builds only (`MaintenanceBudget::permit_for`); and the batches join in table
 and specification order, so the publication is the one a serial pass makes.
 The pass owns the budget: one `ensure_indices` or full-text rebuild pass
 (width 4), or one optimize run across the tables it stages at once (width
 its rewrite concurrency, shared with every compaction task, which holds one
-permit), never one budget per table. In optimize, a full-text or vector build
+permit), never one budget per table. In optimize, such a lone build
 therefore runs one at a time across the whole run, and no compaction task or
 other build runs beside it; a table waiting for its permit keeps its rewrite
 slot, so later tables wait too. No step waits for a permit while it holds
@@ -751,7 +793,9 @@ exact-`id`, filter-bearing MergeInsert adapter:
 
 - strict insert probes the pinned parent and returns `KeyConflict` for an
   existing ID;
-- upsert updates or inserts without changing modes on retry. With an id
+- upsert replaces a matched row whole (its source is the full catalog row,
+  an omitted nullable property null, Blob and vector included) or inserts,
+  without changing modes on retry. With an id
   BTREE it first runs the strict insert's exact-id probe, while the fragments
   the BTREE leaves uncovered times the source ids stay within one keyed batch
   (8,192), since Lance plans the probe's `IN` list once per uncovered
@@ -768,10 +812,35 @@ exact-`id`, filter-bearing MergeInsert adapter:
   the derived `id = v` conjunct to its match scan when the table has an id
   BTREE, as a node delete does, so the scan reads the index;
 - a bare Lance Append is not a production graph-table write;
+- the three keyed statements (GQ 3 RFC, "Keyed writes") and the load modes of
+  the same names map onto these two adapters. `insert` is the strict insert:
+  a key the write staged earlier is refused from the pending image, a
+  committed one by the probe, and when another statement made the table an
+  upsert, the ids `insert` staged there (`PendingTable::strict_ids`) are
+  probed against the pinned table before staging; `KeyConflict`'s message
+  carries `KEY_CONFLICT_FIX`, which names `upsert` and `replace`. `replace`
+  is the whole-row upsert above. `upsert` fills the cells a row omits first
+  (`exec::keep_omitted`): one id scan per run of up to 1,024 rows
+  (`KEEP_OMITTED_RUN_ROWS`) reads only the omitted columns of the keys it
+  matches, from the pinned table and, for a statement, the pending image
+  (`EarlierEffects::Seen`; a load reads committed rows only), refuses a
+  required property still null on a new key, and stages the whole row
+  through the same upsert adapter. Lance 13's partial-schema merge-insert
+  would keep omitted columns unread, but it takes one source schema per call
+  and has no per-row "not supplied" marker, while records may name different
+  properties and the pending image needs whole rows. A row naming every
+  property reads nothing extra; the DST golden's `UpsertKeepScalars` (11
+  gets) against `ReplaceBlob1M` (9) is the scan, and `UpsertKeepBlob1M` (15
+  gets, 8 puts) adds reading and rewriting the omitted 1 MiB Blob;
+- an `update` stages only the rows whose assigned values differ from the
+  matched row under the fixed value order (`rows_that_change`), so one that
+  changes nothing stages nothing and publishes no commit; an unchanged
+  `upsert` or `replace` still publishes, since proving it unchanged would read
+  the named (or every) column of the stored row;
 - one table's keyed input is bounded to 8,192 rows and the effective
   `write_max_bytes` (default 32 MiB) before its data is staged.
 
-Insert/update mutations and keyed Append/Merge loads also cap the sum of
+Insert/update mutations and keyed `insert`, `upsert` and `replace` loads also cap the sum of
 retained row data across tables at `write_max_bytes`
 (`retained keyed batch bytes per operation`). Admission starts with
 `get_array_memory_size`, subtracting only typed logical Blob payload buffer
@@ -808,7 +877,10 @@ id scan also returns each matched row's address at the table's pin, and
 `stage_all` writes the deletion vectors for exactly those rows
 (`TableStore::stage_delete_rows`, Lance's `DeleteBuilder` after its scan), so
 a deleted table is scanned once; addresses from another version than the
-reopened pin take Lance's scanning delete. A node removal reads each edge
+reopened pin take Lance's scanning delete. A delete statement's scan leaves
+out the rows at the addresses earlier statements of the mutation recorded
+(`recorded_row_addrs`), so statements that overlap count and record each row
+once, and no scan's filter grows with the statements before it. A node removal reads each edge
 table that references the type for the edges touching its removed ids (the
 delete cascade, and the retained-edge check of an Overwrite, `load csv` or a
 merge) through `validate::RemovalEdgeReads`. Lance gives every fragment that

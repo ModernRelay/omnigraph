@@ -165,7 +165,7 @@ node Document {
         .join("\n");
 
     let probes = MergeWriteProbes::default();
-    with_merge_write_probes(probes.clone(), db.load("main", &rows, LoadMode::Append))
+    with_merge_write_probes(probes.clone(), db.load("main", &rows, LoadMode::Insert))
         .await
         .expect("deduplicated external S3 load must succeed");
     assert_eq!(probes.external_blob_probe_inputs(), REFERENCES);

@@ -1,0 +1,109 @@
+# issue: none
+# traversal: auto
+# notes: A letter directly followed by `™` (U+2122) is a value Lance 13's NGRAM index turns into a trigram
+# notes: with capitals: its prepper lowercases before ASCII folding, and `™` folds to `TM`. Every String
+# notes: `@index` and every full-text field builds an NGRAM, so the index build meets such a value under
+# notes: every profile. Building the indexes succeeds, each profile's exact scan matches the value, and
+# notes: `contains` on the plain `@index` column probes its NGRAM with such a needle and returns the
+# notes: reference interpreter's rows (`contains` on a full-text column takes the scan). The reference
+# notes: does not evaluate `english_v1`, so that step pins its rows alone.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    standard: String @index(fulltext, analyzer = "standard_v1")
+    folded: String @index(fulltext, analyzer = "standard_folded_v1")
+    english: String @index(fulltext, analyzer = "english_v1")
+    plain: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","standard":"x™ vitamin","folded":"x™ vitamin","english":"x™ vitamins","plain":"x™ vitamin"}}
+{"type":"Doc","data":{"slug":"d2","standard":"brand™name","folded":"brand™name","english":"brand™name","plain":"brand™name"}}
+{"type":"Doc","data":{"slug":"d3","standard":"plain text","folded":"plain text","english":"plain text","plain":"plain text"}}
+
+--- query
+query standard_terms($q: String) {
+    match { $d: Doc }
+    where match_terms($d.standard, terms($q, mode: any))
+    return { $d.slug }
+}
+
+--- params
+{"q": "vitamin"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query folded_terms($q: String) {
+    match { $d: Doc }
+    where match_terms($d.folded, terms($q, mode: any))
+    return { $d.slug }
+}
+
+--- params
+{"q": "x"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query english_terms($q: String) {
+    match { $d: Doc }
+    where match_terms($d.english, terms($q, mode: all))
+    return { $d.slug }
+}
+
+--- params
+{"q": "brand name"}
+
+--- expect unordered
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query contains_letter_and_sign() {
+    match { $d: Doc }
+    where contains($d.plain, "x™ vit")
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: access index_probe plain ngram
+
+--- query
+query contains_sign_between_letters() {
+    match { $d: Doc }
+    where contains($d.plain, "d™n")
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: access index_probe plain ngram

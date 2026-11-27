@@ -167,6 +167,21 @@ this identity even after receipt eviction, rejecting a recreated graph with
 identical schema text. Unaffected graph opens are skipped. Ordinary apply never
 adopts foreign schema identity as an implicit correction.
 
+Desired and achieved schemas compare by accepted identity, not text. A
+configured schema whose accepted identity equals the achieved one (a comment,
+layout, an explicit default such as `distance = "l2"`) plans no step: `cluster
+plan` marks the update `text_only`, its engine intent is a no-op that settles
+as `NoOp`, and the graph keeps its accepted source and head, which a binary
+before GQ 3 re-parses on open. The ledger records the configured text's digest
+as the schema resource beside the unchanged contract that realizes it, so it
+never claims the graph holds that text and the next plan sees no difference.
+A schema resource's digest therefore equals its contract's `source_hash`
+except after such a change. Drift (`applied_schema_drift`) still compares the
+graph's contract with the recorded one, and observation counts a graph whose
+contract is the recorded one as matching its recorded text. A binary before
+v0.17.0 required the two digests to be equal and refuses such a ledger as
+`invalid_state`.
+
 Config capture reads each source once, preserving exact bytes by digest.
 Immutable bundles and prepared engine intents are bounded before acceptance,
 with ledger/result capacity reserved for completion. Bounded versioned storage

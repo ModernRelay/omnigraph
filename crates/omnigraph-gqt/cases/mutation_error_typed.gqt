@@ -21,7 +21,7 @@ node Person {
 
 --- mutate
 query insert_missing_key($age: I32) {
-    insert Person { age: $age }
+    replace Person { age: $age }
 }
 
 --- params
@@ -31,7 +31,8 @@ query insert_missing_key($age: I32) {
 
 --- mutate
 query delete_absent($name: String) {
-    delete Person where name = $name
+    match { $x: Person } where $x.name = $name
+    delete $x
 }
 
 --- params

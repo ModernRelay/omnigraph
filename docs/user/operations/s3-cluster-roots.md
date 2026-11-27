@@ -53,7 +53,7 @@ that create and fill a graph (`init`, `schema apply`, `load`) accept an inline
 
 ```bash
 omnigraph init s3://bucket/bench/main/graph --schema schema.pg
-omnigraph load --target s3://bucket/bench/main/graph --mode merge --data rows.jsonl
+omnigraph load --target s3://bucket/bench/main/graph --mode replace --data rows.jsonl
 omnigraph query --target s3://bucket/bench/main/graph -e 'query q() { match { $r: BenchmarkRun } return { $r.p50_us } limit 5 }'
 omnigraph query --target s3://bucket/cluster --graph results -e '…'
 ```

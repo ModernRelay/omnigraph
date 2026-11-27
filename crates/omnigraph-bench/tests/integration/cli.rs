@@ -964,7 +964,7 @@ fn commit_of(reference: &str) -> String {
 /// `tiny-read` and `tiny-mutate` as the public catalog declares them, under
 /// the suite `pair`.
 #[cfg(not(debug_assertions))]
-const PAIR_YAML: &str = "version: 2\nscenarios:\n- id: tiny-read\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_read.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- query branch: main\n      query items() {\n          match { $i: Item }\n          return { $i.key as key, $i.val as val }\n      }\n- id: tiny-mutate\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_mutate.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- mutate\n      query add() { insert Item { key: \"c\", val: 3 } }\nsuites:\n  pair: [tiny-read, tiny-mutate]\nrun: [pair]\n";
+const PAIR_YAML: &str = "version: 2\nscenarios:\n- id: tiny-read\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_read.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- query branch: main\n      query items() {\n          match { $i: Item }\n          return { $i.key as key, $i.val as val }\n      }\n- id: tiny-mutate\n  fixture: fixtures/tiny_graph.gqt\n  workload: workloads/tiny_mutate.gqt\n  measured_step:\n    ordinal: 1\n    text: |\n      --- mutate\n      query add() { replace Item { key: \"c\", val: 3 } }\nsuites:\n  pair: [tiny-read, tiny-mutate]\nrun: [pair]\n";
 
 /// A catalog beside the public one: its fixture and the two tiny workloads
 /// copied from it, with `yaml` as its `benchmarks.yaml`.

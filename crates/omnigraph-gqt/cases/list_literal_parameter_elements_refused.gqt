@@ -1,0 +1,106 @@
+# issue: none
+# notes: A list literal's element is a literal or a declared non-null scalar
+# notes: parameter, and every parameter element has one declared type, the
+# notes: list's element type. A list parameter, a nullable parameter, a
+# notes: binding or a `let` name as an element is refused with T7 naming it;
+# notes: two parameter types in one list, or a literal that is not a value of
+# notes: the element type, with T53, since no element is cast; an unknown
+# notes: name keeps T6. Unary minus over a parameter is an expression, which
+# notes: a list does not hold, so `[-$a]` does not parse.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":36}}
+
+--- query
+query a_list_parameter_element($a: I32, $l: [I32]) {
+    match { $p: Person } where $p.age in [$a, $l]
+    return { $p.handle }
+}
+
+--- expect error: T7: the list element `$l` is a parameter of type [I32]; a list element is a literal or a declared non-null scalar parameter
+
+--- query
+query a_nullable_parameter_element($a: I32, $b: I32?) {
+    match { $p: Person } where $p.age in [$a, $b]
+    return { $p.handle }
+}
+
+--- expect error: T7: the list element `$b` is a parameter of type I32?; a list element is a literal or a declared non-null scalar parameter
+
+--- query
+query two_parameter_types($a: I32, $b: I64) {
+    match { $p: Person } where $p.age in [$a, $b]
+    return { $p.handle }
+}
+
+--- expect error: T53: the list element `$b` is I64, but `$a` is I32; every parameter element of a list has one type, and no element is cast
+
+--- query
+query a_literal_of_another_type($a: I32) {
+    match { $p: Person } where $p.age in [$a, "36"]
+    return { $p.handle }
+}
+
+--- expect error: T53: the list element `"36"` is not a value of the list's element type I32, the type of `$a`; no element is cast
+
+--- query
+query a_float_literal_beside_an_integer($a: I32) {
+    match { $p: Person } where $p.age in [$a, 36.5]
+    return { $p.handle }
+}
+
+--- expect error: T53: the list element `36.5` is not a value of the list's element type I32, the type of `$a`; no element is cast
+
+--- query
+query a_literal_outside_the_element_range($a: I32) {
+    match { $p: Person } where $p.age in [$a, 3000000000]
+    return { $p.handle }
+}
+
+--- expect error: T53: the list element `3000000000` is not a value of the list's element type I32, the type of `$a` (3000000000 is outside its range -2147483648 to 2147483647); no element is cast
+
+--- query
+query a_binding_element($a: String) {
+    match { $p: Person } where $p.handle in [$a, $p]
+    return { $p.handle }
+}
+
+--- expect error: T7: the list element `$p` is a binding, not a parameter; a list element is a literal or a declared non-null scalar parameter
+
+--- query
+query a_let_element($a: I32) {
+    match { $p: Person, let $n = $p.age + 1 } where $p.age in [$a, $n]
+    return { $p.handle }
+}
+
+--- expect error: T7: the list element `$n` is a value bound by `let` or a block, not a parameter; a list element is a literal or a declared non-null scalar parameter
+
+--- query
+query an_unknown_element($a: I32) {
+    match { $p: Person } where $p.age in [$a, $zz]
+    return { $p.handle }
+}
+
+--- expect error: T6: variable `$zz` is not bound
+
+--- query
+query a_negated_parameter_element($a: I32) {
+    match { $p: Person } where $p.age in [-$a]
+    return { $p.handle }
+}
+
+--- expect error: expected an expression; found `$a`

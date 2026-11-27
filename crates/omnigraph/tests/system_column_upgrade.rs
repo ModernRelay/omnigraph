@@ -59,7 +59,7 @@ const COMPANY_QUERY: &str =
     "query company_identity() { match { $c: Company } return { $c.@id, $c.name } }";
 const OLD_PEOPLE_QUERY: &str =
     "query old_people() { match { $p: Person } return { $p.@id, $p.name } order { $p.@id asc } }";
-const OLD_COWORKERS_QUERY: &str = "query old_coworkers() { match { $p: Person\n $p worksat $c } return { $p.@id, $c.name } order { $p.@id asc } }";
+const OLD_COWORKERS_QUERY: &str = "query old_coworkers() { match { $p: Person, $p worksat $c } return { $p.@id, $c.name } order { $p.@id asc } }";
 
 async fn legacy_graph_with_data(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();
@@ -204,7 +204,7 @@ async fn assert_upgraded(db: &Session, dir: &tempfile::TempDir, expected_export:
 
     db.load_jsonl(
         r#"{"type":"Person","id":"Carol","data":{"name":"Carol","age":41}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -215,13 +215,13 @@ async fn assert_upgraded(db: &Session, dir: &tempfile::TempDir, expected_export:
     );
     db.load_jsonl(
         r#"{"edge":"WorksAt","id":"works-carol","from":"Carol","to":"company-1","data":{}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("an edge insert satisfies the respelled @unique(@src, @dst)");
     db.load_jsonl(
         r#"{"edge":"WorksAt","id":"works-carol-again","from":"Carol","to":"company-1","data":{}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect_err("the respelled @unique(@src, @dst) still refuses a duplicate endpoint pair");
@@ -383,7 +383,7 @@ async fn system_column_upgrade_history_survives_unrelated_reclaimed_tables() {
     let snapshot_before = db.resolve_snapshot("main").await.unwrap();
     db.load_jsonl(
         r#"{"type":"Company","data":{"id":"company-2","name":"Beta"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();

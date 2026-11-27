@@ -386,7 +386,6 @@ impl Failure {
             Action::Retry
         } else if output.recovery_required.is_some()
             || output.full_text_index_rebuild_required.is_some()
-            || output.full_text_index_required.is_some()
         {
             Action::Recover
         } else if let Some(action) = admission {
@@ -508,7 +507,6 @@ pub(crate) fn is_plain_refusal(output: &ErrorOutput) -> bool {
         && output.change_diff_refusal.is_none()
         && output.branch_start_refusal.is_none()
         && output.full_text_index_rebuild_required.is_none()
-        && output.full_text_index_required.is_none()
         && output.diagnostic.is_none()
 }
 

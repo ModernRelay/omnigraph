@@ -546,10 +546,8 @@ edge Links: Person -> Person
 
 --- query
 query fan_out() {
-    match {
-        $h: Person { name: "hub" }
-        $h links $l
-    }
+    match { $h: Person, $h links $l }
+    where $h.name = "hub"
     return { $l.name }
 }
 
@@ -817,10 +815,8 @@ l.name: String
 
 --- query
 query undirected_self_edge() {
-    match {
-        $p: Person { name: "a" }
-        $p <links> $q
-    }
+    match { $p: Person, $p <links> $q }
+    where $p.name = "a"
     return { $q.name }
 }
 
@@ -833,10 +829,8 @@ q.name: String
 
 --- query
 query parallel_edges_once() {
-    match {
-        $c: Person { name: "c" }
-        $c links $d
-    }
+    match { $c: Person, $c links $d }
+    where $c.name = "c"
     return { $d.name }
 }
 

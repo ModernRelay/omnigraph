@@ -1,5 +1,5 @@
 //! The results graph's rows, from a store's records and the catalogs that
-//! declared them: graph JSONL for `omnigraph load --mode merge`, so the graph
+//! declared them: graph JSONL for `omnigraph load --mode replace`, so the graph
 //! lives wherever `omnigraph` can address and the harness owns no location.
 //! A scenario and a suite are their names, a point's spec is its levels and
 //! every other id is content-derived, so a re-export of the same store is a
@@ -679,7 +679,7 @@ mod tests {
     use omnigraph::loader::LoadMode;
     use omnigraph::settings::SessionSettings;
     use omnigraph_compiler::ParamMap;
-    use omnigraph_compiler::query::ast::Literal;
+    use omnigraph_compiler::query::value::Literal;
 
     use super::*;
 
@@ -768,7 +768,7 @@ mod tests {
             SessionSettings::default(),
         );
         session
-            .load_graph_batch("main", &text, LoadMode::Merge)
+            .load_graph_batch("main", &text, LoadMode::Replace)
             .await
             .unwrap();
         let series = rows_of(
@@ -797,7 +797,7 @@ mod tests {
         );
 
         session
-            .load_graph_batch("main", &text, LoadMode::Merge)
+            .load_graph_batch("main", &text, LoadMode::Replace)
             .await
             .unwrap();
         let again = rows_of(
@@ -890,7 +890,7 @@ mod tests {
             SessionSettings::default(),
         );
         session
-            .load_graph_batch("main", rows, LoadMode::Merge)
+            .load_graph_batch("main", rows, LoadMode::Replace)
             .await
             .unwrap();
         session
@@ -1033,7 +1033,11 @@ mod tests {
 
         let session = graph_of(directory.path(), &String::from_utf8(first).unwrap()).await;
         session
-            .load_graph_batch("main", &String::from_utf8(second).unwrap(), LoadMode::Merge)
+            .load_graph_batch(
+                "main",
+                &String::from_utf8(second).unwrap(),
+                LoadMode::Replace,
+            )
             .await
             .unwrap();
         let series = rows_of(&session, "series_for_scenario", ("scenario", case)).await;

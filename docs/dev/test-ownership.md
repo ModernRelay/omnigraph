@@ -21,11 +21,11 @@ export budget and must not share a binary with the other export tests.
 
 | Package | Primary owners | Shared support |
 |---|---|---|
-| `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests | Module-local fixtures |
+| `omnigraph-compiler` | In-source parser, catalog, type-checking, lowering, and lint tests; `query::check::tests::compile_growth`, which holds compile work (term nodes, expression nodes, steps) linear in each construct family and compiles the sizes the old bounds refused | Module-local fixtures; `arbitrary`, the generators every [generated law](#generated-laws) draws from |
 | `omnigraph-planner` | In-source optimizer/cost tests and `tests/integration/query_plan.rs`, `tests/integration/registry.rs`, `tests/integration/lower_walk.rs`; plan assertions over real snapshots live in GQT | `PlanSource` fixtures for metadata and refusal states |
 | `omnigraph-storage` | In-source control-object storage, CAS, locking, and URI tests | Module-local fixtures |
 | `omnigraph-seams` | In-source tests of the seam type: slot scopes, the guard, the decision behaviors; `tests/failpoint_names_guard.rs`, the source walk over the engine, core, catalog, cluster and DST crates and the `.gqt` corpus that keeps every seam catalogued, crossed and armed | None |
-| `omnigraph-core` | In-file `#[cfg(test)]` tests of the error type, branch names, branch control, Lance clone, metadata, full-text compatibility and instrumentation | Module-local fixtures |
+| `omnigraph-core` | In-file `#[cfg(test)]` tests of the error type, branch names, branch control, Lance clone, metadata, full-text analysis (the probe corpus and the [measured-fingerprint golden](#full-text-fingerprint-golden)), full-text compatibility and instrumentation | Module-local fixtures; `fts/` holds the probe corpus and the golden |
 | `omnigraph-catalog` | In-source tests: `crates/omnigraph-catalog/src/tests.rs` for `__manifest` publication, state and lineage, plus in-file tests in `migrations.rs` and `retention.rs` | Module-local fixtures; `omnigraph-core`'s `test-util` helpers |
 | `omnigraph-engine` | `crates/omnigraph/tests/` plus focused in-source tests | `tests/helpers/` and `tests/fixtures/` |
 | `omnigraph-policy` | In-source Cedar policy parsing and evaluation tests | Module-local fixtures |
@@ -37,7 +37,8 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `integration/lane_b.rs`, `integration/torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests, the local-route agreement tests (`routes_agree` in `src/gqt_tests.rs`: one scenario on the direct, object-store and read-through routes with the same verification and equal storage calls) and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
 | `omnigraph-gqt-core` | In-source format, expectation and ordinary execution tests | Shared parser and executor used by the GQT runner and benchmark harness |
-| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus runner self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
+| `omnigraph-reference` | In-source `src/tests.rs`, one test per core operator of the RFC's operator table, `Fix` and `Call` included, and per lowered form (`optional`, `union`'s positional names, a call bound in the caller's scope, `distance`, an edge binding, `limit $n`, the lazy `if` and `coalesce`, an inline read's group per outer row, a block against an outer scalar, `rrf`'s one row per target), the lexical rules (any-term matching, a null document, the edit budget, a profile's whole pipeline, `english_v1`'s stemmer and stop list included, `bm25_v1`), parameter binding and the refusals; `tests/dependencies.rs`, which holds the crate to the compiler, `serde_json`, `libm`, the Snowball stemmer (`frostem`) and `unicode-normalization`, and the GQT runner to being its one dependent | Module-local fixtures; GQT's comparison of every read step on the direct engine ([GQT README](../../crates/omnigraph-gqt/README.md#reference-comparison)) is its corpus-wide use |
+| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), `tests/gq_layout_tests.rs`, every case again under each physical layout, the generated laws in `tests/integration/law_*.rs`, plus runner self-tests, the corpus layout check and `tests/integration/query_corpus.rs`, which parses every documented query text (the guides' and the skill's ```` ```gq ```` blocks, the `.gq` files) and type-checks each `.gq` file that has a `.pg` beside it | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
 
 Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
 
@@ -53,14 +54,13 @@ The engine integration suite is grouped by behavior, not implementation module:
 |---|---|
 | Initialization and representative journeys | `integration/lifecycle.rs`, `integration/end_to_end.rs`, `integration/composite_flow.rs`, `integration/consistency.rs` |
 | Query results and operators | `integration/aggregation.rs`, `integration/literal_filters.rs`, `integration/ordering.rs`, `integration/traversal_indexed.rs`, `integration/traversal_adaptive.rs`, `integration/proptest_equivalence.rs`; `failpoints.rs` owns the graph index build gate (concurrent misses build once), whose seams are process-wide; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
-| V2 execution and memory | `integration/engine_v2.rs`, `integration/engine_v2_memory.rs`; `integration/repro_issue_703.rs` and `integration/repro_issue_723.rs` own ignored scale symptoms |
-| Frozen engine v1, the reference | `crates/omnigraph-reference-engine/tests/frozen.rs` pins every source file's bytes; `forbidden_apis.rs` owns that `omnigraph-gqt` is the crate's only dependent and that its source names neither the engine nor the planner; the crate has no other tests, and a `.gqt` step's `--- expect same as v1` compares v2's rows with its answer |
-| V2 plan nodes' operators and the execution report | In-source `engine/report/tests.rs` owns which operator each node builds and what its row says (`ran`, `actual_rows`, `drained`); `crates/omnigraph-planner/tests/integration/lower_walk.rs` owns the walk's order and refusals; the `ran` lines of `--- expect plan` read the report of the case's own run |
-| V2 plan sufficiency: the bound plan alone reproduces a run | `crates/omnigraph/tests/integration/engine_v2_plan_replay.rs` (see [Plan replay](#plan-replay)): one query per node kind with a switch or a ladder, replayed twice through `Session::replay_bound_plan` from its serialized replay envelope, equal rows, the same trace and the same search decisions required; `crates/omnigraph-planner/tests/integration/bound_plan.rs` owns the serialized form; in-source `engine/search.rs` tests own the declared ladder's stepping; `engine/plan_source.rs` tests own that the assumed memory limit sizes the plan, the lowering and the pool |
-| V2 plan acceptance: every read plan checked against its checked query | In-source `crates/omnigraph-planner/src/validate/tests.rs` owns one broken plan per check (binding, traversal and search identity, predicate retention and origin, block strategy, row cut, order and tie-break including fused and grouped searches, projection and score origin, hydration, declared policies, full-text prerequisites), the key-narrowing conjunct admitted only with its re-derived id, exact-fragment membership over admitted and excluded forms, the derivation's rules and rejections (hydrated members included), entry parity under an exhausted limit, and the `instrument:` derivation cost curve; `engine/plan_source/key_tests.rs` owns the narrowed key on a real snapshot and its refusal when edited; `integration/engine_v2_plan_replay.rs` owns that a saved plan failing well-formedness or a requirement is a bad request at the replay door; `validate/replay.rs` and `validate/budget.rs` tests own decoding limits, version refusals and budget charges; `integration/engine_v2.rs::every_read_door_shares_one_acceptance` owns that the run, both explain doors and the inspected run accept one plan and refuse alike; GQT cases claim the scope with `validation scope <scope>` in `--- expect plan` |
-| V2 scrubbed replay: no input beside the bound plan and the snapshot reaches execution | `engine_v2_scrubbed_replay.rs` owns the mechanism (the `std::env` grep over `crates/omnigraph/src/engine/`, the replay under an ambient memory limit and an ambient `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` the plan did not capture, `ann_nprobes` as a plan field, the `profile` rows); `integration/engine_v2_plan_replay.rs` owns the snapshot pins (an edge write or an insert after planning refuses the replay); the inventory cases `cases/v2/planner/input_*.gqt` own one input class each (`engine`, `ann_nprobes`, index build state), and the clock class is owned by `integration/engine_v2_plan_replay.rs`; `integration/engine_v2_memory.rs` owns `ran id_lookup` under a refused build |
-| V2 declared switches: the report names the side a run took | `cases/v2/planner/switch_ran_on_the_report.gqt` (the `ran` line of `--- expect plan`); in-source `engine/report/tests.rs` owns the switch's row and a scan whose plan declares no fallback |
-| Search and physical indexes | `search.rs`, `integration/scalar_indexes.rs`, `lance_surface_guards.rs`, `integration/rrf_prefilter_gate.rs` (the rrf plan gate's differential oracle and fences), `integration/repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
+| Execution and memory | `integration/execution.rs`, `integration/execution_memory.rs`; `integration/repro_issue_703.rs` and `integration/repro_issue_723.rs` own ignored scale symptoms |
+| Plan nodes' operators and the execution report | In-source `engine/report/tests.rs` owns which operator each node builds and what its row says (`ran`, `actual_rows`, `drained`); `crates/omnigraph-planner/tests/integration/lower_walk.rs` owns the walk's order and refusals; the `ran` lines of `--- expect plan` read the report of the case's own run |
+| Plan sufficiency: the bound plan alone reproduces a run | `crates/omnigraph/tests/integration/plan_replay.rs` (see [Plan replay](#plan-replay)): one query per node kind with a switch or a ladder, replayed twice through `Session::replay_bound_plan` from its serialized replay envelope, equal rows, the same trace and the same search decisions required; `crates/omnigraph-planner/tests/integration/bound_plan.rs` owns the serialized form; in-source `engine/search.rs` tests own the declared ladder's stepping; `engine/plan_source.rs` tests own that the assumed memory limit sizes the plan, the lowering and the pool |
+| Plan acceptance: every read plan checked against its checked query | In-source `crates/omnigraph-planner/src/validate/tests.rs` owns one broken plan per check (binding, traversal and search identity, a fusion's arms checked scope by scope, predicate retention and origin, block strategy, row cut, order and tie-break including fused and grouped searches, projection and score origin, hydration, declared policies, an exact `bm25`'s scoring corpus), the key-narrowing conjunct admitted only with its re-derived id, exact-fragment membership over admitted and excluded forms, the derivation's rules and rejections (hydrated members included), entry parity under an exhausted limit, and the `instrument:` derivation cost curve; `engine/plan_source/key_tests.rs` owns the narrowed key on a real snapshot and its refusal when edited; `integration/plan_replay.rs` owns that a saved plan failing well-formedness or a requirement is a bad request at the replay door; `validate/replay.rs` and `validate/budget.rs` tests own decoding limits, version refusals and budget charges; `integration/execution.rs::every_read_door_shares_one_acceptance` owns that the run, both explain doors and the inspected run accept one plan and refuse alike; GQT cases claim the scope with `validation scope <scope>` in `--- expect plan`; `validate/tests.rs` also owns the placement check's broken plans, derived from the core read (a conjunct written at or after the first one that can fail moved into a scan or tested before an earlier one), and in-source `placement::tests` the law itself, a stand-in selecting node included |
+| Scrubbed replay: no input beside the bound plan and the snapshot reaches execution | `scrubbed_replay.rs` owns the mechanism (the `std::env` grep over `crates/omnigraph/src/engine/`, the replay under an ambient memory limit and an ambient `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` the plan did not capture, `ann_nprobes` as a plan field, the `profile` rows); `integration/plan_replay.rs` owns the snapshot pins (an edge write or an insert after planning refuses the replay); the inventory cases `cases/planner/input_*.gqt` own one input class each (`ann_nprobes`, index build state), and the clock class is owned by `integration/plan_replay.rs`; `integration/execution_memory.rs` owns `ran id_lookup` under a refused build |
+| Declared switches: the report names the side a run took | `cases/planner/switch_ran_on_the_report.gqt` (the `ran` line of `--- expect plan`); in-source `engine/report/tests.rs` owns the switch's row and a scan whose plan declares no fallback |
+| Search and physical indexes | `search.rs`, `integration/scalar_indexes.rs`, `lance_surface_guards.rs`, `cases/rrf_*.gqt` (fusion rows against the reference interpreter, every population shape included), in-source `engine/operators/fuse.rs` tests (ranks counted once per target per arm), `integration/repro_issue_563.rs` (`#[ignore]`d overflow-scale symptom tier) |
 | Writes, validation, schema, and policy | `writes.rs`, `integration/validators.rs`, `schema_apply.rs`, `policy_engine_chassis.rs` |
 | Branches, snapshots, diffs, and merges | `integration/branching.rs`, `integration/point_in_time.rs`, `integration/changes.rs`, `integration/merge_truth_table.rs`, `integration/merge_fast_forward.rs` |
 | Recovery and crash windows | `integration/recovery.rs`, `failpoints.rs` (including the `live_handle_*` liveness owners: a live handle writes again once faults stop, without reopening), `detached_commit_matrix.rs` (the RFC 0067 writer × window × fault × recovery-actor matrix over the insert, multi-table, load, cleanup, ensure-indices, full-text-rebuild, merge, schema-apply, optimize, system-column-upgrade and Blob put and clear writers; the same-handle liveness actor runs by default and `OMNIGRAPH_MATRIX=full` adds the other-process and cleanup actors), in-source manifest/recovery tests |
@@ -121,6 +121,7 @@ When adding a new writer, update all of these layers. See [recovery.md](recovery
 Blob coverage is deliberately split:
 
 - engine `integration/end_to_end.rs`, `integration/branching.rs`, and in-source Blob tests own logical cell selection, snapshots, integrity, ranges, external classification, and write admission;
+- engine `writes.rs::blob_read_from_a_row_copies_the_cell_its_row_selects` owns a Blob an assignment reads from its row (the bytes read back, one batched read per source column, the budget before any read, `E4`, a ranged source), with the GQT case `blob_read_from_a_row_in_an_assignment.gqt` for each statement's rows;
 - engine `integration/export.rs` owns export's batched managed Blob read (one read per Blob column per batch, in request order, shared by the change-feed baseline) and `integration/changes.rs` the change images' reads;
 - engine `integration/maintenance.rs` owns Blob compaction (the batch derived from a row's summed Blob columns, fragments with deleted rows, per-task sizing in `integration/maintenance.rs::optimize_sizes_each_compaction_task_from_its_own_fragments`, external references counting nothing in `integration/maintenance.rs::optimize_does_not_size_a_blob_batch_by_external_references`);
 - cluster tests own persisted external-source policy and serving projections;
@@ -137,7 +138,7 @@ Run this first for every Lance change:
 cargo test -p omnigraph-engine --test lance_surface_guards
 ```
 
-The guards pin only substrate behavior Omnigraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, the stock-cleanup sweep of old files used only by detached versions (with the attached manifest timestamp preceding the file and the file preceding the seven-day cutoff), index coverage and segment ownership, stable row IDs, native V2 vector ordering, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and replace its negative guard with the native behavior the caller now requires. A persisted layout still needs its own format decision.
+The guards pin only substrate behavior Omnigraph actually depends on: version and row columns, transaction witnesses, primary-key conflict filters, branch/ref cleanup, the stock-cleanup sweep of old files used only by detached versions (with the attached manifest timestamp preceding the file and the file preceding the seven-day cutoff), index coverage and segment ownership, the full-text tokenizer a profile's native parameters build, stable row IDs, native V2 vector ordering, Blob reads through compaction, and the detached-commit privacy, twin replay and self-conflict rules that RFC 0067 builds on. If an upstream limitation disappears, remove the workaround and replace its negative guard with the native behavior the caller now requires. A persisted layout still needs its own format decision.
 
 Qualify a dependency bump in both debug and release profiles: upstream unstable
 capabilities can have different gates under `debug_assertions`. Run the native
@@ -179,11 +180,11 @@ maintenance, and the decoy must see no request. The in-source
 
 ### Plan replay
 
-Query behavior has two test tiers. A `.gqt` case owns what is visible in rows, counts, result column types, or errors. A Rust test owns what the format cannot express: mechanism, scale, process environment, concurrency. The claim that a v2 run is a function of its bound plan and the snapshot is of the second kind: no case reaches the replay door. On every successful rows step, the GQT runner checks the report shape, `schema_drift`, `check_pin`, and the plan root's complete declared result schema against both the compiler's retained declarations and the executed columns. Result-schema inference reads the checked query's stored types; it checks propagation and execution, not an independent inference algorithm. Inference compares nullability flags; execution compares names in order, full Arrow types (including node Struct members), and null cells in declared non-null results. It also serializes and deserializes the executed `BoundPlan`, requires equal physical explain documents, and directly compares stored schemas, return declarations, named node-object types and complete block predicates/specs. This checks that the plan's stored decisions survive the mirror without executing another query. The mapping from plan nodes to operators needs no check here: its rule is in [execution.md](execution.md#v2-plan-lowering-one-node-one-operator).
+Query behavior has two test tiers. A `.gqt` case owns what is visible in rows, counts, result column types, or errors. A Rust test owns what the format cannot express: mechanism, scale, process environment, concurrency. The claim that a run is a function of its bound plan and the snapshot is of the second kind: no case reaches the replay door. On every successful rows step, the GQT runner checks the report shape, `schema_drift`, `check_pin`, and the plan root's complete declared result schema against both the compiler's retained declarations and the executed columns. Result-schema inference reads the checked query's stored types; it checks propagation and execution, not an independent inference algorithm. Inference compares nullability flags; execution compares names in order, full Arrow types (including node Struct members), and null cells in declared non-null results. It also serializes and deserializes the executed `BoundPlan`, requires equal physical explain documents, and directly compares stored schemas, return declarations, named node-object types and complete block predicates/specs. This checks that the plan's stored decisions survive the mirror without executing another query. The mapping from plan nodes to operators needs no check here: its rule is in [execution.md](execution.md#v2-plan-lowering-one-node-one-operator).
 
-`crates/omnigraph/tests/integration/engine_v2_plan_replay.rs` owns the replay, including refusal of altered result schemas and missing, duplicate, unused or altered node-object declarations. Each test gathers one query through `Session::query_inspected`, serializes the run's replay envelope (`Executed::replay_envelope`: the query's source and name, the accepted scope, the schema digest, the `BoundPlan` through the planner's mirrors and an exact-fragment member's derivation), reads it back (the plan must read back equal), and executes it twice through `Session::replay_bound_plan`, a door that recompiles the named query against the target's catalog, binds it to the plan's own values, accepts the plan again and takes no session setting. Each replay must return the run's rows, record the run's search decisions (gate verdicts and probe attempts) and repeat its trace: `id`, `operator` and `status` per row, `rung` and `ran` per attempt, and `actual_rows` wherever both attempts are `drained`. `drained` says the consumer pulled the operator's stream to its end; below an operator that stopped early (a `Limit`, a `Sort` with a fetch), a producer's count is a lower bound that depends on how far ahead its channel ran, and is not compared. One query per node kind that has a switch or a ladder: a `HashJoin` over an `Expand` (both switches on the report), a `nearest` ladder with an edge (two rungs), an `rrf` fusion, a `Limit` of zero (everything below skipped), a bulk `AntiJoin`, an `Aggregate`. Three more tests own the pins: after an edge write the replay of a traversal is refused, after an insert the replay of an unfiltered count is refused, and a write to a table the plan never read leaves the replay accepted, because `engine::plan_pins_snapshot` compares the plan's `Assumptions.datasets` (path, Lance branch and version per table key the planner read, or its absence) against the snapshot; a pin mismatch and a changed schema are conflicts. The envelope's own outcomes are tested there too: another envelope version asks for the query again, an exact-fragment member replays only with its unedited derivation, an edited plan that drops a predicate is invalid evidence, and an envelope claiming full full-text coverage of a partially indexed property is refused against the pinned snapshot.
+`crates/omnigraph/tests/integration/plan_replay.rs` owns the replay, including refusal of altered result schemas and missing, duplicate, unused or altered node-object declarations. Each test gathers one query through `Session::query_inspected`, serializes the run's replay envelope (`Executed::replay_envelope`: the query's source and name, the accepted scope, the schema digest, the `BoundPlan` through the planner's mirrors and an exact-fragment member's derivation), reads it back (the plan must read back equal), and executes it twice through `Session::replay_bound_plan`, a door that recompiles the named query against the target's catalog, binds it to the plan's own values, accepts the plan again and takes no session setting. Each replay must return the run's rows, record the run's search decisions (gate verdicts and probe attempts) and repeat its trace: `id`, `operator` and `status` per row, `rung` and `ran` per attempt, and `actual_rows` wherever both attempts are `drained`. `drained` says the consumer pulled the operator's stream to its end; below an operator that stopped early (a `Limit`, a `Sort` with a fetch), a producer's count is a lower bound that depends on how far ahead its channel ran, and is not compared. One query per node kind that has a switch or a ladder: a `HashJoin` over an `Expand` (both switches on the report), a `nearest` ladder with an edge (two rungs), an `rrf` fusion and a three-arm fusion with exact arms whose edited arm is refused, a `Limit` of zero (everything below skipped), a bulk `AntiJoin`, an `Aggregate`. Three more tests own the pins: after an edge write the replay of a traversal is refused, after an insert the replay of an unfiltered count is refused, and a write to a table the plan never read leaves the replay accepted, because `engine::plan_pins_snapshot` compares the plan's `Assumptions.datasets` (path, Lance branch and version per table key the planner read, or its absence) against the snapshot; a pin mismatch and a changed schema are conflicts. The envelope's own outcomes are tested there too: another envelope version asks for the query again, an exact-fragment member replays only with its unedited derivation, an edited plan that drops a predicate is invalid evidence, and an exact `bm25`, which reads no full-text index, replays to its run's rows over a partially indexed property.
 
-The scrubbed side is `crates/omnigraph/tests/engine_v2_scrubbed_replay.rs` (process environment, which no case can express): a grep that fails on any `std::env` read under `crates/omnigraph/src/engine/` outside `plan_source.rs`, the one permitted reader of configuration, before planning; two replays that set an ambient value the plan did not capture (the task-local memory limit, `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`) and require the captured one to win; and the replay of a plan gathered under one `ann_nprobes` in a session set to another. `Session::replay_bound_plan` takes no settings argument and sizes the pool from the plan's memory limit. The inventory sweep is one case per input class that a case can set two ways, `cases/v2/planner/input_*.gqt` (`engine`, `ann_nprobes`, index build state), each requiring equal rows or a plan line that differs, and the clock class is one of the replay plans of `integration/engine_v2_plan_replay.rs`; the `ran` line and the `nprobes` claim of `--- expect plan` are what a differing plan line is spelled with.
+The scrubbed side is `crates/omnigraph/tests/scrubbed_replay.rs` (process environment, which no case can express): a grep that fails on any `std::env` read under `crates/omnigraph/src/engine/` outside `plan_source.rs`, the one permitted reader of configuration, before planning; two replays that set an ambient value the plan did not capture (the task-local memory limit, `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`) and require the captured one to win; and the replay of a plan gathered under one `ann_nprobes` in a session set to another, a fusion's `nearest` arm included. `Session::replay_bound_plan` takes no settings argument and sizes the pool from the plan's memory limit. The inventory sweep is one case per input class that a case can set two ways, `cases/planner/input_*.gqt` (`ann_nprobes`, index build state), each requiring equal rows or a plan line that differs, and the clock class is one of the replay plans of `integration/plan_replay.rs`; the `ran` line and the `nprobes` claim of `--- expect plan` are what a differing plan line is spelled with.
 
 GQT also owns the public ANN diagnostics contract: every inspected query checks
 metric types and names, attempt identities, scan/probe attribution and same-run
@@ -195,6 +196,49 @@ in `search.rs`, plus synthetic missing/zero/unknown/maximum metric inputs and
 replay separation in `engine/search.rs` and `engine/report/tests.rs`.
 
 The `--- expect plan` of an inspected step reads the explain document of that same `Executed`, never a second planning run; its `ran` lines read the report of that run (`crates/omnigraph-gqt-core/src/report.rs` reads the rows). A parameter refusal, a settings error and a query that failed produce no `Executed` and keep their ordinary checks.
+
+### Generated laws
+
+The GQ 3 implementation is held to laws over generated inputs, not to a
+handful of examples. One generator module, `omnigraph_compiler::arbitrary`
+(gated on `cfg(test)` or the compiler's `test-util` feature, which only
+dev-dependencies enable; `forbidden_apis.rs` pins that), draws schemas,
+graphs, well-typed GQ 3 reads and scalar expressions from one choice
+stream, so proptest shrinks the schema, the graph and the query to minimal
+forms. Each law lives with the owner of its boundary:
+
+| Law | Owner | Per pull request | Nightly |
+|---|---|---|---|
+| Generated reads type-check (generator soundness), and every registry scalar row, `stddev`, `percentile`, `collect`, `collect(distinct …)`, `nulls first` and `nulls last` is drawn | compiler `arbitrary::tests` | 2,000 reads | 100,000 |
+| Generated writes that copy a Blob read from the row type-check and lower (`arbitrary::GenBlobWrite`: a generated read's `match`, then an `update`, `insert`, `upsert` or `replace` assigning a `Blob?` a cell of a bound node or edge, `null`, a Blob parameter, or `if` and `coalesce` of them): no refusal, `T86` included, and a write shape the planner builds; every statement, value form, an `optional`'s node and an edge binding is drawn | compiler `arbitrary::tests` | 2,000 writes | 100,000 |
+| A displayed expression types to the expression: the generator's `display` mode (no list membership, whose display is an infix `contains`; wide literal pools; `now()` and `match_terms` beside every other form) draws a predicate and a value, and the text `IRExpr`'s `Display` writes for them type-checks to the same declaration | compiler `query::syntax::tests::round_trip` | 300 expression pairs | 20,000 |
+| 1. Engine equals the reference interpreter, under every traversal mode and with every index built, over reads that draw every registry scalar row (`cast` between the pairs it converts, `round` with and without `digits:`, the rows that can fail included) on values with Unicode whitespace, case mappings, negative zero and the texts `cast` reads or refuses, order keys with `nulls first` and `nulls last`, and `collect` as an aggregate, with `distinct` and as a block; two run-time refusals with different codes the read can each raise agree, since the RFC does not fix which one a read whose rows fail in different ways reports; metamorphic: a tautology, reversed conjuncts that cannot fail, the read respelled with the admitted spellings (`case`, `\|\|`, `<>`, single quotes, another letter case), `rrf` arms swapped. Writes are not drawn: the reference evaluates reads only | `omnigraph-gqt` `integration/law_engine_reference.rs` | 64 reads | 2,000 |
+| 1b. The placement law: a `where` of two to five conjuncts mixing ones that can fail (a division or remainder over a stored zero, an overflowing product, `sqrt`, `ln`, `left` and `cast` over a stored value, a block read as a value whose own `where` can fail, a guard over them) with pure ones in every written position, after elements that can fail (a `let`, a correlated `from` and an `optional` over a division), answers as the reference does, rows or the same refusal, before and after its pure prefix is reversed and with every index built | `omnigraph-gqt` `integration/law_engine_reference.rs` (`ReadOptions::placement`) | 64 reads | 2,000 |
+| 2. Per-row, bound-parameter, folded and reference evaluation of a scalar expression agree, and its type is the RFC's join: arithmetic, guards and comparisons, and every registry scalar row but `size` (`cast` between every pair of the inputs' types it converts) | `omnigraph-gqt` `integration/law_scalar_evaluators.rs` | 300 expressions | 6,000 |
+| 3. Typed expressions and the charged term grow by a constant per unit of every construct family (`optional`s, `let`s, guards, nested registry rows, a `case`'s `when`s, blocks, calls) | compiler `check::tests::compile_cost` | 200 reads | 5,000 |
+| 4. Every single edit of a generated plan's replay envelope is refused or replays the run | engine `integration/plan_replay.rs` | 24 plans, 40 edits each | 300 plans, 100 edits |
+| 5. The refusals: one table keyed by the code catalog (`codes::ALL`), 242 compile rows over ten schemas and nine run rows. Every code has a row that raises it first, or a stated reason no query does (`P002` and `P003`, whose traversal allowance the settings layer always supplies in range, the result typer's `T51`, and the planner's assertion `P006`); each row pins its message's start and its printed fix exactly, and one pass of its printed edits repairs it to its intended text, compared as parse trees; the run rows (`T89`, `P004`, `E1` to `E6`) are refused by the engine with their code, and a read the same way by the reference interpreter; every row and every other corpus step the compiler refuses reaches a fixed point within three passes of machine-applicable fixes; no cut or one-character deletion of a parse refusal's source panics the parser. Over generated reads, `parse(apply_fixes(misprint(t))) == parse(t)` for each misprint of `arbitrary::misprint` (`==`, `&&`, `x not in`, an arrow traversal, a missing comma, a filter inside `match`, `mutation` for `query`): the misprint is refused with its code and one pass of its fixes writes the read back | `omnigraph-gqt` `integration/law_refusals.rs` (rows in `law_refusals/rows.rs`) | every row; 2,000 misprinted reads (about 5 s) | 50,000 misprinted reads (about 2 minutes) |
+| Every refusal resting on a claim about every conforming graph holds it: with the refusal let through by the checker's test-only switch (`query::check::soundness`), the reference interpreter finds no row (a comparison with `null` in `where`, a literal outside its property's domain under `=` and `in`, a reversed triple or selection, a hop range past one hop between two types, two references of two types under `=`) or a null column on every row (a comparison with `null` in `return`); a selection with one member along the written order returns rows on some generated graph | `omnigraph-gqt` `integration/law_refusal_soundness.rs` | 1,000 schemas and graphs | 50,000 |
+| GQ 2 and GQ 3 answer alike the generated reads both express: a test-only tree of bindings, triples in declared direction, filters, a negated pattern, return items, a grouped count and a total `order` with `limit`, printed once as GQ 2 text for the pinned merge base's `omnigraph` CLI (`OMNIGRAPH_GQ_2_BIN`) and once as GQ 3 text for the engine; equal rows, both refusing, or the one difference the cross-version table sanctions as `results.hop-range-self-loop`, recognized by re-running both with the start node excluded. Without the binary it skips; `OMNIGRAPH_REQUIRE_GQ_2=1` fails instead | `omnigraph-gqt` `integration/law_two_versions.rs`, run by `Cross-Version Comparison` | 48 reads | 1,500 |
+| 6. Search answers do not depend on index state: over generated cases of one node type declaring every index kind (BTREE, BITMAP, LABEL_LIST, NGRAM, full text under each analyzer profile, a vector index under each distance; `arbitrary::search`), filters on each indexed column, `contains` over a name and over its `lower`, `match_terms` in both modes with every edit budget, and `distance`, `nearest`, `bm25` and `rrf` of two to four arms with and without `weights` answer as the reference does with no index built, with every index built, and with the indexes built over the first rows before new keys are added and earlier rows replaced whole; the indexed states probe each scalar family. A lone `match_terms` under the profiles without a stemmer keeps the rows a dynamic-programming edit distance admits; a `distance` or `nearest` read returns the RFC's distance computed apart from both implementations, every row or the `k` smallest distances under the tie rule; an `rrf` answers alike under every permutation of its arms and weights, its scores are the formula over each arm's own answer with equal scores broken by the smaller key, and a cut keeps the largest scores under that rule. `cosine` vectors have power-of-two norms, so every distance is exact in `F32` | `omnigraph-gqt` `integration/law_search.rs` | 40 cases of four reads, about 30 s | 2,000 |
+| The engine's banded edit distance equals the full dynamic-programming table on generated term pairs (`arbitrary::search::{term, edited}`: a term and the same term after up to four edits, transpositions among them, over ASCII, an accented letter, a sharp s, an ideograph and a digit), at every budget from 0 to 2 | engine `engine::lexical_scan::tests` | 20,000 pairs | 1,000,000 |
+| 6b. Every direct-engine case keeps its rows under each physical layout | `omnigraph-gqt` `tests/gq_layout_tests.rs` ([GQT README](../../crates/omnigraph-gqt/README.md#physical-layouts)) | layouts `a`, `b` | `a` to `d` |
+| 7. The reference interpreter holds the laws section 2 states of its own core, over random terms. Totality: every generated read that type-checks evaluates to rows or a run-time or input refusal, never a panic or a form it does not evaluate. Bounds: every evaluated term is audited against its operator's row (`Scan` `\|T\|`, `Filter` a subsequence, `Project` and `Order` `\|R\|`, `Group` at most `\|R\|` with distinct keys and one row with none, `Correlate` the sum of one inner evaluation per outer row, `Union` both arms in order, `Expand` `\|R\| · \|T′\|` or `\|R\| · deg`, `Score` at most `\|R\|`, `ApproxTopK` at most `k` targets keeping each one's rows, `Fuse` one row per target). Total order: `Order` returns a sorted permutation in which rows that tie are equal in every column, and the same rows sorted again from three other input orders; `Cut` keeps the first `k` rows of its order. Typing: every result value holds its column's type; a `union` is accepted exactly when the arms' names match and base types agree, typed as their join. Fixpoint agreement: a generated recursion's naive fixpoint equals a semi-naive one and a per-node closure, within the domain bound, and one more round adds nothing. Desugaring equality and the inner-cut rule belong to the compiler's lowering and the planner, which the corpus and the placement law own | `omnigraph-reference` `laws` (seeds under `tests/regressions/law_reference_*.txt`) | 2,000 reads, 1,000 unions, 1,000 recursions (about 5 s) | 50,000 each (about 2 minutes each) |
+| 8. An index path is cheaper than the scan it replaces, in object-store requests to the table it reads under the DST `--measure` ledger, one measured read per case: with every index built the read's requests are fewer than with none (layout `a`); at 4,096 rows in eight fragments and 32,768 in 64 with the same matching rows, the index path's requests stay within a factor of 2 while the scan's grow at least four times; shapes are a key equality (`__id` BTREE), a BTREE, BITMAP, NGRAM and LABEL_LIST probe and a traversal's destination by `id_lookup`, drawing the matching rows and where they sit; every index kind a corpus step's `--- expect plan` claims is one of the shapes; a destination read by `id_lookup` with no identity index keeps its requests within a factor of 2 as its frontier grows four times, over 65,536 rows in 16 fragments. The corpus's own index-path steps are not measured: each seed loads in one fragment, which no scan pays more for than a probe. A BTREE equality on clustered data, which fragment value ranges let a scan prune, is pinned as a `hunt:` | `omnigraph-gqt` `integration/law_index_cost.rs` | 6 shapes, 4 generated reads, the frontier pair | 60 generated reads |
+| One plan for one meaning: every canonical form section 6 lists (lint's `L203` and `L206` to `L216`: `case`, `\|\|`, `<>`, single quotes and another letter case among them) has its canonical spelling's typed IR, logical and physical plan, `logical_hash` and rows, over fixed pairs and over generated reads rewritten at random positions (the admitted spellings by `arbitrary::respell_spellings`, from the parse tree); the spellings the grammar refuses with a printed fix (`==`, `&&`, `x not in`, `starts with`, `between`) suggest one with the canonical IR; lint's printed byte-range fix on every flagged corpus read keeps the typed IR and `logical_hash` | `omnigraph-gqt` `integration/law_canonical_forms.rs` | 200 reads | 5,000 |
+
+The nightly twins are `#[ignore = "nightly: …"]` tests enrolled by exact
+name: the compiler's and the engine's in `tests-slow-nightly.yml`, the
+`omnigraph-gqt` ones and the four layouts in `gqt-slow-nightly.yml`.
+Seeds are deterministic (proptest's ChaCha RNG); a failing case is written
+to the law's file under `tests/regressions/` beside its crate, checked in,
+and replayed first by every later run. To hunt locally, set
+`OMNIGRAPH_LAW_CASES` (the count) and `OMNIGRAPH_LAW_SEED` (another seed);
+`OMNIGRAPH_LAW_TRACE` prints the reads that returned no row. A failure
+prints the shrunk query, the schema, the graph and both answers. Every
+generator finding is a defect: fixed at the root with the shrunk case as a
+regression (a `.gqt` case when rows show it), or pinned as a
+`#[ignore = "hunt: …"]` test beside its law when the fix is not contained.
 
 ## Server and CLI ownership
 
@@ -385,13 +429,17 @@ The v6↔v10 fence works the same way with the `release-0.10.0` row. The stamps 
 
 The separate `Storage Upgrade Compatibility` CI job requires the
 `storage_upgrade` cases of `integration/crossversion_upgrade.rs` (the report on a fresh
-graph, the cluster-path refusal and the six genuine journeys:
+graph, the cluster-path refusal and the eight genuine journeys:
 `genuine_lance11_storage_upgrade_round_trip`,
 `genuine_v13_storage_upgrade_preserves_history`,
 `genuine_v0_11_0_storage_upgrade_preserves_history`,
 `genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup`,
-`genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history` and
-`genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`), the engine
+`genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history`,
+`genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history`,
+`genuine_gq_2_storage_upgrade_names_every_one_way_schema_construct` and
+`genuine_gq_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor`,
+the last two with the `gq-2` row, the published main build before the
+GQ 3 break), the engine
 `db::upgrade::tests`, `lance_version_columns` and `forbidden_apis`. Missing
 cases, empty runs and skipped required cases fail the job.
 
@@ -403,14 +451,22 @@ nullable outer vectors, an uncovered search tail, branches and history. Cold
 candidate reads must leave its whole root unchanged, including index UUIDs and
 analyzer certificates. Candidate writes, an explicit full-text rebuild, optimize and cleanup are followed by
 predecessor reads of the new state and retained snapshots, including an old
-untrained analyzer declaration and newly built candidate postings. Finally the test
-restores its offline whole-root byte-copy backup at the original path and reads
-it with both binaries. This qualifies those exercised shapes, not arbitrary
-external Lance datasets or every possible downgrade.
+untrained analyzer declaration. Rollback in place after the candidate built or
+rebuilt an index is not supported
+([upgrade guide](../user/operations/upgrade.md#lance-substrate-upgrades-v010-v014)), so
+the predecessor must refuse or answer as the candidate does: its full-text query
+on main, whose postings the candidate rebuilt with fingerprint (format 2)
+certificates, must fail with its certificate refusal and return no rows, while
+its key lookup and its `contains` filters, planned through the NGRAM index the
+candidate's optimize built, must equal the candidate's answers. Finally the test
+restores its offline whole-root byte-copy backup at the original path, the
+supported rollback, and reads it with both binaries. This qualifies those
+exercised shapes, not arbitrary external Lance datasets or every possible
+downgrade.
 
 The stamp-13 journey needs the `stamp-13` row, the last main commit that wrote
-stamp 13, built from source. It proves its predecessor by behaviour (that binary's `snapshot --json` reports
-`internal_schema_version` 13 and the current `upgrade --check` observes 13),
+stamp 13, built from source. It proves its predecessor by behavior (that
+binary's `snapshot --json` reports `internal_schema_version` 13 and the current `upgrade --check` observes 13),
 builds branches, a merge, a deleted branch, a recreated one and a fork of a
 deleted branch with the old binary, upgrades, and compares commit history,
 rows, `cleanup` and a backup restore after it.
@@ -445,12 +501,12 @@ written before the respelling among them. Main builds 10 to 13 also
 print `0.11.0`, so these journeys prove their source by the stamp
 `snapshot --json` reports, not by `--version`.
 
-The job provisions its four rows with `require: true`, so a journey whose row
+The job provisions its five rows with `require: true`, so a journey whose row
 is missing fails instead of skipping. To run the crossversion scope locally,
 provision the same rows and run its cases:
 
 ```bash
-python3 scripts/predecessors.py provision stamp-13 lance-11 release-0.10.0 release-0.11.0
+python3 scripts/predecessors.py provision stamp-13 lance-11 release-0.10.0 release-0.11.0 gq-2
 cargo dev-test --test integration crossversion_upgrade:: -- --test-threads=1
 ```
 
@@ -476,8 +532,9 @@ locator codecs and legacy read arms are owned by the `legacy_` tests of
 the predecessor unnoticed only because the genuine journey is required; change
 both together. Keep ordinary-open refusal for all pre-v14 stamps.
 `schema_apply.rs`, `system_column_upgrade.rs` and historical-read owners cover
-atomic contract publication, first-touch retry and current-contract historical
-reads. The catalog tests own row uniqueness, projection and validation;
+atomic contract publication, first-touch retry and historical reads under
+the schema accepted at their commit (`point_in_time.rs`, beside the GQT cases
+that apply a schema between commits). The catalog tests own row uniqueness, projection and validation;
 `lance_surface_guards.rs` owns the filtered packed-record scan. See the
 [support matrix](versioning.md#storage-upgrade-support-matrix).
 
@@ -556,23 +613,9 @@ cannot replay because the data is not frozen. `--measure` requires at least
 one selected DST environment; direct-only selections fail before execution.
 
 Discovery includes every `.gqt` file below `cases/`, recursively. Shared
-cases live at its root; v2-specific cases live in `v2/`, and plan assertions
-in `v2/planner/`. Every case runs on engine v2, the one engine; a
-`set engine = v2;` line some cases carry changes nothing, and directory
-placement selects nothing.
-
-A query step may end with `--- expect same as v1`, directly after its
-`--- expect shape` or `--- expect plan`. The runner then runs the step's query
-again on a copy of the case session that carries the frozen reference engine
-(`omnigraph_reference_engine::ReferenceEngine`, installed through
-`Session::with_read_executor` under the engine's `test-util` feature) and
-compares its rows with v2's, ordered or unordered as the step's rows expect
-says. A v1 error, a v1 gate refusal included, or a row difference fails the
-step. The section is refused on a mutate step, an error expect, `show` and
-`branch list`, and the DST runner skips it. The reference answers `not { ... }`
-blocks only among the correlated blocks, and refuses count predicates and a
-string `nearest` argument, so a case using those carries no
-`expect same as v1`.
+cases live at its root, plan assertions in `planner/`, catalogue reads in
+`catalogue/` and compiler refusals in `diagnostics/`. Directory placement
+selects nothing.
 
 Every case is its own libtest test named `case::<relative/path>.gqt`, registered
 at run time (`datatest-stable`), so the ordinary name filter selects cases, a
@@ -645,6 +688,87 @@ from any directory inside the checkout; a build that overrides it (an env
 DST cases. The [GQT README](../../crates/omnigraph-gqt/README.md)
 defines supported targets, hooks, replay observations, and limits. The configured
 CI owner enrolls the complete corpus.
+
+### Cross-version comparison
+
+GQ 3 replaced the query language in one break, and the corpus was respelled
+with it. `scripts/cross-version.py` makes "the respelled corpus answers as
+GQ 2 did" a check: for every `.gqt` case present at the pinned GQ 2
+commit (`GQ_2_SOURCE_COMMIT` in `ci.yml`, the merge base with `main`) and
+in this tree, under the same path or one git's rename detection pairs, it runs
+the commit's text of the case with that commit's `omnigraph-gqt` and this
+tree's text with this tree's runner. GQ 2 text found after that commit,
+such as a repro of a respelling defect, lives in this tree under
+`crates/omnigraph-gqt/gq-2/`: each case there is the GQ 2 side of the
+case of the same path under `cases/`, its hand rewrite, and a case there with
+no hand rewrite fails the script. Write the hand rewrite as the text `lint
+--fix --review-fixes` writes for each step, with the GQ 2 case's
+expectations, which the GQ 2 runner blesses (`OMNIGRAPH_GQ_BLESS=1`). Both texts get one rewrite, the same on
+both sides: the `--- runner` section becomes a single deterministic-simulation
+environment (in-memory store, seed 0), because only that environment's trace
+(`--trace`) records each step's result: a read's Arrow schema and rows, a
+write's affected counts, an error's text. Steps pair by kind and declared
+query name in sequence order, so an inserted or removed step does not shift
+the rest. For each pair the script compares column names, Arrow types, rows (a
+multiset unless both steps' rows are ordered), affected counts, and the error:
+whether the step failed and its diagnostic code. A difference passes only when
+`crates/omnigraph-gqt/cross-version.tsv` lists it by case, current step
+ordinal (`gq2:<n>` for a GQ 2 step with no counterpart) and aspect,
+naming the bullet of the GQ 3 RFC's Compatibility and reversibility section
+that sanctions it (`BULLETS` in the script, each with the sentence it cites)
+and why; a row that excuses no difference fails too. A row citing an `open:`
+key (`OPEN` in the script) is a difference no Compatibility bullet names: it
+does not fail the job, which prints it as a warning, and the key leaves the
+list when the RFC decides it. A case both versions fail at the same step with
+the same message under the simulation is a warning, its later steps
+uncompared; any other run failure is an error.
+
+```bash
+git worktree add --detach /tmp/gq2 <GQ_2_SOURCE_COMMIT>
+(cd /tmp/gq2 && cargo build --locked -p omnigraph-gqt --bin omnigraph-gqt --target-dir /tmp/gq2-target)
+cargo build --locked -p omnigraph-gqt --bin omnigraph-gqt
+python3 scripts/cross-version.py run --gq-2-runner /tmp/gq2-target/debug/omnigraph-gqt \
+  --current-runner target/debug/omnigraph-gqt --base-ref <GQ_2_SOURCE_COMMIT> --work /tmp/cross-version
+```
+
+With `--measure`, each side also runs under `--measure`, and an aligned
+step whose store requests (seed 0, deterministic under the simulation) rose
+is a difference of aspect `requests`, which a row passes by naming the
+reason (`COSTS` in the script, or an `open:` key); CI runs it as its own
+pass, since the measure ledger moves a concurrent block's park points. A
+case whose two simulation runs of seed 0 measure different requests
+(`replay_mismatch`, seen on 4-CPU runners for a CSV load and a concurrent
+block) is a warning, and its requests are not compared. The report lists
+every changed step's requests and class deltas under `costs`.
+`--case <path>` (repeatable) selects cases; `--reuse` compares the traces an
+earlier run left under `--work`.
+
+`fix_gq_2::printed_fixes_respell_the_gq_2_corpus_into_its_hand_rewrite`
+in `omnigraph-gqt`'s `integration` binary is the gate for `omnigraph lint
+--fix`: it gives every query step GQ 2 ran in the commit's tree
+(`OMNIGRAPH_GQ_2_TREE`; the GQT and benchmark corpora and the `.gq`
+files beside a `.pg`), and every case under `crates/omnigraph-gqt/gq-2/`,
+to the fix loop with review fixes applied, requires
+every one whose refusals print fixes to converge, and compares each
+declaration's typed IR with the hand rewrite of the same case and name in
+this tree. A difference passes as a row of
+`crates/omnigraph-gqt/lint-fix-gq-2.tsv` naming a reason (`REASONS` in
+the test; an `open:` reason prints a warning), and a row that matches nothing
+fails; a keyed `insert` the fix leaves, where the hand rewrite wrote the
+respelling map's `replace`, is recognized by applying that row. The in-tree
+cases run on every run; without the pinned tree it skips that corpus and says
+so, and `OMNIGRAPH_REQUIRE_GQ_2=1` fails instead.
+
+Fix coverage over GQ 2 text is an instrument beside it,
+`fix_coverage::fix_coverage_over_gq_2_text` in `omnigraph-gqt`'s
+`integration` binary (`#[ignore = "instrument: …"]`): point
+`OMNIGRAPH_FIX_COVERAGE_DIR` at the GQ 2 commit's `cases/` or at stored
+queries exported as `<name>.gq` beside `<name>.pg`, and it applies every
+printed suggestion pass by pass and prints counts only (compiled as written,
+respelled by the fixes per pass, stuck by code and message shape), so it may
+run over a private registry; `OMNIGRAPH_FIX_COVERAGE_SHOW=1` also prints the
+stuck text, for a corpus whose text may be shown. The report (`report.json` under `--work`)
+holds every difference with both observations.
 
 ### OpenAPI
 
@@ -722,6 +846,32 @@ configuration the suite needs:
 DST_REGEN_COSTS=1 cargo test --locked --test scenarios dst_bench_cost_count_golden
 cargo test --locked --test scenarios dst_bench_cost_count_golden
 ```
+
+### Full-text fingerprint golden
+
+`crates/omnigraph-core/fts/measured_fingerprints.golden` records, for every
+analyzer profile, the measured fingerprints of its native configuration and of
+its profile analyzer: digests of the tokens each emits over the probe corpus
+`crates/omnigraph-core/fts/probe_corpus.txt`
+([Lance compatibility fences](lance-fences.md#full-text-compatibility)).
+`fts_analysis::tests::measured_fingerprints_are_the_golden` compares them with
+what the binary measures, so a dependency bump that changes what a profile
+emits fails by name. Such a failure is a profile change, and a profile never
+changes once accepted (the GQ 3 RFC, section 4): keep the old behavior (pin or
+patch the dependency) or define a new profile. Never refresh the golden alone.
+
+Regenerate only for a new profile or a reviewed change of the probe corpus,
+both of which change what every certificate records; say in the pull request
+why each changed line moved. The test refuses to regenerate when `CI` is set:
+
+```bash
+OMNIGRAPH_REGEN_FTS_FINGERPRINTS=1 cargo dev-nextest \
+  -E 'package(omnigraph-core) & test(measured_fingerprints_are_the_golden)'
+cargo dev-nextest -E 'package(omnigraph-core) & test(/fts_analysis::/)'
+```
+
+The resolved-lockfile guard (`fts_compat::tests::analyzer_dependencies_are_the_audited_resolved_set`)
+pins the analyzer's dependency versions; the golden pins its behavior.
 
 ### Benchmark harness
 

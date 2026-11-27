@@ -29,14 +29,16 @@ branch create s
 
 --- mutate branch: s
 query set_a_on_s() {
-    update Person set { age: 1 } where name = "a"
+    match { $x: Person } where $x.name = "a"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query set_b_on_main() {
-    update Person set { age: 1 } where name = "b"
+    match { $x: Person } where $x.name = "b"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -55,7 +57,8 @@ branch merge s
 
 --- mutate
 query set_b_again_on_main() {
-    update Person set { age: 2 } where name = "b"
+    match { $x: Person } where $x.name = "b"
+    update $x set { age: 2 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -72,7 +75,8 @@ branch create t from s
 
 --- mutate branch: t
 query set_c_on_t() {
-    update Person set { age: 1 } where name = "c"
+    match { $x: Person } where $x.name = "c"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -116,7 +120,8 @@ branch merge s
 
 --- mutate branch: s
 query set_a_on_recreated_s() {
-    update Person set { age: 5 } where name = "a"
+    match { $x: Person } where $x.name = "a"
+    update $x set { age: 5 }
 }
 
 --- expect affected: nodes=1 edges=0

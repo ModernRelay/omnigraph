@@ -9,7 +9,7 @@ use futures::FutureExt as _;
 use omnigraph::db::MergeOutcome;
 use omnigraph::loader::LoadMode;
 use omnigraph_api_types::{BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ReadOutput};
-use omnigraph_compiler::query::ast::show_statement_name;
+use omnigraph_compiler::query::file::show_statement_name;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -82,15 +82,12 @@ pub fn admit_process_workload(case: &Case, measured: usize) -> Result<(), String
                 ));
             }
             Step::Restart { .. } => {}
-            Step::Settings(_) | Step::Concurrent(_) => {
+            Step::Settings(_) | Step::Concurrent(_) | Step::ApplySchema(_) => {
                 refused.push(format!("step {ordinal} ({})", step_kind(step)));
             }
             Step::Query(query) => {
                 if query.plan.is_some() {
                     refused.push(format!("step {ordinal} (expect plan)"));
-                }
-                if query.same_as_v1 {
-                    refused.push(format!("step {ordinal} (expect same as v1)"));
                 }
             }
             Step::Control(control) => {
@@ -225,10 +222,12 @@ async fn execute_process_inner<H: ExecutionHost, O: Observer>(
                         });
                         Ok(())
                     }
-                    Step::Settings(_) | Step::Concurrent(_) => Err(StepFail::new(
-                        step_label(ordinal, step_kind(step), binding),
-                        "unsupported_environment: refused by process admission".into(),
-                    )),
+                    Step::Settings(_) | Step::Concurrent(_) | Step::ApplySchema(_) => {
+                        Err(StepFail::new(
+                            step_label(ordinal, step_kind(step), binding),
+                            "unsupported_environment: refused by process admission".into(),
+                        ))
+                    }
                 };
                 observer.measure_step_end(ordinal as u64);
                 observer.record("assertion", || match &outcome {
@@ -457,11 +456,7 @@ impl<'a> ProcessClient<'a> {
 }
 
 fn load_mode_word(mode: LoadMode) -> &'static str {
-    match mode {
-        LoadMode::Overwrite => "overwrite",
-        LoadMode::Append => "append",
-        LoadMode::Merge => "merge",
-    }
+    mode.as_str()
 }
 
 /// Undecodable output as diagnostic text, cut to its bound.

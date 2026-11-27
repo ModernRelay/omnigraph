@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
 
 use arrow_schema::SchemaRef;
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
-use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+use omnigraph_compiler::query::value::{BinaryOp, CompOp};
 use omnigraph_compiler::traversal::EdgeSelection;
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
@@ -14,51 +15,51 @@ use crate::cost::{AccessPath, AntiJoinStrategy, ExpandMode, ExpandPolicy, Valida
 use crate::error::{PlanError, SET_TRAVERSAL_WORK_LIMIT};
 use crate::logical::{
     ColumnRef, CsvSourceSpec, DeltaSourceSpec, FragmentWriteSpec, KeyJoinKind, LOGICAL_ID,
-    ScanSpec, ValidateSpec, csv_source_json, delta_source_json, filters_json, fragment_write_json,
-    metadata_count_json, ordering_text, scan_json, tiebreak_text, validate_json,
+    Predicate, ScanSpec, ValidateSpec, csv_source_json, delta_source_json, filters_json,
+    fragment_write_json, metadata_count_json, ordering_text, scan_json, tiebreak_text,
+    validate_json,
 };
 use crate::mirror::EdgeSelectionMirror;
 use crate::operation::TableRef;
-use crate::source::{FullTextCoverage, SideId};
+use crate::source::SideId;
 use omnigraph_compiler::query::codes::{P002, P003};
 
 /// The index of a node in a [`PhysicalPlan`].
 pub type NodeId = usize;
 
-/// The index a ranked scan asks to rank its rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RankKind {
-    /// `nearest($v.prop, q)`: the vector index appends `_distance`.
-    Nearest,
-    /// `bm25($v.prop, q)`: the full-text index appends `_score`.
-    Bm25,
-}
-
-impl RankKind {
-    /// Whether the retrieval's contract is approximate: `nearest` membership
-    /// is, even when a run scores flat; `bm25` matching is exact.
-    pub fn approximate(self) -> bool {
-        self == Self::Nearest
-    }
-
-    /// The column Lance appends and the direction the query sorts it by.
-    pub fn score(self) -> (&'static str, bool) {
-        match self {
-            Self::Nearest => ("_distance", false),
-            Self::Bm25 => ("_score", true),
-        }
+/// The name an exact `Score`'s kind takes in explain and in a saved plan.
+pub fn score_kind_name(kind: ScoreKind) -> &'static str {
+    match kind {
+        ScoreKind::Distance => "distance",
+        ScoreKind::Bm25 => "bm25",
     }
 }
 
-/// Where a ranked scan's rows go: the query's `order`, or one arm of an
-/// `rrf()` fusion.
+/// The column an exact `Score` of `kind` appends under its binding, and its
+/// type: `distance`'s `_distance` (`F32`), `bm25_v1`'s `_score` (`F64`).
+pub fn score_column(kind: ScoreKind) -> (&'static str, arrow_schema::DataType) {
+    match kind {
+        ScoreKind::Distance => (
+            omnigraph_compiler::query::value::DISTANCE_COLUMN,
+            arrow_schema::DataType::Float32,
+        ),
+        ScoreKind::Bm25 => (
+            omnigraph_compiler::query::value::SCORE_COLUMN,
+            arrow_schema::DataType::Float64,
+        ),
+    }
+}
+
+/// Where a ranked scan's rows go: the query's `order`, or a window drawn
+/// as a pattern step (a `nearest` standing alone or a fusion arm).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RankScope {
     Order,
-    Primary,
-    Secondary,
+    /// A ranking drawn as a pattern step: the scan's candidates feed a
+    /// `TargetCut` of the window `k` (its `fetch`), whose selected targets
+    /// the overfetch ladder fills, not the read's `limit`.
+    Window,
 }
 
 /// How the prefilter gates decide, as the session and the environment set it
@@ -130,26 +131,23 @@ pub struct Assumptions {
     /// One shared traversal-work allowance, present for statements using edge selections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traversal_work_limit: Option<u64>,
+    /// The rows the read's expansions may produce, every hop together,
+    /// captured from the session for every read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_work_limit: Option<u64>,
     /// Retained even when rewrites remove an expansion, for historical replay admission.
     #[serde(default, skip_serializing_if = "is_false")]
     pub has_wildcard_traversal: bool,
-    /// The full-text coverage of every property a ranked scan's eligibility
-    /// placement read, keyed `<table key>.<property>`. A pinned dataset
-    /// version fixes it, so the dataset pins re-establish it on replay.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub full_text: BTreeMap<String, FullTextCoverage>,
+    /// The read's plan budget and the work typing, shaping and planning
+    /// charged to it ([`omnigraph_compiler::budget`]): a function of the read
+    /// and the schema, which a replay's compile must charge again exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_work: Option<omnigraph_compiler::budget::WorkRecord>,
     /// The fingerprint of every catalogue table the plan read, keyed by
     /// table key: the binary's rows and schema for that type. A replay is
     /// refused by a binary whose catalogue fingerprints differ.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalogue: BTreeMap<String, String>,
-}
-
-impl Assumptions {
-    /// The key a property's full-text coverage is recorded under.
-    pub fn full_text_key(type_key: &str, property: &str) -> String {
-        format!("{type_key}.{property}")
-    }
 }
 
 impl Assumptions {
@@ -207,23 +205,6 @@ pub struct Prefilter {
     pub ranked_type: String,
     pub hops: Vec<Hop>,
     pub feeds: Vec<NodeId>,
-    /// What an empty eligible set decides: the empty answer for a
-    /// standalone `nearest`, the unfiltered plan for a fusion.
-    pub on_empty: EmptyEligible,
-    /// Whether the recorded full-text coverage of every `bm25` scan in
-    /// `feeds` is full, the guard under which prefiltering keeps BM25
-    /// scores; true when it feeds no `bm25` scan.
-    pub coverage_admits: bool,
-}
-
-/// What a pre-pass's empty eligible set decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EmptyEligible {
-    /// No row survives the traversal: the answer is empty and no scan runs.
-    ProvenEmpty,
-    /// The scans run unfiltered.
-    Postfilter,
 }
 
 /// The adaptive policy of a `nearest` scan, declared before it runs: what
@@ -262,19 +243,6 @@ impl Prefilter {
     }
 }
 
-/// Where a ranked scan applies its eligibility (its pushed filter, a gate's
-/// eligible set and the members of its search predicates): before the index
-/// scores rows, as Lance's prefilter, or after, on the scored rows. A BM25
-/// score is independent of a filter applied before scoring only when the
-/// property's full-text index covers every fragment; elsewhere eligibility
-/// applies after scoring, so the filter never changes a score.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Eligibility {
-    BeforeScoring,
-    AfterScoring,
-}
-
 /// One rerun of a `nearest` scan's overfetch ladder, taken in order after a
 /// full scan left the answer short of the limit. Report rung `r >= 1` names
 /// `overfetch[r - 1]`; rung 0 is the scan as planned.
@@ -310,76 +278,64 @@ impl OverfetchRung {
     }
 }
 
-/// The ranking a Lance index computes while a scan runs: the access path of
-/// the ranked binding's scan, not an operator over its rows. The query
-/// argument is carried as the query wrote it; its value is in the bound
-/// plan's value table.
+/// The `nearest` ranking a Lance vector index computes while a scan runs:
+/// the access path of the ranked binding's scan, not an operator over its
+/// rows. The index appends the distance column
+/// ([`DISTANCE_COLUMN`](omnigraph_compiler::query::value::DISTANCE_COLUMN)),
+/// which the query sorts ascending. The query argument is carried as the
+/// query wrote it; its value is in the bound plan's value table.
 #[derive(Debug, Clone)]
 pub struct RankedAccess {
-    pub kind: RankKind,
     pub property: String,
     pub query: IRExpr,
     pub score: IRExpr,
     /// Candidates the scan asks the index for; `None` is every match.
     pub fetch: Option<usize>,
     /// The IVF partitions a `nearest` scan may probe per index delta, the
-    /// `ann_nprobes` setting when the plan was built; `None` is no cap, and
-    /// on a `bm25` scan it is unread.
+    /// `ann_nprobes` setting when the plan was built; `None` is no cap.
     pub nprobes: Option<usize>,
     pub scope: RankScope,
-    /// The reruns the run may take above `fetch`; empty on a scan that never
-    /// reruns (`bm25`, an arm of `rrf()`).
+    /// The reruns the run may take above `fetch`; empty on a scan with no
+    /// `fetch`.
     pub overfetch: Vec<OverfetchRung>,
     /// The pre-pass that feeds this scan; `None` when no traversal leaves
-    /// the ranked binding, and on every arm of `rrf()`, whose pre-pass the
-    /// `RankFuse` declares.
+    /// the ranked binding.
     pub prefilter: Option<Prefilter>,
-    /// Where the scan applies its eligibility: always before scoring on a
-    /// `nearest` scan, whose candidate window is drawn from eligible rows;
-    /// on a `bm25` scan before scoring only under recorded full coverage.
-    pub eligibility: Eligibility,
-    /// The adaptive policy of a `nearest` scan; `None` on a `bm25` scan.
+    /// The adaptive policy of the `nearest` scan, which acceptance requires.
     pub policy: Option<NearestPolicy>,
 }
 
 impl RankedAccess {
-    /// The score ordering this ranking imposes on `binding`'s rows.
+    /// The score ordering this ranking imposes on `binding`'s rows: the
+    /// distance, nearest first.
     pub fn ordering(&self, _binding: &str) -> IROrdering {
-        let (_, descending) = self.kind.score();
-        IROrdering {
-            expr: self.score.clone(),
-            descending,
-        }
+        IROrdering::new(self.score.clone(), false)
     }
 
+    /// The explain object; `kind` stays `nearest`, the documented name of
+    /// the one ranking a scan computes.
     fn to_json(&self) -> Value {
-        let mut value = json!({
-            "kind": self.kind,
+        json!({
+            "kind": "nearest",
             "property": self.property,
             "query": self.query.to_string(),
             "typed_query": crate::typed::expr(&self.query),
             "typed_score": crate::typed::expr(&self.score),
             "fetch": self.fetch,
             "scope": self.scope,
-        });
-        match self.kind {
-            RankKind::Nearest => {
-                value["nprobes"] = json!(self.nprobes);
-                value["policy"] = json!(self.policy);
-            }
-            RankKind::Bm25 => value["eligibility"] = json!(self.eligibility),
-        }
-        value
+            "nprobes": self.nprobes,
+            "policy": self.policy,
+        })
     }
 }
 
-/// One arm of a `RankFuse`: the subtree the arm runs and the ranked binding
-/// whose score orders it.
+/// One arm of a [`PhysicalNode::Fuse`]: the subtree whose rows the arm
+/// ranks, which arrive in the order `rank` states (`ArmRank`), and how it
+/// ranks them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RankArm {
+pub struct FuseArm {
     pub input: NodeId,
-    pub binding: String,
-    pub kind: RankKind,
+    pub rank: crate::read_shape::ArmRank,
 }
 
 /// A table scan, or the per-slice id lookup of a traversal's destination:
@@ -463,19 +419,17 @@ pub enum OrderKey {
     /// A binding's identity metadata key (`@id`, or `@type` of a selected
     /// edge): ascending, nulls first.
     Identity(ColumnRef),
-    /// The fused reciprocal rank of an `rrf()` over its arms' bindings,
-    /// descending.
-    Fused { bindings: Vec<String> },
 }
 
 impl OrderKey {
-    /// A written or score sort key: ascending keys place nulls first,
-    /// descending keys nulls last (RFC 0047, "One total order").
+    /// A written or score sort key: its written null placement, else
+    /// ascending keys place nulls first and descending keys nulls last
+    /// (RFC 0047, "One total order").
     pub fn of(ordering: &IROrdering) -> Self {
         Self::Expr {
             expr: ordering.expr.clone(),
             descending: ordering.descending,
-            nulls_first: !ordering.descending,
+            nulls_first: ordering.places_nulls_first(),
         }
     }
 }
@@ -485,16 +439,19 @@ impl std::fmt::Display for OrderKey {
         match self {
             Self::Column(column) => f.write_str(column),
             Self::Expr {
-                expr, descending, ..
-            } => write!(f, "{expr} {}", if *descending { "desc" } else { "asc" }),
-            Self::Identity(column) => write!(f, "${column} asc"),
-            Self::Fused { bindings } => {
-                let targets: Vec<String> = bindings
-                    .iter()
-                    .map(|binding| format!("${binding}"))
-                    .collect();
-                write!(f, "rrf({}) desc", targets.join(", "))
+                expr,
+                descending,
+                nulls_first,
+            } => {
+                write!(f, "{expr} {}", if *descending { "desc" } else { "asc" })?;
+                // The placement is printed where it is not the direction's.
+                match (*descending, *nulls_first) {
+                    (false, false) => f.write_str(" nulls last"),
+                    (true, true) => f.write_str(" nulls first"),
+                    _ => Ok(()),
+                }
             }
+            Self::Identity(column) => write!(f, "${column} asc"),
         }
     }
 }
@@ -595,8 +552,20 @@ impl ChildSlots for ScanInput {
     }
 }
 
-impl ChildSlots for [RankArm; 2] {
-    const COUNTS: &'static [usize] = &[2];
+impl ChildSlots for Option<NodeId> {
+    const COUNTS: &'static [usize] = &[0, 1];
+
+    fn ids(&self) -> Vec<NodeId> {
+        self.iter().copied().collect()
+    }
+
+    fn ids_mut(&mut self) -> Vec<&mut NodeId> {
+        self.iter_mut().collect()
+    }
+}
+
+impl ChildSlots for Vec<FuseArm> {
+    const COUNTS: &'static [usize] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
     fn ids(&self) -> Vec<NodeId> {
         self.iter().map(|arm| arm.input).collect()
@@ -640,7 +609,7 @@ macro_rules! physical_nodes {
         /// in the engine's lowering
         /// (`crates/omnigraph/src/engine/lower.rs`), whose exhaustive match is the
         /// proof. A read node carries the IR pieces its arm takes, so the lowering
-        /// never re-derives from `QueryIR`.
+        /// never re-derives from `ReadShape`.
         #[derive(Debug, Clone)]
         pub enum PhysicalNode {
             $(
@@ -740,7 +709,7 @@ macro_rules! physical_nodes {
             /// The inputs the node's operator drains whole before its streamed
             /// input runs, each kind's `sides:` token: a join's build side, the
             /// collected left of a cross or contains join, a correlated block's
-            /// inner tree, a fusion's secondary arm. Each is its own pipeline,
+            /// inner tree, a fusion's arms after the first. Each is its own pipeline,
             /// drained into the node ([`PipelineSink::Node`]); the engine
             /// collects exactly these through its `CollectedSide`.
             #[allow(unused_variables)]
@@ -755,9 +724,9 @@ macro_rules! physical_nodes {
             /// kind declares one, so a new node kind cannot compile without a
             /// classification; a field that gives an existing kind a cut still
             /// needs its token changed by hand. A fusion declares none: it
-            /// emits every arm row, and its `limit` sizes only the nearest
-            /// arm's window, which that arm's scan declares as its fetch. Plan
-            /// acceptance justifies every declared cut against the query.
+            /// emits every target its arms select, and a `nearest` arm's
+            /// window is that arm's own `TargetCut`. Plan acceptance
+            /// justifies every declared cut against the query.
             #[allow(unused_variables)]
             pub fn row_cut(&self) -> Option<usize> {
                 match self {
@@ -769,14 +738,14 @@ macro_rules! physical_nodes {
             /// token, from the operator's definition and its inputs' orders
             /// (the function the declaration names first, which every
             /// `order:` token may call): a ranking scan leaves in score order (`nearest`
-            /// ascending `_distance`, `bm25` descending `_score`), an
+            /// ascending `_distance`), an
             /// id-ordered scan or a key merge in its key's order, a sort in
             /// exactly its comparator (its keys, then its identity keys), and
             /// an order-preserving operator (a dependent scan, a hash join's
             /// probe, a filter, a projection, a limit, a page, a hydration, a
             /// row compare, a validation) in its input's order; every other
-            /// operator declares none. A fusion declares none: it appends the
-            /// fused score as a column, and the `Sort` above it orders by that
+            /// operator declares none. A fusion declares none: its targets
+            /// leave unordered, and a `Sort` above it orders by the fused
             /// score.
             #[allow(unused_variables)]
             pub fn order(
@@ -872,6 +841,55 @@ physical_nodes! {
         rows: usize,
     } => "Page" [input: NodeId]
         shape: PipelineShape::Streaming, sides: vec![], cut: Some(*rows), order: order_of(*input);
+    /// The rows of the first `targets` distinct identities of `binding` in
+    /// its input, which a `Sort` below orders by the window's score then that
+    /// identity: a `nearest` window's selection, each selected target with
+    /// every row it has. Its cut counts targets, not rows, so it declares no
+    /// row cut; plan acceptance holds `targets` to the window `k`.
+    TargetCut {
+        input: NodeId,
+        binding: String,
+        targets: usize,
+    } => "TargetCut" [input: NodeId]
+        shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
+    /// The core's exact `Score`; the other columns ride through in input
+    /// order and no index is read, so index state never changes its rows.
+    /// `Distance` (`distance(rel, $x.f, q)`): every input row with the exact
+    /// distance of `binding`'s vector `property` to the query vector the
+    /// value table binds for this node, under the field's declared distance,
+    /// appended as `<binding>._distance` (`F32`); a row whose vector is null
+    /// drops and a non-finite input is refused (`E3`). `type_name` is the
+    /// binding's node type, whose recipe encodes a String `query` at
+    /// binding. `Bm25` (`bm25` on a field whose index declares an analyzer):
+    /// the exact lexical scan. `query` is the `match_terms` predicate the
+    /// score retains; every input row whose `property` matches it leaves with
+    /// `bm25_v1` against the field corpus (every entity of `type_name` with
+    /// a non-empty analyzed value, before any filter) appended as
+    /// `<binding>._score` (`F64`), and every other row drops. A `bm25`
+    /// runs its one-pass side and declares `fallback`, the side a match
+    /// table past [`crate::bm25_match_table_bytes`] of the plan's memory
+    /// limit takes instead (`two_pass`); a `distance` declares none.
+    Score {
+        input: NodeId,
+        binding: String,
+        type_name: String,
+        property: String,
+        kind: ScoreKind,
+        query: IRExpr,
+        fallback: Option<crate::Bm25Pass>,
+    } => "Score" [input: NodeId]
+        shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
+    /// `let $name = value` whose value can fail, the core's `Project`
+    /// adding one column: `value` evaluated on every input row, a failure
+    /// refusing the read there (A3), every row passing through unchanged in
+    /// input order. The value is pure, so a later read of the name evaluates
+    /// it in place to the same result.
+    Let {
+        input: NodeId,
+        name: String,
+        value: IRExpr,
+    } => "Let" [input: NodeId]
+        shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
     Page {
         input: NodeId,
         rows: usize,
@@ -946,23 +964,77 @@ physical_nodes! {
         strategy: AntiJoinStrategy,
     } => "AntiJoin" [input: NodeId, inner: NodeId]
         shape: PipelineShape::Breaker, sides: vec![*inner], cut: None, order: None;
-    /// The enclosing rows, the leaf of a correlated `AntiJoin` inner tree.
+    /// `from union(a, b)`: every row of `left` then every row of `right`,
+    /// collected, each under the columns of the reference columns
+    /// `bindings`, which every arm binds; the arms' other columns stay
+    /// behind.
+    Union {
+        left: NodeId,
+        right: NodeId,
+        bindings: Vec<String>,
+    } => "Union" [left: NodeId, right: NodeId]
+        shape: PipelineShape::Breaker, sides: vec![*right], cut: None, order: None;
+    /// `optional { … }` over `input`: every input row with each of its
+    /// matches in the `inner` tree, whose leaf is an `OuterReference` to the
+    /// input rows, and an input row with none once, every column the inner
+    /// tree adds null on it.
+    OptionalJoin {
+        input: NodeId,
+        inner: NodeId,
+        outer_var: String,
+    } => "OptionalJoin" [input: NodeId, inner: NodeId]
+        shape: PipelineShape::Breaker, sides: vec![*inner], cut: None, order: None;
+    /// `from` an inline read with its own aggregate, `distinct`, `order` or
+    /// `limit` (the core's `Correlate` over its `Group`, `Order` and `Cut`):
+    /// the read's pattern is the `inner` tree and `read` what it returns.
+    /// With an `input`, the inner tree's leaf is an `OuterReference` to the
+    /// input rows on `outer_var`; the read groups, orders and cuts each
+    /// input row's own inner rows, and each input row leaves once per row of
+    /// its read, its reference columns' and value columns' added. Without
+    /// one the read runs once over all the inner rows and its rows leave.
+    /// `tiebreak` follows the `order` keys so the order is total.
+    Correlate {
+        input: Option<NodeId>,
+        inner: NodeId,
+        outer_var: Option<String>,
+        read: Box<crate::read_shape::InnerRead>,
+        tiebreak: Vec<ColumnRef>,
+    } => "Correlate" [input: Option<NodeId>, inner: NodeId]
+        shape: PipelineShape::Breaker,
+        sides: if input.is_some() { vec![*inner] } else { vec![] },
+        cut: None,
+        order: None;
+    /// The enclosing rows, the leaf of a correlated `AntiJoin`,
+    /// `OptionalJoin` or `Correlate` inner tree.
     OuterReference {
         outer_var: String,
     } => "OuterReference" []
         shape: PipelineShape::Streaming, sides: vec![], cut: None, order: None;
-    /// `rrf(a, b)`: two arms, each its own copy of the pipeline with one
-    /// ranked scan, every arm row emitted with `<primary binding>._rrf`; `k`
-    /// as written, `limit` only the nearest arm's window, `prefilter` feeds `bm25`.
-    RankFuse {
-        arms: [RankArm; 2],
+    /// `from rrf(arm, …)` (the GQ 3 RFC, section 4,
+    /// Fusion): each arm's subtree yields rows binding `target` in its rank
+    /// order, each target ranked at its first row from 1; one row leaves
+    /// per target any arm selected, carrying the target's columns from the
+    /// first arm that selected it and `Σ weight / (k + rank)` over the arms
+    /// that selected it, summed in written order in `F64`, as
+    /// `target._rrf`. `k` and `weights` as written (`None`: 60, and every
+    /// arm `1.0`). The first arm streams; every other arm is a collected
+    /// side.
+    Fuse {
+        arms: Vec<FuseArm>,
+        target: String,
         k: Option<IRExpr>,
-        limit: Option<usize>,
-        prefilter: Prefilter,
-        /// Downstream row keys after the arm score and fused node identity.
-        row_tiebreak: Vec<ColumnRef>,
-    } => "RankFuse" [arms: [RankArm; 2]]
-        shape: PipelineShape::Breaker, sides: vec![arms[1].input], cut: None, order: None;
+        weights: Option<IRExpr>,
+        /// Inside a correlated read's inner tree: the outer name each arm
+        /// starts from, the fusion partitioned by the outer row each arm
+        /// row belongs to (the engine's tag of that read); each arm is a
+        /// correlated read yielding its rows per outer row in its rank
+        /// order.
+        partition: Option<String>,
+    } => "Fuse" [arms: Vec<FuseArm>]
+        shape: PipelineShape::Breaker,
+        sides: arms.iter().skip(1).map(|arm| arm.input).collect(),
+        cut: None,
+        order: None;
     Projection {
         input: NodeId,
         return_exprs: Vec<IRProjection>,
@@ -1252,6 +1324,27 @@ impl PhysicalPlan {
         self.root
     }
 
+    /// Whether an expression in the subtree under `id`, the node included,
+    /// can refuse a row where it is evaluated (`IRExpr::can_fail`, A3). A
+    /// cut of zero rows (`Limit`, `Page`, a `Sort` with a fetch of zero)
+    /// skips its input only when this is false: the core computes every
+    /// expression below a cut on every row before the cut selects
+    /// (`Cut(Order(Extend(R, items), keys), k)`), so a term that can fail
+    /// refuses the read whatever the cut keeps.
+    pub fn can_fail_below(&self, id: NodeId) -> bool {
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            let Some(node) = self.node(id) else {
+                continue;
+            };
+            if node_can_fail(node) {
+                return true;
+            }
+            pending.extend(node.inputs());
+        }
+        false
+    }
+
     pub fn node(&self, id: NodeId) -> Option<&PhysicalNode> {
         self.slots.get(id).and_then(Option::as_ref)
     }
@@ -1304,7 +1397,7 @@ impl PhysicalPlan {
     }
 
     /// The subtree under `id` in post-order, `id` last.
-    pub(crate) fn subtree(&self, id: NodeId) -> Vec<NodeId> {
+    pub fn subtree(&self, id: NodeId) -> Vec<NodeId> {
         let mut order = Vec::new();
         self.visit(id, &mut order);
         order
@@ -1350,274 +1443,332 @@ impl PhysicalPlan {
     }
 
     fn node_json(&self, id: NodeId, query: bool) -> Value {
-        let Some(node) = self.node(id) else {
-            return json!({ "node": "tombstone", "id": id });
-        };
-        let mut value = match node {
-            PhysicalNode::MetadataCount { spec, return_exprs } => {
-                metadata_count_json(spec, return_exprs)
-            }
-            PhysicalNode::Scan {
-                source,
-                spec,
-                ordered,
-                keys_only,
-                ranked,
-            } => {
-                let mut value = scan_json("Scan", spec);
-                if let Some(access) = &spec.access {
-                    access.explain(&mut value);
+        omnigraph_compiler::stack::deep(|| {
+            let Some(node) = self.node(id) else {
+                return json!({ "node": "tombstone", "id": id });
+            };
+            let mut value = match node {
+                PhysicalNode::MetadataCount { spec, return_exprs } => {
+                    metadata_count_json(spec, return_exprs)
                 }
-                if let ScanInput::Dependent { .. } = source {
-                    value["id_restriction"] = json!("input");
-                    value["access"] = json!(AccessPath::IdLookup);
-                }
-                value["ordered"] = json!(ordered);
-                value["keys_only"] = json!(keys_only);
-                if let Some(ranked) = ranked {
-                    value["ranked"] = ranked.to_json();
-                }
-                value
-            }
-            PhysicalNode::SortMergeJoin {
-                kind,
-                on,
-                build,
-                drop_equal_addresses,
-                ..
-            } => json!({
-                "node": "SortMergeJoin",
-                "kind": kind,
-                "on": on,
-                "build": build,
-                "drop_equal_addresses": drop_equal_addresses,
-            }),
-            PhysicalNode::HydrateByAddress { side, .. } => json!({
-                "node": "HydrateByAddress",
-                "side": side,
-            }),
-            PhysicalNode::HydrateColumns { bindings, .. } => json!({
-                "node": "HydrateColumns",
-                "bindings": bindings
-                    .iter()
-                    .map(|binding| json!({
-                        "binding": binding.binding,
-                        "table": binding.table.type_key,
-                        "columns": binding
-                            .columns
-                            .iter()
-                            .map(|column| column.property.as_str())
-                            .collect::<Vec<&str>>(),
-                    }))
-                    .collect::<Vec<Value>>(),
-            }),
-            PhysicalNode::HashJoin {
-                binding, fallback, ..
-            } => json!({
-                "node": "HashJoin",
-                "binding": binding,
-                "fallback": fallback,
-            }),
-            PhysicalNode::Limit { rows, .. } => json!({
-                "node": "Page", "rows": rows, "bytes": 0, "resume": null,
-            }),
-            PhysicalNode::Page {
-                rows,
-                bytes,
-                resume,
-                ..
-            } => json!({
-                "node": "Page",
-                "rows": rows,
-                "bytes": bytes,
-                "resume": resume,
-            }),
-            PhysicalNode::Filter { filters, .. } => json!({
-                "node": "Filter",
-                "filters": filters_json(filters),
-                "typed_filters": crate::typed::exprs(filters),
-            }),
-            PhysicalNode::Expand {
-                src,
-                dst,
-                edges,
-                src_type,
-                dst_type,
-                min_hops,
-                max_hops,
-                edge_binding,
-                mode,
-                frontier_estimate,
-                policy,
-                versions,
-                ..
-            } => json!({
-                "node": "Expand",
-                "src": src,
-                "dst": dst,
-                "edges": EdgeSelectionMirror::from(edges),
-                "src_type": src_type,
-                "dst_type": dst_type,
-                "min_hops": min_hops,
-                "max_hops": max_hops,
-                "edge_binding": edge_binding,
-                "mode": mode,
-                "alternatives": policy.alternatives(*mode),
-                "frontier_estimate": frontier_estimate,
-                "versions": versions,
-            }),
-            PhysicalNode::AntiJoin {
-                outer_var,
-                predicate,
-                aggregate,
-                strategy,
-                ..
-            } => json!({
-                "node": node.name(),
-                "outer_var": outer_var,
-                "strategy": strategy,
-                "predicate": predicate.to_string(),
-                "aggregate": crate::typed::block_aggregate(&predicate.left, *aggregate),
-                "typed_left": crate::typed::block(&predicate.left),
-                "typed_right": crate::typed::expr(&predicate.right),
-            }),
-            PhysicalNode::OuterReference { outer_var } => json!({
-                "node": node.name(),
-                "outer_var": outer_var,
-            }),
-            PhysicalNode::RankFuse {
-                arms,
-                k,
-                limit,
-                row_tiebreak,
-                ..
-            } => json!({
-                "node": "RankFuse",
-                "arms": arms
-                    .iter()
-                    .map(|arm| json!({ "binding": arm.binding, "kind": arm.kind }))
-                    .collect::<Vec<Value>>(),
-                "k": k.as_ref().map(ToString::to_string),
-                "typed_k": k.as_ref().map(crate::typed::expr),
-                "limit": limit,
-                "row_tiebreak": tiebreak_text(row_tiebreak),
-            }),
-            PhysicalNode::Aggregate {
-                return_exprs,
-                aggregates,
-                ..
-            } => json!({
-                "node": node.name(),
-                "exprs": return_exprs.iter().map(|projection| projection.expr.to_string()).collect::<Vec<_>>(),
-                "columns": crate::output::return_columns(return_exprs),
-                "typed_exprs": crate::typed::returns(return_exprs),
-                "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
-                    match (&projection.expr, spec) {
-                        (IRExpr::Aggregate { func, distinct, signature, .. }, Some(spec)) => json!({
-                            "column": crate::optimizer::result_column(projection),
-                            "func": func.to_string(),
-                            "distinct": distinct,
-                            "input": signature.arg.spelling(),
-                            "accumulator": spec.accumulator,
-                            "overflow": spec.overflow,
-                            "result": signature.result.spelling(),
-                        }),
-                        _ => Value::Null,
+                PhysicalNode::Scan {
+                    source,
+                    spec,
+                    ordered,
+                    keys_only,
+                    ranked,
+                } => {
+                    let mut value = scan_json("Scan", spec);
+                    if let Some(access) = &spec.access {
+                        access.explain(&mut value);
                     }
-                }).collect::<Vec<_>>(),
-            }),
-            PhysicalNode::Projection { return_exprs, .. } => json!({
-                "node": node.name(),
-                "columns": crate::output::return_columns(return_exprs),
-                "typed_exprs": crate::typed::returns(return_exprs),
-                "exprs": return_exprs
-                    .iter()
-                    .map(|projection| projection.expr.to_string())
-                    .collect::<Vec<String>>(),
-            }),
-            PhysicalNode::Sort {
-                order_by,
-                fetch,
-                tiebreak,
-                ..
-            } => json!({
-                "node": "Sort",
-                "keys": order_by.iter().map(ordering_text).collect::<Vec<String>>(),
-                "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
-                "fetch": fetch,
-                "tiebreak": tiebreak_text(tiebreak),
-            }),
-            PhysicalNode::CrossJoin { filters, .. } if !filters.is_empty() => json!({
-                "node": "CrossJoin",
-                "filters": filters_json(filters),
-                "typed_filters": crate::typed::exprs(filters),
-            }),
-            PhysicalNode::ContainsJoin {
-                haystack,
-                needle,
-                conjunct,
-                residual,
-                ..
-            } => json!({
-                "node": "ContainsJoin",
-                "haystack": column_text(haystack),
-                "needle": column_text(needle),
-                "residual": filters_json(residual),
-                "typed_residual": crate::typed::exprs(residual),
-                "typed_conjunct": crate::typed::expr(conjunct),
-            }),
-            PhysicalNode::DeltaSource { spec } => delta_source_json(spec),
-            PhysicalNode::CsvSource {
-                spec,
-                max_partitions,
-                max_workers,
-            } => {
-                let mut value = csv_source_json(spec);
-                value["max_partitions"] = json!(max_partitions);
-                value["max_workers"] = json!(max_workers);
-                value["fallback"] = json!("single_scan");
-                value
+                    if let ScanInput::Dependent { .. } = source {
+                        value["id_restriction"] = json!("input");
+                        value["access"] = json!(AccessPath::IdLookup);
+                    }
+                    value["ordered"] = json!(ordered);
+                    value["keys_only"] = json!(keys_only);
+                    if let Some(ranked) = ranked {
+                        value["ranked"] = ranked.to_json();
+                    }
+                    value
+                }
+                PhysicalNode::SortMergeJoin {
+                    kind,
+                    on,
+                    build,
+                    drop_equal_addresses,
+                    ..
+                } => json!({
+                    "node": "SortMergeJoin",
+                    "kind": kind,
+                    "on": on,
+                    "build": build,
+                    "drop_equal_addresses": drop_equal_addresses,
+                }),
+                PhysicalNode::HydrateByAddress { side, .. } => json!({
+                    "node": "HydrateByAddress",
+                    "side": side,
+                }),
+                PhysicalNode::HydrateColumns { bindings, .. } => json!({
+                    "node": "HydrateColumns",
+                    "bindings": bindings
+                        .iter()
+                        .map(|binding| json!({
+                            "binding": binding.binding,
+                            "table": binding.table.type_key,
+                            "columns": binding
+                                .columns
+                                .iter()
+                                .map(|column| column.property.as_str())
+                                .collect::<Vec<&str>>(),
+                        }))
+                        .collect::<Vec<Value>>(),
+                }),
+                PhysicalNode::HashJoin {
+                    binding, fallback, ..
+                } => json!({
+                    "node": "HashJoin",
+                    "binding": binding,
+                    "fallback": fallback,
+                }),
+                PhysicalNode::Limit { rows, .. } => json!({
+                    "node": "Page", "rows": rows, "bytes": 0, "resume": null,
+                }),
+                PhysicalNode::TargetCut {
+                    binding, targets, ..
+                } => json!({
+                    "node": "TargetCut", "binding": binding, "targets": targets,
+                }),
+                PhysicalNode::Score {
+                    binding,
+                    type_name,
+                    property,
+                    kind,
+                    query,
+                    fallback,
+                    ..
+                } => json!({
+                    "node": node.name(),
+                    "binding": binding,
+                    "type_name": type_name,
+                    "property": property,
+                    "kind": score_kind_name(*kind),
+                    "fallback": fallback,
+                    "typed_query": crate::typed::expr(query),
+                }),
+                PhysicalNode::Let { name, value, .. } => json!({
+                    "node": node.name(),
+                    "name": name,
+                    "typed_value": crate::typed::expr(value),
+                }),
+                PhysicalNode::Page {
+                    rows,
+                    bytes,
+                    resume,
+                    ..
+                } => json!({
+                    "node": "Page",
+                    "rows": rows,
+                    "bytes": bytes,
+                    "resume": resume,
+                }),
+                PhysicalNode::Filter { filters, .. } => json!({
+                    "node": "Filter",
+                    "filters": filters_json(filters),
+                    "typed_filters": crate::typed::exprs(filters),
+                }),
+                PhysicalNode::Expand {
+                    src,
+                    dst,
+                    edges,
+                    src_type,
+                    dst_type,
+                    min_hops,
+                    max_hops,
+                    edge_binding,
+                    mode,
+                    frontier_estimate,
+                    policy,
+                    versions,
+                    ..
+                } => json!({
+                    "node": "Expand",
+                    "src": src,
+                    "dst": dst,
+                    "edges": EdgeSelectionMirror::from(edges),
+                    "src_type": src_type,
+                    "dst_type": dst_type,
+                    "min_hops": min_hops,
+                    "max_hops": max_hops,
+                    "edge_binding": edge_binding,
+                    "mode": mode,
+                    "alternatives": policy.alternatives(*mode),
+                    "frontier_estimate": frontier_estimate,
+                    "versions": versions,
+                }),
+                PhysicalNode::AntiJoin {
+                    outer_var,
+                    predicate,
+                    aggregate,
+                    strategy,
+                    ..
+                } => json!({
+                    "node": node.name(),
+                    "outer_var": outer_var,
+                    "strategy": strategy,
+                    "predicate": predicate.to_string(),
+                    "aggregate": crate::typed::block_aggregate(&predicate.left, *aggregate),
+                    "typed_left": crate::typed::block(&predicate.left),
+                    "typed_right": crate::typed::expr(&predicate.right),
+                }),
+                PhysicalNode::Union { bindings, .. } => json!({
+                    "node": node.name(),
+                    "bindings": bindings,
+                }),
+                PhysicalNode::OptionalJoin { outer_var, .. } => json!({
+                    "node": node.name(),
+                    "outer_var": outer_var,
+                }),
+                PhysicalNode::Correlate {
+                    outer_var,
+                    read,
+                    tiebreak,
+                    ..
+                } => {
+                    let mut value = inner_read_json(read, tiebreak);
+                    value["node"] = json!(node.name());
+                    value["outer_var"] = json!(outer_var);
+                    value
+                }
+                PhysicalNode::OuterReference { outer_var } => json!({
+                    "node": node.name(),
+                    "outer_var": outer_var,
+                }),
+                PhysicalNode::Fuse {
+                    arms,
+                    target,
+                    k,
+                    weights,
+                    partition,
+                } => {
+                    let mut value = json!({
+                        "node": "Fuse",
+                        "target": target,
+                        "arms": arms.iter().map(|arm| arm.rank.name()).collect::<Vec<_>>(),
+                        "k": k.as_ref().map(ToString::to_string),
+                        "typed_k": k.as_ref().map(crate::typed::expr),
+                        "weights": weights.as_ref().map(ToString::to_string),
+                        "typed_weights": weights.as_ref().map(crate::typed::expr),
+                    });
+                    if let Some(outer) = partition {
+                        value["partition"] = json!(format!("per outer row of ${outer}"));
+                    }
+                    value
+                }
+                PhysicalNode::Aggregate {
+                    return_exprs,
+                    aggregates,
+                    ..
+                } => json!({
+                    "node": node.name(),
+                    "exprs": return_exprs.iter().map(|projection| projection.expr.to_string()).collect::<Vec<_>>(),
+                    "columns": crate::output::return_columns(return_exprs),
+                    "typed_exprs": crate::typed::returns(return_exprs),
+                    "aggregates": return_exprs.iter().zip(aggregates).map(|(projection, spec)| {
+                        match (&projection.expr, spec) {
+                            (IRExpr::Aggregate { func, distinct, fraction, signature, .. }, Some(spec)) => {
+                                let mut aggregate = json!({
+                                    "column": crate::optimizer::result_column(projection),
+                                    "func": func.to_string(),
+                                    "distinct": distinct,
+                                    "input": signature.arg.spelling(),
+                                    "accumulator": spec.accumulator,
+                                    "overflow": spec.overflow,
+                                    "result": signature.result.spelling(),
+                                });
+                                if let Some(p) = fraction {
+                                    aggregate["fraction"] = Value::String(p.to_string());
+                                }
+                                aggregate
+                            }
+                            _ => Value::Null,
+                        }
+                    }).collect::<Vec<_>>(),
+                }),
+                PhysicalNode::Projection { return_exprs, .. } => json!({
+                    "node": node.name(),
+                    "columns": crate::output::return_columns(return_exprs),
+                    "typed_exprs": crate::typed::returns(return_exprs),
+                    "exprs": return_exprs
+                        .iter()
+                        .map(|projection| projection.expr.to_string())
+                        .collect::<Vec<String>>(),
+                }),
+                PhysicalNode::Sort {
+                    order_by,
+                    fetch,
+                    tiebreak,
+                    ..
+                } => json!({
+                    "node": "Sort",
+                    "keys": order_by.iter().map(ordering_text).collect::<Vec<String>>(),
+                    "typed_keys": order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
+                    "fetch": fetch,
+                    "tiebreak": tiebreak_text(tiebreak),
+                }),
+                PhysicalNode::CrossJoin { filters, .. } if !filters.is_empty() => json!({
+                    "node": "CrossJoin",
+                    "filters": filters_json(filters),
+                    "typed_filters": crate::typed::exprs(filters),
+                }),
+                PhysicalNode::ContainsJoin {
+                    haystack,
+                    needle,
+                    conjunct,
+                    residual,
+                    ..
+                } => json!({
+                    "node": "ContainsJoin",
+                    "haystack": column_text(haystack),
+                    "needle": column_text(needle),
+                    "residual": filters_json(residual),
+                    "typed_residual": crate::typed::exprs(residual),
+                    "typed_conjunct": crate::typed::expr(conjunct),
+                }),
+                PhysicalNode::DeltaSource { spec } => delta_source_json(spec),
+                PhysicalNode::CsvSource {
+                    spec,
+                    max_partitions,
+                    max_workers,
+                } => {
+                    let mut value = csv_source_json(spec);
+                    value["max_partitions"] = json!(max_partitions);
+                    value["max_workers"] = json!(max_workers);
+                    value["fallback"] = json!("single_scan");
+                    value
+                }
+                PhysicalNode::Validate {
+                    table,
+                    checks,
+                    removal,
+                    max_workers,
+                    ..
+                } => {
+                    let mut value = validate_json(table, checks);
+                    value["removal"] = json!(removal);
+                    value["max_workers"] = json!(max_workers);
+                    value
+                }
+                PhysicalNode::FragmentWrite {
+                    spec,
+                    max_input_bytes,
+                    max_workers,
+                    ..
+                } => {
+                    let mut value = fragment_write_json(spec);
+                    value["max_input_bytes"] = json!(max_input_bytes);
+                    value["max_workers"] = json!(max_workers);
+                    value
+                }
+                PhysicalNode::RowCompare { .. }
+                | PhysicalNode::ClassifyThreeWay { .. }
+                | PhysicalNode::CrossJoin { .. } => json!({ "node": node.name() }),
+            };
+            value["id"] = json!(id);
+            if let Some(properties) = self.properties(id) {
+                value["properties"] = properties.to_json(query);
             }
-            PhysicalNode::Validate {
-                table,
-                checks,
-                removal,
-                max_workers,
-                ..
-            } => {
-                let mut value = validate_json(table, checks);
-                value["removal"] = json!(removal);
-                value["max_workers"] = json!(max_workers);
-                value
+            let inputs: Vec<Value> = node
+                .inputs()
+                .into_iter()
+                .map(|input| self.node_json(input, query))
+                .collect();
+            if !inputs.is_empty() {
+                value["inputs"] = Value::Array(inputs);
             }
-            PhysicalNode::FragmentWrite {
-                spec,
-                max_input_bytes,
-                max_workers,
-                ..
-            } => {
-                let mut value = fragment_write_json(spec);
-                value["max_input_bytes"] = json!(max_input_bytes);
-                value["max_workers"] = json!(max_workers);
-                value
-            }
-            PhysicalNode::RowCompare { .. }
-            | PhysicalNode::ClassifyThreeWay { .. }
-            | PhysicalNode::CrossJoin { .. } => json!({ "node": node.name() }),
-        };
-        value["id"] = json!(id);
-        if let Some(properties) = self.properties(id) {
-            value["properties"] = properties.to_json(query);
-        }
-        let inputs: Vec<Value> = node
-            .inputs()
-            .into_iter()
-            .map(|input| self.node_json(input, query))
-            .collect();
-        if !inputs.is_empty() {
-            value["inputs"] = Value::Array(inputs);
-        }
-        value
+            value
+        })
     }
 
     /// The plan cut into pipelines: walking from the root, every side a node
@@ -1787,7 +1938,10 @@ impl PhysicalPlan {
             Some(PhysicalNode::CrossJoin { .. }) => "CrossJoin(build)".to_string(),
             Some(PhysicalNode::ContainsJoin { .. }) => "ContainsJoin(build)".to_string(),
             Some(PhysicalNode::AntiJoin { .. }) => "AntiJoin(inner)".to_string(),
-            Some(PhysicalNode::RankFuse { .. }) => "RankFuse(secondary)".to_string(),
+            Some(PhysicalNode::OptionalJoin { .. }) => "OptionalJoin(inner)".to_string(),
+            Some(PhysicalNode::Correlate { .. }) => "Correlate(inner)".to_string(),
+            Some(PhysicalNode::Union { .. }) => "Union(right)".to_string(),
+            Some(PhysicalNode::Fuse { .. }) => "Fuse(arm)".to_string(),
             Some(node) => node.name().to_string(),
             None => "tombstone".to_string(),
         }
@@ -1984,4 +2138,96 @@ pub enum PipelineSink {
     /// seen all of its input ([`PipelineShape::Breaker`]); the node's
     /// output is the source of the pipeline that depends on this one.
     Breaker(NodeId),
+}
+
+/// What a `Correlate` evaluates, as explain prints it: the read's group,
+/// columns, order, tie-break and cut.
+pub(crate) fn inner_read_json(
+    read: &crate::read_shape::InnerRead,
+    tiebreak: &[ColumnRef],
+) -> Value {
+    let columns = |projections: &[IRProjection]| {
+        projections
+            .iter()
+            .map(|projection| format!("{} as {}", projection.expr, projection.column))
+            .collect::<Vec<String>>()
+    };
+    let mut value = json!({
+        "values": read.values,
+        "group": read.group.as_deref().map(columns),
+        "columns": columns(&read.columns),
+        "typed_columns": crate::typed::returns(&read.columns),
+        "keys": read.order_by.iter().map(ordering_text).collect::<Vec<String>>(),
+        "typed_keys": read.order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
+        "tiebreak": tiebreak_text(tiebreak),
+        "limit": read.limit,
+    });
+    if let Some(group) = &read.group {
+        value["typed_group"] = json!(crate::typed::returns(group));
+    }
+    // A ranking drawn as a read of its own: its `nearest` window, the
+    // first `targets` distinct identities of `binding` in the read's order.
+    if let Some(window) = &read.window {
+        value["window"] = json!({
+            "binding": window.binding,
+            "targets": window.targets,
+        });
+    }
+    value
+}
+
+/// Whether an expression the node itself evaluates can fail, its inputs
+/// apart: [`PhysicalPlan::can_fail_below`] walks the inputs.
+fn node_can_fail(node: &PhysicalNode) -> bool {
+    let projections = |items: &[IRProjection]| items.iter().any(|item| item.expr.can_fail());
+    let exprs = |items: &[IRExpr]| items.iter().any(IRExpr::can_fail);
+    match node {
+        PhysicalNode::MetadataCount { return_exprs, .. }
+        | PhysicalNode::Projection { return_exprs, .. } => projections(return_exprs),
+        PhysicalNode::Aggregate { return_exprs, .. } => projections(return_exprs),
+        PhysicalNode::Sort { order_by, .. } => order_by.iter().any(|key| key.expr.can_fail()),
+        PhysicalNode::Scan { spec, .. } => spec.filter.as_ref().is_some_and(predicate_can_fail),
+        PhysicalNode::Filter { filters, .. } | PhysicalNode::CrossJoin { filters, .. } => {
+            exprs(filters)
+        }
+        PhysicalNode::ContainsJoin {
+            conjunct, residual, ..
+        } => conjunct.can_fail() || exprs(residual),
+        PhysicalNode::Let { value, .. } => value.can_fail(),
+        PhysicalNode::Score { query, .. } => query.can_fail(),
+        PhysicalNode::AntiJoin { predicate, .. } => {
+            predicate.right.can_fail() || predicate.left.arg().is_some_and(IRExpr::can_fail)
+        }
+        PhysicalNode::Correlate { read, .. } => read.exprs().any(IRExpr::can_fail),
+        PhysicalNode::Fuse { k, weights, .. } => {
+            k.as_ref().is_some_and(IRExpr::can_fail)
+                || weights.as_ref().is_some_and(IRExpr::can_fail)
+        }
+        PhysicalNode::SortMergeJoin { .. }
+        | PhysicalNode::HashJoin { .. }
+        | PhysicalNode::HydrateByAddress { .. }
+        | PhysicalNode::HydrateColumns { .. }
+        | PhysicalNode::RowCompare { .. }
+        | PhysicalNode::ClassifyThreeWay { .. }
+        | PhysicalNode::Limit { .. }
+        | PhysicalNode::TargetCut { .. }
+        | PhysicalNode::Page { .. }
+        | PhysicalNode::Expand { .. }
+        | PhysicalNode::Union { .. }
+        | PhysicalNode::OptionalJoin { .. }
+        | PhysicalNode::OuterReference { .. }
+        | PhysicalNode::CsvSource { .. }
+        | PhysicalNode::Validate { .. }
+        | PhysicalNode::FragmentWrite { .. }
+        | PhysicalNode::DeltaSource { .. } => false,
+    }
+}
+
+/// Whether a scan's pushed predicate holds a conjunct that can fail.
+fn predicate_can_fail(predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::Gq { filter, .. } => filter.0.can_fail(),
+        Predicate::And { left, right } => predicate_can_fail(left) || predicate_can_fail(right),
+        Predicate::IdAfter { .. } | Predicate::VersionWindow { .. } => false,
+    }
 }

@@ -21,7 +21,7 @@ node Doc {
 
 --- mutate
 query seed_doc() {
-    insert Doc { slug: "w", note: "short" }
+    replace Doc { slug: "w", note: "short" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -33,7 +33,8 @@ branch create feature;
 
 --- mutate
 query lengthen() {
-    update Doc set { note: "long" } where slug = "w"
+    match { $x: Doc } where $x.slug = "w"
+    update $x set { note: "long" }
 }
 
 --- expect affected: nodes=1 edges=0

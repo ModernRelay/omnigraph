@@ -371,6 +371,9 @@ fn run() -> Result<(), String> {
                     outcome.stem,
                     outcome.elapsed.as_secs_f64()
                 );
+                for note in &outcome.notes {
+                    println!("  {note}");
+                }
                 if let Err(error) = outcome.result {
                     failures.push(error);
                 }

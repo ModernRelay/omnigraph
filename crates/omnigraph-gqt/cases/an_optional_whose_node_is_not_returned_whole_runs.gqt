@@ -1,0 +1,56 @@
+# issue: none
+# notes: An `optional` runs when its node is not returned whole; returned whole, its node is a null object where the `optional`
+# notes: matched nothing (`an_optional_node_returned_whole_is_a_null_object.gqt`).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)?
+    payload: Blob?
+}
+node Collection {
+    slug: String @key
+    min_docs: I32
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+edge In: Doc -> Collection
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+
+--- query
+query q($h: String) { match { $p: Person, optional { $q: Person, $p knows $q } } where $p.handle = $h return { $p.name } }
+
+--- params
+{"h": "ada"}
+
+--- expect unordered
+{"p.name":"Ada"}
+
+--- expect shape
+p.name: String

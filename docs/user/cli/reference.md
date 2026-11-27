@@ -38,21 +38,19 @@ its base, or lies inside it, is refused, also when the two `s3://` bucket names
 address one bucket or the target's bucket holds a copy of the base under the
 base's key. An `s3://` target or base must name one object key in one
 spelling, as every `s3://` root must ([storage](../clusters/config.md#storage)).
-The option applies to `query`, `mutate`, `load`, `branch`,
-`commit`, `changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`;
-maintenance and schema changes keep the one root they are given. A fresh target
-directory or prefix is a new clone; the same target again shows the clone's own
-state. Nothing in the target records its base, so pass the same `--base` on
-every open of that target; a clone root opened without `--base` is refused,
-since its marker says it is a clone and not which base it was cloned from.
-A target that already holds objects but no clone marker, an ordinary graph
-for example, is refused under `--base` before anything is written.
+The option applies to `query`, `mutate`, `load`, `branch`, `commit`, `changes`,
+`diff`, `snapshot`, `export`, `blob` and `schema show`; maintenance and schema
+changes keep the one root they are given. A fresh target directory or prefix is
+a new clone; the same target again shows the clone's own state. Nothing in the
+target records its base, so pass the same `--base` on every open of that target;
+a clone root opened without `--base` is refused, since its marker names no base.
+A target holding objects but no clone marker, such as an ordinary graph, is
+refused under `--base` before anything is written.
 
 `--as ACTOR` attributes supported direct operations; on a cluster graph the
 applied graph policy judges them by it ([direct writes](../operations/policy.md#actor-identity)).
-A served target derives its
-actor from its credential and sends `--as` as the `Omnigraph-If-Actor` assertion,
-exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
+A served target derives its actor from its credential and sends `--as` as the
+`Omnigraph-If-Actor` assertion, exiting 4 on a mismatch ([Assert the actor](../operations/server.md#assert-the-actor));
 a managed target refuses it. `--yes` supplies noninteractive consent for destructive
 operations on nonlocal storage. The retired `--quiet` cannot hide the destination.
 
@@ -64,7 +62,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `catalogue` | Query this binary's engine registries with `-e` or `--query`; optional `--json` | local, no operator config or graph storage |
 | `query` | Run a read query, or a branch read (`branch list`, `diff`, `merge-base`, `merge … dry run`), `show`, or `explain` statement | direct or served |
 | `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create` (refused with `branch_exists` when a branch holds the name), `branch delete` (also removes a [not-ready branch](../branching/index.md#branch-workflow) and finishes a pending retirement), `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
-| `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
+| `load` | Load graph JSONL in `insert`, `upsert`, `replace` or `overwrite` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
 | `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `list --detailed` adds each branch's head, start and times, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
@@ -73,14 +71,14 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `changes poll/baseline` | Consume a branch change feed or establish a new baseline | direct or served |
 | `export` | Stream a branch as JSONL | direct or served |
 | `schema show` | Read the accepted schema | direct or served |
-| `schema apply` | Apply a schema to a standalone graph | direct |
-| `schema plan` | Preview a schema migration | direct |
+| `schema apply` | Apply a schema to a standalone graph; a plan with no step publishes nothing, and `one_way_constructs` names each stored construct an earlier binary cannot read back, with the first release that reads it ([Schemas](../queries/upgrading-to-gq3.md#schemas)) | direct |
+| `schema plan` | Preview a schema migration, with its `one_way_constructs` | direct |
 | `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
-| `lint` | Validate `.gq` source | local schema or direct graph |
+| `lint` | Validate `.gq` source; `--json` gives each refusal and canonical form its `fix` and byte-range `suggestion.edits`, the edits `--fix` applies to a file, a directory or a configuration's stored-query files ([Lint](../queries/lint.md#fix)) | local schema, direct graph or configuration directory |
 | `upgrade` | Convert a v8, v9 or v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
 | `optimize` | Compact data and reconcile declared indexes on `main`; a server target runs it as a [recorded operation](../operations/recorded-operations.md), waiting for its record unless `--no-wait` | direct or served |
-| `index build` | Build a branch's missing declared indexes and refresh lagging BTREE and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
-| `index rebuild --kind full-text` | Replace full-text indexes on one branch; `rebuild-full-text-indexes` is its deprecated spelling | direct |
+| `index build` | Build a branch's missing declared indexes and refresh lagging scalar and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
+| `index rebuild --kind full-text` | Replace full-text indexes on one branch, after which a binary before GQ 3 refuses full-text reads until its own rebuild; `rebuild-full-text-indexes` is its deprecated spelling | direct |
 | `cleanup` | Delete table versions that no retained graph commit pins, under an explicit retention policy ([Maintenance](../operations/maintenance.md#cleanup)) | direct |
 | `graphs list` | List graph metadata or minimal identity discovery | served |
 | `queries list` | List stored queries: a cluster root's registry (`--graph` narrows it to one graph), or one served graph's catalog, whose `--json` is the body of `GET /graphs/{id}/queries` | cluster or served |
@@ -103,7 +101,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `organization members/invitations` | List members, set service roles, offboard and manage invitations; see [team access](managed-team.md) | profile |
 | `organization m2m-applications list/create/secret rotate/delete` | List, create and delete M2M applications; deliver and rotate their client secrets only to a file ([M2M applications](managed-m2m-applications.md)) | profile |
 | `skill export/show` | Export the agent skill built into this binary, or print one of its files ([matching skill](index.md#give-an-agent-the-matching-skill)) | local |
-| `version` | Print the package version, HTTP contract and storage formats; `--json` includes `version`, `http_contract`, `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
+| `version` | Print the package version, HTTP contract, GQ language version and storage formats; `--json` includes `version`, `http_contract`, `gq_language` (`major.minor`, `3.0`), `protocols` (`studio: 1`, `target: 2`, `credential: 2`, `access: 2`) and `internal_schema` (`writes`, `serves`) ([Verify](../install.md#verify)) | local |
 
 ## Query inputs and output
 
@@ -121,24 +119,23 @@ params; see [Work with branches](index.md#work-with-branches)), or one
 as rows under the query's own target and params; see [Explain](../queries/explain.md).
 
 Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, `toon`, and, for
-`query`, `arrow`. With no
-`--format`, no `--json`, and no `defaults.output`, a read prints a table. `--json` is the
-stable machine-readable form for commands that do not use `--format`. Result
-cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
-`table` and `kv` print strings unquoted. CSV writes a null as an empty field
-and an empty string as `""`, and quotes fields containing a comma, double
-quote, or line break, so [`load csv`](../mutations/index.md#csv-loading)
-reads a null back as null and the string `null` as that string. `load csv`
-also reads `""` as null, because it has no spelling for an empty string, and
-it skips empty lines, so a null row of a one-column result is not loaded back.
-`--format json` prints the
-envelope pretty and the `rows` array compact. `--format toon` encodes that same
-document as [TOON](https://github.com/toon-format/spec) (specification 4.4,
-comma delimiter, two-space indent). `rows` declares its fields once when every
-row has the same keys. A null cell omits its key, so one null makes the rows
-non-uniform and TOON repeats every key. Numbers use TOON's canonical spelling,
-so an integral value is `1` where the JSON writer may spell `1.0`. The CLI ends
-the TOON document with a newline. The HTTP API returns JSON. A refusal follows
+`query`, `arrow`. With no `--format`, no `--json`, and no `defaults.output`, a
+read prints a table. `--json` is the stable machine-readable form for commands
+that do not use `--format`. Result cells use the [JSON result
+spelling](../queries/index.md#json-result-spelling); `table` and `kv` print
+strings unquoted. CSV writes a null as an empty field and an empty string as
+`""`, and quotes fields containing a comma, double quote, or line break, so
+[`load csv`](../mutations/index.md#csv-loading) reads a null back as null and
+the string `null` as that string. `load csv` also reads `""` as null, because it
+has no spelling for an empty string, and it skips empty lines, so a null row of
+a one-column result is not loaded back. `--format json` prints the envelope
+pretty and the `rows` array compact. `--format toon` encodes that same document
+as [TOON](https://github.com/toon-format/spec) (specification 4.4, comma
+delimiter, two-space indent). `rows` declares its fields once when every row has
+the same keys. A null cell omits its key, so one null makes the rows non-uniform
+and TOON repeats every key. Numbers use TOON's canonical spelling, so an
+integral value is `1` where the JSON writer may spell `1.0`. The CLI ends the
+TOON document with a newline. The HTTP API returns JSON. A refusal follows
 [Diagnostics](../queries/diagnostics.md).
 
 `query --format arrow` writes the result's columns and rows to stdout as one
@@ -228,13 +225,18 @@ addressing are refused; see [storage upgrade](../operations/upgrade.md#storage-u
 
 ## Load modes
 
-`load --mode` is required:
+`load --mode` is required; each mode is the [write statement](../mutations/index.md#statements) of its name:
 
 | Mode | Existing entities | Typical use |
 |---|---|---|
+| `insert` | Kept; an existing ID fails the load with `key_conflict` and nothing publishes | Strict batch insertion |
+| `upsert` | Sets the properties a record names; an absent property key keeps its value, an explicit `null` clears | Idempotent patching from partial records |
+| `replace` | Replaced whole by ID; a property a record omits becomes null | Idempotent synchronization of complete records |
 | `overwrite` | Each node or edge type represented in the batch is replaced; other types remain | Initial load or import of a complete export |
-| `append` | Kept; duplicate IDs fail | Strict batch insertion |
-| `merge` | Updated by ID | Idempotent synchronization |
+
+GQ 2's `append` and `merge` are refused before anything is read with `Q004`
+and the fix `--mode insert` or `--mode replace`, as [`load csv`](../mutations/index.md#csv-loading)
+and HTTP refuse them. A load retried after an uncertain outcome uses `upsert` or `replace`.
 
 `--branch <NAME>` selects an existing branch. Add `--from <BASE>` to create a
 missing branch from an explicit base. Overwrite is destructive and may require
@@ -334,11 +336,10 @@ progress and idempotency information go to stderr.
 A managed target uses the common served graph client, including schema reads,
 access introspection, stored-query catalogs, the stdio MCP bridge, branches,
 snapshots, history, exports, Blob operations and change feeds. Select a graph
-explicitly or use its configured
-`default_graph`; discovery only lists available IDs. A separate identity
-credential authenticates the data endpoint, and applied Cedar policy decides
-permissions. Direct-only maintenance, schema changes and root administration
-remain unavailable through a managed data endpoint.
+explicitly or use its configured `default_graph`; discovery only lists available
+IDs. A separate identity credential authenticates the data endpoint, and applied
+Cedar policy decides permissions. Direct-only maintenance, schema changes and
+root administration remain unavailable through a managed data endpoint.
 
 ## Confirmation rules
 

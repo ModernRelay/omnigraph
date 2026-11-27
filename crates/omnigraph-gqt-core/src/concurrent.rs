@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::{fmt, str::FromStr};
 
 use omnigraph::loader::LoadMode;
-use omnigraph_compiler::query::ast::{BranchStmt, BranchWrite, FileBody};
+use omnigraph_compiler::query::file::{BranchStmt, BranchWrite, FileBody};
 use omnigraph_compiler::query::parser::parse_query;
 
 use crate::diagnostic::{CaseError, CaseErrorCode};
@@ -342,7 +342,7 @@ pub fn build_sessions(
                         )));
                     }
                     crate::inspect_decl(decl, needs_indices)?;
-                    let kind = if decl.mutations.is_empty() {
+                    let kind = if !decl.is_mutation() {
                         SessionKind::Query
                     } else {
                         SessionKind::Mutation

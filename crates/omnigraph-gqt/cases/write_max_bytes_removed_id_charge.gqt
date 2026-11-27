@@ -35,7 +35,8 @@ edge LoadRef: LoadDoc -> LoadDoc
 --- mutate
 set write_max_bytes = 26;
 query delete_multibyte_under() {
-    delete Doc where slug = "日"
+    match { $x: Doc } where $x.slug = "日"
+    delete $x
 }
 
 --- expect error: retained removed-id bytes per operation
@@ -43,7 +44,8 @@ query delete_multibyte_under() {
 --- mutate
 set write_max_bytes = 27;
 query delete_multibyte_exact() {
-    delete Doc where slug = "日"
+    match { $x: Doc } where $x.slug = "日"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
@@ -51,7 +53,8 @@ query delete_multibyte_exact() {
 --- mutate
 set write_max_bytes = 49;
 query delete_pair_under() {
-    delete Doc where grp = "pair"
+    match { $x: Doc } where $x.grp = "pair"
+    delete $x
 }
 
 --- expect error: retained removed-id bytes per operation
@@ -59,7 +62,8 @@ query delete_pair_under() {
 --- mutate
 set write_max_bytes = 50;
 query delete_pair_exact() {
-    delete Doc where grp = "pair"
+    match { $x: Doc } where $x.grp = "pair"
+    delete $x
 }
 
 --- expect affected: nodes=2 edges=0
@@ -67,7 +71,8 @@ query delete_pair_exact() {
 --- mutate
 set write_max_bytes = 74;
 query delete_hub_under() {
-    delete Doc where slug = "x"
+    match { $x: Doc } where $x.slug = "x"
+    delete $x
 }
 
 --- expect error: retained removed-id bytes per operation
@@ -87,7 +92,7 @@ d.slug: String
 
 --- query
 query cites_after_refused_cascade() {
-    match { $a: Doc $a $e:cites $b }
+    match { $a: Doc, $a $e:cites $b }
     return { $a.slug, $b.slug }
 }
 
@@ -101,7 +106,8 @@ b.slug: String
 --- mutate
 set write_max_bytes = 75;
 query delete_hub_exact() {
-    delete Doc where slug = "x"
+    match { $x: Doc } where $x.slug = "x"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=1
@@ -120,7 +126,7 @@ d.slug: String
 
 --- query
 query cites_after_cascade() {
-    match { $a: Doc $a $e:cites $b }
+    match { $a: Doc, $a $e:cites $b }
     return { $a.slug, $b.slug }
 }
 

@@ -16,7 +16,7 @@ node Tag {
 {"type":"Person","data":{"name":"alice"}}
 --- loop $x 1 2
 --- concurrent
-w1: query add() { insert Person { name: "bob" } }
+w1: query add() { replace Person { name: "bob" } }
 r1: query all() { match { $p: Person } return { $p.name } }
 --- expect
 w1: ok

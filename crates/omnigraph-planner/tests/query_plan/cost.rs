@@ -64,8 +64,8 @@ fn coverage_requires_every_endpoint_and_every_candidate_to_be_complete() {
                 (vec![unusable, dst.clone()], direction == Direction::In),
                 (vec![src, duplicate, dst], direction == Direction::In),
             ] {
-                let mut hop = expand("a", "b", vec![]);
-                let IROp::Expand { edges, .. } = &mut hop else {
+                let mut hop = expand("a", "b");
+                let PatternStep::Expand { edges, .. } = &mut hop else {
                     unreachable!()
                 };
                 *edges = EdgeSelection::Named(EdgeMember {
@@ -97,7 +97,7 @@ fn coverage_requires_every_endpoint_and_every_candidate_to_be_complete() {
 #[test]
 fn bound_expand_coverage_defaults_only_missing_provenance_to_legacy() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -173,7 +173,7 @@ fn bound_expand_coverage_defaults_only_missing_provenance_to_legacy() {
 #[test]
 fn expand_mode_records_the_frontier_and_applies_its_hard_cap() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -210,7 +210,7 @@ fn expand_mode_records_the_frontier_and_applies_its_hard_cap() {
 #[test]
 fn a_forced_traversal_overrides_the_cost_model() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -243,11 +243,7 @@ fn a_forced_traversal_overrides_the_cost_model() {
 #[test]
 fn a_second_expand_after_a_csr_expand_reuses_the_warm_csr() {
     let op = ir(
-        vec![
-            scan("a"),
-            expand("a", "b", vec![]),
-            expand("b", "c", vec![]),
-        ],
+        vec![scan("a"), expand("a", "b"), expand("b", "c")],
         vec![prop("c", "slug")],
         vec![],
     );
@@ -291,7 +287,7 @@ fn a_second_expand_after_a_csr_expand_reuses_the_warm_csr() {
 #[test]
 fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -314,7 +310,7 @@ fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
     assert!(fired.contains(&"access_path"), "{fired:?}");
 
     let from_s = ir(
-        vec![scan_of("a", "S"), expand("a", "b", vec![])],
+        vec![scan_of("a", "S"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -341,7 +337,7 @@ fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
     assert_eq!(json, "id_lookup");
     assert!(fired.contains(&"access_path"), "{fired:?}");
     let json = plan.to_json();
-    let root = &json["inputs"][0]["inputs"][0]["inputs"][0]["inputs"][0];
+    let root = &under_cut(&json)["inputs"][0]["inputs"][0]["inputs"][0];
     assert_eq!(root["node"], "Scan");
     assert!(root.get("access").is_none());
 }
@@ -352,7 +348,7 @@ fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
 #[test]
 fn access_path_looks_ids_up_when_the_build_side_does_not_fit_the_pool() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -435,7 +431,7 @@ fn access_path_looks_ids_up_when_the_build_side_does_not_fit_the_pool() {
 #[test]
 fn access_path_sizes_only_projected_columns() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -527,19 +523,22 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
     let filtered = |property: &str| {
         ir(
             vec![
-                IROp::NodeScan {
+                PatternStep::NodeScan {
                     variable: "a".to_string(),
                     type_name: "T".to_string(),
-                    filters: vec![IRExpr::comparison(
+                },
+                PatternStep::Filter {
+                    pred: IRExpr::comparison(
                         prop("a", property),
                         CompOp::Eq,
                         IRExpr::Literal(
                             Literal::String("x".into()),
                             value_type(ScalarType::String, false),
                         ),
-                    )],
+                    ),
+                    fails: false,
                 },
-                expand("a", "b", vec![]),
+                expand("a", "b"),
             ],
             vec![prop("b", "slug")],
             vec![],
@@ -582,7 +581,7 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
 #[test]
 fn no_statistics_keeps_the_id_lookup_and_records_no_access_pass() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -606,7 +605,7 @@ fn no_statistics_keeps_the_id_lookup_and_records_no_access_pass() {
 #[test]
 fn no_statistics_records_csr_with_no_estimate() {
     let op = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("b", "slug")],
         vec![],
     );
@@ -633,8 +632,8 @@ fn no_statistics_records_csr_with_no_estimate() {
 /// Synthetic caps isolate the cold cost comparison from hard-cap decisions.
 #[test]
 fn two_hops_choose_a_cold_csr_below_both_caps() {
-    let mut step = expand("a", "b", vec![]);
-    if let IROp::Expand { max_hops, .. } = &mut step {
+    let mut step = expand("a", "b");
+    if let PatternStep::Expand { max_hops, .. } = &mut step {
         *max_hops = Some(2);
     }
     let op = ir(vec![scan("a"), step], vec![prop("b", "slug")], vec![]);
@@ -692,7 +691,10 @@ fn a_contains_join_streams_the_searched_side_only_when_it_has_no_fewer_rows() {
             vec![
                 scan_of("m", "Matter"),
                 scan_of("w", "Word"),
-                IROp::Filter(filter),
+                PatternStep::Filter {
+                    pred: filter,
+                    fails: false,
+                },
             ],
             vec![prop("m", "slug"), prop("w", "slug")],
             vec![],
@@ -745,7 +747,10 @@ fn a_contains_join_marks_its_right_scan_and_keeps_the_other_conjunct() {
         vec![
             scan_of("m", "Matter"),
             scan_of("p", "Passage"),
-            IROp::Filter(IRExpr::and_all([contains.clone(), other.clone()]).expect("two")),
+            PatternStep::Filter {
+                pred: IRExpr::and_all([contains.clone(), other.clone()]).expect("two"),
+                fails: false,
+            },
         ],
         vec![prop("m", "slug"), prop("p", "slug")],
         vec![],
@@ -966,18 +971,23 @@ fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
     );
 
     let lookup = ir(
-        vec![IROp::NodeScan {
-            variable: "c".to_string(),
-            type_name: "T".to_string(),
-            filters: vec![IRExpr::comparison(
-                prop("c", "slug"),
-                CompOp::Eq,
-                IRExpr::Literal(
-                    Literal::String("one".to_string()),
-                    value_type(ScalarType::String, false),
+        vec![
+            PatternStep::NodeScan {
+                variable: "c".to_string(),
+                type_name: "T".to_string(),
+            },
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
+                    prop("c", "slug"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String("one".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
                 ),
-            )],
-        }],
+                fails: false,
+            },
+        ],
         vec![prop("c", "body")],
         vec![],
     );
@@ -986,7 +996,7 @@ fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
     assert_eq!(root_hydration(&plan), None);
 
     let traversal = ir(
-        vec![scan("a"), expand("a", "b", vec![])],
+        vec![scan("a"), expand("a", "b")],
         vec![prop("a", "slug"), prop("b", "body")],
         vec![],
     );
@@ -1006,21 +1016,26 @@ fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
 /// not keep the others from hydrating.
 #[test]
 fn hydration_keeps_every_column_something_besides_the_output_reads() {
-    let op = Operation::Query(Box::new(QueryIR {
+    let op = Operation::Query(Box::new(ReadShape {
         name: "q".to_string(),
         params: vec![],
-        pipeline: vec![IROp::NodeScan {
-            variable: "c".to_string(),
-            type_name: "T".to_string(),
-            filters: vec![IRExpr::comparison(
-                prop("c", "state"),
-                CompOp::Eq,
-                IRExpr::Literal(
-                    Literal::String("open".to_string()),
-                    value_type(ScalarType::String, false),
+        pipeline: vec![
+            PatternStep::NodeScan {
+                variable: "c".to_string(),
+                type_name: "T".to_string(),
+            },
+            PatternStep::Filter {
+                pred: IRExpr::comparison(
+                    prop("c", "state"),
+                    CompOp::Eq,
+                    IRExpr::Literal(
+                        Literal::String("open".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
                 ),
-            )],
-        }],
+                fails: false,
+            },
+        ],
         return_exprs: vec![
             returned(prop("c", "slug"), None, "c.slug"),
             returned(prop("c", "rank"), None, "c.rank"),
@@ -1057,13 +1072,19 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
             IROrdering {
                 expr: prop("c", "rank"),
                 descending: false,
+                nulls_first: None,
             },
             IROrdering {
                 expr: IRExpr::AliasRef("t".to_string(), property_type("title")),
                 descending: true,
+                nulls_first: None,
             },
         ],
         limit: Some(5),
+        limit_param: None,
+        written_columns: Vec::new(),
+        made_up: Default::default(),
+        work: Default::default(),
     }));
     let (plan, fired) = physical(&op, &source_with_rows(Some(1_000)));
     assert!(fired.contains(&"late_materialization"), "{fired:?}");
@@ -1096,27 +1117,20 @@ fn equals(variable: &str, property: &str, value: &str) -> IRExpr {
 fn negated_two_hops(
     outer_filters: Vec<IRExpr>,
     k_filters: Vec<IRExpr>,
-    inner_filters: Vec<IROp>,
+    inner_filters: Vec<PatternStep>,
 ) -> Operation {
-    let mut inner = vec![expand("a", "m", vec![]), expand("m", "k", k_filters)];
+    let mut inner = vec![expand("a", "m"), expand("m", "k")];
+    inner.extend(filters(k_filters));
     inner.extend(inner_filters);
-    let outer = IROp::NodeScan {
-        variable: "a".to_string(),
-        type_name: "T".to_string(),
-        filters: outer_filters,
-    };
-    ir(
-        vec![
-            outer,
-            IROp::AntiJoin {
-                outer_var: "a".to_string(),
-                inner,
-                predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
-            },
-        ],
-        vec![prop("a", "slug")],
-        vec![],
-    )
+    let mut pipeline = vec![scan("a")];
+    pipeline.extend(filters(outer_filters));
+    pipeline.push(PatternStep::AntiJoin {
+        fails: false,
+        outer_var: "a".to_string(),
+        inner,
+        predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
+    });
+    ir(pipeline, vec![prop("a", "slug")], vec![])
 }
 
 /// 1,000 `T` rows; `knows` fans out ten per source going out and `in_fanout`
@@ -1163,7 +1177,8 @@ fn anti_join_of(plan: &PhysicalPlan) -> (omnigraph_planner::AntiJoinStrategy, Ve
 /// chain produces fewer rows: one `$k`, ten `$m`, a hundred `$a` keys against
 /// the correlated 1,000 outer rows expanded twice. The key-set tree is a
 /// table scan of `$k` under the pushed equality, then both hops reversed,
-/// ending on `$a` with no scan of it and no `OuterReference`.
+/// ending on `$a` with no scan of it and no `OuterReference`. Nothing reads
+/// `$m` beyond its identity, so neither tree scans it.
 #[test]
 fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
     use omnigraph_planner::AntiJoinStrategy;
@@ -1178,7 +1193,7 @@ fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
     assert!(
         optimized.statistics.iter().any(|statistic| {
             statistic.statistic == "anti_join_rows($a)"
-                && statistic.value == "correlated 4001 estimated, key_set 121 estimated"
+                && statistic.value == "correlated 3001 estimated, key_set 111 estimated"
         }),
         "{:?}",
         optimized.statistics
@@ -1214,20 +1229,20 @@ fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
         shape,
         [
             "expand $m Some(In) $a",
-            "dependent scan $m",
             "expand $k Some(In) $m",
             "table scan $k filtered true",
         ]
     );
     let json = optimized.physical.to_json();
     assert_eq!(
-        json["inputs"][0]["inputs"][0]["strategy"], "key_set",
+        under_cut(&json)["inputs"][0]["strategy"],
+        "key_set",
         "{json}"
     );
 }
 
-/// The same block over one outer row stays correlated: its 122 rows beat the
-/// 1,201 the key set reaches when each destination has a hundred sources.
+/// The same block over one outer row stays correlated: its 112 rows beat the
+/// 1,101 the key set reaches when each destination has a hundred sources.
 #[test]
 fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
     use omnigraph_planner::AntiJoinStrategy;
@@ -1246,7 +1261,7 @@ fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
     assert!(
         optimized.statistics.iter().any(|statistic| {
             statistic.statistic == "anti_join_rows($a)"
-                && statistic.value == "correlated 122 estimated, key_set 1201 estimated"
+                && statistic.value == "correlated 112 estimated, key_set 1101 estimated"
         }),
         "{:?}",
         optimized.statistics
@@ -1267,11 +1282,10 @@ fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
 fn unbounded_or_outer_reading_blocks_stay_correlated() {
     use omnigraph_planner::AntiJoinStrategy;
 
-    let reads_outer = IROp::Filter(IRExpr::comparison(
-        prop("m", "state"),
-        CompOp::Eq,
-        prop("a", "state"),
-    ));
+    let reads_outer = PatternStep::Filter {
+        pred: IRExpr::comparison(prop("m", "state"), CompOp::Eq, prop("a", "state")),
+        fails: false,
+    };
     for (what, op) in [
         (
             "a non-key filter bounds nothing",
@@ -1343,9 +1357,14 @@ fn key_set_starts_from_the_most_bounded_binding_and_the_first_on_a_tie() {
         ir(
             vec![
                 scan("a"),
-                IROp::AntiJoin {
+                PatternStep::AntiJoin {
+                    fails: false,
                     outer_var: "a".to_string(),
-                    inner: vec![expand("a", "m", m_filters), expand("m", "k", k_filters)],
+                    inner: [vec![expand("a", "m")], filters(m_filters)]
+                        .into_iter()
+                        .chain([vec![expand("m", "k")], filters(k_filters)])
+                        .flatten()
+                        .collect(),
                     predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
                 },
             ],

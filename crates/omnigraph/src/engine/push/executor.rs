@@ -168,13 +168,19 @@ fn require_push_node(node: &PhysicalNode) -> Result<()> {
         | PhysicalNode::Filter { .. }
         | PhysicalNode::Expand { .. }
         | PhysicalNode::AntiJoin { .. }
+        | PhysicalNode::OptionalJoin { .. }
+        | PhysicalNode::Correlate { .. }
+        | PhysicalNode::Union { .. }
         | PhysicalNode::OuterReference { .. }
-        | PhysicalNode::RankFuse { .. }
+        | PhysicalNode::Fuse { .. }
         | PhysicalNode::Projection { .. }
         | PhysicalNode::Aggregate { .. }
         | PhysicalNode::Sort { .. }
         | PhysicalNode::HydrateColumns { .. }
         | PhysicalNode::Limit { .. }
+        | PhysicalNode::TargetCut { .. }
+        | PhysicalNode::Score { .. }
+        | PhysicalNode::Let { .. }
         | PhysicalNode::CsvSource { .. }
         | PhysicalNode::DeltaSource { .. }
         | PhysicalNode::Validate { .. }

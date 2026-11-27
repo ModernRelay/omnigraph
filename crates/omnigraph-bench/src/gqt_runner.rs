@@ -36,7 +36,6 @@ use omnigraph::instrumentation::{
     with_merge_write_probes, with_query_io_probes,
 };
 use omnigraph::storage::StorageAdapter;
-use omnigraph_compiler::settings::Engine;
 use omnigraph_gqt_core::runner_config::SeamDirective;
 use omnigraph_gqt_core::{
     Case, ConcurrentStep, ExecutionHost, Observer, Readback, ServedSession, ServerTarget, Step,
@@ -65,6 +64,7 @@ pub enum GqtOperationKind {
     BranchRead,
     Restart,
     Concurrent,
+    ApplySchema,
 }
 impl From<StepKind> for GqtOperationKind {
     fn from(kind: StepKind) -> Self {
@@ -83,6 +83,7 @@ impl From<StepKind> for GqtOperationKind {
             StepKind::BranchRead => Self::BranchRead,
             StepKind::Restart => Self::Restart,
             StepKind::Concurrent => Self::Concurrent,
+            StepKind::ApplySchema => Self::ApplySchema,
         }
     }
 }
@@ -612,7 +613,7 @@ impl<S: MeasurementSignals + Send> BenchHost<'_, S> {
         let db = Omnigraph::open_with_storage(&uri, fresh.storage)
             .await
             .map_err(|error| format!("the readback's handle failed to open: {error}"))?;
-        let reader = case_session(db, case, Engine::V2)?;
+        let reader = case_session(db, case)?;
         let readback = readback_acked_rows(&(), &reader, step, &driven.acked_runs).await?;
         self.observe_block(run, driven, readback);
         Ok(())
@@ -827,7 +828,7 @@ pub(crate) async fn execute_gqt_rep_signaled<S: MeasurementSignals + Send>(
         .map_err(|_| failure("whole-file timeout during open"))?
         .map_err(failure)?;
         let merge_probes = MergeWriteProbes::default();
-        let session = case_session(db, &case, Engine::V2).map_err(failure)?;
+        let session = case_session(db, &case).map_err(failure)?;
         let host = BenchHost {
             signals: Mutex::new(signals),
             selected: bound.plan.definition.workload.measured_step.ordinal,

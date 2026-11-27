@@ -88,6 +88,29 @@ pub(super) fn empty(
     )
 }
 
+/// A stream that pulls `input` to its end, keeping none of its rows, and
+/// then ends: a cut of zero rows over a subtree whose expressions can fail,
+/// which must refuse wherever a row of its input does (A3). Each batch is
+/// dropped as it arrives, so the cut holds no more than one.
+pub(super) fn drained(
+    metrics: &ExecutionPlanMetricsSet,
+    schema: SchemaRef,
+    input: SendableRecordBatchStream,
+) -> SendableRecordBatchStream {
+    let stream = futures::stream::once(async move {
+        let mut input = input;
+        while let Some(batch) = input.next().await {
+            batch?;
+        }
+        Ok::<_, DataFusionError>(None::<RecordBatch>)
+    })
+    .try_filter_map(|batch| async move { Ok(batch) });
+    polled(
+        metrics,
+        Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
+    )
+}
+
 /// The shape of an operator that emits nothing until it has seen all of its
 /// streamed input: one partition, `EmissionType::Final`, bounded.
 #[derive(Debug)]

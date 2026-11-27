@@ -230,6 +230,14 @@ release reports its package version as `version`, its commit as
 `source_version` and the storage format it writes as `internal_schema_version`
 on `GET /healthz`.
 
+A binary that speaks GQ 3 also prints its GQ language version, `major.minor`,
+after the `http-contract` line: `gq-language 3.0`, and `"gq_language": "3.0"`
+in `--json` and on `GET /healthz`. The minor number rises when the language
+only accepts more, the major when it accepts less or changes a shape it
+produces. A binary that reports no GQ language version is a GQ language 2 build,
+so the two tell apart even where their versions and contract numbers agree
+([Upgrading queries to GQ 3](queries/upgrading-to-gq3.md)).
+
 `internal_schema.writes` is the storage-format stamp of a graph this binary
 creates, the highest it writes, and the one `omnigraph upgrade` converts a
 graph to; `serves` is the inclusive range, lowest first, that normal open

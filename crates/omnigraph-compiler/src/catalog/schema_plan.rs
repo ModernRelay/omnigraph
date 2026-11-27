@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::schema::analysis::FullTextAnalysis;
 use crate::schema::ast::{Annotation, Cardinality, Constraint};
+use crate::schema::vector::VectorDistance;
 use crate::types::PropType;
 
 use super::schema_ir::{
@@ -24,6 +26,32 @@ pub enum SchemaTypeKind {
 pub struct SchemaMigrationPlan {
     pub supported: bool,
     pub steps: Vec<SchemaMigrationStep>,
+    /// The constructs of the desired source that a binary before this release
+    /// refuses once stored ([`crate::schema::one_way`]); empty when the plan
+    /// has no step, since such an apply stores nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_way_constructs: Vec<crate::schema::one_way::OneWayConstruct>,
+    /// [`crate::schema::one_way::one_way_note`], present with the constructs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_way_note: Option<String>,
+}
+
+impl SchemaMigrationPlan {
+    /// The plan with the one-way constructs `desired_source` writes, when it
+    /// has a step that would store that source.
+    pub fn with_one_way_constructs(mut self, desired_source: &str) -> Result<Self> {
+        self.one_way_constructs = if self.steps.is_empty() {
+            Vec::new()
+        } else {
+            crate::schema::one_way::one_way_constructs(desired_source)?
+        };
+        self.one_way_note = crate::schema::one_way::one_way_note(
+            self.one_way_constructs
+                .iter()
+                .map(|c| c.first_release.as_str()),
+        );
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -85,6 +113,38 @@ pub enum SchemaMigrationStep {
         type_kind: SchemaTypeKind,
         type_name: String,
         property_name: String,
+    },
+    /// Declare, change or remove the full-text analysis of a node property's
+    /// index (`@index(fulltext, analyzer = ..., scorer = ...)`); `property_name`
+    /// is the DESIRED (post-rename) name. Applied in place: when the analyzer
+    /// fingerprint changes, the column's full-text segments are replaced in
+    /// the apply's publication by one built with the new analysis and
+    /// certified with its fingerprint, so a certificate of the old analysis
+    /// never establishes the new one; postings are built off the critical
+    /// path as for an added `@index`. A scorer-only change on a field without
+    /// a profile changes no index.
+    ChangeFullTextAnalysis {
+        type_kind: SchemaTypeKind,
+        type_name: String,
+        property_name: String,
+        from: Option<FullTextAnalysis>,
+        to: Option<FullTextAnalysis>,
+    },
+    /// Change the distance a vector property declares
+    /// (`Vector(n, distance = ...)`); `property_name` is the DESIRED
+    /// (post-rename) name. Applied in place and metadata-only: no stored
+    /// vector changes, and an index built for the old distance is never used
+    /// for the new one, so reads score and rank from the exact scan until
+    /// `ensure_indices`/`optimize` rebuilds the index with the new distance.
+    /// Vectors already stored are not revalidated: a zero vector in a field
+    /// that becomes `cosine` drops its row from `distance` and `nearest`, as
+    /// a null does.
+    ChangeVectorDistance {
+        type_kind: SchemaTypeKind,
+        type_name: String,
+        property_name: String,
+        from: VectorDistance,
+        to: VectorDistance,
     },
     /// Widen an edge type's `@card` range (#1403): the desired minimum is no
     /// higher and the desired maximum no lower (or absent). `type_name` is the
@@ -231,6 +291,8 @@ pub fn plan_schema_migration(
             .iter()
             .any(|step| matches!(step, SchemaMigrationStep::UnsupportedChange { .. })),
         steps,
+        one_way_constructs: Vec::new(),
+        one_way_note: None,
     })
 }
 
@@ -741,6 +803,26 @@ fn plan_properties(
             &property.property_constraints,
             steps,
         );
+
+        if existing.full_text != property.full_text {
+            steps.push(SchemaMigrationStep::ChangeFullTextAnalysis {
+                type_kind,
+                type_name: type_name.to_string(),
+                property_name: property.name.clone(),
+                from: existing.full_text,
+                to: property.full_text,
+            });
+        }
+
+        if existing.distance != property.distance && existing.prop_type == property.prop_type {
+            steps.push(SchemaMigrationStep::ChangeVectorDistance {
+                type_kind,
+                type_name: type_name.to_string(),
+                property_name: property.name.clone(),
+                from: existing.distance.unwrap_or_default(),
+                to: property.distance.unwrap_or_default(),
+            });
+        }
 
         if existing.declared_directly != property.declared_directly {
             steps.push(SchemaMigrationStep::UnsupportedChange {
@@ -1944,6 +2026,172 @@ node Person @description("new") {
                 kwargs: Default::default(),
             }],
         }));
+    }
+
+    /// Declaring, changing or removing a node property's analyzer or scorer
+    /// is a supported in-place step on its index; renaming the property keeps
+    /// the declaration and plans no analysis step.
+    #[test]
+    fn plan_changes_full_text_analysis_in_place() {
+        use crate::schema::analysis::{AnalyzerProfile, FullTextAnalysis, FullTextScorer};
+        let source = |index: &str| {
+            format!("node Doc {{\n    slug: String @key\n    body: String {index}\n}}\n")
+        };
+        let accepted = ir(&source("@index"));
+        let english = FullTextAnalysis {
+            analyzer: Some(AnalyzerProfile::EnglishV1),
+            scorer: FullTextScorer::Bm25V1,
+        };
+        let step = |from: Option<FullTextAnalysis>, to: Option<FullTextAnalysis>| {
+            SchemaMigrationStep::ChangeFullTextAnalysis {
+                type_kind: SchemaTypeKind::Node,
+                type_name: "Doc".to_string(),
+                property_name: "body".to_string(),
+                from,
+                to,
+            }
+        };
+
+        let declared = evolve(
+            &accepted,
+            &source(r#"@index(fulltext, analyzer = "english_v1")"#),
+        );
+        let plan = plan_schema_migration(&accepted, &declared).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(plan.steps, vec![step(None, Some(english))]);
+
+        let changed = evolve(
+            &declared,
+            &source(r#"@index(fulltext, analyzer = "standard_v1", scorer = "none")"#),
+        );
+        let plan = plan_schema_migration(&declared, &changed).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(
+            plan.steps,
+            vec![step(
+                Some(english),
+                Some(FullTextAnalysis {
+                    analyzer: Some(AnalyzerProfile::StandardV1),
+                    scorer: FullTextScorer::None,
+                })
+            )]
+        );
+
+        let defaults = FullTextAnalysis {
+            analyzer: None,
+            scorer: FullTextScorer::Bm25V1,
+        };
+        let removed = evolve(&declared, &source("@index(fulltext)"));
+        let plan = plan_schema_migration(&declared, &removed).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(plan.steps, vec![step(Some(english), Some(defaults))]);
+
+        let renamed = evolve(
+            &declared,
+            "node Doc {\n    slug: String @key\n    text: String @rename_from(\"body\") @index(fulltext, analyzer = \"english_v1\")\n}\n",
+        );
+        let plan = plan_schema_migration(&declared, &renamed).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, SchemaMigrationStep::ChangeFullTextAnalysis { .. })),
+            "{plan:?}"
+        );
+
+        // `@index(fulltext)` over a plain `@index` declares the full-text
+        // index, and a plain `@index` over it withdraws the declaration; the
+        // resolved analysis is `english_v1` either way.
+        let full_text = evolve(&accepted, &source("@index(fulltext)"));
+        let plan = plan_schema_migration(&accepted, &full_text).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(plan.steps, vec![step(None, Some(defaults))]);
+        let plain = evolve(&full_text, &source("@index"));
+        let plan = plan_schema_migration(&full_text, &plain).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(plan.steps, vec![step(Some(defaults), None)]);
+        let same = evolve(&accepted, &source("@index"));
+        assert!(
+            plan_schema_migration(&accepted, &same)
+                .unwrap()
+                .steps
+                .is_empty()
+        );
+    }
+
+    /// Changing a vector's distance is a supported in-place step; writing
+    /// `l2` where it was omitted changes nothing, and a rename keeps the
+    /// distance.
+    #[test]
+    fn plan_changes_vector_distance_in_place() {
+        use crate::schema::vector::VectorDistance;
+        let source =
+            |ty: &str| format!("node Doc {{\n    slug: String @key\n    e: {ty} @index\n}}\n");
+        let step = |from, to| SchemaMigrationStep::ChangeVectorDistance {
+            type_kind: SchemaTypeKind::Node,
+            type_name: "Doc".to_string(),
+            property_name: "e".to_string(),
+            from,
+            to,
+        };
+        let accepted = ir(&source("Vector(3)"));
+        let cosine = evolve(&accepted, &source(r#"Vector(3, distance = "cosine")"#));
+        let plan = plan_schema_migration(&accepted, &cosine).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(
+            plan.steps,
+            vec![step(VectorDistance::L2, VectorDistance::Cosine)]
+        );
+
+        let dot = evolve(&cosine, &source(r#"Vector(3, distance = "dot")"#));
+        let plan = plan_schema_migration(&cosine, &dot).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(
+            plan.steps,
+            vec![step(VectorDistance::Cosine, VectorDistance::Dot)]
+        );
+
+        let back = evolve(&dot, &source(r#"Vector(3, distance = "l2")"#));
+        let plan = plan_schema_migration(&dot, &back).unwrap();
+        assert_eq!(
+            plan.steps,
+            vec![step(VectorDistance::Dot, VectorDistance::L2)]
+        );
+
+        let written = evolve(&accepted, &source(r#"Vector(3, distance = "l2")"#));
+        assert!(
+            plan_schema_migration(&accepted, &written)
+                .unwrap()
+                .steps
+                .is_empty()
+        );
+
+        let renamed = evolve(
+            &cosine,
+            "node Doc {\n    slug: String @key\n    f: Vector(3, distance = \"cosine\") @rename_from(\"e\") @index\n}\n",
+        );
+        let plan = plan_schema_migration(&cosine, &renamed).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, SchemaMigrationStep::ChangeVectorDistance { .. })),
+            "{plan:?}"
+        );
+
+        // A dimension change stays an unsupported type change, distance or not.
+        let wider = evolve(&accepted, &source(r#"Vector(4, distance = "cosine")"#));
+        let plan = plan_schema_migration(&accepted, &wider).unwrap();
+        assert!(!plan.supported, "{plan:?}");
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, SchemaMigrationStep::ChangeVectorDistance { .. })),
+            "{plan:?}"
+        );
     }
 
     #[test]

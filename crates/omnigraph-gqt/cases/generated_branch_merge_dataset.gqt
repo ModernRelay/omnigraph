@@ -47,7 +47,7 @@ branch create "bench-source" from main
 branch create "bench-target" from main
 --- expect ok
 
---- load generate: v1 seed: 0 mode: merge branch: bench-source
+--- load generate: v1 seed: 0 mode: replace branch: bench-source
 tables:
   - kind: "edge"
     name: "BenchE000"
@@ -65,12 +65,12 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_src_0($c: String) { match { $x: BenchE000 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d3_src_del"}
 --- expect ok
 
---- load generate: v1 seed: 0 mode: append branch: bench-source
+--- load generate: v1 seed: 0 mode: insert branch: bench-source
 tables:
   - kind: "edge"
     name: "BenchE000"
@@ -87,7 +87,7 @@ tables:
       payload: {"kind": "repeat", "text": "y", "count": 64}
 --- expect ok
 
---- load generate: v1 seed: 0 mode: merge branch: bench-target
+--- load generate: v1 seed: 0 mode: replace branch: bench-target
 tables:
   - kind: "edge"
     name: "BenchE000"
@@ -105,12 +105,12 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_tgt_0($c: String) { match { $x: BenchE000 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d3_tgt_del"}
 --- expect ok
 
---- load generate: v1 seed: 0 mode: append branch: bench-target
+--- load generate: v1 seed: 0 mode: insert branch: bench-target
 tables:
   - kind: "edge"
     name: "BenchE000"

@@ -1,0 +1,65 @@
+# issue: none
+# notes: `stddev` and `percentile` hold a group's values in the query's memory pool as `collect`
+# notes: holds its list, so values beyond `query_memory_bytes` refuse the read naming the setting,
+# notes: while `max` and `count` over the same rows, which hold one value each, fit the same
+# notes: budget. 8192 I64 values alone hold the whole 65536 bytes, so the read is refused.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    id: String @key
+    v: I64
+}
+
+--- seed
+{"type":"Item","data":{"id":"a","v":-100}}
+
+--- load generate: v1 seed: 3 mode: insert
+tables:
+  - kind: node
+    name: Item
+    rows: 8192
+    commits: 2
+    batch_rows: 4096
+    columns:
+      id: {kind: key, prefix: k, width: 6}
+      v: {kind: ordinal, start: 0, step: 1}
+--- expect ok
+
+--- query
+set query_memory_bytes = 65536;
+query median_refused() {
+    match { $i: Item }
+    return { percentile($i.v, 0.5) as median }
+}
+
+--- expect error: resource limit exceeded for query_memory_bytes
+
+--- query
+set query_memory_bytes = 65536;
+query spread_refused() {
+    match { $i: Item }
+    return { stddev($i.v) as sd }
+}
+
+--- expect error: resource limit exceeded for query_memory_bytes
+
+--- query
+set query_memory_bytes = 65536;
+query largest_fits() {
+    match { $i: Item }
+    where $i.v >= 0
+    return { max($i.v) as top, count($i) as items }
+}
+
+--- expect unordered
+{"items":8192,"top":8191}
+
+--- expect shape
+top: I64?
+items: I64

@@ -32,7 +32,7 @@ use super::{
 use crate::db::{Omnigraph, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::loader::read_reuse::LoadReadReuse;
-use crate::loader::{enum_constraint_failures, value_constraint_failures};
+use crate::loader::{enum_constraint_failures, value_constraint_failures, zero_vector_failures};
 use crate::storage_layer::WriteBudget;
 
 pub(crate) enum LoadPhase {
@@ -1377,31 +1377,50 @@ fn keep_orphans(orphans: &mut Vec<(Position, Violation)>, report: Report) {
 
 /// The evaluator's row-local value judgment of one batch: every violated
 /// constraint with its declaration index and first violating row, `@range`
-/// and `@check` then enum membership on a node, enum membership on an edge.
+/// and `@check`, enum membership, then a zero vector in a `cosine` field on a
+/// node; enum membership then a zero vector in a `cosine` field on an edge.
 fn value_check(
     table: &str,
     type_name: &str,
     catalog: &Catalog,
     batch: &RecordBatch,
 ) -> Vec<(usize, usize, OmniError)> {
-    if table.starts_with("node:") {
+    let (mut failures, declared, properties, distances) = if table.starts_with("node:") {
         let Some(node_type) = catalog.node_types.get(type_name) else {
             return Vec::new();
         };
-        let declared = node_type.range_constraints.len() + node_type.check_constraints.len();
-        let mut failures = value_constraint_failures(batch, node_type);
-        failures.extend(
-            enum_constraint_failures(batch, &node_type.properties, type_name)
-                .into_iter()
-                .map(|(index, row, error)| (declared + index, row, error)),
-        );
-        failures
+        (
+            value_constraint_failures(batch, node_type),
+            node_type.range_constraints.len() + node_type.check_constraints.len(),
+            &node_type.properties,
+            &node_type.vector_distances,
+        )
     } else {
-        match catalog.edge_types.get(type_name) {
-            Some(edge_type) => enum_constraint_failures(batch, &edge_type.properties, type_name),
-            None => Vec::new(),
-        }
-    }
+        let Some(edge_type) = catalog.edge_types.get(type_name) else {
+            return Vec::new();
+        };
+        (
+            Vec::new(),
+            0,
+            &edge_type.properties,
+            &edge_type.vector_distances,
+        )
+    };
+    let enums = properties
+        .values()
+        .filter(|property| property.enum_values.is_some())
+        .count();
+    failures.extend(
+        enum_constraint_failures(batch, properties, type_name)
+            .into_iter()
+            .map(|(index, row, error)| (declared + index, row, error)),
+    );
+    failures.extend(
+        zero_vector_failures(batch, distances, type_name)
+            .into_iter()
+            .map(|(index, row, error)| (declared + enums + index, row, error)),
+    );
+    failures
 }
 
 /// What the finalizers report, under the judge's [`Report`]: the first
@@ -1782,7 +1801,7 @@ mod tests {
     use arrow_array::StringArray;
     use arrow_schema::{DataType, Field, Schema};
     use omnigraph_compiler::ir::lower_load;
-    use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+    use omnigraph_compiler::query::file::{LoadStmt, LoadStmtMode, LoadTarget};
     use omnigraph_compiler::settings::SessionSettings;
     use omnigraph_planner::ConsultedImage;
 
@@ -1884,8 +1903,8 @@ mod tests {
                 removal,
                 delta: match mode {
                     LoadStmtMode::Overwrite => DeltaClass::Replace,
-                    LoadStmtMode::Append => DeltaClass::Insert,
-                    LoadStmtMode::Merge => DeltaClass::Upsert,
+                    LoadStmtMode::Insert => DeltaClass::Insert,
+                    LoadStmtMode::Upsert | LoadStmtMode::Replace => DeltaClass::Upsert,
                 },
                 deleted_ids: Vec::new(),
             }],
@@ -1991,7 +2010,7 @@ mod tests {
             let refused = judge(
                 &db,
                 LoadTarget::Edge("Knows".into()),
-                LoadStmtMode::Append,
+                LoadStmtMode::Insert,
                 access,
                 &orphan_first,
             )
@@ -2010,7 +2029,7 @@ mod tests {
             let refused = judge(
                 &db,
                 LoadTarget::Edge("Knows".into()),
-                LoadStmtMode::Append,
+                LoadStmtMode::Insert,
                 access,
                 &over_card,
             )
@@ -2028,7 +2047,7 @@ mod tests {
             judge(
                 &db,
                 LoadTarget::Edge("Knows".into()),
-                LoadStmtMode::Append,
+                LoadStmtMode::Insert,
                 access,
                 &admitted,
             )
@@ -2051,7 +2070,7 @@ mod tests {
         let refused = judge(
             &db,
             LoadTarget::Node("Person".into()),
-            LoadStmtMode::Append,
+            LoadStmtMode::Insert,
             ValidateAccess::Probe,
             &batches,
         )
@@ -2065,7 +2084,7 @@ mod tests {
         let refused = judge(
             &db,
             LoadTarget::Node("Person".into()),
-            LoadStmtMode::Append,
+            LoadStmtMode::Insert,
             ValidateAccess::Scan,
             &only_committed,
         )

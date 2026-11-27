@@ -631,7 +631,7 @@ omnigraph init s3://bucket/bench/main/graph --schema schema.pg
 target/release/omnigraph-bench projection export \
   --store s3://bucket/bench/main \
   --catalog benchmarks --catalog catalogs/private \
-  | omnigraph load --target s3://bucket/bench/main/graph --mode merge --data /dev/stdin
+  | omnigraph load --target s3://bucket/bench/main/graph --mode replace --data /dev/stdin
 omnigraph query --target s3://bucket/bench/main/graph \
   --query projection/queries/series_for_scenario.gq series_for_scenario \
   --params '{"scenario": "branch-merge-d50-process-cold"}'
@@ -659,8 +659,8 @@ them fixed: `points_at` answers a scenario's points at one level, and
 records hold and no catalog declares is still a `Scenario`, with no
 declaration, so its runs stay in the series. Each run `ran` the scenario its
 record names, so two case names that measure one point keep their own runs.
-A second export of the same store under `--mode merge` changes nothing. A
-merge load replaces a row and deletes none: a scenario taken out of a suite
+A second export of the same store under `--mode replace` changes nothing. A
+replace load replaces a row and deletes none: a scenario taken out of a suite
 stays in it, and a scenario the last export did not declare keeps the
 workload and fixture of its last declaration. Its facts are empty when the
 records still hold its name, since the export writes that name's row with no

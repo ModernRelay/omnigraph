@@ -25,7 +25,37 @@ fn parse_failure_returns_structured_error_output() {
     assert!(output.results.is_empty());
     assert_eq!(output.findings.len(), 1);
     assert_eq!(output.findings[0].severity, QueryLintSeverity::Error);
-    assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
+    assert_eq!(output.findings[0].code, "Q001");
+}
+
+/// A file declaring one name twice is refused whole, and the finding keeps
+/// the code `T83` at the later declaration, one finding for each later
+/// declaration.
+#[test]
+fn a_repeated_declaration_name_is_a_t83_finding() {
+    let output = lint_query_file(
+        &catalog("node Person { name: String }"),
+        "query q() { match { $p: Person } return { $p.name } }\nquery q() { match { $p: Person } return { $p } }\nquery q() { match { $p: Person } return { $p } }\n",
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+    assert_eq!(output.status, QueryLintStatus::Error);
+    assert_eq!(output.queries_processed, 0);
+    assert_eq!(output.findings.len(), 2);
+    assert_eq!(output.errors, 2);
+    assert!(
+        output.findings[1].message.starts_with("line 3, column 7: "),
+        "{}",
+        output.findings[1].message
+    );
+    assert_eq!(output.findings[0].code, "T83");
+    assert!(
+        output.findings[0]
+            .message
+            .starts_with("line 2, column 7: type error: T83: `q` is declared twice"),
+        "{}",
+        output.findings[0].message
+    );
 }
 
 #[test]
@@ -42,7 +72,7 @@ fn branch_statement_is_refused_as_a_parse_family_finding() {
     assert_eq!(output.errors, 1);
     assert!(output.results.is_empty());
     assert_eq!(output.findings.len(), 1);
-    assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
+    assert_eq!(output.findings[0].code, "Q004");
     assert_eq!(
         output.findings[0].message,
         "`branch merge` is a branch statement, not a query declaration"
@@ -87,7 +117,7 @@ fn refused_set_line_is_reported_with_its_position() {
     assert_eq!(output.status, QueryLintStatus::Error);
     assert_eq!(output.queries_processed, 0);
     assert_eq!(output.findings.len(), 1);
-    assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
+    assert_eq!(output.findings[0].code, "Q003");
     let message = &output.findings[0].message;
     assert!(message.starts_with("line 1, column "), "{message}");
     assert!(message.contains("unknown value `v3`"), "{message}");
@@ -106,12 +136,14 @@ name: String?
         ),
         r#"
 query list_people($slug: String) {
-match { $p: Person { slug: $slug } }
+match { $p: Person } where $p.slug = $slug
 return { $p.name }
 }
 
 query bad_update($slug: String) {
-update Person set { missing: "nope" } where slug = $slug
+match { $x: Person } where $x.slug = $slug
+update $x set { missing: "nope" }
+update $x set { nmae: "x" }
 }
 "#,
         "/tmp/queries.gq",
@@ -125,7 +157,7 @@ update Person set { missing: "nope" } where slug = $slug
     assert_eq!(
         operation.result,
         vec![QueryResultFieldDescriptor {
-            name: "name".to_string(),
+            name: "p.name".to_string(),
             kind: QueryValueKind::String,
             item_kind: None,
             vector_dim: None,
@@ -150,7 +182,18 @@ update Person set { missing: "nope" } where slug = $slug
             .unwrap_or_default()
             .contains("has no property")
     );
+    // Every refusal of the query's pass, each where it stands.
+    let refusals = &output.results[1].diagnostics;
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    assert!(
+        refusals[1]
+            .message
+            .contains("`nmae`; nearest: name (String?)")
+    );
+    assert_eq!(refusals[1].position.map(|at| at.line), Some(10));
     let serialized = serde_json::to_value(&output).unwrap();
+    assert!(serialized["results"][0].get("diagnostics").is_none());
+    assert_eq!(serialized["results"][1]["diagnostics"][1]["code"], "T11");
     assert!(
         serialized["results"][1].get("operation").is_none(),
         "failed queries must omit the descriptor rather than serialize a partial value"
@@ -180,7 +223,7 @@ insert Person { slug: "p1", name: "P1" }
 }
 
 query insert_knows($from: String, $to: String) {
-insert Knows { from: $from, to: $to }
+insert Knows { @src: $from, @dst: $to }
 }
 "#,
         "/tmp/queries.gq",
@@ -246,7 +289,8 @@ effectiveTo: DateTime?
         ),
         r#"
 query update_policy($slug: String, $name: String) {
-update Policy set { name: $name } where slug = $slug
+match { $x: Policy } where $x.slug = $slug
+update $x set { name: $name }
 }
 "#,
         "/tmp/queries.gq",
@@ -300,7 +344,8 @@ embedding: Vector(3)? @embed(body)
         ),
         r#"
 query update_doc($slug: String, $body: String) {
-update Doc set { body: $body } where slug = $slug
+match { $x: Doc } where $x.slug = $slug
+update $x set { body: $body }
 }
 "#,
         "/tmp/queries.gq",
@@ -334,7 +379,8 @@ name: String?
         &catalog,
         r#"
 query update_policy($slug: String, $name: String) {
-update Policy set { name: $name } where slug = $slug
+match { $x: Policy } where $x.slug = $slug
+update $x set { name: $name }
 }
 "#,
         "/tmp/queries.gq",
@@ -364,11 +410,13 @@ a_field: String?
         ),
         r#"
 query update_b($slug: String) {
-update Policy set { a_field: "x" } where slug = $slug
+match { $x: Policy } where $x.slug = $slug
+update $x set { a_field: "x" }
 }
 
 query update_a($slug: String) {
-update Policy set { a_field: "x" } where slug = $slug
+match { $x: Policy } where $x.slug = $slug
+update $x set { a_field: "x" }
 }
 "#,
         "/tmp/queries.gq",
@@ -394,10 +442,8 @@ edge WorksAt: Person -> Company
         ),
         r#"
 query unemployed() {
-match {
-    $p: Person
-    not { $p worksAt $_ }
-}
+match { $p: Person }
+where not exists { $p worksAt $_ }
 return { $p.name }
 }
 
@@ -443,7 +489,8 @@ edge Partners: Company -> Company
         ),
         r#"
 query delete_person($slug: String) {
-delete Person where slug = $slug
+match { $x: Person } where $x.slug = $slug
+delete $x
 }
 "#,
         "/tmp/queries.gq",
@@ -470,7 +517,7 @@ delete Person where slug = $slug
 }
 
 #[test]
-fn same_named_node_and_edge_mutation_keeps_the_typechecked_namespace() {
+fn same_named_node_and_edge_mutation_keeps_the_typechecked_namespace_issue_921() {
     let output = lint_query_file(
         &catalog(
             r#"
@@ -494,6 +541,29 @@ insert Shared { slug: $slug }
     };
     assert_eq!(operation.reads, vec![node.clone()]);
     assert_eq!(operation.writes, vec![node]);
+
+    // Its endpoint assignments make an insert of the same name an edge insert.
+    let output = lint_query_file(
+        &catalog(
+            r#"
+node Shared { slug: String @key }
+edge Shared: Shared -> Shared
+"#,
+        ),
+        r#"
+query link_shared($from: String, $to: String) {
+insert Shared { @src: $from, @dst: $to }
+}
+"#,
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+    let operation = output.results[0].operation.as_ref().unwrap();
+    let edge = QueryGraphFact {
+        kind: QueryGraphFactKind::Edge,
+        type_name: "Shared".to_string(),
+    };
+    assert_eq!(operation.writes, vec![edge]);
 }
 
 #[test]
@@ -516,13 +586,13 @@ createdAt: DateTime?
 query describe_doc() {
 match { $d: Doc }
 return {
-    $d.slug
-    $d.count
-    $d.total
-    $d.score
-    $d.tags
-    $d.embedding
-    $d.createdAt
+    $d.slug,
+    $d.count,
+    $d.total,
+    $d.score,
+    $d.tags,
+    $d.embedding,
+    $d.createdAt,
     $d
 }
 }
@@ -547,19 +617,19 @@ return {
     assert_eq!(
         shapes,
         vec![
-            ("slug", QueryValueKind::String, None, None, false),
-            ("count", QueryValueKind::Int, None, None, false),
-            ("total", QueryValueKind::BigInt, None, None, false),
-            ("score", QueryValueKind::Float, None, None, false),
+            ("d.slug", QueryValueKind::String, None, None, false),
+            ("d.count", QueryValueKind::Int, None, None, false),
+            ("d.total", QueryValueKind::BigInt, None, None, false),
+            ("d.score", QueryValueKind::Float, None, None, false),
             (
-                "tags",
+                "d.tags",
                 QueryValueKind::List,
                 Some(QueryValueKind::Date),
                 None,
                 true,
             ),
-            ("embedding", QueryValueKind::Vector, None, Some(3), false,),
-            ("createdAt", QueryValueKind::DateTime, None, None, true,),
+            ("d.embedding", QueryValueKind::Vector, None, Some(3), false,),
+            ("d.createdAt", QueryValueKind::DateTime, None, None, true,),
             ("d", QueryValueKind::Object, None, None, false),
         ]
     );
@@ -568,7 +638,7 @@ return {
     assert_eq!(
         serialized["results"][0]["operation"]["result"][4],
         serde_json::json!({
-            "name": "tags",
+            "name": "d.tags",
             "kind": "list",
             "item_kind": "date",
             "nullable": true
@@ -577,7 +647,7 @@ return {
     assert_eq!(
         serialized["results"][0]["operation"]["result"][5],
         serde_json::json!({
-            "name": "embedding",
+            "name": "d.embedding",
             "kind": "vector",
             "vector_dim": 3,
             "nullable": false
@@ -594,7 +664,7 @@ fn selected_scopes_contribute_every_read_fact_issue_659() {
         let output = lint_query_file(
             &schema,
             &format!(
-                "query q() {{ match {{ $p: Person not {{ $p {selector} $c $c: Company }} }} return {{ $p.name }} }}"
+                "query q() {{ match {{ $p: Person }} where not exists {{ $p {selector} $c, $c: Company }} return {{ $p.name }} }}"
             ),
             "/tmp/queries.gq",
             QueryLintSchemaSource::file("/tmp/schema.pg"),
@@ -619,6 +689,159 @@ fn selected_scopes_contribute_every_read_fact_issue_659() {
                     type_name: "WorksAt".into()
                 },
             ]
+        );
+    }
+}
+
+/// The count-block rewrites lint names (the GQ 3 RFC,
+/// sections 5 and 6), each at the block's position and with its fix: `L203`
+/// for `count { } > 0`, a canonical form whose fix keeps the typed IR, and
+/// `L204` and `L205` for the rows-equal `count { } >= 1` and
+/// `count { } = 0`, whose fix changes the IR. A count compared with another
+/// bound draws none. Findings about queries keep source order.
+#[test]
+fn l203_to_l205_name_the_count_block_rewrites_with_their_fixes() {
+    let output = lint_query_file(
+        &catalog(
+            r#"
+node Person { name: String @key }
+edge Knows: Person -> Person
+"#,
+        ),
+        r#"query some() {
+  match { $p: Person }
+  where count { $q: Person, $p knows $q } > 0
+  return { $p.name }
+}
+query at_least_one() {
+  match { $p: Person }
+  where count { $q: Person, $p knows $q } >= 1
+  return { $p.name }
+}
+query none() {
+  match { $p: Person }
+  where count { $q: Person, $p knows $q } = 0 and count { $q: Person, $q knows $p } > 1
+  return { $p.name }
+}
+"#,
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+    let findings = output
+        .findings
+        .iter()
+        .map(|f| {
+            (
+                f.code.as_str(),
+                f.query_names.join(","),
+                f.message.as_str(),
+                f.fix.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        findings,
+        vec![
+            (
+                "L203",
+                "some".to_string(),
+                "line 3, column 9: `count { $q: Person, $p knows $q } > 0` is `exists { $q: Person, $p knows $q }`, the same typed IR",
+                Some("exists { $q: Person, $p knows $q }"),
+            ),
+            (
+                "L204",
+                "at_least_one".to_string(),
+                "line 8, column 9: `count { $q: Person, $p knows $q } >= 1` has the rows of `exists { $q: Person, $p knows $q }`, which says it directly",
+                Some("exists { $q: Person, $p knows $q }"),
+            ),
+            (
+                "L205",
+                "none".to_string(),
+                "line 13, column 9: `count { $q: Person, $p knows $q } = 0` has the rows of `not exists { $q: Person, $p knows $q }`, which says it directly",
+                Some("not exists { $q: Person, $p knows $q }"),
+            ),
+        ]
+    );
+    assert!(
+        output
+            .findings
+            .iter()
+            .all(|f| f.severity == QueryLintSeverity::Info)
+    );
+    assert_eq!(output.status, QueryLintStatus::Ok);
+}
+
+/// Every diagnostic `lint` reports carries its fix and, where the fix is
+/// machine-applicable, its byte-range edits: a parse refusal of a GQ 2
+/// form, a type refusal of a removed call and a canonical form alike. The
+/// edits are exactly what `lint --fix` (`fix_source`) applies: applying the
+/// reported edits gives the text `fix_source` writes.
+#[test]
+fn every_reported_fix_carries_the_edits_lint_fix_applies() {
+    use crate::query::diagnostic::TextEdit;
+    use crate::query::fix::{FixOptions, fix_source};
+    let catalog = catalog("node Person { name: String @key\n age: I32? }\n");
+    for (label, source, code) in [
+        (
+            "a GQ 2 filter in match",
+            "query q() { match { $p: Person  $p.age > 30 } return { $p.name } }",
+            "Q017",
+        ),
+        (
+            "fuzzy with a positional budget",
+            "query q($s: String) { match { $p: Person } where fuzzy($p.name, $s, 1) return { $p.name } }",
+            "T6",
+        ),
+        (
+            "a canonical form",
+            "query q() { match { $p: Person } return { $p.name } order { $p.name asc } }",
+            "L208",
+        ),
+    ] {
+        let out = lint_query_file(
+            &catalog,
+            source,
+            "q.gq",
+            QueryLintSchemaSource::file("s.pg"),
+        );
+        let mut reported: Vec<(String, Option<String>, Vec<TextEdit>)> = out
+            .findings
+            .iter()
+            .map(|f| {
+                (
+                    f.code.clone(),
+                    f.fix.clone(),
+                    f.suggestion
+                        .as_ref()
+                        .map(|s| s.edits.clone())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        reported.extend(out.results.iter().flat_map(|r| &r.diagnostics).map(|d| {
+            (
+                d.code.as_str().to_string(),
+                d.fix.clone(),
+                d.suggestion
+                    .as_deref()
+                    .map(|s| s.edits.clone())
+                    .unwrap_or_default(),
+            )
+        }));
+        assert_eq!(reported.len(), 1, "{label}: {reported:?}");
+        let (reported_code, fix, mut edits) = reported.remove(0);
+        assert_eq!(reported_code, code, "{label}");
+        assert!(fix.is_some(), "{label}: no fix");
+        assert!(!edits.is_empty(), "{label}: no edits");
+        edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+        let mut text = source.to_string();
+        for edit in edits {
+            text.replace_range(edit.start..edit.end, &edit.replacement);
+        }
+        assert_eq!(
+            fix_source(&catalog, source, FixOptions::default()).fixed,
+            Some(text),
+            "{label}"
         );
     }
 }

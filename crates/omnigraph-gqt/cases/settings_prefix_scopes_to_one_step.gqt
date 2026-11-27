@@ -24,7 +24,7 @@ set merge_lineage = on;
 --- query
 set merge_lineage = off;
 query people($name: String) {
-    match { $p: Person { name: $name } }
+    match { $p: Person } where $p.name = $name
     return { $p.name }
 }
 

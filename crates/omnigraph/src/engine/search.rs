@@ -27,11 +27,6 @@ pub(super) struct SearchMode {
     /// ranked type satisfies an Expand's first hop. Read off the `Pass` by
     /// `Lowering::search_mode`; an RRF arm's pass never carries it.
     pub(super) answer_proven_empty: bool,
-    /// BM25 full-text search on the scan's binding.
-    pub(super) bm25: Option<Bm25Target>,
-    /// The plan places the scan's eligibility after scoring: its filter
-    /// runs as Lance's postfilter, so BM25 statistics read every row.
-    pub(super) eligibility_after_scoring: bool,
     /// The set a gate ANDs into the ranked scan as `id IN (...)`, read off the
     /// `Pass` by `Lowering::search_mode`; the arms an `rrf()` prefilter feeds
     /// are the plan's `Prefilter.feeds`.
@@ -45,13 +40,6 @@ pub(super) struct NearestTarget {
     pub(super) property: String,
     pub(super) vector: Vec<f32>,
     pub(super) k: usize,
-}
-
-/// `bm25($v.property, q)` as one scan runs it: the bound query text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Bm25Target {
-    pub(super) property: String,
-    pub(super) text: String,
 }
 
 /// The overfetch ladder's rung for one nearest scan: the candidates it asks
@@ -125,12 +113,6 @@ impl Pass {
 
     pub(super) fn is_proven_empty(&self, id: NodeId) -> bool {
         self.proven_empty.contains(&id)
-    }
-
-    /// Whether any scan of this pass was proven empty: the pipeline over it
-    /// feeds nothing.
-    pub(super) fn answer_proven_empty(&self) -> bool {
-        !self.proven_empty.is_empty()
     }
 }
 
@@ -301,13 +283,6 @@ impl SearchMode {
     }
 }
 
-/// `rrf(a, b, k)` as the fusion runs it: the rank constant. The query's
-/// `limit` cuts the fused rows in the `Sort` above the fusion, never here.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct RrfMode {
-    pub(super) k: u32,
-}
-
 #[derive(Debug, PartialEq)]
 enum NearestQuery {
     Vector(Vec<f32>),
@@ -366,9 +341,37 @@ fn resolve_nearest_query(expr: &IRExpr, params: &ParamMap) -> Result<NearestQuer
     Ok(NearestQuery::Vector(values.values().to_vec()))
 }
 
-/// Resolve a nearest query vector, embedding string inputs with the property's
-/// recorded model. Explicit vectors do not require an embedding client.
+/// Resolve the query vector of a `distance` or `nearest`, embedding string
+/// inputs with the property's recorded model. Explicit vectors do not
+/// require an embedding client. A zero vector is refused on a `cosine` field,
+/// whose distance it leaves undefined, here, before the read runs.
 pub(super) async fn resolve_nearest_query_vec(
+    catalog: &Catalog,
+    type_name: &str,
+    property: &str,
+    expr: &IRExpr,
+    params: &ParamMap,
+    embedding: &EmbeddingResolver<'_>,
+) -> Result<Vec<f32>> {
+    let vector =
+        resolve_query_vector(catalog, type_name, property, expr, params, embedding).await?;
+    let distance = catalog
+        .node_types
+        .get(type_name)
+        .map(|node_type| node_type.vector_distance(property))
+        .unwrap_or_default();
+    if distance.refuses_zero_vector() && omnigraph_compiler::schema::vector::is_zero_vector(&vector)
+    {
+        return Err(OmniError::manifest(format!(
+            "the query vector for '{type_name}.{property}' is a zero vector, which its \
+             {distance} distance leaves undefined; a {distance} field ranks only a vector \
+             with a component that is not zero"
+        )));
+    }
+    Ok(vector)
+}
+
+async fn resolve_query_vector(
     catalog: &Catalog,
     type_name: &str,
     property: &str,
@@ -398,16 +401,37 @@ pub(super) async fn resolve_nearest_query_vec(
     }
 }
 
-/// The rank constant defaults only when the optional expression is absent.
+/// The rank constant, in `1..=1000000`; it defaults only when the optional
+/// expression is absent. A parameter bound outside the range refuses the
+/// read.
 pub(super) fn resolve_rrf_k(expr: Option<&IRExpr>, params: &ParamMap) -> Result<u32> {
+    use omnigraph_compiler::ir::core::{RRF_DEFAULT_K, RRF_MAX_K};
     let Some(expr) = expr else {
-        return Ok(60);
+        return Ok(RRF_DEFAULT_K as u32);
     };
     let value = resolve_to_int(expr, params)?;
-    u32::try_from(value)
+    u64::try_from(value)
         .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| OmniError::manifest("rrf k must be greater than 0 and fit U32"))
+        .filter(|value| (1..=RRF_MAX_K).contains(value))
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            OmniError::manifest(format!(
+                "rrf k must be an integer in 1..={RRF_MAX_K}, got {value}"
+            ))
+        })
+}
+
+/// The arms' weights: every arm `1.0` when the plan stores none, otherwise
+/// the stored `[F64]` literal, one weight in `(0, 1000000]` per arm.
+pub(super) fn resolve_rrf_weights(expr: Option<&IRExpr>, arms: usize) -> Result<Vec<f64>> {
+    let Some(expr) = expr else {
+        return Ok(vec![1.0; arms]);
+    };
+    omnigraph_compiler::ir::rrf_weight_values(expr, arms).ok_or_else(|| {
+        OmniError::manifest_internal(
+            "rrf weights must be one F64 in (0, 1000000] per arm, as the query writes them",
+        )
+    })
 }
 
 /// Resolve the nearest() target property's vector dimension and the embedding
@@ -444,113 +468,8 @@ pub(super) fn nearest_property_dim_and_model(
     Ok((dim, recorded_model))
 }
 
-/// The rrf prefilter gate: decide, before the arms run, between two ANSWER-IDENTICAL
-/// plans — prefilter (the uncapped bm25 arms rank only the traversal's
-/// eligible ids) and postfilter (the uncapped corpus-wide arms, v0.9 rrf
-/// semantics). The plan declares the pre-pass (`RankFuse.prefilter`: the
-/// ranked type, the required first hops, the scans it feeds) and the policy
-/// (`Assumptions.gate_policy`); the gate reads the store and decides.
-///
-/// INVARIANT (single owner): with bm25 arms prefiltered and nearest arms
-/// untouched, over FTS-index-covered data,
-/// up to BM25 score ties, the candidate plans are answer-identical;
-/// cardinality decides cost only. A mis-estimate wastes time, never flips a
-/// winner — re-coupling answer content to the estimate would recreate the
-/// PR #574 cap starvation one level up. Every fence below guards that
-/// identity:
-/// - the eligible set MUST over-approximate the traversal's survivors (a
-///   superset only costs speedup; a subset changes answers) — every
-///   shape the planner's `prefilter` admits is an instance;
-/// - full FTS fragment coverage, the plan's recorded fact
-///   (`Prefilter::coverage_admits`; uncovered fragments are scored
-///   filter-dependently, so a mask would change their scores);
-/// - `nearest` arms are never prefiltered (their constitutive `k` makes a
-///   prefiltered run answer-different) — the caller's threading rule;
-/// - an empty eligible set runs postfilter (same empty join, and `IN ()`
-///   edge semantics never arise).
-///
-/// Fallible steps fall back to postfilter — a query must never fail because
-/// an optimization could not start. The gate reads the eligible COUNT only;
-/// id strings materialize only after the prefilter plan is chosen, so the
-/// broad regime never builds them. Every decision records a
-/// `rrf_gate_verdicts` probe entry.
-pub(super) async fn rrf_prefilter_gate(
-    context: &EngineContext<'_>,
-    prefilter: &Prefilter,
-    policy: GatePolicy,
-) -> (Option<EligibleIds>, RrfGateVerdict) {
-    let fall_back =
-        |fallback: RrfGateFallback, forced: bool, eligible: Option<u64>, corpus: Option<u64>| {
-            tracing::debug!(
-                ?fallback,
-                forced,
-                "rrf prefilter gate fell back to the postfilter plan"
-            );
-            let verdict = RrfGateVerdict {
-                plan: RrfGatePlan::Postfilter,
-                fallback: Some(fallback),
-                forced,
-                eligible,
-                corpus,
-            };
-            record_rrf_gate_verdict(verdict.clone());
-            (None, verdict)
-        };
-
-    if policy.mode == PrefilterMode::ForcePostfilter {
-        return fall_back(RrfGateFallback::Forced, true, None, None);
-    }
-    let forced = policy.mode == PrefilterMode::ForcePrefilter;
-    if !prefilter.admits() {
-        return fall_back(RrfGateFallback::Shape, forced, None, None);
-    }
-    let ranked_type = prefilter.ranked_type.as_str();
-    let node_key = format!("node:{ranked_type}");
-    let Some(node_entry) = context
-        .snapshot
-        .and_then(|snapshot| snapshot.dataset(&node_key))
-    else {
-        return fall_back(RrfGateFallback::Shape, forced, None, None);
-    };
-    let corpus = node_entry.entity_count;
-    if !prefilter.coverage_admits {
-        return fall_back(RrfGateFallback::Coverage, forced, None, Some(corpus));
-    }
-
-    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-    let (mut ids, eligible_count) = match adjacency_eligible_ids(
-        &context.graph_index,
-        context.catalog,
-        ranked_type,
-        &prefilter.hops,
-        corpus,
-        forced,
-        policy,
-    )
-    .await
-    {
-        EligibleOutcome::Ids { ids, eligible } => (ids, eligible),
-        EligibleOutcome::FallBack { fallback, eligible } => {
-            return fall_back(fallback, forced, eligible, Some(corpus));
-        }
-    };
-    #[cfg(debug_assertions)]
-    if let Some(dropped) = crate::instrumentation::rrf_gate_subset_drop() {
-        ids.retain(|id| *id != dropped);
-    }
-    let verdict = RrfGateVerdict {
-        plan: RrfGatePlan::Prefilter,
-        fallback: None,
-        forced,
-        eligible: Some(eligible_count),
-        corpus: Some(corpus),
-    };
-    record_rrf_gate_verdict(verdict.clone());
-    (Some(EligibleIds(Arc::new(ids))), verdict)
-}
-
-/// Outcome of the adjacency eligible-id computation shared by the rrf and
-/// nearest prefilter gates.
+/// Outcome of the adjacency eligible-id computation of the nearest
+/// prefilter gate.
 pub(super) enum EligibleOutcome {
     /// The eligible ids, materialized; `eligible` is their count.
     Ids { ids: Vec<String>, eligible: u64 },
@@ -727,10 +646,8 @@ pub(super) async fn nearest_prefilter_gate(
         }
         EligibleOutcome::FallBack { fallback, eligible } => {
             let verdict = fall_back(fallback, eligible, Some(corpus));
-            let plan = match (fallback, prefilter.on_empty) {
-                (RrfGateFallback::EmptyEligible, omnigraph_planner::EmptyEligible::ProvenEmpty) => {
-                    NearestGatePlan::ProvenEmpty
-                }
+            let plan = match fallback {
+                RrfGateFallback::EmptyEligible => NearestGatePlan::ProvenEmpty,
                 _ => NearestGatePlan::Postfilter,
             };
             (plan, verdict)
@@ -751,67 +668,6 @@ pub(super) enum NearestGatePlan {
     ProvenEmpty,
 }
 
-/// The full-text search call a conjunct compares: the left operand of a
-/// comparison-rooted conjunct when it is `search`, `fuzzy` or `match_text`.
-/// The compiler lowers a bare call and `call = true` to that one shape.
-pub(super) fn search_call(filter: &IRExpr) -> Option<&IRExpr> {
-    match filter.comparison_parts()?.0 {
-        call @ (IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }) => {
-            Some(call)
-        }
-        IRExpr::PropAccess { .. }
-        | IRExpr::Nearest { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Param(_, _)
-        | IRExpr::Literal(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _)
-        | IRExpr::Binary { .. }
-        | IRExpr::Not(_, _)
-        | IRExpr::Cast { .. }
-        | IRExpr::IsNull { .. } => None,
-    }
-}
-
-/// Whether a conjunct's left operand is a full-text search call.
-pub(super) fn is_search_filter(filter: &IRExpr) -> bool {
-    search_call(filter).is_some()
-}
-
-/// Whether `filter` is a full-text search call compared to `true`: the one
-/// search shape a scan answers, as membership in the call's matches.
-pub(crate) fn is_positive_search_filter(filter: &IRExpr) -> bool {
-    matches!(
-        filter.comparison_parts(),
-        Some((call, CompOp::Eq, IRExpr::Literal(Literal::Bool(true), _)))
-            if matches!(call, IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. })
-    )
-}
-
-/// The full-text query of a scan's search conjunct; `None` for every other
-/// conjunct. A search call in any other comparison, or one whose property or
-/// query text does not resolve, is refused by the root and dependent scans alike.
-pub(crate) fn search_filter_query(
-    filter: &IRExpr,
-    params: &ParamMap,
-) -> Result<Option<lance_index::scalar::FullTextSearchQuery>> {
-    let Some(call) = search_call(filter) else {
-        return Ok(None);
-    };
-    if is_positive_search_filter(filter)
-        && let Some(query) = build_fts_query(call, params)?
-    {
-        return Ok(Some(query));
-    }
-    Err(OmniError::manifest(format!(
-        "unsupported search filter `{filter}`: a scan answers search(), fuzzy() and \
-         match_text() only as a bare call or compared to true, over a property and a \
-         string query"
-    )))
-}
-
 /// The columns the plan's scan projection names for one bound variable
 /// (`projection_pushdown`); a scan with no projection reads every
 /// non-blob column.
@@ -821,7 +677,7 @@ pub(super) struct NeededColumns(pub(super) HashSet<String>);
 /// Map traversed edge types, including AntiJoin inner pipelines, to endpoints.
 /// Scoping the graph-index build to these types avoids scanning unrelated edges.
 pub(crate) fn referenced_edge_types(
-    pipeline: &[IROp],
+    pipeline: &[PatternStep],
     catalog: &Catalog,
 ) -> HashMap<String, (String, String)> {
     let mut names = std::collections::BTreeSet::new();
@@ -838,12 +694,12 @@ pub(crate) fn referenced_edge_types(
 }
 
 pub(super) fn collect_referenced_edge_names(
-    pipeline: &[IROp],
+    pipeline: &[PatternStep],
     out: &mut std::collections::BTreeSet<String>,
 ) {
     for op in pipeline {
         match op {
-            IROp::Expand { edges, .. } => {
+            PatternStep::Expand { edges, .. } => {
                 out.extend(
                     edges
                         .members()
@@ -851,8 +707,20 @@ pub(super) fn collect_referenced_edge_names(
                         .map(|member| member.edge_type.clone()),
                 );
             }
-            IROp::AntiJoin { inner, .. } => collect_referenced_edge_names(inner, out),
-            IROp::NodeScan { .. } | IROp::Filter(_) => {}
+            PatternStep::AntiJoin { inner, .. }
+            | PatternStep::Optional { inner, .. }
+            | PatternStep::Correlate { inner, .. } => collect_referenced_edge_names(inner, out),
+            PatternStep::Union { arms, .. } => arms
+                .iter()
+                .for_each(|arm| collect_referenced_edge_names(arm, out)),
+            PatternStep::Fuse { arms, .. } => arms
+                .iter()
+                .for_each(|arm| collect_referenced_edge_names(&arm.steps, out)),
+            PatternStep::NodeScan { .. }
+            | PatternStep::Filter { .. }
+            | PatternStep::Rank { .. }
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. } => {}
         }
     }
 }
@@ -950,16 +818,22 @@ pub(super) fn ladder_step(
     }
 }
 
-/// Whether any row of a nearest scan carries `_distance = +inf`: Lance's
-/// marker for a prefilter-admitted row its partition search did not reach
-/// (the late search's match-count stop, `lance/src/io/exec/knn.rs`).
-pub(super) fn batches_hold_infinite_distance(batches: &[RecordBatch]) -> bool {
-    batches.iter().any(|batch| {
-        batch
-            .column_by_name("_distance")
-            .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
-            .is_some_and(|distances| distances.iter().flatten().any(f32::is_infinite))
-    })
+/// Whether a row within the first `k` places of a nearest scan carries
+/// `_distance = +inf`: Lance's marker for a prefilter-admitted row its
+/// partition search did not reach (the late search's match-count stop,
+/// `lance/src/io/exec/knn.rs`). `+inf` sorts last, so a window holds one
+/// exactly when fewer of its rows than its places are finite; the row the
+/// scan fetches past `k` to see a boundary tie is outside the window.
+pub(super) fn batches_hold_infinite_distance(batches: &[RecordBatch], k: usize) -> bool {
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let finite = batches
+        .iter()
+        .filter_map(|batch| batch.column_by_name("_distance"))
+        .filter_map(|column| column.as_any().downcast_ref::<Float32Array>())
+        .flat_map(|distances| distances.iter().flatten())
+        .filter(|distance| !distance.is_infinite())
+        .count();
+    finite < rows.min(k)
 }
 
 #[cfg(test)]
@@ -1393,16 +1267,10 @@ mod ann_probe_budget_tests {
 
 #[cfg(test)]
 mod typed_search_value_tests {
-    use super::{NearestQuery, resolve_nearest_query, resolve_rrf_k, search_filter_query};
-    use crate::engine::scan::{
-        build_fts_query, resolve_to_int, resolve_to_string, scan_output_schema,
-    };
-    use crate::engine::search::SearchMode;
-    use lance_index::scalar::inverted::query::FtsQuery;
-    use omnigraph_compiler::catalog::build_catalog;
+    use super::{NearestQuery, resolve_nearest_query, resolve_rrf_k};
+    use crate::engine::scan::{resolve_to_int, resolve_to_string};
     use omnigraph_compiler::ir::{IRExpr, ParamMap};
-    use omnigraph_compiler::query::ast::{CompOp, Literal};
-    use omnigraph_compiler::schema::parser::parse_schema;
+    use omnigraph_compiler::query::value::Literal;
     use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 
     fn scalar(kind: ScalarType, nullable: bool) -> ExprType {
@@ -1419,22 +1287,6 @@ mod typed_search_value_tests {
         }
     }
 
-    fn fuzzy(max_edits: Option<IRExpr>) -> IRExpr {
-        IRExpr::Fuzzy {
-            field: Box::new(IRExpr::PropAccess {
-                variable: "d".into(),
-                property: "text".into(),
-                ty: scalar(ScalarType::String, false),
-            }),
-            query: Box::new(IRExpr::Literal(
-                Literal::String("needle".into()),
-                scalar(ScalarType::String, false),
-            )),
-            max_edits: max_edits.map(Box::new),
-            ty: scalar(ScalarType::Bool, false),
-        }
-    }
-
     #[test]
     fn cast_search_options_execute_nondefault_values() {
         let params = ParamMap::new();
@@ -1442,15 +1294,6 @@ mod typed_search_value_tests {
         k.check_types().unwrap();
         assert_eq!(resolve_rrf_k(Some(&k), &params).unwrap(), 5);
         assert_eq!(resolve_rrf_k(None, &params).unwrap(), 60);
-        for (max_edits, expected) in [(Some(widened_integer(1)), 1), (None, 2)] {
-            let call = fuzzy(max_edits);
-            call.check_types().unwrap();
-            let FtsQuery::Match(query) = build_fts_query(&call, &params).unwrap().unwrap().query
-            else {
-                panic!("expected fuzzy match query");
-            };
-            assert_eq!(query.fuzziness, Some(expected));
-        }
     }
 
     #[test]
@@ -1473,8 +1316,6 @@ mod typed_search_value_tests {
 
     #[test]
     fn supplied_invalid_search_options_refuse_before_empty_scan_execution() {
-        let catalog =
-            build_catalog(&parse_schema("node Doc { text: String @index }").unwrap()).unwrap();
         let params = ParamMap::new();
         for option in [
             IRExpr::Literal(Literal::Null, scalar(ScalarType::I64, true)),
@@ -1486,34 +1327,9 @@ mod typed_search_value_tests {
             IRExpr::Param("missing".into(), scalar(ScalarType::I64, false)),
         ] {
             assert!(resolve_rrf_k(Some(&option), &params).is_err());
-            let call = fuzzy(Some(option));
-            call.check_types().unwrap();
-            let filter = IRExpr::comparison(
-                call,
-                CompOp::Eq,
-                IRExpr::Literal(Literal::Bool(true), scalar(ScalarType::Bool, false)),
-            );
-            assert!(search_filter_query(&filter, &params).is_err());
-            assert!(
-                scan_output_schema(
-                    "Doc",
-                    "d",
-                    &[filter],
-                    &params,
-                    &catalog,
-                    &SearchMode::default(),
-                    None
-                )
-                .is_err()
-            );
         }
         let zero = IRExpr::Literal(Literal::Integer(0), scalar(ScalarType::I64, false));
         assert!(resolve_rrf_k(Some(&zero), &params).is_err());
-        assert!(
-            build_fts_query(&fuzzy(Some(zero)), &params)
-                .unwrap()
-                .is_some()
-        );
     }
 
     #[test]

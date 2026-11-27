@@ -123,7 +123,7 @@ fn build_heavy_body(batch_idx: usize, rows: usize) -> String {
         data,
         branch: Some("main".to_string()),
         from: Some("main".to_string()),
-        mode: Some(omnigraph::loader::LoadMode::Merge),
+        mode: Some(omnigraph::loader::LoadMode::Replace),
     })
     .unwrap()
 }

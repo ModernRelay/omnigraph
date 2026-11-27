@@ -1,0 +1,134 @@
+# issue: none
+# notes: A ranked scan (`nearest`, an `rrf` arm) keeps contains and residual filters in a cross join.
+# notes: An exact `bm25` scores the joined rows above the scans, so it keeps the contains join, as an
+# notes: unranked lexical filter on the texts does.
+# red_on: 2026-09-26, pre-fix ranked contains join: `contains join 2: its right scan 1 carries no runtime filter`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Matter {
+    number: String @key @index
+}
+node Passage {
+    pid: String @key
+    text: String @index
+    embedding: Vector(2) @index
+}
+
+--- seed
+{"type":"Matter","data":{"number":"case"}}
+{"type":"Passage","data":{"pid":"p","text":"law case","embedding":[1.0,0.0]}}
+{"type":"Passage","data":{"pid":"q","text":"law other","embedding":[0.0,1.0]}}
+{"type":"Passage","data":{"pid":"case","text":"law case","embedding":[0.5,0.5]}}
+
+--- query
+query bm25_order() {
+    match {
+      let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
+      from bm25($pop, $p.text, "law") as $score,
+    }
+    return { $p.pid }
+    order { $score desc }
+    limit 10
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
+
+--- query
+query nearest_order() {
+    match {
+      let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
+      from nearest($pop, $p.embedding, [1.0, 0.0], k: 10) as $distance,
+    }
+    return { $p.pid }
+    order { $distance }
+    limit 10
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+cross join $p.text contains $m.number
+scan Passage as $p: no runtime filter
+scan Passage as $p: ranked nearest fetch 10
+
+--- query
+query rrf_order() {
+    match {
+      let $all = { match { $p: Passage } return { $p } },
+      from rrf(nearest($all, $p.embedding, [1.0, 0.0], k: 10), bm25($all, $p.text, "law"), k: 60) as $score,
+      $m: Matter,
+      $p: Passage,
+    }
+    where contains($p.text, $m.number) and $m.number != $p.pid
+    return { $p.pid }
+    order { $score desc }
+    limit 10
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+cross join $p.text contains $m.number
+scan Passage as $p: no runtime filter
+scan Passage as $p: ranked nearest fetch 10
+
+--- query
+query search_filter_unranked() {
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
+    where contains($p.text, $m.number) and match_terms($p.text, terms("law", mode: any)) and $m.number != $p.pid
+    return { $p.pid }
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text
+pass join_algorithm
+
+--- query
+query bm25_order_on_the_needles() {
+    match {
+      let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
+      from bm25($pop, $m.number, "case") as $score,
+    }
+    return { $p.pid }
+    order { $score desc }
+    limit 10
+}
+
+--- expect unordered
+{"p.pid":"p"}
+
+--- expect shape
+p.pid: String
+
+--- expect plan
+contains join $p.text contains $m.number
+scan Passage as $p: runtime filter text

@@ -1,7 +1,7 @@
 # Embeddings
 
 Omnigraph can turn query text into a vector for
-`nearest($document.embedding, $text)`. Use the same provider and model that
+`nearest(rel, $document.embedding, $text, k: n)`. Use the same provider and model that
 produced the stored document vectors; vectors from different models are not
 comparable.
 
@@ -83,7 +83,7 @@ node Document {
 ```
 
 The vector is the embedding of the record's `body` value exactly as stored,
-and a text `nearest($d.embedding, $q)` embeds `$q` exactly as given. Neither
+and a text `nearest(rel, $d.embedding, $q, k: n)` embeds `$q` exactly as given. Neither
 side adds a type name, a field label or any other template, and neither trims
 whitespace, so a record whose `body` equals the query text embeds the same
 input. The one difference a provider can see is the retrieval role: Gemini
@@ -96,10 +96,13 @@ When `model` is recorded, a text `nearest` query is rejected unless the active
 provider resolves to exactly that model id. Changing the recorded source or
 model is not an in-place schema migration; rebuild or re-embed the data instead.
 
-`@embed` does not populate the property during a load, even with an embedding
-provider configured. Supplied vectors are preserved, omitted nullable vectors
-remain null, and missing required vectors refuse the load. Supply vectors in
-input data or prepare seed files with the offline command.
+`@embed` does not populate the property during a load or a mutation, even with
+an embedding provider configured: no write embeds. Supplied vectors are
+preserved, omitted nullable vectors remain null, and a missing required vector
+refuses the write. Assigning the source does not provide the vector, so an
+`insert` or `replace` that omits a required one is a type error (`T12`), and an
+`upsert` that would create a row without it is refused when it runs. Supply
+vectors in input data or prepare seed files with the offline command.
 
 Successful HTTP and CLI JSON load results include `embedding_generation`:
 `"unsupported"` means the load touched a node type with an `@embed` property;

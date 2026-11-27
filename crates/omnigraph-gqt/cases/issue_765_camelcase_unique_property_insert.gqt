@@ -22,14 +22,14 @@ node Release {
 
 --- mutate
 query insert_release() {
-    insert Release { slug: "r2", versionTag: "v0.2.0" }
+    replace Release { slug: "r2", versionTag: "v0.2.0" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query insert_duplicate_tag() {
-    insert Release { slug: "r3", versionTag: "v0.1.0" }
+    replace Release { slug: "r3", versionTag: "v0.1.0" }
 }
 
 --- expect error: @unique violation on Release.versionTag: value 'v0.1.0' held by 'r1' and 'r3'

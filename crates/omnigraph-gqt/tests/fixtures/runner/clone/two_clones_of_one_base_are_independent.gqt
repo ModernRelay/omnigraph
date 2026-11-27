@@ -32,7 +32,7 @@ query all() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- mutate
-query add() { insert Person { name: "carol" } }
+query add() { replace Person { name: "carol" } }
 --- expect affected: nodes=1 edges=0
 
 --- query

@@ -31,7 +31,7 @@ branch create q
 
 --- mutate branch: s
 query insert_z() {
-    insert Person { name: "z" }
+    replace Person { name: "z" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -43,21 +43,22 @@ branch merge s
 
 --- mutate
 query delete_z() {
-    delete Person where name = "z"
+    match { $x: Person } where $x.name = "z"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query insert_k() {
-    insert Person { name: "k" }
+    replace Person { name: "k" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: q
 query insert_q1() {
-    insert Person { name: "q1" }
+    replace Person { name: "q1" }
 }
 
 --- expect affected: nodes=1 edges=0

@@ -52,14 +52,14 @@ load validate edge_ri edge:LargeLink to Large: access probe
 load executed: partitions 1 rows 2
 
 --- query
-query small_rows() { match { $a: Small $a smallLink $b } return { count($b) as n } }
+query small_rows() { match { $a: Small, $a smallLink $b } return { count($b) as n } }
 --- expect unordered
 {"n":2}
 --- expect shape
 n: I64
 
 --- query
-query large_rows() { match { $a: Large $a largeLink $b } return { count($b) as n } }
+query large_rows() { match { $a: Large, $a largeLink $b } return { count($b) as n } }
 --- expect unordered
 {"n":2}
 --- expect shape

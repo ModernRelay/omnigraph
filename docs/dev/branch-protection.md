@@ -35,6 +35,7 @@ the context. The jobs it needs, and so the jobs that block `main`:
 - `lint` (`Lint (clippy)`)
 - `test` (`Test Workspace`)
 - `storage_upgrade_compatibility` (`Storage Upgrade Compatibility`)
+- `cross_version` (`Cross-Version Comparison`)
 - `test_aws_feature` (`Test omnigraph-server --features aws`)
 
 The verdict: `success` passes; `failure` and `cancelled` fail, whether or not
@@ -42,11 +43,12 @@ the job could have skipped; `skipped` passes exactly when the job's own `if:`
 in `ci.yml` was false on this event, as the script's table restates it
 (`fmt` on a pull request or queue entry with `run_full_ci` true, `lint` there
 or on a push to `main` with `run_full_ci` true, `test` with `run_full_ci`
-true, `graph_vocabulary_guard` off pull requests and queue entries; the other
-six never skip); a result set that is not exactly the table's jobs, an
-unsupported event, or a classifier output other than `true`/`false` fails.
+true, `cross_version` with `run_gqt` true, `graph_vocabulary_guard` off pull
+requests and queue entries; the other six never skip); a result set that is
+not exactly the table's jobs, an unsupported event, a classifier output other
+than `true`/`false`, or `run_gqt` false where `run_full_ci` is true fails.
 GitHub counts a skipped job as a passed required check, so a rule that listed
-the ten jobs by name admitted a job that never ran; the gate does not.
+the eleven jobs by name admitted a job that never ran; the gate does not.
 
 Which jobs block `main` is therefore the gate's `needs:` list and the
 script's table, changed together in a pull request. Adding a blocking job,
@@ -55,7 +57,7 @@ touched. `scripts/check-merge-group-triggers.py`, a step of `Check Workflow
 Action Pins`, holds the two lists equal and pins the gate's wiring: `if:
 always()`, no `continue-on-error` on the gate or on any job it needs, exactly
 a SHA-pinned checkout and an unconditional `python3 scripts/ci_gate.py` step
-with explicit `shell: bash` and the four expected `env:` values, and a
+with explicit `shell: bash` and the five expected `env:` values, and a
 validator job with no condition, no dependencies and no error suppression that runs the validator
 and the gate's self-test. The gate, its dependencies and the validator use
 block-form job mappings so every guarded key can be inspected. The `needs:`

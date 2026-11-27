@@ -18,7 +18,7 @@ use datafusion::physical_plan::{
 };
 use futures::future::BoxFuture;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
-use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+use omnigraph_compiler::query::value::{BinaryOp, CompOp};
 use omnigraph_compiler::types::{ExprType, ScalarType};
 use omnigraph_planner::ContainsJoinFields;
 
@@ -332,7 +332,7 @@ mod tests {
                             ),
                         ),
                     },
-                    omnigraph_compiler::query::ast::CompOp::StringContains,
+                    omnigraph_compiler::query::value::CompOp::StringContains,
                     IRExpr::PropAccess {
                         variable: "m".into(),
                         property: "number".into(),

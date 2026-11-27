@@ -1,3 +1,6 @@
+#[cfg(any(test, feature = "test-util"))]
+pub mod arbitrary;
+pub mod budget;
 pub mod catalog;
 pub mod error;
 pub mod ir;
@@ -8,6 +11,8 @@ pub mod query_input;
 pub mod result;
 pub mod schema;
 pub mod settings;
+pub mod shape;
+pub mod stack;
 pub mod traversal;
 pub mod types;
 
@@ -44,31 +49,41 @@ pub use ir::ParamMap;
 /// `(2, 1)` adds typed edge selections (`docs/rfcs/2026-09-30-typed-edge-alternation.md`);
 /// `(2, 2)` adds the `as commit` clause and the `commit publish` / `commit drop`
 /// statements (`docs/rfcs/2026-10-10-unpublished-graph-commits.md`);
-/// `(2, 3)` adds `branch create <name> from commit "<id>"`.
-pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 3);
-pub use ir::lower::{lower_mutation_query, lower_query};
+/// `(2, 3)` adds `branch create <name> from commit "<id>"`;
+/// `(3, 0)` is GQ 3, which replaces the
+/// language whole.
+pub const GQ_LANGUAGE_VERSION: (u16, u16) = (3, 0);
+
+/// [`GQ_LANGUAGE_VERSION`] rendered `major.minor` (`"3.0"`): the one spelling
+/// `omnigraph version` and `/healthz` report as `gq_language`, so an operator
+/// can tell builds apart; a binary that reports none is a GQ language 2 build.
+pub fn gq_language_version() -> String {
+    let (major, minor) = GQ_LANGUAGE_VERSION;
+    format!("{major}.{minor}")
+}
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
-pub use query::ast::Literal;
-pub use query::checked::CheckedRead;
 pub use query::descriptor::{
     QueryGraphFact, QueryGraphFactKind, QueryOperationDescriptor, QueryResultFieldDescriptor,
     QueryValueKind, describe_query_operation,
 };
 pub use query::diagnostic::{
-    Applicability, Position, QueryCode, QueryDiagnostic, QueryDiagnosticKind, Stage, Suggestion,
-    TextEdit,
+    Applicability, Extra, Position, QueryCode, QueryDiagnostic, QueryDiagnosticKind, RelatedSpan,
+    Stage, Suggestion, TextEdit,
 };
+
+pub use query::fix::{FixOptions, FixOutcome, FixReport, FixStatus, MAX_FIX_PASSES, fix_source};
 pub use query::lint::{
     QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
     QueryLintSchemaSource, QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus,
     lint_query_file,
 };
+pub use query::value::Literal;
 pub use query_input::{
     JsonParamMode, ReadStatement, RunInputError, RunInputResult, ToParam, find_named_query,
     find_read_statement, json_params_to_param_map,
 };
 pub use result::{MutationExecResult, MutationResult, QueryResult, RunResult};
 pub use types::{
-    AggSignature, Direction, ExprType, PropType, ScalarType, check_date_literal,
-    check_datetime_literal,
+    AggSignature, Direction, ExprType, PropType, ScalarType, cast_date_literal_days,
+    check_date_literal, check_datetime_literal, date_literal_days, datetime_literal_millis,
 };

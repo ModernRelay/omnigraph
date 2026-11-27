@@ -1,0 +1,131 @@
+# issue: 919
+# red_on: 672944d32: `insert T { k: "a", ints: [] }` into `ints: [I64]?` fails with `T3: property `ints` has type [I64] but got [String]`, because an empty list literal is typed `[String]` and an assignment never retypes it.
+# notes: An empty list takes its element type from its context, as a list literal's elements do: the property it is assigned to, or the other operand it is compared with.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node T {
+    k: String @key
+    n: I64?
+    i32s: [I32]?
+    ints: [I64]?
+    u64s: [U64]?
+    floats: [F64]?
+    bools: [Bool]?
+    dates: [Date]?
+    stamps: [DateTime]?
+    words: [String]?
+}
+
+edge E: T -> T {
+    ints: [I64]?
+}
+
+--- seed
+{"type":"T","data":{"k":"b","n":1,"ints":[1,2],"bools":[true]}}
+
+--- mutate
+query insert_empty() {
+    replace T { k: "a", n: 2, i32s: [], ints: [], u64s: [], floats: [], bools: [], dates: [], stamps: [], words: [] }
+}
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query update_empty() {
+    match { $t: T } where $t.k = "b"
+    update $t set { ints: [], bools: [] }
+}
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_edge_empty() {
+    insert E { @src: "a", @dst: "b", ints: [] }
+}
+--- expect affected: nodes=0 edges=1
+
+--- query
+query lists() {
+    match { $t: T }
+    return { $t.k, $t.i32s, $t.ints, $t.u64s, $t.floats, $t.bools, $t.dates, $t.stamps, $t.words }
+}
+--- expect unordered
+{"t.k":"a","t.i32s":[],"t.ints":[],"t.u64s":[],"t.floats":[],"t.bools":[],"t.dates":[],"t.stamps":[],"t.words":[]}
+{"t.k":"b","t.ints":[],"t.bools":[]}
+--- expect shape
+t.k: String
+t.i32s: [I32]?
+t.ints: [I64]?
+t.u64s: [U64]?
+t.floats: [F64]?
+t.bools: [Bool]?
+t.dates: [Date]?
+t.stamps: [DateTime]?
+t.words: [String]?
+
+--- query
+query edge_lists() {
+    match { $x: T, $y: T, $x $e:e $y }
+    return { $x.k, $e.ints }
+}
+--- expect unordered
+{"x.k":"a","e.ints":[]}
+--- expect shape
+x.k: String
+e.ints: [I64]?
+
+--- query
+query in_empty() {
+    match { $t: T } where $t.n in []
+    return { $t.k }
+}
+--- expect unordered
+--- expect shape
+t.k: String
+
+--- query
+query not_in_empty() {
+    match { $t: T } where not ($t.n in [])
+    return { $t.k }
+}
+--- expect unordered
+{"t.k":"a"}
+{"t.k":"b"}
+--- expect shape
+t.k: String
+
+--- query
+query coalesce_empty() {
+    match { $t: T } where $t.k = "b"
+    return { $t.k, coalesce($t.floats, []) as floats }
+}
+--- expect unordered
+{"t.k":"b","floats":[]}
+--- expect shape
+t.k: String
+floats: [F64]
+
+--- query
+query default_empty($xs: [I64] = []) {
+    match { $t: T } where $t.n in $xs
+    return { $t.k }
+}
+--- expect unordered
+--- expect shape
+t.k: String
+
+--- query
+query nothing_fixes_it() {
+    match { $t: T }
+    return { [] as xs }
+}
+--- expect error: T7: nothing fixes the element type of this empty list

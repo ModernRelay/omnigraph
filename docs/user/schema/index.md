@@ -50,7 +50,7 @@ letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 | `F32`, `F64` | Floating-point numbers |
 | `Date` | Calendar date |
 | `DateTime` | Timestamp with millisecond precision |
-| `Vector(N)` | `N` 32-bit floating-point values |
+| `Vector(N)` | `N` 32-bit floating-point values; `Vector(N, distance = "cosine")` declares the [distance](../search/distances.md) (`l2`, the default, `cosine` or `dot`) that `distance` and `nearest` read |
 | `Blob` | Managed bytes or an external reference; see [Blobs](../blobs.md) |
 | `enum(a, b, ...)` | One of the declared strings |
 | `[T]` | A list of scalar `T` values |
@@ -68,13 +68,13 @@ and `src`/`dst` on edges. On current graphs all three names are ordinary
 property names. Query meta-fields use `@id`, `@src`, and `@dst`; projected
 node objects use `@id`, and JSONL exports use a top-level `id`. The schema
 endpoint (`GET /schema`) reports the physical spellings in `system_columns`.
-`_distance` and `_score` are also reserved for new declarations: search-ordered
-queries rank results by those columns. A graph whose schema already declared
+`_distance` and `_score` are also reserved for new declarations: a ranking's
+search output carries those columns. A graph whose schema already declared
 either name before this reservation keeps opening; only new schemas are
 refused.
 
-On edge types the names `from` and `to` are also reserved: they are the
-insert parameters that name the endpoints.
+On edge types the names `from` and `to` are also reserved, since GQ 2
+assigned endpoints with them; a write assigns them as `@src` and `@dst`. A node type and an edge type may share a name; a write's `@src`/`@dst` assignments then select the edge type ([mutations](../mutations/index.md)).
 
 ## Constraints
 
@@ -85,10 +85,39 @@ also have a single-property shorthand.
 |---|---|---|
 | `@key(p, ...)` | node or edge | The property tuple identifies the entity; its id is derived from it. Key properties must be non-null scalar values. An edge key must include both `@src` and `@dst`, and a key may be declared only when the type is created. |
 | `@unique(p, ...)` | node or edge | No two entities may share the property tuple. Edge constraints may include `@src` and `@dst`. |
-| `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness. |
+| `@index(p, ...)` | node or edge | Declares index intent. Indexes affect performance, not correctness; see [What `@index` builds](#what-index-builds). |
+| `@index(fulltext, analyzer = "…", scorer = "…")` | a node's String property | Declares the property's full-text index with its analyzer profile (`standard_v1`, `standard_folded_v1` or `english_v1`) and scorer (`bm25_v1`, the default, or `none`). Without `analyzer` it takes `english_v1`. See [Full-text analyzers](../search/analyzers.md). |
 | `@range(p, min..max)` | node | Restricts a numeric property, or each element of a numeric list, to an inclusive range; either bound may be omitted. Values compare with the bounds exactly at any magnitude, and a decimal bound on an integer property admits the integers on its side: `@range(n, -2.5..2.5)` admits -2 through 2. |
 | `@check(p, "regex")` | node | Requires a String property to match the expression. |
 | `@card(min..max)` | edge | Bounds how many edges of the type start at each source node; omit `max` for an unbounded range, as in `@card(1..)`. The default is unbounded from zero. See [Edge cardinality](#edge-cardinality). |
+
+### What `@index` builds
+
+`@index` states intent, and an index pass (`omnigraph index build`, or
+optimize) builds the indexes that serve the property's type, never a write.
+One property can carry more than one:
+
+| Property type | Indexes | Predicates they speed up |
+|---|---|---|
+| enum, `Bool` | BITMAP | `=`, `!=`, `in [...]`, ranges, `is null` |
+| list | LABEL_LIST | `value in $x.list`, `not (value in $x.list)` |
+| free-text `String`, `@index` | NGRAM, BTREE | `contains`; `=`, `in [...]`, ranges, `starts_with` |
+| free-text `String`, `@key` alone | BTREE | `=`, `in [...]`, ranges |
+| free-text `String`, `@index(fulltext, ...)` | full text, NGRAM, BTREE | as `@index`; the full-text index carries the field's [analyzer](../search/analyzers.md), and no query reads it yet |
+| number, `Date`, `DateTime` | BTREE | `=`, `in [...]`, ranges |
+| vector | vector index | `nearest` |
+
+An index changes cost, never rows: a row an index does not cover yet, after a
+write, is read directly, and an NGRAM's candidates are checked exactly. An
+existing graph gains the kinds it lacks at its next index pass. The index
+`@key` implies follows the same table: a String key builds a BTREE only, and
+`contains` on it reads the rows. `@key` with an explicit `@index` follows the
+`@index` row. Only `@index(fulltext, ...)` builds a full-text index; see
+[Full-text analyzers](../search/analyzers.md) for one an earlier release built.
+The table covers single-property node declarations: a composite or
+edge-property declaration is accepted as intent but builds no property index,
+and an edge builds only its identity and endpoint indexes, which traversal uses
+([Search](../search/index.md#indexes)).
 
 `@range(p, ..10)` supplies only a maximum, and `@range(p, 10..)` supplies
 only a minimum; both endpoints are inclusive. Integer bounds must fit `I64`
@@ -118,13 +147,6 @@ one schema change, then add the properties back without it; dropping a
 property discards its stored values. A constraint that also names another
 property or `@src`/`@dst` cannot be removed in place: rebuild the graph
 without it.
-
-Current automatic property indexes are created for single-property node declarations:
-orderable scalars and enums receive a scalar index, free-text Strings receive a
-full-text index, and vectors receive a vector index. Composite declarations and
-edge-property declarations are accepted as schema intent but do not currently
-create a property index. Edge endpoints are indexed independently for traversal.
-See [Search](../search/index.md#indexes).
 
 ### Edge endpoints
 
@@ -175,10 +197,8 @@ rebuilds the graph from an export refuses it. An orphan query lists them:
 
 ```gq
 query people_without_employer() {
-    match {
-        $p: Person
-        not { $p worksAt $c }
-    }
+    match { $p: Person }
+    where not exists { $c: Company, $p worksAt $c }
     return { $p.email }
 }
 ```
@@ -220,8 +240,11 @@ references.
   [Embeddings](../search/embeddings.md).
 
 Property-level `@key`, `@unique`, and `@index` are shorthands for their
-single-property constraints. Unknown annotations are retained as metadata but
-have no built-in behavior.
+single-property constraints; `@index(fulltext, ...)` is the property-level
+`@index` of a free-text String with its full-text options, written only on a
+node property (not on an interface or edge property). An unknown option,
+profile or scorer is a schema error that lists the admitted names. Unknown
+annotations are retained as metadata but have no built-in behavior.
 
 ## Schema changes
 
@@ -235,11 +258,22 @@ omnigraph schema apply --schema next.pg --target ./graph.omni
 Supported changes include adding types, adding nullable properties, renaming
 nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, making a nullable property required, adding
-`@unique` to a node type, updating descriptions or instructions, and
+`@unique` to a node type, declaring, changing or removing a full-text
+analyzer or scorer, changing a vector's distance, updating descriptions or
+instructions, and
 dropping node, edge, or property declarations. Dropping a property also drops
 every constraint that names only dropped properties: its own `@index`,
 `@unique`, `@range` or `@check`, and a composite constraint whose members are
 all dropped.
+
+A changed full-text analyzer replaces the property's index in the same
+publication with one built for the new analysis; `omnigraph index build`
+builds its postings; matching and ranking read the rows with the new analysis
+whatever the index's state (see
+[Full-text analyzers](../search/analyzers.md)). A changed vector distance
+writes no table: the index built for the old distance is no longer used, reads
+answer from the exact scan, and `omnigraph index build` replaces the index (see
+[Vector distances](../search/distances.md#changing-a-distance)).
 
 None of these changes rewrites existing rows. Adding a nullable property,
 renaming a property, or dropping a property changes only the table's metadata:
@@ -309,17 +343,5 @@ Cluster-managed graphs change schema through `omnigraph cluster apply`. Direct
 
 ## Diagnostic codes
 
-Migration rejections may include a stable `OG-...` code. Match automation on the
-code rather than the message text.
-
-| Code | Meaning |
-|---|---|
-| `OG-MF-103` | Add a required property to a populated type. |
-| `OG-MF-104` | Make a property required while a stored row holds a null (reported by `schema apply`). |
-| `OG-MF-106` | Change a property's type, including enum narrowing or renaming. |
-| `OG-MF-107` | Add an edge type with a non-zero `@card` minimum from an existing node type. |
-| `OG-MF-108` | Add `@unique` to a node type while two stored rows share a key (reported by `schema apply`). |
-
-`omnigraph schema plan` includes these codes in human and JSON output, except
-`OG-MF-104` and `OG-MF-108`, which only `schema apply` can know from the stored
-rows.
+Migration rejections may include a stable `OG-...` code, listed in
+[Schema migration codes](migration-codes.md).

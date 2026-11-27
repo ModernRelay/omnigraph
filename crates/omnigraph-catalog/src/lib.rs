@@ -59,8 +59,6 @@ pub mod migrations;
 #[cfg(any(test, feature = "test-util"))]
 pub mod namespace;
 pub mod publisher;
-#[cfg(feature = "test-util")]
-pub mod read_executor;
 pub mod retention;
 pub mod state;
 pub mod unattached;
@@ -475,7 +473,7 @@ impl SnapshotScanner {
 
     /// Execute the configured read without exposing its physical plan.
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
-        crate::dataset_index::validate_full_text_scan(&self.dataset, &self.scanner, None).await?;
+        crate::dataset_index::validate_full_text_scan(&self.dataset, &self.scanner).await?;
         self.scanner
             .try_into_stream()
             .await
@@ -501,7 +499,7 @@ impl SnapshotDataset {
         if let Some(filter) = &filter {
             let mut scanner = self.dataset.scan();
             scanner.filter(filter).map_err(OmniError::storage)?;
-            crate::dataset_index::validate_full_text_scan(&self.dataset, &scanner, None).await?;
+            crate::dataset_index::validate_full_text_scan(&self.dataset, &scanner).await?;
         }
         self.dataset
             .count_rows(filter)
@@ -683,6 +681,13 @@ impl Snapshot {
     /// of a stamp-12 version) or a directly built test snapshot.
     pub fn schema_contract(&self) -> Option<&SchemaContractHead> {
         self.schema_contract.as_ref()
+    }
+
+    /// Whether the schema accepted at this snapshot can be read: it carries
+    /// a contract head, and a commit record names the content behind it.
+    pub fn records_schema(&self) -> bool {
+        self.schema_contract.is_some()
+            && !matches!(self.contract_source, ContractSource::Archive(None))
     }
 
     /// The branch rows of this snapshot's own pinned manifest version: every

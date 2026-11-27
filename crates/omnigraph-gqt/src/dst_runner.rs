@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use omnigraph::error::OmniError;
 use omnigraph_compiler::QueryResult;
-use omnigraph_compiler::settings::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -383,8 +382,6 @@ struct Input {
     environment: Environment,
     seed: Option<u64>,
     effective_settings: settings::EffectiveSettings,
-    #[serde(default)]
-    engine: Engine,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     store: Option<String>,
     /// `--base`: the `--store` root is opened as a clone of this graph, read
@@ -830,7 +827,16 @@ fn run_with_selection(
 ) -> CaseOutcome {
     let started = Instant::now();
     let mut summary = new_summary(Some(path.to_path_buf()));
-    summary.result = run_invocation(path, executable, bless, &selection, started, &mut summary);
+    let mut notes = Vec::new();
+    summary.result = run_invocation(
+        path,
+        executable,
+        bless,
+        &selection,
+        started,
+        &mut summary,
+        &mut notes,
+    );
     (summary.scope, summary.not_run) = coverage(&summary);
     if let Some(options) = &selection.measure {
         if let Err(error) = report_measurements(&summary, options, selection.artifacts.as_deref()) {
@@ -849,6 +855,7 @@ fn run_with_selection(
         stem: stem_of(path),
         elapsed: started.elapsed(),
         result,
+        notes,
     }
 }
 
@@ -992,7 +999,7 @@ fn measure_rows(summary: &Summary) -> Vec<MeasureRow> {
 }
 
 /// The case's name in the baseline: its path under the corpus, whichever
-/// spelling named it (`cases/v2/x.gqt` and its absolute form are one case);
+/// spelling named it (`cases/x.gqt` and its absolute form are one case);
 /// a case outside the corpus is its absolute path.
 fn baseline_case_key(path: &Path) -> String {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -1574,9 +1581,9 @@ fn run_invocation(
     selection: &Selection<'_>,
     started: Instant,
     summary: &mut Summary,
+    notes: &mut Vec<String>,
 ) -> Result<(), String> {
     refuse_ambient()?;
-    let engine = crate::engine_from_env()?;
     let selected = selection.target;
     let selected_storage = selection.storage;
     let selected_seed = selection.seed;
@@ -1733,6 +1740,14 @@ fn run_invocation(
     {
         return Err("invalid_case: bless requires exactly one direct engine environment".into());
     }
+    // The reference comparison is a property of the direct engine: a run
+    // there names every step that opts out of it, and why.
+    if selected_envs
+        .iter()
+        .any(|env| matches!(env.execution, Execution::Engine { .. }))
+    {
+        notes.extend(case.reference_skips());
+    }
     let build = executable_digest(executable)?;
     summary.executable_digest = Some(build.clone());
     let budget = case_budget(&case);
@@ -1775,7 +1790,6 @@ fn run_invocation(
                     environment: env.clone(),
                     seed,
                     effective_settings: settings::EffectiveSettings::for_seed(seed),
-                    engine,
                     store: selection.store.map(str::to_owned),
                     base: selection.base.map(str::to_owned),
                     server: selection.server.cloned(),
@@ -2108,7 +2122,6 @@ fn worker_report(input: &Input, input_digest: String) -> Result<WorkerReport, St
                     &case,
                     &input.case_path,
                     input.bless,
-                    input.engine,
                     input.store.as_deref(),
                     input.base.as_deref(),
                 ),
@@ -2275,7 +2288,6 @@ impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for G
                         &self.input.case_path,
                         &resources.root,
                         storage,
-                        self.input.engine,
                         prepared.as_deref(),
                     ),
                 ),
@@ -2414,7 +2426,6 @@ fn replay_attempts(
     executed: &mut Vec<Attempt>,
 ) -> Result<(), String> {
     refuse_ambient()?;
-    crate::engine_from_env()?;
     if summary.attempts.iter().any(external_attempt) {
         return Err("invalid_case: external-store invocations cannot replay, nor served ones; the report does not freeze store or server contents".into());
     }
@@ -2583,7 +2594,6 @@ mod action_tests {
             },
             seed: Some(0),
             effective_settings: settings::EffectiveSettings::for_seed(Some(0)),
-            engine: Engine::V2,
             store: None,
             base: None,
             server: None,
@@ -2641,7 +2651,7 @@ mod action_tests {
                 "FAILPOINTS",
                 "RAYON_NUM_THREADS",
                 "LANCE_CPU_THREADS",
-                "OMNIGRAPH_ENGINE",
+                "OMNIGRAPH_MERGE_LINEAGE",
                 "DST_ENTROPY_SEED",
                 "HOME",
                 "PATH",
@@ -3140,7 +3150,7 @@ mod action_tests {
 
     #[test]
     fn a_case_has_one_baseline_name_whichever_way_it_was_spelled() {
-        let nested = "v2/planner/input_ann_nprobes.gqt";
+        let nested = "planner/input_ann_nprobes.gqt";
         let relative = std::path::Path::new("cases").join(nested);
         assert!(relative.is_file(), "cargo test runs in the crate root");
         let absolute = crate::corpus_root().join(nested);

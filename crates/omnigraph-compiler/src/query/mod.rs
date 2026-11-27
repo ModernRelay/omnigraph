@@ -1,9 +1,12 @@
-pub mod ast;
-pub mod checked;
+mod canonical;
+pub mod check;
 pub mod codes;
 pub mod depth;
 pub mod descriptor;
 pub mod diagnostic;
+pub mod file;
+pub mod fix;
 pub mod lint;
 pub mod parser;
-pub mod typecheck;
+pub mod syntax;
+pub mod value;

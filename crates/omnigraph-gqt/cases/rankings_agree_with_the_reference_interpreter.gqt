@@ -1,0 +1,239 @@
+# issue: none
+# notes: The rankings (bm25, nearest, rrf, distance), an aggregate over a score and the lexical
+# notes: predicates, over a `standard_v1` field, whose analysis the RFC fixes: the simple
+# notes: tokenizer and lowercasing, no stemming, stop words or folding. Compared with the
+# notes: reference interpreter. The field declares an analyzer, so the exact lexical scan answers
+# notes: it: `bm25` is `bm25_v1` in F64, its projected scores equal the reference's, and `bm25` over
+# notes: `terms(…)` asking for every term or an edit budget runs, as does `match_terms` with an
+# notes: edit budget. An `rrf` of a `nearest` arm and that `bm25` fuses the window d1, d3, d6, d4
+# notes: with the exact ranks d4, d1, d2 (shorter documents score higher): d1 leads, d4 follows, and
+# notes: d2 and d6, tied at 1/63, take the written `$d.slug` key.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+}
+node Doc {
+    slug: String @key
+    text: String @index(fulltext, analyzer = "standard_v1")
+    embedding: Vector(2)? @index
+}
+edge Wrote: Person -> Doc
+
+--- seed
+{"type":"Person","data":{"handle":"ada"}}
+{"type":"Person","data":{"handle":"bob"}}
+{"type":"Doc","data":{"slug":"d1","text":"Graph engines search graphs","embedding":[0.0,1.0]}}
+{"type":"Doc","data":{"slug":"d2","text":"search engines rank documents by their terms","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d3","text":"a graph","embedding":[0.6,0.8]}}
+{"type":"Doc","data":{"slug":"d4","text":"vectors and SEARCH","embedding":[0.9,0.3]}}
+{"type":"Doc","data":{"slug":"d5","text":"nothing relevant here at all"}}
+{"type":"Doc","data":{"slug":"d6","text":"","embedding":[0.2,0.2]}}
+{"edge":"Wrote","from":"ada","to":"d1"}
+{"edge":"Wrote","from":"ada","to":"d3"}
+{"edge":"Wrote","from":"ada","to":"d4"}
+{"edge":"Wrote","from":"bob","to":"d2"}
+{"edge":"Wrote","from":"bob","to":"d4"}
+
+--- query
+query q() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "graph search") as $score }
+    return { $d.slug }
+    order { $score desc }
+}
+
+--- expect ordered
+{"d.slug":"d1"}
+{"d.slug":"d3"}
+{"d.slug":"d4"}
+{"d.slug":"d2"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query q() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, terms("search engines", mode: all)) as $score }
+    return { $d.slug, $score }
+    order { $score desc }
+}
+
+--- expect ordered
+{"d.slug":"d1","score":1.442567196459}
+{"d.slug":"d2","score":1.111365544211}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- query
+query q() {
+    match { $d: Doc } where match_terms($d.text, terms("grapj engine", mode: all, max_edits: 1))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query q() {
+    match { $d: Doc } where match_terms($d.text, terms("graph search", mode: all)) or match_terms($d.text, terms("VECTORS documents", mode: any))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"d1"}
+{"d.slug":"d2"}
+{"d.slug":"d4"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query q() {
+    match { $d: Doc } where not match_terms($d.text, terms("graph vectors", mode: any))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"d2"}
+{"d.slug":"d5"}
+{"d.slug":"d6"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query q() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 3) as $distance }
+    return { $d.slug, $distance }
+    order { $distance }
+}
+
+--- expect ordered
+{"d.slug":"d1","distance":0}
+{"d.slug":"d3","distance":0.4}
+{"d.slug":"d6","distance":0.68000007}
+
+--- expect shape
+d.slug: String
+distance: F32
+
+--- query
+query q($k: I64) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [1.0, 0.0], k: $k) as $distance }
+    return { $d.slug }
+    order { $distance }
+    limit 2
+}
+
+--- params
+{"k": 3}
+
+--- expect ordered
+{"d.slug":"d2"}
+{"d.slug":"d4"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query q() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, [0.5, 0.5]) as $dist }
+    return { $d.slug, $dist }
+    order { $dist, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d3","dist":0.10000001}
+{"d.slug":"d6","dist":0.18}
+{"d.slug":"d4","dist":0.19999997}
+{"d.slug":"d1","dist":0.5}
+{"d.slug":"d2","dist":0.5}
+
+--- expect shape
+d.slug: String
+dist: F32
+
+--- query
+query q() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 4) as $distance }
+    return { count($d) as n, min($distance) as best, max($distance) as worst }
+}
+
+--- expect unordered
+{"best":0,"n":4,"worst":1.3}
+
+--- expect shape
+n: I64
+best: F32
+worst: F32
+
+--- query
+query q() {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from rrf(nearest($pop, $d.embedding, [0.0, 1.0], k: 4), bm25($pop, $d.text, "search"), k: 60) as $score,
+    }
+    return { $d.slug }
+    order { $score desc, $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"d1"}
+{"d.slug":"d4"}
+{"d.slug":"d3"}
+{"d.slug":"d2"}
+{"d.slug":"d6"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query q() {
+    match {
+        let $pop = { match { $p: Person, $d: Doc, $p wrote $d } where $p.handle = "ada" return { $d } },
+        from nearest($pop, $d.embedding, [1.0, 0.0], k: 2) as $distance,
+    }
+    return { $d.slug, $distance }
+    order { $distance }
+}
+
+--- expect ordered
+{"d.slug":"d4","distance":0.10000001}
+{"d.slug":"d3","distance":0.8}
+
+--- expect shape
+d.slug: String
+distance: F32
+
+--- query
+query q() {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from bm25($pop, $d.text, "search") as $score,
+        $p: Person,
+        $p wrote $d,
+    }
+    return { $p.handle, $d.slug }
+    order { $score desc, $p.handle }
+}
+
+--- expect ordered
+{"d.slug":"d4","p.handle":"ada"}
+{"d.slug":"d4","p.handle":"bob"}
+{"d.slug":"d1","p.handle":"ada"}
+{"d.slug":"d2","p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+d.slug: String

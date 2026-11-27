@@ -751,9 +751,9 @@ node Doc {
 "#;
     const EMBED_QUERY: &str = r#"
 query vector_search_string($q: String) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 "#;
@@ -876,7 +876,7 @@ async fn cluster_boot_refuses_missing_embedding_secret_env() {
     .unwrap();
     fs::write(
         temp.path().join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
     )
     .unwrap();
     fs::write(
@@ -934,7 +934,7 @@ async fn cluster_boot_wires_policy_bindings_into_cedar_slots() {
         .unwrap();
         fs::write(
             temp.path().join("people.gq"),
-            "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+            "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
         )
         .unwrap();
         fs::write(

@@ -1,0 +1,51 @@
+# issue: none
+# notes: GQ 2 reads named after a registry row (`count`) or after a lexical call the body makes (`search`):
+# notes: `lint --fix --review-fixes` renames each read (`count_2`, `search_2`), printed for review since callers
+# notes: invoke a read by its name, and the rewrite answers as GQ 2 did. The hand rewrite is
+# notes: crates/omnigraph-gqt/cases/fix_renames_a_read_named_after_a_function.gqt.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"dog"}}
+{"type":"Doc","data":{"slug":"d2","title":"cat"}}
+
+--- query
+query count() {
+  match {
+    $d: Doc
+  }
+  return { $d.title }
+}
+
+--- expect unordered
+{"d.title":"cat"}
+{"d.title":"dog"}
+
+--- expect shape
+d.title: String
+
+--- query
+query search() {
+  match {
+    $d: Doc
+    search($d.title, "dog")
+  }
+  return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"d1"}
+
+--- expect shape
+d.slug: String

@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use omnigraph::db::Omnigraph;
-use omnigraph_compiler::settings::Engine;
 use omnigraph_gqt_core::{Case, PlainHost, branch_case, case_session, execute_steps};
 
 use crate::gqt_case::{DatasetRecipe, PlannedGqt};
@@ -102,7 +101,7 @@ async fn run_without_data(
         let db = Omnigraph::init(uri, &declared.schema)
             .await
             .map_err(|e| format!("fixture: schema: {e}"))?;
-        let session = case_session(db, fixture, Engine::V2).map_err(|e| format!("fixture: {e}"))?;
+        let session = case_session(db, fixture).map_err(|e| format!("fixture: {e}"))?;
         branch_case(&session, declared, needs_indices)
             .await
             .map_err(|e| format!("fixture: {e}"))?;
@@ -137,7 +136,7 @@ async fn run_without_data(
             .map_err(|e| format!("csv fixture policy: {e}"))?,
         None => db,
     };
-    let session = case_session(db, workload, Engine::V2)?;
+    let session = case_session(db, workload)?;
     let timeout = Duration::from_millis(workload.runner.timeout_ms);
     let run = execute_steps(
         workload,

@@ -1,17 +1,17 @@
 query scenario_facts() {
     match {
-        $s: Scenario
-        $s executes $w
-        $s uses $f
+        $s: Scenario,
+        $s executes $w,
+        $s uses $f,
     }
     return {
-        $s.name as scenario
-        $s.measured_step as measured_step
-        $s.repetitions as repetitions
-        $w.path as workload
-        $w.sha256 as workload_sha256
-        $f.kind as fixture_kind
+        $s.name as scenario,
+        $s.measured_step as measured_step,
+        $s.repetitions as repetitions,
+        $w.path as workload,
+        $w.sha256 as workload_sha256,
+        $f.kind as fixture_kind,
         $f.path as fixture
     }
-    order { scenario asc }
+    order { scenario }
 }

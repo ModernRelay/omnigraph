@@ -25,7 +25,7 @@ edge Knows: Person -> Person {
 {"type":"Person","data":{"name":"a0"}}
 {"type":"Person","data":{"name":"b0"}}
 
---- load generate: v1 seed: 1 mode: append
+--- load generate: v1 seed: 1 mode: insert
 tables:
   - kind: edge
     name: Knows
@@ -40,10 +40,8 @@ tables:
 --- query
 set query_memory_bytes = 4194304;
 query four_mib() {
-    match {
-        $p: Person { name: "a0" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a0"
     return { count($e.payload) as n }
 }
 
@@ -56,10 +54,8 @@ n: I64
 --- query
 set query_memory_bytes = 5242880;
 query five_mib() {
-    match {
-        $p: Person { name: "a0" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a0"
     return { count($e.payload) as n }
 }
 
@@ -72,10 +68,8 @@ n: I64
 --- query
 set query_memory_bytes = 6291456;
 query six_mib() {
-    match {
-        $p: Person { name: "a0" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a0"
     return { count($e.payload) as n }
 }
 
@@ -88,10 +82,8 @@ n: I64
 --- query
 set query_memory_bytes = 8388608;
 query eight_mib() {
-    match {
-        $p: Person { name: "a0" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a0"
     return { count($e.payload) as n }
 }
 
@@ -104,10 +96,8 @@ n: I64
 --- query
 set query_memory_bytes = 16777216;
 query sixteen_mib() {
-    match {
-        $p: Person { name: "a0" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a0"
     return { count($e.payload) as n }
 }
 

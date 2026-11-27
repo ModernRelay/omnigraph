@@ -894,7 +894,7 @@ fn check_relaxes_data_expectations_and_drops_the_fixture_loads() {
     let directory = tempfile::tempdir().unwrap();
     copy_pair(directory.path());
     let fixture = fs::read_to_string(directory.path().join("fixtures/tiny_graph.gqt")).unwrap()
-        + "\n--- mutate\nload csv \"file:///nonexistent/check/items.csv\" into node:Item mode append header\n--- expect ok\n";
+        + "\n--- mutate\nload csv \"file:///nonexistent/check/items.csv\" into node:Item mode insert header\n--- expect ok\n";
     fs::write(directory.path().join("fixtures/loading_graph.gqt"), fixture).unwrap();
     let workload = fs::read_to_string(directory.path().join("workloads/tiny_read.gqt"))
         .unwrap()

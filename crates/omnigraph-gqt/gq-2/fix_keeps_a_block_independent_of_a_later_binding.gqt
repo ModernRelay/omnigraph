@@ -1,0 +1,62 @@
+# issue: none
+# notes: GQ 2 blocks among the elements that name a variable a later element binds: GQ 2 correlated a
+# notes: block only on the names bound before it, so the block's name was its own. `lint --fix` keeps the block at
+# notes: its place as `let $block = …`, which correlates the same way, and the rewrite answers as GQ 2 did.
+# notes: The hand rewrite is crates/omnigraph-gqt/cases/fix_keeps_a_block_independent_of_a_later_binding.gqt.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+node Company {
+    name: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"p"}}
+{"type":"Person","data":{"name":"q"}}
+{"type":"Person","data":{"name":"x"}}
+{"type":"Company","data":{"name":"idle"}}
+{"edge":"Knows","from":"p","to":"q"}
+
+--- query
+query knows_anyone() {
+  match {
+    $p: Person
+    exists { $p knows $x }
+    $x: Company
+  }
+  return { $p.name, $x.name }
+}
+
+--- expect unordered
+{"p.name":"p","x.name":"idle"}
+
+--- expect shape
+p.name: String
+x.name: String
+
+--- query
+query knows_nobody() {
+  match {
+    $p: Person
+    not { $p knows $x }
+    $x: Company
+  }
+  return { $p.name, $x.name }
+}
+
+--- expect unordered
+{"p.name":"q","x.name":"idle"}
+{"p.name":"x","x.name":"idle"}
+
+--- expect shape
+p.name: String
+x.name: String

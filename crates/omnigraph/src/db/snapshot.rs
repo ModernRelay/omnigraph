@@ -23,7 +23,22 @@ pub struct Snapshot {
     /// Opened through a branch incarnation that was already retired, by its
     /// exact commit, while a live branch retained the commit.
     retired_incarnation: bool,
+    /// Set only on the view a read query at an earlier commit runs against
+    /// ([`Self::set_property_views`]): per table key, each property the read
+    /// may see, stable property id to current name.
+    property_views: Option<Arc<PropertyViews>>,
 }
+
+/// Per table key, stable property id to the name a historical read sees the
+/// property under.
+pub(crate) type PropertyViews =
+    std::collections::HashMap<String, std::collections::HashMap<String, String>>;
+
+/// The name a stored column takes in a historical read's view when its
+/// property identity is not one the read may see: a dropped property's
+/// column, which may share a current name. No property name can begin with
+/// a control character, so nothing the read names reaches it.
+const HIDDEN_LIFETIME_PREFIX: &str = "\u{1f}omnigraph_hidden_lifetime_";
 
 /// Read-only view of one backing dataset pinned by a [`Snapshot`].
 ///
@@ -209,6 +224,39 @@ impl SnapshotDataset {
     }
 }
 
+/// `dataset` with its columns renamed in memory as `view` says, the
+/// metadata-only change Lance's own column rename commits: a column is its
+/// field id, which data files, deletion files and indexes reference, and its
+/// name is metadata of the manifest's schema. Nothing is written; the handle
+/// reads the same pinned version.
+fn viewed(mut dataset: Dataset, view: &std::collections::HashMap<String, String>) -> Dataset {
+    let renamed: Vec<(usize, String)> = dataset
+        .schema()
+        .fields
+        .iter()
+        .enumerate()
+        .filter_map(|(at, field)| {
+            let id = field
+                .metadata
+                .get(crate::db::STABLE_PROPERTY_ID_METADATA_KEY)?;
+            let name = match view.get(id) {
+                Some(name) => name.clone(),
+                None => format!("{HIDDEN_LIFETIME_PREFIX}{id}"),
+            };
+            (name != field.name).then_some((at, name))
+        })
+        .collect();
+    if renamed.is_empty() {
+        return dataset;
+    }
+    let mut manifest = dataset.manifest().clone();
+    for (at, name) in renamed {
+        manifest.schema.fields[at].name = name;
+    }
+    dataset.manifest = Arc::new(manifest);
+    dataset
+}
+
 impl Snapshot {
     pub(crate) fn clone_allocation_bytes(&self) -> usize {
         self.inner.clone_allocation_bytes()
@@ -222,6 +270,7 @@ impl Snapshot {
         Self {
             inner,
             retired_incarnation: false,
+            property_views: None,
         }
     }
 
@@ -235,11 +284,6 @@ impl Snapshot {
 
     pub(crate) fn is_retired_incarnation(&self) -> bool {
         self.retired_incarnation
-    }
-
-    #[cfg(feature = "test-util")]
-    pub(crate) fn raw(&self) -> &omnigraph_catalog::Snapshot {
-        &self.inner
     }
 
     #[cfg(test)]
@@ -296,6 +340,12 @@ impl Snapshot {
             .map(SchemaContractIdentity::from)
     }
 
+    /// Whether the schema accepted at this snapshot can be read
+    /// ([`Self::read_schema_contract`]).
+    pub(crate) fn records_schema(&self) -> bool {
+        self.inner.records_schema()
+    }
+
     pub(crate) fn bind_catalog_aliases(
         &mut self,
         catalog: &Catalog,
@@ -321,7 +371,24 @@ impl Snapshot {
     }
 
     pub(crate) async fn open_lance_dataset(&self, type_key: &str) -> Result<Dataset> {
-        self.inner.open_lance_dataset(type_key).await
+        let dataset = self.inner.open_lance_dataset(type_key).await?;
+        match self
+            .property_views
+            .as_ref()
+            .and_then(|views| views.get(type_key))
+        {
+            Some(view) => Ok(viewed(dataset, view)),
+            None => Ok(dataset),
+        }
+    }
+
+    /// Read every table this view opens for a query under the names `views`
+    /// gives its property identities: a stored column whose stable property
+    /// id `views` maps takes that name, and one carrying any other id is
+    /// hidden. A column with no id (a system column, or data written before
+    /// property identity was persisted) keeps its name.
+    pub(crate) fn set_property_views(&mut self, views: PropertyViews) {
+        self.property_views = Some(Arc::new(views));
     }
 
     pub(crate) fn set_read_caches(&mut self, caches: omnigraph_catalog::SnapshotReadCaches) {

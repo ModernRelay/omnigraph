@@ -239,12 +239,53 @@ pub enum IndexBuildSpec {
         column: String,
         name: Option<String>,
     },
+    /// A BITMAP, LABEL_LIST or NGRAM index (a BTREE is [`Self::BTree`]),
+    /// named `{column}_{family}` so it never collides with a companion built
+    /// on the same column in the same batch.
+    Scalar {
+        column: String,
+        family: omnigraph_core::dataset_index::ScalarIndexFamily,
+    },
     FullText {
         column: String,
+        analysis: FullTextBuild,
     },
+    /// An IVF_FLAT index built for the column's declared distance; it
+    /// replaces every vector index on the column.
     Vector {
         column: String,
+        distance: omnigraph_compiler::schema::vector::VectorDistance,
     },
+}
+
+/// The analysis a full-text segment is built with: the profile the column's
+/// accepted schema applies (`english_v1` where it names none) and the
+/// fingerprint the segment's certificate records
+/// (the GQ 3 RFC, section 4). Both are required, so no segment
+/// is built without the fingerprint its certificate needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextBuild {
+    pub profile: omnigraph_compiler::schema::analysis::AnalyzerProfile,
+    pub fingerprint: String,
+}
+
+#[cfg(test)]
+impl FullTextBuild {
+    /// `english_v1` with a fixed fingerprint, for a test that builds an index
+    /// outside a catalog.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            profile: omnigraph_compiler::schema::analysis::AnalyzerProfile::EnglishV1,
+            fingerprint: "sha256:test".to_string(),
+        }
+    }
+}
+
+/// One column carrying a declared full-text index, with its analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullTextColumn {
+    pub column: String,
+    pub analysis: FullTextBuild,
 }
 
 impl IndexBuildSpec {
@@ -252,8 +293,9 @@ impl IndexBuildSpec {
     pub(crate) fn column_and_kind(&self) -> (&str, &'static str) {
         match self {
             Self::BTree { column, .. } => (column, "BTREE"),
-            Self::FullText { column } => (column, "FTS"),
-            Self::Vector { column } => (column, "Vector"),
+            Self::Scalar { column, family } => (column, family.as_str()),
+            Self::FullText { column, .. } => (column, "FTS"),
+            Self::Vector { column, .. } => (column, "Vector"),
         }
     }
 
@@ -261,6 +303,7 @@ impl IndexBuildSpec {
     pub(crate) fn index_type(&self) -> lance_index::IndexType {
         match self {
             Self::BTree { .. } => lance_index::IndexType::BTree,
+            Self::Scalar { family, .. } => family.index_type(),
             Self::FullText { .. } => lance_index::IndexType::Inverted,
             Self::Vector { .. } => lance_index::IndexType::Vector,
         }
@@ -906,7 +949,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: SnapshotHandle,
         staged: StagedHandle,
         witness: &crate::table_store::StagingWitness,
-        declared_full_text: &[String],
+        declared_full_text: &[FullTextColumn],
     ) -> Result<(
         SnapshotHandle,
         crate::table_store::StagedTransactionIdentity,
@@ -918,7 +961,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn commit_full_text_declarations(
         &self,
         snapshot: SnapshotHandle,
-        columns: &[String],
+        columns: &[FullTextColumn],
         witness: &crate::table_store::StagingWitness,
     ) -> Result<
         Option<(
@@ -926,6 +969,20 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
             crate::table_store::StagedTransactionIdentity,
         )>,
     >;
+
+    /// Commit, detached under `witness`, the replacement of every full-text
+    /// segment of each column of `columns` by one untrained segment built
+    /// with the column's analysis (`TableStore::commit_full_text_redeclarations`):
+    /// the effect of a schema apply that changes a column's analyzer.
+    async fn commit_full_text_redeclarations(
+        &self,
+        snapshot: SnapshotHandle,
+        columns: &[FullTextColumn],
+        witness: &crate::table_store::StagingWitness,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )>;
 
     /// RFC 0067: the identity of the transaction a version records.
     fn transaction_identity(
@@ -1015,11 +1072,25 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     // ── Index presence (reads, no HEAD advance) ──────────────────────
 
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
+    /// Whether `column` carries an index of the scalar `family`.
+    async fn has_scalar_index(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+        family: omnigraph_core::dataset_index::ScalarIndexFamily,
+    ) -> Result<bool>;
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     /// Whether a full-text segment on `column` holds postings; an untrained
     /// declaration segment does not.
     async fn has_fts_postings(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
-    async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
+    /// Whether `column` has a vector index and every vector index on it is
+    /// built for `distance`, the field's declared distance.
+    async fn has_vector_index_for(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+        distance: omnigraph_compiler::schema::vector::VectorDistance,
+    ) -> Result<bool>;
 
     // ── URI helpers ────────────────────────────────────────────────────
     //
@@ -1568,7 +1639,7 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         staged: StagedHandle,
         witness: &crate::table_store::StagingWitness,
-        declared_full_text: &[String],
+        declared_full_text: &[FullTextColumn],
     ) -> Result<(
         SnapshotHandle,
         crate::table_store::StagedTransactionIdentity,
@@ -1595,7 +1666,7 @@ impl TableStorage for TableStore {
     async fn commit_full_text_declarations(
         &self,
         snapshot: SnapshotHandle,
-        columns: &[String],
+        columns: &[FullTextColumn],
         witness: &crate::table_store::StagingWitness,
     ) -> Result<
         Option<(
@@ -1608,6 +1679,25 @@ impl TableStorage for TableStore {
                 .await?
                 .map(|(dataset, identity)| (SnapshotHandle::new(dataset), identity)),
         )
+    }
+
+    async fn commit_full_text_redeclarations(
+        &self,
+        snapshot: SnapshotHandle,
+        columns: &[FullTextColumn],
+        witness: &crate::table_store::StagingWitness,
+    ) -> Result<(
+        SnapshotHandle,
+        crate::table_store::StagedTransactionIdentity,
+    )> {
+        let (dataset, identity) = TableStore::commit_full_text_redeclarations(
+            self,
+            snapshot.into_arc(),
+            columns,
+            witness,
+        )
+        .await?;
+        Ok((SnapshotHandle::new(dataset), identity))
     }
 
     async fn commit_staged_exact(
@@ -1734,6 +1824,15 @@ impl TableStorage for TableStore {
         TableStore::has_btree_index(self, snapshot.dataset(), column).await
     }
 
+    async fn has_scalar_index(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+        family: omnigraph_core::dataset_index::ScalarIndexFamily,
+    ) -> Result<bool> {
+        TableStore::has_scalar_index(self, snapshot.dataset(), column, family).await
+    }
+
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {
         TableStore::has_fts_index(self, snapshot.dataset(), column).await
     }
@@ -1742,8 +1841,13 @@ impl TableStorage for TableStore {
         TableStore::has_fts_postings(self, snapshot.dataset(), column).await
     }
 
-    async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {
-        TableStore::has_vector_index(self, snapshot.dataset(), column).await
+    async fn has_vector_index_for(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+        distance: omnigraph_compiler::schema::vector::VectorDistance,
+    ) -> Result<bool> {
+        TableStore::has_vector_index_for(self, snapshot.dataset(), column, distance).await
     }
 
     fn root_uri(&self) -> &str {

@@ -12,7 +12,7 @@ use omnigraph_planner::PhysicalPlan;
 
 use super::context::QueryContext;
 use super::lower::{Lowered, in_order, return_order};
-use super::report::{Ran, ReportRow, Spilled};
+use super::report::{LexicalScanned, Ran, ReportRow, Spilled};
 use super::*;
 use crate::loader::LoadOperatorExecuted;
 
@@ -134,6 +134,7 @@ pub(super) fn pass_rows(
             actual_rows,
             drained,
             Spilled::read(&metrics),
+            LexicalScanned::read(&metrics),
         ));
     }
     Ok(rows)

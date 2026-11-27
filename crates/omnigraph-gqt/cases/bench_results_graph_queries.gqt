@@ -259,23 +259,24 @@ edge Has: BenchmarkPoint -> Level {
 --- query
 query series_for_scenario($scenario: String) {
     match {
-        $s: Scenario { name: $scenario }
-        $r ran $s
-        $r measures $p
-        $r built $c
+        $s: Scenario,
+        $r ran $s,
+        $r measures $p,
+        $r built $c,
     }
+    where $s.name = $scenario
     return {
-        $s.name as scenario
-        $p.point_name as point
-        $c.sha as commit
-        $r.invoked_at_unix_ms as invoked_at_unix_ms
-        $r.min_us as min_us
-        $r.p50_us as p50_us
-        $r.max_us as max_us
-        $r.observed_repetitions as repetitions
+        $s.name as scenario,
+        $p.point_name as point,
+        $c.sha as commit,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.min_us as min_us,
+        $r.p50_us as p50_us,
+        $r.max_us as max_us,
+        $r.observed_repetitions as repetitions,
         $r.claim_eligible as claim_eligible
     }
-    order { invoked_at_unix_ms asc }
+    order { invoked_at_unix_ms }
 }
 --- params
 {"scenario": "branch-merge-d50"}
@@ -296,19 +297,20 @@ claim_eligible: Bool
 --- query
 query suite_series($suite: String) {
     match {
-        $u: Suite { name: $suite }
-        $u groups $s
-        $r ran $s
-        $r built $c
+        $u: Suite,
+        $u groups $s,
+        $r ran $s,
+        $r built $c,
     }
+    where $u.name = $suite
     return {
-        $s.name as scenario
-        $c.sha as commit
-        $r.invoked_at_unix_ms as invoked_at_unix_ms
-        $r.p50_us as p50_us
+        $s.name as scenario,
+        $c.sha as commit,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.p50_us as p50_us,
         $r.claim_eligible as claim_eligible
     }
-    order { scenario asc, invoked_at_unix_ms asc }
+    order { scenario, invoked_at_unix_ms }
 }
 --- params
 {"suite": "regression"}
@@ -325,21 +327,22 @@ claim_eligible: Bool
 --- query
 query runs_for_commit($sha: String) {
     match {
-        $c: Revision { sha: $sha }
-        $r built $c
-        $r measures $p
-        $r ran $s
+        $c: Revision,
+        $r built $c,
+        $r measures $p,
+        $r ran $s,
     }
+    where $c.sha = $sha
     return {
-        $s.name as scenario
-        $p.point_name as point
-        $r.invocation_id as invocation_id
-        $r.invoked_at_unix_ms as invoked_at_unix_ms
-        $r.p50_us as p50_us
-        $r.acquisition_status as acquisition_status
+        $s.name as scenario,
+        $p.point_name as point,
+        $r.invocation_id as invocation_id,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.p50_us as p50_us,
+        $r.acquisition_status as acquisition_status,
         $r.claim_eligible as claim_eligible
     }
-    order { scenario asc, invoked_at_unix_ms asc }
+    order { scenario, invoked_at_unix_ms }
 }
 --- params
 {"sha": "bbbb0002"}
@@ -358,18 +361,19 @@ claim_eligible: Bool
 --- query
 query scenarios_in_suite($suite: String) {
     match {
-        $u: Suite { name: $suite }
-        $u groups $s
-        $s executes $w
-        $s uses $f
+        $u: Suite,
+        $u groups $s,
+        $s executes $w,
+        $s uses $f,
     }
+    where $u.name = $suite
     return {
-        $s.name as scenario
-        $s.measured_step as measured_step
-        $w.path as workload
+        $s.name as scenario,
+        $s.measured_step as measured_step,
+        $w.path as workload,
         $f.kind as fixture_kind
     }
-    order { scenario asc }
+    order { scenario }
 }
 --- params
 {"suite": "regression"}
@@ -384,25 +388,25 @@ fixture_kind: String
 --- query
 query all_series() {
     match {
-        $s: Scenario
-        $r ran $s
-        $r measures $p
-        $r built $c
+        $s: Scenario,
+        $r ran $s,
+        $r measures $p,
+        $r built $c,
     }
     return {
-        $s.name as scenario
-        $p.point_name as point
-        $c.sha as commit
-        $r.invocation_id as invocation_id
-        $r.invoked_at_unix_ms as invoked_at_unix_ms
-        $r.min_us as min_us
-        $r.p50_us as p50_us
-        $r.max_us as max_us
-        $r.observed_repetitions as repetitions
-        $r.acquisition_status as acquisition_status
+        $s.name as scenario,
+        $p.point_name as point,
+        $c.sha as commit,
+        $r.invocation_id as invocation_id,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.min_us as min_us,
+        $r.p50_us as p50_us,
+        $r.max_us as max_us,
+        $r.observed_repetitions as repetitions,
+        $r.acquisition_status as acquisition_status,
         $r.claim_eligible as claim_eligible
     }
-    order { scenario asc, invoked_at_unix_ms asc }
+    order { scenario, invoked_at_unix_ms }
 }
 --- expect ordered
 {"scenario": "branch-merge-alias", "point": "gqt-cold-pt1", "commit": "bbbb0002", "invocation_id": "inv-3", "invoked_at_unix_ms": 3000, "min_us": 65, "p50_us": 70, "max_us": 80, "repetitions": 5, "acquisition_status": "complete", "claim_eligible": true}
@@ -424,14 +428,14 @@ claim_eligible: Bool
 --- query
 query suite_members() {
     match {
-        $u: Suite
-        $u groups $s
+        $u: Suite,
+        $u groups $s,
     }
     return {
-        $u.name as suite
+        $u.name as suite,
         $s.name as scenario
     }
-    order { suite asc, scenario asc }
+    order { suite, scenario }
 }
 --- expect ordered
 {"suite": "regression", "scenario": "branch-merge-d50"}
@@ -442,20 +446,20 @@ scenario: String
 --- query
 query scenario_facts() {
     match {
-        $s: Scenario
-        $s executes $w
-        $s uses $f
+        $s: Scenario,
+        $s executes $w,
+        $s uses $f,
     }
     return {
-        $s.name as scenario
-        $s.measured_step as measured_step
-        $s.repetitions as repetitions
-        $w.path as workload
-        $w.sha256 as workload_sha256
-        $f.kind as fixture_kind
+        $s.name as scenario,
+        $s.measured_step as measured_step,
+        $s.repetitions as repetitions,
+        $w.path as workload,
+        $w.sha256 as workload_sha256,
+        $f.kind as fixture_kind,
         $f.path as fixture
     }
-    order { scenario asc }
+    order { scenario }
 }
 --- expect ordered
 {"scenario": "branch-merge-d50", "measured_step": "branch merge w0 into main", "repetitions": 5, "workload": "workloads/merge_one.gqt", "workload_sha256": "wl-1", "fixture_kind": "file", "fixture": "fixtures/branches_16.gqt"}
@@ -471,19 +475,19 @@ fixture: String?
 --- query
 query run_hosts() {
     match {
-        $r: BenchmarkRun
-        $r measuredBy $h
-        $m hosted $r
+        $r: BenchmarkRun,
+        $r measuredBy $h,
+        $m hosted $r,
     }
     return {
-        $r.invocation_id as invocation_id
-        $h.sha as harness
-        $m.label as machine
-        $m.cpu_model as cpu_model
-        $m.architecture as architecture
+        $r.invocation_id as invocation_id,
+        $h.sha as harness,
+        $m.label as machine,
+        $m.cpu_model as cpu_model,
+        $m.architecture as architecture,
         $m.logical_cores as logical_cores
     }
-    order { invocation_id asc }
+    order { invocation_id }
 }
 --- expect ordered
 {"invocation_id": "inv-1", "harness": "cccc0003", "machine": "c8gd.2xlarge", "cpu_model": "Neoverse-V2", "architecture": "aarch64", "logical_cores": 8}
@@ -500,14 +504,15 @@ logical_cores: U32?
 --- query
 query point_levels($point: String) {
     match {
-        $p: BenchmarkPoint { point_id: $point }
-        $p has $l
+        $p: BenchmarkPoint,
+        $p has $l,
     }
+    where $p.point_id = $point
     return {
-        $l.factor as factor
+        $l.factor as factor,
         $l.value as value
     }
-    order { factor asc }
+    order { factor }
 }
 --- params
 {"point": "pt-2"}
@@ -522,16 +527,17 @@ value: String
 --- query
 query points_at($scenario: String, $factor: String, $value: String) {
     match {
-        $s: Scenario { name: $scenario }
-        $s defines $p
-        $l: Level { factor: $factor, value: $value }
-        $p has $l
+        $s: Scenario,
+        $s defines $p,
+        $l: Level,
+        $p has $l,
     }
+    where $s.name = $scenario and $l.factor = $factor and $l.value = $value
     return {
-        $p.point_id as point
+        $p.point_id as point,
         $p.point_name as point_name
     }
-    order { point asc }
+    order { point }
 }
 --- params
 {"scenario": "branch-merge-d50", "factor": "protocol.deadline_seconds", "value": "90"}

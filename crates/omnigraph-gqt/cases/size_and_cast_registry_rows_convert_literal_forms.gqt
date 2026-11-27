@@ -1,0 +1,375 @@
+# issue: none
+# notes: The registry's `size` and `cast` rows (the GQ 3 RFC, section 2). `size` counts a
+# notes: list's elements as an I64, a null element included; an empty list is 0 and a null
+# notes: list is null. `cast(x, T)` converts between numbers (a float truncated toward
+# notes: zero into an integer), between Bool and an integer (1 and 0; non-zero is true),
+# notes: every scalar to and from String, and between Date and DateTime (midnight; the day
+# notes: an instant falls on). A float writes its shortest decimal (positional between
+# notes: 1e-5 and 1e16, scientific outside), and a String reads only literal forms: an
+# notes: optionally signed integer, a decimal, `true` or `false` in any letter case, a Date
+# notes: or DateTime literal. A value that does not convert or does not fit is `E6`, a
+# notes: null is null, and a conversion the registry has no row for (from a Vector, a
+# notes: Date to a number, a Bool to a float) or a list operand is a type error.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node C {
+    k: String @key
+    s: String?
+    l: I64?
+    f: F64?
+    g: F32?
+    b: Bool?
+    d: Date?
+    t: DateTime?
+    tags: [String]?
+    v: Vector(2)?
+}
+
+--- seed
+{"type":"C","data":{"k":"a","s":"42","l":-5,"f":2.5,"g":0.1,"b":true,"d":"2024-02-29","t":"2024-02-29T13:45:00Z","tags":["x","y","x"],"v":[1.0,2.0]}}
+{"type":"C","data":{"k":"b","s":"-7","l":0,"f":1e16,"g":-3.75,"b":false,"d":"1970-01-01","t":"1969-12-31T23:59:59.999Z","tags":[]}}
+{"type":"C","data":{"k":"c","s":"+3","l":9223372036854775807,"f":0.00001,"g":1e13,"tags":["only",null]}}
+{"type":"C","data":{"k":"d","s":"0.000001","l":2147483648,"f":-3.9,"g":-0.0}}
+{"type":"C","data":{"k":"e"}}
+
+--- query
+query sizes() {
+    match { $x: C }
+    return { $x.k, size($x.tags) as n, size(["a", "b"]) as lit }
+}
+
+--- expect unordered
+{"lit":2,"n":0,"x.k":"b"}
+{"lit":2,"n":2,"x.k":"c"}
+{"lit":2,"n":3,"x.k":"a"}
+{"lit":2,"x.k":"d"}
+{"lit":2,"x.k":"e"}
+
+--- expect shape
+x.k: String
+n: I64?
+lit: I64
+
+--- query
+query scalars_to_string() {
+    match { $x: C }
+    return {
+        $x.k,
+        cast($x.l, String) as ls,
+        cast($x.f, String) as fs,
+        cast($x.g, String) as gs,
+        cast($x.b, String) as bs,
+        cast($x.d, String) as ds,
+        cast($x.t, String) as ts,
+        cast($x.s, String) as ss
+    }
+}
+
+--- expect unordered
+{"bs":"false","ds":"1970-01-01","fs":"1e16","gs":"-3.75","ls":"0","ss":"-7","ts":"1969-12-31T23:59:59.999","x.k":"b"}
+{"bs":"true","ds":"2024-02-29","fs":"2.5","gs":"0.1","ls":"-5","ss":"42","ts":"2024-02-29T13:45:00","x.k":"a"}
+{"fs":"-3.9","gs":"-0.0","ls":"2147483648","ss":"0.000001","x.k":"d"}
+{"fs":"0.00001","gs":"1e13","ls":"9223372036854775807","ss":"+3","x.k":"c"}
+{"x.k":"e"}
+
+--- expect shape
+x.k: String
+ls: String?
+fs: String?
+gs: String?
+bs: String?
+ds: String?
+ts: String?
+ss: String?
+
+--- query
+query between_numbers_bools_and_days() {
+    match { $x: C } where $x.k in ["a", "b", "e"]
+    return {
+        $x.k,
+        cast($x.f, I64) as f_i,
+        cast($x.f, F32) as f_g,
+        cast($x.g, F64) as g_f,
+        cast($x.l, F64) as l_f,
+        cast($x.l, Bool) as l_b,
+        cast($x.b, I32) as b_i,
+        cast($x.d, DateTime) as d_t,
+        cast($x.t, Date) as t_d
+    }
+}
+
+--- expect unordered
+{"b_i":0,"d_t":"1970-01-01T00:00:00","f_g":10000000000000000,"f_i":10000000000000000,"g_f":-3.75,"l_b":false,"l_f":0,"t_d":"1969-12-31","x.k":"b"}
+{"b_i":1,"d_t":"2024-02-29T00:00:00","f_g":2.5,"f_i":2,"g_f":0.10000000149,"l_b":true,"l_f":-5,"t_d":"2024-02-29","x.k":"a"}
+{"x.k":"e"}
+
+--- expect shape
+x.k: String
+f_i: I64?
+f_g: F32?
+g_f: F64?
+l_f: F64?
+l_b: Bool?
+b_i: I32?
+d_t: DateTime?
+t_d: Date?
+
+--- query
+query truncation_toward_zero() {
+    match { $x: C } where $x.k = "d"
+    return { cast($x.f, I32) as f_i, cast(3.9, U32) as up, cast(-0.9, I64) as small }
+}
+
+--- expect unordered
+{"f_i":-3,"small":0,"up":3}
+
+--- expect shape
+f_i: I32
+up: U32
+small: I64
+
+--- query
+query strings_read_as_literals() {
+    match { $x: C } where $x.k = "a"
+    return {
+        cast("+7", I32) as plus,
+        cast("-0", I64) as neg_zero,
+        cast("4294967295", U32) as u32_max,
+        cast(".5", F64) as frac,
+        cast("1e3", F64) as exp,
+        cast("-2.5E-2", F32) as exp_upper,
+        cast("TRUE", Bool) as t,
+        cast("fAlSe", Bool) as f,
+        cast("2024-02-29", Date) as d,
+        cast("2024-02-29T13:45:00Z", DateTime) as dt
+    }
+}
+
+--- expect unordered
+{"d":"2024-02-29","dt":"2024-02-29T13:45:00","exp":1000,"exp_upper":-0.025,"f":false,"frac":0.5,"neg_zero":0,"plus":7,"t":true,"u32_max":4294967295}
+
+--- expect shape
+plus: I32
+neg_zero: I64
+u32_max: U32
+frac: F64
+exp: F64
+exp_upper: F32
+t: Bool
+f: Bool
+d: Date
+dt: DateTime
+
+--- query
+query string_columns_read_as_integers() {
+    match { $x: C } where $x.k in ["a", "b", "c", "e"]
+    return { $x.k, cast($x.s, I64) as n }
+}
+
+--- expect unordered
+{"n":-7,"x.k":"b"}
+{"n":3,"x.k":"c"}
+{"n":42,"x.k":"a"}
+{"x.k":"e"}
+
+--- expect shape
+x.k: String
+n: I64?
+
+--- query
+query decimal_string_is_not_an_integer() {
+    match { $x: C } where $x.k = "d"
+    return { cast($x.s, I64) as n }
+}
+
+--- expect error: E6
+
+--- query
+query cast_text($v: String) {
+    match { $x: C } where $x.k = "a"
+    return { cast($v, I32) as n }
+}
+
+--- params
+{"v": " 7"}
+
+--- expect error: E6
+
+--- query
+query cast_text($v: String) {
+    match { $x: C } where $x.k = "a"
+    return { cast($v, I32) as n }
+}
+
+--- params
+{"v": "2147483648"}
+
+--- expect error: E6
+
+--- query
+query cast_text($v: String) {
+    match { $x: C } where $x.k = "a"
+    return { cast($v, F64) as n }
+}
+
+--- params
+{"v": "inf"}
+
+--- expect error: E6
+
+--- query
+query cast_text($v: String) {
+    match { $x: C } where $x.k = "a"
+    return { cast($v, F64) as n }
+}
+
+--- params
+{"v": "NaN"}
+
+--- expect error: E6
+
+--- query
+query cast_text($v: String) {
+    match { $x: C } where $x.k = "a"
+    return { cast($v, F64) as n }
+}
+
+--- params
+{"v": "1e400"}
+
+--- expect error: E6
+
+--- query
+query cast_text($v: String) {
+    match { $x: C } where $x.k = "a"
+    return { cast($v, Bool) as n }
+}
+
+--- params
+{"v": "yes"}
+
+--- expect error: E6
+
+--- query
+query cast_text($v: String) {
+    match { $x: C } where $x.k = "a"
+    return { cast($v, Bool) as n }
+}
+
+--- params
+{"v": "1"}
+
+--- expect error: E6
+
+--- query
+query cast_text($v: String) {
+    match { $x: C } where $x.k = "a"
+    return { cast($v, Date) as n }
+}
+
+--- params
+{"v": "2023-02-29"}
+
+--- expect error: E6
+
+--- query
+query integer_out_of_range() {
+    match { $x: C } where $x.k = "d"
+    return { cast($x.l, I32) as n }
+}
+
+--- expect error: E6
+
+--- query
+query negative_to_unsigned() {
+    match { $x: C } where $x.k = "a"
+    return { cast($x.l, U32) as n }
+}
+
+--- expect error: E6
+
+--- query
+query float_out_of_integer_range() {
+    match { $x: C } where $x.k = "b"
+    return { cast($x.f, I32) as n }
+}
+
+--- expect error: E6
+
+--- query
+query float_out_of_f32_range() {
+    match { $x: C } where $x.k = "a"
+    return { cast(1.0e300, F32) as n }
+}
+
+--- expect error: E6
+
+--- query
+query guarded_cast() {
+    match { $x: C } where $x.k != "d" and cast($x.s, I64) > 0
+    return { $x.k }
+}
+
+--- expect unordered
+{"x.k":"a"}
+{"x.k":"c"}
+
+--- expect shape
+x.k: String
+
+--- query
+query cast_from_a_vector() {
+    match { $x: C } return { cast($x.v, String) as v }
+}
+
+--- expect error: T7: `cast` does not convert Vector(2) to String
+
+--- query
+query cast_to_a_vector() {
+    match { $x: C } return { cast($x.l, Vector(2)) as v }
+}
+
+--- expect error: T7: `cast` converts to a scalar type, not `Vector(2)`
+
+--- query
+query cast_to_a_node_type() {
+    match { $x: C } return { cast($x.l, C) as v }
+}
+
+--- expect error: T7: `cast` converts to a scalar type, not `C`
+
+--- query
+query cast_a_date_to_a_number() {
+    match { $x: C } return { cast($x.d, I64) as v }
+}
+
+--- expect error: T7: `cast` does not convert Date to I64
+
+--- query
+query cast_a_bool_to_a_float() {
+    match { $x: C } return { cast($x.b, F64) as v }
+}
+
+--- expect error: T7: `cast` does not convert Bool to F64
+
+--- query
+query cast_a_list() {
+    match { $x: C } return { cast($x.tags, String) as v }
+}
+
+--- expect error: T7: `cast` converts a scalar, got [String]?
+
+--- query
+query size_of_a_string() {
+    match { $x: C } return { size($x.s) as v }
+}
+
+--- expect error: T7: `size` counts a list's elements, got String?

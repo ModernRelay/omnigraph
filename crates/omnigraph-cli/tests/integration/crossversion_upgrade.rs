@@ -162,7 +162,7 @@ fn genuine_v0_12_0_cluster_ledger_upgrade_preserves_live_deployment() {
                 "mutate",
                 "seed",
                 "-e",
-                "query seed() { insert Person { name: \"Alice\", age: 31 } }",
+                "query seed() { replace Person { name: \"Alice\", age: 31 } }",
                 "--store",
             ])
             .arg(&graph)
@@ -1341,8 +1341,11 @@ fn current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end() {
         ),
     )
     .unwrap();
-    let queries = cluster.join("queries.gq");
-    let query_source = r#"
+    // The predecessor's cluster holds its queries in the predecessor syntax;
+    // the rebuilt cluster below holds the same queries in the current syntax,
+    // which reserves the name `terms`, so its `terms` is `title_search`.
+    let predecessor_queries = cluster.join("queries.gq");
+    let predecessor_query_source = r#"
 query docs() {
     match { $d: Doc }
     return { $d.slug, $d.title, $d.body, $d.embedding }
@@ -1372,7 +1375,37 @@ query vectors($q: Vector(4)) {
 query retitle($title: String) { update Doc set { title: $title } where slug = "ml-intro" }
 query revise($body: String) { update Doc set { body: $body } where slug = "dl-basics" }
 "#;
-    fs::write(&queries, query_source).unwrap();
+    let query_source = r#"
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.body, $d.embedding }
+    order { $d.slug }
+}
+query edges() {
+    match { $a: Doc, $a $c:cites $b }
+    return { $a.slug, $b.slug, $c.note }
+}
+query title_search($term: String) {
+    match { $d: Doc } where match_terms($d.title, terms($term, mode: any))
+    return { $d.slug }
+    order { $d.slug }
+}
+query ranked($term: String) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $term) as $score }
+    return { $d.slug }
+    order { $score desc }
+    limit 10
+}
+query vectors($q: Vector(4)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
+    return { $d.slug }
+    order { $distance }
+    limit 1
+}
+query retitle($title: String) { match { $x: Doc } where $x.slug = "ml-intro"  update $x set { title: $title } }
+query revise($body: String) { match { $x: Doc } where $x.slug = "dl-basics"  update $x set { body: $body } }
+"#;
+    fs::write(&predecessor_queries, predecessor_query_source).unwrap();
     fs::write(
         cluster.join("cluster.yaml"),
         "version: 1\nstate: { backend: cluster, lock: true }\ngraphs:\n  knowledge:\n    schema: graph.pg\n    queries: [queries.gq]\n",
@@ -1391,7 +1424,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     .unwrap();
     let graph = cluster.join("graphs/knowledge.omni");
     let uri = graph.to_str().unwrap();
-    let query_path = queries.to_str().unwrap();
+    let predecessor_query_path = predecessor_queries.to_str().unwrap();
     assert_ok(
         "lint",
         &run_old(
@@ -1401,7 +1434,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                 "--schema",
                 schema.to_str().unwrap(),
                 "--query",
-                query_path,
+                predecessor_query_path,
             ],
         ),
     );
@@ -1436,7 +1469,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                 "mutate",
                 "retitle",
                 "--query",
-                query_path,
+                predecessor_query_path,
                 "--store",
                 uri,
                 "--params",
@@ -1457,7 +1490,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                 "mutate",
                 "retitle",
                 "--query",
-                query_path,
+                predecessor_query_path,
                 "--store",
                 uri,
                 "--branch",
@@ -1481,7 +1514,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                     "query",
                     "terms",
                     "--query",
-                    query_path,
+                    predecessor_query_path,
                     "--store",
                     uri,
                     "--branch",
@@ -1535,6 +1568,14 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         "the v6 refusal must direct the operator to export/import rebuild, got: {storage_refusal}",
     );
 
+    let rebuilt_cluster = temp.path().join("rebuilt-cluster");
+    fs::create_dir(&rebuilt_cluster).unwrap();
+    for name in ["graph.pg", "cluster.yaml"] {
+        fs::copy(cluster.join(name), rebuilt_cluster.join(name)).unwrap();
+    }
+    let queries = rebuilt_cluster.join("queries.gq");
+    fs::write(&queries, query_source).unwrap();
+    let query_path = queries.to_str().unwrap();
     output_success(
         cli()
             .args(["lint", "--schema"])
@@ -1542,12 +1583,6 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             .arg("--query")
             .arg(&queries),
     );
-
-    let rebuilt_cluster = temp.path().join("rebuilt-cluster");
-    fs::create_dir(&rebuilt_cluster).unwrap();
-    for name in ["graph.pg", "queries.gq", "cluster.yaml"] {
-        fs::copy(cluster.join(name), rebuilt_cluster.join(name)).unwrap();
-    }
     apply_cluster_fixture(&rebuilt_cluster);
     let rebuilt = rebuilt_cluster.join("graphs/knowledge.omni");
     let rebuilt_uri = rebuilt.to_str().unwrap();
@@ -1613,7 +1648,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         );
         for (name, params) in [
             ("vectors", vector_params),
-            ("terms", term_params),
+            ("title_search", term_params),
             ("ranked", term_params),
         ] {
             let rows = parse_stdout_json(&output_success(&mut query_command(
@@ -1633,7 +1668,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         for (name, params) in [
             ("docs", "{}"),
             ("edges", "{}"),
-            ("terms", term_params),
+            ("title_search", term_params),
             ("ranked", term_params),
             ("vectors", vector_params),
         ] {
@@ -1644,7 +1679,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                 &remote, branch, name, params,
             )));
             assert_eq!(served["rows"], local["rows"], "{branch}/{name}");
-            if matches!(name, "terms" | "ranked" | "vectors") {
+            if matches!(name, "title_search" | "ranked" | "vectors") {
                 assert_eq!(served["rows"], json!([{ "d.slug":"ml-intro" }]));
             }
         }
@@ -1719,7 +1754,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         parse_stdout_json(&output_success(&mut query_command(
             &remote,
             "main",
-            "terms",
+            "title_search",
             term_params
         )))["rows"],
         json!([{ "d.slug":"ml-intro" }])
@@ -1836,11 +1871,14 @@ const ROOT_SCHEMA_OBJECTS: [&str; 3] = ["_schema.pg", "_schema.ir.json", "__sche
 const JOURNEY_LIVE_BRANCHES: [&str; 3] = ["main", "review", "child"];
 
 /// Writes the schema, the rows and the queries every in-place journey starts
-/// from under `directory`, and returns their paths in that order.
-fn journey_fixture(directory: &Path) -> [PathBuf; 3] {
+/// from under `directory`, and returns their paths in that order: the queries
+/// once in the current syntax and once in the predecessor syntax, which is
+/// the only one a predecessor binary parses.
+fn journey_fixture(directory: &Path) -> [PathBuf; 4] {
     let schema = directory.join("journey.pg");
     let data = directory.join("journey.jsonl");
     let queries = directory.join("journey.gq");
+    let predecessor_queries = directory.join("journey-predecessor.gq");
     std::fs::write(
         &schema,
         format!(
@@ -1861,7 +1899,8 @@ fn journey_fixture(directory: &Path) -> [PathBuf; 3] {
     )
     .unwrap();
     std::fs::write(&queries, journey_query_source()).unwrap();
-    [schema, data, queries]
+    std::fs::write(&predecessor_queries, predecessor_journey_query_source()).unwrap();
+    [schema, data, queries, predecessor_queries]
 }
 
 fn assert_writes_format(old: &Path, uri: &str, format: u32) {
@@ -1874,7 +1913,33 @@ fn assert_writes_format(old: &Path, uri: &str, format: u32) {
     );
 }
 
+/// The journey's queries in the current syntax; [`predecessor_journey_query_source`]
+/// holds the same queries for the predecessor binaries.
 fn journey_query_source() -> &'static str {
+    r#"
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.body, $d.embedding }
+    order { $d.slug }
+}
+query edges() {
+    match { $a: Doc, $a $c:cites $b }
+    return { $a.slug, $b.slug, $c.note }
+}
+query retitle($title: String) { match { $x: Doc } where $x.slug = "ml-intro"  update $x set { title: $title } }
+query remove() { match { $x: Doc } where $x.slug = "rl-intro"  delete $x }
+query revise() { match { $x: Doc } where $x.slug = "dl-basics"  update $x set { body: "written after storage upgrade" } }
+query vectors($q: Vector(4)) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
+    return { $d.slug }
+    order { $distance }
+    limit 1
+}
+"#
+}
+
+/// [`journey_query_source`] in the predecessor syntax.
+fn predecessor_journey_query_source() -> &'static str {
     r#"
 query docs() {
     match { $d: Doc }
@@ -1899,6 +1964,7 @@ query vectors($q: Vector(4)) {
 
 /// The rows `name` returns through `binary` at `selector value`, with the
 /// predecessor's widened floats narrowed so both binaries print alike.
+/// `query_path` holds the queries in the syntax `binary` parses.
 fn journey_rows(
     binary: Option<&Path>,
     uri: &str,
@@ -1946,6 +2012,16 @@ fn journey_rows(
 /// `Doc`, kept apart from [`journey_query_source`] so the binaries that never
 /// see that property compile the shared file.
 const RATED_QUERY_SOURCE: &str = r#"
+query rated() {
+    match { $d: Doc }
+    return { $d.slug, $d.rating }
+    order { $d.slug }
+}
+query rate() { match { $x: Doc } where $x.slug = "ml-intro"  update $x set { rating: 5 } }
+"#;
+
+/// [`RATED_QUERY_SOURCE`] in the predecessor syntax.
+const PREDECESSOR_RATED_QUERY_SOURCE: &str = r#"
 query rated() {
     match { $d: Doc }
     return { $d.slug, $d.rating }
@@ -2051,8 +2127,9 @@ fn genuine_lance11_storage_upgrade_round_trip() {
     let temp = tempdir().unwrap();
     let graph = temp.path().join("lance-transition.omni");
     let uri = graph.to_str().unwrap();
-    let [schema, data, queries] = journey_fixture(temp.path());
+    let [schema, data, queries, predecessor_queries] = journey_fixture(temp.path());
     let query_path = queries.to_str().unwrap();
+    let predecessor_query_path = predecessor_queries.to_str().unwrap();
     fs::write(
         &schema,
         format!(
@@ -2075,12 +2152,36 @@ fn genuine_lance11_storage_upgrade_round_trip() {
         ),
     )
     .unwrap();
-    fs::write(
-        &queries,
-        format!(
-            "{}\n{}",
-            journey_query_source(),
-            r#"
+    // The predecessor reads its own syntax; the current one reserves the name
+    // `terms`, so its file names that query `title_search`.
+    let added_queries = r#"
+query title_search($term: String) {
+    match { $d: Doc } where match_terms($d.title, terms($term, mode: any))
+    return { $d.slug }
+    order { $d.slug }
+}
+query nullable_vectors() {
+    match { $v: NullableVector }
+    return { $v.name, $v.embedding }
+    order { $v.name }
+}
+query slug_lookup() {
+    match { $d: Doc } where $d.slug = "ml-intro"
+    return { $d.slug, $d.title }
+    order { $d.slug }
+}
+query title_contains() {
+    match { $d: Doc } where contains($d.title, "organism")
+    return { $d.slug }
+    order { $d.slug }
+}
+query title_contains_case() {
+    match { $d: Doc } where contains($d.title, "ORGANISM")
+    return { $d.slug }
+    order { $d.slug }
+}
+"#;
+    let predecessor_added_queries = r#"
 query terms($term: String) {
     match { $d: Doc search($d.title, $term) }
     return { $d.slug }
@@ -2091,7 +2192,32 @@ query nullable_vectors() {
     return { $v.name, $v.embedding }
     order { $v.name }
 }
-"#,
+query slug_lookup() {
+    match { $d: Doc $d.slug = "ml-intro" }
+    return { $d.slug, $d.title }
+    order { $d.slug }
+}
+query title_contains() {
+    match { $d: Doc $d.title contains "organism" }
+    return { $d.slug }
+    order { $d.slug }
+}
+query title_contains_case() {
+    match { $d: Doc $d.title contains "ORGANISM" }
+    return { $d.slug }
+    order { $d.slug }
+}
+"#;
+    fs::write(
+        &queries,
+        format!("{}\n{}", journey_query_source(), added_queries),
+    )
+    .unwrap();
+    fs::write(
+        &predecessor_queries,
+        format!(
+            "{}\n{predecessor_added_queries}",
+            predecessor_journey_query_source()
         ),
     )
     .unwrap();
@@ -2110,9 +2236,17 @@ query nullable_vectors() {
             binary,
             &[
                 "query",
-                name,
+                if binary != old && name == "terms" {
+                    "title_search"
+                } else {
+                    name
+                },
                 "--query",
-                query_path,
+                if binary == old {
+                    predecessor_query_path
+                } else {
+                    query_path
+                },
                 if binary == old { "--store" } else { "--target" },
                 uri,
                 selector,
@@ -2189,7 +2323,7 @@ query nullable_vectors() {
             "mutate",
             "retitle",
             "--query",
-            query_path,
+            predecessor_query_path,
             "--store",
             uri,
             "--params",
@@ -2205,7 +2339,7 @@ query nullable_vectors() {
             "mutate",
             "retitle",
             "--query",
-            query_path,
+            predecessor_query_path,
             "--store",
             uri,
             "--branch",
@@ -2258,7 +2392,20 @@ query nullable_vectors() {
         assert!(docs.has_unindexed_fragments().await.unwrap());
     });
     const BRANCHES: [&str; 2] = ["main", "review"];
-    const QUERIES: [&str; 5] = ["docs", "edges", "vectors", "terms", "nullable_vectors"];
+    // The last three filter the String columns on which the candidate's
+    // `optimize` builds BTREE and NGRAM indexes the predecessor never builds;
+    // `title_contains_case` matches no row unless a reader skips the NGRAM
+    // index's case-sensitive recheck.
+    const QUERIES: [&str; 8] = [
+        "docs",
+        "edges",
+        "vectors",
+        "terms",
+        "nullable_vectors",
+        "slug_lookup",
+        "title_contains",
+        "title_contains_case",
+    ];
     let exports = BRANCHES.map(|branch| export(&old, branch));
     let histories = BRANCHES.map(|branch| history(&old, branch));
     let heads: [String; 2] = std::array::from_fn(|index| {
@@ -2279,6 +2426,21 @@ query nullable_vectors() {
         json!([{"d.slug":"ml-intro"}, {"d.slug":"old-tail"}])
     );
     assert_eq!(answers[1][3], json!([{"d.slug":"ml-intro"}]));
+    assert_eq!(
+        answers.each_ref().map(|answer| answer[5..].to_vec()),
+        [
+            vec![
+                json!([{"d.slug":"ml-intro", "d.title":"organism indexed"}]),
+                json!([{"d.slug":"ml-intro"}, {"d.slug":"old-tail"}]),
+                json!([]),
+            ],
+            vec![
+                json!([{"d.slug":"ml-intro", "d.title":"organism review"}]),
+                json!([{"d.slug":"ml-intro"}]),
+                json!([]),
+            ],
+        ]
+    );
     let certificates: Vec<_> = before
         .iter()
         .filter(|(path, _)| {
@@ -2345,7 +2507,7 @@ query nullable_vectors() {
         &[
             "load",
             "--mode",
-            "append",
+            "insert",
             "--data",
             additions.to_str().unwrap(),
             "--target",
@@ -2373,12 +2535,22 @@ query nullable_vectors() {
         !new_certificates.is_empty(),
         "the candidate must build new posting artifacts"
     );
+    // Format 2 records the field's analyzer fingerprint and the measured
+    // fingerprint of the native pipeline that built the postings, and no
+    // analyzer generation; the predecessor reads only format 1, so it refuses
+    // these postings below.
     for (_, bytes) in new_certificates {
         let certificate: Value = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(
-            certificate["analyzer_generation"],
-            "lance11.0.0-frostem1.20260821.3-v1"
-        );
+        assert_eq!(certificate["format_version"], 2);
+        assert!(certificate.get("analyzer_generation").is_none());
+        for fingerprint in ["analyzer_fingerprint", "native_fingerprint"] {
+            assert!(
+                certificate[fingerprint]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("sha256:")),
+                "{certificate}"
+            );
+        }
     }
     run(&current, &["optimize", "--target", uri]);
     run(
@@ -2398,6 +2570,27 @@ query nullable_vectors() {
             manifest.manifest().writer_version.as_ref().unwrap().version,
             "13.0.0"
         );
+        // The candidate's `optimize` builds BTREE and NGRAM indexes on the
+        // String columns of main, the branch it optimized; the predecessor
+        // never builds these.
+        let db = Omnigraph::open(uri).await.unwrap();
+        for (branch, built) in [("main", true), ("review", false)] {
+            let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await.unwrap();
+            let names = snapshot
+                .open_dataset("node:Doc")
+                .await
+                .unwrap()
+                .built_index_names()
+                .await
+                .unwrap();
+            for name in ["slug_btree", "title_btree", "title_ngram"] {
+                assert_eq!(
+                    names.iter().any(|index| index == name),
+                    built,
+                    "{branch} {name}: {names:?}"
+                );
+            }
+        }
     });
     assert_eq!(
         rows(&current, "--branch", "main", "terms"),
@@ -2416,15 +2609,74 @@ query nullable_vectors() {
             format!("base64:{payload}")
         );
     }
-    // Qualified rollback reads actual candidate data and index writes, including
-    // all-null nullable outer vectors, rather than only reopening old files.
+    // Rollback in place after the candidate built or rebuilt an index is not
+    // supported: the predecessor reads the candidate's data writes, including
+    // all-null nullable outer vectors, and answers as the candidate does, or it
+    // refuses; it never answers differently. The candidate rebuilt main's
+    // full-text indexes with fingerprint certificates, which the predecessor
+    // refuses without returning rows. The supported rollback is the backup
+    // restore below.
+    //
+    // The predecessor plans `title_contains` on main through the candidate's
+    // NGRAM index, so its equal answer below covers that index kind.
+    let explain = support::parse_stdout_json(&run(
+        &old,
+        &[
+            "query",
+            "-e",
+            r#"explain query title_contains() { match { $d: Doc $d.title contains "organism" } return { $d.slug } }"#,
+            "--store",
+            uri,
+            "--branch",
+            "main",
+            "--json",
+        ],
+    ));
+    let scan = explain["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["tree"] == "physical" && row["node"] == "Scan")
+        .unwrap();
+    let scan: Value = serde_json::from_str(scan["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (&scan["access"], &scan["index"]),
+        (&json!("index_probe"), &json!(["title_ngram"]))
+    );
     for (index, branch) in BRANCHES.into_iter().enumerate() {
         assert_eq!(export(&old, branch), export(&current, branch));
         for (query_index, name) in QUERIES.into_iter().enumerate() {
-            assert_eq!(
-                rows(&old, "--branch", branch, name),
-                rows(&current, "--branch", branch, name)
-            );
+            if (branch, name) == ("main", "terms") {
+                let output = run_old(
+                    &old,
+                    &[
+                        "query",
+                        "terms",
+                        "--query",
+                        predecessor_query_path,
+                        "--store",
+                        uri,
+                        "--branch",
+                        branch,
+                        "--params",
+                        r#"{"term":"ORGANISM"}"#,
+                        "--json",
+                    ],
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    !output.status.success()
+                        && output.stdout.is_empty()
+                        && stderr.contains("requires rebuild")
+                        && stderr.contains("analyzer certificate payload is malformed"),
+                    "the predecessor must refuse the candidate's full-text postings: {output:?}"
+                );
+            } else {
+                assert_eq!(
+                    rows(&old, "--branch", branch, name),
+                    rows(&current, "--branch", branch, name)
+                );
+            }
             for binary in [&old, &current] {
                 assert_eq!(
                     rows(binary, "--snapshot", &heads[index], name),
@@ -2442,8 +2694,10 @@ query nullable_vectors() {
             untrained_terms
         );
     }
-    // No backup command exists: reuse the owner's offline whole-root byte-copy
-    // restore at the original path, including native refs and index artifacts.
+    // The supported rollback restores the backup taken before the candidate
+    // wrote. No backup command exists: reuse the owner's offline whole-root
+    // byte-copy restore at the original path, including native refs and index
+    // artifacts.
     fs::remove_dir_all(&graph).unwrap();
     for (path, bytes) in &before {
         let destination = graph.join(path);
@@ -2553,8 +2807,9 @@ fn storage_upgrade_preserves_history(
     let graph = temp.path().join("standalone.omni");
     let uri = graph.to_str().unwrap();
     let current = omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION;
-    let [schema, data, queries] = journey_fixture(temp.path());
+    let [schema, data, queries, predecessor_queries] = journey_fixture(temp.path());
     let query_path = queries.to_str().unwrap();
+    let predecessor_query_path = predecessor_queries.to_str().unwrap();
     let first = born_with.as_ref().map_or(old, |born| born.binary);
     let released_writer = source_format < 13 && born_with.is_none();
 
@@ -2585,8 +2840,16 @@ fn storage_upgrade_preserves_history(
             &run_old(
                 binary,
                 &[
-                    "mutate", name, "--query", query_path, "--store", uri, "--branch", branch,
-                    "--params", params,
+                    "mutate",
+                    name,
+                    "--query",
+                    predecessor_query_path,
+                    "--store",
+                    uri,
+                    "--branch",
+                    branch,
+                    "--params",
+                    params,
                 ],
             ),
         );
@@ -2635,6 +2898,9 @@ fn storage_upgrade_preserves_history(
         let rated = temp.path().join("journey-rated.gq");
         std::fs::write(&rated, RATED_QUERY_SOURCE).unwrap();
         let rated_path = rated.to_str().unwrap().to_owned();
+        let predecessor_rated = temp.path().join("journey-rated-predecessor.gq");
+        std::fs::write(&predecessor_rated, PREDECESSOR_RATED_QUERY_SOURCE).unwrap();
+        let predecessor_rated_path = predecessor_rated.to_str().unwrap();
         assert_ok(
             "predecessor mutate of the added property",
             &run_old(
@@ -2643,7 +2909,7 @@ fn storage_upgrade_preserves_history(
                     "mutate",
                     "rate",
                     "--query",
-                    &rated_path,
+                    predecessor_rated_path,
                     "--store",
                     uri,
                     "--branch",
@@ -2660,7 +2926,7 @@ fn storage_upgrade_preserves_history(
                 "query",
                 "rated",
                 "--query",
-                rated_path.as_str(),
+                predecessor_rated_path,
                 "--store",
                 uri,
                 "--snapshot",
@@ -2780,8 +3046,22 @@ fn storage_upgrade_preserves_history(
         let id = commit["graph_commit_id"].as_str().unwrap();
         historical_rows.entry(id.to_owned()).or_insert_with(|| {
             [
-                journey_rows(Some(old), uri, query_path, "--snapshot", id, "docs"),
-                journey_rows(Some(old), uri, query_path, "--snapshot", id, "edges"),
+                journey_rows(
+                    Some(old),
+                    uri,
+                    predecessor_query_path,
+                    "--snapshot",
+                    id,
+                    "docs",
+                ),
+                journey_rows(
+                    Some(old),
+                    uri,
+                    predecessor_query_path,
+                    "--snapshot",
+                    id,
+                    "edges",
+                ),
             ]
         });
     }
@@ -3254,8 +3534,9 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
     let temp = tempdir().unwrap();
     let graph = temp.path().join("cleaned.omni");
     let uri = graph.to_str().unwrap();
-    let [schema, data, queries] = journey_fixture(temp.path());
+    let [schema, data, queries, predecessor_queries] = journey_fixture(temp.path());
     let query_path = queries.to_str().unwrap();
+    let predecessor_query_path = predecessor_queries.to_str().unwrap();
 
     assert_ok(
         "v0.11.0 init",
@@ -3290,7 +3571,7 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
                 "mutate",
                 "retitle",
                 "--query",
-                query_path,
+                predecessor_query_path,
                 "--store",
                 uri,
                 "--branch",
@@ -3324,7 +3605,11 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
             "query",
             "docs",
             "--query",
-            query_path,
+            if target_flag == "--store" {
+                predecessor_query_path
+            } else {
+                query_path
+            },
             target_flag,
             uri,
             "--snapshot",
@@ -3485,4 +3770,282 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
         );
     }
     assert_eq!(head_exports(), heads, "--older-than 0s");
+}
+
+/// The current binary, run hermetically.
+fn run_current(args: &[&str]) -> std::process::Output {
+    run_old(&assert_cmd::cargo::cargo_bin("omnigraph"), args)
+}
+
+/// Every row of the one-way table, applied by the current binary over a
+/// graph the GQ 2 binary created, is named by `schema plan` and
+/// `schema apply`, and the GQ 2 binary then refuses the whole graph.
+/// A change outside the table (plain `@index` on a String, an added
+/// property, a body-level `@index` over a list) leaves a graph it still
+/// reads, and so does an explicit `l2`, which plans no step and publishes
+/// nothing.
+#[test]
+fn genuine_gq_2_storage_upgrade_names_every_one_way_schema_construct() {
+    use omnigraph_compiler::schema::one_way::{ONE_WAY_CONSTRUCTS, one_way_note};
+    let Some(old) = predecessor("gq-2") else {
+        return;
+    };
+    let old = old.omnigraph();
+    let temp = tempdir().unwrap();
+    let graph_for = |name: &str, before: &str| {
+        let dir = temp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let schema = dir.join("before.pg");
+        std::fs::write(&schema, before).unwrap();
+        let graph = dir.join("g");
+        assert_ok(
+            "init",
+            &run_old(
+                &old,
+                &[
+                    "init",
+                    "--schema",
+                    schema.to_str().unwrap(),
+                    graph.to_str().unwrap(),
+                ],
+            ),
+        );
+        (dir, graph)
+    };
+    let apply = |dir: &Path, graph: &Path, after: &str| -> serde_json::Value {
+        let schema = dir.join("after.pg");
+        std::fs::write(&schema, after).unwrap();
+        let args = [
+            "--schema",
+            schema.to_str().unwrap(),
+            "--target",
+            graph.to_str().unwrap(),
+            "--json",
+        ];
+        let plan = run_current(&[&["schema", "plan"][..], &args[..]].concat());
+        output_success_ref("schema plan", &plan);
+        let applied = run_current(&[&["schema", "apply"][..], &args[..]].concat());
+        output_success_ref("schema apply", &applied);
+        let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+        let applied: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+        assert_eq!(
+            plan["one_way_constructs"], applied["one_way_constructs"],
+            "plan and apply name the same constructs"
+        );
+        applied
+    };
+    for row in ONE_WAY_CONSTRUCTS {
+        let (dir, graph) = graph_for(row.id, row.before);
+        let applied = apply(&dir, &graph, row.after);
+        assert_eq!(applied["applied"], true, "{}: {applied}", row.id);
+        let named: Vec<_> = applied["one_way_constructs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{}: {applied}", row.id))
+            .iter()
+            .map(|c| c["construct"].as_str().unwrap())
+            .collect();
+        assert!(named.contains(&row.id), "{}: {applied}", row.id);
+        let releases = applied["one_way_constructs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["first_release"].as_str().unwrap());
+        assert_eq!(applied["one_way_note"], one_way_note(releases).unwrap());
+        let refused = run_old(
+            &old,
+            &["snapshot", "--target", graph.to_str().unwrap(), "--json"],
+        );
+        assert!(
+            !refused.status.success(),
+            "{}: the GQ 2 binary still opens the graph:\n{}",
+            row.id,
+            String::from_utf8_lossy(&refused.stdout)
+        );
+    }
+
+    let (dir, graph) = graph_for(
+        "outside",
+        "node Doc { slug: String @key title: String tags: [String] }\n",
+    );
+    let applied = apply(
+        &dir,
+        &graph,
+        "node Doc { slug: String @key title: String @index tags: [String] n: I64? @index @index(tags) }\n",
+    );
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert!(applied.get("one_way_constructs").is_none(), "{applied}");
+    assert_ok(
+        "snapshot after a change outside the table",
+        &run_old(
+            &old,
+            &["snapshot", "--target", graph.to_str().unwrap(), "--json"],
+        ),
+    );
+
+    let (dir, graph) = graph_for(
+        "explicit_l2",
+        "node Doc { slug: String @key emb: Vector(2) }\n",
+    );
+    let applied = apply(
+        &dir,
+        &graph,
+        "node Doc { slug: String @key emb: Vector(2, distance = \"l2\") }\n",
+    );
+    assert_eq!(applied["applied"], false, "{applied}");
+    assert_eq!(applied["step_count"], 0, "{applied}");
+    assert_ok(
+        "snapshot after an explicit l2",
+        &run_old(
+            &old,
+            &["snapshot", "--target", graph.to_str().unwrap(), "--json"],
+        ),
+    );
+}
+
+/// The full-text rebuild is the one maintenance step the GQ 2 binary
+/// cannot read back, and its own rebuild undoes it. On a graph it indexed
+/// and then wrote past, the current `index build` recommends no full-text
+/// rebuild; the current rebuild names its one-way effect; the GQ 2
+/// binary then refuses full-text reads until its own `index rebuild --kind
+/// full-text` restores them with the same rows.
+#[test]
+fn genuine_gq_2_storage_upgrade_full_text_rebuild_is_undone_by_the_predecessor() {
+    let Some(old) = predecessor("gq-2") else {
+        return;
+    };
+    let old = old.omnigraph();
+    let temp = tempdir().unwrap();
+    let schema = temp.path().join("s.pg");
+    let data = temp.path().join("d.jsonl");
+    let more = temp.path().join("more.jsonl");
+    let query = temp.path().join("q.gq");
+    let graph = temp.path().join("g");
+    let g = graph.to_str().unwrap();
+    std::fs::write(
+        &schema,
+        "node Doc { slug: String @key title: String @index }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &data,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"a\",\"title\":\"graph engines\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"b\",\"title\":\"vector search\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &more,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"c\",\"title\":\"graph search\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &query,
+        "query s($q: String) { match { $d: Doc search($d.title, $q) } return { $d.slug } order { $d.slug } }\n",
+    )
+    .unwrap();
+    assert_ok(
+        "init",
+        &run_old(&old, &["init", "--schema", schema.to_str().unwrap(), g]),
+    );
+    for (label, file) in [("load", &data), ("load more", &more)] {
+        assert_ok(
+            label,
+            &run_old(
+                &old,
+                &[
+                    "load",
+                    "--data",
+                    file.to_str().unwrap(),
+                    "--mode",
+                    "merge",
+                    "--target",
+                    g,
+                ],
+            ),
+        );
+        if label == "load" {
+            assert_ok(
+                "index build",
+                &run_old(&old, &["index", "build", "--target", g]),
+            );
+        }
+    }
+    let search = || {
+        run_old(
+            &old,
+            &[
+                "query",
+                "s",
+                "--query",
+                query.to_str().unwrap(),
+                "--params",
+                "{\"q\":\"graph\"}",
+                "--target",
+                g,
+                "--format",
+                "json",
+            ],
+        )
+    };
+    let before = search();
+    assert_ok("search before", &before);
+
+    let build = run_current(&["index", "build", "--target", g, "--json"]);
+    output_success_ref("current index build", &build);
+    let build: serde_json::Value = serde_json::from_slice(&build.stdout).unwrap();
+    assert!(
+        !build.to_string().contains("rebuild --kind full-text"),
+        "the build recommends no full-text rebuild: {build}"
+    );
+    assert_ok("search after the current index build", &search());
+
+    let rebuilt = run_current(&[
+        "index",
+        "rebuild",
+        "--kind",
+        "full-text",
+        "--target",
+        g,
+        "--json",
+    ]);
+    output_success_ref("current full-text rebuild", &rebuilt);
+    let rebuilt: serde_json::Value = serde_json::from_slice(&rebuilt.stdout).unwrap();
+    assert!(
+        rebuilt["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .starts_with("Binaries before this release refuse full-text reads")),
+        "{rebuilt}"
+    );
+    let refused = search();
+    assert!(
+        !refused.status.success(),
+        "the GQ 2 binary reads the rebuilt index"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("requires rebuild")
+            || String::from_utf8_lossy(&refused.stderr).contains("requires rebuild"),
+        "{}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_ok(
+        "the GQ 2 full-text rebuild",
+        &run_old(
+            &old,
+            &["index", "rebuild", "--kind", "full-text", "--target", g],
+        ),
+    );
+    let restored = search();
+    assert_ok("search after the GQ 2 rebuild", &restored);
+    let rows = |out: &std::process::Output| -> serde_json::Value {
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["rows"].clone()
+    };
+    assert_eq!(rows(&restored), rows(&before));
+}
+
+fn output_success_ref(label: &str, out: &std::process::Output) {
+    assert!(
+        out.status.success(),
+        "current binary `{label}` failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
 }

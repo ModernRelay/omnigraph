@@ -1,6 +1,9 @@
 # issue: 659
 # red_on: 7f1233bb
-# notes: RRF retains concrete edge multiplicity and orders equal IDs by type before applying a row limit.
+# notes: RRF retains concrete edge multiplicity and orders equal IDs by type before applying a row limit: the
+# notes: fusion yields one row per Person, the traversal after its `from` multiplies them by edge, and the
+# notes: final sort's tie rule orders a selected edge by type then id.
+# notes: The second arm ranks `hay` so the two arms differ; it selects only `b`, which has no outgoing edge, so the rows are `a`'s.
 
 --- runner
 timeout_ms: 10000
@@ -11,7 +14,7 @@ environments:
 --- schema
 node Person {
     name: String @key
-    text: String @index
+    text: String @index(fulltext, analyzer = "standard_v1")
 }
 edge Knows: Person -> Person
 edge Likes: Person -> Person
@@ -25,11 +28,13 @@ edge Likes: Person -> Person
 --- query
 query fused_types() {
     match {
-        $p: Person
-        $p $e:(likes | knows) $q
+      let $all = { match { $p: Person } return { $p } },
+      from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60) as $score,
+      $p: Person,
+      $p $e:(likes | knows) $q,
     }
     return { $e.@type as edge_type, $e.@id as edge_id }
-    order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+    order { $score desc }
     limit 2
 }
 
@@ -43,16 +48,19 @@ edge_id: String
 
 --- expect plan
 expand $p $q: selection alternation [Knows out, Likes out]
-rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
+fuse $p: arms [bm25, bm25]
+sort tiebreak [$p, $q, $e.@type, $e.@id]
 
 --- query
 query fused_type_page() {
     match {
-        $p: Person
-        $p $e:(likes | knows) $q
+      let $all = { match { $p: Person } return { $p } },
+      from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60) as $score,
+      $p: Person,
+      $p $e:(likes | knows) $q,
     }
     return { $e.@type as edge_type, $e.@id as edge_id }
-    order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+    order { $score desc }
     limit 1
 }
 
@@ -66,12 +74,14 @@ edge_id: String
 --- query
 query fused_wildcard_type_page() {
     match {
-        $p: Person
-        $q: Person
-        $p $e:* $q
+      let $all = { match { $p: Person } return { $p } },
+      from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60) as $score,
+      $p: Person,
+      $q: Person,
+      $p $e:* $q,
     }
     return { $e.@type as edge_type, $e.@id as edge_id }
-    order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+    order { $score desc }
     limit 1
 }
 
@@ -84,4 +94,5 @@ edge_id: String
 
 --- expect plan
 expand $p $q: selection wildcard [Knows out, Likes out]
-rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
+fuse $p: arms [bm25, bm25]
+sort tiebreak [$p, $q, $e.@type, $e.@id]

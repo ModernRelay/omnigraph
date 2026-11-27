@@ -18,7 +18,7 @@ node Person {
 {"type":"Person","data":{"name":"alice","age":30}}
 
 --- concurrent scripted
-w1: query add_bob() { insert Person { name: "bob", age: 31 } }
+w1: query add_bob() { replace Person { name: "bob", age: 31 } }
 r1: query all() { match { $p: Person } return { $p.name } }
 r2: query all() { match { $p: Person } return { $p.name } }
 order: w1 park put __manifest/_versions/, r1 start, r1 park head __manifest/, r2 start, r2 park head __manifest/, w1 put __manifest/_versions/, w1, r2 head __manifest/, r2, r1 head __manifest/, r1
@@ -28,7 +28,7 @@ r1: ok
 r2: ok
 
 --- mutate
-query age_alice() { update Person set { age: 99 } where name = "alice" }
+query age_alice() { match { $x: Person } where $x.name = "alice"  update $x set { age: 99 } }
 --- expect ok
 
 --- query

@@ -1,0 +1,52 @@
+# issue: none
+# notes: GQ 2 reads named after a registry row (`count`) or after a lexical call the body makes (`search`):
+# notes: `lint --fix --review-fixes` renames each read (`count_2`, `search_2`), printed for review since callers
+# notes: invoke a read by its name, and the rewrite answers as GQ 2 did. The hand rewrite is
+# notes: crates/omnigraph-gqt/cases/fix_renames_a_read_named_after_a_function.gqt.
+
+# notes: The hand rewrite of crates/omnigraph-gqt/gq-2/fix_renames_a_read_named_after_a_function.gqt, each step the text `lint --fix
+# notes: --review-fixes` writes for the GQ 2 step: the same rows, which the Cross-Version Comparison
+# notes: checks against GQ 2, and the same typed IR, which the lint-fix GQ 2 proof checks.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"dog"}}
+{"type":"Doc","data":{"slug":"d2","title":"cat"}}
+
+--- query
+query count_2() {
+  match {
+    $d: Doc
+  }
+  return { $d.title }
+}
+
+--- expect unordered
+{"d.title":"cat"}
+{"d.title":"dog"}
+
+--- expect shape
+d.title: String
+
+--- query
+query search_2() {
+  match { $d: Doc } where match_terms($d.title, terms("dog", mode: any))
+  return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"d1"}
+
+--- expect shape
+d.slug: String

@@ -8,7 +8,7 @@ const QUERY: &str =
 const EXPECT: &str =
     "--- expect unordered\n{\"p.name\": \"alice\"}\n--- expect shape\np.name: String\n";
 const SHAPE: &str = "--- expect shape\np.name: String\n";
-const MUTATE: &str = "--- mutate\nquery ins($n: String) {\n    insert Person { name: $n }\n}\n";
+const MUTATE: &str = "--- mutate\nquery ins($n: String) {\n    replace Person { name: $n }\n}\n";
 const PARAMS: &str = "--- params\n{\"n\": \"bob\"}\n";
 const EXPECT_OK: &str = "--- expect ok\n";
 
@@ -21,7 +21,7 @@ const GENERATED_PERSON: &str = "tables:\n  - kind: node\n    name: Person\n    r
 fn source_policy_is_one_base_per_source_directory_with_nested_bases_dropped() {
     let load = |source: &str| {
         format!(
-            "--- mutate\nload csv \"{source}\" into node:Person mode append header\n{EXPECT_OK}"
+            "--- mutate\nload csv \"{source}\" into node:Person mode insert header\n{EXPECT_OK}"
         )
     };
     let text = format!(
@@ -71,7 +71,7 @@ fn source_policy_is_one_base_per_source_directory_with_nested_bases_dropped() {
 fn source_policy_cuts_segments_refuses_a_pathless_uri_and_canonicalizes_file_directories() {
     let load = |source: &str| {
         format!(
-            "--- mutate\nload csv \"{source}\" into node:Person mode append header\n{EXPECT_OK}"
+            "--- mutate\nload csv \"{source}\" into node:Person mode insert header\n{EXPECT_OK}"
         )
     };
     let siblings = parse_case(
@@ -118,7 +118,7 @@ fn source_policy_cuts_segments_refuses_a_pathless_uri_and_canonicalizes_file_dir
 #[test]
 fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
     let text = format!(
-        "{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{GENERATED_PERSON}--- load generate: v1 seed: 7 mode: merge branch: main\n{GENERATED_PERSON}{EXPECT_OK}"
+        "{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{GENERATED_PERSON}--- load generate: v1 seed: 7 mode: replace branch: main\n{GENERATED_PERSON}{EXPECT_OK}"
     );
     let case = parse_case("generated", &text).unwrap();
     assert!(matches!(
@@ -129,7 +129,7 @@ fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
     assert!(
         case.steps()[0]
             .source
-            .starts_with("--- load generate: v1 seed: 7 mode: merge branch: main")
+            .starts_with("--- load generate: v1 seed: 7 mode: replace branch: main")
     );
     let [Item::Step(Step::Load(load))] = case.items.as_slice() else {
         panic!("expected generated load");
@@ -139,9 +139,11 @@ fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
         ("generate: v1", "generate: v2"),
         ("seed: 7", "seed: -1"),
         ("seed: 7", "seed: 7 seed: 8"),
-        ("mode: merge", "mode: overwrite"),
-        ("mode: merge", "mode: unknown"),
-        ("mode: merge", ""),
+        ("mode: replace", "mode: overwrite"),
+        ("mode: replace", "mode: unknown"),
+        ("mode: replace", "mode: merge"),
+        ("mode: replace", "mode: append"),
+        ("mode: replace", ""),
         ("--- expect ok", "--- expect affected: nodes=1 edges=0"),
         ("--- expect ok", "--- params\n{}\n--- expect ok"),
     ] {
@@ -162,7 +164,7 @@ fn generated_seed_and_load_headers_are_strict_and_load_is_a_write_step() {
         for source in [
             format!("{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{recipe}"),
             format!(
-                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{recipe}{EXPECT_OK}"
+                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert\n{recipe}{EXPECT_OK}"
             ),
         ] {
             assert!(
@@ -183,7 +185,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
         "--- params generate: v1 seed: 7\nparams:\n  n: {kind: key, prefix: gen-, width: 3}\n";
     let text = format!(
         "{HDR}{SCHEMA}{SEED}{MUTATE}{GENERATED}--- expect affected: nodes=1 edges=0\n\
-         --- query\nquery named() {{\n    match {{ $p: Person {{ name: \"gen-000\" }} }}\n    return {{ $p.name }}\n}}\n\
+         --- query\nquery named() {{\n    match {{ $p: Person }}\n    where $p.name = \"gen-000\"\n    return {{ $p.name }}\n}}\n\
          --- expect unordered\n{{\"p.name\": \"gen-000\"}}\n{SHAPE}"
     );
     let case = parse_case("generated_params", &text).unwrap();
@@ -194,7 +196,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
     let blob = format!(
         "{HDR}--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n\
          --- schema\nnode Doc {{\n    slug: String @key\n    body: Blob?\n}}\n--- seed\n\
-         --- mutate\nquery put($slug: String, $body: Blob) {{\n    insert Doc {{ slug: $slug, body: $body }}\n}}\n\
+         --- mutate\nquery put($slug: String, $body: Blob) {{\n    replace Doc {{ slug: $slug, body: $body }}\n}}\n\
          --- params generate: v1 seed: 0\nparams:\n  slug: {{kind: literal, value: doc}}\n  body: {{kind: blob, byte: 1, length: 3}}\n\
          --- expect affected: nodes=1 edges=0\n"
     );
@@ -239,7 +241,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
     for (from, to) in [
         ("generate: v1", "generate: v2"),
         (" seed: 7", ""),
-        ("seed: 7", "seed: 7 mode: merge"),
+        ("seed: 7", "seed: 7 mode: replace"),
         ("seed: 7", "seed: 7 branch: main"),
         (
             "{kind: key, prefix: gen-, width: 3}",
@@ -267,7 +269,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
         parse_case(
             "generated_params",
             &format!(
-                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{GENERATED_PERSON}{GENERATED}{EXPECT_OK}"
+                "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert\n{GENERATED_PERSON}{GENERATED}{EXPECT_OK}"
             )
         )
         .is_err(),
@@ -286,7 +288,7 @@ fn empty_generated_seeds_are_admitted_but_empty_loads_are_refused() {
         let seed = format!("{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{recipe}");
         assert!(parse_case("empty_seed", &seed).is_ok());
         let load = format!(
-            "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append branch: absent\n{recipe}{EXPECT_OK}"
+            "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert branch: absent\n{recipe}{EXPECT_OK}"
         );
         assert!(refusal("empty_load", &load).contains("at least one nonempty batch"));
     }
@@ -295,10 +297,10 @@ fn empty_generated_seeds_are_admitted_but_empty_loads_are_refused() {
 #[tokio::test]
 async fn generated_load_calls_the_host_once_before_checking_its_expectation() {
     let text = format!(
-        "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append\n{GENERATED_PERSON}--- expect error: deliberately false\n"
+        "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert\n{GENERATED_PERSON}--- expect error: deliberately false\n"
     );
     let case = parse_case("generated", &text).unwrap();
-    let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
     let host = RecordingHost::default();
     let result = execute_steps(
         &case,
@@ -326,7 +328,7 @@ async fn generated_append_partitions_publish_the_declared_number_of_commits() {
             .replace("commits: 1\n", &format!("commits: {commits}\n{batch}"));
         let text = format!("{HDR}{SCHEMA}--- seed generate: v1 seed: 7\n{recipe}");
         let case = parse_case("generated", &text).unwrap();
-        let (session, _, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (session, _, _dir) = open_case_store(&case).await.unwrap();
         assert_eq!(
             session.list_commits(Some("main")).await.unwrap().len(),
             commits + 1
@@ -347,10 +349,10 @@ async fn generated_append_partitions_publish_the_declared_number_of_commits() {
 #[tokio::test]
 async fn generated_load_repeats_the_same_recipe_in_a_loop() {
     let text = format!(
-        "{HDR}{SCHEMA}--- seed\n--- loop $i 0 3\n--- load generate: v1 seed: 7 mode: merge\n{GENERATED_PERSON}{EXPECT_OK}--- endloop\n"
+        "{HDR}{SCHEMA}--- seed\n--- loop $i 0 3\n--- load generate: v1 seed: 7 mode: replace\n{GENERATED_PERSON}{EXPECT_OK}--- endloop\n"
     );
     let case = parse_case("generated", &text).unwrap();
-    let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
     let host = RecordingHost::default();
     let session = execute_steps(
         &case,
@@ -399,10 +401,10 @@ async fn generated_load_observes_typed_errors_for_single_and_multiple_calls() {
             .replace("rows: 1", &format!("rows: {count}"))
             .replace("commits: 1", &format!("commits: {count}"));
         let text = format!(
-            "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: append branch: absent\n{recipe}--- expect error: absent\n"
+            "{HDR}{SCHEMA}--- seed\n--- load generate: v1 seed: 7 mode: insert branch: absent\n{recipe}--- expect error: absent\n"
         );
         let case = parse_case("generated", &text).unwrap();
-        let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (session, uri, _dir) = open_case_store(&case).await.unwrap();
         let host = RecordingHost::default();
         execute_steps(
             &case,
@@ -457,7 +459,7 @@ fn a_fault_section_is_refused() {
 }
 
 const DST_RUNNER: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
-const BLOCK: &str = "--- concurrent scripted\nw1: query add() { insert Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
+const BLOCK: &str = "--- concurrent scripted\nw1: query add() { replace Person { name: \"bob\" } }\nr1: query all() { match { $p: Person } return { $p.name } }\norder: w1 put __manifest/, r1, w1\n";
 const BLOCK_EXPECT: &str = "--- expect\nw1: ok\nr1: ok\n";
 
 #[test]
@@ -535,7 +537,7 @@ fn a_worker_count_declares_one_session_per_worker_under_one_label() {
 
 #[test]
 fn a_recipe_or_a_merge_is_a_session_statement() {
-    let recipe = "--- concurrent\nwriter x3: load generate: v1 seed: 42 mode: append\n  tables:\n    - kind: node\n      name: Person\n      rows: 4\n      commits: 1\n      columns:\n        name: {kind: key, prefix: cw-, width: 3}\nreader: query all() { match { $p: Person } return { $p.name } }\n";
+    let recipe = "--- concurrent\nwriter x3: load generate: v1 seed: 42 mode: insert\n  tables:\n    - kind: node\n      name: Person\n      rows: 4\n      commits: 1\n      columns:\n        name: {kind: key, prefix: cw-, width: 3}\nreader: query all() { match { $p: Person } return { $p.name } }\n";
     let text = format!("{HDR}{ENGINE_RUNNER}{SEED}{recipe}--- expect\nwriter: ok\nreader: ok\n");
     let case = parse_case("recipe", &text).unwrap();
     let Item::Step(Step::Concurrent(step)) = &case.items[0] else {
@@ -807,16 +809,22 @@ fn schema_and_seed_are_optional_together() {
 }
 
 #[test]
-fn refuses_second_declaration_in_one_section() {
-    let two = "--- query\nquery a() {\n    match { $p: Person }\n    return { $p.name }\n}\nquery b() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{two}{EXPECT}");
-    assert!(refusal("x", &text).contains("exactly one declaration"));
+fn a_section_runs_its_last_declaration_after_the_reads_it_calls() {
+    let two = "--- query\nquery a() {\n    match { $p: Person }\n    return { $p }\n}\nquery b() {\n    match { from a() }\n    return { $p.name }\n}\n";
+    let case = parse_case("x", &format!("{HDR}{SCHEMA}{SEED}{two}{EXPECT}")).unwrap();
+    let Some(Item::Step(Step::Query(step))) = case.items.first() else {
+        panic!("one query step");
+    };
+    assert_eq!(step.name, "b");
+    let mutation_first = "--- query\nquery ins($n: String) {\n    replace Person { name: $n }\n}\nquery b() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{mutation_first}{EXPECT}");
+    assert!(refusal("x", &text).contains("a mutation declaration is the last or none"));
 }
 
 #[test]
 fn refuses_mutation_declaration_under_query() {
     let text = format!(
-        "{HDR}{SCHEMA}{SEED}--- query\nquery ins($n: String) {{\n    insert Person {{ name: $n }}\n}}\n{EXPECT}"
+        "{HDR}{SCHEMA}{SEED}--- query\nquery ins($n: String) {{\n    replace Person {{ name: $n }}\n}}\n{EXPECT}"
     );
     assert!(refusal("x", &text).contains("use `--- mutate`"));
 }
@@ -827,7 +835,7 @@ fn refuses_mutation_declaration_under_query() {
 /// unbound name, or with a shape section.
 #[test]
 fn branch_read_steps_parse_and_refuse() {
-    const BIND: &str = "--- mutate\nquery ins() {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $c\n";
+    const BIND: &str = "--- mutate\nquery ins() {\n    replace Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $c\n";
     let accepted = format!(
         "{HDR}{SCHEMA}{SEED}{BIND}\
          --- query\nbranch diff \"${{c}}\" to main\n--- expect ordered\n\
@@ -1086,7 +1094,7 @@ fn refuses_substitution_marker_in_a_statement_body() {
     );
 }
 
-const PROPOSE: &str = "--- mutate\nquery propose() as commit {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n";
+const PROPOSE: &str = "--- mutate\nquery propose() as commit {\n    replace Person { name: \"bob\" }\n}\n--- expect ok\n";
 const BIND: &str = "--- bind commit $c\n";
 
 /// `--- bind commit $name` attaches to the write before it, a `snapshot:
@@ -1141,7 +1149,7 @@ fn bind_commit_names_a_write_and_its_consumers_resolve_it() {
 #[test]
 fn as_commit_and_bound_drop_are_visible_per_step() {
     let text = format!(
-        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\ncommit drop \"${{c}}\"\n{EXPECT_OK}--- mutate\nquery publish_bob() {{\n    insert Person {{ name: \"carol\" }}\n}}\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- mutate\nbranch merge b0\n--- expect outcome: merged\n--- mutate\ncommit drop \"hb1-literal\"\n{EXPECT_OK}{QUERY}{EXPECT}"
+        "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\ncommit drop \"${{c}}\"\n{EXPECT_OK}--- mutate\nquery publish_bob() {{\n    replace Person {{ name: \"carol\" }}\n}}\n{EXPECT_OK}--- mutate\nbranch merge b0 as commit\n--- expect outcome: merged\n--- mutate\nbranch merge b0\n--- expect outcome: merged\n--- mutate\ncommit drop \"hb1-literal\"\n{EXPECT_OK}{QUERY}{EXPECT}"
     );
     let case = parse_case("x", &text).unwrap();
     let want = [
@@ -1265,8 +1273,8 @@ fn bind_fence_admits_only_a_whole_quoted_commit_operand() {
     );
 }
 
-const ROOT: &str = "--- mutate\nquery root() as unattached branch {\n    insert Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $r\n";
-const CHILD: &str = "--- mutate\nquery child() as unattached branch on \"${r}\" {\n    insert Person { name: \"carol\" }\n}\n--- expect ok\n";
+const ROOT: &str = "--- mutate\nquery root() as unattached branch {\n    replace Person { name: \"bob\" }\n}\n--- expect ok\n--- bind commit $r\n";
+const CHILD: &str = "--- mutate\nquery child() as unattached branch on \"${r}\" {\n    replace Person { name: \"carol\" }\n}\n--- expect ok\n";
 
 /// A whole quoted `on "${name}"` base operand needs its binding first, is the
 /// id in the compiled source, and admits no other `${` in the body; a params
@@ -1274,7 +1282,7 @@ const CHILD: &str = "--- mutate\nquery child() as unattached branch on \"${r}\" 
 #[test]
 fn unattached_base_operand_resolves_its_binding() {
     let text = format!(
-        "{HDR}{SCHEMA}{SEED}{ROOT}{CHILD}--- mutate branch: feature\nquery by_param($base: String) as unattached branch on $base {{\n    insert Person {{ name: \"dave\" }}\n}}\n--- params\n{{\"base\": \"${{r}}\"}}\n{EXPECT_OK}"
+        "{HDR}{SCHEMA}{SEED}{ROOT}{CHILD}--- mutate branch: feature\nquery by_param($base: String) as unattached branch on $base {{\n    replace Person {{ name: \"dave\" }}\n}}\n--- params\n{{\"base\": \"${{r}}\"}}\n{EXPECT_OK}"
     );
     let case = parse_case("x", &text).unwrap();
     let [
@@ -1434,36 +1442,55 @@ fn refuses_ok_expect_on_a_query_step() {
     assert!(refusal("x", &text).contains("a query step takes"));
 }
 
-const SAME: &str = "--- expect same as v1\n";
+const SKIP: &str = "--- reference skipped: a stated reason\n";
 
-#[test]
-fn same_as_v1_follows_a_query_steps_shape_or_plan() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{QUERY}{EXPECT}");
-    let case = parse_case("x", &text).unwrap();
-    let flags: Vec<bool> = case
-        .items
+/// The reason of each query step's `--- reference skipped:`, in order.
+fn skips(case: &Case) -> Vec<Option<String>> {
+    case.items
         .iter()
         .map(|item| match item {
-            Item::Step(Step::Query(step)) => step.same_as_v1,
+            Item::Step(Step::Query(step)) => step.reference_skipped.clone(),
             other => panic!("expected query steps, got {other:?}"),
         })
-        .collect();
-    assert_eq!(flags, [true, false]);
+        .collect()
+}
+
+#[test]
+fn reference_skipped_follows_a_read_steps_last_expect() {
+    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SKIP}{QUERY}{EXPECT}");
+    let case = parse_case("x", &text).unwrap();
+    assert_eq!(skips(&case), [Some("a stated reason".to_string()), None]);
     let after_plan = format!(
-        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\npass projection_pushdown\n{SAME}"
+        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\nscan Person as $p: no filter\n{SKIP}"
     );
     let case = parse_case("x", &after_plan).unwrap();
     let Some(Item::Step(Step::Query(step))) = case.items.first() else {
         panic!("first item is the query step");
     };
-    assert!(step.same_as_v1 && step.plan.is_some());
+    assert!(step.reference_skipped.is_some() && step.plan.is_some());
+    let after_error = format!(
+        "{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: boom\n{SKIP}{QUERY}--- expect error: boom\n"
+    );
+    let case = parse_case("x", &after_error).unwrap();
+    assert_eq!(skips(&case), [Some("a stated reason".to_string()), None]);
+    let in_a_loop =
+        format!("{HDR}{SCHEMA}{SEED}--- loop $i 0 2\n{QUERY}{EXPECT}{SKIP}--- endloop\n");
+    let case = parse_case("x", &in_a_loop).unwrap();
+    let Some(Item::Loop { steps, .. }) = case.items.first() else {
+        panic!("first item is the loop");
+    };
+    assert!(matches!(&steps[0], Step::Query(step) if step.reference_skipped.is_some()));
+    assert_eq!(
+        case.reference_skips(),
+        ["step 1 (line 15): reference skipped: a stated reason"]
+    );
 }
 
 #[test]
-fn same_as_v1_is_refused_off_a_query_rows_expect() {
+fn reference_skipped_is_refused_off_a_read_step_or_without_a_reason() {
     for text in [
-        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{SAME}"),
-        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SAME}"),
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{SKIP}"),
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SKIP}"),
     ] {
         let refused = refusal("x", &text);
         assert!(refused.contains("refused on a mutate step"), "{refused}");
@@ -1471,32 +1498,119 @@ fn same_as_v1_is_refused_off_a_query_rows_expect() {
     let rows = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
     for (text, needle) in [
         (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{SAME}{SHAPE}"),
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{SKIP}{SHAPE}"),
             "must directly follow",
         ),
         (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{rows}{SAME}{SHAPE}"),
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{rows}{SKIP}{SHAPE}"),
             "needs an `--- expect shape`",
         ),
         (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: boom\n{SAME}"),
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SKIP}{SKIP}"),
             "must directly follow",
         ),
         (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{SAME}"),
-            "must directly follow",
-        ),
-        (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{{\"p.name\": \"alice\"}}\n"),
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SKIP}{{\"p.name\": \"alice\"}}\n"),
             "carries no body",
         ),
         (
-            format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}{SAME}"),
-            "only on a query declaration step",
+            format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}{SKIP}"),
+            "query declaration step only",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- reference skipped:\n"),
+            "names no reason",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- reference skipped:   \n"),
+            "names no reason",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- reference compared\n"),
+            "one form is `--- reference skipped: <reason>`",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect same as reference\n"),
+            "unknown expect mode",
         ),
     ] {
-        let refused = refusal("x", &text);
-        assert!(refused.contains(needle), "{needle}: {refused}");
+        let errors = parse_case("x", &text).expect_err("expected the case to be refused");
+        let first = errors.first();
+        assert!(
+            first.message.contains(needle),
+            "{needle}: {}",
+            first.message
+        );
+        assert!(first.fix.is_some(), "{needle}: no fix");
+    }
+}
+
+#[test]
+fn the_reference_comparison_judges_rows_and_refusals() {
+    let a = serde_json::json!({"p.name": "alice"});
+    let b = serde_json::json!({"p.name": "bob"});
+    let rows = |rows: &[Value], ordered| Ok((rows.to_vec(), ordered));
+    let runtime = |code: &str| {
+        Err(ReferenceRefusal::Runtime {
+            code: code.into(),
+            message: "refused".into(),
+        })
+    };
+    let input = || Err(ReferenceRefusal::Input("a parameter".into()));
+    // Rows compare as the step's expect does: as bags, or in order.
+    judge_reference(
+        &Ok(vec![a.clone(), b.clone()]),
+        &rows(&[b.clone(), a.clone()], false),
+    )
+    .unwrap();
+    let moved = judge_reference(
+        &Ok(vec![a.clone(), b.clone()]),
+        &rows(&[b.clone(), a.clone()], true),
+    )
+    .unwrap_err();
+    assert!(
+        moved.contains(
+            "the engine and the reference disagree (expected = reference, actual = engine)"
+        ),
+        "{moved}"
+    );
+    let missing = judge_reference(
+        &Ok(vec![a.clone(), b.clone()]),
+        &rows(std::slice::from_ref(&a), false),
+    )
+    .unwrap_err();
+    assert!(
+        missing.contains("reference: [") && missing.contains("engine: [{\"p.name\":\"alice\"}]"),
+        "{missing}"
+    );
+    // An `E` refusal needs the same code; an input refusal an input
+    // refusal; a resource bound the reference's rows.
+    let coded = Err(EngineRefusal::Coded("E2"));
+    judge_reference(&runtime("E2"), &coded).unwrap();
+    for reference in [runtime("E1"), input(), Ok(vec![a.clone()])] {
+        let refused = judge_reference(&reference, &coded).unwrap_err();
+        assert!(
+            refused.contains("the engine refused (with E2)"),
+            "{refused}"
+        );
+    }
+    let bad_input = Err(EngineRefusal::Input("parameter 'id' not provided".into()));
+    judge_reference(&input(), &bad_input).unwrap();
+    for reference in [runtime("E2"), Ok(Vec::new())] {
+        let refused = judge_reference(&reference, &bad_input).unwrap_err();
+        assert!(refused.contains("on its input"), "{refused}");
+    }
+    let bound = Err(EngineRefusal::Bound("query_memory_bytes".into()));
+    judge_reference(&Ok(vec![a.clone()]), &bound).unwrap();
+    for reference in [runtime("E1"), input()] {
+        let refused = judge_reference(&reference, &bound).unwrap_err();
+        assert!(refused.contains("at a resource bound"), "{refused}");
+    }
+    // A reference that does not evaluate the query disagrees with any
+    // engine answer.
+    let unsupported = Err(ReferenceRefusal::Unsupported("a form".into()));
+    for engine in [rows(&[a], false), coded, bad_input, bound] {
+        assert!(judge_reference(&unsupported, &engine).is_err());
     }
 }
 
@@ -1668,26 +1782,29 @@ fn refuses_ordered_expect_without_an_order_clause() {
     assert!(refusal("x", &text).contains("order` clause"));
 }
 
+/// A schema using `@embed` resolves no embedding provider, since no load or
+/// write embeds, so a case may declare one; a `nearest` over a string still
+/// resolves one and stays refused.
 #[test]
-fn refuses_embed_schema() {
+fn accepts_embed_schema() {
     let schema = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Doc {\n    slug: String @key\n    text: String\n    vec: Vector(4) @embed(\"text\")\n}\n";
     let seed = "--- seed\n";
     let text = format!("{HDR}{schema}{seed}{QUERY}{EXPECT}")
         .replace("$p: Person", "$p: Doc")
         .replace("$p.name", "$p.slug");
-    assert!(refusal("x", &text).contains("@embed"));
+    parse_case("x", &text).unwrap();
 }
 
 #[test]
 fn refuses_nearest_over_a_string_literal() {
-    let query = "--- query\nquery q() {\n    match { $p: Person }\n    return { $p.name }\n    order { nearest($p.name, \"alpha\") }\n}\n";
+    let query = "--- query\nquery q() {\n    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.name, \"alpha\", k: 3) as $distance }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
     assert!(refusal("x", &text).contains("string argument"));
 }
 
 #[test]
 fn refuses_nearest_over_a_string_param() {
-    let query = "--- query\nquery q($q: String) {\n    match { $p: Person }\n    return { $p.name }\n    order { nearest($p.name, $q) }\n}\n";
+    let query = "--- query\nquery q($q: String) {\n    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.name, $q, k: 3) as $distance }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
     let text = format!(
         "{HDR}{SCHEMA}{SEED}{query}--- params\n{{\"q\": \"alpha\"}}\n--- expect unordered\n"
     );
@@ -1703,7 +1820,7 @@ fn accepts_empty_expect_body_as_empty_result_assertion() {
 #[test]
 fn search_construct_sets_the_index_decision() {
     let schema = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Doc {\n    slug: String @key\n    text: String @index\n}\n";
-    let query = "--- query\nquery q($q: String) {\n    match {\n        $d: Doc\n        search($d.text, $q)\n    }\n    return { $d.slug }\n}\n";
+    let query = "--- query\nquery q($q: String) {\n    match { $d: Doc }\n    where match_terms($d.text, terms($q, mode: any))\n    return { $d.slug }\n}\n";
     let text = format!(
         "{HDR}{schema}--- seed\n{query}--- params\n{{\"q\": \"needle\"}}\n--- expect unordered\n--- expect shape\nd.slug: String\n"
     );
@@ -1771,14 +1888,6 @@ mod schema_drift {
 
     use super::*;
 
-    const AGG_QUERY: &str =
-        "query q() {\n    match { $p: Person }\n    return { count($p) as n, min($p.age) as m }\n}";
-    const NAME_QUERY: &str = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}";
-
-    fn decl(source: &str) -> QueryDecl {
-        parse_query(source).unwrap().single_decl().clone()
-    }
-
     fn agg_inferred() -> Schema {
         Schema::new(vec![
             Field::new("n", DataType::Int64, true),
@@ -1804,7 +1913,7 @@ mod schema_drift {
                 Arc::new(Float64Array::from(vec![None::<f64>])),
             ],
         );
-        let msg = schema_drift(&decl(AGG_QUERY), &agg_inferred(), &executed).unwrap();
+        let msg = schema_drift(&agg_inferred(), &executed).unwrap();
         assert!(msg.contains("column 1 `m`"), "got: {msg}");
         assert!(msg.contains("inferred Int32"), "got: {msg}");
         assert!(msg.contains("returned Float64"), "got: {msg}");
@@ -1822,10 +1931,7 @@ mod schema_drift {
                 Arc::new(Int32Array::from(vec![Some(7)])),
             ],
         );
-        assert_eq!(
-            schema_drift(&decl(AGG_QUERY), &agg_inferred(), &executed),
-            None
-        );
+        assert_eq!(schema_drift(&agg_inferred(), &executed), None);
     }
 
     #[test]
@@ -1834,31 +1940,31 @@ mod schema_drift {
             vec![Field::new("n", DataType::Int64, true)],
             vec![Arc::new(Int64Array::from(vec![0]))],
         );
-        let msg = schema_drift(&decl(AGG_QUERY), &agg_inferred(), &executed).unwrap();
+        let msg = schema_drift(&agg_inferred(), &executed).unwrap();
         assert!(msg.contains("inferred 2 column(s)"), "got: {msg}");
         assert!(msg.contains("returned 1"), "got: {msg}");
     }
 
     #[test]
     fn reports_an_executed_name_off_the_compiler_rule() {
-        let inferred = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        let inferred = Schema::new(vec![Field::new("p.name", DataType::Utf8, false)]);
         let executed = result(
             vec![Field::new("name", DataType::Utf8, false)],
             vec![Arc::new(StringArray::from(vec!["alice"]))],
         );
-        let msg = schema_drift(&decl(NAME_QUERY), &inferred, &executed).unwrap();
+        let msg = schema_drift(&inferred, &executed).unwrap();
         assert!(msg.contains("expected name `p.name`"), "got: {msg}");
         assert!(msg.contains("returned `name`"), "got: {msg}");
     }
 
     #[test]
     fn reports_nulls_in_a_column_inferred_non_nullable() {
-        let inferred = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        let inferred = Schema::new(vec![Field::new("p.name", DataType::Utf8, false)]);
         let executed = result(
             vec![Field::new("p.name", DataType::Utf8, true)],
             vec![Arc::new(StringArray::from(vec![Some("alice"), None]))],
         );
-        let msg = schema_drift(&decl(NAME_QUERY), &inferred, &executed).unwrap();
+        let msg = schema_drift(&inferred, &executed).unwrap();
         assert!(msg.contains("column 0 `p.name`"), "got: {msg}");
         assert!(msg.contains("returned 1 null(s)"), "got: {msg}");
     }
@@ -1902,12 +2008,14 @@ mod result_contract {
                         "p".into(),
                         omnigraph_compiler::types::ExprType::Node {
                             type_name: "Person".into(),
+                            nullable: false,
                         },
                     ),
                     alias: Some("person".into()),
                     column: "person".into(),
                     ty: ExprType::Node {
                         type_name: "Person".into(),
+                        nullable: false,
                     },
                 },
             ],
@@ -2073,7 +2181,7 @@ mod result_contract {
 
     #[test]
     fn planner_typed_renderer_and_gqt_validator_agree_on_every_expression_kind() {
-        use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+        use omnigraph_compiler::query::value::{AggFunc, CompOp};
         use omnigraph_compiler::types::AggSignature;
         let ty = |scalar, nullable| ExprType::from_prop(&PropType::scalar(scalar, nullable));
         let text = || {
@@ -2092,13 +2200,9 @@ mod result_contract {
                 "p".into(),
                 ExprType::Node {
                     type_name: "Person".into(),
+                    nullable: false,
                 },
             )
-        };
-        let rank = || IRExpr::Bm25 {
-            field: Box::new(property()),
-            query: Box::new(text()),
-            ty: ty(ScalarType::F32, false),
         };
         let expressions = vec![
             property(),
@@ -2112,39 +2216,15 @@ mod result_contract {
                 query: Box::new(text()),
                 ty: ty(ScalarType::F32, false),
             },
-            IRExpr::Search {
-                field: Box::new(property()),
-                query: Box::new(text()),
-                ty: ty(ScalarType::Bool, false),
-            },
-            IRExpr::Fuzzy {
-                field: Box::new(property()),
-                query: Box::new(text()),
-                max_edits: Some(Box::new(IRExpr::Literal(
-                    Literal::Integer(1),
-                    ty(ScalarType::I64, false),
-                ))),
-                ty: ty(ScalarType::Bool, false),
-            },
-            IRExpr::MatchText {
-                field: Box::new(property()),
-                query: Box::new(text()),
-                ty: ty(ScalarType::Bool, false),
-            },
-            rank(),
-            IRExpr::Rrf {
-                primary: Box::new(rank()),
-                secondary: Box::new(rank()),
-                k: None,
-                ty: ty(ScalarType::F64, false),
-            },
             IRExpr::Aggregate {
+                fraction: None,
                 func: AggFunc::Count,
                 distinct: false,
                 arg: Box::new(node()),
                 signature: AggSignature {
                     arg: ExprType::Node {
                         type_name: "Person".into(),
+                        nullable: false,
                     },
                     result: ty(ScalarType::I64, true),
                 },
@@ -2186,7 +2266,7 @@ mod result_contract {
     fn block_typed_trees_and_specs_survive_every_row_round_trip_guard() {
         use omnigraph_compiler::AggSignature;
         use omnigraph_compiler::ir::{BlockAggregateExpr, SubqueryPredicate};
-        use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+        use omnigraph_compiler::query::value::{AggFunc, CompOp};
         let ty = |scalar, nullable| ExprType::from_prop(&PropType::scalar(scalar, nullable));
         let leaf = BlockAggregateExpr::Aggregate {
             func: AggFunc::Sum,
@@ -2347,8 +2427,17 @@ mod shape_section {
     #[test]
     fn a_node_type_name_spells_a_bare_node_projection() {
         let parsed = lines("p: Person");
-        assert!(matches!(&parsed[0].shape_type, ShapeType::Node(name) if name == "Person"));
-        assert!(shape_refusal("p: Person?").contains("never null"));
+        assert!(
+            matches!(&parsed[0].shape_type, ShapeType::Node { type_name, nullable: false } if type_name == "Person")
+        );
+        assert!(
+            matches!(&lines("p: Person?")[0].shape_type, ShapeType::Node { type_name, nullable: true } if type_name == "Person")
+        );
+        // An edge returned whole: `edge` and the binding's types.
+        assert!(
+            matches!(&lines("k: edge Knows|Likes?")[0].shape_type, ShapeType::Node { type_name, nullable: true } if type_name == "edge Knows|Likes")
+        );
+        assert!(shape_refusal("k: edge knows").contains("unknown type"));
         let (field, column) = person_struct();
         let executed = result(vec![field], vec![column]);
         assert_eq!(mismatch(&lines("p: Person"), &executed), None);
@@ -2365,6 +2454,36 @@ mod shape_section {
         assert_eq!(
             bless_shape_lines(&executed, &age_catalog()).unwrap(),
             vec!["p: Person".to_string()]
+        );
+        // A null object, which an `optional` leaves, needs `?`, and bless
+        // writes it.
+        let (field, column) = person_struct();
+        let DataType::Struct(fields) = field.data_type().clone() else {
+            unreachable!()
+        };
+        let absent = StructArray::new(
+            fields.clone(),
+            column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+                .columns()
+                .to_vec(),
+            Some(vec![false].into()),
+        );
+        let executed = result(
+            vec![Field::new("p", DataType::Struct(fields), true)],
+            vec![Arc::new(absent)],
+        );
+        assert!(
+            mismatch(&lines("p: Person"), &executed)
+                .unwrap()
+                .contains("null object")
+        );
+        assert_eq!(mismatch(&lines("p: Person?"), &executed), None);
+        assert_eq!(
+            bless_shape_lines(&executed, &age_catalog()).unwrap(),
+            vec!["p: Person?".to_string()]
         );
     }
 
@@ -2433,7 +2552,14 @@ mod shape_section {
             .iter()
             .map(|l| match &l.shape_type {
                 ShapeType::Scalar(t) => format!("{}: {}", l.name, t.display_name()),
-                ShapeType::Node(n) => format!("{}: {n}", l.name),
+                ShapeType::Node {
+                    type_name,
+                    nullable,
+                } => format!(
+                    "{}: {type_name}{}",
+                    l.name,
+                    if *nullable { "?" } else { "" }
+                ),
             })
             .collect();
         assert_eq!(
@@ -2831,7 +2957,7 @@ fn refuses_loop_headers_with_a_body() {
 
 #[test]
 fn refuses_nearest_over_a_string_property() {
-    let query = "--- query\nquery q() {\n    match { $p: Person }\n    return { $p.name }\n    order { nearest($p.name, $p.name) }\n}\n";
+    let query = "--- query\nquery q() {\n    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.name, $p.name, k: 3) as $distance }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
     assert!(refusal("x", &text).contains("vector parameter"));
 }
@@ -2892,7 +3018,7 @@ async fn writer_header_claims_main_in_one_version_that_moves_no_head() {
         let pin = if held { "# writer: held\n" } else { "" };
         let text = format!("{HDR}{pin}{SCHEMA}{SEED}{QUERY}{EXPECT}");
         let case = parse_case("x", &text).unwrap();
-        let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (session, uri, _dir) = open_case_store(&case).await.unwrap();
         let (seeded, head) = main_version_and_head(session.db()).await;
 
         let session = execute_steps(
@@ -2954,17 +3080,17 @@ fn pin_violation_names_the_path_that_ran() {
 #[test]
 fn expects_expand_ignores_bound_edges_and_plain_bindings() {
     let unbound = parse_query(TRAVERSAL_QUERY.trim_start_matches("--- query\n")).unwrap();
-    assert!(expects_expand(&unbound.single_decl().match_clause));
-    let bound = "query f($n: String) {\n    match {\n        $a: Person\n        $a.name = $n\n        \
-                 $a $k:knows $b\n    }\n    return { $b.name }\n}\n";
+    assert!(expects_expand(unbound.single_decl()));
+    let bound = "query f($n: String) {\n    match {\n        $a: Person,\n        \
+                 $a $k:knows $b,\n    }\n    where $a.name = $n\n    return { $b.name }\n}\n";
     let bound = parse_query(bound).unwrap();
-    assert!(!expects_expand(&bound.single_decl().match_clause));
+    assert!(!expects_expand(bound.single_decl()));
     let plain = parse_query(QUERY.trim_start_matches("--- query\n")).unwrap();
-    assert!(!expects_expand(&plain.single_decl().match_clause));
-    let negated = "query f() {\n    match {\n        $a: Person\n        not { $a knows $x }\n    }\n    \
+    assert!(!expects_expand(plain.single_decl()));
+    let negated = "query f() {\n    match { $a: Person }\n    where not exists { $x: Person, $a knows $x }\n    \
                    return { $a.name }\n}\n";
     let negated = parse_query(negated).unwrap();
-    assert!(!expects_expand(&negated.single_decl().match_clause));
+    assert!(!expects_expand(negated.single_decl()));
 }
 
 /// A two-node, one-edge graph with a one-hop traversal, for the pin tests.
@@ -2973,8 +3099,8 @@ const TRAVERSAL_SCHEMA: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  
 const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n\
                               {\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n\
                               {\"edge\":\"Knows\",\"id\":\"k-1\",\"from\":\"alice\",\"to\":\"bob\",\"data\":{\"since\":2020}}\n";
-const TRAVERSAL_QUERY: &str = "--- query\nquery friends($n: String) {\n    match {\n        $a: Person\n        \
-                               $a.name = $n\n        $a knows $b\n    }\n    return { $b.name }\n}\n";
+const TRAVERSAL_QUERY: &str = "--- query\nquery friends($n: String) {\n    match {\n        $a: Person,\n        \
+                               $a knows $b,\n    }\n    where $a.name = $n\n    return { $b.name }\n}\n";
 const TRAVERSAL_PARAMS: &str = "--- params\n{\"n\": \"alice\"}\n";
 const TRAVERSAL_EXPECT: &str =
     "--- expect unordered\n{\"b.name\": \"bob\"}\n--- expect shape\nb.name: String\n";
@@ -2993,7 +3119,7 @@ async fn pinned_step_runs_only_its_pinned_path() {
             .await
             .unwrap_or_else(|e| panic!("{mode}: {e}"));
 
-        let (session, _uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (session, _uri, _dir) = open_case_store(&case).await.unwrap();
         assert_eq!(session.settings().traversal().as_str(), mode);
         let Some(Item::Step(Step::Query(step))) = case.items.first() else {
             panic!("first item is the query step");
@@ -3047,7 +3173,7 @@ async fn traversal_pin_survives_settings_steps_and_rebind() {
          --- restart\n"
     );
     let case = parse_case("pinned", &text).unwrap();
-    let (mut session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (mut session, uri, _dir) = open_case_store(&case).await.unwrap();
     let Some(Item::Step(Step::Query(query))) = case.items.first() else {
         panic!("first item is the query step");
     };
@@ -3122,15 +3248,19 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 
 #[test]
 fn refuses_ordered_expect_with_an_aggregate_in_return() {
-    let query = "--- query\nquery q($t: String) {\n    match { $p: Person\n        search($p.name, $t) }\n    \
-                 return { count($p) as total }\n    order { bm25($p.name, $t) }\n}\n";
+    let query = "--- query\nquery q($t: String) {\n    match { let $pop = { match { $p: Person }\n        where match_terms($p.name, terms($t, mode: any)) return { $p } }, from bm25($pop, $p.name, $t) as $score }\n    \
+                 return { count($p) as total }\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
+    assert!(refusal("x", &text).contains("order` clause"));
+    let unranked = "--- query\nquery q() {\n    match { $p: Person }\n    \
+                    return { $p.name, count($p) as total }\n    order { total desc }\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{unranked}--- expect ordered\n");
     assert!(refusal("x", &text).contains("aggregate in its `return` list"));
     let text =
         format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n--- expect shape\ntotal: I64?\n");
     parse_case("x", &text).unwrap();
-    let query = "--- query\nquery q($t: String) {\n    match { $p: Person }\n    \
-                 return { $p.name, count($p) as total }\n    order { bm25($p.name, $t), total desc }\n    limit 3\n}\n";
+    let query = "--- query\nquery q($t: String) {\n    match { let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.name, $t) as $score }\n    \
+                 return { $p.name, count($p) as total }\n    order { total desc }\n    limit 3\n}\n";
     let text = format!(
         "{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n--- expect shape\np.name: String\ntotal: I64?\n"
     );
@@ -3139,15 +3269,24 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
 
 #[test]
 fn refuses_ordered_expect_with_rank_only_distinct_issue_953() {
-    for ranking in [
-        "nearest($p.vec, $v)",
-        "bm25($p.name, $t)",
-        "rrf(nearest($p.vec, $v), bm25($p.name, $t))",
+    for (ranking, score) in [
+        (
+            "let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.vec, $v, k: 3) as $distance",
+            "$distance",
+        ),
+        (
+            "let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.name, $t) as $score",
+            "$score desc",
+        ),
+        (
+            "let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.vec, $v, k: 3), bm25($all, $p.name, $t), k: 60) as $score",
+            "$score desc",
+        ),
     ] {
         let query = format!(
             "--- query\nquery q($v: Vector(4), $t: String) {{\n\
-             match {{ $p: Person }}\nreturn distinct {{ $p.name }}\n\
-             order {{ {ranking} }}\nlimit 3\n}}\n"
+             match {{ {ranking} }}\nreturn distinct {{ $p.name }}\n\
+             order {{ {score} }}\nlimit 3\n}}\n"
         );
         let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n{SHAPE}");
         assert!(refusal("x", &text).contains("rank-only `return distinct`"));
@@ -3155,8 +3294,11 @@ fn refuses_ordered_expect_with_rank_only_distinct_issue_953() {
         parse_case("x", &text).unwrap();
         for accepted in [
             query.replace("return distinct", "return"),
-            query.replace(ranking, &format!("{ranking}, $p.name")),
-            query.replace(ranking, "$p.name"),
+            query.replace(
+                &format!("order {{ {score} }}"),
+                &format!("order {{ {score}, $p.name }}"),
+            ),
+            query.replace(&format!("order {{ {score} }}"), "order { $p.name }"),
         ] {
             let text = format!("{HDR}{SCHEMA}{SEED}{accepted}--- expect ordered\n{SHAPE}");
             parse_case("x", &text).unwrap();
@@ -3321,7 +3463,7 @@ async fn bless_never_rewrites_on_a_kind_mismatch() {
 
 #[tokio::test]
 async fn params_refusal_satisfies_an_error_expect() {
-    let query = "--- query\nquery q($q: String) {\n    match {\n        $p: Person\n        $p.name = $q\n    }\n    return { $p.name }\n}\n";
+    let query = "--- query\nquery q($q: String) {\n    match { $p: Person }\n    where $p.name = $q\n    return { $p.name }\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect error: q\n");
     let case = parse_case("x", &text).unwrap();
     execute_case(&case, Path::new("unused.gqt"), false)
@@ -3389,7 +3531,7 @@ fn runner_is_required_and_cannot_be_repeated() {
 #[test]
 fn fault_limits_and_loop_scope_are_enforced() {
     let fault = "--- seam\nat: mutation.post_sidecar_pre_fork\noccurrence: 1\naction: fail\nscope: next_step\n";
-    let operation = "--- mutate\nquery add() { insert Person { name: \"bob\" } }\n--- expect error: injected failpoint\n";
+    let operation = "--- mutate\nquery add() { replace Person { name: \"bob\" } }\n--- expect error: injected failpoint\n";
     let prefix = format!("{HDR}{SCHEMA}{SEED}");
     assert!(
         parse_case(
@@ -3414,10 +3556,7 @@ fn fault_limits_and_loop_scope_are_enforced() {
     );
 }
 
-async fn open_case_store(
-    case: &Case,
-    engine: Engine,
-) -> Result<(Session, String, tempfile::TempDir), String> {
+async fn open_case_store(case: &Case) -> Result<(Session, String, tempfile::TempDir), String> {
     let fixture = case
         .fixture
         .as_ref()
@@ -3431,7 +3570,7 @@ async fn open_case_store(
     let db = Omnigraph::init(&uri, &fixture.schema)
         .await
         .map_err(|e| format!("init failed: {e}"))?;
-    let session = case_session(db, case, engine)?;
+    let session = case_session(db, case)?;
     seed_case(&session, fixture, case.needs_indices).await?;
     Ok((session, uri, dir))
 }
@@ -3442,7 +3581,7 @@ fn execute_case<'a>(
     bless: bool,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
     async move {
-        let (session, uri, _dir) = open_case_store(case, Engine::V2).await?;
+        let (session, uri, _dir) = open_case_store(case).await?;
         execute_steps(case, path, bless, session, &uri, None, &PlainHost, &())
             .await
             .map(|_| ())
@@ -3453,12 +3592,7 @@ fn execute_case<'a>(
 #[test]
 fn core_manifest_has_no_runner_or_test_feature_dependency() {
     let manifest = include_str!("../Cargo.toml");
-    for forbidden in [
-        "omnigraph-dst",
-        "omnigraph-reference-engine",
-        "test-util",
-        "[build-dependencies]",
-    ] {
+    for forbidden in ["omnigraph-dst", "test-util", "[build-dependencies]"] {
         assert!(
             !manifest.contains(forbidden),
             "core dependency boundary: {forbidden}"
@@ -3597,7 +3731,7 @@ async fn engine_operation_finishes_before_failed_expectation() {
         EXPECT.replace("alice", "bob")
     );
     let case = parse_case("failed_expectation", &text).unwrap();
-    let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
     let host = RecordingHost::default();
     let result = execute_steps(
         &case,
@@ -3622,7 +3756,7 @@ async fn restart_preserves_supplied_storage_and_returns_current_session() {
     let both = "--- expect unordered\n{\"p.name\":\"alice\"}\n{\"p.name\":\"bob\"}\n--- expect shape\np.name: String\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}--- restart\n{QUERY}{both}");
     let case = parse_case("restart_storage", &text).unwrap();
-    let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
     let storage: Arc<dyn StorageAdapter> =
         Arc::new(omnigraph::storage::ObjectStorageAdapter::local());
     let host = RecordingHost {
@@ -3837,6 +3971,8 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
             &[(QueryParse, 7), (BodyShape, 13)],
         ),
         ("query_parse_unclosed_brace", &[(QueryParse, 14)]),
+        ("reference_skip_after_a_mutate_step", &[(ReferenceSkip, 18)]),
+        ("reference_skip_without_a_reason", &[(ReferenceSkip, 19)]),
         ("runner_config_timeout_as_a_word", &[(RunnerConfig, 2)]),
         ("section_order_bench_after_the_steps", &[(SectionOrder, 20)]),
         (
@@ -3974,4 +4110,149 @@ fn every_near_miss_word_is_a_dispatched_spelling() {
             "`--- expect {word}` is a mode: {errors:?}"
         );
     }
+}
+
+/// A host whose reference interpreter answers with fixed rows, or refuses.
+struct FixedReferenceHost {
+    reference: Result<Vec<Value>, ReferenceRefusal>,
+}
+
+impl ExecutionHost for FixedReferenceHost {
+    type StepGuard = ();
+
+    fn admit_case(&self, _case: &Case) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn arm_seams(&self, seams: &[SeamDirective], step: &Step) -> Result<(), String> {
+        PlainHost.arm_seams(seams, step)
+    }
+
+    fn finish_seams(&self, guard: ()) -> Result<(), String> {
+        PlainHost.finish_seams(guard)
+    }
+
+    fn compares_reference(&self) -> bool {
+        true
+    }
+
+    fn reference_rows<'a>(
+        &'a self,
+        _session: &'a Session,
+        _read: &'a omnigraph_compiler::ir::core::CoreRead,
+        _target: &'a ReadTarget,
+        _params: &'a omnigraph_compiler::ParamMap,
+    ) -> futures::future::BoxFuture<'a, Result<Result<Vec<Value>, ReferenceRefusal>, String>> {
+        futures::future::ready(Ok(self.reference.clone())).boxed()
+    }
+}
+
+/// The step's outcome under a host whose reference answers `reference`.
+async fn with_reference(
+    text: &str,
+    reference: Result<Vec<Value>, ReferenceRefusal>,
+) -> Result<(), String> {
+    let case = parse_case("reference_comparison", text).unwrap();
+    let (session, uri, _dir) = open_case_store(&case).await.unwrap();
+    let host = FixedReferenceHost { reference };
+    execute_steps(
+        &case,
+        Path::new("unused.gqt"),
+        false,
+        session,
+        &uri,
+        None,
+        &host,
+        &(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("{error:?}"))
+}
+
+/// Every read step is compared by default: a rows step fails when the
+/// reference's rows differ or it refuses, and passes when they agree; an
+/// error step that ran fails unless the reference refuses with the same
+/// code; a step refused at compile time is not compared; a skipped step is
+/// not compared, and a skip on a step the comparison never reaches fails.
+#[tokio::test]
+async fn every_read_step_is_compared_with_the_reference() {
+    let rows_step = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let e2 = || {
+        Err(ReferenceRefusal::Runtime {
+            code: "E2".into(),
+            message: "a divisor is zero".into(),
+        })
+    };
+    let alice = || Ok(vec![serde_json::json!({"p.name": "alice"})]);
+    let bob = || Ok(vec![serde_json::json!({"p.name": "bob"})]);
+    with_reference(&rows_step, alice()).await.unwrap();
+    for (reference, needle) in [
+        (bob(), "the engine and the reference disagree"),
+        (e2(), "the reference refused: E2: a divisor is zero"),
+    ] {
+        let error = with_reference(&rows_step, reference).await.unwrap_err();
+        assert!(error.contains(needle), "{needle} not in {error}");
+    }
+    let skipped = format!("{rows_step}--- reference skipped: the host answers bob\n");
+    with_reference(&skipped, bob()).await.unwrap();
+
+    let divide = "--- query\nquery q($d: I64) {\n    match { $p: Person }\n    return { 1 / $d as x }\n}\n--- params\n{\"d\": 0}\n--- expect error: E2\n";
+    let error_step = format!("{HDR}{SCHEMA}{SEED}{divide}");
+    with_reference(&error_step, e2()).await.unwrap();
+    for (reference, needle) in [
+        (alice(), "the reference returned rows"),
+        (
+            Err(ReferenceRefusal::Input("a parameter".into())),
+            "the reference refused otherwise",
+        ),
+    ] {
+        let error = with_reference(&error_step, reference).await.unwrap_err();
+        assert!(error.contains(needle), "{needle} not in {error}");
+    }
+
+    let unparsed = format!(
+        "{HDR}{SCHEMA}{SEED}--- query\nquery q() {{ match {{ $p: Person }}\n--- expect error: Q001\n"
+    );
+    with_reference(&unparsed, alice()).await.unwrap();
+    let stale = format!("{unparsed}--- reference skipped: a stale reason\n");
+    let error = with_reference(&stale, alice()).await.unwrap_err();
+    assert!(error.contains("does not reach"), "{error}");
+}
+
+/// `--- apply schema` is a step whose body is the whole desired schema, an
+/// `@embed` one included; any other argument or an empty body refuses the
+/// case, and the served path refuses the step by name.
+#[test]
+fn apply_schema_is_a_step_with_a_schema_body() {
+    let apply = "--- apply schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{apply}{QUERY}{EXPECT}");
+    let case = parse_case("apply_schema", &text).unwrap();
+    assert_eq!(case.steps()[0].kind, StepKind::ApplySchema);
+    let [
+        Item::Step(Step::ApplySchema(step)),
+        Item::Step(Step::Query(_)),
+    ] = case.items.as_slice()
+    else {
+        panic!("expected an apply schema step, then a query");
+    };
+    assert!(step.source.contains("age: I32?"));
+    for (from, to) in [
+        ("--- apply schema\n", "--- apply schemas\n"),
+        ("--- apply schema\n", "--- apply\n"),
+        (
+            "--- apply schema\nnode Person {\n    name: String @key\n    age: I32?\n}\n",
+            "--- apply schema\n\n",
+        ),
+    ] {
+        assert!(
+            parse_case("apply_schema", &text.replace(from, to)).is_err(),
+            "{from} -> {to}"
+        );
+    }
+    parse_case(
+        "apply_schema",
+        &text.replace("age: I32?", "e: Vector(2) @embed(\"name\")"),
+    )
+    .unwrap();
 }

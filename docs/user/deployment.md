@@ -52,9 +52,9 @@ Readiness is unauthenticated and names no graph. Authorized `GET /graphs`
 returns one `graphs` list, including blocked entries, with each graph's `state`
 (`loading`, `ready`, `blocked`, `transitioning` or `stopping`), `read_available`, `write_available` and
 `action`. Availability describes the runtime, not the caller's permissions.
-Blocked entries include a sanitized `failure`: `invalid_configuration`,
-`invalid_policy`, `invalid_external_blob_policy`, `open_failed` or
-`invalid_stored_queries`. Details remain in server logs.
+Blocked entries include a sanitized `failure`: `invalid_configuration`, `invalid_policy`, `invalid_external_blob_policy`, `open_failed` or
+`invalid_stored_queries` (only under `OMNIGRAPH_STRICT_STORED_QUERIES=1`). A served graph lists each stored query that fails
+to compile under `unavailable_queries`, with its diagnostic, and `/readyz` counts them (`unavailable_query_count`). Details remain in server logs.
 `apply_correction_or_restart` means deploy corrected queries, policies or provider
 configuration, or restore damaged storage from a verified backup and restart.
 It never authorizes adopting a different graph identity. `wait_for_restart` means

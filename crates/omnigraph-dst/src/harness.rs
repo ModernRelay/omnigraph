@@ -1602,12 +1602,12 @@ enum Op {
     SchemaAddProperty {
         count: usize,
     },
-    /// Mid-life bulk load, `LoadMode::Merge` (upsert by @key) over the load
+    /// Mid-life bulk load, `LoadMode::Replace` (upsert by @key) over the load
     /// alphabet. Model: upsert each payload row.
     LoadMerge {
         people: Vec<(String, i64, i64)>,
     },
-    /// Mid-life bulk load, `LoadMode::Append` (StrictInsert) — names are
+    /// Mid-life bulk load, `LoadMode::Insert` (StrictInsert) — names are
     /// fresh-by-construction (`ld{n}` counter) so the insert can't collide.
     LoadAppend {
         people: Vec<(String, i64, i64)>,
@@ -1769,7 +1769,7 @@ async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
                 "{}\n{{\"type\": \"Company\", \"data\": {{\"name\": \"lc0\"}}}}",
                 person_jsonl(people)
             );
-            Box::pin(db.load_jsonl(&payload, LoadMode::Merge))
+            Box::pin(db.load_jsonl(&payload, LoadMode::Replace))
                 .await
                 .map(|_| ())
         }
@@ -1782,7 +1782,7 @@ async fn exec_op(db: &Session, branch: &str, op: &Op) -> OmniResult<()> {
                 person_jsonl(people),
                 people[0].0
             );
-            Box::pin(db.load_jsonl(&payload, LoadMode::Append))
+            Box::pin(db.load_jsonl(&payload, LoadMode::Insert))
                 .await
                 .map(|_| ())
         }
@@ -2219,7 +2219,7 @@ async fn exec_world_op(db: &Session, wop: &WorldOp) -> OmniResult<()> {
                 "{}\n{{\"type\": \"Company\", \"data\": {{\"name\": \"lc0\"}}}}",
                 person_jsonl(people)
             );
-            Box::pin(db.load_as(branch, Some("main"), &payload, LoadMode::Merge, None))
+            Box::pin(db.load_as(branch, Some("main"), &payload, LoadMode::Replace, None))
                 .await
                 .map(|_| ())
         }
@@ -3874,6 +3874,17 @@ async fn assert_physical_matches(db: &Session, world: &WorldModel, where_: &str)
 /// path relies on that property, and a future member with durable effects
 /// would silently break it. The dead-target member below covers ops whose
 /// model target a ruling removed.
+/// A branch create resent after a lost acknowledgement meets the branch its
+/// first attempt created: graph writes carry no request identity (contract
+/// `E4`, gap `G7`), so the resend is refused `branch_exists` naming that same
+/// branch, and reconcile decides from the store whether the first one landed.
+fn retry_meets_its_own_create(err: &OmniError, wop: &WorldOp) -> bool {
+    matches!(
+        (err, wop),
+        (OmniError::BranchExists { branch, .. }, WorldOp::BranchCreate { name }) if branch == name
+    )
+}
+
 fn is_legal_rejection(
     err: &OmniError,
     world: &WorldModel,
@@ -6462,6 +6473,7 @@ impl UniverseScenario<RustResources> for Scenario {
                             let retry = Box::pin(exec_world_op(&db, &wop)).await;
                             if let Err(retry_err) = &retry
                                 && !(matches!(retry_err, OmniError::RecoveryRequired { .. })
+                                    || retry_meets_its_own_create(retry_err, &wop)
                                     || is_legal_rejection(
                                         retry_err,
                                         &world,
@@ -7358,7 +7370,7 @@ mod history_schema_tests {
             db.branch_delete("blocks-schema").await.unwrap();
             db.load_jsonl(
                 r#"{"type":"Person","data":{"name":"after-schema","age":61,"ver":7}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
             )
             .await
             .unwrap();

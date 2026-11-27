@@ -10,7 +10,6 @@ use lance_index::is_system_index;
 use lance_table::format::IndexMetadata;
 
 use crate::error::{OmniError, Result};
-use crate::fts_compat::verify_index;
 
 /// Whether a `key_col IN (...)` scan on a dataset will be served by the
 /// persisted scalar (BTREE) index, or silently fall back to a full filtered
@@ -68,30 +67,26 @@ impl FtsFilterDemand {
 
 /// Check only full-text reads, against this exact snapshot's artifacts.
 /// SQL SDK filters are inspected as typed expressions, not string-matched.
-pub async fn validate_full_text_scan(
-    ds: &Dataset,
-    scanner: &Scanner,
-    columns: Option<HashSet<String>>,
-) -> Result<()> {
+pub async fn validate_full_text_scan(ds: &Dataset, scanner: &Scanner) -> Result<()> {
     let filter_demand = match scanner.get_expr_filter().map_err(OmniError::storage)? {
         Some(filter) => FtsFilterDemand::from_filter(&filter),
         None => FtsFilterDemand::default(),
     };
-    validate_full_text_demand(ds, columns, filter_demand).await
+    validate_full_text_demand(ds, filter_demand).await
 }
 
-/// The validation proper, over an already-derived demand: `columns` is
-/// the full-text query's column set (`Some(empty)` = every FTS column),
-/// `filter_demand` what the filters read through `contains_tokens`.
-pub async fn validate_full_text_demand(
-    ds: &Dataset,
-    columns: Option<HashSet<String>>,
-    filter_demand: FtsFilterDemand,
-) -> Result<()> {
+/// The validation proper, over an already-derived demand: what the filters
+/// read through `contains_tokens`. A raw filter names no field analysis, and
+/// [`crate::fts_compat::verify_index`] qualifies a segment only for the
+/// accepted fingerprint of the field it serves, so a raw filter over a column
+/// that holds a full-text segment refuses with
+/// [`OmniError::FullTextIndexRebuildRequired`] before it reads the postings.
+/// A column without a segment has no postings to read. No lexical query
+/// reads a full-text index; the exact scan answers it.
+pub async fn validate_full_text_demand(ds: &Dataset, filter_demand: FtsFilterDemand) -> Result<()> {
     crate::instrumentation::record_fts_validation();
-    let all_columns = columns.as_ref().is_some_and(HashSet::is_empty) || filter_demand.all_columns;
-    let mut requested = columns.unwrap_or_default();
-    requested.extend(filter_demand.columns);
+    let all_columns = filter_demand.all_columns;
+    let requested = filter_demand.columns;
     if !all_columns && requested.is_empty() {
         return Ok(());
     }
@@ -103,11 +98,18 @@ pub async fn validate_full_text_demand(
     // storage-validation future out of every caller's scan/count state.
     Box::pin(async move {
         let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-        for index in indices.iter().filter(|index| {
+        if let Some(index) = indices.iter().find(|index| {
             (is_full_text_index(index) || index.index_details.is_none())
                 && (all_columns || index.fields.iter().any(|field| fields.contains(field)))
         }) {
-            verify_index(ds, index).await?;
+            return Err(OmniError::FullTextIndexRebuildRequired {
+                index: index.name.clone(),
+                reason: format!(
+                    "a raw `contains_tokens` filter names no field analysis, so no full-text \
+                     segment qualifies for it (index UUID {})",
+                    index.uuid
+                ),
+            });
         }
         Ok(())
     })
@@ -450,6 +452,70 @@ pub async fn user_indices_for_column(ds: &Dataset, column: &str) -> Result<Vec<I
         .filter(|index| index.fields.len() == 1 && index.fields[0] == field_id)
         .cloned()
         .collect())
+}
+
+/// A scalar index family Omnigraph builds on a declared property
+/// (the GQ 3 RFC, section 4): BTREE for equality, ranges and
+/// order, BITMAP for an enum or `Bool`, LABEL_LIST for a list's membership and
+/// NGRAM for a String's substring test. Every family is derived acceleration;
+/// a fold rebuilds an index whole in its own family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarIndexFamily {
+    BTree,
+    Bitmap,
+    LabelList,
+    NGram,
+}
+
+impl ScalarIndexFamily {
+    /// The family of `index`, read from its details type URL; `None` for any
+    /// other index (full text, vector, a zone map or Bloom filter another
+    /// writer built, or one with no details).
+    pub fn of(index: &IndexMetadata) -> Option<Self> {
+        let url = &index.index_details.as_ref()?.type_url;
+        let message = url.rsplit(['.', '/']).next()?;
+        [
+            (Self::BTree, "BTreeIndexDetails"),
+            (Self::Bitmap, "BitmapIndexDetails"),
+            (Self::LabelList, "LabelListIndexDetails"),
+            (Self::NGram, "NGramIndexDetails"),
+        ]
+        .into_iter()
+        .find_map(|(family, details)| (message == details).then_some(family))
+    }
+
+    /// The Lance index type that builds this family.
+    pub fn index_type(self) -> lance_index::IndexType {
+        match self {
+            Self::BTree => lance_index::IndexType::BTree,
+            Self::Bitmap => lance_index::IndexType::Bitmap,
+            Self::LabelList => lance_index::IndexType::LabelList,
+            Self::NGram => lance_index::IndexType::NGram,
+        }
+    }
+
+    /// The family's name in reports and index names (`btree`, `bitmap`,
+    /// `label_list`, `ngram`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BTree => "btree",
+            Self::Bitmap => "bitmap",
+            Self::LabelList => "label_list",
+            Self::NGram => "ngram",
+        }
+    }
+}
+
+/// Whether `column` of `ds` carries an index of `family`.
+pub async fn has_scalar_index_on(
+    ds: &Dataset,
+    column: &str,
+    family: ScalarIndexFamily,
+) -> Result<bool> {
+    let indices = user_indices_for_column(ds, column).await?;
+    Ok(indices
+        .iter()
+        .any(|index| ScalarIndexFamily::of(index) == Some(family)))
 }
 
 pub async fn has_btree_index_on(ds: &Dataset, column: &str) -> Result<bool> {

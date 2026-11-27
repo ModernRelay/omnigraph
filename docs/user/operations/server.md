@@ -23,7 +23,8 @@ For object storage, replace `./company-brain` with the cluster root, for example
 
 The default bind address is `127.0.0.1:8080`. `--require-all-graphs` makes any
 graph startup failure fatal. Otherwise failed graphs remain in the authorized
-inventory as blocked while healthy graphs serve; see [readiness](../deployment.md).
+inventory as blocked while healthy graphs serve; see [readiness](../deployment.md). A stored query that
+fails to compile makes only itself unavailable unless `OMNIGRAPH_STRICT_STORED_QUERIES=1` ([upgrade](../queries/upgrading-to-gq3.md#stored-queries-at-upgrade)).
 
 An applied empty cluster creates no default graph and serves an empty inventory.
 `/readyz` reports its applied digest, ledger revision/CAS and zero graph counts.
@@ -110,7 +111,7 @@ every action to every token, reads included: bearer tokens are not scoped to
 graphs, so a permit there would reach every graph that lacks a policy. Apply a
 [graph policy](policy.md) to each graph a token should reach. Setting
 `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` in the server's environment restores
-the earlier behaviour, in which every static token may `read` every graph
+the earlier behavior, in which every static token may `read` every graph
 without a policy; the server logs a warning at startup when it is set.
 
 ### Assert the actor
@@ -252,7 +253,7 @@ curl -sS http://localhost:8080/graphs/knowledge/query \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -d '{
-    "query":"query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+    "query":"query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }",
     "name":"find",
     "params":{"name":"Ada"}
   }'
@@ -273,9 +274,9 @@ curl -sS http://localhost:8080/graphs/knowledge/queries/find_person \
   -d '{"params":{"name":"Ada"}}'
 ```
 
-Authorization denials for stored-query invocation appear as `404`, preventing
-callers from probing registry names. A stored query then receives the normal
-`read` or `change` authorization check for its body.
+The body takes `params`, `branch`, `snapshot` and `expect_mutation`. Denials appear
+as `404`, preventing callers from probing registry names; a stored query then
+receives the normal `read` or `change` authorization check for its body.
 
 ## Conditional mutations
 
@@ -288,7 +289,7 @@ curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -H 'Omnigraph-If-Graph-Commit: <graph_commit_id>' \
-  -d '{"query":"query rename($name: String) { update Person set { name: $name } where email = \"ada@example.com\" }","name":"rename","params":{"name":"Ada"}}'
+  -d '{"query":"query rename($name: String) { match { $x: Person } where $x.email = \"ada@example.com\" update $x set { name: $name } }","name":"rename","params":{"name":"Ada"}}'
 ```
 
 Stored mutations use `POST /graphs/{graph_id}/queries/{query_name}/if-graph-commit` with
@@ -314,7 +315,7 @@ batch; it is not a durable stream or an unbounded ingestion session. Split a
 larger feed into batches and wait for each response before acknowledging it
 upstream.
 
-HTTP loading defaults to `mode=merge` and branch `main`. A missing target branch
+HTTP loading defaults to `mode=replace` and branch `main`. A missing target branch
 is an error unless the request supplies `from`. This differs from the CLI,
 where `--mode` is always required.
 
@@ -340,9 +341,9 @@ resume cursor ([Changes, Diffs and Change Feeds](../branching/changes.md)).
 ## Errors and retries
 
 Every error body, an unknown route's and a malformed request's included, carries
-a `code`, its details and a `disposition` (`effects`, `action`; see
-[failed writes](troubleshooting.md#failed-data-write-commands)); a write the
-server could not settle is `outcome_unknown`, with `500`. Admission limits use `429`, size limits `413`, blocked graphs or closed admission `503`, each refusal
+a `code`, its details and a `disposition` (`effects`, `action`; see [failed writes](troubleshooting.md#failed-data-write-commands)).
+A JSON body key a route does not define is `400 bad_request`, naming it and the
+accepted keys; a write the server could not settle is `outcome_unknown`, with `500`. Admission limits use `429`, size limits `413`, blocked graphs or closed admission `503`, each refusal
 that asks for a retry with `Retry-After`. Admitted writes continue after disconnect.
 
 For TLS, secrets, storage credentials, container examples and Azure admission,

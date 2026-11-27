@@ -60,7 +60,7 @@ a warm-up read, the measured read, a `--- restart` and a verification read, and
 on the server the restart is the long-running lifecycle's no-op (a step
 receipt with no door opened). Six of the suite's scenarios have no served door:
 `e2e-query-destination-search`, `e2e-nearest-prefilter`,
-`e2e-nearest-nprobes-one` and `e2e-rrf-traversal` need indexes (search,
+`e2e-nearest-nprobes-one` and `e2e-rrf-exact-traversal` need indexes (search,
 nearest and RRF), and `e2e-traversal-selective-csr` and
 `e2e-traversal-selective-indexed` pin a traversal path; a served run of those
 is refused by name before any request. The served point of a scenario is
@@ -635,7 +635,7 @@ target/release/omnigraph-bench projection list-points \
 
 The same schema fills a graph of your own: `projection schema` prints it,
 `projection export --store <store> --catalog <dir>` emits the store's records
-and the catalogs' declarations as graph JSONL for `omnigraph load --mode merge`,
+and the catalogs' declarations as graph JSONL for `omnigraph load --mode replace`,
 and the stored queries under `crates/omnigraph-bench/projection/queries/`
 read it (the harness README, §The results graph).
 

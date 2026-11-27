@@ -21,7 +21,7 @@ node Person {
 
 const QUERY: &str = r#"
 query find_person($name: String) {
-  match { $p: Person { name: $name } }
+  match { $p: Person } where $p.name = $name
   return { $p.name, $p.age }
 }
 "#;
@@ -2165,7 +2165,7 @@ async fn offline_deployment_upgrade_preserves_data_history_and_applied_facts() {
     );
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Ada","age":37}}"#,
-        omnigraph::loader::LoadMode::Merge,
+        omnigraph::loader::LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3350,6 +3350,115 @@ async fn plan_embeds_migration_preview_for_schema_update() {
             .contains("add_property"),
         "{migration:?}"
     );
+    assert!(migration.one_way_constructs.is_empty(), "{migration:?}");
+    assert!(migration.one_way_note.is_none(), "{migration:?}");
+    let additive = fs::read_to_string(dir.path().join("people.pg")).unwrap();
+
+    // A change that stores a construct an older binary refuses names it.
+    fs::write(
+        dir.path().join("people.pg"),
+        additive.replace("bio: String?", "bio: String? @index(fulltext)"),
+    )
+    .unwrap();
+    let out = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let migration = out
+        .changes
+        .iter()
+        .find(|change| change.resource == "schema.knowledge")
+        .and_then(|change| change.migration.as_ref())
+        .unwrap();
+    let named: Vec<_> = migration
+        .one_way_constructs
+        .iter()
+        .map(|c| {
+            (
+                c.construct.as_str(),
+                c.type_name.as_str(),
+                c.property.as_deref(),
+                c.first_release.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        [("full_text_index", "Person", Some("bio"), "0.18.0")]
+    );
+    assert_eq!(
+        migration.one_way_note,
+        omnigraph_compiler::schema::one_way::one_way_note(["0.18.0"])
+    );
+
+    // Text that keeps the accepted identity plans no step: the plan names it
+    // text only, apply publishes no graph commit and the graph keeps its
+    // accepted source, and the ledger records the configured text's digest
+    // beside the unchanged contract, so the next plan sees no change.
+    fs::write(
+        dir.path().join("people.pg"),
+        format!("// reworded comment\n{SCHEMA}"),
+    )
+    .unwrap();
+    let version = identity_manifest_version(dir.path()).await;
+    let ledger = |dir: &Path| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(dir.join(CLUSTER_STATE_FILE)).unwrap()).unwrap()
+    };
+    let contract = ledger(dir.path())["applied_revision"]["schema_contracts"]["knowledge"].clone();
+    let out = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
+    assert!(out.ok, "{:?}", out.diagnostics);
+    let change = out
+        .changes
+        .iter()
+        .find(|change| change.resource == "schema.knowledge")
+        .unwrap();
+    assert!(change.text_only, "{change:?}");
+    assert!(
+        change
+            .migration
+            .as_ref()
+            .is_some_and(|plan| plan.supported && plan.steps.is_empty())
+    );
+    let configured = change.after_digest.clone().unwrap();
+    let applied = apply_deployment(
+        dir.path(),
+        None,
+        &DeploymentCaller::storage_owner(Some("principal:owner".into())),
+        |_, _, _| {},
+    )
+    .await
+    .unwrap();
+    let DeploymentLookup::Complete { result } = applied else {
+        panic!("{applied:?}");
+    };
+    assert!(result.converged, "{result:?}");
+    assert!(
+        matches!(
+            &result.graphs["knowledge"],
+            GraphDeploymentResult::Schema {
+                result: omnigraph::db::SchemaApplySettlement::NoOp { .. }
+            }
+        ),
+        "{:?}",
+        result.graphs
+    );
+    assert_eq!(identity_manifest_version(dir.path()).await, version);
+    let achieved = ledger(dir.path());
+    assert_eq!(
+        achieved["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        configured.as_str()
+    );
+    assert_eq!(
+        achieved["applied_revision"]["schema_contracts"]["knowledge"],
+        contract
+    );
+    assert_ne!(contract["source_hash"], configured.as_str());
+    let db = Omnigraph::open_read_only(dir.path().join("graphs/knowledge.omni").to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(db.schema_source().as_str(), SCHEMA);
+    drop(db);
+    let out = plan_config_dir_as(dir.path(), Some("principal:owner".into())).await;
+    assert!(out.ok && out.changes.is_empty(), "{out:?}");
+    fs::write(dir.path().join("people.pg"), additive).unwrap();
 
     let caller = DeploymentCaller::storage_owner(Some("principal:owner".into()));
     let root = dir.path().join("graphs/knowledge.omni");
@@ -3664,7 +3773,7 @@ fn queries_directory_discovers_every_declaration() {
     fs::create_dir(dir.path().join("queries")).unwrap();
     fs::write(
             dir.path().join("queries/people.gq"),
-            "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n\nquery all_people() {\n  match { $p: Person }\n  return { $p.name }\n}\n",
+            "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n\nquery all_people() {\n  match { $p: Person }\n  return { $p.name }\n}\n",
         )
         .unwrap();
     fs::write(
@@ -3838,7 +3947,7 @@ fn queries_list_and_single_file_forms_discover() {
     .unwrap();
     fs::write(
             dir.path().join("a.gq"),
-            "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+            "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
         )
         .unwrap();
     fs::write(
@@ -3888,7 +3997,7 @@ fn query_discovery_rejects_duplicates_and_parse_errors() {
         "\nnode Person {\n  name: String @key\n}\n",
     )
     .unwrap();
-    let decl = "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n";
+    let decl = "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n";
     fs::write(dir.path().join("a.gq"), decl).unwrap();
     fs::write(dir.path().join("b.gq"), decl).unwrap();
     fs::write(
@@ -3905,6 +4014,22 @@ fn query_discovery_rejects_duplicates_and_parse_errors() {
         "{:?}",
         out.diagnostics
     );
+
+    // One name declared twice in one file is the compiler's `T83`.
+    fs::write(dir.path().join("twice.gq"), format!("{decl}{decl}")).unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./twice.gq\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "query_parse_error")
+        .unwrap_or_else(|| panic!("{:?}", out.diagnostics));
+    assert_eq!(diagnostic.detail.as_ref().unwrap().code.as_str(), "T83");
 
     fs::write(
         dir.path().join("broken.gq"),
@@ -4835,4 +4960,82 @@ async fn plan_observes_graph_removal_and_policy_rebinding() {
         );
         assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
     }
+}
+
+/// `stored_query_files` names, per graph, the files `queries:` declares as
+/// validation reads them (a declared file, a directory's top-level `.gq`
+/// files, an explicit map's files), without reading them: a file that does
+/// not parse is named like any other. A path leaving the directory is
+/// refused.
+#[test]
+fn stored_query_files_names_every_declared_file_unread() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("queries/nested")).unwrap();
+    for (path, text) in [
+        ("people.pg", "node Person { name: String @key }\n"),
+        (
+            "queries/one.gq",
+            "query one() { match { $p: Person } return { $p.name } }\n",
+        ),
+        (
+            "queries/two.gq",
+            "mutation two() { insert Person { name: \"a\" } }\n",
+        ),
+        ("queries/notes.txt", "not a query\n"),
+        ("queries/nested/three.gq", "query three() {}\n"),
+        ("extra.gq", "query extra( {\n"),
+        (
+            "named.gq",
+            "query named() { match { $p: Person } return { $p } }\n",
+        ),
+    ] {
+        fs::write(root.join(path), text).unwrap();
+    }
+    fs::write(
+        root.join("cluster.yaml"),
+        "version: 1\ngraphs:\n  a:\n    schema: ./people.pg\n    queries: ./queries/\n  b:\n    schema: ./people.pg\n    queries: [./extra.gq, ./queries/]\n  c:\n    schema: ./people.pg\n    queries:\n      named:\n        file: ./named.gq\n  d:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    let graphs = stored_query_files(root).unwrap();
+    let listed: Vec<(&str, Vec<String>)> = graphs
+        .iter()
+        .map(|g| {
+            assert_eq!(g.schema, root.join("./people.pg"));
+            (
+                g.graph_id.as_str(),
+                g.files
+                    .iter()
+                    .map(|f| f.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("a", vec!["queries/one.gq".into(), "queries/two.gq".into()]),
+            (
+                "b",
+                vec![
+                    "extra.gq".into(),
+                    "queries/one.gq".into(),
+                    "queries/two.gq".into()
+                ]
+            ),
+            ("c", vec!["named.gq".into()]),
+            ("d", Vec::<String>::new()),
+        ]
+    );
+
+    fs::write(
+        root.join("cluster.yaml"),
+        "version: 1\ngraphs:\n  a:\n    schema: ./people.pg\n    queries: ../outside.gq\n",
+    )
+    .unwrap();
+    let refused = stored_query_files(root).unwrap_err();
+    assert!(
+        refused.iter().any(|d| d.code == "config_path_escape"),
+        "{refused:?}"
+    );
 }

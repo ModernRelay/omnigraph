@@ -1,0 +1,59 @@
+# issue: none
+# notes: Thirty `optional` blocks in one read type, plan and run: the core
+# notes: writes the elements before an `optional` once (`Correlate(R, Union(p,
+# notes: Project(Filter(Env, ¬ exists p), nulls)))`), so the term grows by the
+# notes: same number of nodes with each block, never doubling it.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+node City {
+    slug: String @key
+}
+edge WorksAt: Person -> Company
+edge Knows: Person -> Person
+edge LocatedIn: Company -> City
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":25}}
+{"type":"Person","data":{"handle":"cy","name":"Cy","age":41}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Company","data":{"slug":"bolt","name":"Bolt"}}
+{"type":"City","data":{"slug":"oslo"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"ada","to":"bolt"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"Knows","from":"ada","to":"bob"}
+{"edge":"Knows","from":"cy","to":"ada"}
+{"edge":"LocatedIn","from":"acme","to":"oslo"}
+
+--- query
+query thirty() { match { $p: Person, optional { $q0: Person, $p knows $q0 }, optional { $q1: Person, $p knows $q1 }, optional { $q2: Person, $p knows $q2 }, optional { $q3: Person, $p knows $q3 }, optional { $q4: Person, $p knows $q4 }, optional { $q5: Person, $p knows $q5 }, optional { $q6: Person, $p knows $q6 }, optional { $q7: Person, $p knows $q7 }, optional { $q8: Person, $p knows $q8 }, optional { $q9: Person, $p knows $q9 }, optional { $q10: Person, $p knows $q10 }, optional { $q11: Person, $p knows $q11 }, optional { $q12: Person, $p knows $q12 }, optional { $q13: Person, $p knows $q13 }, optional { $q14: Person, $p knows $q14 }, optional { $q15: Person, $p knows $q15 }, optional { $q16: Person, $p knows $q16 }, optional { $q17: Person, $p knows $q17 }, optional { $q18: Person, $p knows $q18 }, optional { $q19: Person, $p knows $q19 }, optional { $q20: Person, $p knows $q20 }, optional { $q21: Person, $p knows $q21 }, optional { $q22: Person, $p knows $q22 }, optional { $q23: Person, $p knows $q23 }, optional { $q24: Person, $p knows $q24 }, optional { $q25: Person, $p knows $q25 }, optional { $q26: Person, $p knows $q26 }, optional { $q27: Person, $p knows $q27 }, optional { $q28: Person, $p knows $q28 }, optional { $c: Company, $p worksAt $c } } return { $p.handle, $q0.handle, $q28.handle, $c.slug } }
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada","q0.handle":"bob","q28.handle":"bob"}
+{"c.slug":"bolt","p.handle":"ada","q0.handle":"bob","q28.handle":"bob"}
+{"c.slug":"acme","p.handle":"bob"}
+{"p.handle":"cy","q0.handle":"ada","q28.handle":"ada"}
+
+--- expect shape
+p.handle: String
+q0.handle: String?
+q28.handle: String?
+c.slug: String?

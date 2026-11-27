@@ -18,7 +18,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult, path::Path,
 };
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::{ExprType, ScalarType};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -369,7 +369,7 @@ async fn measure(
     let (plan, filter) = read.plan_with_filter().await.unwrap();
     if finalized {
         assert!(matches!(
-            inspect(&plan, &ds, filter).await.unwrap(),
+            inspect(&plan, &ds, filter, None).await.unwrap(),
             ScanAccess::IndexProbe { .. }
         ));
     }

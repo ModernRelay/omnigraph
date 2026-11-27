@@ -1,0 +1,85 @@
+# issue: none
+# notes: The return items are computed beside every match column before the cut
+# notes: (`Project(Cut(Order(Extend(R, items), keys), k), items)`), and a term that can
+# notes: fail keeps its place, so a zero divisor in a return item, an order key or an
+# notes: aggregate's argument refuses (`E2`) however many rows the `limit` keeps, `limit 0`
+# notes: included, in the outer read and in an inline read. A total item under `limit 0`
+# notes: returns no row. Each step is compared with the reference interpreter.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p: I32?
+}
+
+--- seed
+{"type":"A","data":{"k":"a","p":1}}
+{"type":"A","data":{"k":"b","p":0}}
+{"type":"A","data":{"k":"c","p":2}}
+
+--- query
+query item_under_limit_zero() {
+    match { $n: A }
+    return { (1 / $n.p) as c }
+    limit 0
+}
+
+--- expect error: E2
+
+--- query
+query item_under_limit_one() {
+    match { $n: A }
+    return { $n.k, (1 / $n.p) as c }
+    order { $n.k }
+    limit 1
+}
+
+--- expect error: E2
+
+--- query
+query order_key_under_limit_zero() {
+    match { $n: A }
+    return { $n.k }
+    order { 1 / $n.p }
+    limit 0
+}
+
+--- expect error: E2
+
+--- query
+query aggregate_under_limit_zero() {
+    match { $n: A }
+    return { sum(1 / $n.p) as s }
+    limit 0
+}
+
+--- expect error: E2
+
+--- query
+query inline_read_under_limit_zero() {
+    match {
+      from { match { $n: A } return { $n, (10 / $n.p) as c } limit 0 },
+    }
+    return { $n.k }
+}
+
+--- expect error: E2
+
+--- query
+query total_item_under_limit_zero() {
+    match { $n: A }
+    return { $n.k, ($n.p + 1) as c }
+    limit 0
+}
+
+--- expect unordered
+
+--- expect shape
+n.k: String
+c: I32?

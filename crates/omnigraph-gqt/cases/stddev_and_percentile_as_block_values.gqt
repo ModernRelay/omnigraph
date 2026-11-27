@@ -1,0 +1,119 @@
+# issue: none
+# notes: `stddev($x.p) { … }` and `percentile($x.p, p) { … }` are block values: per outer row, the
+# notes: aggregate over the block's rows, null where the block has too few values (no row, only
+# notes: nulls, or one value for `stddev`). A block compared in `where` keeps the outer rows whose
+# notes: value passes; a null value passes no comparison. p may be a parameter.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Shop {
+    name: String @key
+}
+node Sale {
+    id: String @key
+    amount: F64?
+    qty: I64?
+}
+edge Sells: Shop -> Sale
+
+--- seed
+{"type":"Shop","data":{"name":"a"}}
+{"type":"Shop","data":{"name":"b"}}
+{"type":"Shop","data":{"name":"c"}}
+{"type":"Shop","data":{"name":"d"}}
+{"type":"Shop","data":{"name":"e"}}
+{"type":"Sale","data":{"id":"s1","amount":1.0,"qty":3}}
+{"type":"Sale","data":{"id":"s2","amount":2.0,"qty":1}}
+{"type":"Sale","data":{"id":"s3","amount":6.0,"qty":8}}
+{"type":"Sale","data":{"id":"s4","amount":5.0,"qty":2}}
+{"type":"Sale","data":{"id":"s5","qty":4}}
+{"type":"Sale","data":{"id":"s6","amount":7.0}}
+{"type":"Sale","data":{"id":"s7","amount":9.0}}
+{"edge":"Sells","from":"a","to":"s1"}
+{"edge":"Sells","from":"a","to":"s2"}
+{"edge":"Sells","from":"a","to":"s3"}
+{"edge":"Sells","from":"b","to":"s4"}
+{"edge":"Sells","from":"c","to":"s5"}
+{"edge":"Sells","from":"d","to":"s6"}
+{"edge":"Sells","from":"d","to":"s7"}
+
+--- query
+query spread_per_shop($p: F64) {
+    match { $h: Shop }
+    return {
+        $h.name as name,
+        stddev($s.amount) { $s: Sale, $h sells $s } as sd,
+        percentile($s.amount, 0.5) { $s: Sale, $h sells $s } as median,
+        percentile($s.qty, $p) { $s: Sale, $h sells $s } as qty_at
+    }
+    order { name }
+}
+
+--- params
+{"p": 0.75}
+
+--- expect ordered
+{"median":2,"name":"a","qty_at":5.5,"sd":2.645751311065}
+{"median":5,"name":"b","qty_at":2}
+{"name":"c","qty_at":4}
+{"median":8,"name":"d","sd":1.414213562373}
+{"name":"e"}
+
+--- expect shape
+name: String
+sd: F64?
+median: F64?
+qty_at: F64?
+
+--- query
+query spread_shops() {
+    match { $h: Shop }
+    where stddev($s.amount) { $s: Sale, $h sells $s } > 1.5
+    return { $h.name as name }
+}
+
+--- expect unordered
+{"name":"a"}
+
+--- expect shape
+name: String
+
+--- query
+query median_above($m: F64) {
+    match { $h: Shop }
+    where percentile($s.amount, 0.5) { $s: Sale, $h sells $s } >= $m
+    return { $h.name as name }
+}
+
+--- params
+{"m": 2.0}
+
+--- expect unordered
+{"name":"a"}
+{"name":"b"}
+{"name":"d"}
+
+--- expect shape
+name: String
+
+--- query
+query median_above($m: F64) {
+    match { $h: Shop }
+    where not (percentile($s.amount, 0.5) { $s: Sale, $h sells $s } >= $m)
+    return { $h.name as name }
+}
+
+--- params
+{"m": 2.0}
+
+--- expect unordered
+
+--- expect shape
+name: String

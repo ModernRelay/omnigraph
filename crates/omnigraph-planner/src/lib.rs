@@ -38,7 +38,9 @@ pub mod optimizer;
 pub mod output;
 pub mod passes;
 pub mod physical;
+mod placement;
 pub mod ranking;
+pub mod read_shape;
 pub mod registry;
 pub mod route;
 pub mod scan_access;
@@ -52,10 +54,11 @@ pub use aggregate::{
 };
 pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
 pub use cost::{
-    AccessPath, AntiJoinStrategy, CSR_BUILD_FACTOR, CoverageProvenance, EndpointProbe,
-    ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO,
-    HYDRATE_ROW_RATIO, IndexCoverage, PROBE_CHUNK_KEYS, SOURCE_PARTITION_BYTES, ValidateAccess,
-    ValidateCostInputs, ValidateIndexCoverage, ValidateRemoval, chain_rows, choose_access_path,
+    AccessPath, AntiJoinStrategy, BM25_TABLE_POOL_DIVISOR, Bm25Pass, CSR_BUILD_FACTOR,
+    CoverageProvenance, EndpointProbe, ExpandCostInputs, ExpandMode, ExpandPolicy,
+    HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO, HYDRATE_ROW_RATIO, IndexCoverage, PROBE_CHUNK_KEYS,
+    SOURCE_PARTITION_BYTES, ValidateAccess, ValidateCostInputs, ValidateIndexCoverage,
+    ValidateRemoval, bm25_match_table_bytes, chain_rows, choose_access_path,
     choose_anti_join_strategy, choose_expand_mode, choose_validate_access,
     coverage_validate_access, direction_probe_factor, estimate_rows, executed_hops,
     hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
@@ -65,13 +68,13 @@ pub use explain::Explain;
 pub use gate::{Decision, Unrouted, accept_query, accept_query_explained, plan_query, route};
 pub use logical::{
     Census, ColumnRef, ConsultedImage, CsvSourceSpec, DeltaSourceSpec, FragmentWriteSpec,
-    IndexQuery, JoinKind, KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan, Predicate,
-    RuntimeFilterKind, RuntimeFilterSpec, RuntimeInput, ScanAccess, ScanSpec, SearchArm,
+    FuseInput, IndexQuery, JoinKind, KeyJoinKind, LogicalId, LogicalKind, LogicalNode, LogicalPlan,
+    Predicate, RuntimeFilterKind, RuntimeFilterSpec, RuntimeInput, ScanAccess, ScanSpec,
     ValidateSpec,
 };
 pub use lower::{
-    AggregateFields, ContainsJoinFields, CsvSourceFields, DeltaSourceFields, ExpandFields,
-    FragmentWriteFields, HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields,
+    AggregateFields, ContainsJoinFields, CorrelateFields, CsvSourceFields, DeltaSourceFields,
+    ExpandFields, FragmentWriteFields, FuseFields, HashJoinFields, Lower, SortMergeJoinFields,
     ValidateFields,
 };
 pub use operation::{
@@ -81,20 +84,20 @@ pub use optimizer::{Bounds, physical_plan, rewrite};
 pub use output::{NodeObjectType, validate_output_schemas};
 pub use passes::{PassId, PassRow, PassStage, pass_rows};
 pub use physical::{
-    Assumptions, DatasetPin, Eligibility, EmptyEligible, Estimate, GatePolicy, Hop,
-    HydratedBinding, HydratedColumn, NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung,
-    PhysicalNode, PhysicalNodeKind, PhysicalPlan, PipelineShape, PipelineSink, PipelineSource,
-    PipelineSpec, Prefilter, PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankArm, RankKind,
-    RankScope, RankedAccess, ScanInput, SideChain, StatisticSource, operator_rows,
-    validate_streams,
+    Assumptions, DatasetPin, Estimate, FuseArm, GatePolicy, Hop, HydratedBinding, HydratedColumn,
+    NearestPolicy, NodeId, OperatorRow, OrderKey, OverfetchRung, PhysicalNode, PhysicalNodeKind,
+    PhysicalPlan, PipelineShape, PipelineSink, PipelineSource, PipelineSpec, Prefilter,
+    PrefilterMode, Properties, ROW_ADDRESS_PREFIX, RankScope, RankedAccess, ScanInput, SideChain,
+    StatisticSource, operator_rows, score_column, score_kind_name, validate_streams,
 };
 pub use ranking::{PlannedRanking, planned_ranking};
+pub use read_shape::{ArmRank, InnerRead, PatternStep, ReadShape, TargetWindow};
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
 pub use source::{
     AdjacencyProof, EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics,
-    FragmentCoverage, FragmentStat, FullTextCoverage, IndexFact, IndexKind, IndexSplitFuture,
-    MemorySource, NodeTypeSpec, PlanSource, SideId, btree_covers_column,
+    FragmentCoverage, FragmentStat, IndexFact, IndexKind, IndexSplitFuture, MemorySource,
+    NodeTypeSpec, PlanSource, QueryWork, SideId, btree_covers_column,
 };
 pub use validate::{
     AcceptInput, AcceptedBoundPlan, AcceptedPlan, Evidence, KeyIds, ReplayEnvelope, ReplayQuery,

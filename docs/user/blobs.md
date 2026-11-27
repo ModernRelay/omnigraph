@@ -37,7 +37,7 @@ Write mode determines ownership:
 
 - `load --mode overwrite` preserves an allowed external URI as an external
   reference;
-- incremental inserts, upserts, updates, append/merge loads, and branch merges
+- incremental inserts, upserts, replaces, updates, `insert`/`upsert`/`replace` loads, and branch merges
   that write entities copy allowed source bytes into graph-managed storage;
 - an existing external reference remains readable even when new external
   ingress is disabled, and exportable when it names its whole object (see
@@ -163,12 +163,41 @@ write takes its actor from the bearer token, and `--as` there only asserts it. A
 embedded or served, as a graph-commit precondition does. Each write is sent
 once: after an unknown outcome, read the cell before writing again.
 
+### Copying a Blob from a row
+
+A mutation assignment may read a Blob from its group's row, in `update`,
+`insert`, `upsert` and `replace`. Each row writes the cell its row names:
+
+```gq
+query copy_cover($from: String, $to: String) {
+  match { $f: Document, $t: Document } where $f.slug = $from and $t.slug = $to
+  update $t set { content: $f.content }
+}
+```
+
+The value may also be a branch of `if` or an argument of `coalesce`
+(`content: coalesce($f.content, $t.content)`), beside a Blob parameter or
+`null`; a node an `optional` matched nothing for gives null. A copied value is
+the source cell as the write's snapshot holds it, written as the write path
+writes a parameter of the same value: managed bytes are copied, a null cell
+writes null (refused on a non-nullable property), and an external reference to
+a whole object is written as its URI, so it needs the graph's external Blob
+policy to admit its source, and the incremental write copies the object's bytes
+into graph-managed storage. A stored reference to a byte range of an object is
+refused rather than widened to the whole object. The copied bytes count toward
+`write_max_bytes` before any is read, and rows of one statement that give one
+entity two different Blobs are refused (`E4`) without showing either.
+
+A String read from a row and assigned to a Blob property is the Blob's input
+spelling, as a String parameter is: `base64:` bytes or an external URI.
+
 ## Query behavior
 
 Blob properties are not ordinary `.gq` read values. They cannot be projected,
-filtered, ordered, or aggregated. Write them through load or mutation
-assignment, then read an individual Blob value through the dedicated CLI or
-HTTP surface.
+filtered, ordered, aggregated, bound by `let` or tested with `is null`
+(`T24`); the one place a `.gq` text reads a Blob is an assignment that copies
+it. Write them through load or mutation assignment, then read an individual
+Blob value through the dedicated CLI or HTTP surface.
 
 To replace or clear one value, use the CLI, HTTP or embedded writes in
 [Replacing one Blob value](#replacing-one-blob-value); each is an atomic graph
@@ -257,7 +286,7 @@ and retry.
 |---|---|---|
 | `write_max_bytes` decoded bytes | Each node or edge type in one load, in every mode, including `overwrite` | `decoded blob input bytes for <table>` |
 | `write_max_bytes` decoded bytes | One `base64:` value in an insert or update mutation; a statement's values add up across its Blob properties and an update's matched rows. A load reports its decoded bytes under the `for <table>` and `per operation` names | `decoded blob input bytes per operation` |
-| `write_max_bytes` row bytes per type and across all touched types | Incremental writes: `append` and `merge` loads, inserts and updates. Counts ordinary columns, Blob descriptors and Arrow bookkeeping; excludes logical Blob payload buffers | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation`, `keyed parsed entity bytes for <table>`, `keyed parsed entity bytes per operation` |
+| `write_max_bytes` row bytes per type and across all touched types | Incremental writes: `insert`, `upsert` and `replace` loads and statements, and updates. Counts ordinary columns, Blob descriptors and Arrow bookkeeping; excludes logical Blob payload buffers | `keyed write bytes for <table>`, `keyed entity bytes for <table>`, `retained keyed batch bytes per operation`, `keyed parsed entity bytes for <table>`, `keyed parsed entity bytes per operation` |
 | `write_max_bytes` logical Blob payload bytes | One incremental write across all types: inline payloads, copied external payloads and Blob values carried by updates or by a Blob put count together | `materialized blob payload bytes`, `decoded blob input bytes per operation` |
 | `write_max_bytes` bytes, inclusive | The bytes of one Blob put, embedded or the body of an HTTP `PUT`, checked before the write opens a table | `Blob write payload bytes` |
 | `write_max_bytes` Blob payload bytes | One branch merge that writes rows, across all types, managed and external bytes together | `materialized blob payload bytes` |

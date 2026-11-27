@@ -30,7 +30,7 @@ scope: next_step
 
 --- mutate
 query add_row() {
-    insert Person { name: "bob" }
+    replace Person { name: "bob" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -51,7 +51,7 @@ p.name: String
 
 --- mutate
 query add_another() {
-    insert Person { name: "carol" }
+    replace Person { name: "carol" }
 }
 
 --- expect affected: nodes=1 edges=0

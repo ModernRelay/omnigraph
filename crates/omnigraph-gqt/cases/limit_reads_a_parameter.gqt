@@ -1,0 +1,113 @@
+# issue: none
+# notes: `limit $k` is the core's `Cut` with a count bound at execution: the
+# notes: first `$k` rows of the read's order (the tie rule's without one),
+# notes: `0` returning none and a count past the rows returning every row. A
+# notes: negative or null count is refused before the read runs.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32?
+}
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":36}}
+{"type":"Person","data":{"handle":"bob","age":25}}
+{"type":"Person","data":{"handle":"cy","age":41}}
+{"type":"Person","data":{"handle":"dee","age":19}}
+
+--- query
+query oldest($k: I64) {
+    match { $p: Person }
+    return { $p.handle, $p.age }
+    order { $p.age desc }
+    limit $k
+}
+
+--- params
+{"k": 2}
+
+--- expect ordered
+{"p.age":41,"p.handle":"cy"}
+{"p.age":36,"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+p.age: I32?
+
+--- query
+query oldest($k: I64) {
+    match { $p: Person }
+    return { $p.handle, $p.age }
+    order { $p.age desc }
+    limit $k
+}
+
+--- params
+{"k": 0}
+
+--- expect ordered
+
+--- expect shape
+p.handle: String
+p.age: I32?
+
+--- query
+query oldest($k: I64) {
+    match { $p: Person }
+    return { $p.handle, $p.age }
+    order { $p.age desc }
+    limit $k
+}
+
+--- params
+{"k": 10}
+
+--- expect ordered
+{"p.age":41,"p.handle":"cy"}
+{"p.age":36,"p.handle":"ada"}
+{"p.age":25,"p.handle":"bob"}
+{"p.age":19,"p.handle":"dee"}
+
+--- expect shape
+p.handle: String
+p.age: I32?
+
+--- query
+query some($k: I32) {
+    match { $p: Person }
+    where $p.age > 20
+    return { $p.handle }
+    limit $k
+}
+
+--- params
+{"k": 2}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query oldest($k: I64) {
+    match { $p: Person }
+    return { $p.handle }
+    order { $p.age desc }
+    limit $k
+}
+
+--- params
+{"k": -1}
+
+--- expect error: must be bound to a non-negative integer

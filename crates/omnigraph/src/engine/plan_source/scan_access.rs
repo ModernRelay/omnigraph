@@ -46,13 +46,14 @@ pub(super) async fn index_split(source: &QuerySource<'_>, spec: &ScanSpec) -> Re
         columns.as_ref(),
     )?;
     let (plan, filter) = read.plan_with_filter().await?;
-    inspect(&plan, &dataset, filter).await
+    inspect(&plan, &dataset, filter, read.recheck()).await
 }
 
 fn mirror(expr: &ScalarIndexExpr) -> IndexQuery {
     match expr {
         ScalarIndexExpr::Query(search) => IndexQuery::Search {
             index: search.index_name.clone(),
+            family: index_family_name(&search.index_type),
             column: search.column.clone(),
             search: search.query.format(&search.column),
         },
@@ -67,6 +68,18 @@ fn mirror(expr: &ScalarIndexExpr) -> IndexQuery {
         ScalarIndexExpr::Not(input) => IndexQuery::Not {
             input: Box::new(mirror(input)),
         },
+    }
+}
+
+/// The family name a probe records for Lance's index type name: the
+/// families the engine builds by their schema names, any other in lower case.
+fn index_family_name(index_type: &str) -> String {
+    match index_type {
+        "BTree" => "btree".to_string(),
+        "Bitmap" => "bitmap".to_string(),
+        "LabelList" => "label_list".to_string(),
+        "NGram" => "ngram".to_string(),
+        other => other.to_ascii_lowercase(),
     }
 }
 
@@ -114,9 +127,10 @@ pub(super) async fn inspect(
     plan: &Arc<dyn ExecutionPlan>,
     dataset: &Dataset,
     filter: Option<Expr>,
+    recheck: Option<&Expr>,
 ) -> Result<ScanAccess> {
-    if let Some(filter) = &filter {
-        if !immutable(filter)? {
+    for expr in filter.iter().chain(recheck) {
+        if !immutable(expr)? {
             return Ok(ScanAccess::Runtime {
                 input: RuntimeInput::DynamicExpression,
             });
@@ -145,6 +159,8 @@ pub(super) async fn inspect(
                 ));
             }
             residuals.extend(covered_residual);
+            // Conjuncts an identity probe leaves to a recheck above Lance.
+            residuals.extend(recheck.cloned());
             let residuals: BTreeSet<_> = residuals.iter().map(|expr| format!("({expr})")).collect();
             let residual = (!residuals.is_empty())
                 .then(|| residuals.into_iter().collect::<Vec<_>>().join(" AND "));

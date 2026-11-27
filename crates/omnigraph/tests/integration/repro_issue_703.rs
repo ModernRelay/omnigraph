@@ -1,6 +1,6 @@
 //! Overflow geometry for unused Expand destination payloads. The always-on
-//! memory owner is engine_v2_memory.rs; result coverage is
-//! omnigraph-gqt/cases/v2/planner/issue_703_expand_destination_projection.gqt.
+//! memory owner is execution_memory.rs; result coverage is
+//! omnigraph-gqt/cases/planner/issue_703_expand_destination_projection.gqt.
 
 use crate::helpers;
 

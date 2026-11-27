@@ -315,26 +315,26 @@ work and response bodies before deletion. Other graphs continue serving. If
 deletion is interrupted, reconcile the original deployment ID; the recorded
 operation resumes removal of the exact root. Editing the desired configuration
 does not cancel accepted deletion, and absence during recovery does not create a
-replacement graph.
-
-Importing an existing root, recreating a missing managed graph, accepting schema
-drift and repairing catalog payloads are not apply modes. Restore missing or
-damaged authoritative data from a verified backup before deploying changes to
-that graph.
+replacement graph. Importing an existing root, recreating a missing managed
+graph, accepting schema drift and repairing catalog payloads are not apply
+modes: restore missing or damaged data from a verified backup first.
 
 Every present affected root is checked against its achieved schema identity,
-even when source text changes. Removing an already-absent graph still records a
-completed deletion; it never recreates the root. An out-of-band replacement or schema change refuses with
-`applied_schema_drift`; matching text cannot authorize a different graph identity.
+even when source text changes. A text-only edit (a comment, layout, an explicit
+`distance = "l2"`) keeps it: `cluster plan` marks it `text_only`, apply makes no
+graph commit, and `omnigraph schema show` still shows the accepted source.
+Removing an absent graph records a completed deletion and never recreates the
+root. An out-of-band replacement or schema change refuses with
+`applied_schema_drift`; matching text cannot authorize a different identity.
 
 Plan always observes without taking the cluster writer lock. It reports the
-existing owner and runs the same effect-free preparation used by apply, with
-the intended actor. Its migration steps come from that preparation, not a second
+existing owner and runs the same effect-free preparation used by apply, with the
+intended actor. Its migration steps come from that preparation, not a second
 schema-file read. Apply prepares again under writer admission because a preview
 reserves nothing. Unavailable affected graphs, schema drift and migration
-restrictions are errors, except that deletion accepts an already-absent root. An unavailable unrelated graph does not block an
-independent change. Live apply also validates provider secrets and serving
-settings on the server.
+restrictions are errors, except that deletion accepts an already-absent root. An
+unavailable unrelated graph does not block an independent change. Live apply
+also validates provider secrets and serving settings on the server.
 
 ## Operational boundaries
 

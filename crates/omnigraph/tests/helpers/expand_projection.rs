@@ -8,7 +8,7 @@ use omnigraph::instrumentation::{
 };
 use omnigraph::loader::LoadMode;
 
-use super::{Session, params, query_main, session, with_setting};
+use super::{Session, params, query_main, session};
 
 const SCHEMA: &str = r#"
 node Segment {
@@ -24,13 +24,13 @@ edge SegmentOf: Segment -> Artifact
 
 const QUERIES: &str = r#"
 query segment_counts() {
-    match { $s: Segment $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t }
     return { $t.slug, count($s) as segments }
     order { segments desc }
     limit 10
 }
 query requested_payload() {
-    match { $s: Segment $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t }
     return { $t.content }
 }
 "#;
@@ -59,12 +59,12 @@ pub async fn fixture(dir: &tempfile::TempDir, sources: usize, payload_bytes: usi
                     .to_string(),
             );
         }
-        db.load_jsonl(&lines.join("\n"), LoadMode::Append)
+        db.load_jsonl(&lines.join("\n"), LoadMode::Insert)
             .await
             .unwrap();
     }
     db.ensure_indices_as(None).await.unwrap();
-    with_setting(&db, "engine", "v2")
+    db.clone()
 }
 
 fn assert_released(probes: &QueryMemoryProbes) {

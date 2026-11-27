@@ -32,8 +32,8 @@ branch create source;
 
 --- mutate branch: source
 query insert_source($payload: Blob) {
-    insert Doc { slug: "d", content: $payload, note: "source" }
-    insert Image { slug: "i", content: $payload }
+    replace Doc { slug: "d", content: $payload, note: "source" }
+    replace Image { slug: "i", content: $payload }
 }
 
 --- params
@@ -43,8 +43,8 @@ query insert_source($payload: Blob) {
 
 --- mutate
 query diverge_main() {
-    insert Doc { slug: "target", note: "target" }
-    insert Image { slug: "target-image" }
+    replace Doc { slug: "target", note: "target" }
+    replace Image { slug: "target-image" }
 }
 
 --- expect affected: nodes=2 edges=0

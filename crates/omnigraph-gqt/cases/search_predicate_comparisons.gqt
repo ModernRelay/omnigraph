@@ -1,0 +1,120 @@
+# issue: none
+# notes: A full-text call is a Boolean operand like any other: compared with `false`, `true` or a
+# notes: parameter, on either side of the comparison, it is the row's membership in the call's
+# notes: matches, true for `d` and false for `e`; the call standing alone joined by `and` is the
+# notes: membership the scan answers.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index(fulltext, analyzer = "standard_folded_v1")
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d","text":"needle"}}
+{"type":"Doc","data":{"slug":"e","text":"haystack"}}
+
+--- query
+query compared_with_false() {
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) = false
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query not_equal_to_true() {
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) != true
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query less_than_true() {
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) < true
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query compared_with_a_parameter($enabled: Bool) {
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) = $enabled
+    return { $d.slug }
+}
+
+--- params
+{"enabled":true}
+
+--- expect unordered
+{"d.slug": "d"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query true_compared_with_it() {
+    match { $d: Doc } where true = match_terms($d.text, terms("needle", mode: any))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query match_text_compared_with_false() {
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) = false
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query fuzzy_compared_with_false() {
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any, max_edits: 2)) = false
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query accepted_joined_by_and() {
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any)) and $d.slug = "d"
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d"}
+
+--- expect shape
+d.slug: String

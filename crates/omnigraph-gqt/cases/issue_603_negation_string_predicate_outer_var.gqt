@@ -22,10 +22,8 @@ node Person {
 
 --- query
 query not_prefixed() {
-    match {
-        $p: Person
-        not { $p.name starts_with "a" }
-    }
+    match { $p: Person }
+    where not (starts_with($p.name, "a"))
     return { $p.name }
 }
 

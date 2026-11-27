@@ -559,14 +559,16 @@ async fn bound_pairs_size_a_list_property_by_its_own_elements_issue_1251() {
     );
 }
 
-/// A bound frontier holds nodes, whose ids are never null, so a null
-/// source id is an integrity fault: the pairs refuse it instead of dropping
-/// the row, and emit nothing.
+/// A null source id is a node an `optional` left null on a row with no
+/// match: it reaches nothing, so its row takes no pair and the rows beside
+/// it expand as before (`Expand` over a null reference).
 #[tokio::test]
-async fn bound_pairs_refuse_a_null_source_id() {
+async fn bound_pairs_drop_a_null_source_id() {
+    let mut rows = people();
+    rows.push(serde_json::json!({"edge":"Knows","from":"a","to":"b"}));
     let (_dir, env) = graph_environment_for(
         "node Person { name: String @key }\nedge Knows: Person -> Person",
-        people(),
+        rows,
     )
     .await;
     let ctx = QueryContext::new(64 * 1024 * 1024).unwrap();
@@ -583,11 +585,11 @@ async fn bound_pairs_refuse_a_null_source_id() {
             DataType::Utf8,
             true,
         )])),
-        vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
+        vec![Arc::new(StringArray::from(vec![None, Some("a"), None]))],
     )
     .unwrap();
-    let mut emitted = 0;
-    let error = produce_bound_edge_pairs(
+    let mut pairs = Vec::new();
+    produce_bound_edge_pairs(
         &wide,
         &env.snapshot,
         &env.catalog,
@@ -596,13 +598,24 @@ async fn bound_pairs_refuse_a_null_source_id() {
         None,
         &schema,
         &memory,
-        |_batch, _lease| {
-            emitted += 1;
+        |batch, _lease| {
+            let rows = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::UInt32Array>()
+                .unwrap();
+            let destinations = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                pairs.push((rows.value(row), destinations.value(row).to_owned()));
+            }
             std::future::ready(Ok(()))
         },
     )
     .await
-    .unwrap_err();
-    assert!(error.to_string().contains("null 'p.__id'"), "{error}");
-    assert_eq!(emitted, 0);
+    .unwrap();
+    assert_eq!(pairs, [(1, "b".to_string())]);
 }

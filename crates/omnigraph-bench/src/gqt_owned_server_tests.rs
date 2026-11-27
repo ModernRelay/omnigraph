@@ -33,7 +33,7 @@ warmup_seconds: 0
 duration_seconds: 2
 
 --- concurrent measured
-writer x2: load generate: v1 seed: 42 mode: append
+writer x2: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -42,13 +42,13 @@ writer x2: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 5}
         n: {kind: ordinal, start: 1000, step: 1}
-reader: query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.n } }
+reader: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.n } }
 --- expect
 writer: ok
 reader: ok
 
 --- query branch: main
-query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.slug, $c.n } }
+query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.slug, $c.n } }
 --- expect unordered
 {"c.slug":"seed-07","c.n":7}
 --- expect shape
@@ -315,25 +315,29 @@ impl Graph {
     }
 }
 
-/// The rows of `match { $v: Table [{ column: literal }] } return { ... }`,
+/// The rows of `match { $v: Table } [where $v.column = literal] return { ... }`,
 /// the one shape the provisioning count, the readback and these workloads
 /// ask: `count($v) as n`, or `$v.column` projections named `v.column`.
 fn select(rows: &BTreeMap<String, Vec<Value>>, source: &str) -> Result<Vec<Value>, String> {
     let shape = || format!("the stand-in does not answer `{source}`");
     let (_, rest) = source.split_once("match {").ok_or_else(shape)?;
     let (pattern, returned) = rest.split_once("return {").ok_or_else(shape)?;
-    let pattern = pattern.trim().strip_suffix('}').ok_or_else(shape)?;
-    let (variable, node) = pattern.split_once(':').ok_or_else(shape)?;
-    let variable = variable.trim().trim_start_matches('$');
-    let (table, filter) = match node.split_once('{') {
-        Some((table, filter)) => (table, Some(filter.trim().trim_end_matches('}'))),
-        None => (node, None),
+    let (pattern, condition) = match pattern.split_once(" where ") {
+        Some((pattern, condition)) => (pattern, Some(condition.trim())),
+        None => (pattern, None),
     };
-    let filter = filter
-        .map(|filter| {
-            let (column, literal) = filter.split_once(':').ok_or_else(shape)?;
+    let pattern = pattern.trim().strip_suffix('}').ok_or_else(shape)?;
+    let (variable, table) = pattern.split_once(':').ok_or_else(shape)?;
+    let variable = variable.trim().trim_start_matches('$');
+    let filter = condition
+        .map(|condition| {
+            let (column, literal) = condition.split_once('=').ok_or_else(shape)?;
+            let column = column
+                .trim()
+                .strip_prefix(&format!("${variable}."))
+                .ok_or_else(shape)?;
             let literal: Value = serde_json::from_str(literal.trim()).map_err(|_| shape())?;
-            Ok::<_, String>((column.trim().to_string(), literal))
+            Ok::<_, String>((column.to_string(), literal))
         })
         .transpose()?;
     let matched: Vec<&Value> = rows
@@ -523,7 +527,8 @@ async fn repetition(script: impl FnOnce(&mut Graph)) -> Repetition {
 }
 
 /// A mutation that leaves the seeded row it names as the fixture wrote it.
-const TOUCH: &str = r#"query touch() { update Chunk set { n: 7 } where slug = "seed-07" }"#;
+const TOUCH: &str =
+    r#"query touch() { match { $c: Chunk } where $c.slug = "seed-07" update $c set { n: 7 } }"#;
 
 const FOLD: &str = "branch merge side into main";
 
@@ -1922,7 +1927,7 @@ warmup_seconds: 0
 duration_seconds: 2
 
 --- concurrent measured
-writer x2: load generate: v1 seed: 42 mode: append
+writer x2: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -1931,8 +1936,8 @@ writer x2: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 5}
         n: {kind: ordinal, start: 1000, step: 1}
-reader: query seeded_row() { match { $c: Chunk { slug: "seed-07" } } return { $c.n } }
-toucher: query touch() { update Chunk set { n: 300 } where slug = "seed-03" }
+reader: query seeded_row() { match { $c: Chunk } where $c.slug = "seed-07" return { $c.n } }
+toucher: query touch() { match { $c: Chunk } where $c.slug = "seed-03" update $c set { n: 300 } }
 folder: branch merge side0 into main
 --- expect
 writer: ok
@@ -1941,7 +1946,7 @@ toucher: ok
 folder: ok
 
 --- query branch: main
-query touched() { match { $c: Chunk { slug: "seed-03" } } return { $c.slug, $c.n } }
+query touched() { match { $c: Chunk } where $c.slug = "seed-03" return { $c.slug, $c.n } }
 --- expect unordered
 {"c.slug":"seed-03","c.n":300}
 --- expect shape
@@ -1949,7 +1954,7 @@ c.slug: String
 c.n: I64
 
 --- query branch: main
-query folded() { match { $c: Chunk { slug: "side0-000" } } return { $c.slug, $c.n } }
+query folded() { match { $c: Chunk } where $c.slug = "side0-000" return { $c.slug, $c.n } }
 --- expect unordered
 {"c.slug":"side0-000","c.n":100}
 --- expect shape

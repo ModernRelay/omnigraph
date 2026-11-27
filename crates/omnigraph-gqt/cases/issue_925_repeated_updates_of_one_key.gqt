@@ -1,0 +1,122 @@
+# issue: 925
+# red_on: 574a0531dd0177277d751eda9df15e97d08a4099: the third update of one key fails with `@unique violation on Person.name: value 'a' held by 'a' and 'a'`; a later update matches the row's older version and stores a lost update; a keyless row updated four times counts eight.
+# notes: Within one group, each statement sees the current version of every row the statements before it wrote, never an older one, and whole-write validation checks the final state once.
+# notes: Every group of a write selects on the write's one snapshot, so the issue's later groups re-selecting the rows an earlier group updated are refused (`T91`); its repeated updates are written as several statements over one group's selection.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32?
+    score: F64?
+    flag: Bool?
+}
+
+node Item {
+    label: String
+    n: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","age":30}}
+{"type":"Item","data":{"label":"x","n":0}}
+
+--- mutate
+query score_three_times() {
+    match { $p: Person } where $p.name = "a"
+    update $p set { score: 1.0 }
+    update $p set { score: 2.0 }
+    update $p set { score: 3.0 }
+}
+--- expect affected: nodes=3 edges=0
+
+--- query
+query person_a() { match { $p: Person } where $p.name = "a" return { $p.name, $p.score } }
+--- expect unordered
+{"p.name":"a","p.score":3.0}
+--- expect shape
+p.name: String
+p.score: F64?
+
+--- mutate
+query insert_then_upsert_twice() {
+    replace Person { name: "b", age: 1 }
+    replace Person { name: "b", age: 2 }
+    replace Person { name: "b", age: 3 }
+}
+--- expect affected: nodes=3 edges=0
+
+--- query
+query person_b() { match { $p: Person } where $p.name = "b" return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"b","p.age":3}
+--- expect shape
+p.name: String
+p.age: I32?
+
+--- mutate
+query no_lost_update() {
+    match { $p: Person } where $p.name = "a"
+    update $p set { age: 35 }
+    match { $p: Person } where $p.name = "a"
+    update $p set { age: 20 }
+    match { $p: Person } where $p.age > 30
+    update $p set { flag: true }
+}
+--- expect error: T91: `no_lost_update`: group 2 selects on type `Person`, which an earlier group of the write changes
+
+--- mutate
+query age_twice() {
+    match { $p: Person } where $p.name = "a"
+    update $p set { age: 35 }
+    update $p set { age: 20 }
+}
+--- expect affected: nodes=2 edges=0
+
+--- query
+query person_a_after() { match { $p: Person } where $p.name = "a" return { $p.name, $p.age, $p.flag, $p.score } }
+--- expect unordered
+{"p.name":"a","p.age":20,"p.score":3.0}
+--- expect shape
+p.name: String
+p.age: I32?
+p.flag: Bool?
+p.score: F64?
+
+--- mutate
+query bump_keyless_four_times() {
+    match { $i: Item } where $i.label = "x"
+    update $i set { n: 1 }
+    update $i set { n: 2 }
+    update $i set { n: 3 }
+    update $i set { n: 4 }
+}
+--- expect affected: nodes=4 edges=0
+
+--- query
+query items() { match { $i: Item } return { $i.label, $i.n } }
+--- expect unordered
+{"i.label":"x","i.n":4}
+--- expect shape
+i.label: String
+i.n: I32
+
+--- query
+query people() { match { $p: Person } return { $p.name, $p.age, $p.score } order { $p.name } }
+--- expect ordered
+{"p.name":"a","p.age":20,"p.score":3.0}
+{"p.name":"b","p.age":3}
+--- expect shape
+p.name: String
+p.age: I32?
+p.score: F64?

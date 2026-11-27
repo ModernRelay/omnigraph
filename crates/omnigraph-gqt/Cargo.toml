@@ -17,11 +17,11 @@ omnigraph-gqt-core = { path = "../omnigraph-gqt-core", version = "0.17.2" }
 async-trait = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
-# `test-util` is `Session::with_read_executor`, the seam `expect same as v1`
-# installs the reference engine through; GQT is its one regular enabler.
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.17.2", features = ["test-util"] }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.17.2" }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.17.2" }
-omnigraph-reference-engine = { path = "../omnigraph-reference-engine" }
+# The core reference interpreter every read step on the direct engine is
+# compared with; GQT is its one caller.
+omnigraph-reference = { path = "../omnigraph-reference" }
 serde_json = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
@@ -36,12 +36,22 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 datatest-stable = "0.3"
+# The generated laws (tests/integration/law_*.rs) draw from the compiler's
+# shared generators.
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.17.2", features = ["test-util"] }
+proptest = "1"
+regex = { workspace = true }
 # tests/runner_dispatch.rs lists an `s3://` base's objects through the storage crate's test helper.
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.17.2", features = ["test-util"] }
 
 # One libtest test per `cases/**/*.gqt`; mechanism and flags: tests/gq_logic_tests.rs.
 [[test]]
 name = "gq_logic_tests"
+harness = false
+
+# Every direct-engine case under each physical layout; tests/gq_layout_tests.rs.
+[[test]]
+name = "gq_layout_tests"
 harness = false
 
 [lints]

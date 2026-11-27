@@ -32,7 +32,7 @@ tables:
       id: {kind: key, prefix: p, width: 6}
 
 --- mutate
-query ins() { insert Knows { from: "p000000", to: "p000001" } }
+query ins() { insert Knows { @src: "p000000", @dst: "p000001" } }
 --- expect affected: nodes=0 edges=1
 --- expect plan
 load route: pipeline
@@ -40,7 +40,7 @@ load validate edge_ri edge:Knows from Person: access probe
 load validate edge_ri edge:Knows to Person: access probe
 
 --- query
-query loaded() { match { $a: Person $a knows $b } return { count($b) as n } }
+query loaded() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n": 1}
 --- expect shape

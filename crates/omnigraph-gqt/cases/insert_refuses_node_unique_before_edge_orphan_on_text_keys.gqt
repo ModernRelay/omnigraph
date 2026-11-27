@@ -33,7 +33,7 @@ tables:
 
 --- mutate
 query w() {
-    insert Person { id: "n000000", email: "e000003" }
-    insert Knows { from: "p000000", to: "zz0002" }
+    replace Person { id: "n000000", email: "e000003" }
+    insert Knows { @src: "p000000", @dst: "zz0002" }
 }
 --- expect error: @unique violation on Person.email: value 'e000003' held by 'p000003' and 'n000000'

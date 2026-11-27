@@ -202,7 +202,7 @@ async fn compaction_peak_allocation_on_blob_tables() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         load_rows(&db, rows, mode).await;
         if load % 4 == 3 {
@@ -262,7 +262,7 @@ async fn schema_apply_peak(rows: usize) -> usize {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         load_rows(&db, start..(start + 16).min(rows), mode).await;
     }
@@ -347,7 +347,7 @@ async fn dropped_blob_erasure_peak_allocation_is_within_the_compaction_bound() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load_jsonl(&lines.join("\n"), mode).await.unwrap();
     }

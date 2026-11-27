@@ -31,7 +31,7 @@ with no `continue-on-error`, its `needs:` equals the job table in
 `scripts/ci_gate.py`, every needed job uses a block mapping without
 `continue-on-error`, and its
 steps are exactly a pinned unconditional checkout and an unconditional
-`python3 scripts/ci_gate.py` step with explicit `shell: bash` and the four
+`python3 scripts/ci_gate.py` step with explicit `shell: bash` and the five
 expected `env:` values;
 and `workflow_action_pins`, the job that runs this check, has no condition, no
 dependencies and no error suppression, and runs this script and the gate's
@@ -70,6 +70,7 @@ GATE_ENV = {
     "EVENT_NAME": "${{ github.event_name }}",
     "EVENT_REF": "${{ github.ref }}",
     "RUN_FULL_CI": "${{ needs.classify_changes.outputs.run_full_ci }}",
+    "RUN_GQT": "${{ needs.classify_changes.outputs.run_gqt }}",
 }
 VALIDATOR_COMMANDS = ("python3 scripts/check-merge-group-triggers.py", "python3 scripts/ci_gate.py --self-test")
 PINNED_CHECKOUT = re.compile(r"^actions/checkout@[0-9a-f]{40}$")
@@ -614,6 +615,7 @@ jobs:
           EVENT_NAME: ${{{{ github.event_name }}}}
           EVENT_REF: ${{{{ github.ref }}}}
           RUN_FULL_CI: ${{{{ needs.classify_changes.outputs.run_full_ci }}}}
+          RUN_GQT: ${{{{ needs.classify_changes.outputs.run_gqt }}}}
         run: python3 scripts/ci_gate.py
 """
 GATE_GQ = "on:\n  pull_request:\n  merge_group:\njobs:\n  gq_logic_tests:\n    name: GQ Logic Tests\n    if: always()\n    runs-on: u\n"
@@ -688,12 +690,13 @@ def self_test_gate() -> None:
     refused("the verdict step carries if", gate("        run: python3 scripts/ci_gate.py\n", "        if: github.event_name == 'pull_request'\n        run: python3 scripts/ci_gate.py\n"))
     refused("the verdict step carries continue-on-error", gate("        run: python3 scripts/ci_gate.py\n", "        continue-on-error: true\n        run: python3 scripts/ci_gate.py\n"))
     refused("exactly two steps", gate("      - name: Judge the blocking jobs\n", "      - name: Noop\n        run: true\n      - name: Judge the blocking jobs\n"))
-    refused("exactly two steps", gate("\n      - name: Judge the blocking jobs\n        shell: bash\n        env:\n          NEEDS_JSON: ${{ toJSON(needs) }}\n          EVENT_NAME: ${{ github.event_name }}\n          EVENT_REF: ${{ github.ref }}\n          RUN_FULL_CI: ${{ needs.classify_changes.outputs.run_full_ci }}\n        run: python3 scripts/ci_gate.py\n", ""))
+    refused("exactly two steps", gate("\n      - name: Judge the blocking jobs\n        shell: bash\n        env:\n          NEEDS_JSON: ${{ toJSON(needs) }}\n          EVENT_NAME: ${{ github.event_name }}\n          EVENT_REF: ${{ github.ref }}\n          RUN_FULL_CI: ${{ needs.classify_changes.outputs.run_full_ci }}\n          RUN_GQT: ${{ needs.classify_changes.outputs.run_gqt }}\n        run: python3 scripts/ci_gate.py\n", ""))
     refused("must run exactly 'python3 scripts/ci_gate.py'", gate("        run: python3 scripts/ci_gate.py\n", "        run: python3 scripts/ci_gate.py --lenient\n"))
     refused("must run exactly 'python3 scripts/ci_gate.py'", gate("        run: python3 scripts/ci_gate.py\n", "        run: |\n          python3 scripts/ci_gate.py || true\n"))
     refused("must run exactly 'python3 scripts/ci_gate.py'", gate("        run: python3 scripts/ci_gate.py\n", "        run: true\n"))
     refused("verdict env must be exactly", gate("          RUN_FULL_CI: ${{ needs.classify_changes.outputs.run_full_ci }}\n", "          RUN_FULL_CI: 'false'\n"))
     refused("verdict env must be exactly", gate("          RUN_FULL_CI: ${{ needs.classify_changes.outputs.run_full_ci }}\n", ""))
+    refused("verdict env must be exactly", gate("          RUN_GQT: ${{ needs.classify_changes.outputs.run_gqt }}\n", ""))
     refused("verdict env must be exactly", gate("          EVENT_REF: ${{ github.ref }}\n", "          EVENT_REF: ${{ github.ref }}\n          EXTRA: x\n"))
     refused("verdict env must be exactly", gate("          NEEDS_JSON: ${{ toJSON(needs) }}\n", "          NEEDS_JSON: '{}'\n"))
     refused("first step must be a SHA-pinned actions/checkout", gate(f"        uses: actions/checkout@{SHA} # v5.0.1\n", "        uses: actions/checkout@v5\n"))

@@ -1,0 +1,126 @@
+# issue: none
+# notes: A full-text index without `analyzer` takes `english_v1` (the GQ 3 RFC,
+# notes: section 4, Schema), so `Doc.body`, declared `@index(fulltext)`, is analyzed exactly as
+# notes: `Doc.english`, declared with the profile: the same rows for every query, with no index read.
+# notes: The profile stems before it removes stop words, and its stop list holds each of NLTK's 198
+# notes: English stop words and its stem, so a query of `only` or `very` (stems `onli`, `veri`) has
+# notes: no searchable term and matches nothing, never refused at run time, while "human beings" analyzes to
+# notes: `human` (`being` stems to the stop word `be`). There is no token-length filter, so the
+# notes: 45-letter word matches. The edit relation holds on every full-text field: `grph` is one
+# notes: edit from `graph`. `bm25` is `bm25_v1`'s `F64` over the field corpus, and every term is
+# notes: required under `terms(q)`. The reference interpreter has no stemmer, so these steps have
+# notes: no reference comparison.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    body: String @index(fulltext)
+    english: String @index(fulltext, analyzer = "english_v1")
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","body":"Human beings run graph engines","english":"Human beings run graph engines"}}
+{"type":"Doc","data":{"slug":"d2","body":"only the very graph","english":"only the very graph"}}
+{"type":"Doc","data":{"slug":"d3","body":"pneumonoultramicroscopicsilicovolcanoconiosis","english":"pneumonoultramicroscopicsilicovolcanoconiosis"}}
+
+--- query
+query hits($q: String) {
+    match { $d: Doc }
+    where match_terms($d.body, terms($q, mode: any))
+    return { $d.slug }
+}
+
+--- params
+{"q": "only very"}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits($q: String) {
+    match { $d: Doc }
+    where match_terms($d.body, terms($q, mode: any))
+    return { $d.slug }
+}
+
+--- params
+{"q": "human beings"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits($q: String) {
+    match { $d: Doc }
+    where match_terms($d.body, terms($q, mode: any))
+    return { $d.slug }
+}
+
+--- params
+{"q": "pneumonoultramicroscopicsilicovolcanoconiosis"}
+
+--- expect unordered
+{"d.slug": "d3"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query edits($q: String) {
+    match { $d: Doc }
+    where match_terms($d.body, terms($q, mode: any, max_edits: 1))
+    return { $d.slug }
+}
+
+--- params
+{"q": "grph"}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query same_as_declared($q: String) {
+    match { $d: Doc }
+    where match_terms($d.body, terms($q, mode: any)) != match_terms($d.english, terms($q, mode: any))
+    return { $d.slug }
+}
+
+--- params
+{"q": "running engine humans"}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- query
+query ranked($q: String) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($q)) as $score }
+    return { $d.slug, $score }
+    order { $score desc, $d.slug }
+}
+
+--- params
+{"q": "graph engine"}
+
+--- expect ordered
+{"d.slug":"d1","score":1.029623335796}
+
+--- expect shape
+d.slug: String
+score: F64

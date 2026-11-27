@@ -74,7 +74,9 @@ use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{BranchStartRefusal, ManifestConflictDetails, ManifestErrorKind, OmniError};
+use omnigraph::error::{
+    BranchStartRefusal, KEY_CONFLICT_FIX, ManifestConflictDetails, ManifestErrorKind, OmniError,
+};
 use omnigraph::storage::normalize_root_uri;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::json_params_to_param_map;
@@ -553,7 +555,6 @@ enum ApiErrorDetails {
     ChangeDiffRefusal(api::ChangeDiffRefusalOutput),
     BranchStartRefusal(api::BranchStartRefusalOutput),
     FullTextIndexRebuildRequired(api::FullTextIndexRebuildRequiredOutput),
-    FullTextIndexRequired(api::FullTextIndexRequiredOutput),
     Diagnostic(api::DiagnosticOutput),
     /// Whether a 401 followed a presented bearer credential. The challenge
     /// layer renders it as `WWW-Authenticate`; the body carries nothing.
@@ -589,9 +590,9 @@ impl ApiErrorDetails {
             | Self::BranchStartRefusal(_)
             | Self::Diagnostic(_)
             | Self::Unauthenticated(_) => DetailClass::Refusal,
-            Self::RecoveryRequired(_)
-            | Self::FullTextIndexRebuildRequired(_)
-            | Self::FullTextIndexRequired(_) => DetailClass::Recovery,
+            Self::RecoveryRequired(_) | Self::FullTextIndexRebuildRequired(_) => {
+                DetailClass::Recovery
+            }
             Self::BlobRange(_) | Self::ChangeFeedGap(_) | Self::ChangeDiffRefusal(_) => {
                 DetailClass::Read
             }
@@ -1173,7 +1174,8 @@ impl AppState {
 
 /// Refuse request settings that raise a resource budget past this server's
 /// ceiling: the larger of its own value and the built-in default. A served
-/// request may lower `traversal_work_limit`, `query_memory_bytes`,
+/// request may lower `traversal_work_limit`, `read_work_limit`, `plan_budget_limit`,
+/// `query_memory_bytes`,
 /// `write_max_bytes` and `load_source_max_bytes`, or raise one back to the
 /// default an operator lowered it from; going further is the operator's
 /// decision, made through the process environment, since a raised budget is
@@ -1191,6 +1193,16 @@ pub(crate) fn refuse_raised_budgets(
             server
                 .traversal_work_limit()
                 .max(default.traversal_work_limit()),
+        ),
+        (
+            SettingId::ReadWorkLimit,
+            requested.read_work_limit(),
+            server.read_work_limit().max(default.read_work_limit()),
+        ),
+        (
+            SettingId::PlanBudgetLimit,
+            requested.plan_budget_limit(),
+            server.plan_budget_limit().max(default.plan_budget_limit()),
         ),
         (
             SettingId::QueryMemoryBytes,
@@ -1554,6 +1566,27 @@ impl ApiError {
             .with_details(ApiErrorDetails::BranchStartRefusal(details))
     }
 
+    /// HTTP 409 `stored_query_unavailable`: the stored query's source fails
+    /// to compile under this release, with the refusal its listing reports
+    /// as the `diagnostic` detail. Nothing ran.
+    pub(crate) fn stored_query_unavailable(query: &queries::UnavailableQuery) -> Self {
+        let mut response = Self::new(
+            ErrorCode::StoredQueryUnavailable,
+            format!(
+                "stored query '{}' is unavailable: its source fails to compile under this \
+                 release: {}",
+                query.name,
+                query.refusal()
+            ),
+        );
+        if let Some(diagnostic) = &query.diagnostic {
+            response.details = Some(Box::new(ApiErrorDetails::Diagnostic(
+                api::DiagnosticOutput::from(diagnostic),
+            )));
+        }
+        response
+    }
+
     /// A refused query: HTTP 400 with the one-line message, plus the
     /// compiler's structured diagnostic when the refusal carries one.
     fn from_compiler(err: &omnigraph_compiler::error::CompilerError) -> Self {
@@ -1824,16 +1857,6 @@ impl ApiError {
                 )));
                 response
             }
-            error @ OmniError::FullTextIndexRequired { .. } => {
-                let mut response = Self::conflict(error.to_string());
-                let OmniError::FullTextIndexRequired { index } = error else {
-                    unreachable!()
-                };
-                response.details = Some(Box::new(ApiErrorDetails::FullTextIndexRequired(
-                    api::FullTextIndexRequiredOutput { index },
-                )));
-                response
-            }
             // Caller-side continuation fault (decode, checksum, or scope). The
             // "change cursor rejected: " prefix is a stable contract so raw
             // HTTP clients can tell it from a genuine retention gap.
@@ -2077,8 +2100,8 @@ fn format_key_conflict(
 ) -> String {
     let subject = graph_type_subject(entity_kind, type_name);
     entity_id.map_or_else(
-        || format!("{subject} already has this id"),
-        |entity_id| format!("{subject} already has id '{entity_id}'"),
+        || format!("{subject} already has this id{KEY_CONFLICT_FIX}"),
+        |entity_id| format!("{subject} already has id '{entity_id}'{KEY_CONFLICT_FIX}"),
     )
 }
 
@@ -2188,9 +2211,6 @@ impl ApiError {
                 ApiErrorDetails::FullTextIndexRebuildRequired(value) => {
                     output.full_text_index_rebuild_required = Some(value)
                 }
-                ApiErrorDetails::FullTextIndexRequired(value) => {
-                    output.full_text_index_required = Some(value)
-                }
                 ApiErrorDetails::Diagnostic(value) => output.diagnostic = Some(value),
                 ApiErrorDetails::Unauthenticated(_) => {}
             }
@@ -2276,28 +2296,6 @@ mod api_error_tests {
         let ordinary: ErrorOutput = serde_json::from_slice(&body).unwrap();
         assert_eq!(ordinary.code, Some(ErrorCode::Conflict));
         assert!(ordinary.full_text_index_rebuild_required.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_full_text_index_with_no_segment_returns_required_conflict() {
-        let response = ApiError::from_omni(OmniError::FullTextIndexRequired {
-            index: "Doc.title".into(),
-        })
-        .into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 8192)
-            .await
-            .unwrap();
-        let error: ErrorOutput = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error.code, Some(ErrorCode::Conflict));
-        assert!(error.error.contains("has no segment"), "{}", error.error);
-        assert!(
-            error.error.contains("omnigraph index build"),
-            "{}",
-            error.error
-        );
-        assert_eq!(error.full_text_index_required.unwrap().index, "Doc.title");
-        assert!(error.full_text_index_rebuild_required.is_none());
     }
 
     #[tokio::test]
@@ -4033,13 +4031,31 @@ fn validate_registry_against_catalog(
 /// the single gate every open path funnels through, so no opener can
 /// attach a registry that has not been schema-checked. `label` names the
 /// graph in messages.
+///
+/// A per-query registry (the default) refuses nothing: each query that
+/// fails the check is withdrawn and held unavailable with its refusal, which
+/// is logged, so the graph stays served; a strict one refuses the graph.
 fn validate_and_attach(
-    queries: QueryRegistry,
+    mut queries: QueryRegistry,
     catalog: &Catalog,
     label: &str,
 ) -> Result<Option<Arc<QueryRegistry>>> {
-    validate_registry_against_catalog(&queries, catalog, label)
-        .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+    if queries.is_strict() {
+        validate_registry_against_catalog(&queries, catalog, label)
+            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+    } else {
+        let report = check(&queries, catalog);
+        queries.withdraw_breakages(&report);
+        log_registry_warnings(label, &report);
+    }
+    for unavailable in queries.unavailable() {
+        warn!(
+            graph = label,
+            query = %unavailable.name,
+            "stored query unavailable: {}",
+            unavailable.refusal()
+        );
+    }
     Ok(if queries.is_empty() {
         None
     } else {

@@ -27,6 +27,9 @@ fn case(path: &Path) -> datatest_stable::Result<()> {
         outcome.stem,
         outcome.elapsed.as_secs_f64()
     );
+    for note in &outcome.notes {
+        println!("  {note}");
+    }
     outcome.result.map_err(Into::into)
 }
 

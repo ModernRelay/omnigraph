@@ -77,8 +77,8 @@ every removed id, copied to each uncovered fragment, holds at most 8,192 ids
 per endpoint, every fragment gets the filter. Append and merge keep the
 consulted table, so their `edge_ri` and non-key `@unique` checks use `probe` only when every
 looked-up column carries a BTREE covering every fragment of that table (the
-`@key` column's own index, or an `@index` on an orderable scalar; an `@index`
-on a String is a full-text index and does not count) and `scan` otherwise, a
+`@key` column's own index, or an `@index` on an orderable scalar or a String,
+whose BTREE counts; a full-text index does not) and `scan` otherwise, a
 partly covered index included: an unindexed probe hands the store one filter
 of every key, copied per fragment for the whole read.
 
@@ -91,7 +91,7 @@ The `plan` rows are the query explain's, with these values for a load:
 |---|---|
 | `datafusion` | `unavailable`: a load's operators are lowered at execution, under the statement's transaction |
 | `route` | `engine` for overwrite, which runs the plan; `executor` for append and merge, which the plan describes while the keyed adapters run them (`reason` then says `mode_on_executor`) |
-| `explain_version` | the shared counter, `8` since a write's plan has the `DeltaSource` leaf |
+| `explain_version` | the shared counter, `9` since GQ 3's node kinds (`Fuse`, `TargetCut`, `Score`, `Let`, `Union`, `OptionalJoin`, `Correlate`; `TextSearch` removed) (`8` added a write's `DeltaSource` leaf) |
 | `operation` | `kind` (`load`), `mode`, and `tables`: the target and each consulted committed table with its `type_key` and `version` |
 
 ## A staged write's document
@@ -109,10 +109,10 @@ shows while the keyed adapters write. Such a document has two nodes:
 | `Validate` | as above: `table`, `checks` with each check's `access`, `removal` |
 | `DeltaSource` | `table`, `version` (the committed version the write pins, or `null` for a table new in the base), `rows` (the staged rows, exact), `delta` and `deletes` |
 
-`delta` is what the write does to the table's rows: `insert` (a strict
-insert, an append), `upsert` (a keyed upsert, a merge load, a staged
-mutation, a branch merge's effects), `replace` (an overwrite's whole new
-image) or `removal` (no rows: the write only removes ids). `deletes` says
+`delta` is what the write does to the table's rows: `insert` (an `insert`
+statement or load), `upsert` (an `upsert` or `replace` statement or load,
+whose rows reach the keyed upsert adapter whole, a staged mutation, a branch
+merge's effects), `replace` (an overwrite's whole new image) or `removal` (no rows: the write only removes ids). `deletes` says
 whether the write removes ids from the table (a `delete`, a branch merge's
 deletions); a removed node may strand committed edges, so a node table with
 `deletes` carries the `retained_edges` checks an overwrite carries, and an

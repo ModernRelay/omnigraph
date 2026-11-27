@@ -1,5 +1,5 @@
 # issue: none
-# notes: Seven text chunks, one artifact and three edges. Four high-ranked alpha decoys have no edge; complete BM25 rankings make x win. Auto RRF planning only; forced-plan process settings and isolated expression construction are not reproduced.
+# notes: Seven text chunks, one artifact and three edges. Four high-ranked alpha decoys have no edge; complete BM25 rankings make x win. Both arms are exact `bm25` scores over every chunk; the traversal after the fusion keeps x.
 
 --- runner
 timeout_ms: 60000
@@ -35,13 +35,15 @@ edge ChunkOfArtifact: Chunk -> Artifact
 --- query
 query recall_two_terms($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $a: Artifact
-        $c chunkOfArtifact $a
-        search($c.text, $q1)
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $a: Artifact,
+      $c chunkOfArtifact $a,
     }
+    where match_terms($c.text, terms($q1, mode: any))
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 1
 }
 
@@ -56,4 +58,4 @@ c.slug: String
 
 --- expect plan
 expand $c $a: selection named [ChunkOfArtifact out]
-rank fuse row tiebreak [$a.@id]
+fuse $c: arms [bm25, bm25]

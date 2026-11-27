@@ -1,0 +1,87 @@
+# issue: none
+# notes: A union arm reads the enclosing scope's `let` values and a grouped `from`'s
+# notes: value columns in place. Found by the generated engine-equals-reference law
+# notes: (law_engine_reference.rs).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node A {
+    k: String @key
+    p0: I64?
+}
+edge Rel0: A -> A
+
+--- seed
+{"type":"A","data":{"k":"a","p0":1}}
+{"type":"A","data":{"k":"b"}}
+{"edge":"Rel0","from":"a","to":"b"}
+
+--- query
+query q() { match { from { match { $g: A } return { $g.k as k2, count($g) as m3 } }, $n4: A, from union({ match { $n5: A, $n4 rel0 $n5 } where $m3 > 0 return { $n5 as u6 } }, { match { $n7: A } return { $n7 as u6 } }) } return { $m3 as c0, $u6.k as c1 } }
+
+--- expect unordered
+{"c0":1,"c1":"a"}
+{"c0":1,"c1":"a"}
+{"c0":1,"c1":"a"}
+{"c0":1,"c1":"a"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+
+--- expect shape
+c0: I64
+c1: String
+
+--- query
+query q() { match { from { match { $g: A } return { $g.k as k2, $g.p0 as m3 } }, $n4: A, from union({ match { $n5: A, $n4 rel0 $n5 } where $m3 > 0 return { $n5 as u6 } }, { match { $n7: A } return { $n7 as u6 } }) } return { $m3 as c0, $u6.k as c1 } }
+
+--- expect unordered
+{"c0":1,"c1":"a"}
+{"c0":1,"c1":"a"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+{"c1":"a"}
+{"c1":"a"}
+{"c1":"b"}
+{"c1":"b"}
+
+--- expect shape
+c0: I64?
+c1: String
+
+--- query
+query q() { match { $n4: A, let $m3 = 1, from union({ match { $n5: A, $n4 rel0 $n5 } where $m3 > 0 return { $n5 as u6 } }, { match { $n7: A } return { $n7 as u6 } }) } return { $m3 as c0, $u6.k as c1 } }
+
+--- expect unordered
+{"c0":1,"c1":"a"}
+{"c0":1,"c1":"a"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+
+--- expect shape
+c0: I64
+c1: String
+
+--- query
+query q() { match { $n4: A, let $m3 = count { $x: A, $n4 rel0 $x }, from union({ match { $n5: A, $n4 rel0 $n5 } where $m3 > 0 return { $n5 as u6 } }, { match { $n7: A } return { $n7 as u6 } }) } return { $m3 as c0, $u6.k as c1 } }
+
+--- expect unordered
+{"c0":0,"c1":"a"}
+{"c0":0,"c1":"b"}
+{"c0":1,"c1":"a"}
+{"c0":1,"c1":"b"}
+{"c0":1,"c1":"b"}
+
+--- expect shape
+c0: I64
+c1: String

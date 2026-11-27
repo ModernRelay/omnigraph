@@ -139,9 +139,13 @@ impl CatalogueType {
             key: Some(vec![self.key().to_string()]),
             unique_constraints: Vec::new(),
             indices: Vec::new(),
+            index_declarations: HashMap::new(),
             range_constraints: Vec::new(),
             check_constraints: Vec::new(),
             embed_sources: HashMap::new(),
+            full_text_analysis: HashMap::new(),
+            full_text_fingerprints: HashMap::new(),
+            vector_distances: HashMap::new(),
             blob_properties: Default::default(),
             arrow_schema: Arc::new(Schema::new(fields)),
         }

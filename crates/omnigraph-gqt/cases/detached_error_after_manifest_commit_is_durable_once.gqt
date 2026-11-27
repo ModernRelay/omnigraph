@@ -25,7 +25,7 @@ action: fail
 scope: next_step
 
 --- mutate
-query add_carol() { insert Person { name: "carol", age: 50 } }
+query add_carol() { replace Person { name: "carol", age: 50 } }
 --- expect error: injected failpoint triggered: graph_publish.after_manifest_commit
 
 --- query branch: main
@@ -39,7 +39,7 @@ p.name: String
 p.age: I64
 
 --- mutate
-query add_carol() { insert Person { name: "carol", age: 50 } }
+query add_carol() { replace Person { name: "carol", age: 50 } }
 --- expect affected: nodes=1 edges=0
 
 --- query branch: main
@@ -53,7 +53,7 @@ p.name: String
 p.age: I64
 
 --- mutate
-query older() { update Person set { age: 51 } where name = "carol" }
+query older() { match { $x: Person } where $x.name = "carol"  update $x set { age: 51 } }
 --- expect affected: nodes=1 edges=0
 
 --- restart

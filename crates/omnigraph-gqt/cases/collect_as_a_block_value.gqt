@@ -1,0 +1,51 @@
+# issue: none
+# notes: `collect($x.p) { … }` is a block value: per outer row, the list of the block's values,
+# notes: nulls skipped, in the fixed value order, and the empty list where the block has no row
+# notes: or only nulls, so the column is never null.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32?
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ann","age":40}}
+{"type":"Person","data":{"handle":"bob","age":30}}
+{"type":"Person","data":{"handle":"cid"}}
+{"type":"Person","data":{"handle":"dan","age":30}}
+{"edge":"Knows","from":"ann","to":"bob"}
+{"edge":"Knows","from":"ann","to":"cid"}
+{"edge":"Knows","from":"ann","to":"dan"}
+{"edge":"Knows","from":"bob","to":"cid"}
+
+--- query
+query friend_ages() {
+    match { $p: Person }
+    return {
+        $p.handle as handle,
+        collect($f.age) { $f: Person, $p knows $f } as ages,
+        collect($f.handle) { $f: Person, $p knows $f } as friends
+    }
+    order { handle }
+}
+
+--- expect ordered
+{"ages":[30,30],"friends":["bob","cid","dan"],"handle":"ann"}
+{"ages":[],"friends":["cid"],"handle":"bob"}
+{"ages":[],"friends":[],"handle":"cid"}
+{"ages":[],"friends":[],"handle":"dan"}
+
+--- expect shape
+handle: String
+ages: [I32]
+friends: [String]

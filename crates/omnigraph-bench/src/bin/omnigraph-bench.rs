@@ -629,7 +629,7 @@ enum ProjectionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Emit the results graph's rows, graph JSONL for `omnigraph load --mode merge`,
+    /// Emit the results graph's rows, graph JSONL for `omnigraph load --mode replace`,
     /// from a store's records and the catalogs that declared them.
     Export {
         /// The fixture store whose `records/` are read.

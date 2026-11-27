@@ -404,6 +404,14 @@ async fn optimize_calls_before_publish_once_with_the_nonce_its_commit_answers() 
     };
     assert_eq!(outcomes(&publication.datasets), outcomes(&report.datasets));
 
+    // The first run compacts the four inserted fragments apart from the base
+    // fragment, whose index set differs until the run's fold covers them
+    // alike (Lance plans one bin per index set); a second run merges the two.
+    let converged = db
+        .optimize_as(None, OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(converged.graph_commit_id.is_some(), "{converged:?}");
     // A run that stages no table publishes nothing and never calls the hook.
     let (hook, seen) = recording_hook();
     let idle = db
@@ -832,7 +840,7 @@ async fn optimize_rewrite_keeps_index_coverage_so_index_rows_count_only_a_laggin
                 "data": {"slug": slug, "n": n, "embedding": [n as f32, 0.0, 0.0, 0.0]},
             })
             .to_string(),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -891,7 +899,7 @@ async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
     for name in ["Acme", "Beta", "Cygnus", "Delta"] {
         db.load_jsonl(
             &serde_json::json!({"type": "Company", "data": {"name": name}}).to_string(),
-            LoadMode::Merge,
+            LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -1008,7 +1016,11 @@ async fn optimize_byte_budget_defers_the_tables_after_it_and_resumes_there() {
         ),
         "{next:?}"
     );
-    assert_eq!(next.resume_at, None);
+    // The resumed run wraps to Company, whose base fragment now merges with
+    // the tail the first run compacted (Lance plans one bin per index set,
+    // and the first run's fold made them alike), so the budget may defer it
+    // in turn; it never defers Person again.
+    assert_ne!(next.resume_at.as_deref(), Some("node:Person"), "{next:?}");
 }
 
 /// The artifact limit holds before the scan (a lower bound) and during it
@@ -1436,7 +1448,7 @@ async fn optimize_preserves_versions_under_stale_auto_cleanup_config_on_data_tab
 async fn optimize_reindexes_fragments_appended_after_index_build() {
     const SCHEMA: &str = r#"
 node Doc {
-    slug: String @key
+    slug: String @key @index(fulltext)
     rank: I32 @index
 }
 "#;
@@ -1449,7 +1461,7 @@ node Doc {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1460,7 +1472,7 @@ node Doc {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"rank\":3}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"rank\":4}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1494,18 +1506,15 @@ node Doc {
         IndexCoverage::Indexed,
         "rank BTREE must cover all fragments after optimize"
     );
+    // No read uses a full-text index, so its partial coverage is no pending
+    // work, and optimize never names the full-text rebuild, which binaries
+    // before this release cannot read back.
     let deferred = &stats
         .iter()
         .find(|stat| stat.type_key == "node:Doc")
         .unwrap()
         .pending_indexes;
-    assert_eq!(deferred.len(), 1);
-    assert_eq!(deferred[0].property, "slug");
-    assert!(
-        deferred[0]
-            .reason
-            .contains("omnigraph index rebuild --kind full-text")
-    );
+    assert!(deferred.is_empty(), "{deferred:?}");
     let commits_before = db.list_commits(None).await.unwrap().len();
     for _ in 0..2 {
         let repeated = db
@@ -1518,8 +1527,7 @@ node Doc {
             .find(|stat| stat.type_key == "node:Doc")
             .unwrap();
         assert!(!doc.committed(), "deferred FTS alone is not optimize work");
-        assert_eq!(doc.pending_indexes.len(), 1);
-        assert_eq!(doc.pending_indexes[0].property, "slug");
+        assert!(doc.pending_indexes.is_empty());
         assert_same_dataset_entry(
             snap.dataset("node:Doc").unwrap(),
             snapshot_main(&db)
@@ -1625,14 +1633,14 @@ node Tag {\n    slug: String @key\n}\n";
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:\"}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"content\":\"base64:cm93LXRocmVl\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"content\":\"base64:cm93LWZvdXI=\"}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d5\",\"content\":\"base64:cm93LWZpdmU=\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1654,12 +1662,12 @@ node Tag {\n    slug: String @key\n}\n";
         "test precondition: valid empty must lead the second of three fragments"
     );
     // Plain table, also multi-fragment so it has something to compact.
-    db.load_jsonl("{\"type\":\"Tag\",\"data\":{\"slug\":\"t1\"}}\n{\"type\":\"Tag\",\"data\":{\"slug\":\"t2\"}}", LoadMode::Merge, )
+    db.load_jsonl("{\"type\":\"Tag\",\"data\":{\"slug\":\"t1\"}}\n{\"type\":\"Tag\",\"data\":{\"slug\":\"t2\"}}", LoadMode::Replace, )
     .await
     .unwrap();
     db.load_jsonl(
         "{\"type\":\"Tag\",\"data\":{\"slug\":\"t3\"}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -1784,7 +1792,7 @@ async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load_jsonl(&lines.join("\n"), mode).await.unwrap();
     }
@@ -1964,7 +1972,7 @@ async fn optimize_sizes_a_blob_batch_by_the_sum_of_a_rows_blob_columns() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load_jsonl(&line, mode).await.unwrap();
     }
@@ -2041,14 +2049,14 @@ async fn optimize_compacts_blob_fragments_with_deleted_rows() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load_jsonl(&lines.join("\n"), mode).await.unwrap();
     }
     for slug in ["a2", "b1"] {
         mutate_main(
             &db,
-            "query drop($slug: String) {\n    delete Doc where slug = $slug\n}",
+            "query drop($slug: String) {\n    match { $x: Doc } where $x.slug = $slug\n    delete $x\n}",
             "drop",
             &mixed_params(&[("$slug", slug)], &[]),
         )
@@ -2123,7 +2131,7 @@ async fn optimize_sizes_each_compaction_task_from_its_own_fragments() {
         let mode = if load == 0 {
             LoadMode::Overwrite
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load_jsonl(&line, mode).await.unwrap();
         if load == 1 {
@@ -2201,7 +2209,7 @@ async fn optimize_does_not_size_a_blob_batch_by_external_references() {
     db.load_jsonl(&lines[0].to_string(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.load_jsonl(&lines[1].to_string(), LoadMode::Merge)
+    db.load_jsonl(&lines[1].to_string(), LoadMode::Replace)
         .await
         .unwrap();
     let external = db
@@ -2504,7 +2512,7 @@ async fn optimize_then_cleanup_erases_dropped_property_values() {
     db.load(
         "retained",
         r#"{"type":"Tag","data":{"slug":"u","icon":"base64:dQ=="}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -2763,7 +2771,7 @@ async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_the_coll
     );
     db.load_jsonl(
         r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -2784,7 +2792,7 @@ async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_the_coll
 
     db.load_jsonl(
         r#"{"type":"Company","data":{"name":"Acme"}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .expect("the write stages on the pin, not the foreign HEAD");
@@ -2831,7 +2839,10 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     let db = init_and_load(&dir).await;
     db.apply_schema(
         &TEST_SCHEMA
-            .replace("age: I32?", "age: I32?\n    biography: String? @index")
+            .replace(
+                "age: I32?",
+                "age: I32?\n    biography: String? @index(fulltext)",
+            )
             .replace("since: Date?", "since: Date?\n    note: String? @index")
             .replace(
                 "edge WorksAt: Person -> Company",
@@ -2840,7 +2851,7 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     )
     .await
     .unwrap();
-    db.load_jsonl(r#"{"type":"Person","data":{"name":"Alice","age":30,"biography":"organism university running"}}"#, LoadMode::Merge, )
+    db.load_jsonl(r#"{"type":"Person","data":{"name":"Alice","age":30,"biography":"organism university running"}}"#, LoadMode::Replace, )
     .await
     .unwrap();
     db.ensure_indices_as(None).await.unwrap();
@@ -2893,13 +2904,11 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
             property: "note".to_string(),
         },
         RebuiltFullTextIndex {
-            type_key: "node:Company".to_string(),
-            property: "name".to_string(),
-        },
-        RebuiltFullTextIndex {
             type_key: "node:Person".to_string(),
             property: "biography".to_string(),
         },
+        // `Person.name` is a `@key`, which declares no full-text index; the
+        // physical one forged above is still replaced, never removed.
         RebuiltFullTextIndex {
             type_key: "node:Person".to_string(),
             property: "name".to_string(),
@@ -2928,7 +2937,7 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
         before.graph_manifest_version() + 1
     );
 
-    for (table_key, expected_fts) in [("edge:Knows", 1), ("node:Company", 1), ("node:Person", 2)] {
+    for (table_key, expected_fts) in [("edge:Knows", 1), ("node:Person", 2)] {
         let old = before.open_dataset(table_key).await.unwrap();
         let new = after.open_dataset(table_key).await.unwrap();
         assert_eq!(
@@ -2980,10 +2989,13 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
     }
     // Edge declarations alone do not create FTS: normal ensure only builds
     // edge id/src/dst BTREEs. An existing physical edge FTS is still replaced.
-    assert_same_dataset_entry(
-        before.dataset("edge:WorksAt").unwrap(),
-        after.dataset("edge:WorksAt").unwrap(),
-    );
+    // A `@key` String (`Company.name`) has none to replace.
+    for table_key in ["edge:WorksAt", "node:Company"] {
+        assert_same_dataset_entry(
+            before.dataset(table_key).unwrap(),
+            after.dataset(table_key).unwrap(),
+        );
+    }
     assert_eq!(recovery_sidecar_count(&dir), 0);
 
     // A force rebuild remains a real operation after coverage is complete.
@@ -3000,30 +3012,35 @@ async fn full_text_rebuild_replaces_all_columns_and_segments_in_one_publication(
 }
 
 /// An index build on a branch builds the declared indexes a type whose first
-/// rows landed there lacks, rebuilds a BTREE whose coverage lags the branch's
-/// new rows, and publishes both in one commit on that branch, attributed to
-/// its actor. Full-text coverage is pending with the rebuild that refreshes
-/// it; main keeps its registrations and history; a second run publishes
-/// nothing.
+/// rows landed there lacks, rebuilds each BTREE and NGRAM whose coverage lags
+/// the branch's new rows in its own family, and publishes both in one commit
+/// on that branch, attributed to its actor. Full-text coverage no read uses
+/// is not pending; main keeps its registrations and history; a second run
+/// publishes nothing.
 #[tokio::test]
 async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() {
     use omnigraph::db::{BuiltIndex, BuiltIndexAction, BuiltIndexKind};
 
     let dir = tempfile::tempdir().unwrap();
-    let schema =
-        format!("{TEST_SCHEMA}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n}}\n");
+    // `Tag` carries each String declaration: a `@key` alone builds a BTREE, a
+    // plain `@index` an NGRAM and a BTREE, and `@index(fulltext)` its full
+    // text beside them.
+    let schema = format!(
+        "{}\nnode Tag {{\n    slug: String @key\n    rank: I64 @index\n    label: String? @index\n    body: String? @index(fulltext)\n}}\n",
+        helpers::full_text_test_schema()
+    );
     let db = helpers::init_and_load_with_schema(&dir, &schema).await;
     db.branch_create("feature").await.unwrap();
     db.load(
         "feature",
         concat!(
-            r#"{"type":"Tag","data":{"slug":"graphs","rank":1}}"#,
+            r#"{"type":"Tag","data":{"slug":"graphs","rank":1,"label":"g","body":"graph text"}}"#,
             "\n",
-            r#"{"type":"Tag","data":{"slug":"search","rank":2}}"#,
+            r#"{"type":"Tag","data":{"slug":"search","rank":2,"label":"s","body":"search text"}}"#,
             "\n",
             r#"{"type":"Person","data":{"name":"Eve","age":41}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3065,9 +3082,51 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
                 BuiltIndexAction::Refreshed
             ),
             built(
+                "node:Person",
+                "name",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Refreshed
+            ),
+            built(
+                "node:Person",
+                "name",
+                BuiltIndexKind::NGram,
+                BuiltIndexAction::Refreshed
+            ),
+            built(
                 "node:Tag",
                 "__id",
                 BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "body",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "body",
+                BuiltIndexKind::NGram,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "body",
+                BuiltIndexKind::FullText,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "label",
+                BuiltIndexKind::Btree,
+                BuiltIndexAction::Built
+            ),
+            built(
+                "node:Tag",
+                "label",
+                BuiltIndexKind::NGram,
                 BuiltIndexAction::Built
             ),
             built(
@@ -3079,21 +3138,15 @@ async fn index_build_on_a_branch_builds_missing_and_lagging_indexes_issue_840() 
             built(
                 "node:Tag",
                 "slug",
-                BuiltIndexKind::FullText,
+                BuiltIndexKind::Btree,
                 BuiltIndexAction::Built
             ),
         ]
     );
-    assert_eq!(result.pending.len(), 1, "{:?}", result.pending);
-    assert_eq!(result.pending[0].type_key, "node:Person");
-    assert_eq!(result.pending[0].property, "name");
-    assert!(
-        result.pending[0]
-            .reason
-            .contains(&omnigraph::error::FULL_TEXT_REBUILD_COMMAND.replace("<branch>", "feature")),
-        "{}",
-        result.pending[0].reason
-    );
+    // The partially covered full-text index no read uses is not pending: the
+    // build never recommends the full-text rebuild, which binaries before
+    // this release cannot read back.
+    assert!(result.pending.is_empty(), "{:?}", result.pending);
 
     let feature_after = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
     let tag = feature_after.open_dataset("node:Tag").await.unwrap();
@@ -3167,7 +3220,8 @@ async fn index_build_and_optimize_rebuild_a_vector_index_a_column_patch_left_emp
     const SCHEMA: &str = "node D {\n    slug: String @key\n    n: I64?\n    s: String?\n    b: Blob?\n    v: Vector(4)? @index\n}\n";
     const UPDATE: &str = r#"
 query patch($v: Vector(4)?) {
-    update D set { v: $v } where slug in ["k5", "k2"]
+    match { $x: D } where $x.slug in ["k5", "k2"]
+    update $x set { v: $v }
 }
 "#;
     // The vector index's segments, how many of them cover no fragment, and
@@ -3216,7 +3270,7 @@ query patch($v: Vector(4)?) {
             "\n",
             r#"{"type":"D","data":{"slug":"k5","v":[1.0,-2.0,-2.0,-1.0]}}"#,
         ),
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -3284,7 +3338,7 @@ query patch($v: Vector(4)?) {
 
     let rows = helpers::query_main(
         &db,
-        "query near($q: Vector(4)) { match { $d: D } return { $d.slug } order { nearest($d.v, $q) } limit 1 }",
+        "query near($q: Vector(4)) { match { let $pop = { match { $d: D } return { $d } }, from nearest($pop, $d.v, $q, k: 1) as $distance } return { $d.slug } order { $distance } }",
         "near",
         &helpers::vector_param("q", &[0.0, 1.0, 2.0, 3.0]),
     )
@@ -3298,7 +3352,7 @@ query patch($v: Vector(4)?) {
 #[tokio::test]
 async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_location_without_changing_main() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let db = helpers::init_and_load_with_schema(&dir, &helpers::full_text_test_schema()).await;
     db.branch_create("feature").await.unwrap();
     let inherited = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
     db.ensure_indices_on_as("feature", None).await.unwrap();
@@ -3418,9 +3472,12 @@ async fn full_text_rebuild_reports_empty_builds_but_not_no_work() {
     assert_eq!(recovery_sidecar_count(&no_fts), 0);
 
     let empty = tempfile::tempdir().unwrap();
-    let db = Omnigraph::init(empty.path().to_str().unwrap(), TEST_SCHEMA)
-        .await
-        .unwrap();
+    let db = Omnigraph::init(
+        empty.path().to_str().unwrap(),
+        &helpers::full_text_test_schema(),
+    )
+    .await
+    .unwrap();
     let before = snapshot_main(&db).await.unwrap();
     let result = db
         .rebuild_full_text_indices_on_as("main", None)
@@ -3682,7 +3739,7 @@ async fn cleanup_older_than_zero_preserves_head() {
 
     // Smoke test: after aggressive cleanup, we can still read and write the
     // graph — head wasn't pruned.
-    db.load_jsonl(TEST_DATA, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(TEST_DATA, LoadMode::Replace).await.unwrap();
 }
 
 #[tokio::test]
@@ -3994,7 +4051,7 @@ async fn cleanup_then_optimize_preserves_rows_and_table_remains_writable() {
     assert_eq!(count_rows(&db, "node:Company").await, companies_before);
 
     // Table is still writable after the cleanup+optimize sequence.
-    db.load_jsonl(TEST_DATA, LoadMode::Merge).await.unwrap();
+    db.load_jsonl(TEST_DATA, LoadMode::Replace).await.unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, people_before);
 }
 
@@ -4159,7 +4216,7 @@ async fn cleanup_reconciles_live_branch_orphan_fork_and_keeps_the_branch_write()
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"Acme"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -4260,7 +4317,7 @@ async fn cleanup_age_window_preserves_a_recent_snapshot_across_a_pointer_switch(
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"RecentCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -4281,7 +4338,7 @@ async fn cleanup_age_window_preserves_a_recent_snapshot_across_a_pointer_switch(
         "main",
         None,
         r#"{"type":"Company","data":{"name":"LaterCo"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -4669,7 +4726,7 @@ async fn cleanup_preserves_the_pin_a_lazy_child_reads_after_its_parent_retires()
             "feature",
             None,
             r#"{"type":"Company","data":{"name":"BorrowedCo"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
             None,
         )
         .await
@@ -4687,7 +4744,7 @@ async fn cleanup_preserves_the_pin_a_lazy_child_reads_after_its_parent_retires()
             "main",
             None,
             r#"{"type":"Company","data":{"name":"MainCo"}}"#,
-            LoadMode::Merge,
+            LoadMode::Replace,
             None,
         )
         .await
@@ -4724,7 +4781,7 @@ async fn cleanup_preserves_the_pin_a_lazy_child_reads_after_its_parent_retires()
                 "child",
                 None,
                 r#"{"type":"Company","data":{"name":"ChildCo"}}"#,
-                LoadMode::Merge,
+                LoadMode::Replace,
                 None,
             )
             .await
@@ -4786,7 +4843,7 @@ async fn cleanup_reclaims_dead_incarnation_fork_of_live_branch() {
         "feature",
         None,
         r#"{"type":"Company","data":{"name":"Acme"}}"#,
-        LoadMode::Merge,
+        LoadMode::Replace,
         None,
     )
     .await
@@ -4926,7 +4983,7 @@ async fn index_build_tolerates_null_vector_rows() {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"n\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"n\":2}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .expect("load rows with null embeddings");
@@ -4965,7 +5022,9 @@ async fn index_build_tolerates_null_vector_rows() {
     );
     let ds = after.open_dataset("node:Doc").await.unwrap();
     assert!(ds.has_btree_index("__id").await.unwrap());
-    assert!(ds.has_fts_index("slug").await.unwrap());
+    // A `@key` String builds a BTREE and no full-text index.
+    assert!(ds.has_btree_index("slug").await.unwrap());
+    assert!(!ds.has_fts_index("slug").await.unwrap());
     assert!(ds.has_btree_index("n").await.unwrap());
     assert!(!ds.has_vector_index("embedding").await.unwrap());
 }
@@ -4985,7 +5044,7 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();
@@ -5016,7 +5075,11 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
     let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open_dataset("node:Doc").await.unwrap();
     assert!(ds.has_btree_index("__id").await.unwrap());
-    assert!(ds.has_fts_index("slug").await.unwrap());
+    assert!(ds.has_btree_index("slug").await.unwrap());
+    assert!(
+        !ds.has_fts_index("slug").await.unwrap(),
+        "a `@key` builds no full text"
+    );
     assert!(ds.has_btree_index("rank").await.unwrap());
     assert_eq!(
         ds.index_coverage("rank").await.unwrap(),
@@ -5038,7 +5101,7 @@ async fn optimize_materializes_index_after_type_rename() {
     db.load_jsonl(
         "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
          {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
-        LoadMode::Merge,
+        LoadMode::Replace,
     )
     .await
     .unwrap();

@@ -42,10 +42,10 @@ node Counter {
 {"type":"Counter","data":{"name":"ceilings_at","ceiling":10,"ceilings":[10]}}
 
 --- mutate
-query count_above_max() { insert Counter { name: "count_above", count: 9007199254740993 } }
+query count_above_max() { replace Counter { name: "count_above", count: 9007199254740993 } }
 --- expect error: @range violation on Counter.count: value 9007199254740993 > max 9007199254740992
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Counter
@@ -56,7 +56,7 @@ tables:
       count: {kind: literal, value: 9007199254740993}
 --- expect error: @range violation on Counter.count: value 9007199254740993 > max 9007199254740992
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Counter
@@ -68,43 +68,43 @@ tables:
 --- expect error: @range violation on Counter.unsigned: value 9223372036854775808 > max 9223372036854775807
 
 --- mutate
-query unsigned_above_max_by_parameter($unsigned: U64) { insert Counter { name: "unsigned_above_by_param", unsigned: $unsigned } }
+query unsigned_above_max_by_parameter($unsigned: U64) { replace Counter { name: "unsigned_above_by_param", unsigned: $unsigned } }
 --- params
 {"unsigned": 9223372036854775808}
 --- expect error: @range violation on Counter.unsigned: value 9223372036854775808 > max 9223372036854775807
 
 --- mutate
-query small_below_float_min($small: I32) { insert Counter { name: "small_below", small: $small } }
+query small_below_float_min($small: I32) { replace Counter { name: "small_below", small: $small } }
 --- params
 {"small": -3}
 --- expect error: @range violation on Counter.small: value -3 < min -2.5
 
 --- mutate
-query small_above_float_max($small: I32) { insert Counter { name: "small_above", small: $small } }
+query small_above_float_max($small: I32) { replace Counter { name: "small_above", small: $small } }
 --- params
 {"small": 3}
 --- expect error: @range violation on Counter.small: value 3 > max 2.5
 
 --- mutate
-query reading_below_integer_min() { insert Counter { name: "reading_below", reading: 9007199254740992.0 } }
+query reading_below_integer_min() { replace Counter { name: "reading_below", reading: 9007199254740992.0 } }
 --- expect error: @range violation on Counter.reading: value 9007199254740992 < min 9007199254740993
 
 --- mutate
-query counts_element_above_max() { insert Counter { name: "counts_above", counts: [0, 9007199254740993] } }
+query counts_element_above_max() { replace Counter { name: "counts_above", counts: [0, 9007199254740993] } }
 --- expect error: @range violation on Counter.counts: value 9007199254740993 > max 9007199254740992
 
 --- mutate
-query ceilings_below_max($ceiling: I64, $ceilings: [I64]) { insert Counter { name: "ceilings_below", ceiling: $ceiling, ceilings: $ceilings } }
+query ceilings_below_max($ceiling: I64, $ceilings: [I64]) { replace Counter { name: "ceilings_below", ceiling: $ceiling, ceilings: $ceilings } }
 --- params
 {"ceiling": -1, "ceilings": [-1, 10]}
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query ceiling_above_max() { insert Counter { name: "ceiling_above", ceiling: 11 } }
+query ceiling_above_max() { replace Counter { name: "ceiling_above", ceiling: 11 } }
 --- expect error: @range violation on Counter.ceiling: value 11 > max 10
 
 --- mutate
-query ceilings_element_above_max() { insert Counter { name: "ceilings_above", ceilings: [10, 11] } }
+query ceilings_element_above_max() { replace Counter { name: "ceilings_above", ceilings: [10, 11] } }
 --- expect error: @range violation on Counter.ceilings: value 11 > max 10
 
 --- query

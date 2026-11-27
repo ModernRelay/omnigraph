@@ -27,7 +27,7 @@ node Person {
 
 --- mutate
 query mark() {
-    insert Person { name: "start", age: 0 }
+    replace Person { name: "start", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -36,63 +36,68 @@ query mark() {
 
 --- mutate
 query alice_ages() {
-    update Person set { age: 31 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query alice_reverts() {
-    update Person set { age: 30 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 30 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query gina_arrives() {
-    insert Person { name: "gina", age: 50 }
+    replace Person { name: "gina", age: 50 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query gina_leaves() {
-    delete Person where name = "gina"
+    match { $x: Person } where $x.name = "gina"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query hank_leaves() {
-    delete Person where name = "hank"
+    match { $x: Person } where $x.name = "hank"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query hank_returns() {
-    insert Person { name: "hank", age: 40 }
+    replace Person { name: "hank", age: 40 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query ivan_leaves() {
-    delete Person where name = "ivan"
+    match { $x: Person } where $x.name = "ivan"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query ivan_returns_older() {
-    insert Person { name: "ivan", age: 21 }
+    replace Person { name: "ivan", age: 21 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query jill_arrives() {
-    insert Person { name: "jill", age: 18 }
+    replace Person { name: "jill", age: 18 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -101,7 +106,8 @@ query jill_arrives() {
 
 --- mutate
 query jill_ages() {
-    update Person set { age: 19 } where name = "jill"
+    match { $x: Person } where $x.name = "jill"
+    update $x set { age: 19 }
 }
 
 --- expect affected: nodes=1 edges=0

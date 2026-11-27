@@ -1,0 +1,206 @@
+# issue: none
+# traversal: auto
+# notes: `@index` on a list builds a LABEL_LIST (the GQ 3 RFC section 4, "Scalar indexes").
+# notes: `value in $x.list` and its negation probe it; every step's rows equal the reference interpreter's
+# notes: and an unindexed twin type's. A null or empty list never holds a value, and a null list stays out
+# notes: of the negation. The appended rows lie outside the index (partial coverage) and are still returned.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    tags: [String]? @index
+}
+node PlainDoc {
+    slug: String @key
+    tags: [String]?
+}
+
+--- seed
+{"type": "Doc", "data": {"slug": "d1", "tags": ["rust", "db"]}}
+{"type": "Doc", "data": {"slug": "d2", "tags": ["go"]}}
+{"type": "Doc", "data": {"slug": "d3"}}
+{"type": "Doc", "data": {"slug": "d4", "tags": []}}
+{"type": "Doc", "data": {"slug": "d5", "tags": ["db"]}}
+{"type": "PlainDoc", "data": {"slug": "d1", "tags": ["rust", "db"]}}
+{"type": "PlainDoc", "data": {"slug": "d2", "tags": ["go"]}}
+{"type": "PlainDoc", "data": {"slug": "d3"}}
+{"type": "PlainDoc", "data": {"slug": "d4", "tags": []}}
+{"type": "PlainDoc", "data": {"slug": "d5", "tags": ["db"]}}
+
+--- query
+query holds_rust_indexed() {
+    match { $d: Doc }
+    where "rust" in $d.tags
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: access index_probe tags label_list
+
+--- query
+query holds_rust_unindexed() {
+    match { $d: PlainDoc }
+    where "rust" in $d.tags
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan PlainDoc as $d: access sequential
+
+--- query
+query holds_db_indexed() {
+    match { $d: Doc }
+    where "db" in $d.tags
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d5"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: access index_probe tags label_list
+
+--- query
+query holds_db_unindexed() {
+    match { $d: PlainDoc }
+    where "db" in $d.tags
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d5"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan PlainDoc as $d: access sequential
+
+--- query
+query holds_nothing_stored_indexed() {
+    match { $d: Doc }
+    where "none" in $d.tags
+    return { $d.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: access index_probe tags label_list
+
+--- query
+query holds_nothing_stored_unindexed() {
+    match { $d: PlainDoc }
+    where "none" in $d.tags
+    return { $d.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan PlainDoc as $d: access sequential
+
+--- query
+query lacks_db_indexed() {
+    match { $d: Doc }
+    where not ("db" in $d.tags)
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d2"}
+{"d.slug": "d4"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: access index_probe tags label_list
+
+--- query
+query lacks_db_unindexed() {
+    match { $d: PlainDoc }
+    where not ("db" in $d.tags)
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d2"}
+{"d.slug": "d4"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan PlainDoc as $d: access sequential
+
+--- mutate
+query append_docs() {
+    replace Doc { slug: "d6", tags: ["rust"] }
+    replace PlainDoc { slug: "d6", tags: ["rust"] }
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query appended_holds_rust_indexed() {
+    match { $d: Doc }
+    where "rust" in $d.tags
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d6"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan Doc as $d: access index_probe tags label_list
+
+--- query
+query appended_holds_rust_unindexed() {
+    match { $d: PlainDoc }
+    where "rust" in $d.tags
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d6"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+scan PlainDoc as $d: access sequential

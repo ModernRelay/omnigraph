@@ -11,7 +11,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use datafusion::common::ScalarValue;
 use omnigraph_compiler::ir::{BlockAggregateExpr, ParamMap, SubqueryPredicate};
-use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+use omnigraph_compiler::query::value::{AggFunc, CompOp};
 use omnigraph_compiler::types::{AggSignature, ExprType};
 use omnigraph_planner::{Accumulator, AggregateSpec, plan_block_aggregate};
 
@@ -65,7 +65,9 @@ impl ValueAccumulator {
     fn for_spec(func: AggFunc, spec: AggregateSpec) -> Result<Option<Self>> {
         Ok(match (func, spec.accumulator) {
             (AggFunc::Count, Accumulator::Count) => None,
-            (AggFunc::Sum, Accumulator::ExactInteger) => Some(Self::Sum(Number::Exact(0))),
+            (AggFunc::Sum | AggFunc::Avg, Accumulator::ExactInteger) => {
+                Some(Self::Sum(Number::Exact(0)))
+            }
             (AggFunc::Sum | AggFunc::Avg, Accumulator::Float64) => {
                 Some(Self::Sum(Number::Float(0.0)))
             }
@@ -76,17 +78,26 @@ impl ValueAccumulator {
                 Accumulator::ExactInteger | Accumulator::Float64 | Accumulator::Extremum,
             )
             | (AggFunc::Sum, Accumulator::Count | Accumulator::Extremum)
-            | (
-                AggFunc::Avg,
-                Accumulator::Count | Accumulator::ExactInteger | Accumulator::Extremum,
-            )
+            | (AggFunc::Avg, Accumulator::Count | Accumulator::Extremum)
             | (
                 AggFunc::Min | AggFunc::Max,
                 Accumulator::Count | Accumulator::ExactInteger | Accumulator::Float64,
+            )
+            | (
+                AggFunc::Count | AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max,
+                Accumulator::List,
             ) => {
                 return Err(OmniError::manifest_internal(
                     "block function differs from its aggregate specification",
                 ));
+            }
+            // A block that holds its group's values (`collect`, `stddev`,
+            // `percentile`) is read as a value, through the plan's
+            // aggregate, never folded by a semi-join.
+            (AggFunc::Collect | AggFunc::Stddev | AggFunc::Percentile, _) => {
+                return Err(OmniError::manifest_internal(format!(
+                    "a {func} block reached a semi-join comparison"
+                )));
             }
         })
     }
@@ -141,11 +152,21 @@ fn fold_extremum(
     Ok(())
 }
 
-/// Bound once, retaining the left recipe and the right Arrow scalar domain.
+/// Whether the right side is a constant, evaluated once before any outer
+/// row. A right side that reads no column but can fail (a negation, an
+/// arithmetic term, a call) is evaluated over the outer rows like one that
+/// reads them, so it fails only where an outer row reaches it (A3).
+fn right_is_constant(predicate: &SubqueryPredicate) -> bool {
+    predicate.right.columns_empty() && crate::engine::constant::is_constant(&predicate.right)
+}
+
+/// Bound once, retaining the left recipe and the right Arrow scalar domain:
+/// a constant right side evaluated once, or one reading an outer row's
+/// columns evaluated over the outer rows by the caller.
 struct BoundComparison {
     left: BlockAggregateExpr,
     op: CompOp,
-    right: ArrayRef,
+    right: Option<ArrayRef>,
 }
 
 impl BoundComparison {
@@ -154,21 +175,35 @@ impl BoundComparison {
         Ok(Self {
             left: predicate.left.clone(),
             op: predicate.op,
-            right: evaluate_constant_array(&predicate.right, params)?,
+            right: if right_is_constant(predicate) {
+                Some(evaluate_constant_array(&predicate.right, params)?)
+            } else {
+                None
+            },
         })
     }
 
     /// Whether the predicate holds for each of `values`, the block
     /// aggregate's results in the leaf's declared type: one cast chain and
     /// one comparison over the whole column, a null verdict reading `false`.
-    fn holds_all(&self, values: &ArrayRef) -> Result<BooleanArray> {
+    /// `rows` is the right side for each value when it reads the outer
+    /// row's columns.
+    fn holds_all(&self, values: &ArrayRef, rows: Option<&ArrayRef>) -> Result<BooleanArray> {
         let value = cast_left(&self.left, values)?;
-        let right = arrow_select::take::take(
-            self.right.as_ref(),
-            &UInt32Array::from(vec![0u32; value.len()]),
-            None,
-        )
-        .map_err(OmniError::arrow_internal)?;
+        let right = match (&self.right, rows) {
+            (_, Some(rows)) if rows.len() == value.len() => Arc::clone(rows),
+            (Some(constant), None) => arrow_select::take::take(
+                constant.as_ref(),
+                &UInt32Array::from(vec![0u32; value.len()]),
+                None,
+            )
+            .map_err(OmniError::arrow_internal)?,
+            _ => {
+                return Err(OmniError::manifest_internal(
+                    "a block's right side reads the outer row and was given none",
+                ));
+            }
+        };
         let mask = compare_arrays(&value, self.op, &right)?;
         Ok(if mask.null_count() == 0 {
             mask
@@ -231,7 +266,8 @@ impl RowCountPredicate {
         predicate: &SubqueryPredicate,
         params: &ParamMap,
     ) -> Result<Option<Self>> {
-        if !predicate.is_row_count() {
+        // A right side read from the outer row takes the tagged path.
+        if !predicate.is_row_count() || !right_is_constant(predicate) {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -246,7 +282,7 @@ impl RowCountPredicate {
 
     /// The verdict of every outer row from its neighbour count.
     pub(crate) fn holds_all(&self, counts: &[u64]) -> Result<BooleanArray> {
-        self.comparison.holds_all(&count_values(counts)?)
+        self.comparison.holds_all(&count_values(counts)?, None)
     }
 
     #[cfg(test)]
@@ -399,6 +435,19 @@ impl SubqueryAggregate {
                     ScalarValue::Float64(Some(sum / count as f64))
                 }
             }
+            // An integer mean: the exact total divided once.
+            (
+                BlockAggregateExpr::Aggregate {
+                    func: AggFunc::Avg, ..
+                },
+                Some(ValueAccumulator::Sum(Number::Exact(sum))),
+            ) => {
+                if count == 0 {
+                    null()?
+                } else {
+                    ScalarValue::Float64(Some(*sum as f64 / count as f64))
+                }
+            }
             (
                 BlockAggregateExpr::Aggregate {
                     func: AggFunc::Min, ..
@@ -429,6 +478,35 @@ impl SubqueryAggregate {
     /// the block counts rows, else each row's finalized aggregate gathered
     /// into one column, then one comparison.
     pub(crate) fn keep_mask(&self) -> Result<BooleanArray> {
+        self.comparison.holds_all(&self.values()?, None)
+    }
+
+    /// Whether the right side reads the outer row's columns.
+    pub(crate) fn reads_outer_row(&self) -> bool {
+        self.comparison.right.is_none()
+    }
+
+    /// Each group's verdict against `right`, the right side evaluated for
+    /// the outer row each group stands for.
+    pub(crate) fn keep_mask_against(&self, right: &ArrayRef) -> Result<BooleanArray> {
+        self.comparison.holds_all(&self.values()?, Some(right))
+    }
+
+    /// The verdict of each outer row against `right`, evaluated over the
+    /// outer rows, its aggregate the one of the group `groups` names for it.
+    pub(crate) fn keep_rows_against(
+        &self,
+        groups: &UInt32Array,
+        right: &ArrayRef,
+    ) -> Result<BooleanArray> {
+        let values = arrow_select::take::take(self.values()?.as_ref(), groups, None)
+            .map_err(OmniError::arrow_internal)?;
+        self.comparison.holds_all(&values, Some(right))
+    }
+
+    /// Every group's finalized aggregate as one column: the row counts as
+    /// `I64` when the block counts rows.
+    fn values(&self) -> Result<ArrayRef> {
         let leaf = self.comparison.left.leaf();
         let values = match (leaf, &self.values) {
             (BlockAggregateExpr::CountRows { .. }, None)
@@ -446,7 +524,7 @@ impl SubqueryAggregate {
                 ScalarValue::iter_to_array(values).map_err(OmniError::datafusion)?
             }
         };
-        self.comparison.holds_all(&values)
+        Ok(values)
     }
 }
 
@@ -467,6 +545,11 @@ impl Column {
             Accumulator::Count => {
                 return Err(OmniError::manifest_internal(
                     "count needs no value accumulator",
+                ));
+            }
+            Accumulator::List => {
+                return Err(OmniError::manifest_internal(
+                    "a collect block reached a semi-join comparison",
                 ));
             }
         };
@@ -492,9 +575,9 @@ impl Column {
                 .cloned()
                 .map(Self::Float)
                 .ok_or_else(|| OmniError::manifest_internal("floating block input is not Float64")),
-            Accumulator::Count | Accumulator::Extremum => Err(OmniError::manifest_internal(
-                "unexpected block accumulator conversion",
-            )),
+            Accumulator::Count | Accumulator::Extremum | Accumulator::List => Err(
+                OmniError::manifest_internal("unexpected block accumulator conversion"),
+            ),
         }
     }
 }
@@ -504,7 +587,7 @@ mod tests {
     use super::*;
     use arrow_array::{Float32Array, Int64Array, UInt64Array};
     use omnigraph_compiler::ir::IRExpr;
-    use omnigraph_compiler::query::ast::Literal;
+    use omnigraph_compiler::query::value::Literal;
     use omnigraph_compiler::types::{PropType, ScalarType};
 
     fn scalar(kind: ScalarType, nullable: bool) -> ExprType {
@@ -513,7 +596,7 @@ mod tests {
 
     fn column_predicate(func: AggFunc, kind: ScalarType, right: IRExpr) -> SubqueryPredicate {
         let arg = scalar(kind, true);
-        let result = scalar(func.result_type(&arg).unwrap(), true);
+        let result = func.result_type(&arg).unwrap();
         SubqueryPredicate {
             left: BlockAggregateExpr::Aggregate {
                 func,

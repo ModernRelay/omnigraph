@@ -1,0 +1,1 @@
+- `lint --fix` keeps an `insert` written after `update … where` out of the new `match` group, so it runs once; one inserting the updated type stops at `T91`.

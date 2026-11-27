@@ -76,7 +76,7 @@ load csv "absent_dst.csv" into edge:SmallLink mode overwrite header
 --- expect error: '8' not found in Small
 
 --- mutate
-load csv "absent_dst.csv" into edge:SmallLink mode append header
+load csv "absent_dst.csv" into edge:SmallLink mode insert header
 --- expect error: '8' not found in Small
 
 --- csv absent_both.csv
@@ -113,7 +113,7 @@ load csv "padded_small.csv" into edge:SmallLink mode overwrite header
 --- expect error: '007' not found in Small
 
 --- mutate
-load csv "padded_small.csv" into edge:SmallLink mode append header
+load csv "padded_small.csv" into edge:SmallLink mode insert header
 --- expect error: '007' not found in Small
 
 --- csv padded_large.csv
@@ -125,7 +125,7 @@ load csv "padded_large.csv" into edge:LargeLink mode overwrite header
 --- expect error: '01' not found in Large
 
 --- query
-query small_rows() { match { $a: Small $a smallLink $b } return { $a.id, $b.id } }
+query small_rows() { match { $a: Small, $a smallLink $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 0, "b.id": 1}
 {"a.id": 7, "b.id": 6}
@@ -134,14 +134,14 @@ a.id: I64
 b.id: I64
 
 --- query
-query large_rows() { match { $a: Large $a largeLink $b } return { $a.id, $b.id } }
+query large_rows() { match { $a: Large, $a largeLink $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 0, "b.id": 63}
 {"a.id": 63, "b.id": 32}
 --- expect shape
 a.id: I64
 b.id: I64
---- load generate: v1 seed: 43 mode: append
+--- load generate: v1 seed: 43 mode: insert
 tables:
   - kind: node
     name: Large
@@ -160,7 +160,7 @@ load validate edge_ri edge:LargeLink to Large: access probe
 load executed: partitions 1 rows 1
 
 --- query
-query across_fragments() { match { $a: Large $a largeLink $b } return { $a.id, $b.id } }
+query across_fragments() { match { $a: Large, $a largeLink $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 63, "b.id": 64}
 --- expect shape

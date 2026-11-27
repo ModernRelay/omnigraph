@@ -21,24 +21,100 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 
 use super::memory::WorkMemory;
-use super::shape::{Breaker, empty, work};
+use super::shape::{Breaker, drained, empty, work};
 use super::{drain, external};
 use crate::engine::lower::HIDDEN;
 use crate::error::{OmniError, Result};
 
 /// One key of the order: a column of the input, its direction and where
-/// nulls go.
+/// nulls go. `types` makes the column an edge identity ordered by its type's
+/// stable type id, which a rename never reorders: a column of type names,
+/// or an edge object ([`TypeOrder::identity`]).
 #[derive(Debug, Clone)]
 pub(crate) struct SortKey {
     pub(crate) column: String,
     pub(crate) descending: bool,
     pub(crate) nulls_first: bool,
+    pub(crate) types: Option<Arc<TypeOrder>>,
+}
+
+/// Each edge type's stable type id by its name, in one accepted catalog: the
+/// order of the type part of an edge identity (the GQ 3 RFC, `Order`). A
+/// name is a value, ordered as text; an identity's type is ordered by this.
+#[derive(Debug)]
+pub(crate) struct TypeOrder(std::collections::HashMap<String, u64>);
+
+impl TypeOrder {
+    pub(crate) fn of(catalog: &omnigraph_compiler::catalog::Catalog) -> Result<Self> {
+        catalog
+            .edge_types
+            .keys()
+            .map(|name| {
+                catalog
+                    .edge_type_id(name)
+                    .map(|id| (name.clone(), id.get()))
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "edge type `{name}` has no stable type id in the accepted catalog"
+                        ))
+                    })
+            })
+            .collect::<Result<_>>()
+            .map(Self)
+    }
+
+    /// The columns that order `values` as edge identities: a column of type
+    /// names as their stable type ids; an edge object (a struct with `@type`
+    /// and `@id` members) as its type's stable id, then its `@id`.
+    pub(crate) fn identity(
+        &self,
+        values: &arrow_array::ArrayRef,
+    ) -> Result<Vec<arrow_array::ArrayRef>> {
+        let Some(object) = values.as_any().downcast_ref::<arrow_array::StructArray>() else {
+            return Ok(vec![self.ids(values)?]);
+        };
+        let member = |name: &str| {
+            object.column_by_name(name).cloned().ok_or_else(|| {
+                OmniError::manifest_internal(format!("an edge object has no `{name}` member"))
+            })
+        };
+        let types = member(omnigraph_compiler::traversal::EDGE_TYPE_META)?;
+        Ok(vec![
+            self.ids(&types)?,
+            member(omnigraph_compiler::SYSTEM_COLUMNS_META.id)?,
+        ])
+    }
+
+    /// `names`, a column of edge type names, as their stable type ids.
+    fn ids(&self, names: &arrow_array::ArrayRef) -> Result<arrow_array::ArrayRef> {
+        let names = names
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .ok_or_else(|| OmniError::manifest_internal("an edge type column is not text"))?;
+        let ids = names
+            .iter()
+            .map(|name| {
+                name.map(|name| {
+                    self.0.get(name).copied().ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "edge type `{name}` is not in the accepted catalog"
+                        ))
+                    })
+                })
+                .transpose()
+            })
+            .collect::<Result<arrow_array::UInt64Array>>()?;
+        Ok(Arc::new(ids))
+    }
 }
 
 pub(crate) struct SortExec {
     input: Arc<dyn ExecutionPlan>,
     keys: Vec<SortKey>,
     fetch: Option<usize>,
+    /// A fetch of zero pulls its input to the end: an expression below it
+    /// can fail, and a failing row refuses the read under any fetch (A3).
+    drains: bool,
     /// The input columns the output keeps, in input order.
     visible: Vec<usize>,
     shape: Breaker,
@@ -50,6 +126,7 @@ impl SortExec {
         input: Arc<dyn ExecutionPlan>,
         keys: Vec<SortKey>,
         fetch: Option<usize>,
+        drains: bool,
     ) -> Result<Self> {
         let input_schema = input.schema();
         for key in &keys {
@@ -77,6 +154,7 @@ impl SortExec {
             input,
             keys,
             fetch,
+            drains,
             visible,
             shape: Breaker::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -89,6 +167,7 @@ impl fmt::Debug for SortExec {
         f.debug_struct("SortExec")
             .field("keys", &self.keys)
             .field("fetch", &self.fetch)
+            .field("drains", &self.drains)
             .finish_non_exhaustive()
     }
 }
@@ -110,6 +189,9 @@ impl DisplayAs for SortExec {
         write!(f, "SortExec: [{}]", keys.join(", "))?;
         if let Some(fetch) = self.fetch {
             write!(f, ", fetch={fetch}")?;
+            if fetch == 0 && self.drains {
+                f.write_str(", drains")?;
+            }
         }
         Ok(())
     }
@@ -142,6 +224,7 @@ impl ExecutionPlan for SortExec {
                 children.pop().expect("one child"),
                 self.keys.clone(),
                 self.fetch,
+                self.drains,
             )
             .map_err(external)?,
         ))
@@ -158,6 +241,10 @@ impl ExecutionPlan for SortExec {
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "SortExec has one partition");
         if self.fetch == Some(0) {
+            if self.drains {
+                let input = self.input.execute(0, ctx)?;
+                return Ok(drained(&self.metrics, self.schema(), input));
+            }
             return Ok(empty(&self.metrics, self.schema()));
         }
         let input_schema = self.input.schema();
@@ -194,24 +281,28 @@ fn sorted(
     fetch: Option<usize>,
     memory: &WorkMemory,
 ) -> DfResult<RecordBatch> {
-    let columns = keys
-        .iter()
-        .map(|key| {
-            let values = batch.column_by_name(&key.column).ok_or_else(|| {
-                external(OmniError::manifest_internal(format!(
-                    "the sort key column '{}' left the sort input",
-                    key.column
-                )))
-            })?;
-            Ok(SortColumn {
-                values: Arc::clone(values),
-                options: Some(SortOptions {
-                    descending: key.descending,
-                    nulls_first: key.nulls_first,
-                }),
-            })
-        })
-        .collect::<DfResult<Vec<_>>>()?;
+    let mut columns = Vec::with_capacity(keys.len());
+    for key in keys {
+        let values = batch.column_by_name(&key.column).ok_or_else(|| {
+            external(OmniError::manifest_internal(format!(
+                "the sort key column '{}' left the sort input",
+                key.column
+            )))
+        })?;
+        let values = match &key.types {
+            Some(types) => types.identity(values).map_err(external)?,
+            None => vec![Arc::clone(values)],
+        };
+        let options = Some(SortOptions {
+            descending: key.descending,
+            nulls_first: key.nulls_first,
+        });
+        columns.extend(
+            values
+                .into_iter()
+                .map(|values| SortColumn { values, options }),
+        );
+    }
     memory.entries::<u32>(batch.num_rows())?;
     let indices = if columns.is_empty() {
         let rows = fetch.map_or(batch.num_rows(), |fetch| fetch.min(batch.num_rows()));

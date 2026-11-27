@@ -1,0 +1,53 @@
+# issue: none
+# notes: An order key over grouped rows that repeats a return item reads that item's column by name. A return item
+# notes: refused before it (an unbound name) is no column, so the read is refused with the item's own code, `T6`,
+# notes: rather than the order key indexing past the typed columns and the checker panicking. A grouped read whose
+# notes: items all type answers.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Org {
+    name: String @key
+}
+
+--- seed
+{"type":"Org","data":{"name":"a"}}
+{"type":"Org","data":{"name":"b"}}
+
+--- query
+query refused_item_before_the_key() {
+  match { $o: Org }
+  return { $unbound, $o.name, count($unbound) as n }
+  order { $o.name desc }
+}
+
+--- expect error: T6:
+
+--- query
+query refused_item_before_an_aggregate_key() {
+  match { $o: Org }
+  return { $unbound, $o.name, count($o) as n }
+  order { n desc, $o.name }
+}
+
+--- expect error: T6:
+
+--- query
+query grouped() {
+  match { $o: Org }
+  return { $o.name, count($o) as n }
+  order { $o.name desc }
+}
+
+--- expect unordered
+{"o.name":"b","n":1}
+{"o.name":"a","n":1}
+
+--- expect shape
+o.name: String
+n: I64

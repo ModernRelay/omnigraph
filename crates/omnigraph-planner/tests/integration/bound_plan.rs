@@ -6,13 +6,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::ir::core::ScoreKind;
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, ParamMap};
+use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::result::SearchFunction;
 use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
+use omnigraph_planner::read_shape::{ArmRank, FuseArm, PatternStep, ReadShape};
 use omnigraph_planner::{
     BOUND_PLAN_VERSION, BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan,
-    RankKind, RankScope, TableRef, ValueTable, plan_query, planned_ranking,
+    RankScope, TableRef, ValueTable, plan_query, planned_ranking,
 };
 
 use crate::fixture_bounds;
@@ -69,14 +71,13 @@ fn prop(variable: &str, property: &str) -> IRExpr {
     }
 }
 
-fn query(order_by: IRExpr) -> QueryIR {
-    QueryIR {
+fn query(order_by: IRExpr) -> ReadShape {
+    ReadShape {
         name: "q".to_string(),
         params: vec![],
-        pipeline: vec![IROp::NodeScan {
+        pipeline: vec![PatternStep::NodeScan {
             variable: "d".to_string(),
             type_name: "Doc".to_string(),
-            filters: vec![],
         }],
         return_exprs: vec![IRProjection {
             expr: prop("d", "slug"),
@@ -91,8 +92,13 @@ fn query(order_by: IRExpr) -> QueryIR {
         order_by: vec![IROrdering {
             expr: order_by,
             descending: false,
+            nulls_first: None,
         }],
         limit: Some(3),
+        limit_param: None,
+        written_columns: Vec::new(),
+        made_up: Default::default(),
+        work: Default::default(),
     }
 }
 
@@ -124,7 +130,8 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
     counted.limit = None;
     counted.return_exprs = vec![IRProjection {
         expr: IRExpr::Aggregate {
-            func: omnigraph_compiler::query::ast::AggFunc::Count,
+            fraction: None,
+            func: omnigraph_compiler::query::value::AggFunc::Count,
             distinct: true,
             arg: Box::new(prop("d", "slug")),
             signature: omnigraph_compiler::AggSignature {
@@ -218,66 +225,6 @@ fn a_wide_bound_value_reads_back_exactly_issue_918() {
 }
 
 #[test]
-fn fused_saved_node_refuses_a_reader_without_declared_row_keys() {
-    let arm = IRExpr::Bm25 {
-        field: Box::new(prop("d", "text")),
-        query: Box::new(IRExpr::Literal(
-            Literal::String("needle".into()),
-            value_type(ScalarType::String, false),
-        )),
-        ty: value_type(ScalarType::F32, false),
-    };
-    let bound = BoundPlan {
-        plan: plan(IRExpr::Rrf {
-            primary: Box::new(arm.clone()),
-            secondary: Box::new(arm),
-            k: None,
-            ty: value_type(ScalarType::F64, false),
-        }),
-        values: Default::default(),
-    };
-    let encoded = serde_json::to_value(&bound).unwrap();
-    let node = encoded["body"]["plan"]["slots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|node| node["node"] == "RankFuseWithTiebreak")
-        .unwrap()
-        .clone();
-    assert_eq!(node["row_tiebreak"], serde_json::json!([]));
-    let mut missing = encoded.clone();
-    let slot = missing["body"]["plan"]["slots"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|node| node["node"] == "RankFuseWithTiebreak")
-        .unwrap();
-    slot.as_object_mut().unwrap().remove("row_tiebreak");
-    let error = serde_json::from_value::<BoundPlan>(missing).unwrap_err();
-    assert!(error.to_string().contains("row_tiebreak"), "{error}");
-
-    #[derive(serde::Deserialize)]
-    #[serde(tag = "node")]
-    #[allow(dead_code)]
-    enum OldReader {
-        RankFuse {
-            arms: serde_json::Value,
-            k: Option<serde_json::Value>,
-            limit: Option<usize>,
-            prefilter: serde_json::Value,
-        },
-    }
-    let error = serde_json::from_value::<OldReader>(node).err().unwrap();
-    assert!(
-        error
-            .to_string()
-            .contains("unknown variant `RankFuseWithTiebreak`"),
-        "{error}"
-    );
-    assert_eq!(round_trip(&bound), bound);
-}
-
-#[test]
 fn a_nearest_plan_with_its_vector_reads_back_equal() {
     let plan = plan(IRExpr::Nearest {
         variable: "d".to_string(),
@@ -316,66 +263,120 @@ fn a_nearest_plan_with_its_vector_reads_back_equal() {
     assert_eq!(back.plan.post_order(), bound.plan.post_order());
     assert_eq!(back.values.vectors[&scan], vec![0.25, 0.5, 0.75, 1.0]);
     let ranked = back.plan.node(scan).unwrap().ranked().unwrap();
-    assert_eq!(ranked.kind, RankKind::Nearest);
     assert_eq!(ranked.fetch, Some(3));
     assert!(matches!(&ranked.query, IRExpr::Param(name, _) if name == "q"));
 }
 
-#[test]
-fn a_fused_plan_reads_back_with_both_arms() {
-    let plan = plan(IRExpr::Rrf {
-        primary: Box::new(IRExpr::Nearest {
-            variable: "d".to_string(),
-            property: "embedding".to_string(),
-            query: Box::new(IRExpr::Literal(
-                Literal::List(vec![
-                    Literal::Float(1.0),
-                    Literal::Float(0.0),
-                    Literal::Float(0.0),
-                    Literal::Float(0.0),
-                ]),
-                ExprType::Value {
-                    scalar: ScalarType::F64,
-                    list: true,
-                    nullable: false,
+/// A fusion of a `nearest` arm and an exact `distance` arm over the type,
+/// each its own pipeline, `k: 30`.
+fn fused_query() -> ReadShape {
+    let vector = || {
+        IRExpr::Literal(
+            Literal::List(vec![
+                Literal::Float(1.0),
+                Literal::Float(0.0),
+                Literal::Float(0.0),
+                Literal::Float(0.0),
+            ]),
+            ExprType::Value {
+                scalar: ScalarType::F64,
+                list: true,
+                nullable: false,
+            },
+        )
+    };
+    let nearest = FuseArm {
+        steps: vec![
+            doc_scan("d"),
+            PatternStep::Rank {
+                key: IRExpr::Nearest {
+                    variable: "d".to_string(),
+                    property: "embedding".to_string(),
+                    query: Box::new(vector()),
+                    ty: value_type(ScalarType::F32, false),
                 },
-            )),
-            ty: value_type(ScalarType::F32, false),
-        }),
-        secondary: Box::new(IRExpr::Bm25 {
-            field: Box::new(prop("d", "text")),
-            query: Box::new(IRExpr::Literal(
-                Literal::String("needle".to_string()),
-                value_type(ScalarType::String, false),
-            )),
-            ty: value_type(ScalarType::F32, false),
-        }),
-        k: Some(Box::new(IRExpr::Literal(
+                binding: "d".to_string(),
+                window: Some(3),
+                window_param: None,
+                recall: None,
+            },
+        ],
+        rank: ArmRank::Nearest,
+    };
+    let distance = FuseArm {
+        steps: vec![
+            doc_scan("d"),
+            PatternStep::Score {
+                binding: "d".to_string(),
+                type_name: "Doc".to_string(),
+                property: "embedding".to_string(),
+                kind: ScoreKind::Distance,
+                query: vector(),
+            },
+        ],
+        rank: ArmRank::Distance,
+    };
+    let mut shape = query(prop("d", "slug"));
+    shape.pipeline = vec![PatternStep::Fuse {
+        arms: vec![nearest, distance],
+        target: "d".to_string(),
+        target_type: "Doc".to_string(),
+        k: Some(IRExpr::Literal(
             Literal::Integer(30),
             value_type(ScalarType::I64, false),
-        ))),
-        ty: value_type(ScalarType::F64, false),
-    });
-    let primary = ranked_scan(&plan, RankScope::Primary);
-    let secondary = ranked_scan(&plan, RankScope::Secondary);
-    assert_ne!(primary, secondary, "each arm has its own scan");
+        )),
+        weights: None,
+        outer_var: None,
+    }];
+    shape.order_by = vec![IROrdering {
+        expr: IRExpr::PropAccess {
+            variable: "d".to_string(),
+            property: "_rrf".to_string(),
+            ty: value_type(ScalarType::F64, false),
+        },
+        descending: true,
+        nulls_first: None,
+    }];
+    shape
+}
+
+#[test]
+fn a_fused_plan_reads_back_with_every_arm() {
+    let plan = futures::executor::block_on(plan_query(
+        &fused_query(),
+        &source(),
+        &fixture_bounds::BOUNDS,
+    ))
+    .expect("the fusion plans");
+    let window = ranked_scan(&plan, RankScope::Window);
     let fuse = plan
         .live()
-        .find_map(|(id, node)| matches!(node, PhysicalNode::RankFuse { .. }).then_some(id))
-        .expect("a RankFuse");
+        .find_map(|(id, node)| matches!(node, PhysicalNode::Fuse { .. }).then_some(id))
+        .expect("a Fuse");
     assert_eq!(plan.node(fuse).unwrap().inputs().len(), 2);
     let bound = BoundPlan {
         plan,
         values: ValueTable {
             params: Arc::new(Default::default()),
-            vectors: BTreeMap::from([(primary, vec![1.0, 0.0, 0.0, 0.0])]),
+            vectors: BTreeMap::from([(window, vec![1.0, 0.0, 0.0, 0.0])]),
         },
     };
     let back = round_trip(&bound);
     assert_eq!(back, bound);
+    let encoded = serde_json::to_value(&bound).unwrap();
+    let node = encoded["body"]["plan"]["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["node"] == "Fuse")
+        .unwrap()
+        .clone();
+    assert_eq!(node["arms"][0]["rank"], "nearest");
+    assert_eq!(node["arms"][1]["rank"], "distance");
+    assert_eq!(node["target"], "d");
     let changed = BoundPlan {
         values: ValueTable {
-            vectors: BTreeMap::from([(primary, vec![0.0, 1.0, 0.0, 0.0])]),
+            vectors: BTreeMap::from([(window, vec![0.0, 1.0, 0.0, 0.0])]),
             ..back.values.clone()
         },
         ..back.clone()
@@ -383,45 +384,33 @@ fn a_fused_plan_reads_back_with_both_arms() {
     assert_ne!(changed, bound, "the value table is part of equality");
 
     // The plan read back reports the ranking the plan does: a fusion whose
-    // nearest arm alone decides whether a run was exhaustive.
+    // nearest arm alone decides whether a run was exhaustive, its exact arm
+    // always exhaustive.
     let planned = planned_ranking(&bound.plan).unwrap().expect("rrf ranks");
     assert_eq!(
         planned_ranking(&back.plan).unwrap().as_ref(),
         Some(&planned)
     );
     assert_eq!(planned.by(), SearchFunction::Rrf);
-    assert_eq!(planned.nearest_scans(), [primary]);
+    assert_eq!(planned.nearest_scans(), [window]);
     assert!(
         planned.score_columns().is_empty(),
         "no column returns the fused score"
     );
-
-    // An arm whose ranked scan lost its ranking is a plan acceptance refuses,
-    // never a fusion reported over one arm.
-    let mut broken = bound.plan.clone();
-    let Some(PhysicalNode::Scan { ranked, .. }) = broken.node_mut(secondary) else {
-        panic!("the secondary arm ranks a scan");
-    };
-    *ranked = None;
-    assert!(matches!(
-        planned_ranking(&broken),
-        Err(omnigraph_planner::PlanError::Internal(_))
-    ));
 }
 
-fn doc_scan(variable: &str) -> IROp {
-    IROp::NodeScan {
+fn doc_scan(variable: &str) -> PatternStep {
+    PatternStep::NodeScan {
         variable: variable.to_string(),
         type_name: "Doc".to_string(),
-        filters: vec![],
     }
 }
 
 /// `$d` and `$e` over `Doc` under `filter`, returning `$d.slug`.
 fn two_docs(filter: Option<IRExpr>) -> PhysicalPlan {
     let mut pipeline = vec![doc_scan("d"), doc_scan("e")];
-    pipeline.extend(filter.map(IROp::Filter));
-    let query = QueryIR {
+    pipeline.extend(filter.map(|pred| PatternStep::Filter { pred, fails: false }));
+    let query = ReadShape {
         name: "q".to_string(),
         params: vec![],
         pipeline,
@@ -437,6 +426,10 @@ fn two_docs(filter: Option<IRExpr>) -> PhysicalPlan {
         distinct: false,
         order_by: vec![],
         limit: Some(3),
+        limit_param: None,
+        written_columns: Vec::new(),
+        made_up: Default::default(),
+        work: Default::default(),
     };
     futures::executor::block_on(plan_query(&query, &source(), &fixture_bounds::BOUNDS))
         .expect("the query plans")
@@ -593,6 +586,49 @@ fn a_filtered_cross_join_has_its_own_tag_and_a_plain_one_the_old_shape() {
     assert_eq!(round_trip(&plain), plain);
 }
 
+/// A written null placement is part of the sort's key and reads back; a key
+/// with none keeps the shape without the field, and that shape reads back as
+/// the direction's default placement, a different plan.
+#[test]
+fn a_sort_key_reads_back_with_its_null_placement() {
+    let sort_keys = |bound: &BoundPlan| -> serde_json::Value {
+        let value = serde_json::to_value(bound).expect("the bound plan serializes");
+        value["body"]["plan"]["slots"]
+            .as_array()
+            .expect("the plan's slots")
+            .iter()
+            .find(|slot| slot["node"] == "Sort")
+            .unwrap_or_else(|| panic!("no `Sort` node in {value}"))["order_by"]
+            .clone()
+    };
+    let default = bound(plan(prop("d", "slug")));
+    assert!(sort_keys(&default)[0].get("nulls_first").is_none());
+    assert_eq!(round_trip(&default), default);
+    for placement in [true, false] {
+        let mut placed = query(prop("d", "slug"));
+        placed.order_by[0].nulls_first = Some(placement);
+        let placed = bound(
+            futures::executor::block_on(plan_query(&placed, &source(), &fixture_bounds::BOUNDS))
+                .expect("the query plans"),
+        );
+        assert_eq!(sort_keys(&placed)[0]["nulls_first"], placement);
+        let back = round_trip(&placed);
+        assert_eq!(back, placed);
+        assert_ne!(back, default);
+        let mut stripped = serde_json::to_value(&placed).unwrap();
+        for slot in stripped["body"]["plan"]["slots"].as_array_mut().unwrap() {
+            if slot["node"] == "Sort" {
+                slot["order_by"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("nulls_first");
+            }
+        }
+        let stripped: BoundPlan = serde_json::from_value(stripped).unwrap();
+        assert_ne!(stripped, placed);
+    }
+}
+
 /// A top-k whose return-only column is fetched by row address reads back
 /// with its `HydrateColumns` node and the scan's address column.
 #[test]
@@ -628,47 +664,12 @@ fn expression_mirror_preserves_every_typed_interior_and_nested_cast() {
             value_type(ScalarType::String, false),
         )
     };
-    let field = || Box::new(prop("d", "text"));
-    let rank = || IRExpr::Bm25 {
-        field: field(),
-        query: Box::new(text()),
-        ty: value_type(ScalarType::F32, false),
-    };
     let mut expressions = vec![
         IRExpr::Nearest {
             variable: "d".into(),
             property: "embedding".into(),
             query: Box::new(text()),
             ty: value_type(ScalarType::F32, false),
-        },
-        IRExpr::Search {
-            field: field(),
-            query: Box::new(text()),
-            ty: value_type(ScalarType::Bool, false),
-        },
-        IRExpr::Fuzzy {
-            field: field(),
-            query: Box::new(text()),
-            max_edits: Some(Box::new(IRExpr::Literal(
-                Literal::Integer(1),
-                value_type(ScalarType::I64, false),
-            ))),
-            ty: value_type(ScalarType::Bool, false),
-        },
-        IRExpr::MatchText {
-            field: field(),
-            query: Box::new(text()),
-            ty: value_type(ScalarType::Bool, false),
-        },
-        rank(),
-        IRExpr::Rrf {
-            primary: Box::new(rank()),
-            secondary: Box::new(rank()),
-            k: Some(Box::new(IRExpr::Literal(
-                Literal::Integer(60),
-                value_type(ScalarType::I64, false),
-            ))),
-            ty: value_type(ScalarType::F64, false),
         },
         IRExpr::Not(
             Box::new(IRExpr::Param(
@@ -725,6 +726,30 @@ fn expression_mirror_preserves_every_typed_interior_and_nested_cast() {
             },
         });
     }
+    let age = || IRExpr::Param("age".into(), value_type(ScalarType::I64, true));
+    let sum = IRExpr::binary(
+        age(),
+        omnigraph_compiler::query::value::BinaryOp::Arith(
+            omnigraph_compiler::query::syntax::ArithOp::Rem,
+        ),
+        age(),
+    );
+    expressions.push(IRExpr::Neg {
+        ty: sum.ty().clone(),
+        expr: Box::new(sum),
+    });
+    for func in [
+        omnigraph_compiler::ir::expr::ScalarFunc::Coalesce,
+        omnigraph_compiler::ir::expr::ScalarFunc::MatchTerms {
+            mode: omnigraph_compiler::ir::expr::TermsMode::All,
+        },
+    ] {
+        expressions.push(IRExpr::Call {
+            func,
+            args: vec![age(), text()],
+            ty: value_type(ScalarType::I64, true),
+        });
+    }
     for expression in expressions {
         let mirror = ExprMirror::from(&expression);
         let encoded = serde_json::to_vec(&mirror).unwrap();
@@ -741,22 +766,22 @@ fn cast_mirror_operand_is_the_child_consumed_by_type_validation() {
     use omnigraph_planner::mirror::ExprMirror;
     let cast = IRExpr::Cast {
         expr: Box::new(IRExpr::Literal(
-            Literal::Float(30.0),
-            value_type(ScalarType::F64, false),
+            Literal::Integer(30),
+            value_type(ScalarType::I64, false),
         )),
-        ty: value_type(ScalarType::I64, false),
+        ty: value_type(ScalarType::I32, false),
     };
     cast.check_types().unwrap();
     let mut encoded = serde_json::to_value(ExprMirror::from(&cast)).unwrap();
     assert_eq!(encoded["expr"], "cast");
     assert_eq!(encoded["operand"]["expr"], "literal");
-    assert_eq!(encoded["operand"]["ty"]["scalar"], "F64");
-    assert_eq!(encoded["ty"]["scalar"], "I64");
+    assert_eq!(encoded["operand"]["ty"]["scalar"], "I64");
+    assert_eq!(encoded["ty"]["scalar"], "I32");
     let restored = IRExpr::from(serde_json::from_value::<ExprMirror>(encoded.clone()).unwrap());
     assert_eq!(restored, cast);
     encoded["operand"] = serde_json::to_value(ExprMirror::from(&IRExpr::Param(
         "bound".into(),
-        value_type(ScalarType::F64, false),
+        value_type(ScalarType::I64, false),
     )))
     .unwrap();
     let forged = IRExpr::from(serde_json::from_value::<ExprMirror>(encoded).unwrap());
@@ -848,7 +873,7 @@ fn block_bound(left: omnigraph_compiler::ir::BlockAggregateExpr, right: IRExpr) 
 
 fn signed_sum_block() -> BoundPlan {
     use omnigraph_compiler::ir::BlockAggregateExpr;
-    use omnigraph_compiler::query::ast::AggFunc;
+    use omnigraph_compiler::query::value::AggFunc;
     let arg = value_type(ScalarType::I64, true);
     block_bound(
         BlockAggregateExpr::Aggregate {
@@ -895,7 +920,7 @@ fn refuses_block_before_execution(bound: &BoundPlan) {
 #[test]
 fn saved_block_tree_preserves_spec_signature_and_both_cast_roots() {
     use omnigraph_compiler::ir::BlockAggregateExpr;
-    use omnigraph_compiler::query::ast::AggFunc;
+    use omnigraph_compiler::query::value::AggFunc;
     let exact = |nullable| ExprType::ExactInteger {
         list: false,
         nullable,
@@ -1019,13 +1044,10 @@ fn saved_blocks_refuse_spec_signature_and_cast_drift_before_reading_rows() {
         ty: value_type(ScalarType::F64, false),
     };
     refuses_block_before_execution(&bound);
+    // A bound read from the outer row (`$p.amount`) is a scalar of the row
+    // the block compares with; a result alias is not.
     for right in [
         IRExpr::Literal(Literal::Integer(0), value_type(ScalarType::I64, false)),
-        IRExpr::PropAccess {
-            variable: "p".into(),
-            property: "amount".into(),
-            ty: value_type(ScalarType::F64, false),
-        },
         IRExpr::AliasRef("bound".into(), value_type(ScalarType::F64, false)),
     ] {
         let mut bound = signed_sum_block();

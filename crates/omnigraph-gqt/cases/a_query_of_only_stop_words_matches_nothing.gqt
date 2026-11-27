@@ -1,0 +1,141 @@
+# issue: none
+# notes: A `terms` value whose text analyzes to no term, a query of only stop words under `english_v1`, matches no
+# notes: document (the GQ 3 RFC, section 4, "The lexical query"): `match_terms` is false under both modes and every
+# notes: edit budget, `bm25` keeps no row, and an `rrf` arm of such a `bm25` contributes nothing, so the fused rows
+# notes: are the other arm's. The text is usually a parameter its author never sees, so it is never refused at run
+# notes: time. `only` and `very` are stop words through their stems (`onli`, `veri`).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    body: String @index(fulltext)
+    emb: Vector(2) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d0","body":"the river and the stone","emb":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","body":"only very old stones","emb":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","body":"a cat of the house","emb":[2.0,0.0]}}
+
+--- query
+query any_literal() {
+    match { $d: Doc }
+    where match_terms($d.body, terms("the and of", mode: any))
+    return { $d.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- query
+query all_literal() {
+    match { $d: Doc }
+    where match_terms($d.body, terms("only very", mode: all, max_edits: 2))
+    return { $d.slug }
+}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- query
+query negated() {
+    match { $d: Doc }
+    where not match_terms($d.body, terms("the", mode: all, max_edits: 1))
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d0"}
+{"d.slug": "d1"}
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query bound($q: String, $n: I64) {
+    match { $d: Doc }
+    where match_terms($d.body, terms($q, mode: all, max_edits: $n))
+    return { $d.slug }
+}
+
+--- params
+{"q": "Only very, because THE", "n": 1}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- query
+query bound_any($q: String) {
+    match { $d: Doc }
+    where match_terms($d.body, terms($q, mode: any, max_edits: 2)) or $d.slug = "d2"
+    return { $d.slug }
+}
+
+--- params
+{"q": "why during any"}
+
+--- expect unordered
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query ranked($q: String) {
+    match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $q) as $score }
+    return { $d.slug, $score }
+    order { $score desc }
+}
+
+--- params
+{"q": "the of and"}
+
+--- expect ordered
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- query
+query ranked_all($q: String) {
+    match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, terms($q, mode: all, max_edits: 2)) as $score }
+    return { $d.slug }
+}
+
+--- params
+{"q": "very only"}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- query
+query fused($v: Vector(2), $q: String) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.emb, $v, k: 2), bm25($all, $d.body, $q), k: 60) as $score }
+    return { $d.slug }
+    order { $score desc }
+}
+
+--- params
+{"v": [0.1, 0.0], "q": "the"}
+
+--- expect ordered
+{"d.slug": "d0"}
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String

@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
         }
         setup
-            .load_jsonl(&lines.join("\n"), LoadMode::Append)
+            .load_jsonl(&lines.join("\n"), LoadMode::Insert)
             .await?;
     }
     for start in (0..args.rows).step_by(2_000) {
@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             })
             .collect();
         setup
-            .load_jsonl(&lines.join("\n"), LoadMode::Append)
+            .load_jsonl(&lines.join("\n"), LoadMode::Insert)
             .await?;
     }
     setup.ensure_indices().await?;

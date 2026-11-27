@@ -196,7 +196,27 @@ impl QueryContext {
         memory_limit: u64,
         traversal_limit: Option<NonZeroU64>,
     ) -> Result<Self> {
-        Self::with_limits(memory_limit, traversal_limit, ORDERED_SCAN_SCRATCH_BYTES)
+        Self::with_limits(
+            memory_limit,
+            traversal_limit,
+            None,
+            ORDERED_SCAN_SCRATCH_BYTES,
+        )
+    }
+
+    /// The context a read plan runs in: its captured memory, traversal and
+    /// read-work limits.
+    pub(super) fn for_read(
+        memory_limit: u64,
+        traversal_limit: Option<NonZeroU64>,
+        read_limit: Option<NonZeroU64>,
+    ) -> Result<Self> {
+        Self::with_limits(
+            memory_limit,
+            traversal_limit,
+            read_limit,
+            ORDERED_SCAN_SCRATCH_BYTES,
+        )
     }
 
     #[cfg(test)]
@@ -205,12 +225,13 @@ impl QueryContext {
         traversal_limit: Option<NonZeroU64>,
         scratch_limit: u64,
     ) -> Result<Self> {
-        Self::with_limits(memory_limit, traversal_limit, scratch_limit)
+        Self::with_limits(memory_limit, traversal_limit, None, scratch_limit)
     }
 
     fn with_limits(
         memory_limit: u64,
         traversal_limit: Option<NonZeroU64>,
+        read_limit: Option<NonZeroU64>,
         scratch_limit: u64,
     ) -> Result<Self> {
         let config = SessionConfig::new()
@@ -229,10 +250,11 @@ impl QueryContext {
             .map_err(OmniError::datafusion_internal)?;
         Ok(Self {
             session: SessionContext::new_with_config_rt(
-                config.with_extension(Arc::new(QueryResources::with_traversal_limit(
+                config.with_extension(Arc::new(QueryResources::with_work_limits(
                     Arc::clone(&runtime.memory_pool),
                     memory_limit,
                     traversal_limit,
+                    read_limit,
                     work.clone(),
                 ))),
                 runtime,
@@ -391,24 +413,76 @@ impl LoadMemory {
     }
 
     /// A named charge on the statement's pool, freed when dropped.
-    pub(crate) fn charge(&self, name: &str) -> Result<LoadCharge> {
-        super::operators::memory::WorkMemory::new(self.context.task_ctx(), name)
-            .map(LoadCharge)
-            .map_err(|error| self.context.classify(error))
+    pub(crate) fn charge(&self, name: &str) -> Result<PoolCharge> {
+        PoolCharge::on(&self.context, name)
     }
 }
 
-/// One named charge of a load statement: grows by bytes or by held batches,
-/// each refusal the typed `query_memory_bytes` resource error.
-pub(crate) struct LoadCharge(super::operators::memory::WorkMemory);
+/// What a write keeps of one group's selection read: its rows, held on the
+/// read's own pool, and that pool and read-work budget, which charge
+/// everything the write derives from the rows (its entity and value maps),
+/// so the write's selection state is bounded by `query_memory_bytes` and
+/// `read_work_limit` as the read that produced it is.
+pub(crate) struct SelectionRead {
+    result: omnigraph_compiler::result::QueryResult,
+    _rows: PoolCharge,
+    context: QueryContext,
+}
 
-impl fmt::Debug for LoadCharge {
+impl SelectionRead {
+    /// `result` with its batches held on `context`'s pool, which the run
+    /// itself released when its operators dropped.
+    pub(super) fn hold(
+        result: omnigraph_compiler::result::QueryResult,
+        context: QueryContext,
+    ) -> Result<Self> {
+        let rows = PoolCharge::on(&context, "write selection rows")?;
+        for batch in result.batches() {
+            rows.hold(batch)?;
+        }
+        Ok(Self {
+            result,
+            _rows: rows,
+            context,
+        })
+    }
+
+    pub(crate) fn result(&self) -> &omnigraph_compiler::result::QueryResult {
+        &self.result
+    }
+
+    /// A named charge on the read's pool and read-work budget, freed when
+    /// dropped.
+    pub(crate) fn charge(&self, name: &str) -> Result<PoolCharge> {
+        PoolCharge::on(&self.context, name)
+    }
+}
+
+/// One named charge on a statement's query pool: grows by bytes, entries or
+/// held batches, each refusal the typed `query_memory_bytes` resource error,
+/// and charges row work to the statement's `read_work_limit`.
+pub(crate) struct PoolCharge(super::operators::memory::WorkMemory);
+
+impl fmt::Debug for PoolCharge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LoadCharge").finish_non_exhaustive()
+        f.debug_struct("PoolCharge").finish_non_exhaustive()
     }
 }
 
-impl LoadCharge {
+impl PoolCharge {
+    fn on(context: &QueryContext, name: &str) -> Result<Self> {
+        super::operators::memory::WorkMemory::new(context.task_ctx(), name)
+            .map(Self)
+            .map_err(|error| context.classify(error))
+    }
+
+    /// Charge `rows` of work to the statement's `read_work_limit`.
+    pub(crate) fn work(&self, rows: u64) -> Result<()> {
+        self.0
+            .charge_produced(rows)
+            .map_err(|error| self.0.error(error))
+    }
+
     /// Release temporary capture headroom after only the final bytes remain.
     pub(crate) fn shrink_to(&self, bytes: u64) {
         self.0

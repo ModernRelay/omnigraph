@@ -30,6 +30,9 @@ use crate::helpers::cost::{
 use crate::helpers::{
     MUTATION_QUERIES, commit_many, commit_many_as, init_and_load, mixed_params, mutate_main,
 };
+use omnigraph::db::Omnigraph;
+use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+use omnigraph::loader::LoadMode;
 
 // ── (A) The internal-table LOCK — the acceptance test for step 2 (compaction) ──
 //
@@ -794,12 +797,12 @@ node User {
         );
         // Committed baseline so the cross-version `@unique` probe has a
         // non-empty committed view (an empty view skips the probe entirely).
-        db.load_jsonl(&users_jsonl("seed", 4), omnigraph::loader::LoadMode::Append)
+        db.load_jsonl(&users_jsonl("seed", 4), omnigraph::loader::LoadMode::Insert)
             .await
             .unwrap();
         let (res, io) = measure(db.load_jsonl(
             &users_jsonl(&format!("delta{rows}"), rows),
-            omnigraph::loader::LoadMode::Append,
+            omnigraph::loader::LoadMode::Insert,
         ))
         .await;
         res.unwrap();
@@ -908,7 +911,7 @@ async fn load_csv_reuses_endpoint_reads_and_falls_back_under_a_small_pool() {
     use omnigraph::loader::{CsvLoadRequest, LoadMode};
     use omnigraph::settings::{SettingId, SettingValue, Source};
     use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
 
     const SCHEMA: &str = "node Person { name: String @key }\nedge Knows: Person -> Person\n";
     const PEOPLE: &str = r#"{"type":"Person","data":{"name":"Alice"}}
@@ -917,7 +920,7 @@ async fn load_csv_reuses_endpoint_reads_and_falls_back_under_a_small_pool() {
         let source_dir = tempfile::tempdir().unwrap();
         let csv_path = source_dir.path().join("knows.csv");
         std::fs::write(&csv_path, "from,to\nAlice,Bob\nBob,Alice\n").unwrap();
-        for mode in [LoadMode::Overwrite, LoadMode::Append, LoadMode::Merge] {
+        for mode in [LoadMode::Overwrite, LoadMode::Insert, LoadMode::Replace] {
             let mut counts = Vec::new();
             for budget in [3 * 1024 * 1024, 150 * 1024 * 1024] {
                 let policy = ExternalBlobPolicy::allow(vec![
@@ -960,4 +963,211 @@ async fn load_csv_reuses_endpoint_reads_and_falls_back_under_a_small_pool() {
                 "{mode:?}: reuse must reduce total data-table reads; uncached={uncached:?}, cached={cached:?}");
         }
     }).await;
+}
+
+// ── (G) Write groups whose selection runs as a read — bounded per statement ──
+
+const SELECTION_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+    tag: String?
+}
+node Company {
+    slug: String @key
+}
+node Badge {
+    owner: String @key
+}
+edge WorksAt: Person -> Company
+edge Mentors: Person -> Person
+"#;
+
+const SELECTION_MUTATIONS: &str = r#"
+query badge_and_mentor_staff($slug: String, $hub: String) {
+  match { $c: Company, $p worksAt $c, $h: Person } where $c.slug = $slug and $h.name = $hub
+  replace Badge { owner: $p.name }
+  insert Mentors { @src: $h, @dst: $p }
+}
+query tag_staff($slug: String) {
+  match { $c: Company, $p worksAt $c } where $c.slug = $slug
+  update $p set { tag: $c.slug }
+}
+query close_staff($slug: String) {
+  match { $c: Company, $p worksAt $c } where $c.slug = $slug
+  delete $p
+}
+"#;
+
+/// The ids one pushed membership predicate carries at most
+/// (`validate::PROBE_CHUNK_KEYS`), and the rows one table stages per
+/// mutation (`KEYED_WRITE_MAX_ROWS`); both are 8192.
+const MEMBERSHIP_CHUNK_IDS: usize = 8192;
+
+/// A graph with `staff` people working at `slug`, each person's name
+/// `{slug}-{i}`, a `hub` person working nowhere, and, when `chain`, a
+/// `Mentors` edge from each of the staff to the next.
+async fn selection_graph(
+    dir: &tempfile::TempDir,
+    companies: &[(&str, usize)],
+    chain: bool,
+) -> helpers::Session {
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), SELECTION_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let mut rows = vec![r#"{"type":"Person","data":{"name":"hub"}}"#.to_string()];
+    for (slug, staff) in companies {
+        rows.push(format!(
+            r#"{{"type":"Company","data":{{"slug":"{slug}"}}}}"#
+        ));
+        for i in 0..*staff {
+            rows.push(format!(
+                r#"{{"type":"Person","data":{{"name":"{slug}-{i}"}}}}"#
+            ));
+            rows.push(format!(
+                r#"{{"edge":"WorksAt","from":"{slug}-{i}","to":"{slug}"}}"#
+            ));
+            if chain && i + 1 < *staff {
+                rows.push(format!(
+                    r#"{{"edge":"Mentors","from":"{slug}-{i}","to":"{slug}-{}"}}"#,
+                    i + 1
+                ));
+            }
+        }
+    }
+    db.load_jsonl(&rows.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db
+}
+
+/// An `insert` fed by a selection's rows stages them as one batch: each
+/// statement opens its table once, however many rows its group selected.
+/// Before, every selected row ran a whole insert, table open included, so
+/// the opens grew one per row and statement.
+#[tokio::test]
+async fn selection_insert_opens_each_table_once_per_statement() {
+    for staff in [4usize, 64] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = selection_graph(&dir, &[("acme", staff)], false).await;
+        let probes = MergeWriteProbes::default();
+        let result = with_merge_write_probes(
+            probes.clone(),
+            mutate_main(
+                &db,
+                SELECTION_MUTATIONS,
+                "badge_and_mentor_staff",
+                &helpers::params(&[("$slug", "acme"), ("$hub", "hub")]),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.affected_nodes, staff);
+        assert_eq!(result.affected_edges, staff);
+        assert_eq!(
+            probes.mutation_table_open_calls(),
+            2,
+            "{staff} selected rows: one open for `node:Badge`, one for `edge:Mentors`"
+        );
+        assert_eq!(helpers::count_rows(&db, "node:Badge").await, staff);
+        assert_eq!(helpers::count_rows(&db, "edge:Mentors").await, staff);
+    }
+}
+
+/// An `update` over more selected entities than one table stages
+/// (`KEYED_WRITE_MAX_ROWS`) is refused before its table opens and before a
+/// membership predicate of them all is built; a smaller one builds one.
+/// Before, the predicate of every selected id was built and scanned and the
+/// staging refused the rows afterwards.
+#[tokio::test]
+async fn selection_update_over_more_entities_than_a_table_stages_is_refused_before_its_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = selection_graph(
+        &dir,
+        &[("big", MEMBERSHIP_CHUNK_IDS + 1), ("small", 3)],
+        false,
+    )
+    .await;
+
+    let probes = MergeWriteProbes::default();
+    let refused = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            SELECTION_MUTATIONS,
+            "tag_staff",
+            &helpers::params(&[("$slug", "big")]),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("keyed entities for node:Person"),
+        "{refused}"
+    );
+    assert_eq!(probes.selection_membership_predicates(), 0);
+    assert_eq!(probes.mutation_table_open_calls(), 0);
+
+    let probes = MergeWriteProbes::default();
+    let tagged = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            SELECTION_MUTATIONS,
+            "tag_staff",
+            &helpers::params(&[("$slug", "small")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(tagged.affected_nodes, 3);
+    assert_eq!(probes.selection_membership_predicates(), 1);
+    assert_eq!(probes.selection_membership_max_ids(), 3);
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        MEMBERSHIP_CHUNK_IDS + 5
+    );
+}
+
+/// A `delete` over more selected entities than one membership predicate
+/// carries evaluates them a chunk at a time, and still removes exactly the
+/// selected nodes and their edges, each edge counted once though the
+/// `Mentors` chain joins nodes of different chunks. Before, one predicate
+/// carried every selected id.
+#[tokio::test]
+async fn selection_delete_evaluates_membership_a_chunk_at_a_time() {
+    let big = MEMBERSHIP_CHUNK_IDS + 100;
+    let dir = tempfile::tempdir().unwrap();
+    let db = selection_graph(&dir, &[("big", big), ("small", 3)], true).await;
+
+    let probes = MergeWriteProbes::default();
+    let closed = with_merge_write_probes(
+        probes.clone(),
+        mutate_main(
+            &db,
+            SELECTION_MUTATIONS,
+            "close_staff",
+            &helpers::params(&[("$slug", "big")]),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed.affected_nodes, big);
+    // Each person's `WorksAt` edge and the `Mentors` chain between them.
+    assert_eq!(closed.affected_edges, big + (big - 1));
+    assert_eq!(
+        probes.selection_membership_predicates(),
+        big.div_ceil(MEMBERSHIP_CHUNK_IDS) as u64
+    );
+    assert_eq!(
+        probes.selection_membership_max_ids(),
+        MEMBERSHIP_CHUNK_IDS as u64
+    );
+    // The hub and the small company's staff remain.
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
+    assert_eq!(helpers::count_rows(&db, "edge:WorksAt").await, 3);
+    assert_eq!(helpers::count_rows(&db, "edge:Mentors").await, 2);
 }

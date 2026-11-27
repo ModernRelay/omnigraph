@@ -48,7 +48,7 @@ edge Knows: Person -> Person {}
             r#"{"type":"Person","data":{"name":"a"}}
 {"type":"Person","data":{"name":"b"}}
 {"type":"Person","data":{"name":"c"}}"#,
-            crate::loader::LoadMode::Merge,
+            crate::loader::LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -60,7 +60,7 @@ edge Knows: Person -> Person {}
             "left",
             r#"{"type":"Person","data":{"name":"d"}}
 {"edge":"Knows","from":"a","to":"b"}"#,
-            crate::loader::LoadMode::Merge,
+            crate::loader::LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -70,7 +70,7 @@ edge Knows: Person -> Person {}
             r#"{"type":"Person","data":{"name":"e"}}
 {"type":"Person","data":{"name":"f"}}
 {"edge":"Knows","from":"b","to":"c"}"#,
-            crate::loader::LoadMode::Merge,
+            crate::loader::LoadMode::Replace,
         )
         .await
         .unwrap();
@@ -213,7 +213,7 @@ async fn detached_commit_over_an_unpinned_detached_base_stacks_on_it() {
             r#"{"type":"Person","data":{"name":"a"}}
 {"type":"Person","data":{"name":"b"}}
 {"type":"Person","data":{"name":"c"}}"#,
-            crate::loader::LoadMode::Merge,
+            crate::loader::LoadMode::Replace,
         )
         .await
         .unwrap();

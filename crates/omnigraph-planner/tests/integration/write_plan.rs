@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use omnigraph_compiler::ir::{DeltaClass, WriteKind, lower_write_table};
-use omnigraph_compiler::query::ast::LoadTarget;
+use omnigraph_compiler::query::file::LoadTarget;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{SYSTEM_COLUMNS_V3, build_catalog};
 use omnigraph_planner::optimizer::resolve;
@@ -231,7 +231,7 @@ fn an_upsert_of_nodes_resolves_to_delta_source_and_validate() {
         "a kept table's lookup scans without index facts"
     );
     let document = explain.to_value();
-    assert_eq!(document["explain_version"], 8);
+    assert_eq!(document["explain_version"], 9);
     assert_eq!(document["route"], "executor");
     assert_eq!(document["reason"]["kind"], "write_on_executor");
     assert_eq!(document["reason"]["write"], "mutation");

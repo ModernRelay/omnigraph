@@ -115,15 +115,8 @@ impl ScanExec {
                 )?))
             }
             ScanSource::Table { mode, .. } => {
-                let schema = scan_output_schema(
-                    &type_name,
-                    &binding,
-                    &filters,
-                    &params,
-                    &catalog,
-                    mode,
-                    projection.as_ref(),
-                )?;
+                let schema =
+                    scan_output_schema(&type_name, &binding, &catalog, mode, projection.as_ref())?;
                 if pipelined::streams(mode) {
                     ScanShape::Pipelined(Source::new(schema))
                 } else {
@@ -281,9 +274,6 @@ impl ExecutionPlan for ScanExec {
                 )
                 .await
                 .map_err(external)?;
-                if mode.bm25.is_some() {
-                    reservation.metric("bm25_scan_rows", batch.num_rows());
-                }
                 if let Some(nearest) = scan_report.nearest_scan {
                     reservation.metric("nearest_rows", nearest.rows);
                     reservation.metric("nearest_k", nearest.k);

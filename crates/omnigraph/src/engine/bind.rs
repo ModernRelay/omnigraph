@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use omnigraph_planner::{AcceptedBoundPlan, AcceptedPlan, PhysicalNode, RankKind, ValueTable};
+use omnigraph_planner::{AcceptedBoundPlan, AcceptedPlan, PhysicalNode, ValueTable};
 
 use super::*;
 
@@ -32,13 +32,35 @@ pub(super) async fn bind(
     }
     let mut vectors = BTreeMap::new();
     for (id, node) in plan.live() {
+        // An exact `bm25` reads no vector: the exact lexical scan answers it
+        // before the run.
+        if let PhysicalNode::Score {
+            type_name,
+            property,
+            kind: omnigraph_compiler::ir::core::ScoreKind::Distance,
+            query,
+            ..
+        } = node
+        {
+            let vector = resolve_nearest_query_vec(
+                source.catalog,
+                type_name,
+                property,
+                query,
+                &params,
+                embedding,
+            )
+            .await?;
+            vectors.insert(id, vector);
+            continue;
+        }
+        if matches!(node, PhysicalNode::Score { .. }) {
+            continue;
+        }
         let PhysicalNode::Scan { spec, ranked, .. } = node else {
             continue;
         };
-        let Some(ranked) = ranked
-            .as_ref()
-            .filter(|ranked| ranked.kind == RankKind::Nearest)
-        else {
+        let Some(ranked) = ranked.as_ref() else {
             continue;
         };
         let type_name = spec.table.node_type_name().ok_or_else(|| {

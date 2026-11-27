@@ -24,12 +24,12 @@ query add() { insert Sample { key: "new", xs: [] } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query clear() { update Sample set { xs: [] } where key = "existing" }
+query clear() { match { $x: Sample } where $x.key = "existing" update $x set { xs: [] } }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query wrong_element() { update Sample set { xs: ["text"] } where key = "existing" }
+query wrong_element() { match { $x: Sample } where $x.key = "existing" update $x set { xs: ["text"] } }
 
 --- expect error: property `xs` has type [I64] but got [String]
 

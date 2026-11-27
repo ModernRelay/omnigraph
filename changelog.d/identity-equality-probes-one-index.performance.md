@@ -1,0 +1,1 @@
+- A read, `update` or `delete` that selects a node by its key now probes only the identity index and rechecks its other conditions on that row, where it also probed the key column's own index.

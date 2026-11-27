@@ -438,6 +438,142 @@ async fn held_server_owner_applies_twice_and_retains_exact_achieved_receipts() {
         .unwrap();
         assert!(!repeated_effects);
     }
+    // A text-only change (a comment) keeps the accepted identity. The plan
+    // names it with no step; apply publishes no graph commit and the graph
+    // keeps its accepted source; the ledger records the configured text's
+    // digest beside the unchanged contract, so the next plan sees nothing.
+    let accepted_source = fs::read_to_string(dir.path().join("people.pg")).unwrap();
+    let (accepted, version) = graph_state(dir.path(), "knowledge").await;
+    fs::write(
+        dir.path().join("people.pg"),
+        format!("// reviewed\n{accepted_source}"),
+    )
+    .unwrap();
+    let bundle = capture_deployment(dir.path()).unwrap();
+    let configured = bundle.resources["schema.knowledge"].digest.clone();
+    assert_ne!(configured, accepted.source_hash);
+    let planned = plan_captured_deployment(&bundle, &admission, &owner(), &handles)
+        .await
+        .unwrap();
+    assert!(planned.ok && planned.diagnostics.is_empty(), "{planned:?}");
+    let change = planned
+        .changes
+        .iter()
+        .find(|change| change.resource == "schema.knowledge")
+        .unwrap();
+    assert!(change.text_only, "{change:?}");
+    assert!(
+        change
+            .migration
+            .as_ref()
+            .is_some_and(|plan| plan.supported && plan.steps.is_empty())
+    );
+    let mut started = false;
+    let applied = apply_captured_deployment(
+        &bundle,
+        None,
+        &owner(),
+        &admission,
+        &handles,
+        |_, _, _| {},
+        |_| {},
+        &mut started,
+    )
+    .await
+    .unwrap();
+    let DeploymentLookup::Complete { result } = applied else {
+        panic!("{applied:?}");
+    };
+    assert!(result.converged);
+    assert!(
+        matches!(
+            &result.graphs["knowledge"],
+            GraphDeploymentResult::Schema {
+                result: SchemaApplySettlement::NoOp { contract, .. }
+            } if contract == &accepted
+        ),
+        "{:?}",
+        result.graphs
+    );
+    assert_eq!(
+        graph_state(dir.path(), "knowledge").await,
+        (accepted.clone(), version)
+    );
+    assert_eq!(db.schema_source().as_str(), accepted_source);
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap()).unwrap();
+    assert_eq!(
+        ledger["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+        configured.as_str()
+    );
+    assert_eq!(
+        ledger["applied_revision"]["schema_contracts"]["knowledge"],
+        serde_json::to_value(&accepted).unwrap()
+    );
+    let replanned = plan_captured_deployment(&bundle, &admission, &owner(), &handles)
+        .await
+        .unwrap();
+    assert!(
+        replanned.ok && replanned.changes.is_empty(),
+        "{replanned:?}"
+    );
+    // A real change after it publishes the configured text.
+    fs::write(
+        dir.path().join("people.pg"),
+        format!(
+            "// reviewed\n{}",
+            accepted_source.replace("age: I32?", "age: I32?\n  nickname: String?")
+        ),
+    )
+    .unwrap();
+    let bundle = capture_deployment(dir.path()).unwrap();
+    let planned = plan_captured_deployment(&bundle, &admission, &owner(), &handles)
+        .await
+        .unwrap();
+    assert!(
+        planned
+            .changes
+            .iter()
+            .any(|change| change.resource == "schema.knowledge"
+                && !change.text_only
+                && change
+                    .migration
+                    .as_ref()
+                    .is_some_and(|plan| !plan.steps.is_empty())),
+        "{planned:?}"
+    );
+    let applied = apply_captured_deployment(
+        &bundle,
+        None,
+        &owner(),
+        &admission,
+        &handles,
+        |_, _, _| {},
+        |_| {},
+        &mut started,
+    )
+    .await
+    .unwrap();
+    let DeploymentLookup::Complete { result } = applied else {
+        panic!("{applied:?}");
+    };
+    assert!(result.converged);
+    assert!(matches!(
+        &result.graphs["knowledge"],
+        GraphDeploymentResult::Schema {
+            result: SchemaApplySettlement::Committed { .. }
+        }
+    ));
+    let (evolved, evolved_version) = graph_state(dir.path(), "knowledge").await;
+    assert_eq!(
+        evolved.source_hash,
+        bundle.resources["schema.knowledge"].digest
+    );
+    assert_eq!(
+        evolved.schema_identity_domain,
+        accepted.schema_identity_domain
+    );
+    assert!(evolved_version > version);
     // Membership captured at server boot is not current deployment authority:
     // create and delete a later graph under this same lifetime writer.
     add_second_graph(dir.path());

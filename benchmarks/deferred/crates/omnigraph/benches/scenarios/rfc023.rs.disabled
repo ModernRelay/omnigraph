@@ -545,7 +545,7 @@ pub(super) async fn age_fixture(db: &Session, args: &Args) -> serde_json::Value 
             &original
         };
         let row = graph_jsonl_chunk("base", 0, 1, patterns);
-        db.load("main", &row, LoadMode::Merge)
+        db.load("main", &row, LoadMode::Replace)
             .await
             .expect("apply age update");
         applied += 1;
@@ -572,7 +572,7 @@ pub(super) async fn age_fixture(db: &Session, args: &Args) -> serde_json::Value 
             .await
             .expect("create retirement fixture branch");
         let row = graph_jsonl_chunk("age-retired-row", 0, 1, &original);
-        db.load(&branch, &row, LoadMode::Append)
+        db.load(&branch, &row, LoadMode::Insert)
             .await
             .expect("first-touch retired branch");
         let snapshot = db
@@ -701,7 +701,7 @@ pub(super) async fn load_graph_rows(
         let mode = if cursor == 0 {
             first_mode
         } else {
-            LoadMode::Append
+            LoadMode::Insert
         };
         let result = db
             .load(branch, &jsonl, mode)
@@ -825,7 +825,7 @@ pub(super) async fn fenced_adopt_setup(args: &Args) -> serde_json::Value {
         args.rows,
         source_plan.batch_rows,
         &source_vectors,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await;
     let table_uri = only_node_table_uri(root);
@@ -1797,9 +1797,9 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
         let jsonl = graph_jsonl_chunk(source_prefix, cursor, end, &source_vectors);
         max_source_json_chunk_bytes = max_source_json_chunk_bytes.max(jsonl.len() as u64);
         let mode = if inserting {
-            LoadMode::Append
+            LoadMode::Insert
         } else {
-            LoadMode::Merge
+            LoadMode::Replace
         };
         db.load(GENERAL_MERGE_SOURCE_BRANCH, &jsonl, mode)
             .await
@@ -1820,7 +1820,7 @@ pub(super) async fn general_merge_setup(args: &Args) -> serde_json::Value {
     let diverge_start = Instant::now();
     let diverge_jsonl =
         graph_jsonl_chunk("base", target_divergence_start, args.rows, &diverge_vectors);
-    db.load("main", &diverge_jsonl, LoadMode::Merge)
+    db.load("main", &diverge_jsonl, LoadMode::Replace)
         .await
         .expect("advance main after the branch forked");
     let target_diverge_ms = diverge_start.elapsed().as_millis() as u64;

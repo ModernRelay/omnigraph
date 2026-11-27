@@ -2,51 +2,35 @@
 //! types are declarations carried by the IR, including explicit conversions.
 
 use omnigraph_compiler::ir::{BlockAggregateExpr, IRExpr, IRProjection};
-use omnigraph_compiler::query::ast::BinaryOp;
+use omnigraph_compiler::query::value::BinaryOp;
 use serde_json::{Value, json};
 
 use crate::logical::Predicate;
 
+/// The typed tree of `root`, each node with its operator, its text and its
+/// type. A node [`MAX_HANDED_OFF_DEPTH`] levels down is written without its
+/// arguments, marked `elided`: every node carries its subtree's text, so a
+/// deeper tree would render in space quadratic in its depth.
+///
+/// [`MAX_HANDED_OFF_DEPTH`]: omnigraph_compiler::stack::MAX_HANDED_OFF_DEPTH
 pub(crate) fn expr(root: &IRExpr) -> Value {
     enum Step<'a> {
-        Visit(&'a IRExpr),
-        Finish(&'a IRExpr, &'static str, usize),
+        Visit(&'a IRExpr, usize),
+        Finish(&'a IRExpr, &'static str, usize, bool),
     }
-    let mut pending = vec![Step::Visit(root)];
+    let mut pending = vec![Step::Visit(root, 1)];
     let mut completed = Vec::new();
     while let Some(step) = pending.pop() {
         match step {
-            Step::Visit(expr) => {
+            Step::Visit(expr, depth) => {
                 let (op, children): (&'static str, Vec<&IRExpr>) = match expr {
                     IRExpr::PropAccess { .. } => ("property", vec![]),
                     IRExpr::Nearest { query, .. } => ("nearest", vec![query]),
-                    IRExpr::Search { field, query, .. } => ("search", vec![field, query]),
-                    IRExpr::Fuzzy {
-                        field,
-                        query,
-                        max_edits,
-                        ..
-                    } => {
-                        let mut args = vec![field.as_ref(), query.as_ref()];
-                        args.extend(max_edits.as_deref());
-                        ("fuzzy", args)
-                    }
-                    IRExpr::MatchText { field, query, .. } => ("match_text", vec![field, query]),
-                    IRExpr::Bm25 { field, query, .. } => ("bm25", vec![field, query]),
-                    IRExpr::Rrf {
-                        primary,
-                        secondary,
-                        k,
-                        ..
-                    } => {
-                        let mut args = vec![primary.as_ref(), secondary.as_ref()];
-                        args.extend(k.as_deref());
-                        ("rrf", args)
-                    }
                     IRExpr::Variable(_, _) => ("variable", vec![]),
                     IRExpr::Param(_, _) => ("param", vec![]),
                     IRExpr::Literal(_, _) => ("literal", vec![]),
-                    IRExpr::Aggregate { arg, .. } => ("aggregate", vec![arg]),
+                    // The argument, then `percentile`'s fraction.
+                    IRExpr::Aggregate { .. } => ("aggregate", expr.children()),
                     IRExpr::AliasRef(_, _) => ("alias", vec![]),
                     IRExpr::Binary {
                         left, op, right, ..
@@ -55,20 +39,44 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                             BinaryOp::And => "and",
                             BinaryOp::Or => "or",
                             BinaryOp::Compare(_) => "compare",
+                            BinaryOp::Arith(_) => "arith",
                         },
                         vec![left, right],
                     ),
                     IRExpr::Not(inner, _) => ("not", vec![inner]),
                     IRExpr::IsNull { expr, .. } => ("is_null", vec![expr]),
                     IRExpr::Cast { expr, .. } => ("cast", vec![expr]),
+                    IRExpr::Neg { expr, .. } => ("neg", vec![expr]),
+                    // The registry's `cast` row is `cast_value`: `cast` is the
+                    // stored widening conversion's node.
+                    IRExpr::Call {
+                        func: omnigraph_compiler::ir::expr::ScalarFunc::Cast,
+                        args,
+                        ..
+                    } => ("cast_value", args.iter().collect()),
+                    IRExpr::Call { func, args, .. } => (func.name(), args.iter().collect()),
                 };
 
-                pending.push(Step::Finish(expr, op, children.len()));
-                pending.extend(children.into_iter().rev().map(Step::Visit));
+                let elided = depth >= omnigraph_compiler::stack::MAX_HANDED_OFF_DEPTH
+                    && !children.is_empty();
+                if elided {
+                    pending.push(Step::Finish(expr, op, 0, true));
+                } else {
+                    pending.push(Step::Finish(expr, op, children.len(), false));
+                    pending.extend(
+                        children
+                            .into_iter()
+                            .rev()
+                            .map(|child| Step::Visit(child, depth + 1)),
+                    );
+                }
             }
-            Step::Finish(expr, op, count) => {
+            Step::Finish(expr, op, count, elided) => {
                 let children = completed.split_off(completed.len() - count);
-                let tree = json!({ "op": op, "gq": expr.to_string(), "type": expr.ty().spelling(), "args": children });
+                let mut tree = json!({ "op": op, "gq": expr.to_string(), "type": expr.ty().spelling(), "args": children });
+                if elided {
+                    tree["elided"] = Value::Bool(true);
+                }
                 if pending.is_empty() {
                     return tree;
                 }
@@ -157,7 +165,7 @@ pub(crate) fn block_aggregate(
 mod tests {
     use super::*;
     use crate::logical::GqFilter;
-    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::query::value::{CompOp, Literal};
     use omnigraph_compiler::{ExprType, PropType, ScalarType};
 
     fn ty(scalar: ScalarType, nullable: bool) -> ExprType {
@@ -181,24 +189,6 @@ mod tests {
         assert_eq!(tree["args"][0]["args"][0]["type"], "I32");
         assert_eq!(tree["args"][1]["gq"], "$right");
         assert_eq!(tree["args"][1]["args"][0]["type"], "U32");
-        let fuzzy = IRExpr::Fuzzy {
-            field: Box::new(IRExpr::PropAccess {
-                variable: "p".into(),
-                property: "name".into(),
-                ty: ty(ScalarType::String, false),
-            }),
-            query: Box::new(IRExpr::Param("query".into(), ty(ScalarType::String, false))),
-            max_edits: Some(Box::new(IRExpr::Literal(
-                Literal::Integer(2),
-                ty(ScalarType::I64, false),
-            ))),
-            ty: ty(ScalarType::Bool, false),
-        };
-        let tree = expr(&fuzzy);
-        assert_eq!(tree["args"].as_array().unwrap().len(), 3);
-        assert_eq!(tree["args"][0]["gq"], "$p.name");
-        assert_eq!(tree["args"][1]["gq"], "$query");
-        assert_eq!(tree["args"][2]["gq"], "2");
     }
 
     #[test]

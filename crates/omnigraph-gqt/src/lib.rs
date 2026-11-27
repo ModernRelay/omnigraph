@@ -2,16 +2,16 @@
 
 use futures::FutureExt as _;
 use omnigraph::Session;
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::Omnigraph;
 use omnigraph::storage::StorageAdapter;
-use omnigraph_compiler::settings::{DEFINITIONS, Engine};
-use omnigraph_compiler::{ParamMap, QueryResult};
+use omnigraph_compiler::QueryResult;
+use omnigraph_compiler::settings::DEFINITIONS;
 use omnigraph_gqt_core::concurrent::{ConcurrentStep, Pass, permutation};
 pub use omnigraph_gqt_core::runner_config;
 use omnigraph_gqt_core::runner_config::{Execution, SeamDirective};
 use omnigraph_gqt_core::{
-    Case, ControlStep, ControlWrite, ExecutionHost, Item, Observer, QueryStep, Step, StepFail,
-    canonical_json, case_session, parse_case, run_session, seed_case,
+    Case, ControlStep, ControlWrite, ExecutionHost, Item, Observer, ReferenceRefusal, Step,
+    StepFail, canonical_json, case_session, parse_case, run_session, seed_case,
 };
 pub use omnigraph_gqt_core::{ServerTarget, admit_served};
 use serde_json::Value;
@@ -38,7 +38,6 @@ pub use dst_runner::{
 pub const CASE_TIMEOUT_ENV: &str = "OMNIGRAPH_GQ_CASE_TIMEOUT_SECS";
 pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 10;
 pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
-pub const ENGINE_ENV: &str = "OMNIGRAPH_GQ_ENGINE";
 pub(crate) const RETIRED_SETTING_ENVIRONMENT: [&str; 1] = ["OMNIGRAPH_TRAVERSAL_MODE"];
 
 /// The runner's host: `base` makes every reopen an `Omnigraph::open_clone`
@@ -46,11 +45,15 @@ pub(crate) const RETIRED_SETTING_ENVIRONMENT: [&str; 1] = ["OMNIGRAPH_TRAVERSAL_
 /// (`concurrent::permutation`, `Pass(0)` the declaration order).
 struct GqtHost {
     base: Option<String>,
+    /// The physical layout of a layout variant run, whose plans are not
+    /// held to the case's `--- expect plan`.
+    layout: Option<Layout>,
     pass: Pass,
 }
 
 const PLAIN_HOST: GqtHost = GqtHost {
     base: None,
+    layout: None,
     pass: Pass(0),
 };
 
@@ -80,23 +83,56 @@ impl ExecutionHost for GqtHost {
     fn finish_seams(&self, guard: Self::StepGuard) -> Result<(), String> {
         dst_runner::finish_seams(guard)
     }
-    fn active(&self) -> bool {
-        dst_runner::active()
+    fn compares_reference(&self) -> bool {
+        !dst_runner::active()
     }
-    fn reference_query<'a>(
+    fn checks_plans(&self) -> bool {
+        self.layout.is_none()
+    }
+    fn reference_rows<'a>(
         &'a self,
         session: &'a Session,
-        step: &'a QueryStep,
-        target: ReadTarget,
-        params: &'a ParamMap,
-    ) -> futures::future::BoxFuture<'a, Result<QueryResult, String>> {
+        read: &'a omnigraph_compiler::ir::core::CoreRead,
+        target: &'a omnigraph::db::ReadTarget,
+        params: &'a omnigraph_compiler::ParamMap,
+    ) -> futures::future::BoxFuture<'a, Result<Result<Vec<Value>, ReferenceRefusal>, String>> {
         async move {
-            session
-                .clone()
-                .with_read_executor(Arc::new(omnigraph_reference_engine::ReferenceEngine))
-                .query(target, &step.source, &step.name, params)
-                .await
-                .map_err(|error| error.to_string())
+            // The reference reads the target's rows through the engine's
+            // export, the narrowest public read of a whole branch or
+            // snapshot.
+            // A target the export cannot read is input the reference
+            // cannot read.
+            let export = match session.db().export_jsonl_at(target.clone(), &[]).await {
+                Ok(export) => export,
+                Err(e) => return Ok(Err(ReferenceRefusal::Input(format!("export failed: {e}")))),
+            };
+            // At an explicit commit the read, and the export, see the
+            // current schema as the commit holds it.
+            let catalog = match omnigraph_gqt_core::read_catalog(session, target).await {
+                Ok(catalog) => catalog,
+                Err(e) => return Ok(Err(ReferenceRefusal::Input(e))),
+            };
+            let params = params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            Ok(omnigraph_reference::Graph::from_export(&catalog, &export)
+                .and_then(|graph| {
+                    omnigraph_reference::Interpreter::new(&catalog, &graph, &params)
+                        .run(read)
+                        .map(|(rows, _)| rows)
+                })
+                .map_err(|refusal| match refusal {
+                    omnigraph_reference::Refusal::Runtime(code, message) => {
+                        ReferenceRefusal::Runtime {
+                            code: code.to_string(),
+                            message,
+                        }
+                    }
+                    omnigraph_reference::Refusal::Input(message) => {
+                        ReferenceRefusal::Input(message)
+                    }
+                    omnigraph_reference::Refusal::Unsupported(what) => {
+                        ReferenceRefusal::Unsupported(what)
+                    }
+                }))
         }
         .boxed()
     }
@@ -148,16 +184,16 @@ pub struct CaseOutcome {
     pub stem: String,
     pub elapsed: Duration,
     pub result: Result<(), String>,
+    /// The `--- reference skipped:` reasons of a run on the direct engine,
+    /// one line per step, printed under the case's result line.
+    pub notes: Vec<String>,
 }
 
 pub fn measure_model_names() -> Vec<&'static str> {
     measure::MODELS.iter().map(|model| model.name).collect()
 }
 
-async fn open_case_store(
-    case: &Case,
-    engine: Engine,
-) -> Result<(Session, String, tempfile::TempDir), String> {
+async fn open_case_store(case: &Case) -> Result<(Session, String, tempfile::TempDir), String> {
     let fixture = case
         .fixture
         .as_ref()
@@ -172,7 +208,7 @@ async fn open_case_store(
         .await
         .map_err(|e| format!("init failed: {e}"))?;
     let db = with_case_external_blob_policy(db, case)?;
-    let session = case_session(db, case, engine)?;
+    let session = case_session(db, case)?;
     seed_case(&session, fixture, case.needs_indices).await?;
     Ok((session, uri, dir))
 }
@@ -193,10 +229,7 @@ fn execute_case<'a>(
     path: &'a Path,
     bless: bool,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    match engine_from_env() {
-        Ok(engine) => execute_case_on_engine(case, path, bless, engine, None, None),
-        Err(error) => futures::future::ready(Err(error)).boxed(),
-    }
+    execute_case_on_engine(case, path, bless, None, None)
 }
 
 /// The in-process verdict of a parsed case on a fresh engine, as the
@@ -222,11 +255,10 @@ fn execute_case_on_engine<'a>(
     case: &'a Case,
     path: &'a Path,
     bless: bool,
-    engine: Engine,
     store: Option<&'a str>,
     base: Option<&'a str>,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_case_inner(case, path, bless, engine, store, base).boxed()
+    execute_case_inner(case, path, bless, store, base).boxed()
 }
 
 /// With `base`, the `--store` root is opened as a clone read through to that
@@ -235,7 +267,6 @@ async fn execute_case_inner(
     case: &Case,
     path: &Path,
     bless: bool,
-    engine: Engine,
     store: Option<&str>,
     base: Option<&str>,
 ) -> Result<(), String> {
@@ -247,9 +278,10 @@ async fn execute_case_inner(
         }
         .map_err(|e| format!("open failed: {e}"))?;
         let db = with_case_external_blob_policy(db, case)?;
-        let session = case_session(db, case, engine)?;
+        let session = case_session(db, case)?;
         let host = GqtHost {
             base: base.map(str::to_owned),
+            layout: None,
             pass: Pass(0),
         };
         return omnigraph_gqt_core::execute_steps(
@@ -260,8 +292,12 @@ async fn execute_case_inner(
     }
     let passes = if bless { 1 } else { case.plain_passes() };
     for pass in (0..passes).map(Pass) {
-        let (session, uri, _dir) = open_case_store(case, engine).await?;
-        let host = GqtHost { base: None, pass };
+        let (session, uri, _dir) = open_case_store(case).await?;
+        let host = GqtHost {
+            base: None,
+            layout: None,
+            pass,
+        };
         omnigraph_gqt_core::execute_steps(case, path, bless, session, &uri, None, &host, &host)
             .await
             .map_err(|e| {
@@ -300,7 +336,6 @@ async fn execute_case_with_storage(
     path: &Path,
     uri: &str,
     storage: Arc<dyn StorageAdapter>,
-    engine: Engine,
     prepared: Option<&str>,
 ) -> Result<(), String> {
     let db = match (prepared, case.fixture.as_ref()) {
@@ -318,7 +353,7 @@ async fn execute_case_with_storage(
         (None, None) => return Err("invalid_case: DST requires schema and seed, or --store".into()),
     };
     let db = with_case_external_blob_policy(db, case)?;
-    let session = case_session(db, case, engine)?;
+    let session = case_session(db, case)?;
     if let (None, Some(fixture)) = (prepared, case.fixture.as_ref()) {
         seed_case(&session, fixture, case.needs_indices).await?;
     }
@@ -475,19 +510,6 @@ pub fn bless_from_env() -> Result<bool, String> {
     }
 }
 
-pub fn engine_from_env() -> Result<Engine, String> {
-    match std::env::var(ENGINE_ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(Engine::V2),
-        Err(std::env::VarError::NotUnicode(v)) => Err(format!(
-            "invalid_case: {ENGINE_ENV} requires UTF-8, got {v:?}"
-        )),
-        Ok(v) if v.is_empty() => Ok(Engine::V2),
-        Ok(v) => Engine::from_spelling(&v).ok_or_else(|| {
-            format!("invalid_case: {ENGINE_ENV} takes v2 (or empty/unset), got `{v}`")
-        }),
-    }
-}
-
 pub fn case_budget_from_env() -> Duration {
     Duration::from_secs(env_positive(CASE_TIMEOUT_ENV).unwrap_or(DEFAULT_CASE_TIMEOUT_SECS))
 }
@@ -570,6 +592,7 @@ where
         stem: stem.to_string(),
         elapsed: started.elapsed(),
         result,
+        notes: Vec::new(),
     }
 }
 
@@ -580,3 +603,215 @@ pub async fn run_case_bounded(path: PathBuf, budget: Duration, bless: bool) -> C
 
 #[cfg(test)]
 mod tests;
+
+/// One read judged against the core reference interpreter, for the
+/// generated laws (`tests/integration/law_*.rs`): both answers rendered,
+/// and the corpus's verdict on them ([`omnigraph_gqt_core::judge_reference`]).
+#[derive(Debug)]
+pub struct ReferenceJudgment {
+    pub engine: String,
+    pub reference: String,
+    pub verdict: Result<(), String>,
+}
+
+/// Runs the read `name` of `source` on `session`'s `main` and on the
+/// reference interpreter over the same branch, judged as the corpus judges
+/// a read step: as ordered rows when `ordered`, as bags otherwise, or as
+/// the same refusal. A compile-time refusal is an error: the read has no
+/// core term, so the law has nothing to compare.
+pub async fn judge_read_against_reference(
+    session: &Session,
+    source: &str,
+    name: &str,
+    params: &omnigraph_compiler::ParamMap,
+    ordered: bool,
+) -> Result<ReferenceJudgment, String> {
+    use omnigraph_compiler::ir::core::CoreDecl;
+    use omnigraph_gqt_core::{EngineRefusal, judge_reference};
+    let catalog = session.catalog();
+    let checked = omnigraph_compiler::query::check::check_source(&catalog, source)
+        .map_err(|d| format!("the source does not parse: {}: {}", d.code, d.message))?;
+    let read = match checked.into_iter().find(|(n, _)| n == name).map(|(_, r)| r) {
+        Some(Ok(checked)) => match checked.core {
+            CoreDecl::Read(read) => read,
+            CoreDecl::Write(_) => return Err(format!("`{name}` is a write")),
+        },
+        Some(Err(d)) => {
+            return Err(format!(
+                "the checker refuses `{name}`: {}: {}",
+                d.code, d.message
+            ));
+        }
+        None => return Err(format!("no declaration `{name}`")),
+    };
+    let target = omnigraph::db::ReadTarget::branch("main");
+    let engine = match session.query(target.clone(), source, name, params).await {
+        Ok(result) => match result.to_rust_json() {
+            Ok(Value::Array(rows)) => Ok((rows, ordered)),
+            Ok(other) => return Err(format!("the engine rendered {other}")),
+            Err(e) => return Err(format!("the engine's rows did not render: {e}")),
+        },
+        Err(error) => match EngineRefusal::of(&error) {
+            EngineRefusal::Static => {
+                return Err(format!("the engine refused at compile time: {error}"));
+            }
+            refusal => Err(refusal),
+        },
+    };
+    let reference = PLAIN_HOST
+        .reference_rows(session, &read, &target, params)
+        .await?;
+    let render_engine = match &engine {
+        Ok((rows, _)) => Value::Array(rows.clone()).to_string(),
+        Err(refusal) => format!("refused: {refusal:?}"),
+    };
+    let render_reference = match &reference {
+        Ok(rows) => Value::Array(rows.clone()).to_string(),
+        Err(refusal) => format!("refused: {refusal}"),
+    };
+    Ok(ReferenceJudgment {
+        verdict: judge_reference(&reference, &engine),
+        engine: render_engine,
+        reference: render_reference,
+    })
+}
+
+/// A physical layout of a case's seeded graph (the layout variants,
+/// `tests/gq_layout_tests.rs`): the same rows stored and indexed four ways,
+/// under which every direct-engine case must keep its expected rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// `a`: no index is built, so every read scans.
+    NoIndexes,
+    /// `b`: every index the schema declares is built.
+    Indexed,
+    /// `c`: every index built, then the seed's second half of keyed nodes
+    /// written again, so their rows sit in fragments no index covers and
+    /// the uncovered tail is scanned beside the index.
+    PartialCoverage,
+    /// `d`: the seed's second half and then its first quarter of keyed
+    /// nodes written again, leaving several fragments with deleted rows and
+    /// their re-inserted copies, then every index built.
+    Fragmented,
+}
+
+impl Layout {
+    pub const ALL: [Layout; 4] = [
+        Layout::NoIndexes,
+        Layout::Indexed,
+        Layout::PartialCoverage,
+        Layout::Fragmented,
+    ];
+
+    pub fn letter(self) -> char {
+        match self {
+            Layout::NoIndexes => 'a',
+            Layout::Indexed => 'b',
+            Layout::PartialCoverage => 'c',
+            Layout::Fragmented => 'd',
+        }
+    }
+
+    pub fn of_letter(letter: char) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|layout| layout.letter() == letter)
+    }
+}
+
+/// The verdict of `case` with its seed stored in `layout`: every step runs
+/// as in the corpus, the reference comparison included, except that a
+/// step's `--- expect plan` is not held (it names the case's own access
+/// path).
+pub async fn execute_with_layout(case: &Case, path: &Path, layout: Layout) -> Result<(), String> {
+    let fixture = case
+        .fixture
+        .as_ref()
+        .ok_or("invalid_case: a layout variant needs the case's schema and seed")?;
+    let dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
+    let uri = dir
+        .path()
+        .to_str()
+        .ok_or_else(|| "temp path is not utf-8".to_string())?
+        .to_string();
+    let db = Omnigraph::init(&uri, &fixture.schema)
+        .await
+        .map_err(|e| format!("init failed: {e}"))?;
+    let db = with_case_external_blob_policy(db, case)?;
+    let session = case_session(db, case)?;
+    // The fixture as the corpus seeds it (its rows and declared branches),
+    // without index preparation: the layout decides the indexes.
+    seed_case(&session, fixture, false).await?;
+    let index = |session: &Session| {
+        let session = session.clone();
+        async move {
+            session
+                .ensure_indices_as(None)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("ensure_indices failed: {e}"))
+        }
+    };
+    match layout {
+        Layout::NoIndexes => {}
+        Layout::Indexed => index(&session).await?,
+        Layout::PartialCoverage => {
+            index(&session).await?;
+            rewrite_keyed_nodes(&session, &fixture.seed, |i, n| i >= n / 2).await?;
+        }
+        Layout::Fragmented => {
+            rewrite_keyed_nodes(&session, &fixture.seed, |i, n| i >= n / 2).await?;
+            rewrite_keyed_nodes(&session, &fixture.seed, |i, n| i < n.div_ceil(4)).await?;
+            index(&session).await?;
+        }
+    }
+    let host = GqtHost {
+        base: None,
+        layout: Some(layout),
+        pass: Pass(0),
+    };
+    omnigraph_gqt_core::execute_steps(case, path, false, session, &uri, None, &host, &host)
+        .await
+        .map(|_| ())
+}
+
+/// Writes again, by key (`LoadMode::Replace`), the seed lines of keyed node
+/// types that `pick(position, count)` selects: the same logical rows, moved
+/// to a new fragment with their old copies deleted. A generated seed is
+/// left as it is.
+async fn rewrite_keyed_nodes(
+    session: &Session,
+    seed: &omnigraph_gqt_core::Seed,
+    pick: impl Fn(usize, usize) -> bool,
+) -> Result<(), String> {
+    let omnigraph_gqt_core::Seed::Inline(text) = seed else {
+        return Ok(());
+    };
+    let catalog = session.catalog();
+    let keyed: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line).ok().is_some_and(|row| {
+                row.get("type")
+                    .and_then(Value::as_str)
+                    .and_then(|t| catalog.node_types.get(t))
+                    .is_some_and(|node| node.key.is_some())
+            })
+        })
+        .collect();
+    let n = keyed.len();
+    let picked: Vec<&str> = keyed
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| pick(*i, n))
+        .map(|(_, line)| line)
+        .collect();
+    if picked.is_empty() {
+        return Ok(());
+    }
+    session
+        .load_jsonl(&picked.join("\n"), omnigraph::loader::LoadMode::Replace)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("layout rewrite failed: {e}"))
+}

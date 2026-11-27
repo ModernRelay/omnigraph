@@ -12,19 +12,18 @@ use arrow_schema::SchemaRef;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::datatypes::Field;
 use lance_file::version::ConcreteFileVersion;
-use omnigraph_compiler::CheckedRead;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRExpr, IROp, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::ir::{IRExpr, ParamMap};
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::settings::{RrfPlan, SessionSettings, Traversal};
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{
     AcceptInput, AcceptedBoundPlan, AcceptedPlan, AdjacencyProof, Bounds, DatasetPin,
     EXPAND_INDEXED_MAX_FRONTIER_ENV, EXPAND_INDEXED_MAX_HOPS_ENV, ExpandStatistics, Explain,
-    FragmentStat, FullTextCoverage, GatePolicy, IndexFact, KeyIds, NodeTypeSpec, Operation,
-    PlanError, PlanSource, PrefilterMode, ReplayEnvelope, ReplayRefusal, SideId, TableRef,
-    Unrouted, ValidationLimits,
+    FragmentStat, GatePolicy, IndexFact, KeyIds, NodeTypeSpec, Operation, PlanError, PlanSource,
+    PrefilterMode, ReplayEnvelope, ReplayRefusal, SideId, TableRef, Unrouted, ValidationLimits,
 };
+use omnigraph_planner::{PatternStep, ReadShape};
 
 use super::ResolvedParams;
 use super::scan::ir_expr_to_df_expr;
@@ -112,10 +111,10 @@ fn gate_policy(settings: &SessionSettings) -> GatePolicy {
 pub(crate) struct QuerySource<'a> {
     /// The compiled query with every constant of a filter position folded to
     /// its bound value (`engine::constant`); the planner reads no other form.
-    pub ir: QueryIR,
-    /// The declaration `ir` was lowered from, as the type checker accepted
-    /// it: acceptance derives the query's requirements from it.
-    pub checked: CheckedRead,
+    pub ir: ReadShape,
+    /// The checked core read, which plan acceptance derives the placement
+    /// of the conjuncts from.
+    pub core: Arc<omnigraph_compiler::ir::core::CoreRead>,
     pub catalog: &'a Arc<Catalog>,
     /// The pinned snapshot of the user graph; `None` under the
     /// catalogue-only scope, where every table the planner asks for is a
@@ -136,9 +135,6 @@ struct TableStatistics {
     file_bytes: Option<u64>,
     column_bytes: HashMap<String, u64>,
     index_facts: Vec<IndexFact>,
-    /// The pinned version's current fragments: one with none holds no row a
-    /// full-text call could answer differently.
-    fragments: usize,
 }
 
 impl<'a> QuerySource<'a> {
@@ -152,7 +148,21 @@ impl<'a> QuerySource<'a> {
         params: &ParamMap,
         settings: &'a SessionSettings,
     ) -> Result<QuerySource<'a>> {
-        let params = resolve_params(&query.ir, params)?;
+        Self::gather_at(query, catalog, snapshot, params, None, settings).await
+    }
+
+    /// [`Self::gather`] with `now()` bound to `now` instead of the clock
+    /// when one is given: a write's selection reads the instant the write
+    /// bound once for every attempt and every assignment.
+    pub(crate) async fn gather_at(
+        query: &CompiledQuery,
+        catalog: &'a Arc<Catalog>,
+        snapshot: Option<&'a Snapshot>,
+        params: &ParamMap,
+        now: Option<&Literal>,
+        settings: &'a SessionSettings,
+    ) -> Result<QuerySource<'a>> {
+        let params = resolve_params(&query.ir, params, now)?;
         let ir = super::constant::fold_query_constants(&query.ir, params.shared())?;
         let table_stats = match snapshot {
             Some(snapshot) => query_table_statistics(&ir, snapshot).await?,
@@ -160,7 +170,7 @@ impl<'a> QuerySource<'a> {
         };
         let mut source = QuerySource {
             ir,
-            checked: query.checked.clone(),
+            core: Arc::clone(&query.core),
             catalog,
             snapshot,
             params,
@@ -273,18 +283,6 @@ impl<'a> QuerySource<'a> {
 }
 
 impl PlanSource for QuerySource<'_> {
-    /// A table the snapshot does not hold has no rows, so nothing is refused;
-    /// otherwise the coverage its pinned index facts and fragments establish,
-    /// the rule replay applies to the same version.
-    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
-        match self.table_stats.get(type_key) {
-            Some(stats) => {
-                FullTextCoverage::of_table(&stats.index_facts, property, stats.fragments)
-            }
-            None => FullTextCoverage::Full,
-        }
-    }
-
     fn canonical_key_id(
         &self,
         type_key: &str,
@@ -300,21 +298,6 @@ impl PlanSource for QuerySource<'_> {
         };
         canonical_key_id_of(self.catalog, type_key, literal, value.ty())
             .map_err(|error| PlanError::Internal(error.to_string()))
-    }
-
-    fn scan_runtime_input(
-        &self,
-        scan: &omnigraph_planner::ScanSpec,
-    ) -> Option<omnigraph_planner::RuntimeInput> {
-        scan.filter
-            .as_ref()
-            .is_some_and(|predicate| {
-                predicate
-                    .gq_filters()
-                    .iter()
-                    .any(super::search::is_search_filter)
-            })
-            .then_some(omnigraph_planner::RuntimeInput::SearchFilter)
     }
 
     fn index_split<'a>(
@@ -350,6 +333,10 @@ impl PlanSource for QuerySource<'_> {
             .then(|| self.settings.traversal_work_limit())
     }
 
+    fn read_work_limit(&self) -> Option<u64> {
+        Some(self.settings.read_work_limit())
+    }
+
     fn schema(&self, side: SideId) -> std::result::Result<SchemaRef, PlanError> {
         Err(PlanError::Unresolved {
             detail: format!("a query plan names its scans by type, not by side {side:?}"),
@@ -379,6 +366,17 @@ impl PlanSource for QuerySource<'_> {
             .column_bytes
             .get(column)
             .copied()
+    }
+
+    fn edge_object_fields(
+        &self,
+        type_name: &str,
+    ) -> std::result::Result<arrow_schema::Fields, PlanError> {
+        self.catalog
+            .edge_object_fields(type_name)
+            .ok_or_else(|| PlanError::Unresolved {
+                detail: format!("unknown edge type `{type_name}`"),
+            })
     }
 
     /// The scan keeps the catalog's key (`node:<type_name>`), never the
@@ -517,7 +515,6 @@ fn unsupported_query(diagnostic: Box<omnigraph_compiler::QueryDiagnostic>) -> Om
 fn plan_error(error: PlanError) -> OmniError {
     match error {
         PlanError::Unsupported(diagnostic) => unsupported_query(diagnostic),
-        PlanError::FullTextIndexRequired { index } => OmniError::FullTextIndexRequired { index },
         other => no_plan(other),
     }
 }
@@ -529,22 +526,31 @@ fn no_plan(reason: impl std::fmt::Display) -> OmniError {
 }
 
 /// The query's parameters with every omitted nullable one bound to null and
-/// `now()` bound to the clock; an omitted required one is the error the query
-/// answers.
-fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
+/// `now()` bound to `now`, or to the clock when none is given; an omitted
+/// required one is the error the query answers.
+fn resolve_params(
+    ir: &ReadShape,
+    params: &ParamMap,
+    now: Option<&Literal>,
+) -> Result<ResolvedParams> {
     let mut resolved = params.clone();
     fill_declared_params(&mut resolved, &ir.params)?;
-    let now_name = omnigraph_compiler::query::ast::NOW_PARAM_NAME;
+    let now_name = omnigraph_compiler::query::value::NOW_PARAM_NAME;
     if resolved.contains_key(now_name) {
         return Err(OmniError::manifest(format!(
             "param '{now_name}': reserved for now() and cannot be bound"
         )));
     }
-    let now = time::OffsetDateTime::from(crate::dst_clock::system_time_now())
-        .truncate_to_millisecond()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?;
-    resolved.insert(now_name.to_string(), Literal::DateTime(now));
+    let now = match now {
+        Some(now) => now.clone(),
+        None => Literal::DateTime(
+            time::OffsetDateTime::from(crate::dst_clock::system_time_now())
+                .truncate_to_millisecond()
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?,
+        ),
+    };
+    resolved.insert(now_name.to_string(), now);
     validate_params(&resolved, &ir.params)?;
     Ok(ResolvedParams(Arc::new(resolved)))
 }
@@ -613,7 +619,6 @@ impl KeyIds for CatalogKeys<'_> {
 fn unaccepted(reason: Unrouted) -> OmniError {
     match reason {
         Unrouted::UnsupportedQuery { diagnostic } => unsupported_query(diagnostic),
-        Unrouted::FullTextIndexRequired { index } => OmniError::FullTextIndexRequired { index },
         Unrouted::ValidationExhausted { limit, value } => OmniError::ResourceLimitExceeded {
             resource: format!("plan validation {limit}"),
             limit: value,
@@ -634,9 +639,9 @@ impl QuerySource<'_> {
 
     fn accept_input<'s>(&'s self, keys: &'s CatalogKeys<'s>) -> AcceptInput<'s> {
         AcceptInput {
-            checked: &self.checked,
             catalog: self.catalog,
             ir: &self.ir,
+            core: Some(&self.core),
             params: self.params.shared(),
             keys,
             limits: ValidationLimits::DEFAULT,
@@ -664,55 +669,14 @@ pub(crate) fn accept_replay(
     let ir = super::constant::fold_query_constants(&query.ir, &params)?;
     let keys = CatalogKeys(catalog);
     let input = AcceptInput {
-        checked: &query.checked,
         catalog,
         ir: &ir,
+        core: Some(&query.core),
         params: &params,
         keys: &keys,
         limits: ValidationLimits::DEFAULT,
     };
     omnigraph_planner::accept_replay(envelope, &input).map_err(replay_refused)
-}
-
-/// Re-establish from the pinned snapshot every full-text coverage fact a
-/// replayed plan records, since a serialized fact cannot vouch for itself:
-/// a pinned dataset version fixes its index coverage, so a recorded value
-/// that differs, or one for a table the plan pins no version of, is invalid
-/// evidence. The dataset pins are checked first (`plan_pins_snapshot`).
-pub(crate) async fn replayed_coverage_holds(
-    plan: &omnigraph_planner::PhysicalPlan,
-    snapshot: &Snapshot,
-) -> Result<()> {
-    let refuse = |reason: String| replay_refused(ReplayRefusal::InvalidEvidence { reason });
-    for (key, recorded) in &plan.assumptions().full_text {
-        let Some((type_key, property)) = key.rsplit_once('.') else {
-            return Err(refuse(format!(
-                "the plan records full-text coverage under `{key}`, which names no table property"
-            )));
-        };
-        if !plan.assumptions().datasets.contains_key(type_key) {
-            return Err(refuse(format!(
-                "the plan records full-text coverage of `{key}` without pinning `{type_key}`"
-            )));
-        }
-        let actual = match snapshot.dataset(type_key) {
-            Some(_) => {
-                let dataset = snapshot.open_lance_dataset(type_key).await?;
-                FullTextCoverage::of_table(
-                    &indexes::gather(&dataset).await?,
-                    property,
-                    dataset.get_fragments().len(),
-                )
-            }
-            None => FullTextCoverage::Full,
-        };
-        if actual != *recorded {
-            return Err(refuse(format!(
-                "the plan records full-text coverage {recorded:?} of `{key}`; the pinned snapshot holds {actual:?}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// A refused replay as the caller sees it: replanning is a conflict to
@@ -768,7 +732,7 @@ pub(crate) async fn load_index_facts(
 }
 
 async fn query_table_statistics(
-    ir: &QueryIR,
+    ir: &ReadShape,
     snapshot: &Snapshot,
 ) -> Result<HashMap<String, TableStatistics>> {
     let mut types = BTreeMap::new();
@@ -776,14 +740,13 @@ async fn query_table_statistics(
     while let Some(ops) = pending.pop() {
         for op in ops {
             match op {
-                IROp::NodeScan {
+                PatternStep::NodeScan {
                     type_name,
                     variable: _,
-                    filters: _,
                 } => {
                     types.entry(format!("node:{type_name}")).or_insert(false);
                 }
-                IROp::Expand {
+                PatternStep::Expand {
                     edges,
                     src_type,
                     dst_type,
@@ -791,7 +754,6 @@ async fn query_table_statistics(
                     dst_var: _,
                     min_hops: _,
                     max_hops: _,
-                    dst_filters: _,
                     edge_binding: _,
                 } => {
                     types.entry(format!("node:{src_type}")).or_insert(false);
@@ -802,12 +764,31 @@ async fn query_table_statistics(
                             .or_insert(false);
                     }
                 }
-                IROp::AntiJoin {
+                PatternStep::AntiJoin {
                     inner,
                     outer_var: _,
                     predicate: _,
+                    fails: _,
                 } => pending.push(inner),
-                IROp::Filter(_) => {}
+                PatternStep::Optional {
+                    inner,
+                    outer_var: _,
+                    fails: _,
+                }
+                | PatternStep::Correlate {
+                    inner,
+                    outer_var: _,
+                    read: _,
+                    fails: _,
+                } => pending.push(inner),
+                PatternStep::Union { arms, .. } => pending.extend(arms.iter().map(Vec::as_slice)),
+                PatternStep::Fuse { arms, .. } => {
+                    pending.extend(arms.iter().map(|arm| arm.steps.as_slice()))
+                }
+                PatternStep::Filter { .. }
+                | PatternStep::Rank { .. }
+                | PatternStep::Score { .. }
+                | PatternStep::Let { .. } => {}
             }
         }
     }
@@ -835,7 +816,6 @@ async fn query_table_statistics(
                 file_bytes: destination.then_some(size).flatten(),
                 column_bytes: HashMap::new(),
                 index_facts: indexes::gather(&dataset).await?,
-                fragments: dataset.get_fragments().len(),
             },
         );
     }
@@ -875,21 +855,19 @@ edge Likes: Person -> Doc
 
     const QUERIES: &str = r#"
 query liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
 }
 query nobody_older() {
-    match {
-        $p: Person
-        not {
-            $q: Person
-            $q.age > $p.age
-        }
+    match { $p: Person }
+    where not exists {
+        $q: Person
+        where $q.age > $p.age
     }
     return { $p.name }
 }
 query likes_nothing() {
-    match { $p: Person not { $p likes $d } }
+    match { $p: Person } where not exists { $d: Doc, $p likes $d }
     return { $p.name }
 }
 query people() { match { $p: Person } return { count($p) as n } }
@@ -897,12 +875,7 @@ query people() { match { $p: Person } return { count($p) as n } }
 
     fn compile(catalog: &Catalog, name: &str) -> CompiledQuery {
         let statement = omnigraph_compiler::find_read_statement(QUERIES, name).unwrap();
-        let checked = CheckedRead::check(catalog, statement.decl()).unwrap();
-        let ir = omnigraph_compiler::lower_query(catalog, checked.query()).unwrap();
-        CompiledQuery {
-            ir: Arc::new(ir),
-            checked,
-        }
+        CompiledQuery::compile(catalog, statement.decl()).unwrap()
     }
 
     /// GQT cannot inspect gathered facts or the catalog's version origin.

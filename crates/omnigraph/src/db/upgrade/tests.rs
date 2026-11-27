@@ -2693,11 +2693,11 @@ async fn insert(graph: &Arc<Omnigraph>, branch: &str, name: &str) {
     session(graph)
         .mutate(
             branch,
-            "query seed($name: String) { insert Person { name: $name } }",
+            "query seed($name: String) { replace Person { name: $name } }",
             "seed",
             &HashMap::from([(
                 "name".to_string(),
-                omnigraph_compiler::query::ast::Literal::String(name.to_string()),
+                omnigraph_compiler::query::value::Literal::String(name.to_string()),
             )]),
         )
         .await
@@ -2785,10 +2785,15 @@ fn person_root(state: &ManifestState) -> u64 {
 async fn engine_source() -> EngineSource {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
+    // `@index(fulltext)` makes Person's first rows carry a full-text
+    // declaration commit above them, the one link no commit pins.
     let graph = Arc::new(
-        Omnigraph::init(&root, "node Person { name: String @key }\n")
-            .await
-            .unwrap(),
+        Omnigraph::init(
+            &root,
+            "node Person { name: String @key @index(fulltext) }\n",
+        )
+        .await
+        .unwrap(),
     );
     let created = ManifestCoordinator::open(&root).await.unwrap().snapshot();
     let contract = ManifestCoordinator::read_schema_contract_for_snapshot(&root, &created)

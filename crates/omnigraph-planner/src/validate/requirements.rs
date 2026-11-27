@@ -1,27 +1,24 @@
-//! What a checked read declaration requires of every plan for it (RFC 0047,
-//! "Requirements come from the checked query"). The declaration fixes what
-//! the query asks for: its bindings and their types, how many traversals,
-//! correlated blocks, return items and order keys it writes, its limit, and
-//! which rank call a projected score names. The compiler's typed lowering of
-//! that declaration (`AcceptInput::ir`, its filter constants folded under the
-//! bound values) states each expression in the form a plan carries it: every
-//! conjunct, traversal, block predicate and order key is copied from IR.
-//! A split return reads aggregate leaves by alias after grouping; acceptance
-//! checks their operands against this IR, with explicit casts and types intact.
-//! The declaration is consulted only where the lowering erases meaning: a
-//! projected rank call becomes its score column.
+//! What a checked read requires of every plan for it (RFC 0047,
+//! "Requirements come from the checked query"). The checked read is the
+//! core term; its shape (`AcceptInput::ir`, a [`crate::read_shape::ReadShape`]
+//! with its filter constants folded under the bound values) states each
+//! expression in the form a plan carries it: every binding and its type,
+//! conjunct, traversal, block predicate, return item, order key and the
+//! limit. A split return reads aggregate leaves by alias after grouping;
+//! acceptance checks their operands against the shape, with explicit casts
+//! and types intact. A return item that reads the leading ranking's score
+//! column projects that ranking.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, SubqueryPredicate};
-use omnigraph_compiler::query::ast::{Clause, Expr, Literal, Projection};
-use omnigraph_compiler::query::typecheck::BoundVariable;
+use crate::read_shape::{ArmRank, PatternStep};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
+use omnigraph_compiler::query::value::{DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN};
 use omnigraph_compiler::traversal::EdgeSelection;
 use omnigraph_compiler::types::ExprType;
 
 use super::budget::Budget;
 use super::{AcceptInput, ValidationError};
-use crate::physical::RankKind;
 
 /// The canonical id of a node keyed by one String property, as every write
 /// path derives it from the key's value. The engine implements it with the
@@ -33,11 +30,9 @@ pub trait KeyIds: Sync {
     fn canonical_key_id(&self, type_key: &str, value: &Literal, ty: &ExprType) -> Option<String>;
 }
 
-/// One retrieval a search order names: `nearest($v.p, q)` or `bm25($v.p, q)`,
-/// with the query argument as the plan's ranked scan carries it.
+/// One retrieval a search order names, `nearest($v.p, q)`, with the query argument as the plan's ranked scan carries it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Retrieval {
-    pub kind: RankKind,
     pub binding: String,
     pub property: String,
     pub query: IRExpr,
@@ -52,41 +47,37 @@ impl Retrieval {
                 query,
                 ..
             } => Some(Self {
-                kind: RankKind::Nearest,
                 binding: variable.clone(),
                 property: property.clone(),
                 query: query.as_ref().clone(),
             }),
-            IRExpr::Bm25 { field, query, .. } => match field.as_ref() {
-                IRExpr::PropAccess {
-                    variable, property, ..
-                } => Some(Self {
-                    kind: RankKind::Bm25,
-                    binding: variable.clone(),
-                    property: property.clone(),
-                    query: query.as_ref().clone(),
-                }),
-                _ => None,
-            },
             _ => None,
         }
     }
-
-    /// The approximation the retrieval's contract declares: `nearest`
-    /// membership is approximate even when a run scores flat; `bm25` is exact.
-    pub fn approximate(&self) -> bool {
-        self.kind == RankKind::Nearest
-    }
 }
 
-/// The search a leading `order` key names.
+/// What a variable of the top-level scope binds.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundVariable {
+    Node { type_name: String },
+    Edge { type_names: Vec<String> },
+}
+
+/// The search a leading `order` key or a ranking step names.
 #[derive(Debug, Clone)]
 pub(crate) enum Search {
     Rank(Retrieval),
-    Fuse {
-        arms: Box<[Retrieval; 2]>,
-        k: Option<IRExpr>,
-    },
+}
+
+/// A fusion of the scope (`PatternStep::Fuse`): its target, the
+/// requirements of each arm's own steps with how the arm ranks, and its
+/// constant and weights as written.
+#[derive(Debug, Clone)]
+pub(crate) struct FuseRequirements {
+    pub(crate) target: String,
+    pub(crate) arms: Vec<(ArmRank, Requirements)>,
+    pub(crate) k: Option<IRExpr>,
+    pub(crate) weights: Option<IRExpr>,
 }
 
 /// One traversal of the top-level scope, as the IR states it.
@@ -110,30 +101,395 @@ pub(crate) struct Block {
     pub predicate: SubqueryPredicate,
 }
 
+/// An `optional { }` of the top-level scope: its correlation binding and
+/// the eligibility conjuncts of its own pattern, which the plan tests inside
+/// its inner tree and nowhere after it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OptionalMatch {
+    pub outer_var: String,
+    pub eligibility: Vec<IRExpr>,
+}
+
+/// A `from` over an inline read with its own group or cut: its correlation
+/// binding, what it returns, and the eligibility conjuncts of its own
+/// pattern, which the plan tests inside its inner tree, under its group and
+/// cut, and nowhere after it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CorrelateMatch {
+    pub outer_var: Option<String>,
+    pub read: crate::read_shape::InnerRead,
+    pub eligibility: Vec<IRExpr>,
+}
+
+/// The eligibility conjuncts of a nested scope's own steps.
+fn own_eligibility(inner: &[PatternStep]) -> Vec<IRExpr> {
+    let mut eligibility = Vec::new();
+    for own in inner {
+        match own {
+            PatternStep::Filter { pred: filter, .. } => {
+                push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
+            }
+            PatternStep::NodeScan { .. }
+            | PatternStep::Expand { .. }
+            | PatternStep::Rank { .. }
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. }
+            | PatternStep::AntiJoin { .. }
+            | PatternStep::Optional { .. }
+            | PatternStep::Union { .. }
+            | PatternStep::Correlate { .. }
+            | PatternStep::Fuse { .. } => {}
+        }
+    }
+    eligibility
+}
+
+/// A nested region of a scope a conjunct is tested in: inside an
+/// `optional`'s inner tree, in one arm of a `union` (its bindings and the
+/// arm's position), inside a correlated read's inner tree, or below a
+/// `nearest` window's cut. A conjunct is tested in the regions that write it
+/// and nowhere else: moved into or out of one, it changes which rows the
+/// region keeps.
+///
+/// Each region names one scope, not a kind of scope: an `optional` and a
+/// correlated read carry their correlation binding and their ordinal among
+/// the regions of their kind that the enclosing region holds, in written
+/// order, which is the order the plan runs them in (each wraps the rows of
+/// the elements before it). Two sibling `optional`s over one binding are two
+/// regions, so a conjunct moved from one to the other is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Region {
+    Optional(String, usize),
+    UnionArm(Vec<String>, usize),
+    Correlate(Option<String>, usize),
+    Window,
+}
+
+/// The ordinal of each `optional` and correlated read within the region
+/// that holds it ([`Region`]): the count of regions of its kind already met
+/// there. The requirements number the written steps and the plan its nodes,
+/// each in the order its rows are built.
+#[derive(Debug, Default)]
+pub(crate) struct RegionOrdinals {
+    next: std::collections::HashMap<(Vec<Region>, NumberedKind), usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NumberedKind {
+    Optional,
+    Correlate,
+}
+
+impl RegionOrdinals {
+    /// The region of the next `optional` over `outer_var` in `path`.
+    pub(crate) fn optional(&mut self, path: &[Region], outer_var: &str) -> Region {
+        Region::Optional(
+            outer_var.to_string(),
+            self.take(path, NumberedKind::Optional),
+        )
+    }
+
+    /// The region of the next correlated read over `outer_var` in `path`.
+    pub(crate) fn correlate(&mut self, path: &[Region], outer_var: &Option<String>) -> Region {
+        Region::Correlate(outer_var.clone(), self.take(path, NumberedKind::Correlate))
+    }
+
+    fn take(&mut self, path: &[Region], kind: NumberedKind) -> usize {
+        let next = self.next.entry((path.to_vec(), kind)).or_default();
+        let ordinal = *next;
+        *next += 1;
+        ordinal
+    }
+}
+
+/// Every eligibility conjunct of `steps` with the regions it is written in,
+/// under `path`. Blocks and fusion arms are checked as scopes of their own.
+pub(crate) fn conjunct_regions(
+    steps: &[PatternStep],
+    path: &[Region],
+    out: &mut Vec<(IRExpr, Vec<Region>)>,
+) {
+    omnigraph_compiler::stack::deep(|| {
+        // The steps before a `nearest` ranking step are its population, which
+        // the plan tests below the window's cut, whether the window searches a
+        // scan or ranks rows by their exact distance.
+        let window = steps
+            .iter()
+            .rposition(|step| matches!(step, PatternStep::Rank { .. }));
+        let mut ordinals = RegionOrdinals::default();
+        for (index, step) in steps.iter().enumerate() {
+            let mut here = path.to_vec();
+            if window.is_some_and(|window| index < window) {
+                here.push(Region::Window);
+            }
+            let within = |region: Region| {
+                let mut nested = here.clone();
+                nested.push(region);
+                nested
+            };
+            match step {
+                PatternStep::NodeScan { .. } | PatternStep::Expand { .. } => {}
+                PatternStep::Filter { pred: filter, .. } => {
+                    let mut own = Vec::new();
+                    push_conjuncts(&mut own, std::slice::from_ref(filter));
+                    out.extend(own.into_iter().map(|conjunct| (conjunct, here.clone())));
+                }
+                PatternStep::Optional {
+                    outer_var, inner, ..
+                } => conjunct_regions(inner, &within(ordinals.optional(&here, outer_var)), out),
+                PatternStep::Union { arms, bindings, .. } => {
+                    for (position, arm) in arms.iter().enumerate() {
+                        conjunct_regions(
+                            arm,
+                            &within(Region::UnionArm(bindings.clone(), position)),
+                            out,
+                        );
+                    }
+                }
+                PatternStep::Correlate {
+                    outer_var, inner, ..
+                } => conjunct_regions(inner, &within(ordinals.correlate(&here, outer_var)), out),
+                PatternStep::Rank { .. }
+                | PatternStep::Score { .. }
+                | PatternStep::Let { .. }
+                | PatternStep::AntiJoin { .. }
+                | PatternStep::Fuse { .. } => {}
+            }
+        }
+    })
+}
+
+/// The steps of `steps` with each `optional`'s own steps in its place: the
+/// names an `optional` introduces are the scope's, so its bindings,
+/// traversals, conjuncts and blocks are the scope's requirements too, and
+/// `optionals` records where its conjuncts must run.
+fn flatten<'p>(
+    steps: &'p [PatternStep],
+    out: &mut Vec<&'p PatternStep>,
+    optionals: &mut Vec<OptionalMatch>,
+    unions: &mut Vec<Vec<String>>,
+    correlates: &mut Vec<CorrelateMatch>,
+) {
+    flatten_in(steps, out, optionals, unions, correlates, false)
+}
+
+/// [`flatten`]; `in_read` inside a correlated read's pattern, where a
+/// fusion (a ranking drawn as a read of its own) is the read's and not the
+/// scope's: the plan holds it inside the read's inner tree.
+fn flatten_in<'p>(
+    steps: &'p [PatternStep],
+    out: &mut Vec<&'p PatternStep>,
+    optionals: &mut Vec<OptionalMatch>,
+    unions: &mut Vec<Vec<String>>,
+    correlates: &mut Vec<CorrelateMatch>,
+    in_read: bool,
+) {
+    for step in steps {
+        match step {
+            // A union's arms each bind its names: their bindings,
+            // traversals, conjuncts and blocks are the scope's, and the plan
+            // folds the arms with one `Union` per arm after the first.
+            PatternStep::Union { arms, bindings, .. } => {
+                for _ in 1..arms.len() {
+                    unions.push(bindings.clone());
+                }
+                for arm in arms {
+                    flatten_in(arm, out, optionals, unions, correlates, in_read);
+                }
+            }
+            // A correlated read's pattern binds its names and runs its
+            // traversals, conjuncts and blocks inside its inner tree.
+            PatternStep::Correlate {
+                outer_var,
+                inner,
+                read,
+                ..
+            } => {
+                correlates.push(CorrelateMatch {
+                    outer_var: outer_var.clone(),
+                    read: read.clone(),
+                    eligibility: own_eligibility(inner),
+                });
+                flatten_in(inner, out, optionals, unions, correlates, true);
+            }
+            PatternStep::Optional {
+                outer_var, inner, ..
+            } => {
+                let eligibility = own_eligibility(inner);
+                optionals.push(OptionalMatch {
+                    outer_var: outer_var.clone(),
+                    eligibility,
+                });
+                flatten_in(inner, out, optionals, unions, correlates, in_read);
+            }
+            PatternStep::Fuse { .. } if in_read => {}
+            other => out.push(other),
+        }
+    }
+}
+
+/// One column of the read's rows as the tie rule orders it, in column
+/// order (see `optimizer::tie_rule`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TieColumn {
+    /// A reference: its `@id`, after its `@type` when it is a selected edge.
+    Identity { binding: String, selected: bool },
+    /// A value column of a correlated read or a union, `binding.column`.
+    Value { binding: String, column: String },
+}
+
+impl TieColumn {
+    fn binding(&self) -> &str {
+        match self {
+            Self::Identity { binding, .. } | Self::Value { binding, .. } => binding,
+        }
+    }
+
+    /// A reference the query names, which leads the rule.
+    pub(crate) fn is_named(&self, made_up: &std::collections::BTreeSet<String>) -> bool {
+        matches!(self, Self::Identity { binding, .. } if !made_up.contains(binding))
+    }
+}
+
+/// The columns `steps` add to the rows, in the order the pattern introduces
+/// them, each once: a block adds none, an `optional` the names its pattern
+/// binds, a correlated read only what it returns, a union its first arm's
+/// reference and value columns.
+pub(crate) fn tie_columns(steps: &[PatternStep], out: &mut Vec<TieColumn>) {
+    fn push(out: &mut Vec<TieColumn>, column: TieColumn) {
+        if !out.contains(&column) {
+            out.push(column);
+        }
+    }
+    for step in steps {
+        match step {
+            PatternStep::NodeScan { variable, .. } => push(
+                out,
+                TieColumn::Identity {
+                    binding: variable.clone(),
+                    selected: false,
+                },
+            ),
+            PatternStep::Expand {
+                dst_var,
+                edges,
+                edge_binding,
+                ..
+            } => {
+                push(
+                    out,
+                    TieColumn::Identity {
+                        binding: dst_var.clone(),
+                        selected: false,
+                    },
+                );
+                if let Some(edge) = edge_binding {
+                    push(
+                        out,
+                        TieColumn::Identity {
+                            binding: edge.clone(),
+                            selected: edges.named().is_none(),
+                        },
+                    );
+                }
+            }
+            PatternStep::Optional { inner, .. } => tie_columns(inner, out),
+            PatternStep::Correlate { inner, read, .. } => {
+                let mut own = Vec::new();
+                tie_columns(inner, &mut own);
+                for column in &read.columns {
+                    match &column.expr {
+                        IRExpr::Variable(name, _) => {
+                            if let Some(entry) = own.iter().find(|entry| entry.binding() == name) {
+                                push(out, entry.clone());
+                            }
+                        }
+                        _ => push(
+                            out,
+                            TieColumn::Value {
+                                binding: read.values.clone(),
+                                column: column.column.clone(),
+                            },
+                        ),
+                    }
+                }
+            }
+            PatternStep::Union { arms, bindings, .. } => {
+                let mut arm = Vec::new();
+                if let Some(first) = arms.first() {
+                    tie_columns(first, &mut arm);
+                }
+                for entry in arm {
+                    let leaves = match &entry {
+                        TieColumn::Identity { binding, .. } => bindings.contains(binding),
+                        TieColumn::Value { .. } => true,
+                    };
+                    if leaves {
+                        push(out, entry);
+                    }
+                }
+            }
+            // A fusion's rows are its targets.
+            PatternStep::Fuse { target, .. } => push(
+                out,
+                TieColumn::Identity {
+                    binding: target.clone(),
+                    selected: false,
+                },
+            ),
+            PatternStep::Filter { .. }
+            | PatternStep::Rank { .. }
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. }
+            | PatternStep::AntiJoin { .. } => {}
+        }
+    }
+}
+
 /// What every plan for one checked declaration must preserve.
 #[derive(Debug, Clone)]
 pub struct Requirements {
+    /// The names the query declares none of (`ReadShape::made_up`).
+    pub(crate) made_up: std::collections::BTreeSet<String>,
     /// The named bindings of the top-level scope and their types.
     pub(crate) bindings: BTreeMap<String, BoundVariable>,
-    /// Edge bindings of a traversal over more than one edge type, whose
-    /// identity is the pair (`@type`, `@id`).
-    pub(crate) selected_edges: HashSet<String>,
+    /// The columns of the top-level rows in column order, for the tie rule.
+    pub(crate) tie_columns: Vec<TieColumn>,
     /// Traversals of the top-level scope, in written order.
     pub(crate) traversals: Vec<Traversal>,
     /// Correlated blocks of the top-level scope, in written order.
     pub(crate) blocks: Vec<Block>,
+    /// The `optional`s of the top-level scope, nested ones included.
+    pub(crate) optionals: Vec<OptionalMatch>,
+    /// The correlated reads of the top-level scope, nested ones included,
+    /// each one `Correlate` node of the plan.
+    pub(crate) correlates: Vec<CorrelateMatch>,
+    /// The names every `Union` node of the plan binds: one entry per arm
+    /// after the first of each written `union`.
+    pub(crate) unions: Vec<Vec<String>>,
+    /// Every exact score of the query (`distance`, and `bm25` on a field
+    /// whose index declares an analyzer), each one `Score` node of the plan.
+    pub(crate) scores: Vec<ExactScore>,
+    /// The value of every `let`, each one `Let` node of the plan.
+    pub(crate) lets: Vec<IRExpr>,
     pub(crate) search: Option<Search>,
+    /// The fusion the scope's rows come from, each arm a scope of its own
+    /// (an `rrf`'s `from`, which leads its pattern).
+    pub(crate) fuse: Option<FuseRequirements>,
     /// Every eligibility conjunct of the top-level scope (inline matches,
     /// `match` filters and the filters of a deferred traversal destination),
     /// split at its top-level `and`; a constant `true` constrains nothing and
     /// is left out.
     pub(crate) eligibility: Vec<IRExpr>,
+    /// Each eligibility conjunct with the regions of the scope it is
+    /// written in ([`Region`]).
+    pub(crate) regions: Vec<(IRExpr, Vec<Region>)>,
     pub(crate) returns: Vec<IRProjection>,
-    /// The written return items that project a rank call, by position, with
-    /// the call as written.
-    pub(crate) projected_ranks: Vec<(usize, Expr)>,
-    /// The leading `order` key as written, when it is a search.
-    pub(crate) written_search: Option<Expr>,
+    /// The return items that read the leading ranking's score column, by
+    /// position, with that ranking.
+    pub(crate) projected_ranks: Vec<(usize, IRExpr)>,
+    /// The leading `order` key, when it is a search.
+    pub(crate) written_search: Option<IRExpr>,
     /// The `order` keys after a leading search key that order something (a
     /// literal key does not), each bound to a `return` item as the planner
     /// binds it.
@@ -144,6 +500,26 @@ pub struct Requirements {
     pub(crate) limit: Option<u64>,
     /// Whether the rows are groups: an aggregate return or `return distinct`.
     pub(crate) aggregate: bool,
+    /// A ranking drawn as a pattern step (`PatternStep::Rank`) rather than
+    /// led by the `order`: its `nearest` window `k` in targets, `None` for
+    /// one with no window. Its score leads no sort, and the
+    /// eligibility conjuncts after it run over the selected rows.
+    pub(crate) window: Option<Option<u64>>,
+    /// That step's declared `recall:`; `recall: 1` probes without a cap.
+    pub(crate) recall: Option<f64>,
+}
+
+/// One exact score the query writes: the scored binding, its node type
+/// (whose entities are a `bm25` score's field corpus), the property, the
+/// kind and the query (`distance`'s vector, or the `match_terms` predicate an
+/// exact `bm25` retains).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExactScore {
+    pub(crate) binding: String,
+    pub(crate) type_name: String,
+    pub(crate) property: String,
+    pub(crate) kind: omnigraph_compiler::ir::core::ScoreKind,
+    pub(crate) query: IRExpr,
 }
 
 impl Requirements {
@@ -151,39 +527,130 @@ impl Requirements {
         input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<Self, ValidationError> {
-        let decl = input.checked.decl();
-        let types = input.checked.query();
         let ir = input.ir;
+        let mut required = Self::scope(
+            &ir.pipeline,
+            &ir.return_exprs,
+            &ir.order_by,
+            ir.distinct,
+            ir.limit,
+            &ir.made_up,
+            budget,
+        )?;
+        // The tie rule takes the named references in written column order,
+        // which the steps' run order need not keep.
+        required.tie_columns.sort_by_key(|column| match column {
+            TieColumn::Identity { binding, .. } if column.is_named(&ir.made_up) => ir
+                .written_columns
+                .iter()
+                .position(|name| name == binding)
+                .unwrap_or(usize::MAX),
+            _ => usize::MAX,
+        });
+        Ok(required)
+    }
+
+    /// The requirements of one scope: the read's top-level pattern with its
+    /// `return`, `order` and `limit`, or a fusion arm's steps, which return,
+    /// order and cut nothing of their own.
+    fn scope(
+        pipeline: &[PatternStep],
+        return_exprs: &[IRProjection],
+        order_by: &[IROrdering],
+        distinct: bool,
+        limit: Option<u64>,
+        made_up: &std::collections::BTreeSet<String>,
+        budget: &mut Budget,
+    ) -> Result<Self, ValidationError> {
         let mut eligibility = Vec::new();
         let mut traversals = Vec::new();
         let mut blocks = Vec::new();
-        for op in &ir.pipeline {
+        let mut bindings: BTreeMap<String, BoundVariable> = BTreeMap::new();
+        let mut rank_step: Option<(&IRExpr, Option<u64>)> = None;
+        let mut recall = None;
+        let mut fuse = None;
+        let mut steps = Vec::new();
+        let mut optionals = Vec::new();
+        let mut unions = Vec::new();
+        let mut scores = Vec::new();
+        let mut lets = Vec::new();
+        let mut correlates = Vec::new();
+        flatten(
+            pipeline,
+            &mut steps,
+            &mut optionals,
+            &mut unions,
+            &mut correlates,
+        );
+        for op in steps {
             budget.visit(1)?;
             match op {
-                IROp::NodeScan {
+                PatternStep::Score {
+                    binding,
+                    type_name,
+                    property,
+                    kind,
+                    query,
+                } => scores.push(ExactScore {
+                    binding: binding.clone(),
+                    type_name: type_name.clone(),
+                    property: property.clone(),
+                    kind: *kind,
+                    query: query.clone(),
+                }),
+                PatternStep::Let { value, .. } => lets.push(value.clone()),
+                PatternStep::Rank {
+                    key,
+                    window,
+                    recall: declared,
+                    ..
+                } => {
+                    rank_step = Some((key, *window));
+                    recall = *declared;
+                }
+                PatternStep::Fuse {
+                    arms,
+                    target,
+                    target_type,
+                    k,
+                    weights,
+                    ..
+                } => {
+                    bindings.insert(
+                        target.clone(),
+                        BoundVariable::Node {
+                            type_name: target_type.clone(),
+                        },
+                    );
+                    let mut required = Vec::with_capacity(arms.len());
+                    for arm in arms {
+                        required.push((
+                            arm.rank,
+                            Self::scope(&arm.steps, &[], &[], false, None, made_up, budget)?,
+                        ));
+                    }
+                    fuse = Some(FuseRequirements {
+                        target: target.clone(),
+                        arms: required,
+                        k: k.clone(),
+                        weights: weights.clone(),
+                    });
+                }
+                PatternStep::NodeScan {
                     variable,
                     type_name,
-                    filters,
                 } => {
-                    match types.bindings().get(variable) {
-                        Some(BoundVariable::Node {
-                            type_name: declared,
-                        }) if declared == type_name => {}
-                        _ => {
-                            return Err(ValidationError::violated(
-                                "binding identity",
-                                format!(
-                                    "the lowering scans `${variable}: {type_name}`, which the query does not bind"
-                                ),
-                            ));
-                        }
-                    }
-                    push_conjuncts(&mut eligibility, filters);
+                    bindings.insert(
+                        variable.clone(),
+                        BoundVariable::Node {
+                            type_name: type_name.clone(),
+                        },
+                    );
                 }
-                IROp::Filter(filter) => {
+                PatternStep::Filter { pred: filter, .. } => {
                     push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
                 }
-                IROp::Expand {
+                PatternStep::Expand {
                     src_var,
                     dst_var,
                     edges,
@@ -191,9 +658,25 @@ impl Requirements {
                     dst_type,
                     min_hops,
                     max_hops,
-                    dst_filters,
                     edge_binding,
                 } => {
+                    if !made_up.contains(dst_var) {
+                        bindings.insert(
+                            dst_var.clone(),
+                            BoundVariable::Node {
+                                type_name: dst_type.clone(),
+                            },
+                        );
+                    }
+                    if let Some(edge) = edge_binding {
+                        let mut type_names: Vec<String> = edges
+                            .members()
+                            .iter()
+                            .map(|m| m.edge_type.clone())
+                            .collect();
+                        type_names.dedup();
+                        bindings.insert(edge.clone(), BoundVariable::Edge { type_names });
+                    }
                     traversals.push(Traversal {
                         src: src_var.clone(),
                         dst: dst_var.clone(),
@@ -204,9 +687,8 @@ impl Requirements {
                         max_hops: *max_hops,
                         edge_binding: edge_binding.clone(),
                     });
-                    push_conjuncts(&mut eligibility, dst_filters);
                 }
-                IROp::AntiJoin {
+                PatternStep::AntiJoin {
                     outer_var,
                     predicate,
                     ..
@@ -214,114 +696,76 @@ impl Requirements {
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
                 }),
+                PatternStep::Optional { .. }
+                | PatternStep::Union { .. }
+                | PatternStep::Correlate { .. } => {
+                    unreachable!(
+                        "flatten puts an optional's, a union's and a correlated read's steps in their place"
+                    )
+                }
             }
         }
-        // The lowering states each expression; the declaration fixes how many
-        // of each the query asks for.
-        let written_blocks = decl
-            .match_clause
-            .iter()
-            .filter(|clause| matches!(clause, Clause::Subquery(_)))
-            .count();
-        let counts = [
-            ("traversals", types.traversals().count(), traversals.len()),
-            ("correlated blocks", written_blocks, blocks.len()),
-            (
-                "return items",
-                decl.return_clause.len(),
-                ir.return_exprs.len(),
-            ),
-            ("order keys", decl.order_clause.len(), ir.order_by.len()),
-        ];
-        for (what, written, lowered) in counts {
-            if written != lowered {
-                return Err(ValidationError::violated(
-                    "lowering",
-                    format!("the query writes {written} {what}; its lowering holds {lowered}"),
-                ));
-            }
-        }
-        if ir.limit != decl.limit {
-            return Err(ValidationError::violated(
-                "lowering",
-                format!(
-                    "the query's `limit` is {:?}; its lowering's is {:?}",
-                    decl.limit, ir.limit
-                ),
-            ));
-        }
-        let mut selected_edges = HashSet::new();
-        for traversal in types.traversals() {
-            budget.visit(1)?;
-            if let Some(edge) = traversal
-                .edge_binding
-                .as_deref()
-                .filter(|edge| *edge != "_")
-                && traversal.edges.named().is_none()
-            {
-                selected_edges.insert(edge.to_string());
-            }
-        }
-        let mut keys = ir.order_by.as_slice();
-        let search = match keys.first().map(|key| &key.expr) {
-            Some(IRExpr::Rrf {
-                primary,
-                secondary,
-                k,
-                ..
-            }) => match (Retrieval::of(primary), Retrieval::of(secondary)) {
-                (Some(primary), Some(secondary)) => Some(Search::Fuse {
-                    arms: Box::new([primary, secondary]),
-                    k: k.as_deref().cloned(),
-                }),
-                _ => None,
-            },
-            Some(expr) => Retrieval::of(expr).map(Search::Rank),
-            None => None,
+        let mut keys = order_by;
+        let leading = match rank_step {
+            Some((key, _)) => Some(key),
+            None => keys.first().map(|key| &key.expr),
         };
-        if search.is_some() {
+        let search = leading.and_then(Retrieval::of).map(Search::Rank);
+        if search.is_some() && rank_step.is_none() {
             keys = &keys[1..];
         }
         // Group rows (aggregates or `return distinct`) bind every key to the
         // return item it names, as the planner does, before constants drop.
-        let grouped = ir.distinct
-            || ir
-                .return_exprs
+        let grouped = distinct
+            || return_exprs
                 .iter()
                 .any(|projection| crate::optimizer::contains_aggregate(&projection.expr));
         let order = keys
             .iter()
             .map(|key| IROrdering {
-                expr: crate::optimizer::bind_order_key(&key.expr, &ir.return_exprs, grouped),
-                descending: key.descending,
+                expr: crate::optimizer::bind_order_key(&key.expr, return_exprs, grouped),
+                ..key.clone()
             })
             .filter(|key| !matches!(key.expr, IRExpr::Literal(_, _)))
             .collect();
-        let written_search = search
-            .as_ref()
-            .and(decl.order_clause.first())
-            .map(|key| key.expr.clone());
-        Ok(Self {
-            bindings: types
-                .bindings()
+        let written_search = search.as_ref().and(leading).cloned();
+        let projected_ranks = match &written_search {
+            Some(lead) => return_exprs
                 .iter()
-                .map(|(name, bound)| (name.clone(), bound.clone()))
+                .enumerate()
+                .filter(|(_, projection)| reads_score(&projection.expr))
+                .map(|(index, _)| (index, lead.clone()))
                 .collect(),
-            selected_edges,
+            None => Vec::new(),
+        };
+        let mut columns = Vec::new();
+        tie_columns(pipeline, &mut columns);
+        let mut regions = Vec::new();
+        conjunct_regions(pipeline, &[], &mut regions);
+        Ok(Self {
+            made_up: made_up.clone(),
+            regions,
+            bindings,
+            tie_columns: columns,
             traversals,
             blocks,
+            optionals,
+            correlates,
+            unions,
+            scores,
+            lets,
             search,
+            fuse,
             eligibility,
-            returns: ir.return_exprs.clone(),
-            projected_ranks: projected_rank_calls(&decl.return_clause)
-                .into_iter()
-                .map(|(index, call)| (index, call.clone()))
-                .collect(),
+            returns: return_exprs.to_vec(),
+            projected_ranks,
             written_search,
             order,
-            ordered: !ir.order_by.is_empty(),
-            limit: ir.limit,
+            ordered: !order_by.is_empty(),
+            limit,
             aggregate: grouped,
+            window: rank_step.map(|(_, window)| window),
+            recall,
         })
     }
 }
@@ -350,7 +794,7 @@ pub(crate) fn narrowed_identity<'w>(
             property,
             ty,
         },
-        omnigraph_compiler::query::ast::CompOp::Eq,
+        omnigraph_compiler::query::value::CompOp::Eq,
         IRExpr::Literal(Literal::String(id), literal_ty),
     )) = derived.comparison_parts()
     else {
@@ -371,7 +815,7 @@ pub(crate) fn narrowed_identity<'w>(
         return false;
     };
     written.into_iter().any(|conjunct| {
-        let Some((left, omnigraph_compiler::query::ast::CompOp::Eq, right)) =
+        let Some((left, omnigraph_compiler::query::value::CompOp::Eq, right)) =
             conjunct.comparison_parts()
         else {
             return false;
@@ -412,29 +856,24 @@ pub(crate) fn constant_true(conjunct: &IRExpr) -> bool {
     matches!(conjunct, IRExpr::Literal(Literal::Bool(true), _))
 }
 
-/// Every written return item that projects a rank call, at its root or in
-/// the Boolean structure around it, with the call.
-pub(crate) fn projected_rank_calls(returns: &[Projection]) -> Vec<(usize, &Expr)> {
-    fn calls<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
-        match expr {
-            Expr::Binary { left, right, .. } => {
-                calls(left, out);
-                calls(right, out);
+/// Whether a return item reads a retrieval's score column, at its root or
+/// in the Boolean structure around it.
+pub(crate) fn reads_score(expr: &IRExpr) -> bool {
+    let mut found = false;
+    let mut pending = vec![expr];
+    while let Some(e) = pending.pop() {
+        match e {
+            IRExpr::PropAccess { property, .. }
+                if [DISTANCE_COLUMN, SCORE_COLUMN, RRF_COLUMN].contains(&property.as_str()) =>
+            {
+                found = true
             }
-            Expr::In { needle, list } => {
-                calls(needle, out);
-                calls(list, out);
-            }
-            Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => calls(inner, out),
-            call if call.score_column().is_some() => out.push(call),
+            IRExpr::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
+            IRExpr::Not(inner, _)
+            | IRExpr::IsNull { expr: inner, .. }
+            | IRExpr::Cast { expr: inner, .. } => pending.push(inner),
             _ => {}
         }
     }
-    let mut out = Vec::new();
-    for (index, projection) in returns.iter().enumerate() {
-        let mut found = Vec::new();
-        calls(&projection.expr, &mut found);
-        out.extend(found.into_iter().map(|call| (index, call)));
-    }
-    out
+    found
 }

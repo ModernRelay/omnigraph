@@ -1918,7 +1918,7 @@ async fn single_edge_query_builds_only_referenced_edge() {
 async fn write_keeps_graph_index_of_untouched_edge_tables() {
     const HIRE: &str = r#"
 query hire($person: String, $company: String) {
-    insert WorksAt { from: $person, to: $company }
+    insert WorksAt { @src: $person, @dst: $company }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -3136,7 +3136,7 @@ async fn merge_and_load_close_a_block_under_the_session_budget() {
                 async move {
                     history.requests();
                     let receipt = lowered
-                        .load_as_with_receipt("loaded", None, &line, LoadMode::Append, None)
+                        .load_as_with_receipt("loaded", None, &line, LoadMode::Insert, None)
                         .await
                         .unwrap();
                     receipt.commit.graph_commit_id
@@ -3282,4 +3282,68 @@ async fn repeated_merges_reuse_shared_cold_registry_files() {
             "the fixed-schema hot write must stay bounded: {written:?}"
         );
     }
+}
+
+/// A declaration the planner does not lower, or a write whose later group
+/// selects on a type an earlier group changes, is checked and does not run:
+/// each door types it against the handle's accepted catalog and the type
+/// checker refuses it (`T86`, `T91`), as it answers a type error with its own code,
+/// both after the warm freshness probe and before any table opens. Neither door
+/// issues another storage request on the way.
+#[tokio::test]
+async fn an_unlowered_declaration_is_refused_before_any_storage_access() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        init_and_load(&dir).await;
+        let db = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+        let read = "query friends($name: String) { match { $p: Person, $p knows $f } where $p.name = $name return { $p.name, collect($f) as friends } }";
+        let write = "query rename($name: String) { match { $p: Person } where $p.name = $name  update $p set { age: 1 }  match { $q: Person, $q knows $f }  update $f set { age: 2 } }";
+        let ill_typed = "query q() { match { $p: Person } where $p.name + 1 > 0 return { $p.name } }";
+        let cases = [
+            (
+                measure(db.query(
+                    ReadTarget::branch("main"),
+                    read,
+                    "friends",
+                    &params(&[("$name", "Alice")]),
+                ))
+                .await,
+                "T86",
+            ),
+            (
+                measure(db.query(ReadTarget::branch("main"), ill_typed, "q", &params(&[])))
+                    .await,
+                "T72",
+            ),
+        ];
+        for ((outcome, io), code) in cases {
+            let error = outcome.expect_err("the declaration does not run");
+            assert_eq!(error.diagnostic().map(|d| d.code.as_str()), Some(code), "{error}");
+            // The warm freshness probe, as for any refused declaration, and
+            // nothing else: no table opens.
+            assert_eq!(
+                (io.total_reads(), io.version_probes, io.data_open_count, io.internal_open_count),
+                (1, 1, 0, 0),
+                "{code}: {io:?}"
+            );
+        }
+        let (outcome, io) =
+            measure(db.mutate("main", write, "rename", &params(&[("$name", "Alice")]))).await;
+        let error = outcome.expect_err("the declaration does not run");
+        // A later group selecting on the type an earlier group changes.
+        assert_eq!(error.diagnostic().map(|d| d.code.as_str()), Some("T91"), "{error}");
+        assert_eq!(
+            (
+                io.total_reads(),
+                io.data_writes,
+                io.manifest_writes,
+                io.version_probes,
+                io.data_open_count,
+                io.internal_open_count
+            ),
+            (1, 0, 0, 1, 0, 0),
+            "{io:?}"
+        );
+    })
+    .await;
 }

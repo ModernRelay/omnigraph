@@ -163,8 +163,8 @@ graph and mode. The native CLI sends the exact UTF-8 NDJSON body to the
 authenticated data endpoint; it does not write storage directly.
 
 ```bash
-omnigraph load --target production --graph knowledge --data batch-01.jsonl --mode append --branch review --from main --json
-omnigraph load --target production --graph knowledge --data batch-02.jsonl --mode append --branch review --json
+omnigraph load --target production --graph knowledge --data batch-01.jsonl --mode insert --branch review --from main --json
+omnigraph load --target production --graph knowledge --data batch-02.jsonl --mode insert --branch review --json
 ```
 
 Every load requires `change` for that graph. `--from` additionally requires
@@ -175,13 +175,13 @@ Review and merge use the existing branch operations and their separate
 permissions; a load does not merge its target branch.
 
 One managed load accepts at most **32 MiB (33,554,432 bytes)** of input. The
-CLI checks this before sending the request. Incremental `append` and `merge`
+CLI checks this before sending the request. Incremental `insert`, `upsert` and `replace`
 also retain the engine's **8,192 rows and 32 MiB per keyed table** bounds, plus
 **32 MiB across retained keyed batches** and a separate parsed-payload estimate
 across types. Strict loads check projected in-memory size too. The NDJSON byte
 bound does not prove that a batch fits those
 [engine limits](../mutations/index.md#limits-and-conflicts).
-Split prepared `append` and `merge` inputs into suitable batches, preserving
+Split prepared `insert`, `upsert` and `replace` inputs into suitable batches, preserving
 endpoint dependencies and recording each batch's returned commit. Blob values carry
 their own [limits](../blobs.md#limits).
 

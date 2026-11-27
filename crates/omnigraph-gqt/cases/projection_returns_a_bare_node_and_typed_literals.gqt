@@ -38,7 +38,7 @@ flag: Bool
 
 --- query
 query numeric_list_literals() {
-    match { $p: Person { name: "alice" } }
+    match { $p: Person } where $p.name = "alice"
     return {
         [1, 2.5] as integer_first,
         [2.5, 1] as float_first
@@ -57,18 +57,11 @@ result columns [integer_first: [F64], float_first: [F64]]
 
 --- query
 query empty_list_literal() {
-    match { $p: Person { name: "alice" } }
+    match { $p: Person } where $p.name = "alice"
     return { [] as empty }
 }
 
---- expect unordered
-{"empty":[]}
-
---- expect shape
-empty: [String]
-
---- expect plan
-result columns [empty: [String]]
+--- expect error: T7: nothing fixes the element type of this empty list
 
 --- query
 query incompatible_list_literal() {

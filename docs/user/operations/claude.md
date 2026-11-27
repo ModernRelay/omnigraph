@@ -55,7 +55,7 @@ If your cluster has no graphs yet, Claude tells you so. Create one with the Omni
 1. Install the [Omnigraph CLI](../install.md) and [sign in](../cli/login.md): `omnigraph login --create-profile work`.
 2. Register your cluster as a target: `omnigraph target add brain --profile work --cluster <cluster-id>`.
 3. Pull the cluster's configuration, add the `brain` graph from the [second-brain cookbook](https://github.com/ModernRelay/omnigraph-cookbooks/tree/main/second-brain) (schema, queries and policy), then push, plan and apply it, as in [managed configuration](../cli/managed-lifecycle.md): `omnigraph cluster pull`, `cluster push --expected-revision <rev>`, `cluster plan --rev <rev>`, `cluster apply --plan <preview-id>`.
-4. Optionally load the example data: `omnigraph load --target brain --graph brain --data seed.jsonl --mode append`.
+4. Optionally load the example data: `omnigraph load --target brain --graph brain --data seed.jsonl --mode insert`.
 
 Claude Code can run these steps for you: ask it to set up the second brain and point it at the cookbook.
 

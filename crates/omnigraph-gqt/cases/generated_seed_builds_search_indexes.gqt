@@ -39,7 +39,7 @@ tables:
 
 --- query
 query search_seed() {
-    match { $d: Doc search($d.text, "needle") }
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any))
     return { $d.slug, $d.text }
 }
 --- expect unordered
@@ -52,7 +52,7 @@ d.text: String
 --- restart
 --- query
 query search_reopened_seed() {
-    match { $d: Doc search($d.text, "needle") }
+    match { $d: Doc } where match_terms($d.text, terms("needle", mode: any))
     return { $d.slug, $d.text }
 }
 --- expect unordered

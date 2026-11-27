@@ -36,7 +36,7 @@ const NO_SERVED_DOOR: [&str; 6] = [
     "e2e-query-destination-search",
     "e2e-nearest-prefilter",
     "e2e-nearest-nprobes-one",
-    "e2e-rrf-traversal",
+    "e2e-rrf-exact-traversal",
     "e2e-traversal-selective-csr",
     "e2e-traversal-selective-indexed",
 ];
@@ -173,7 +173,7 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
     let mut invalid = plan("tiny-read");
     invalid.definition.protocol.reset = ResetMode::None;
     assert!(replan(invalid).is_err());
-    const PROPOSE: &str = "\n--- mutate\nquery propose() as commit { insert Person { name: \"zed\" } }\n--- expect affected: nodes=1 edges=0\n--- bind commit $w\n";
+    const PROPOSE: &str = "\n--- mutate\nquery propose() as commit { replace Person { name: \"zed\" } }\n--- expect affected: nodes=1 edges=0\n--- bind commit $w\n";
     let restarted = format!("{}\n--- restart\n", p.queries.text);
     let parsed = omnigraph_gqt_core::parse_case("served_restart_suffix", &restarted).unwrap();
     assert_eq!(
@@ -212,7 +212,7 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
     );
     for (suffix, refusal) in [
         (
-            "\n--- mutate\nquery write() { delete Person where name = \"added\" }\n--- expect affected: nodes=0 edges=0\n".to_string(),
+            "\n--- mutate\nquery write() { match { $x: Person } where $x.name = \"added\"  delete $x }\n--- expect affected: nodes=0 edges=0\n".to_string(),
             "step 5 (mutate) advances a branch head; reset:none admits a served write only as an unpublished commit",
         ),
         (
@@ -1486,7 +1486,7 @@ val: I64
 #[test]
 fn served_admission_rejects_loop_writes_and_wrong_environment() {
     let p = served_plan("e2e-query-count");
-    let suffix = "\n--- loop $i 0 2\n--- mutate\nquery write() { delete Person where name = \"added\" }\n--- expect affected: nodes=0 edges=0\n--- endloop\n";
+    let suffix = "\n--- loop $i 0 2\n--- mutate\nquery write() { match { $x: Person } where $x.name = \"added\"  delete $x }\n--- expect affected: nodes=0 edges=0\n--- endloop\n";
     let text = format!("{}{suffix}", p.queries.text);
     let parsed = omnigraph_gqt_core::parse_case("served_loop_write", &text).unwrap();
     let error = admit_target_queries(

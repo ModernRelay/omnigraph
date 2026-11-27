@@ -1,7 +1,7 @@
 gqt format 1
 header keys: issue, red_on, notes, traversal, csv_slice_bytes, overwrite_chunk_rows, writer
 sections: runner, bench, schema, seed, branches, csv, load, query, mutate, concurrent, params, expect, bind, restart, loop, foreach, endloop, seam
-expect modes: ok, unordered, ordered, error:, affected:, outcome:, shape, plan, same as v1
+expect modes: ok, unordered, ordered, error:, affected:, outcome:, shape, plan, same as reference
 corpus timeout_ms: at most 10000
 rules:
   line_endings: a case file is UTF-8 with `\n` line endings
@@ -20,8 +20,8 @@ rules:
   step_kind: a `--- query` holds one read declaration or read statement and a `--- mutate` one mutation declaration or write statement, each with the arguments its kind takes
   expect_mode_missing: every `--- expect` names its mode; the modes depend on the step kind
   unknown_expect_mode: an expect mode is ok, unordered, ordered, error: <needle>, affected: nodes=<N> edges=<M> or outcome: <word>
-  expect_mode_for_step: an expect mode fits its step: rows modes on a read, `ok`, `error:` and `affected:` on a write, `outcome:` on a merge, `shape`, `plan` and `same as v1` on a read's rows expect
-  expect_without_step: every `--- expect` follows the step it completes, and `shape`, `plan` and `same as v1` follow the expect they extend
+  expect_mode_for_step: an expect mode fits its step: rows modes on a read, `ok`, `error:` and `affected:` on a write, `outcome:` on a merge, `shape`, `plan` and `same as reference` on a read's rows expect
+  expect_without_step: every `--- expect` follows the step it completes, and `shape`, `plan` and `same as reference` follow the expect they extend
   missing_expect: every step is followed by its `--- expect` section
   missing_shape: a rows expect (`unordered` or `ordered`) is followed by its `--- expect shape` section
   params_placement: `--- params` follows a query or mutate declaration step, once, and no other step kind

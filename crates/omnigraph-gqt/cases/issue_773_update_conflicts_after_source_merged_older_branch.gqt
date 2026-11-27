@@ -29,7 +29,8 @@ branch create b0
 
 --- mutate
 query set_alice_1() {
-    update Person set { age: 1 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -41,28 +42,28 @@ branch create b1
 
 --- mutate branch: b0
 query insert_y() {
-    insert Person { name: "y", age: 0 }
+    replace Person { name: "y", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b1
 query insert_x1() {
-    insert Person { name: "x1", age: 0 }
+    replace Person { name: "x1", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b1
 query insert_x2() {
-    insert Person { name: "x2", age: 0 }
+    replace Person { name: "x2", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: b1
 query insert_x3() {
-    insert Person { name: "x3", age: 0 }
+    replace Person { name: "x3", age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -74,7 +75,8 @@ branch merge b0 into b1
 
 --- mutate
 query set_alice_2() {
-    update Person set { age: 2 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 2 }
 }
 
 --- expect affected: nodes=1 edges=0

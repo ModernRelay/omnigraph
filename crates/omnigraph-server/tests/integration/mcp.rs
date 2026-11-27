@@ -63,12 +63,12 @@ rules:
         ),
         (
             "person",
-            "query person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+            "query person($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }",
             true,
         ),
         (
             "add",
-            "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
             true,
         ),
     ]);
@@ -344,7 +344,7 @@ async fn oidc_mcp_reuses_discovery_cedar_and_stored_read_handlers_without_mutati
         json!({"graph":"default","name":"add","params":{"name":"MCP must not write","age":7}}),
         json!({"graph":"default","name":"people","actor":"principal:stable_alice"}),
         json!({"graph":"default","name":"people","expect_mutation":true}),
-        json!({"graph":"default","name":"people","query":"insert Person { name: 'x', age: 1 }"}),
+        json!({"graph":"default","name":"people","query":"replace Person { name: 'x', age: 1 }"}),
         // Neither source nor a stored name.
         json!({"graph":"default"}),
     ] {
@@ -801,7 +801,7 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
 
     // `query` with source answers exactly `POST /query`'s body, including
     // branch reads.
-    let source = "query adults($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } order { $p.name asc } }";
+    let source = "query adults($min: I32) { match { $p: Person } where $p.age >= $min return { $p.name } order { $p.name asc } }";
     for arguments in [
         json!({"graph":"default","query":source,"params":{"min":30}}),
         json!({"graph":"default","query":source,"params":{"min":30},"branch":"main"}),
@@ -880,9 +880,9 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
     // Writes never pass through `query`, and leave the graph unchanged.
     let before = manifest_dataset_version(&graph_path(temp.path())).await;
     for query in [
-        "query add() { insert Person { name: \"Mallory\", age: 1 } }",
-        "query bump() { update Person set { age: 99 } where name = \"Alice\" }",
-        "query drop() { delete Person where name = \"Alice\" }",
+        "query add() { replace Person { name: \"Mallory\", age: 1 } }",
+        "query bump() { match { $x: Person } where $x.name = \"Alice\"  update $x set { age: 99 } }",
+        "query drop() { match { $x: Person } where $x.name = \"Alice\"  delete $x }",
         "branch create feature from main",
     ] {
         let refused = call(
@@ -982,7 +982,7 @@ async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
         &app,
         "secret",
         "mutate",
-        json!({"graph":"default","query":"query add($name: String) { insert Person { name: $name } }","params":{"name":"Mallory"}}),
+        json!({"graph":"default","query":"query add($name: String) { replace Person { name: $name } }","params":{"name":"Mallory"}}),
     )
     .await;
     assert_eq!(refused["result"]["isError"], true, "{refused}");
@@ -1094,11 +1094,11 @@ fn mcp_tool_calls_fit_a_server_worker_stack() {
             ("snapshot", json!({"graph":"default"})),
             (
                 "query",
-                json!({"graph":"default","query":"query adults() { match { $p: Person $p.age >= 30 } return { $p.name } }"}),
+                json!({"graph":"default","query":"query adults() { match { $p: Person } where $p.age >= 30 return { $p.name } }"}),
             ),
             (
                 "mutate",
-                json!({"graph":"default","query":"query add() { insert Person { name: \"Stack\", age: 1 } }"}),
+                json!({"graph":"default","query":"query add() { replace Person { name: \"Stack\", age: 1 } }"}),
             ),
         ];
         for (tool, arguments) in calls {
@@ -1139,7 +1139,7 @@ async fn mcp_read_parity_tools_equal_their_routes() {
         &app,
         "secret",
         "mutate",
-        json!({"graph":"default","query":"query add($name: String) { insert Person { name: $name, age: 41 } }","params":{"name":"Dana"}}),
+        json!({"graph":"default","query":"query add($name: String) { replace Person { name: $name, age: 41 } }","params":{"name":"Dana"}}),
     )
     .await;
     assert_eq!(written["result"]["isError"], false, "{written}");
@@ -1149,7 +1149,7 @@ async fn mcp_read_parity_tools_equal_their_routes() {
         .to_owned();
     // A branch with two changes of its own, and a proposal awaiting
     // publication.
-    let insert = "query add($name: String) { insert Person { name: $name, age: 9 } }";
+    let insert = "query add($name: String) { replace Person { name: $name, age: 9 } }";
     for (tool, arguments) in [
         (
             "branches_create",
@@ -1165,7 +1165,7 @@ async fn mcp_read_parity_tools_equal_their_routes() {
         ),
         (
             "mutate",
-            json!({"graph":"default","query":"query propose() as commit { insert Person { name: \"Pia\", age: 33 } }"}),
+            json!({"graph":"default","query":"query propose() as commit { replace Person { name: \"Pia\", age: 33 } }"}),
         ),
     ] {
         let result = call(&app, "secret", tool, arguments).await;
@@ -1566,7 +1566,7 @@ async fn mcp_write_tools_are_conditional_and_policy_gated() {
         .as_str()
         .unwrap()
         .to_owned();
-    let insert = "query add($name: String) { insert Person { name: $name, age: 7 } }";
+    let insert = "query add($name: String) { replace Person { name: $name, age: 7 } }";
     let first = call(
         &app,
         "secret",
@@ -1612,7 +1612,7 @@ async fn mcp_write_tools_are_conditional_and_policy_gated() {
         &app,
         "secret",
         "load",
-        json!({"graph":"default","mode":"merge","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Gina\",\"age\":50}}"}),
+        json!({"graph":"default","mode":"replace","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Gina\",\"age\":50}}"}),
     )
     .await;
     assert_eq!(loaded["result"]["isError"], false, "{loaded}");
@@ -1670,7 +1670,7 @@ async fn mcp_write_tools_are_conditional_and_policy_gated() {
         &app,
         "secret",
         "load",
-        json!({"graph":"default","branch":"forked","from":"main","mode":"append","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}"}),
+        json!({"graph":"default","branch":"forked","from":"main","mode":"insert","data":"{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":31}}"}),
     )
     .await;
     assert_eq!(refused["result"]["isError"], true, "{refused}");
@@ -1793,7 +1793,7 @@ async fn operations_app(settings: omnigraph_server::McpSettings) -> (tempfile::T
         ),
         (
             "add",
-            "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
             true,
         ),
     ]);
@@ -1989,7 +1989,7 @@ async fn mcp_blob_commit_control_and_stored_mutation_tools_equal_their_routes() 
     let propose = |name: &str| {
         let app = app.clone();
         let source = format!(
-            "query propose() as commit {{ insert Person {{ name: \"{name}\", age: 40 }} }}"
+            "query propose() as commit {{ replace Person {{ name: \"{name}\", age: 40 }} }}"
         );
         async move {
             let proposed = call(
@@ -2493,7 +2493,8 @@ async fn mcp_a_read_past_the_budget_or_the_cap_is_refused_naming_the_budget() {
     .unwrap()
     .with_mcp_settings(omnigraph_server::McpSettings::default());
     let app = omnigraph_server::build_app(state);
-    let query = "query n($below: I32) { match { $p: Person $p.age < $below } return { $p.name } }";
+    let query =
+        "query n($below: I32) { match { $p: Person } where $p.age < $below return { $p.name } }";
     let read = |below: i32| {
         let app = app.clone();
         async move {

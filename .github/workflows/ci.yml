@@ -100,8 +100,12 @@ jobs:
           for path in "${changed[@]}"; do
             case "$path" in
               docs/user/queries/catalogue.md) run_full_ci=true ;;
-              docs/*.md|docs/*.mdx|docs/*.rst|docs/*.adoc|changelog.d/*.md|changelog.d/release.json) ;;
-              README.md|AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
+              # The documented query texts (a guide's `gq` blocks, the README's) are
+              # parsed by GQT's query corpus test, which `run_gqt` runs.
+              docs/rfcs/*|docs/releases/*) ;;
+              docs/*.md|README.md) run_gqt=true ;;
+              docs/*.mdx|docs/*.rst|docs/*.adoc|changelog.d/*.md|changelog.d/release.json) ;;
+              AGENTS.md|CLAUDE.md|CHANGELOG.md|CONTRIBUTING.md|CODE_OF_CONDUCT.md) ;;
               LICENSE|LICENSE.md) ;;
               crates/omnigraph-gqt/cases/*.gqt) run_gqt=true ;;
               Dockerfile|.dockerignore|docker/*|deploy/*) run_deployment=true ;;
@@ -872,13 +876,15 @@ jobs:
       # The genuine predecessors of the in-place route (`omnigraph upgrade`):
       # release-0.11.0 writes stamp 9 and converts a release-0.10.0 graph to
       # stamp 8; stamp-13 is the last main commit that wrote stamp 13;
-      # lance-11 is the same graph format on a genuinely older substrate.
+      # lance-11 is the same graph format on a genuinely older substrate;
+      # gq-2 is the published main build before the GQ 3 break, the
+      # binary the one-way journeys read back with.
       # `require` fails a journey whose row is missing instead of skipping
       # it: this context is required on every change.
       - name: Provision predecessors
         uses: ./.github/actions/predecessors
         with:
-          rows: stamp-13 lance-11 release-0.10.0 release-0.11.0
+          rows: stamp-13 lance-11 release-0.10.0 release-0.11.0 gq-2
           require: true
 
       # The owner is the `crossversion_upgrade` module of the CLI's
@@ -992,6 +998,160 @@ jobs:
             || { echo "::error::exact v5↔v10 format fence did not execute normally"; exit 1; }
           grep -Eq "test result: ok\. 1 passed; 0 failed" "$test_log" \
             || { echo "::error::v5↔v10 format fence matched the wrong test set"; exit 1; }
+
+  cross_version:
+    name: Cross-Version Comparison
+    needs: classify_changes
+    # Runs wherever GQT runs (engine input or the `.gqt` corpus), since its
+    # input is the corpus and the engine both.
+    if: needs.classify_changes.outputs.run_gqt == 'true'
+    runs-on: ubuntu-latest
+    # Two runner builds share one target directory (the pinned GQ 2
+    # commit's `omnigraph-gqt`, then this tree's), then every case pair runs
+    # under the deterministic simulation twice per side. Measured cold on the
+    # first hosted run (2026-11-18): the two builds 45 minutes, each
+    # comparison pass 6.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 16777216
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: |
+            . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          version: "v0.16.0"
+
+      - name: Check the cross-version comparator
+        run: python3 scripts/cross-version.py --self-test
+
+      # The GQ 2 side: the GQT runner of the merge base with main that
+      # the GQ 3 break was measured against. Keep it immutable: the GQ 2
+      # engine is what every case is compared with, and a moving reference
+      # would compare GQ 3 with itself (docs/dev/test-ownership.md, Cross-version
+      # comparison).
+      - name: Build the GQ 2 GQT runner and CLI
+        env:
+          GQ_2_SOURCE_COMMIT: 64b3b2f3917b6c146a60e5445f6ead158a572b02
+        run: |
+          set -euo pipefail
+          gq2_source="$RUNNER_TEMP/omnigraph-gq-2"
+          gq2_bin="$RUNNER_TEMP/omnigraph-gqt-gq-2"
+          gq2_cli="$RUNNER_TEMP/omnigraph-gq-2-cli"
+          git fetch --no-tags --depth=1 origin "$GQ_2_SOURCE_COMMIT"
+          git worktree add --detach "$gq2_source" "$GQ_2_SOURCE_COMMIT"
+          test "$(git -C "$gq2_source" rev-parse HEAD)" = "$GQ_2_SOURCE_COMMIT"
+          # Run inside the predecessor checkout so its workspace configuration
+          # (the `tokio_unstable` cfg the simulation needs) applies.
+          (cd "$gq2_source" && cargo build --locked \
+            --package omnigraph-gqt \
+            --package omnigraph-cli \
+            --bin omnigraph-gqt \
+            --bin omnigraph \
+            --target-dir "$GITHUB_WORKSPACE/target")
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph-gqt" "$gq2_bin"
+          cp "$GITHUB_WORKSPACE/target/debug/omnigraph" "$gq2_cli"
+          test -x "$gq2_bin"
+          test -x "$gq2_cli"
+          # The two commits' path packages share names and versions; remove
+          # both identities before the current runner links.
+          cargo clean --workspace --locked \
+            --manifest-path "$gq2_source/Cargo.toml" \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          cargo clean --workspace --locked \
+            --target-dir "$GITHUB_WORKSPACE/target"
+          echo "GQ_2_SOURCE_COMMIT=$GQ_2_SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_GQ_2_GQT_BIN=$gq2_bin" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_GQ_2_BIN=$gq2_cli" >> "$GITHUB_ENV"
+          echo "OMNIGRAPH_GQ_2_TREE=$gq2_source" >> "$GITHUB_ENV"
+
+      - name: Build the current GQT runner
+        run: cargo build --locked --package omnigraph-gqt --bin omnigraph-gqt
+
+      - name: Compare every case both versions hold
+        run: |
+          set -euo pipefail
+          python3 scripts/cross-version.py run \
+            --gq-2-runner "$OMNIGRAPH_GQ_2_GQT_BIN" \
+            --current-runner target/debug/omnigraph-gqt \
+            --base-ref "$GQ_2_SOURCE_COMMIT" \
+            --work "$RUNNER_TEMP/cross-version" \
+            --jobs "$(nproc)"
+
+      # A second pass under `--measure`: store requests are deterministic
+      # under the simulation, so a step whose requests rose is a difference
+      # the table must name. Its own pass, since the measure ledger moves a
+      # concurrent block's park points.
+      - name: Compare every paired step's store requests
+        run: |
+          set -euo pipefail
+          python3 scripts/cross-version.py run \
+            --gq-2-runner "$OMNIGRAPH_GQ_2_GQT_BIN" \
+            --current-runner target/debug/omnigraph-gqt \
+            --base-ref "$GQ_2_SOURCE_COMMIT" \
+            --work "$RUNNER_TEMP/cross-version-measure" \
+            --jobs "$(nproc)" \
+            --measure
+
+      # The generated reads both versions express, run through the GQ 2
+      # CLI and this tree's engine (docs/dev/test-ownership.md, Generated laws).
+      - name: Run the two-version law
+        env:
+          OMNIGRAPH_REQUIRE_GQ_2: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p omnigraph-gqt --test integration \
+            law_two_versions:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/two-versions.log"
+          grep -F "test law_two_versions::gq_2_and_gq_3_answer_generated_reads_alike ... ok" "$RUNNER_TEMP/two-versions.log"
+
+      # `omnigraph lint --fix`'s loop over every GQ 2 text of the pinned
+      # tree: the printed fixes converge, and what they write has the typed
+      # IR of the hand rewrite in this tree or a row of
+      # crates/omnigraph-gqt/lint-fix-gq-2.tsv (docs/dev/test-ownership.md,
+      # Cross-version comparison).
+      - name: Respell the GQ 2 corpus with the printed fixes
+        env:
+          OMNIGRAPH_REQUIRE_GQ_2: '1'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p omnigraph-gqt --test integration \
+            fix_gq_2:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/lint-fix-gq-2.log"
+          grep -F "test fix_gq_2::printed_fixes_respell_the_gq_2_corpus_into_its_hand_rewrite ... ok" "$RUNNER_TEMP/lint-fix-gq-2.log"
+
+      - name: Retain the cross-version report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cross-version-report
+          path: |
+            ${{ runner.temp }}/cross-version/report.json
+            ${{ runner.temp }}/cross-version-measure/report.json
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
 
   test_aws_feature:
     name: Test omnigraph-server --features aws
@@ -1679,7 +1839,7 @@ jobs:
   # only where the job's own `if:` was false (docs/dev/branch-protection.md).
   ci_gate:
     name: CI Gate
-    needs: [classify_changes, check_agents_md, workflow_action_pins, cargo_deny, graph_vocabulary_guard, fmt, lint, test, storage_upgrade_compatibility, test_aws_feature]
+    needs: [classify_changes, check_agents_md, workflow_action_pins, cargo_deny, graph_vocabulary_guard, fmt, lint, test, storage_upgrade_compatibility, cross_version, test_aws_feature]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1696,4 +1856,5 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_REF: ${{ github.ref }}
           RUN_FULL_CI: ${{ needs.classify_changes.outputs.run_full_ci }}
+          RUN_GQT: ${{ needs.classify_changes.outputs.run_gqt }}
         run: python3 scripts/ci_gate.py

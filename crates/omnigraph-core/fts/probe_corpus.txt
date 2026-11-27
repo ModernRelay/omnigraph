@@ -1,0 +1,140 @@
+# The probe corpus of the measured analyzer fingerprint (the GQ 3 RFC, section 4,
+# Schema: Text, and RFC 0043). `omnigraph_core::fts_analysis` runs every profile's
+# analyzer and its native Lance configuration over these probes, in order, and digests
+# the tokens each emits. A probe catches only what it exercises, so each group below
+# exercises one pipeline step.
+#
+# Format: one probe per line, written as a JSON string literal; a line starting with
+# `#` and a blank line are not probes. Escapes (`\u0301`) spell inputs whose bytes
+# matter, so an editor that normalizes text cannot change them. Changing this file
+# changes every measured fingerprint, which invalidates every certificate built before;
+# `fts_analysis::tests::measured_fingerprints_are_the_golden` names it.
+
+# Case: ASCII and non-ASCII capitals, title case, the Turkish dotted capital I
+# (its lowercase adds a combining dot), the German sharp s and Greek final sigma.
+"Hello WORLD hello World"
+"MiXeD CaSe tExT"
+"ÉCOLE École école"
+"İstanbul ISTANBUL"
+"STRASSE Straße straße"
+"ΟΔΟΣ Οδός οδός"
+"ǅ ǆ Ǆ ǈ"
+
+# ASCII folding: accents, ligatures and letters that fold to two ASCII letters, and
+# folding after stemming (`résumés` and `resumes` stay apart under `english_v1`).
+"café crème brûlée"
+"naïve façade coöperate"
+"Æsir æther Œuvre œuvre"
+"Ångström smörgåsbord"
+"Ørsted Łódź Đakovo"
+"résumé résumés resumes"
+"señor SEÑOR"
+"þorn ð ß"
+
+# Stemming: Snowball English suffixes, irregular forms it leaves, a word whose stem is
+# a stop word (`beings` stems to `be`), and words the stemmer leaves alone.
+"running runs ran runner runners"
+"connection connected connecting connections"
+"generously generous generation generate"
+"caresses ponies ties caress cats"
+"happily happiness happy"
+"argued arguing argue argues"
+"human beings"
+"national nationality nationalism"
+"sky skies dying lying"
+"the quick brown fox jumps over the lazy dog"
+
+# Stop words: every word of `english_v1`'s stop list (each NLTK English stop word and
+# its Snowball stem), then the words whose stem differs, capitalized, so the list must
+# meet the stemmer's output.
+"a about abov above after again against ain all am an and ani any"
+"are aren aren't as at be becaus because been befor before being"
+"below between both but by can couldn couldn't d did didn didn't"
+"do doe does doesn doesn't doing don don't down dure during each"
+"few for from further had hadn hadn't has hasn hasn't have haven"
+"haven't having he he'd he'll he's her here hers herself him himself"
+"his how i i'd i'll i'm i'v i've if in into is isn isn't it it'd"
+"it'll it's its itself just ll m ma me mightn mightn't more most"
+"mustn mustn't my myself needn needn't no nor not now o of off"
+"on onc once onli only or other our ours ourselv ourselves out"
+"over own re s same shan shan't she she'd she'll she's should should'v"
+"should've shouldn shouldn't so some such t than that that'll the"
+"their theirs them themselv themselves then there these they they'd"
+"they'll they'r they're they'v they've this those through to too"
+"under until up ve veri very was wasn wasn't we we'd we'll we'r"
+"we're we'v we've were weren weren't what when where whi which"
+"while who whom why will with won won't wouldn wouldn't y you you'd"
+"you'll you'r you're you'v you've your yours yourself yourselv"
+"yourselves"
+"Only Very Any Why During Above Because Before Does Once Ourselves Themselves Yourselves"
+"ONLY VERY ANY WHY DURING"
+
+# NFC: decomposed and composed spellings of one text, canonical reordering of combining
+# marks, singletons NFC replaces (Kelvin, Angstrom and Ohm signs), decomposed Hangul
+# jamo, and compatibility characters NFC leaves (only NFKC would change them).
+"cafe\u0301"
+"café"
+"e\u0301tude \u00e9tude"
+"A\u030angstro\u0308m \u00c5ngstr\u00f6m"
+"n\u0303 \u00f1"
+"a\u0323\u0302 a\u0302\u0323 \u1ead"
+"\u212bngstrom 300\u212a 5\u2126"
+"\u1112\u1161\u11ab\u1100\u1173\u11af \ud55c\uae00"
+"\u0915\u093c \u0958"
+"\ufb01ne \ufb02ow"
+"\u2460 x\u00b2 \u2163"
+"\uff21\uff22\uff23 \uff41\uff42\uff43"
+"e\u0301"
+
+# Token length: no profile filters by length. Tokens of 39, 40 and 41 bytes (GQ 2's
+# analysis dropped 40 or more), 40 bytes of two-byte letters, and one of 300 bytes.
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx short"
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx short"
+"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx short"
+"éééééééééééééééééééé"
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+# Punctuation and digits: hyphens, apostrophes, dotted abbreviations, numbers with
+# separators, underscores, symbols, addresses and digits inside words.
+"e-mail co-operate state-of-the-art"
+"don't won't it's O'Brien"
+"U.S.A. e.g. i.e."
+"3.14159 1,000,000 42nd 1st 2nd"
+"hello_world snake_case camelCase"
+"C++ C# .NET F#"
+"foo@bar.com https://example.org/path?q=1&r=2"
+"x86_64 v2 2024-11-17 10:30"
+"!!! ??? ... --- ***"
+"(parenthesized) [bracketed] {braced} \"quoted\""
+
+# Empty and whitespace-only values: empty, spaces, tabs and newlines, a no-break space,
+# an ideographic space and a zero-width space.
+""
+" "
+"   "
+"\t\n\r"
+"\u00a0"
+"\u3000"
+"\u200b"
+"word\u200bword"
+
+# Non-Latin scripts: Cyrillic, Greek, Arabic, Hebrew, Devanagari, Chinese, Japanese,
+# Korean, Thai and emoji with skin-tone and flag sequences.
+"Москва БЕГУЩИЙ бегущий"
+"Οδυσσεύς ΟΔΥΣΣΕΥΣ"
+"مرحبا بالعالم"
+"שלום עולם"
+"नमस्ते दुनिया"
+"東京都 日本語"
+"カタカナ ひらがな"
+"한국어 문장"
+"ภาษาไทย"
+"😀 👍🏽 🇯🇵"
+
+# Letters next to characters that lowercase to themselves and ASCII-fold to capitals (the
+# trade mark and service mark signs), and small capital letters, which folding leaves.
+"x\u2122 vitamin"
+"\u2122"
+"brand\u2122name"
+"acme\u2120"
+"\u0299\u026a\u0262 \u029f\u0280"

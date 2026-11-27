@@ -31,7 +31,7 @@ branch create b0
 --- expect ok
 
 --- mutate branch: b0
-query upsert_inherited_edge() { insert Knows { from: "Alice", to: "Bob" } }
+query upsert_inherited_edge() { replace Knows { @src: "Alice", @dst: "Bob" } }
 
 --- expect affected: nodes=0 edges=1
 
@@ -41,21 +41,18 @@ branch merge b0
 --- expect ok
 
 --- mutate branch: b0
-query write_on_merged_branch() { insert Knows { from: "Charlie", to: "Diana" } }
+query write_on_merged_branch() { replace Knows { @src: "Charlie", @dst: "Diana" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- mutate branch: main
-query write_on_main() { insert Knows { from: "Bob", to: "Charlie" } }
+query write_on_main() { replace Knows { @src: "Bob", @dst: "Charlie" } }
 
 --- expect affected: nodes=0 edges=1
 
 --- query branch: b0
 query edges() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 
@@ -70,16 +67,13 @@ p.name: String
 q.name: String
 
 --- mutate branch: main
-query delete_alice_edges() { delete Knows where from = "Alice" }
+query delete_alice_edges() { match { $x: Knows } where $x.@src = "Alice"  delete $x }
 
 --- expect affected: nodes=0 edges=2
 
 --- query branch: main
 query edges() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 
@@ -95,10 +89,7 @@ q.name: String
 
 --- query branch: main
 query edge_count() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { count($q.name) as n }
 }
 

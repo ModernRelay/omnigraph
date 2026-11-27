@@ -1,0 +1,1 @@
+- A grouped read whose order key repeats a `return` item after a refused item is refused with that item's code (`T6`) instead of crashing the compiler.

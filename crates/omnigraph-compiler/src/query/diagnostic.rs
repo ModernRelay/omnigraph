@@ -9,6 +9,10 @@
 //! `Display` renders the legacy one-line form (`parse error: …`,
 //! `type error: T33: …`) and nothing else, so every existing assertion on the
 //! rendered text keeps holding; the other fields travel as data.
+//!
+//! A compile pass returns every independent refusal of its source
+//! (`check::check_source_all`); where an API has room for one diagnostic it
+//! carries the first, and the others ride its `further` list.
 
 use serde::Serialize;
 
@@ -58,6 +62,65 @@ pub enum QueryDiagnosticKind {
     Parse,
     Type,
     Plan,
+    /// A row the query refused while it ran (an `E…` code).
+    Execution,
+}
+
+thread_local! {
+    /// The line indexes of the sources whose scopes are open on this thread,
+    /// innermost last (a parse can reparse inside itself).
+    static LINE_INDEXES: std::cell::RefCell<Vec<LineIndex>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many positions this thread computed by reading the source's
+    /// prefix, outside any [`LineIndex::scope`].
+    pub(crate) static PREFIX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The byte offset where each line of a source starts, computed once.
+pub(crate) struct LineIndex {
+    /// The source's address and length: while its scope is open the source
+    /// is borrowed, so these name that text and no other.
+    source: (usize, usize),
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    fn serves(&self, source: &str) -> bool {
+        self.source == (source.as_ptr() as usize, source.len())
+    }
+
+    /// The 1-based line holding `byte` and the offset where it starts.
+    fn line_of(&self, byte: usize) -> (usize, usize) {
+        let line = self.starts.partition_point(|start| *start <= byte);
+        (line, self.starts[line - 1])
+    }
+
+    /// Run `f` with `source`'s line index installed: every
+    /// [`Position::at`] over `source` inside `f` reads it.
+    pub(crate) fn scope<T>(source: &str, f: impl FnOnce() -> T) -> T {
+        let starts = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(n, _)| n + 1))
+            .collect();
+        LINE_INDEXES.with(|indexes| {
+            indexes.borrow_mut().push(LineIndex {
+                source: (source.as_ptr() as usize, source.len()),
+                starts,
+            })
+        });
+        // Removed on unwind too, so no index outlives its borrow.
+        struct Pop;
+        impl Drop for Pop {
+            fn drop(&mut self) {
+                LINE_INDEXES.with(|indexes| indexes.borrow_mut().pop());
+            }
+        }
+        let _pop = Pop;
+        f()
+    }
 }
 
 /// A source position: 1-based line and column (in characters) plus the byte
@@ -72,15 +135,37 @@ pub struct Position {
 impl Position {
     /// The line and column of byte offset `byte` in `source`; an offset past
     /// the end positions at the end.
+    /// An offset inside a multi-byte character positions at that
+    /// character.
+    ///
+    /// Inside a [`LineIndex::scope`] for `source` the line is found by a
+    /// binary search over the line starts computed once for the scope, so a
+    /// parse that positions many refusals reads the source once, not once
+    /// per refusal; elsewhere the prefix is read.
     pub fn at(source: &str, byte: usize) -> Self {
-        let byte = byte.min(source.len());
-        let prefix = source.get(..byte).unwrap_or(source);
-        let line = prefix.matches('\n').count() + 1;
-        let column = prefix
-            .rsplit('\n')
-            .next()
-            .map_or(0, |last| last.chars().count())
-            + 1;
+        let mut byte = byte.min(source.len());
+        while !source.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        let (line, line_start) = LINE_INDEXES
+            .with(|indexes| {
+                indexes
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|index| index.serves(source))
+                    .map(|index| index.line_of(byte))
+            })
+            .unwrap_or_else(|| {
+                #[cfg(test)]
+                PREFIX_READS.with(|n| n.set(n.get() + 1));
+                let prefix = &source[..byte];
+                (
+                    prefix.matches('\n').count() + 1,
+                    prefix.rfind('\n').map_or(0, |n| n + 1),
+                )
+            });
+        let column = source[line_start..byte].chars().count() + 1;
         Self {
             line: u32::try_from(line).unwrap_or(u32::MAX),
             column: u32::try_from(column).unwrap_or(u32::MAX),
@@ -122,6 +207,28 @@ pub struct Suggestion {
     pub edits: Vec<TextEdit>,
 }
 
+/// Another source span a refusal names: the earlier of two declarations
+/// of one name, beside the later one the refusal points at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RelatedSpan {
+    pub position: Position,
+    pub end: Position,
+    /// What stands there, one line.
+    pub message: String,
+}
+
+/// What few diagnostics carry, boxed so a diagnostic stays small: the other
+/// spans the refusal names, and the further refusals of its compile pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct Extra {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedSpan>,
+    /// The independent refusals the same compile pass found after this one,
+    /// in source order; each carries no further list of its own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub further: Vec<QueryDiagnostic>,
+}
+
 /// One query compile diagnostic. See the module documentation for the
 /// contract each field carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -130,8 +237,13 @@ pub struct QueryDiagnostic {
     pub code: QueryCode,
     /// What was expected or violated, one line, without a position.
     pub message: String,
+    /// Where the refused construct starts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
+    /// Where the refused construct ends (exclusive): with `position`, its
+    /// span.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<Position>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<Box<Stage>>,
     /// One concrete fix, naming the construct to use.
@@ -140,6 +252,9 @@ pub struct QueryDiagnostic {
     /// Optional edits for the original source, separate from human guidance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<Box<Suggestion>>,
+    /// The related spans and the further refusals, when there are any.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<Box<Extra>>,
 }
 
 impl QueryDiagnostic {
@@ -151,9 +266,11 @@ impl QueryDiagnostic {
             code,
             message: message.into(),
             position,
+            end: None,
             stage: None,
             fix: None,
             suggestion: None,
+            extra: None,
         }
     }
 
@@ -165,12 +282,14 @@ impl QueryDiagnostic {
             code,
             message: message.into(),
             position: None,
+            end: None,
             stage: Some(Box::new(Stage {
                 name: "typecheck",
                 expression: None,
             })),
             fix: None,
             suggestion: None,
+            extra: None,
         }
     }
 
@@ -182,12 +301,34 @@ impl QueryDiagnostic {
             code,
             message: message.into(),
             position: None,
+            end: None,
             stage: Some(Box::new(Stage {
                 name: "plan",
                 expression: None,
             })),
             fix: None,
             suggestion: None,
+            extra: None,
+        }
+    }
+
+    /// An execution diagnostic: a well-typed expression refused a row while
+    /// the query ran (an integer overflow, a zero divisor, a non-finite
+    /// float), so it carries the `execution` stage.
+    pub fn execution(code: QueryCode, message: impl Into<String>) -> Self {
+        Self {
+            kind: QueryDiagnosticKind::Execution,
+            code,
+            message: message.into(),
+            position: None,
+            end: None,
+            stage: Some(Box::new(Stage {
+                name: "execution",
+                expression: None,
+            })),
+            fix: None,
+            suggestion: None,
+            extra: None,
         }
     }
 
@@ -199,6 +340,85 @@ impl QueryDiagnostic {
     pub fn with_suggestion(mut self, suggestion: Suggestion) -> Self {
         self.suggestion = Some(Box::new(suggestion));
         self
+    }
+
+    /// The span `start..end` of `source`, when the diagnostic has no
+    /// position of its own.
+    pub fn at_span(mut self, source: &str, start: usize, end: usize) -> Self {
+        if self.position.is_none() {
+            self.position = Some(Position::at(source, start));
+            self.end = Some(Position::at(source, end));
+        }
+        self
+    }
+
+    /// Another span the refusal names.
+    pub fn with_related(mut self, related: RelatedSpan) -> Self {
+        self.extra.get_or_insert_default().related.push(related);
+        self
+    }
+
+    /// The other spans the refusal names.
+    pub fn related(&self) -> &[RelatedSpan] {
+        self.extra.as_ref().map_or(&[], |extra| &extra.related)
+    }
+
+    /// The independent refusals the same compile pass found after this one.
+    pub fn further(&self) -> &[QueryDiagnostic] {
+        self.extra.as_ref().map_or(&[], |extra| &extra.further)
+    }
+
+    /// Every refusal of the pass: this one, then [`Self::further`], each
+    /// without its further list.
+    /// This diagnostic, and each further one, with its suggestion's edits
+    /// of `source` rewritten to keep every comment they replace
+    /// ([`crate::query::syntax::trivia::keep_comments`]).
+    pub fn keep_comments(&mut self, source: &str) {
+        if let Some(suggestion) = self.suggestion.as_deref_mut()
+            && suggestion.edits.iter().all(|e| {
+                e.start <= e.end
+                    && e.end <= source.len()
+                    && source.is_char_boundary(e.start)
+                    && source.is_char_boundary(e.end)
+            })
+        {
+            suggestion.edits =
+                crate::query::syntax::trivia::keep_comments(source, &suggestion.edits);
+        }
+        if let Some(extra) = self.extra.as_deref_mut() {
+            for further in &mut extra.further {
+                further.keep_comments(source);
+            }
+        }
+    }
+
+    pub fn all(&self) -> Vec<QueryDiagnostic> {
+        let mut first = self.clone();
+        let further = first
+            .extra
+            .as_mut()
+            .map(|extra| std::mem::take(&mut extra.further))
+            .unwrap_or_default();
+        if first
+            .extra
+            .as_ref()
+            .is_some_and(|extra| extra.related.is_empty())
+        {
+            first.extra = None;
+        }
+        std::iter::once(first).chain(further).collect()
+    }
+
+    /// The first of `refusals`, carrying the others as its further list;
+    /// `None` when there are none.
+    pub fn first_of(refusals: Vec<QueryDiagnostic>) -> Option<QueryDiagnostic> {
+        let mut refusals = refusals.into_iter();
+        let mut first = refusals.next()?;
+        let further: Vec<QueryDiagnostic> = refusals.collect();
+        if !further.is_empty() {
+            first.extra.get_or_insert_default().further = further;
+        }
+        Some(first)
     }
 
     pub fn with_expression(mut self, expression: impl Into<String>) -> Self {
@@ -225,6 +445,9 @@ impl std::fmt::Display for QueryDiagnostic {
             }
             QueryDiagnosticKind::Plan => {
                 write!(f, "plan error: {}: {}", self.code, self.message)
+            }
+            QueryDiagnosticKind::Execution => {
+                write!(f, "execution error: {}: {}", self.code, self.message)
             }
         }
     }

@@ -24,7 +24,7 @@ edge Knows: Person -> Person {
 {"type":"Person","data":{"name":"a0"}}
 {"type":"Person","data":{"name":"b0"}}
 
---- load generate: v1 seed: 1 mode: append
+--- load generate: v1 seed: 1 mode: insert
 tables:
   - kind: edge
     name: Knows
@@ -39,10 +39,8 @@ tables:
 --- query
 set query_memory_bytes = 1048576;
 query one_mib() {
-    match {
-        $p: Person { name: "a0" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a0"
     return { $q.name, count($e.payload) as n }
 }
 
@@ -56,10 +54,8 @@ n: I64
 --- query
 set query_memory_bytes = 2097152;
 query two_mib() {
-    match {
-        $p: Person { name: "a0" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a0"
     return { $q.name, count($e.payload) as n }
 }
 

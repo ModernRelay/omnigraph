@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{ReadTarget, SnapshotId};
 use omnigraph_api_types::{ChangeOutput, ReadOutput};
-use omnigraph_compiler::query::ast::{BranchWrite, CommitWrite, LoadStmt, LoadStmtMode};
+use omnigraph_compiler::query::file::{BranchWrite, CommitWrite, LoadStmt, LoadStmtMode};
 use serde_json::Value;
 
 use crate::client::{GraphClient, parse_set_flags};

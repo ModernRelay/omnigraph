@@ -1,0 +1,189 @@
+# issue: none
+# traversal: auto
+# notes: What a String's declaration builds (the GQ 3 RFC, section 4, "Scalar indexes"): a `@key`
+# notes: alone builds a BTREE only, so `contains` on a key is answered by the scan; a plain `@index`
+# notes: builds an NGRAM and a BTREE; a `@key` with an explicit `@index` follows the `@index` rule;
+# notes: and only `@index(fulltext)` adds a full-text index beside its NGRAM and BTREE. The four
+# notes: types hold the same texts. `contains` answers the same rows on each, and the plan names
+# notes: the path it takes: the scan on the key, an NGRAM probe elsewhere; a range on the key
+# notes: probes its BTREE. `match_terms` reads no index (the exact scan answers it
+# notes: whatever is built), so it answers the same rows on all four; the reference interpreter
+# notes: applies no stemmer, so those steps have no reference comparison. Whether a full-text index
+# notes: is physically built is owned by the engine's `scalar_indexes` test.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node KeyOnly {
+    text: String @key
+}
+node Plain {
+    slug: String @key
+    text: String @index
+}
+node KeyIndexed {
+    text: String @key @index
+}
+node FullText {
+    slug: String @key
+    text: String @index(fulltext)
+}
+
+--- seed
+{"type": "KeyOnly", "data": {"text": "graph engines"}}
+{"type": "KeyOnly", "data": {"text": "a search engine runs"}}
+{"type": "KeyOnly", "data": {"text": "databases"}}
+{"type": "Plain", "data": {"slug": "s1", "text": "graph engines"}}
+{"type": "Plain", "data": {"slug": "s2", "text": "a search engine runs"}}
+{"type": "Plain", "data": {"slug": "s3", "text": "databases"}}
+{"type": "KeyIndexed", "data": {"text": "graph engines"}}
+{"type": "KeyIndexed", "data": {"text": "a search engine runs"}}
+{"type": "KeyIndexed", "data": {"text": "databases"}}
+{"type": "FullText", "data": {"slug": "s1", "text": "graph engines"}}
+{"type": "FullText", "data": {"slug": "s2", "text": "a search engine runs"}}
+{"type": "FullText", "data": {"slug": "s3", "text": "databases"}}
+
+--- query
+query key_only_contains() {
+    match { $n: KeyOnly }
+    where contains($n.text, "engine")
+    return { $n.text }
+}
+
+--- expect unordered
+{"n.text": "graph engines"}
+{"n.text": "a search engine runs"}
+
+--- expect shape
+n.text: String
+
+--- expect plan
+scan KeyOnly as $n: access sequential
+
+--- query
+query plain_contains() {
+    match { $n: Plain }
+    where contains($n.text, "engine")
+    return { $n.text }
+}
+
+--- expect unordered
+{"n.text": "graph engines"}
+{"n.text": "a search engine runs"}
+
+--- expect shape
+n.text: String
+
+--- expect plan
+scan Plain as $n: access index_probe text ngram
+
+--- query
+query key_indexed_contains() {
+    match { $n: KeyIndexed }
+    where contains($n.text, "engine")
+    return { $n.text }
+}
+
+--- expect unordered
+{"n.text": "graph engines"}
+{"n.text": "a search engine runs"}
+
+--- expect shape
+n.text: String
+
+--- expect plan
+scan KeyIndexed as $n: access index_probe text ngram
+
+--- query
+query full_text_contains() {
+    match { $n: FullText }
+    where contains($n.text, "engine")
+    return { $n.text }
+}
+
+--- expect unordered
+{"n.text": "graph engines"}
+{"n.text": "a search engine runs"}
+
+--- expect shape
+n.text: String
+
+--- expect plan
+scan FullText as $n: access index_probe text ngram
+
+--- query
+query key_only_range() {
+    match { $n: KeyOnly }
+    where $n.text > "c"
+    return { $n.text }
+}
+
+--- expect unordered
+{"n.text": "databases"}
+{"n.text": "graph engines"}
+
+--- expect shape
+n.text: String
+
+--- expect plan
+scan KeyOnly as $n: access index_probe text btree
+
+--- query
+query key_only_matches() {
+    match { $n: KeyOnly }
+    where match_terms($n.text, terms("engine", mode: any))
+    return { $n.text }
+}
+
+--- expect unordered
+{"n.text": "graph engines"}
+{"n.text": "a search engine runs"}
+
+--- expect shape
+n.text: String
+
+--- query
+query plain_matches() {
+    match { $n: Plain }
+    where match_terms($n.text, terms("engine", mode: any))
+    return { $n.text }
+}
+
+--- expect unordered
+{"n.text": "graph engines"}
+{"n.text": "a search engine runs"}
+
+--- expect shape
+n.text: String
+
+--- query
+query key_indexed_matches() {
+    match { $n: KeyIndexed }
+    where match_terms($n.text, terms("engine", mode: any))
+    return { $n.text }
+}
+
+--- expect unordered
+{"n.text": "graph engines"}
+{"n.text": "a search engine runs"}
+
+--- expect shape
+n.text: String
+
+--- query
+query full_text_matches() {
+    match { $n: FullText }
+    where match_terms($n.text, terms("engine", mode: any))
+    return { $n.text }
+}
+
+--- expect unordered
+{"n.text": "graph engines"}
+{"n.text": "a search engine runs"}
+
+--- expect shape
+n.text: String

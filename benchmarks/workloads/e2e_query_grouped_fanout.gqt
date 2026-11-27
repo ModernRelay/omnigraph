@@ -11,7 +11,7 @@ environments:
 
 --- query
 query grouped_fanout() {
-    match { $p: Person $p knows $q }
+    match { $p: Person, $p knows $q }
     return { $p.team, count($q) as n }
 }
 --- expect unordered
@@ -23,7 +23,7 @@ n: I64
 
 --- query
 query grouped_fanout() {
-    match { $p: Person $p knows $q }
+    match { $p: Person, $p knows $q }
     return { $p.team, count($q) as n }
 }
 --- expect unordered
@@ -37,7 +37,7 @@ n: I64
 
 --- query
 query grouped_fanout() {
-    match { $p: Person $p knows $q }
+    match { $p: Person, $p knows $q }
     return { $p.team, count($q) as n }
 }
 --- expect unordered

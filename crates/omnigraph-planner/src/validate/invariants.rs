@@ -1,7 +1,7 @@
 //! The checks every accepted plan passes (RFC 0047, "Checks have explicit
 //! boundaries"): binding and traversal identity, the eligibility predicates
 //! (every required conjunct placed, every placed conjunct required),
-//! correlated blocks, search identity and its declared approximation, the
+//! correlated blocks, search identity, the
 //! projection and the origin of every projected score, late hydration, the
 //! required order and the row cut, and the policy data the plan declares for
 //! its search. They establish that the plan keeps what the query requires
@@ -14,24 +14,28 @@
 //! which is admitted only when the validator derives the same id from the
 //! written value.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use super::requirements::{BoundVariable, Region, TieColumn};
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
-use omnigraph_compiler::query::ast::{Expr, RRF_COLUMN};
-use omnigraph_compiler::query::typecheck::BoundVariable;
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
 use super::budget::Budget;
-use super::requirements::{Requirements, Retrieval, Search, constant_true};
+use super::requirements::{
+    Block, ExactScore, FuseRequirements, Requirements, Retrieval, Search, constant_true,
+};
 use super::{AcceptInput, ValidationError};
 use crate::cost::AntiJoinStrategy;
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
-use crate::optimizer::{RRF_NEAREST_ARM_K, contains_aggregate, derived_order};
+use crate::optimizer::{arm_score, contains_aggregate, derived_order};
 use crate::physical::{
-    Assumptions, Eligibility, EmptyEligible, NodeId, OverfetchRung, PhysicalNode, PhysicalPlan,
-    RankKind, RankScope, RankedAccess,
+    NodeId, OverfetchRung, PhysicalNode, PhysicalPlan, RankScope, RankedAccess, score_kind_name,
 };
-use crate::source::FullTextCoverage;
+use crate::read_shape::ArmRank;
+use omnigraph_compiler::ir::core::ScoreKind;
+use omnigraph_compiler::ir::expr::ScalarFunc;
+use omnigraph_compiler::query::value::SCORE_COLUMN;
+use omnigraph_compiler::schema::analysis::FullTextScorer;
 
 /// The nodes of one pipeline: every node reachable from `root` without
 /// entering a correlated block's inner tree.
@@ -101,62 +105,9 @@ fn check_block_strategy(
     ))
 }
 
-/// One pipeline a query's eligibility constrains: `own`, the nodes that
-/// produce its rows, and `after`, the nodes those rows pass through above a
-/// fusion (empty without one).
-struct Constrained {
-    own: Vec<NodeId>,
-    after: Vec<NodeId>,
-}
-
-impl Constrained {
-    /// Every node the pipeline's rows reach.
-    fn reached(&self) -> Vec<NodeId> {
-        self.own.iter().chain(&self.after).copied().collect()
-    }
-}
-
-/// The pipelines whose rows a query's eligibility constrains: one per `rrf`
-/// arm, each its own copy of the match, followed by the nodes above the
-/// fusion; or the whole top level.
-fn constrained_pipelines(
-    plan: &PhysicalPlan,
-    budget: &mut Budget,
-) -> Result<Vec<Constrained>, ValidationError> {
-    let top = pipeline(plan, plan.root(), budget)?;
-    let fuse = top.iter().find_map(|id| match plan.node(*id) {
-        Some(PhysicalNode::RankFuse { arms, .. }) => Some((*id, arms.clone())),
-        _ => None,
-    });
-    let Some((fuse, arms)) = fuse else {
-        return Ok(vec![Constrained {
-            own: top,
-            after: Vec::new(),
-        }]);
-    };
-    let mut below = HashSet::new();
-    let mut arm_pipelines = Vec::new();
-    for arm in &arms {
-        let own = pipeline(plan, arm.input, budget)?;
-        below.extend(own.iter().copied());
-        arm_pipelines.push(own);
-    }
-    let after: Vec<NodeId> = top
-        .into_iter()
-        .filter(|id| *id != fuse && !below.contains(id))
-        .collect();
-    Ok(arm_pipelines
-        .into_iter()
-        .map(|own| Constrained {
-            own,
-            after: after.clone(),
-        })
-        .collect())
-}
-
 /// Every conjunct a pipeline's nodes test, wherever placement put it, with
 /// the node that tests it.
-fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<(NodeId, IRExpr)> {
+pub(super) fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<(NodeId, IRExpr)> {
     let mut out = Vec::new();
     for id in nodes {
         match plan.node(*id) {
@@ -200,6 +151,133 @@ fn conjuncts(plan: &PhysicalPlan, nodes: &[NodeId]) -> Vec<(NodeId, IRExpr)> {
     out
 }
 
+/// The region path of every node of the scope under `root`
+/// ([`Region`]): an `OptionalJoin`'s inner tree is inside its optional, each
+/// arm of a `Union` fold (a left spine of unions over the same bindings) is
+/// inside that arm, a `Correlate`'s inner tree is inside its read, and a
+/// `TargetCut`'s input is below its window. A block's inner tree and a
+/// fusion's arms are scopes of their own and are not walked.
+///
+/// The walk numbers each `OptionalJoin` and `Correlate` within its region
+/// after every node of its input side, the first input of a node before its
+/// second: the order the planner builds them in, one written element
+/// wrapping the rows of the elements before it, and the order the
+/// requirements number the written ones in.
+fn plan_regions(
+    plan: &PhysicalPlan,
+    root: NodeId,
+    budget: &mut Budget,
+) -> Result<std::collections::HashMap<NodeId, Vec<Region>>, ValidationError> {
+    fn fold_arms(
+        plan: &PhysicalPlan,
+        id: NodeId,
+        bindings: &[String],
+    ) -> (Vec<NodeId>, Vec<NodeId>) {
+        match plan.node(id) {
+            Some(PhysicalNode::Union {
+                left,
+                right,
+                bindings: own,
+            }) if own == bindings => {
+                let (mut spine, mut arms) = fold_arms(plan, *left, bindings);
+                spine.push(id);
+                arms.push(*right);
+                (spine, arms)
+            }
+            _ => (Vec::new(), vec![id]),
+        }
+    }
+    enum Visit {
+        /// The node's region is its path; its input side comes next.
+        Enter(NodeId, Vec<Region>),
+        /// Its input side is numbered: the node takes its ordinal and its
+        /// inner tree is walked inside it.
+        Leave(NodeId, Vec<Region>),
+    }
+    let mut regions = std::collections::HashMap::new();
+    let mut ordinals = super::requirements::RegionOrdinals::default();
+    let mut pending = vec![Visit::Enter(root, Vec::new())];
+    while let Some(visit) = pending.pop() {
+        let (id, path) = match visit {
+            Visit::Enter(id, path) => (id, path),
+            Visit::Leave(id, path) => {
+                let within = |region: Region| {
+                    let mut nested = path.clone();
+                    nested.push(region);
+                    nested
+                };
+                match plan.node(id) {
+                    Some(PhysicalNode::OptionalJoin {
+                        inner, outer_var, ..
+                    }) => pending.push(Visit::Enter(
+                        *inner,
+                        within(ordinals.optional(&path, outer_var)),
+                    )),
+                    Some(PhysicalNode::Correlate {
+                        inner, outer_var, ..
+                    }) => pending.push(Visit::Enter(
+                        *inner,
+                        within(ordinals.correlate(&path, outer_var)),
+                    )),
+                    _ => {}
+                }
+                continue;
+            }
+        };
+        budget.visit(1)?;
+        let Some(node) = plan.node(id) else {
+            continue;
+        };
+        let within = |region: Region| {
+            let mut nested = path.clone();
+            nested.push(region);
+            nested
+        };
+        match node {
+            PhysicalNode::OptionalJoin { input, .. } => {
+                pending.push(Visit::Leave(id, path.clone()));
+                pending.push(Visit::Enter(*input, path.clone()));
+            }
+            PhysicalNode::Correlate { input, .. } => {
+                pending.push(Visit::Leave(id, path.clone()));
+                if let Some(input) = input {
+                    pending.push(Visit::Enter(*input, path.clone()));
+                }
+            }
+            PhysicalNode::Union { bindings, .. } => {
+                let (spine, arms) = fold_arms(plan, id, bindings);
+                for node in spine {
+                    regions.insert(node, path.clone());
+                }
+                for (position, arm) in arms.into_iter().enumerate() {
+                    pending.push(Visit::Enter(
+                        arm,
+                        within(Region::UnionArm(bindings.clone(), position)),
+                    ));
+                }
+                continue;
+            }
+            PhysicalNode::TargetCut { input, .. } => {
+                pending.push(Visit::Enter(*input, within(Region::Window)))
+            }
+            PhysicalNode::AntiJoin { input, .. } => {
+                pending.push(Visit::Enter(*input, path.clone()))
+            }
+            PhysicalNode::Fuse { .. } => {}
+            // The first input is walked first: it is the last pushed.
+            other => pending.extend(
+                other
+                    .inputs()
+                    .into_iter()
+                    .rev()
+                    .map(|input| Visit::Enter(input, path.clone())),
+            ),
+        }
+        regions.insert(id, path);
+    }
+    Ok(regions)
+}
+
 /// The expression an order key names: for an alias, the return item it
 /// aliases.
 fn named_expr<'e>(returns: &'e [IRProjection], key: &'e IRExpr) -> &'e IRExpr {
@@ -212,32 +290,48 @@ fn named_expr<'e>(returns: &'e [IRProjection], key: &'e IRExpr) -> &'e IRExpr {
     }
 }
 
-/// Every full-text call the query writes reads its property's index at the
-/// pinned snapshot, so the plan records that index's coverage, and the
-/// coverage holds a segment (full or partial; an untrained declaration
-/// carries the analyzer too). Replay re-derives every recorded coverage from
-/// the pinned dataset, so a saved plan can neither omit the fact nor claim a
-/// segment the snapshot lacks.
-fn check_full_text_indexes(
-    plan: &PhysicalPlan,
-    input: &AcceptInput<'_>,
-    budget: &mut Budget,
-) -> Result<(), ValidationError> {
-    let targets = crate::optimizer::full_text_targets(input.ir);
-    budget.visit(u64::try_from(targets.len()).unwrap_or(u64::MAX))?;
-    for (type_name, property) in targets {
-        let key = Assumptions::full_text_key(&format!("node:{type_name}"), &property);
-        match plan.assumptions().full_text.get(&key) {
-            Some(FullTextCoverage::Full | FullTextCoverage::Partial) => {}
-            recorded => {
-                return Err(ValidationError::violated(
-                    "prerequisite",
-                    format!(
-                        "a full-text call reads the index of `{type_name}.{property}` under recorded coverage {recorded:?}; it needs a recorded index segment"
-                    ),
-                ));
-            }
-        }
+/// An exact `bm25` is `bm25_v1` of a full-text field over its field corpus:
+/// its retained predicate is `match_terms` over the scored `$binding.property`
+/// (the membership, evaluated before any cut), and the corpus type declares
+/// a full-text index with the ranking scorer on that property.
+fn check_exact_bm25(score: &ExactScore, input: &AcceptInput<'_>) -> Result<(), ValidationError> {
+    let retained = matches!(
+        &score.query,
+        IRExpr::Call {
+            func: ScalarFunc::MatchTerms { .. },
+            args,
+            ..
+        } if matches!(
+            args.first(),
+            Some(IRExpr::PropAccess { variable, property, .. })
+                if *variable == score.binding && *property == score.property
+        ) && args.len() == 3
+    );
+    if !retained {
+        return Err(ValidationError::violated(
+            "predicate retention",
+            format!(
+                "the exact `bm25` of `${}.{}` retains `{}`, not the `match_terms` of its field",
+                score.binding, score.property, score.query
+            ),
+        ));
+    }
+    let corpus = input
+        .catalog
+        .node_types
+        .get(&score.type_name)
+        .is_some_and(|node| {
+            node.is_lexical_field(&score.property)
+                && node.full_text_scorer(&score.property) == FullTextScorer::Bm25V1
+        });
+    if !corpus {
+        return Err(ValidationError::violated(
+            "scoring corpus",
+            format!(
+                "the exact `bm25` scores `{}.{}`, which declares no full-text index with the `bm25_v1` scorer",
+                score.type_name, score.property
+            ),
+        ));
     }
     Ok(())
 }
@@ -263,36 +357,194 @@ impl Requirements {
         input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        // A fused query's eligibility belongs inside each arm (retention);
-        // what its rows pass through after the fusion is checked with the
-        // arm for origin, extra traversals and blocks.
-        for pipeline in &constrained_pipelines(plan, budget)? {
-            let reached = pipeline.reached();
-            self.check_bindings(plan, &reached)?;
-            self.check_eligibility(plan, &pipeline.own, &reached, input, budget)?;
-            self.check_blocks(plan, &pipeline.own, budget)?;
-            if let Some(id) = pipeline
-                .after
-                .iter()
-                .find(|id| matches!(plan.node(**id), Some(PhysicalNode::AntiJoin { .. })))
-            {
+        self.check_scope(plan, plan.root(), true, input, budget)?;
+        check_policies(plan, budget)?;
+        Ok(())
+    }
+
+    /// The checks of one scope over the pipeline under `root`: the read's
+    /// own (`outermost`), with its projection, hydration, order and cut, or
+    /// a fusion arm's, whose rows the fusion ranks. A fusion's arms are
+    /// scopes of their own (`check_fusion`), so the scope's nodes stop at
+    /// them.
+    fn check_scope(
+        &self,
+        plan: &PhysicalPlan,
+        root: NodeId,
+        outermost: bool,
+        input: &AcceptInput<'_>,
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        let mut top = pipeline(plan, root, budget)?;
+        let mut held = HashSet::new();
+        // A ranking drawn as a read of its own fuses inside its read
+        // (`check_correlates` holds its arms' order): the scope's fusion is
+        // outside every correlated read's inner tree.
+        let mut in_reads = HashSet::new();
+        for id in &top {
+            if let Some(PhysicalNode::Correlate { inner, .. }) = plan.node(*id) {
+                in_reads.extend(pipeline(plan, *inner, budget)?);
+            }
+        }
+        let scoped: Vec<NodeId> = top
+            .iter()
+            .copied()
+            .filter(|id| !in_reads.contains(id))
+            .collect();
+        // A fused read's arms are each a pipeline of its own, held by its
+        // read as the scope's fusion holds its arms.
+        let mut fused_in_reads = HashSet::new();
+        for id in &in_reads {
+            if let Some(PhysicalNode::Fuse { arms, .. }) = plan.node(*id) {
+                fused_in_reads.insert(*id);
+                for arm in arms {
+                    fused_in_reads.extend(pipeline(plan, arm.input, budget)?);
+                }
+            }
+        }
+        top.retain(|id| !fused_in_reads.contains(id));
+        match &self.fuse {
+            Some(fuse) => {
+                held = self.check_fusion(plan, &scoped, fuse, input, budget)?;
+                top.retain(|id| !held.contains(id));
+            }
+            None => {
+                if scoped
+                    .iter()
+                    .any(|id| matches!(plan.node(*id), Some(PhysicalNode::Fuse { .. })))
+                {
+                    return Err(ValidationError::violated(
+                        "search identity",
+                        "the plan fuses retrievals the query does not fuse",
+                    ));
+                }
+            }
+        }
+        self.check_bindings(plan, &top)?;
+        self.check_eligibility(plan, &top, &top, &self.eligibility, input, budget)?;
+        let blocks: Vec<&Block> = self.blocks.iter().collect();
+        self.check_blocks(plan, &top, &blocks, budget)?;
+        self.check_optionals(plan, &top, budget)?;
+        self.check_correlates(plan, &top, budget)?;
+        self.check_unions(plan, &top)?;
+        self.check_regions(plan, root, &top, budget)?;
+        self.check_scores(plan, &top, input)?;
+        self.check_lets(plan, &top)?;
+        self.check_search(plan, &top)?;
+        let scope: Vec<NodeId> = plan
+            .subtree(root)
+            .into_iter()
+            .filter(|id| !held.contains(id) && !fused_in_reads.contains(id))
+            .collect();
+        self.check_row_cuts(plan, root, &scope, budget)?;
+        if outermost {
+            self.check_returns(plan, &top, budget)?;
+            self.check_hydration(plan, &top)?;
+            self.check_order_and_cut(plan, &top, input, budget)?;
+        }
+        Ok(())
+    }
+
+    /// The scope's fusion is the query's: one `Fuse` node outside every
+    /// other's arms, of the written target, with the written `k` and
+    /// `weights`, one arm per written arm in written order, each ranking as
+    /// written, its rows arriving in that rank order (`check_arm_order`) and
+    /// its subtree holding exactly the arm's requirements. Returns every
+    /// node of the arms' subtrees.
+    fn check_fusion(
+        &self,
+        plan: &PhysicalPlan,
+        top: &[NodeId],
+        fuse: &FuseRequirements,
+        input: &AcceptInput<'_>,
+        budget: &mut Budget,
+    ) -> Result<HashSet<NodeId>, ValidationError> {
+        let mut fusions = Vec::new();
+        let mut held = HashSet::new();
+        for id in top {
+            if let Some(PhysicalNode::Fuse { arms, .. }) = plan.node(*id) {
+                fusions.push(*id);
+                for arm in arms {
+                    held.extend(pipeline(plan, arm.input, budget)?);
+                }
+            }
+        }
+        let outer: Vec<NodeId> = fusions
+            .into_iter()
+            .filter(|id| !held.contains(id))
+            .collect();
+        let [id] = outer[..] else {
+            return Err(ValidationError::violated(
+                "search identity",
+                format!(
+                    "the query fuses one ranking's arms; the plan's scope holds {} fusions",
+                    outer.len()
+                ),
+            ));
+        };
+        let Some(PhysicalNode::Fuse {
+            arms,
+            target,
+            k,
+            weights,
+            ..
+        }) = plan.node(id)
+        else {
+            unreachable!("`outer` holds fusions");
+        };
+        if *target != fuse.target {
+            return Err(ValidationError::violated(
+                "search identity",
+                format!(
+                    "the fusion ranks `${target}`; the query fuses `${}`",
+                    fuse.target
+                ),
+            ));
+        }
+        if arms.len() != fuse.arms.len() {
+            return Err(ValidationError::violated(
+                "search identity",
+                format!(
+                    "the fusion has {} arms; the query fuses {}",
+                    arms.len(),
+                    fuse.arms.len()
+                ),
+            ));
+        }
+        if *k != fuse.k {
+            return Err(ValidationError::violated(
+                "search identity",
+                "the fusion's `k` is not the one the query writes",
+            ));
+        }
+        if *weights != fuse.weights
+            || weights.as_ref().is_some_and(|weights| {
+                omnigraph_compiler::ir::rrf_weight_values(weights, arms.len()).is_none()
+            })
+        {
+            return Err(ValidationError::violated(
+                "search identity",
+                "the fusion's `weights` are not the ones the query writes",
+            ));
+        }
+        let mut nodes = HashSet::new();
+        for (index, (arm, (rank, required))) in arms.iter().zip(&fuse.arms).enumerate() {
+            if arm.rank != *rank {
                 return Err(ValidationError::violated(
-                    "predicate origin",
+                    "search identity",
                     format!(
-                        "node {id} decides a correlated block above the fusion, outside every arm"
+                        "the fusion's arm {} ranks as {}; the query's arm is {}",
+                        index + 1,
+                        arm.rank.name(),
+                        rank.name()
                     ),
                 ));
             }
+            check_arm_order(plan, arm, target)?;
+            required.check_scope(plan, arm.input, false, input, budget)?;
+            nodes.extend(plan.subtree(arm.input));
         }
-        let top = pipeline(plan, plan.root(), budget)?;
-        check_full_text_indexes(plan, input, budget)?;
-        self.check_search(plan)?;
-        self.check_row_cuts(plan, budget)?;
-        self.check_returns(plan, &top, budget)?;
-        self.check_hydration(plan, &top)?;
-        self.check_order_and_cut(plan, &top, input, budget)?;
-        check_policies(plan, budget)?;
-        Ok(())
+        Ok(nodes)
     }
 
     /// Every written binding is read with its type: a node binding by a scan
@@ -312,6 +564,18 @@ impl Requirements {
                     spec.binding.as_deref() == Some(name.as_str())
                         && spec.table.node_type_name() == Some(type_name.as_str())
                 }
+                // A fusion binds its target; each arm's own scope reads it
+                // with its type.
+                (Some(PhysicalNode::Fuse { target, .. }), BoundVariable::Node { .. }) => {
+                    target == name
+                }
+                // A traversal binds its destination by identity, of the type
+                // every edge it follows ends on, when nothing reads more of it
+                // (the optimizer then drops the destination's scan).
+                (
+                    Some(PhysicalNode::Expand { dst, dst_type, .. }),
+                    BoundVariable::Node { type_name },
+                ) => dst == name && dst_type == type_name,
                 (
                     Some(PhysicalNode::Expand {
                         edge_binding: Some(edge),
@@ -404,17 +668,39 @@ impl Requirements {
         plan: &PhysicalPlan,
         retained: &[NodeId],
         reached: &[NodeId],
+        required: &[IRExpr],
         input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        let kept = conjuncts(plan, retained);
         let placed = conjuncts(plan, reached);
-        budget.visit(
-            u64::try_from(kept.len() + placed.len() + self.eligibility.len()).unwrap_or(u64::MAX),
-        )?;
+        budget.visit(u64::try_from(placed.len() + self.eligibility.len()).unwrap_or(u64::MAX))?;
+        self.check_retained(plan, retained, required)?;
+        let required: HashSet<&IRExpr> = self.eligibility.iter().collect();
+        for (id, conjunct) in &placed {
+            if constant_true(conjunct)
+                || required.contains(conjunct)
+                || self.narrowed_key(plan, *id, conjunct, &required, input)
+            {
+                continue;
+            }
+            return Err(ValidationError::violated(
+                "predicate origin",
+                format!("the plan tests `{conjunct}`, which the query does not require"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Every conjunct of `required` is tested by one of `retained`.
+    fn check_retained(
+        &self,
+        plan: &PhysicalPlan,
+        retained: &[NodeId],
+        required: &[IRExpr],
+    ) -> Result<(), ValidationError> {
+        let kept = conjuncts(plan, retained);
         let kept_set: HashSet<&IRExpr> = kept.iter().map(|(_, conjunct)| conjunct).collect();
-        if let Some(missing) = self
-            .eligibility
+        if let Some(missing) = required
             .iter()
             .find(|required| !kept_set.contains(required))
         {
@@ -429,19 +715,6 @@ impl Requirements {
                 format!("the plan tests no conjunct for `{missing}`")
             };
             return Err(ValidationError::violated("predicate retention", detail));
-        }
-        let required: HashSet<&IRExpr> = self.eligibility.iter().collect();
-        for (id, conjunct) in &placed {
-            if constant_true(conjunct)
-                || required.contains(conjunct)
-                || self.narrowed_key(plan, *id, conjunct, &required, input)
-            {
-                continue;
-            }
-            return Err(ValidationError::violated(
-                "predicate origin",
-                format!("the plan tests `{conjunct}`, which the query does not require"),
-            ));
         }
         Ok(())
     }
@@ -485,6 +758,7 @@ impl Requirements {
         &self,
         plan: &PhysicalPlan,
         nodes: &[NodeId],
+        blocks: &[&Block],
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
         let mut planned: Vec<(&String, &omnigraph_compiler::ir::SubqueryPredicate)> = Vec::new();
@@ -501,17 +775,17 @@ impl Requirements {
                 planned.push((outer_var, predicate));
             }
         }
-        if planned.len() != self.blocks.len() {
+        if planned.len() != blocks.len() {
             return Err(ValidationError::violated(
                 "predicate retention",
                 format!(
-                    "the query writes {} correlated blocks; the plan runs {}",
-                    self.blocks.len(),
+                    "the query writes {} correlated blocks there; the plan runs {}",
+                    blocks.len(),
                     planned.len()
                 ),
             ));
         }
-        for block in &self.blocks {
+        for block in blocks {
             let found = planned.iter().position(|(outer_var, predicate)| {
                 **outer_var == block.outer_var && **predicate == block.predicate
             });
@@ -533,22 +807,532 @@ impl Requirements {
         Ok(())
     }
 
-    /// The plan ranks exactly the retrievals the leading `order` key names,
-    /// each on its binding and property, with its argument and the
-    /// approximation its contract declares, in the scope it orders.
-    fn check_search(&self, plan: &PhysicalPlan) -> Result<(), ValidationError> {
-        let ranked = ranked_scans(plan);
-        let fuse = plan.live().find_map(|(_, node)| match node {
-            PhysicalNode::RankFuse { arms, k, .. } => Some((arms, k)),
-            _ => None,
-        });
+    /// Every written `optional` runs as one `OptionalJoin` over its
+    /// correlation binding, the conjuncts of its own pattern tested inside
+    /// its inner tree and nowhere else the query does not require them: a
+    /// conjunct of the optional tested after it would drop the outer rows it
+    /// keeps.
+    fn check_optionals(
+        &self,
+        plan: &PhysicalPlan,
+        top: &[NodeId],
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        let mut planned: Vec<(NodeId, &String, Vec<NodeId>)> = Vec::new();
+        for id in top {
+            if let Some(PhysicalNode::OptionalJoin {
+                outer_var, inner, ..
+            }) = plan.node(*id)
+            {
+                planned.push((*id, outer_var, pipeline(plan, *inner, budget)?));
+            }
+        }
+        if planned.len() != self.optionals.len() {
+            return Err(ValidationError::violated(
+                "predicate retention",
+                format!(
+                    "the query writes {} optionals; the plan runs {}",
+                    self.optionals.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        let inside: HashSet<NodeId> = planned
+            .iter()
+            .flat_map(|(_, _, nodes)| nodes.iter().copied())
+            .collect();
+        let outside: Vec<NodeId> = top
+            .iter()
+            .copied()
+            .filter(|id| !inside.contains(id))
+            .collect();
+        // Each conjunct tested outside every optional, with how many times:
+        // a correlated read writing the same conjunct tests its own copy
+        // there, which is not the optional's.
+        let mut tested_outside: HashMap<IRExpr, usize> = HashMap::new();
+        for (_, conjunct) in conjuncts(plan, &outside) {
+            *tested_outside.entry(conjunct).or_default() += 1;
+        }
+        let top_level: HashSet<&IRExpr> = self.eligibility.iter().collect();
+        // Each query optional takes the plan optional on its binding that
+        // tests its conjuncts and the fewest others, the optionals writing
+        // the most conjuncts first, so two optionals on one binding (one
+        // testing a conjunct, one none) never take each other's join.
+        let mut required: Vec<&super::requirements::OptionalMatch> =
+            self.optionals.iter().collect();
+        required.sort_by_key(|optional| std::cmp::Reverse(optional.eligibility.len()));
+        let tested: Vec<HashSet<IRExpr>> = planned
+            .iter()
+            .map(|(_, _, nodes)| {
+                conjuncts(plan, nodes)
+                    .into_iter()
+                    .map(|(_, conjunct)| conjunct)
+                    .collect()
+            })
+            .collect();
+        let mut tested = tested;
+        for optional in required {
+            let found = planned
+                .iter()
+                .zip(&tested)
+                .enumerate()
+                .filter(|(_, ((_, outer_var, _), tested))| {
+                    **outer_var == optional.outer_var
+                        && optional
+                            .eligibility
+                            .iter()
+                            .all(|conjunct| tested.contains(conjunct))
+                })
+                .min_by_key(|(_, (_, tested))| tested.len())
+                .map(|(index, _)| index);
+            let Some(index) = found else {
+                return Err(ValidationError::violated(
+                    "predicate retention",
+                    format!(
+                        "no optional of the plan over `${}` tests the conjuncts the query's optional writes",
+                        optional.outer_var
+                    ),
+                ));
+            };
+            planned.remove(index);
+            tested.remove(index);
+            if let Some(leaked) = optional.eligibility.iter().find(|conjunct| {
+                let correlated = self
+                    .correlates
+                    .iter()
+                    .filter(|correlate| correlate.eligibility.contains(*conjunct))
+                    .count();
+                tested_outside
+                    .get(*conjunct)
+                    .is_some_and(|tested| *tested > correlated)
+                    && !self.top_level_conjunct(conjunct, &top_level)
+            }) {
+                return Err(ValidationError::violated(
+                    "predicate origin",
+                    format!("the plan tests the optional's `{leaked}` outside the optional"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The plan runs one `Correlate` per written `from` over an inline read
+    /// with its own group or cut, on the same correlation binding and
+    /// returning the same read, each testing its pattern's conjuncts inside
+    /// its inner tree and never outside it, where they would run after the
+    /// read's group or cut.
+    fn check_correlates(
+        &self,
+        plan: &PhysicalPlan,
+        top: &[NodeId],
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        let mut planned: Vec<(&Option<String>, &crate::read_shape::InnerRead, Vec<NodeId>)> =
+            Vec::new();
+        for id in top {
+            if let Some(PhysicalNode::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                ..
+            }) = plan.node(*id)
+            {
+                if input.is_some() != outer_var.is_some() {
+                    return Err(ValidationError::violated(
+                        "plan shape",
+                        format!(
+                            "node {id} correlates without both its outer rows and its correlation binding"
+                        ),
+                    ));
+                }
+                check_window(plan, *id, *inner, read)?;
+                planned.push((outer_var, read, pipeline(plan, *inner, budget)?));
+            }
+        }
+        if planned.len() != self.correlates.len() {
+            return Err(ValidationError::violated(
+                "plan shape",
+                format!(
+                    "the query draws {} inline reads with their own group or cut; the plan correlates {}",
+                    self.correlates.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        let inside: HashSet<NodeId> = planned
+            .iter()
+            .flat_map(|(_, _, nodes)| nodes.iter().copied())
+            .collect();
+        let outside: Vec<NodeId> = top
+            .iter()
+            .copied()
+            .filter(|id| !inside.contains(id))
+            .collect();
+        // Each conjunct tested outside every correlated read, with how many
+        // times: an optional writing the same conjunct tests its own copy
+        // there, which is not the read's.
+        let mut tested_outside: HashMap<IRExpr, usize> = HashMap::new();
+        for (_, conjunct) in conjuncts(plan, &outside) {
+            *tested_outside.entry(conjunct).or_default() += 1;
+        }
+        let top_level: HashSet<&IRExpr> = self.eligibility.iter().collect();
+        for correlate in &self.correlates {
+            let found = planned.iter().position(|(outer_var, read, nodes)| {
+                let tested: HashSet<IRExpr> = conjuncts(plan, nodes)
+                    .into_iter()
+                    .map(|(_, conjunct)| conjunct)
+                    .collect();
+                **outer_var == correlate.outer_var
+                    && **read == correlate.read
+                    && correlate
+                        .eligibility
+                        .iter()
+                        .all(|conjunct| tested.contains(conjunct))
+            });
+            let Some(index) = found else {
+                return Err(ValidationError::violated(
+                    "predicate retention",
+                    format!(
+                        "no correlated read of the plan returns `{}` with the conjuncts the query's inline read writes",
+                        correlate
+                            .read
+                            .columns
+                            .iter()
+                            .map(|column| column.column.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            };
+            planned.remove(index);
+            if let Some(leaked) = correlate.eligibility.iter().find(|conjunct| {
+                // An optional writing the same conjunct tests its own copy
+                // outside every correlated read.
+                let others = self
+                    .optionals
+                    .iter()
+                    .filter(|optional| optional.eligibility.contains(*conjunct))
+                    .count();
+                tested_outside
+                    .get(*conjunct)
+                    .is_some_and(|tested| *tested > others)
+                    && !self.top_level_conjunct(conjunct, &top_level)
+            }) {
+                return Err(ValidationError::violated(
+                    "predicate origin",
+                    format!("the plan tests the inline read's `{leaked}` outside its read"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The plan runs one `Score` per written exact score, of the same kind,
+    /// over the same binding, node type, property and query. An exact
+    /// `bm25` retains its `match_terms` predicate over the scored field,
+    /// scores against the field corpus of a type whose index declares an
+    /// analyzer and the `bm25_v1` scorer, and every read of a binding's
+    /// `F64` `_score` is such a score's.
+    fn check_scores(
+        &self,
+        plan: &PhysicalPlan,
+        top: &[NodeId],
+        input: &AcceptInput<'_>,
+    ) -> Result<(), ValidationError> {
+        let mut planned: Vec<ExactScore> = top
+            .iter()
+            .filter_map(|id| match plan.node(*id) {
+                Some(PhysicalNode::Score {
+                    binding,
+                    type_name,
+                    property,
+                    kind,
+                    query,
+                    ..
+                }) => Some(ExactScore {
+                    binding: binding.clone(),
+                    type_name: type_name.clone(),
+                    property: property.clone(),
+                    kind: *kind,
+                    query: query.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let scored: Vec<String> = planned
+            .iter()
+            .filter(|score| score.kind == ScoreKind::Bm25)
+            .map(|score| score.binding.clone())
+            .collect();
+        if planned.len() != self.scores.len() {
+            return Err(ValidationError::violated(
+                "plan shape",
+                format!(
+                    "the query writes {} exact scores; the plan runs {} scores",
+                    self.scores.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        for score in &self.scores {
+            let ExactScore {
+                binding,
+                property,
+                query,
+                ..
+            } = score;
+            match planned.iter().position(|planned| planned == score) {
+                Some(index) => {
+                    planned.remove(index);
+                }
+                None => {
+                    return Err(ValidationError::violated(
+                        "search identity",
+                        format!(
+                            "no score of the plan reads `${binding}.{property}` against `{query}` as the query's {} does",
+                            score_kind_name(score.kind)
+                        ),
+                    ));
+                }
+            }
+            if score.kind == ScoreKind::Bm25 {
+                check_exact_bm25(score, input)?;
+            }
+        }
+        // Score origin: a `_score` read as `bm25_v1`'s `F64` comes from an
+        // exact `bm25` of its binding.
+        let mut reads = Vec::new();
+        for expr in self
+            .returns
+            .iter()
+            .map(|projection| &projection.expr)
+            .chain(self.order.iter().map(|ordering| &ordering.expr))
+            .chain(&self.eligibility)
+        {
+            expr.visit_nodes(|node| {
+                if let IRExpr::PropAccess {
+                    variable,
+                    property,
+                    ty:
+                        ExprType::Value {
+                            scalar: ScalarType::F64,
+                            ..
+                        },
+                } = node
+                    && property == SCORE_COLUMN
+                {
+                    reads.push(variable.clone());
+                }
+            });
+        }
+        if let Some(read) = reads.iter().find(|read| !scored.contains(read)) {
+            return Err(ValidationError::violated(
+                "score origin",
+                format!(
+                    "the query reads `${read}.{SCORE_COLUMN}`, which no exact `bm25` of the plan produces"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The plan runs one `Let` per `let`, computing the same value: a plan
+    /// without one would read a column nothing computes, or skip a value's
+    /// failure on a row `where` removes.
+    fn check_lets(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
+        let mut planned: Vec<&IRExpr> = top
+            .iter()
+            .filter_map(|id| match plan.node(*id) {
+                Some(PhysicalNode::Let { value, .. }) => Some(value),
+                _ => None,
+            })
+            .collect();
+        if planned.len() != self.lets.len() {
+            return Err(ValidationError::violated(
+                "plan shape",
+                format!(
+                    "the query has {} `let` values; the plan computes {}",
+                    self.lets.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        for value in &self.lets {
+            match planned.iter().position(|v| *v == value) {
+                Some(index) => {
+                    planned.remove(index);
+                }
+                None => {
+                    return Err(ValidationError::violated(
+                        "predicate retention",
+                        format!(
+                            "no `Let` of the plan evaluates `{value}` as the query's `let` does"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The plan runs one `Union` per arm after the first of each written
+    /// `union`, each over the names the union binds.
+    fn check_unions(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
+        let mut planned: Vec<&Vec<String>> = top
+            .iter()
+            .filter_map(|id| match plan.node(*id) {
+                Some(PhysicalNode::Union { bindings, .. }) => Some(bindings),
+                _ => None,
+            })
+            .collect();
+        if planned.len() != self.unions.len() {
+            return Err(ValidationError::violated(
+                "plan shape",
+                format!(
+                    "the query's unions fold {} arms; the plan runs {} unions",
+                    self.unions.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        for bindings in &self.unions {
+            match planned.iter().position(|planned| *planned == bindings) {
+                Some(index) => {
+                    planned.remove(index);
+                }
+                None => {
+                    return Err(ValidationError::violated(
+                        "binding identity",
+                        format!("no union of the plan binds {bindings:?} as the query's does"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every conjunct is tested in the regions of the scope that write it
+    /// ([`Region`]) and in no other: a required conjunct tested only in
+    /// another region, or a copy tested in a region that does not write it,
+    /// is refused. A conjunct the query writes nowhere is the eligibility
+    /// check's.
+    fn check_regions(
+        &self,
+        plan: &PhysicalPlan,
+        root: NodeId,
+        top: &[NodeId],
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        let regions = plan_regions(plan, root, budget)?;
+        let placed: Vec<(IRExpr, &[Region])> = conjuncts(plan, top)
+            .into_iter()
+            .map(|(id, conjunct)| (conjunct, regions.get(&id).map_or(&[][..], Vec::as_slice)))
+            .collect();
+        budget
+            .visit(u64::try_from(placed.len() * self.regions.len().max(1)).unwrap_or(u64::MAX))?;
+        let describe = |path: &[Region]| -> String {
+            if path.is_empty() {
+                return "the scope".to_string();
+            }
+            path.iter()
+                .map(|region| match region {
+                    Region::Optional(var, ordinal) => {
+                        format!("optional {} over `${var}`", ordinal + 1)
+                    }
+                    Region::UnionArm(_, position) => format!("union arm {}", position + 1),
+                    Region::Correlate(_, ordinal) => {
+                        format!("correlated read {}", ordinal + 1)
+                    }
+                    Region::Window => "below the window's cut".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        for (conjunct, path) in &self.regions {
+            if !placed
+                .iter()
+                .any(|(tested, at)| tested == conjunct && *at == path.as_slice())
+            {
+                return Err(ValidationError::violated(
+                    "predicate retention",
+                    format!(
+                        "the query tests `{conjunct}` in {}; the plan does not test it there",
+                        describe(path)
+                    ),
+                ));
+            }
+        }
+        for (conjunct, at) in &placed {
+            if constant_true(conjunct) {
+                continue;
+            }
+            let written: Vec<&Vec<Region>> = self
+                .regions
+                .iter()
+                .filter(|(own, _)| own == conjunct)
+                .map(|(_, path)| path)
+                .collect();
+            if !written.is_empty() && !written.iter().any(|path| path.as_slice() == *at) {
+                return Err(ValidationError::violated(
+                    "predicate origin",
+                    format!(
+                        "the plan tests `{conjunct}` in {}; the query writes it in {}",
+                        describe(at),
+                        describe(written[0])
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `conjunct` is required outside every `optional`: the scope's
+    /// eligibility holds each optional's conjuncts too, so one written in
+    /// `where` as well counts once more than the optionals write it.
+    fn top_level_conjunct(&self, conjunct: &IRExpr, eligibility: &HashSet<&IRExpr>) -> bool {
+        let in_optionals = self
+            .optionals
+            .iter()
+            .flat_map(|optional| optional.eligibility.iter())
+            .chain(
+                self.correlates
+                    .iter()
+                    .flat_map(|correlate| correlate.eligibility.iter()),
+            )
+            .filter(|own| *own == conjunct)
+            .count();
+        eligibility.contains(conjunct)
+            && self
+                .eligibility
+                .iter()
+                .filter(|own| *own == conjunct)
+                .count()
+                > in_optionals
+    }
+
+    /// The scope ranks exactly the retrieval its leading `order` key or its
+    /// ranking step names, on its binding and property, with its argument,
+    /// in the scope it orders.
+    fn check_search(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
+        let ranked: Vec<(NodeId, &str, &RankedAccess)> = ranked_scans(plan)
+            .into_iter()
+            .filter(|(id, ..)| top.contains(id))
+            .collect();
         let expected: Vec<(RankScope, &Retrieval)> = match &self.search {
             None => Vec::new(),
-            Some(Search::Rank(retrieval)) => vec![(RankScope::Order, retrieval)],
-            Some(Search::Fuse { arms, .. }) => vec![
-                (RankScope::Primary, &arms[0]),
-                (RankScope::Secondary, &arms[1]),
-            ],
+            Some(Search::Rank(retrieval)) => {
+                // A windowed `nearest` fills its own window; every other
+                // ranking of the read is its ordering ranking.
+                vec![(
+                    if self.window.is_some() {
+                        RankScope::Window
+                    } else {
+                        RankScope::Order
+                    },
+                    retrieval,
+                )]
+            }
         };
         if ranked.len() != expected.len() {
             return Err(ValidationError::violated(
@@ -561,7 +1345,7 @@ impl Requirements {
             ));
         }
         for (scope, retrieval) in &expected {
-            let Some((id, binding, access)) =
+            let Some((_, binding, access)) =
                 ranked.iter().find(|(_, _, access)| access.scope == *scope)
             else {
                 return Err(ValidationError::violated(
@@ -570,74 +1354,22 @@ impl Requirements {
                 ));
             };
             let same = *binding == retrieval.binding
-                && access.kind == retrieval.kind
                 && access.property == retrieval.property
                 && access.query == retrieval.query;
             if !same {
                 return Err(ValidationError::violated(
                     "search identity",
                     format!(
-                        "the plan ranks `${binding}.{}` by {:?} with `{}`; the query names {:?} of `${}.{}` with `{}`",
+                        "the plan ranks `${binding}.{}` by nearest with `{}`; the query names nearest of `${}.{}` with `{}`",
                         access.property,
-                        access.kind,
                         access.query,
-                        retrieval.kind,
                         retrieval.binding,
                         retrieval.property,
                         retrieval.query
                     ),
                 ));
             }
-            if access.kind.approximate() != retrieval.approximate() {
-                return Err(ValidationError::violated(
-                    "approximation",
-                    format!(
-                        "the plan declares the {:?} retrieval of `${binding}` {}; its contract is {}",
-                        access.kind,
-                        exactness(access.kind.approximate()),
-                        exactness(retrieval.approximate())
-                    ),
-                ));
-            }
-            let type_key = match plan.node(*id) {
-                Some(PhysicalNode::Scan { spec, .. }) => spec.table.type_key.as_str(),
-                _ => "",
-            };
-            self.check_access(plan, type_key, access)?;
-        }
-        match (&self.search, fuse) {
-            (Some(Search::Fuse { arms, k }), Some((planned, planned_k))) => {
-                for (arm, retrieval) in planned.iter().zip(arms.iter()) {
-                    if arm.binding != retrieval.binding || arm.kind != retrieval.kind {
-                        return Err(ValidationError::violated(
-                            "search identity",
-                            format!(
-                                "the fusion's arm ranks `${}` by {:?}; the query names {:?} of `${}`",
-                                arm.binding, arm.kind, retrieval.kind, retrieval.binding
-                            ),
-                        ));
-                    }
-                }
-                if planned_k != k {
-                    return Err(ValidationError::violated(
-                        "search identity",
-                        "the fusion's `k` is not the one the query writes",
-                    ));
-                }
-            }
-            (Some(Search::Fuse { .. }), None) => {
-                return Err(ValidationError::violated(
-                    "search identity",
-                    "the query fuses two retrievals; the plan has no fusion",
-                ));
-            }
-            (_, Some(_)) => {
-                return Err(ValidationError::violated(
-                    "search identity",
-                    "the plan fuses retrievals the query does not fuse",
-                ));
-            }
-            (_, None) => {}
+            self.check_access(plan, access)?;
         }
         Ok(())
     }
@@ -651,13 +1383,15 @@ impl Requirements {
     fn check_row_cuts(
         &self,
         plan: &PhysicalPlan,
+        root: NodeId,
+        scope: &[NodeId],
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        budget.visit(u64::try_from(plan.live().count()).unwrap_or(u64::MAX))?;
+        budget.visit(u64::try_from(scope.len()).unwrap_or(u64::MAX))?;
         let limit = self
             .limit
             .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
-        let root = below_hydration(plan, plan.root());
+        let root = below_hydration(plan, root);
         let mut id = match plan.node(root) {
             Some(PhysicalNode::Limit { input, .. }) => *input,
             _ => root,
@@ -666,7 +1400,21 @@ impl Requirements {
             id = *input;
         }
         let final_sort = matches!(plan.node(id), Some(PhysicalNode::Sort { .. })).then_some(id);
-        for (id, node) in plan.live() {
+        for &id in scope {
+            let Some(node) = plan.node(id) else {
+                continue;
+            };
+            if let PhysicalNode::TargetCut { targets, .. } = node {
+                let window = self.window.flatten();
+                if window != u64::try_from(*targets).ok() {
+                    return Err(ValidationError::violated(
+                        "row cut",
+                        format!(
+                            "node {id} (TargetCut) keeps {targets} targets; the query's window is {window:?}"
+                        ),
+                    ));
+                }
+            }
             let Some(cut) = node.row_cut() else {
                 continue;
             };
@@ -688,6 +1436,17 @@ impl Requirements {
                 ));
             }
         }
+        // A `nearest` window keeps its `k` targets: the plan cuts them.
+        if let Some(window) = self.window.flatten()
+            && !scope
+                .iter()
+                .any(|id| matches!(plan.node(*id), Some(PhysicalNode::TargetCut { .. })))
+        {
+            return Err(ValidationError::violated(
+                "row cut",
+                format!("the query's window keeps {window} targets; the plan cuts no targets"),
+            ));
+        }
         Ok(())
     }
 
@@ -695,53 +1454,31 @@ impl Requirements {
     /// declares, from the cut its scope requires: an ordering `nearest`
     /// fetches the `limit` and may widen it by the declared ladder, a
     /// fusion's `nearest` arm fetches the `limit` (or the default arm size)
-    /// and never widens, and `bm25` fetches every match.
+    /// and never widens.
     fn check_access(
         &self,
         plan: &PhysicalPlan,
-        type_key: &str,
         access: &RankedAccess,
     ) -> Result<(), ValidationError> {
-        match (access.kind, access.eligibility) {
-            (RankKind::Nearest, Eligibility::AfterScoring) => {
-                return Err(ValidationError::violated(
-                    "declared policy",
-                    "a nearest scan draws its candidates from eligible rows; it filters before scoring",
-                ));
-            }
-            (RankKind::Bm25, Eligibility::BeforeScoring) => {
-                let recorded = plan
-                    .assumptions()
-                    .full_text
-                    .get(&Assumptions::full_text_key(type_key, &access.property));
-                if recorded != Some(&FullTextCoverage::Full) {
-                    return Err(ValidationError::violated(
-                        "prerequisite",
-                        format!(
-                            "the bm25 scan of `{type_key}.{}` filters before scoring under recorded coverage {recorded:?}; only full coverage keeps its scores independent of the filter",
-                            access.property
-                        ),
-                    ));
-                }
-            }
-            _ => {}
-        }
         let limit = self.limit.and_then(|limit| usize::try_from(limit).ok());
-        let (fetch, overfetch) = match (access.kind, access.scope) {
-            (RankKind::Bm25, _) => (None, Vec::new()),
-            (RankKind::Nearest, RankScope::Order) => {
-                (limit, limit.map(OverfetchRung::ladder).unwrap_or_default())
-            }
-            (RankKind::Nearest, RankScope::Primary | RankScope::Secondary) => {
-                (Some(limit.unwrap_or(RRF_NEAREST_ARM_K)), Vec::new())
-            }
+        // A ranking drawn as a pattern step declares its own window; today's
+        // ordering ranking takes the read's `limit`.
+        let window = match self.window {
+            Some(window) => window.and_then(|k| usize::try_from(k).ok()),
+            None => limit,
+        };
+        let (fetch, overfetch) = match access.scope {
+            RankScope::Order | RankScope::Window => (
+                window,
+                window.map(OverfetchRung::ladder).unwrap_or_default(),
+            ),
         };
         if access.fetch != fetch || access.overfetch != overfetch {
             return Err(ValidationError::violated(
                 "row cut",
                 format!(
-                    "the {:?} scan fetches {:?} with overfetch {:?}; the query's cut requires {fetch:?} with {overfetch:?}",
-                    access.kind, access.fetch, access.overfetch
+                    "the nearest scan fetches {:?} with overfetch {:?}; the query's cut requires {fetch:?} with {overfetch:?}",
+                    access.fetch, access.overfetch
                 ),
             ));
         }
@@ -749,8 +1486,11 @@ impl Requirements {
             .assumptions()
             .settings
             .get(omnigraph_compiler::settings::SettingId::AnnNprobes.name());
-        let nprobes = match access.kind {
-            RankKind::Nearest => setting
+        // A step that declares `recall: 1` searches every partition.
+        let nprobes = if self.recall == Some(1.0) {
+            None
+        } else {
+            setting
                 .map(|value| match value.as_str() {
                     "0" => None,
                     value => value.parse::<usize>().ok(),
@@ -760,15 +1500,14 @@ impl Requirements {
                         "declared policy",
                         "a nearest scan's probe cap was read from no recorded `ann_nprobes`",
                     )
-                })?,
-            RankKind::Bm25 => None,
+                })?
         };
         if access.nprobes != nprobes {
             return Err(ValidationError::violated(
                 "declared policy",
                 format!(
-                    "the {:?} scan probes {:?}; the recorded setting is {nprobes:?}",
-                    access.kind, access.nprobes
+                    "the nearest scan probes {:?}; the recorded setting is {nprobes:?}",
+                    access.nprobes
                 ),
             ));
         }
@@ -827,21 +1566,12 @@ impl Requirements {
             }
         }
         for (_, call) in &self.projected_ranks {
-            let origin = self.written_search.as_ref().is_some_and(|lead| {
-                lead == call
-                    || matches!(lead, Expr::Rrf { primary, secondary, .. }
-                        if **primary == *call || **secondary == *call)
+            let origin = self.written_search.as_ref() == Some(call);
+            let planned = projected_retrieval(call).is_some_and(|(binding, property)| {
+                ranked_scans(plan)
+                    .into_iter()
+                    .any(|(_, scanned, access)| scanned == binding && access.property == property)
             });
-            let planned = match call {
-                Expr::Rrf { .. } => plan
-                    .live()
-                    .any(|(_, node)| matches!(node, PhysicalNode::RankFuse { .. })),
-                call => projected_retrieval(call).is_some_and(|(kind, binding, property)| {
-                    ranked_scans(plan).into_iter().any(|(_, scanned, access)| {
-                        scanned == binding && access.kind == kind && access.property == property
-                    })
-                }),
-            };
             if !origin || !planned {
                 return Err(ValidationError::violated(
                     "score origin",
@@ -922,71 +1652,83 @@ impl Requirements {
     }
 
     /// The final sort's comparator as RFC 0047 defines it: a ranking's score
-    /// (a fused ranking's `_rrf` descending) then the written keys; over a
-    /// search-led aggregate or a `return distinct` the written keys then every
-    /// group key not written, ascending; no sort where the query orders nothing.
+    /// then the written keys; over
+    /// group rows (an aggregate or a `return distinct`) the written keys then
+    /// the tie rule's group keys ([`Self::with_group_keys`]); no sort where
+    /// the query neither orders nor cuts its rows. A `limit` with no `order`
+    /// cuts the tie rule's order alone (RFC, `Cut`).
     fn required_keys(&self) -> Option<Vec<IROrdering>> {
+        let cut_or_ordered = self.ordered || self.limit.is_some();
         if self.aggregate {
-            // Under a search, groups have no order unless a key remains
-            // after the score; otherwise any written clause sorts them.
-            if !self.ordered || (self.search.is_some() && self.order.is_empty()) {
+            // A search leads no sort of groups: with no key after it and no
+            // `limit` they leave unordered.
+            let led = self.search.is_some() && self.window.is_none();
+            if !cut_or_ordered || (led && self.order.is_empty() && self.limit.is_none()) {
                 return None;
             }
-            // A search-led sort, or a `return distinct` (groups without an
-            // aggregate), is total through every group key it did not write.
-            let distinct = !self
-                .returns
-                .iter()
-                .any(|projection| contains_aggregate(&projection.expr));
-            let mut keys = self.order.clone();
-            if self.search.is_some() || distinct {
-                for projection in &self.returns {
-                    if contains_aggregate(&projection.expr) {
-                        continue;
-                    }
-                    let written = keys.iter().any(|key| match &key.expr {
-                        IRExpr::AliasRef(alias, _) => *alias == projection.column,
-                        expr => *expr == projection.expr,
-                    });
-                    if !written {
-                        keys.push(IROrdering {
-                            expr: IRExpr::AliasRef(
-                                projection.column.clone(),
-                                projection.ty.clone(),
-                            ),
-                            descending: false,
-                        });
-                    }
-                }
+            return Some(self.with_group_keys(self.order.clone()));
+        }
+        if self.window.is_some() {
+            // A ranking drawn as a pattern step leads nothing: the written
+            // keys order the rows.
+            if !cut_or_ordered {
+                return None;
             }
-            return Some(keys);
+            return Some(self.order.clone());
         }
         let lead = match &self.search {
-            None if !self.ordered => return None,
+            None if !cut_or_ordered => return None,
             None => Vec::new(),
-            Some(Search::Rank(retrieval)) => {
-                let (column, descending) = retrieval.kind.score();
-                vec![(retrieval.binding.as_str(), column, descending)]
-            }
-            Some(Search::Fuse { arms, .. }) => vec![(arms[0].binding.as_str(), RRF_COLUMN, true)],
+            Some(Search::Rank(retrieval)) => vec![(
+                retrieval.binding.as_str(),
+                omnigraph_compiler::query::value::DISTANCE_COLUMN,
+                false,
+            )],
         };
         Some(
             lead.into_iter()
-                .map(|(binding, column, descending)| IROrdering {
-                    expr: IRExpr::PropAccess {
-                        variable: binding.to_string(),
-                        property: column.to_string(),
-                        ty: ExprType::Value {
-                            scalar: ScalarType::F64,
-                            list: false,
-                            nullable: false,
+                .map(|(binding, column, descending)| {
+                    IROrdering::new(
+                        IRExpr::PropAccess {
+                            variable: binding.to_string(),
+                            property: column.to_string(),
+                            ty: ExprType::Value {
+                                scalar: ScalarType::F64,
+                                list: false,
+                                nullable: false,
+                            },
                         },
-                    },
-                    descending,
+                        descending,
+                    )
                 })
                 .chain(self.order.iter().cloned())
                 .collect(),
         )
+    }
+
+    /// `keys`, then every group key not written, ascending: each reference
+    /// (by its identity) first, then each value, in column order. An
+    /// aggregate column breaks no tie between groups.
+    fn with_group_keys(&self, mut keys: Vec<IROrdering>) -> Vec<IROrdering> {
+        let groups = self
+            .returns
+            .iter()
+            .filter(|projection| !contains_aggregate(&projection.expr));
+        let (references, values): (Vec<_>, Vec<_>) =
+            groups.partition(|projection| crate::optimizer::is_reference_expr(&projection.expr));
+        for projection in references.into_iter().chain(values) {
+            let written = keys.iter().any(|key| match &key.expr {
+                IRExpr::AliasRef(alias, _) => *alias == projection.column,
+                expr => *expr == projection.expr,
+            });
+            if !written {
+                keys.push(IROrdering::new(
+                    IRExpr::AliasRef(projection.column.clone(), projection.ty.clone()),
+                    false,
+                ));
+            }
+        }
+        keys
     }
 
     /// The plan's rows leave in the order the query requires and are cut
@@ -1014,9 +1756,16 @@ impl Requirements {
             }
         }
         let Some(required) = self.required_keys() else {
-            let sorted = top
-                .iter()
-                .any(|id| matches!(plan.node(*id), Some(PhysicalNode::Sort { .. })));
+            // A window's own sort orders its candidates for its `TargetCut`;
+            // it orders no row the query returns.
+            let window_sort = |sort: NodeId| {
+                top.iter().any(|id| {
+                    matches!(plan.node(*id), Some(PhysicalNode::TargetCut { input, .. }) if *input == sort)
+                })
+            };
+            let sorted = top.iter().any(|id| {
+                matches!(plan.node(*id), Some(PhysicalNode::Sort { .. })) && !window_sort(*id)
+            });
             if sorted {
                 return Err(ValidationError::violated(
                     "order",
@@ -1071,8 +1820,10 @@ impl Requirements {
                 .all(|(index, (planned, key))| {
                     if !self.aggregate && index < lead {
                         // A score key reads the ranked scan's (or the fusion's)
-                        // score column of the binding, in the score's direction.
+                        // score column of the binding, in the score's direction
+                        // and null placement.
                         planned.descending == key.descending
+                            && planned.nulls_first == key.nulls_first
                             && matches!((&planned.expr, &key.expr), (
                             IRExpr::PropAccess { variable, property, .. },
                             IRExpr::PropAccess { variable: v, property: p, .. },
@@ -1096,14 +1847,16 @@ impl Requirements {
         Ok(())
     }
 
-    /// The sort's metadata keys complete its comparator as RFC 0047 defines:
-    /// every written binding's identity (`@type` then `@id` for a selected
-    /// edge) in binding-name order, ascending, nulls first. Three planner
-    /// omissions are comparator equivalences and accepted: a key the
-    /// comparator already holds, every key when the query returns only order
-    /// keys or constants (rows that tie are indistinguishable), and identities of
-    /// bindings the query does not name (anonymous traversal endpoints)
-    /// after every named one. A sort of group rows appends none.
+    /// The sort's metadata keys complete its comparator as the tie rule
+    /// defines (RFC, `Order`): the identity of every reference column the
+    /// query names, in column order (`@type` then `@id` for a selected edge),
+    /// then every other column in column order, a correlated read's or a
+    /// union's value by value and a name the lowering made up (an anonymous
+    /// end, an inlined read's unreturned binding) by identity; ascending,
+    /// nulls first. Two omissions are comparator equivalences and accepted: a
+    /// key the comparator already holds, and every key when the query
+    /// returns only order keys or constants (rows that tie are
+    /// indistinguishable). A sort of group rows appends none.
     fn check_tiebreak(
         &self,
         order_by: &[IROrdering],
@@ -1142,33 +1895,38 @@ impl Requirements {
             let physical = match column.property.as_deref() {
                 Some(IDENTITY_MEMBER) => columns.id,
                 Some(EDGE_TYPE_MEMBER) => omnigraph_compiler::traversal::EDGE_TYPE_COLUMN,
-                _ => return false,
+                Some(value) => value,
+                None => return false,
             };
             order_by.iter().any(|key| {
                 matches!(named_expr(&self.returns, &key.expr), IRExpr::PropAccess { variable, property, .. }
                     if *variable == column.binding && property == physical)
             })
         };
+        let (named, rest): (Vec<_>, Vec<_>) = self
+            .tie_columns
+            .iter()
+            .partition(|column| column.is_named(&self.made_up));
         let mut expected = Vec::new();
-        for name in self.bindings.keys() {
-            if self.selected_edges.contains(name) {
-                expected.push(ColumnRef::property(name, EDGE_TYPE_MEMBER));
+        for column in named.into_iter().chain(rest) {
+            match column {
+                TieColumn::Identity { binding, selected } => {
+                    if *selected {
+                        expected.push(ColumnRef::property(binding, EDGE_TYPE_MEMBER));
+                    }
+                    expected.push(ColumnRef::property(binding, IDENTITY_MEMBER));
+                }
+                TieColumn::Value { binding, column } => {
+                    expected.push(ColumnRef::property(binding, column));
+                }
             }
-            expected.push(ColumnRef::property(name, IDENTITY_MEMBER));
         }
         expected.retain(|column| !keyed(column));
-        let planned: Vec<&ColumnRef> = tiebreak.iter().filter(|column| !keyed(column)).collect();
-        let named = planned.len().min(expected.len());
-        let (head, tail) = planned.split_at(named);
-        let head_ok = head.iter().copied().eq(expected.iter());
-        let tail_ok = tail
-            .iter()
-            .all(|column| !self.bindings.contains_key(&column.binding));
-        if !head_ok || named != expected.len() || !tail_ok {
+        if tiebreak != expected.as_slice() {
             return Err(ValidationError::violated(
                 "order",
                 format!(
-                    "the final sort breaks ties by {:?}; the query's comparator requires {:?} first",
+                    "the final sort breaks ties by {:?}; the query's comparator requires {:?}",
                     tiebreak.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     expected.iter().map(ToString::to_string).collect::<Vec<_>>()
                 ),
@@ -1181,10 +1939,9 @@ impl Requirements {
 /// The adaptive search policies the plan declares (RFC 0047, "Execution and
 /// replay use the same acceptance path"): every `nearest` scan's probe
 /// ladder terminates and keeps its correctness fallbacks, and every
-/// pre-pass draws its eligible set from required first hops, feeds only the
-/// scans its kind may prefilter, decides an empty set as its kind must, and
-/// guards BM25 scans by their recorded coverage. The gate policy's
-/// thresholds are finite.
+/// pre-pass draws its eligible set from required first hops and feeds its
+/// own `nearest` scan alone, an empty set proving the answer empty. The gate
+/// policy's thresholds are finite.
 fn check_policies(plan: &PhysicalPlan, budget: &mut Budget) -> Result<(), ValidationError> {
     let policy = plan.assumptions().gate_policy;
     if !policy.ratio.is_finite() || policy.ratio < 0.0 {
@@ -1198,98 +1955,258 @@ fn check_policies(plan: &PhysicalPlan, budget: &mut Budget) -> Result<(), Valida
     }
     for (id, node) in plan.live() {
         budget.visit(1)?;
-        match node {
-            PhysicalNode::Scan {
-                ranked: Some(access),
-                spec,
-                ..
-            } => {
-                match (access.kind, access.policy) {
-                    (RankKind::Nearest, Some(policy)) => {
-                        if policy.probe_factor < 2
-                            || !policy.flat_rescan_on_unreached
-                            || !policy.uncapped_on_missing_counters
-                        {
-                            return Err(ValidationError::violated(
-                                "declared policy",
-                                format!(
-                                    "the nearest scan's policy {policy:?} lets its probe ladder stall or drops a fallback that keeps its rows in order"
-                                ),
-                            ));
-                        }
-                    }
-                    (RankKind::Bm25, None) => {}
-                    (kind, policy) => {
-                        return Err(ValidationError::violated(
-                            "declared policy",
-                            format!("a {kind:?} scan declares the nearest policy {policy:?}"),
-                        ));
-                    }
-                }
-                if let Some(prefilter) = &access.prefilter {
-                    if access.kind != RankKind::Nearest
-                        || access.scope != RankScope::Order
-                        || prefilter.feeds != [id]
-                        || prefilter.on_empty != EmptyEligible::ProvenEmpty
-                    {
-                        return Err(ValidationError::violated(
-                            "declared policy",
-                            "only a standalone nearest scan carries its own pre-pass, feeding itself and proving an empty eligible set empty",
-                        ));
-                    }
-                    let binding = spec.binding.as_deref().unwrap_or_default();
-                    check_prefilter(plan, plan.root(), binding, prefilter, budget)?;
-                }
+        let PhysicalNode::Scan {
+            ranked: Some(access),
+            spec,
+            ..
+        } = node
+        else {
+            continue;
+        };
+        let Some(policy) = access.policy else {
+            return Err(ValidationError::violated(
+                "declared policy",
+                "a nearest scan declares no policy",
+            ));
+        };
+        if policy.probe_factor < 2
+            || !policy.flat_rescan_on_unreached
+            || !policy.uncapped_on_missing_counters
+        {
+            return Err(ValidationError::violated(
+                "declared policy",
+                format!(
+                    "the nearest scan's policy {policy:?} lets its probe ladder stall or drops a fallback that keeps its rows in order"
+                ),
+            ));
+        }
+        if let Some(prefilter) = &access.prefilter {
+            if prefilter.feeds != [id] {
+                return Err(ValidationError::violated(
+                    "declared policy",
+                    "a nearest scan's pre-pass feeds that scan alone",
+                ));
             }
-            PhysicalNode::RankFuse {
-                arms, prefilter, ..
-            } => {
-                if prefilter.on_empty != EmptyEligible::Postfilter {
-                    return Err(ValidationError::violated(
-                        "declared policy",
-                        "a fusion's empty eligible set proves nothing; its arms run unfiltered",
-                    ));
-                }
-                let mut admits = true;
-                for feed in &prefilter.feeds {
-                    match plan.node(*feed) {
-                        Some(PhysicalNode::Scan {
-                            spec,
-                            ranked: Some(ranked),
-                            ..
-                        }) if ranked.kind == RankKind::Bm25 => {
-                            admits &=
-                                plan.assumptions()
-                                    .full_text
-                                    .get(&Assumptions::full_text_key(
-                                        &spec.table.type_key,
-                                        &ranked.property,
-                                    ))
-                                    == Some(&FullTextCoverage::Full);
-                        }
-                        _ => {
-                            return Err(ValidationError::violated(
-                                "declared policy",
-                                "a fusion's pre-pass feeds only its bm25 arms",
-                            ));
-                        }
-                    }
-                }
-                if admits != prefilter.coverage_admits {
-                    return Err(ValidationError::violated(
-                        "prerequisite",
-                        format!(
-                            "the fusion's pre-pass claims coverage admits {}; the recorded coverage of its bm25 arms admits {admits}",
-                            prefilter.coverage_admits
-                        ),
-                    ));
-                }
-                check_prefilter(plan, arms[0].input, &arms[0].binding, prefilter, budget)?;
-            }
-            _ => {}
+            let binding = spec.binding.as_deref().unwrap_or_default();
+            check_prefilter(plan, scope_root(plan, id), binding, prefilter, budget)?;
         }
     }
     Ok(())
+}
+
+/// The root of the scope `id` belongs to: the input of the innermost
+/// fusion arm whose subtree holds it, else the plan's root. A ranking in an
+/// arm ranks that arm's population alone.
+fn scope_root(plan: &PhysicalPlan, id: NodeId) -> NodeId {
+    let mut root = plan.root();
+    let mut size = usize::MAX;
+    for (_, node) in plan.live() {
+        let PhysicalNode::Fuse { arms, .. } = node else {
+            continue;
+        };
+        for arm in arms {
+            let subtree = plan.subtree(arm.input);
+            if subtree.len() < size && subtree.contains(&id) {
+                root = arm.input;
+                size = subtree.len();
+            }
+        }
+    }
+    root
+}
+
+/// A correlated read's `nearest` window counts distinct targets in its
+/// order, so each target's rows must be adjacent there and ranked by their
+/// own distance: the read's inner tree ends on the exact distance of the
+/// window's binding, and its order leads with that distance ascending, then
+/// the binding's identity.
+fn check_window(
+    plan: &PhysicalPlan,
+    id: NodeId,
+    inner: NodeId,
+    read: &crate::read_shape::InnerRead,
+) -> Result<(), ValidationError> {
+    // A fusion drawn as a read of its own: each arm yields its rows in its
+    // rank order, as the scope's fusion's do. A fusion whose arms read the
+    // outer rows is partitioned by them exactly when the read is correlated,
+    // and each arm is then a correlated read yielding each outer row's rows
+    // in its rank order.
+    if let Some(PhysicalNode::Fuse {
+        arms,
+        target,
+        partition,
+        ..
+    }) = plan.node(inner)
+    {
+        let correlated = matches!(
+            plan.node(id),
+            Some(PhysicalNode::Correlate { input: Some(_), .. })
+        );
+        if correlated != partition.is_some() {
+            return Err(ValidationError::violated(
+                "search identity",
+                format!(
+                    "node {id}'s fusion is {} by the outer row of a read that is {}",
+                    if partition.is_some() {
+                        "partitioned"
+                    } else {
+                        "not partitioned"
+                    },
+                    if correlated {
+                        "correlated"
+                    } else {
+                        "uncorrelated"
+                    }
+                ),
+            ));
+        }
+        for arm in arms {
+            match partition {
+                Some(_) => check_partitioned_arm_order(plan, arm, target)?,
+                None => check_arm_order(plan, arm, target)?,
+            }
+        }
+    }
+    let Some(window) = &read.window else {
+        return Ok(());
+    };
+    let binding = &window.binding;
+    let scored = matches!(
+        plan.node(inner),
+        Some(PhysicalNode::Score { binding: scored, kind: ScoreKind::Distance, .. }) if scored == binding
+    );
+    let distance = |key: &IROrdering| {
+        !key.descending
+            && matches!(&key.expr, IRExpr::PropAccess { variable, property, .. }
+                if variable == binding && property == omnigraph_compiler::query::value::DISTANCE_COLUMN)
+    };
+    let identity = |key: &IROrdering| {
+        !key.descending
+            && matches!(&key.expr, IRExpr::PropAccess { variable, property, .. }
+                if variable == binding && property != omnigraph_compiler::query::value::DISTANCE_COLUMN)
+    };
+    let ordered = matches!(read.order_by.as_slice(), [first, second, ..] if distance(first) && identity(second));
+    if scored && ordered && window.targets.is_some() {
+        Ok(())
+    } else {
+        Err(ValidationError::violated(
+            "search identity",
+            format!(
+                "node {id}'s window over `${binding}` does not rank its targets by their own distance, then their identity"
+            ),
+        ))
+    }
+}
+
+/// An arm of a fusion partitioned per outer row is a correlated read over
+/// the outer rows returning the target, whose rows for each outer row arrive
+/// in the arm's rank order: a ranking's or a nested fusion's score in its
+/// kind's direction (`arm_score`), then the target's identity, a `nearest`
+/// window cut per outer row over that order; an ordered read's own order.
+fn check_partitioned_arm_order(
+    plan: &PhysicalPlan,
+    arm: &crate::physical::FuseArm,
+    target: &str,
+) -> Result<(), ValidationError> {
+    let ordered = match plan.node(arm.input) {
+        Some(PhysicalNode::Correlate {
+            input: Some(_),
+            read,
+            ..
+        }) if read.references().any(|name| name == target) => match arm_score(target, arm.rank) {
+            None => !read.order_by.is_empty(),
+            Some(score) => {
+                let identity = |key: &IROrdering| {
+                    !key.descending
+                        && matches!(&key.expr, IRExpr::PropAccess { variable, property, .. }
+                                if variable == target && *property != score_column(&score))
+                };
+                let window = match (&read.window, arm.rank) {
+                    (Some(window), ArmRank::Nearest) => window.binding == target,
+                    (None, ArmRank::Nearest) => false,
+                    (window, _) => window.is_none(),
+                };
+                matches!(read.order_by.as_slice(), [first, second, ..]
+                        if first.expr == score.expr
+                            && first.descending == score.descending
+                            && identity(second))
+                    && window
+                    && read.limit.is_none()
+            }
+        },
+        _ => false,
+    };
+    if ordered {
+        Ok(())
+    } else {
+        Err(ValidationError::violated(
+            "search identity",
+            format!(
+                "the partitioned fusion's {} arm (node {}) is not a correlated read yielding each outer row's rows of `${target}` in its rank order",
+                arm.rank.name(),
+                arm.input
+            ),
+        ))
+    }
+}
+
+/// The score column an arm's rank key reads.
+fn score_column(score: &IROrdering) -> String {
+    match &score.expr {
+        IRExpr::PropAccess { property, .. } => property.clone(),
+        _ => String::new(),
+    }
+}
+
+/// A fusion arm's rows arrive in its rank order, each target's rows
+/// together at its rank: a `nearest` window's `TargetCut` of the target over
+/// a sort leading with its distance ascending; an exact score's or a nested
+/// fusion's rows sorted by the target's score in its kind's direction
+/// (`arm_score`), then the target's identity, with no cut; an ordered
+/// read's uncorrelated `Correlate`, which orders and cuts its own rows and
+/// returns the target.
+fn check_arm_order(
+    plan: &PhysicalPlan,
+    arm: &crate::physical::FuseArm,
+    target: &str,
+) -> Result<(), ValidationError> {
+    let refused = |detail: String| Err(ValidationError::violated("search identity", detail));
+    let score = arm_score(target, arm.rank);
+    let ordered = match (arm.rank, plan.node(arm.input)) {
+        (ArmRank::Nearest, Some(PhysicalNode::TargetCut { input, binding, .. })) => {
+            binding == target
+                && matches!(plan.node(*input), Some(PhysicalNode::Sort { order_by, fetch: None, .. })
+                    if order_by.first() == score.as_ref())
+        }
+        (
+            ArmRank::Ordered,
+            Some(PhysicalNode::Correlate {
+                input: None, read, ..
+            }),
+        ) => !read.order_by.is_empty() && read.references().any(|name| name == target),
+        (
+            ArmRank::Distance | ArmRank::Bm25 | ArmRank::Fused,
+            Some(PhysicalNode::Sort {
+                order_by,
+                fetch: None,
+                tiebreak,
+                ..
+            }),
+        ) => {
+            order_by.as_slice() == score.as_slice()
+                && tiebreak.as_slice() == [ColumnRef::property(target, IDENTITY_MEMBER)]
+        }
+        _ => false,
+    };
+    if ordered {
+        Ok(())
+    } else {
+        refused(format!(
+            "the fusion's {} arm (node {}) does not yield its rows of `${target}` in its rank order",
+            arm.rank.name(),
+            arm.input
+        ))
+    }
 }
 
 /// Every hop of a pre-pass is a required first hop of `binding` in the
@@ -1369,25 +2286,25 @@ fn projections_of<'p>(plan: &'p PhysicalPlan, top: &[NodeId]) -> Vec<&'p Vec<IRP
 
 fn keys_text(keys: &[IROrdering]) -> String {
     keys.iter()
-        .map(|key| format!("{}{}", key.expr, if key.descending { " desc" } else { "" }))
+        .map(|key| {
+            let placement = match key.nulls_first {
+                None => "",
+                Some(true) => " nulls first",
+                Some(false) => " nulls last",
+            };
+            let direction = if key.descending { " desc" } else { "" };
+            format!("{}{direction}{placement}", key.expr)
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn exactness(approximate: bool) -> &'static str {
-    if approximate { "approximate" } else { "exact" }
-}
-
-/// The (kind, binding, property) a projected `nearest` or `bm25` call reads.
-fn projected_retrieval(expr: &Expr) -> Option<(RankKind, &str, &str)> {
+/// The (binding, property) a projected `nearest` call reads.
+fn projected_retrieval(expr: &IRExpr) -> Option<(&str, &str)> {
     match expr {
-        Expr::Nearest {
+        IRExpr::Nearest {
             variable, property, ..
-        } => Some((RankKind::Nearest, variable, property)),
-        Expr::Bm25 { field, .. } => match field.as_ref() {
-            Expr::PropAccess { variable, property } => Some((RankKind::Bm25, variable, property)),
-            _ => None,
-        },
+        } => Some((variable, property)),
         _ => None,
     }
 }

@@ -29,7 +29,6 @@ impl RedactedCause {
             OmniError::Storage(_) => "Storage",
             OmniError::HistoricalVersionReclaimed { .. } => "HistoricalVersionReclaimed",
             OmniError::FullTextIndexRebuildRequired { .. } => "FullTextIndexRebuildRequired",
-            OmniError::FullTextIndexRequired { .. } => "FullTextIndexRequired",
             OmniError::RetryableCommitConflict(_) => "RetryableCommitConflict",
             OmniError::DataFusion(_) => "DataFusion",
             OmniError::Io(_) => "Io",

@@ -22,6 +22,10 @@ pub(crate) struct VersionOutput {
     /// The full commit a packaged build was compiled from; null otherwise.
     pub(crate) commit: Option<&'static str>,
     pub(crate) http_contract: &'static str,
+    /// The GQ language version this binary compiles, `major.minor`
+    /// ([`omnigraph_compiler::gq_language_version`]); a binary that reports
+    /// none is a GQ language 2 build.
+    pub(crate) gq_language: String,
     /// Versions of the machine-readable CLI command contracts.
     pub(crate) protocols: ProtocolVersionsOutput,
     pub(crate) internal_schema: InternalSchemaOutput,
@@ -50,6 +54,7 @@ impl VersionOutput {
             channel: omnigraph_api_types::build::RELEASE_CHANNEL,
             commit: omnigraph_api_types::build::SOURCE_COMMIT,
             http_contract: omnigraph_api_types::HTTP_API_CONTRACT,
+            gq_language: omnigraph_compiler::gq_language_version(),
             protocols: ProtocolVersionsOutput {
                 studio: crate::targets::STUDIO_PROTOCOL,
                 target: crate::targets::TARGET_PROTOCOL,

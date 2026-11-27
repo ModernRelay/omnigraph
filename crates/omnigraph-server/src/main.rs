@@ -79,6 +79,8 @@ struct Cli {
     mcp_setup_url: Option<String>,
 }
 
+// Every worker and blocking thread compiles and runs queries with Tokio's
+// default stack: every walk over a deep query grows its own.
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -159,6 +161,7 @@ mod tests {
                 build::INTERNAL_SCHEMA_WRITES
             ),
             format!("http-contract {}", omnigraph_server::api::HTTP_API_CONTRACT),
+            format!("gq-language {}", omnigraph_compiler::gq_language_version()),
         ];
         expected.extend(build::SOURCE_COMMIT.map(|commit| format!("commit {commit}")));
         let rendered = long.to_string();

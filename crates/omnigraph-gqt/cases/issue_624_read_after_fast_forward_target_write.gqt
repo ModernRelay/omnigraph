@@ -35,7 +35,7 @@ branch create b
 --- expect ok
 
 --- mutate branch: a
-query ins_a() { insert Person { name: "a1", value: 1000, text: "needle" } }
+query ins_a() { replace Person { name: "a1", value: 1000, text: "needle" } }
 
 --- expect affected: nodes=1 edges=0
 
@@ -45,16 +45,14 @@ branch merge a into tgt
 --- expect outcome: fast_forward
 
 --- mutate branch: tgt
-query ins_t() { insert Person { name: "t1", value: 2000, text: "needle" } }
+query ins_t() { replace Person { name: "t1", value: 2000, text: "needle" } }
 
 --- expect affected: nodes=1 edges=0
 
 --- query branch: tgt
 query scalar_read() {
-    match {
-        $p: Person
-        $p.value = 0
-    }
+    match { $p: Person }
+    where $p.value = 0
     return { $p.name }
 }
 
@@ -66,10 +64,8 @@ p.name: String
 
 --- query branch: tgt
 query text_read() {
-    match {
-        $p: Person
-        search($p.text, "needle")
-    }
+    match { $p: Person }
+    where match_terms($p.text, terms("needle", mode: any))
     return { count($p) as n }
 }
 
@@ -80,7 +76,7 @@ query text_read() {
 n: I64
 
 --- mutate branch: b
-query ins_b() { insert Person { name: "b1", value: 3000, text: "needle" } }
+query ins_b() { replace Person { name: "b1", value: 3000, text: "needle" } }
 
 --- expect affected: nodes=1 edges=0
 

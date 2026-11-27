@@ -1,11 +1,12 @@
 //! Lowering a [`PhysicalPlan`] to an engine's operators. The walk lives
 //! here, so an engine writes one method per [`PhysicalNode`] variant and a
 //! variant without a method does not compile. A ranked scan is one `scan`
-//! call with its [`RankedAccess`]; the two arms of a `RankFuse` are two
-//! subtrees, each lowered once.
+//! call with its [`RankedAccess`]; the arms of a `Fuse` are subtrees, each
+//! lowered once.
 
 use std::collections::HashSet;
 
+use omnigraph_compiler::ir::core::ScoreKind;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::traversal::EdgeSelection;
 
@@ -17,11 +18,9 @@ use crate::logical::{
     ValidateSpec,
 };
 use crate::physical::{
-    HydratedBinding, NodeId, PhysicalNode, PhysicalPlan, RankArm, RankedAccess, ScanInput,
+    FuseArm, HydratedBinding, NodeId, PhysicalNode, PhysicalPlan, RankedAccess, ScanInput,
 };
 
-#[cfg(doc)]
-use crate::physical::RankKind;
 use crate::source::SideId;
 
 /// Aggregate expressions and their aligned planner-selected implementations.
@@ -31,13 +30,23 @@ pub struct AggregateFields<'p> {
     pub aggregates: &'p [Option<AggregateSpec>],
 }
 
-/// The configuration of a [`PhysicalNode::RankFuse`] beside its two inputs.
+/// The configuration of a [`PhysicalNode::Fuse`] beside its arm inputs.
 #[derive(Debug, Clone, Copy)]
-pub struct RankFuseFields<'p> {
-    pub arms: &'p [RankArm; 2],
+pub struct FuseFields<'p> {
+    pub arms: &'p [FuseArm],
+    pub target: &'p str,
     pub k: Option<&'p IRExpr>,
-    pub limit: Option<usize>,
-    pub row_tiebreak: &'p [ColumnRef],
+    pub weights: Option<&'p IRExpr>,
+    /// Partitioned per outer row of the enclosing correlated read.
+    pub partition: Option<&'p str>,
+}
+
+/// The fields of [`PhysicalNode::Correlate`] beside its inputs.
+#[derive(Debug, Clone, Copy)]
+pub struct CorrelateFields<'p> {
+    pub outer_var: Option<&'p str>,
+    pub read: &'p crate::read_shape::InnerRead,
+    pub tiebreak: &'p [ColumnRef],
 }
 
 /// The fields of [`PhysicalNode::Expand`] beside its input.
@@ -186,6 +195,42 @@ pub trait Lower {
 
     fn limit(&mut self, id: NodeId, rows: usize, input: Self::Op) -> Result<Self::Op, Self::Error>;
 
+    /// The rows of the first `targets` distinct `binding` identities of an
+    /// input sorted by score then identity.
+    fn target_cut(
+        &mut self,
+        id: NodeId,
+        binding: &str,
+        targets: usize,
+        input: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// Every input row with its exact score appended: under `Distance`, the
+    /// distance of `binding`'s vector `property` to the node's bound query
+    /// vector, a row whose vector is null dropping; under `Bm25`, `bm25_v1`
+    /// of `binding`'s String `property` against the field corpus, a row
+    /// whose value `query` does not match dropping.
+    fn score(
+        &mut self,
+        id: NodeId,
+        binding: &str,
+        property: &str,
+        kind: ScoreKind,
+        query: &IRExpr,
+        fallback: Option<crate::Bm25Pass>,
+        input: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// Every input row with `value` evaluated on it, a failure refusing the
+    /// read; the rows pass through unchanged.
+    fn let_value(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        value: &IRExpr,
+        input: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
     fn page(
         &mut self,
         id: NodeId,
@@ -227,9 +272,10 @@ pub trait Lower {
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
-    /// Called with the lowered outer input before the walk enters the inner
-    /// tree, whose [`Lower::outer_reference`] leaf reads what this set up.
-    fn anti_join_outer(
+    /// Called with the lowered outer input of an `AntiJoin` or an
+    /// `OptionalJoin` before the walk enters the inner tree, whose
+    /// [`Lower::outer_reference`] leaf reads what this set up.
+    fn correlate_outer(
         &mut self,
         id: NodeId,
         outer_var: &str,
@@ -244,15 +290,43 @@ pub trait Lower {
         inner: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
-    fn outer_reference(&mut self, id: NodeId, outer_var: &str) -> Result<Self::Op, Self::Error>;
-
-    /// Called with both arm subtrees lowered, the primary first.
-    fn rank_fuse(
+    /// Called with both arms lowered, the left first.
+    fn union(
         &mut self,
         id: NodeId,
-        fields: RankFuseFields<'_>,
-        primary: Self::Op,
-        secondary: Self::Op,
+        bindings: &[String],
+        left: Self::Op,
+        right: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// Called with the outer input and the inner tree lowered, after
+    /// [`Lower::correlate_outer`].
+    fn optional_join(
+        &mut self,
+        id: NodeId,
+        outer_var: &str,
+        outer: Self::Op,
+        inner: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// Called with the inner tree lowered, and with the outer input lowered
+    /// first (then [`Lower::correlate_outer`]) when the read correlates.
+    fn correlate(
+        &mut self,
+        id: NodeId,
+        fields: CorrelateFields<'_>,
+        outer: Option<Self::Op>,
+        inner: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    fn outer_reference(&mut self, id: NodeId, outer_var: &str) -> Result<Self::Op, Self::Error>;
+
+    /// Called with every arm subtree lowered, in written order.
+    fn fuse(
+        &mut self,
+        id: NodeId,
+        fields: FuseFields<'_>,
+        arms: Vec<Self::Op>,
     ) -> Result<Self::Op, Self::Error>;
 
     fn projection(
@@ -459,6 +533,30 @@ impl PhysicalPlan {
                 let input = self.lower_node(*input, l)?;
                 l.limit(id, *rows, input)
             }
+            PhysicalNode::TargetCut {
+                input,
+                binding,
+                targets,
+            } => {
+                let input = self.lower_node(*input, l)?;
+                l.target_cut(id, binding, *targets, input)
+            }
+            PhysicalNode::Score {
+                input,
+                binding,
+                type_name: _,
+                property,
+                kind,
+                query,
+                fallback,
+            } => {
+                let input = self.lower_node(*input, l)?;
+                l.score(id, binding, property, *kind, query, *fallback, input)
+            }
+            PhysicalNode::Let { input, name, value } => {
+                let input = self.lower_node(*input, l)?;
+                l.let_value(id, name, value, input)
+            }
             PhysicalNode::Page {
                 input,
                 rows,
@@ -537,30 +635,80 @@ impl PhysicalPlan {
                 ..
             } => {
                 let outer = self.lower_node(*input, l)?;
-                l.anti_join_outer(id, outer_var, &outer)?;
+                l.correlate_outer(id, outer_var, &outer)?;
                 let inner = self.lower_node(*inner, l)?;
                 l.anti_join(id, outer_var, outer, inner)
             }
-            PhysicalNode::OuterReference { outer_var } => l.outer_reference(id, outer_var),
-            PhysicalNode::RankFuse {
-                arms,
-                k,
-                limit,
-                row_tiebreak,
-                ..
+            PhysicalNode::Union {
+                left,
+                right,
+                bindings,
             } => {
-                let primary = self.lower_node(arms[0].input, l)?;
-                let secondary = self.lower_node(arms[1].input, l)?;
-                l.rank_fuse(
+                let left = self.lower_node(*left, l)?;
+                let right = self.lower_node(*right, l)?;
+                l.union(id, bindings, left, right)
+            }
+            PhysicalNode::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+            } => {
+                let outer = self.lower_node(*input, l)?;
+                l.correlate_outer(id, outer_var, &outer)?;
+                let inner = self.lower_node(*inner, l)?;
+                l.optional_join(id, outer_var, outer, inner)
+            }
+            PhysicalNode::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                tiebreak,
+            } => {
+                let outer = match (input, outer_var) {
+                    (Some(input), Some(outer_var)) => {
+                        let outer = self.lower_node(*input, l)?;
+                        l.correlate_outer(id, outer_var, &outer)?;
+                        Some(outer)
+                    }
+                    (None, None) => None,
+                    _ => {
+                        return Err(PlanError::Internal(format!(
+                            "correlate {id} has an outer input without its correlation name, or one without the other"
+                        ))
+                        .into());
+                    }
+                };
+                let inner = self.lower_node(*inner, l)?;
+                let fields = CorrelateFields {
+                    outer_var: outer_var.as_deref(),
+                    read,
+                    tiebreak,
+                };
+                l.correlate(id, fields, outer, inner)
+            }
+            PhysicalNode::OuterReference { outer_var } => l.outer_reference(id, outer_var),
+            PhysicalNode::Fuse {
+                arms,
+                target,
+                k,
+                weights,
+                partition,
+            } => {
+                let mut lowered = Vec::with_capacity(arms.len());
+                for arm in arms {
+                    lowered.push(self.lower_node(arm.input, l)?);
+                }
+                l.fuse(
                     id,
-                    RankFuseFields {
+                    FuseFields {
                         arms,
+                        target,
                         k: k.as_ref(),
-                        limit: *limit,
-                        row_tiebreak,
+                        weights: weights.as_ref(),
+                        partition: partition.as_deref(),
                     },
-                    primary,
-                    secondary,
+                    lowered,
                 )
             }
             PhysicalNode::Projection {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::seams::{decide_seam, fail};
+use crate::storage_layer::FullTextColumn;
 
 mod prepared;
 mod settlement;
@@ -82,6 +83,7 @@ pub(super) async fn plan_schema(
     let accepted_ir = accepted_ir_for_planning(db).await?;
     let desired_ir = resolve_desired_schema_ir(&accepted_ir, desired_schema_source)?;
     plan_schema_migration(&accepted_ir, &desired_ir)
+        .and_then(|plan| plan.with_one_way_constructs(desired_schema_source))
         .map_err(|err| OmniError::manifest(err.to_string()))
 }
 
@@ -101,6 +103,7 @@ pub(super) fn plan_schema_at_contract(
     })?;
     let desired_ir = resolve_desired_schema_ir(accepted_ir, desired_schema_source)?;
     plan_schema_migration(accepted_ir, &desired_ir)
+        .and_then(|plan| plan.with_one_way_constructs(desired_schema_source))
         .map_err(|error| OmniError::manifest(error.to_string()))
 }
 
@@ -164,6 +167,7 @@ async fn plan_schema_for_apply_from_accepted(
 
     let desired_ir = resolve_desired_schema_ir(accepted_ir, desired_schema_source)?;
     let plan = plan_schema_migration(accepted_ir, &desired_ir)
+        .and_then(|plan| plan.with_one_way_constructs(desired_schema_source))
         .map_err(|err| OmniError::manifest(err.to_string()))?;
     if !plan.supported {
         let message = plan
@@ -269,7 +273,7 @@ where
         prepared.validate_capture(db, actor, &captured)?;
         prepared
     } else {
-        issued = captured.issue(db, desired_schema_source, actor)?;
+        issued = captured.issue(db, actor)?;
         &issued
     };
     if let Some(commit_id) = prepared.graph_commit_id()
@@ -302,16 +306,18 @@ where
         desired_catalog,
     } = planned;
     if prepared.is_noop() {
+        // The accepted schema stays: its catalog, IR and stored source.
         db.store_schema_view(
-            desired_catalog,
-            desired_schema_source.to_string(),
-            &desired_ir,
+            (*accepted_catalog).clone(),
+            prepared.desired_source.clone(),
+            &accepted_ir,
         )?;
         return Ok(SchemaApplyResult {
             supported: true,
             applied: false,
             graph_manifest_version: snapshot.graph_manifest_version(),
             steps: plan.steps,
+            one_way_constructs: Vec::new(),
             commit: None,
             contract: prepared.desired_contract().clone(),
         });
@@ -353,6 +359,9 @@ where
     // Properties this apply adds, by desired table and name: no stored column
     // holds them yet.
     let mut added_properties = HashMap::<String, HashSet<String>>::new();
+    // Node properties whose declared full-text analysis changes what their
+    // index is built with or certified for, by desired table and property.
+    let mut analysis_changes = BTreeMap::<String, BTreeSet<String>>::new();
 
     for step in &plan.steps {
         match step {
@@ -447,7 +456,32 @@ where
                     .push(property_name.clone());
                 evolved_tables.insert(table_key);
             }
-            SchemaMigrationStep::AddConstraint { .. }
+            SchemaMigrationStep::ChangeFullTextAnalysis {
+                type_kind,
+                type_name,
+                property_name,
+                from,
+                to,
+            } => {
+                if matches!(type_kind, SchemaTypeKind::Node)
+                    && omnigraph_compiler::schema::analysis::changes_index_analysis(
+                        from.as_ref(),
+                        to.as_ref(),
+                    )
+                {
+                    analysis_changes
+                        .entry(schema_table_key(*type_kind, type_name))
+                        .or_default()
+                        .insert(property_name.clone());
+                }
+            }
+            // A changed distance is metadata-only: no stored vector
+            // changes, and an index built for the old distance is never
+            // used for the new one (the scan checks the index's metric
+            // against the field's), so reads take the exact path until
+            // `ensure_indices`/`optimize` rebuilds it with the new distance.
+            SchemaMigrationStep::ChangeVectorDistance { .. }
+            | SchemaMigrationStep::AddConstraint { .. }
             | SchemaMigrationStep::ExtendEnum { .. }
             | SchemaMigrationStep::RelaxCardinality { .. }
             | SchemaMigrationStep::UpdateTypeMetadata { .. }
@@ -488,12 +522,46 @@ where
         }
     }
 
+    // A full-text column whose analyzer changes (declared, changed or
+    // removed) and whose index the accepted schema already declared has its
+    // segments replaced in this publication by one untrained segment built
+    // with the new analysis and certified with its fingerprint, so no search
+    // reads a segment of the old analysis; the postings are rebuilt off the
+    // critical path once no segment covers a fragment. A column the apply
+    // newly indexes is declared below with its analysis instead.
+    let mut redeclared_tables = BTreeMap::<String, Vec<FullTextColumn>>::new();
+    for (table_key, properties) in &analysis_changes {
+        if added_tables.contains(table_key) || dropped_tables.contains(table_key) {
+            continue;
+        }
+        let source_table_key = renamed_tables.get(table_key).unwrap_or(table_key);
+        let renames = property_renames.get(table_key);
+        let accepted = super::table_ops::declared_full_text_columns(
+            accepted_catalog.as_ref(),
+            source_table_key,
+        )?;
+        let columns: Vec<FullTextColumn> =
+            super::table_ops::declared_full_text_columns(&desired_catalog, table_key)?
+                .into_iter()
+                .filter(|column| {
+                    let source = renames
+                        .and_then(|renames| renames.get(&column.column))
+                        .unwrap_or(&column.column);
+                    properties.contains(&column.column)
+                        && accepted.iter().any(|accepted| &accepted.column == source)
+                })
+                .collect();
+        if !columns.is_empty() {
+            redeclared_tables.insert(table_key.clone(), columns);
+        }
+    }
+
     // A full-text index the desired schema declares on a table this apply
     // neither adds, evolves nor drops (a new `@index`) is declared in this
     // publication by an untrained segment, so no search on it runs without
     // its analyzer; the postings are built off the critical path. An evolved
     // table declares its full-text columns in its evolution's commits.
-    let mut declared_tables = BTreeMap::<String, Vec<String>>::new();
+    let mut declared_tables = BTreeMap::<String, Vec<FullTextColumn>>::new();
     for type_name in desired_catalog.node_types.keys() {
         let table_key = schema_table_key(SchemaTypeKind::Node, type_name);
         if added_tables.contains(&table_key)
@@ -506,13 +574,18 @@ where
         let accepted = super::table_ops::declared_full_text_columns(
             accepted_catalog.as_ref(),
             source_table_key,
-        );
-        let columns: Vec<String> =
-            super::table_ops::declared_full_text_columns(&desired_catalog, &table_key)
+        )?;
+        let columns: Vec<FullTextColumn> =
+            super::table_ops::declared_full_text_columns(&desired_catalog, &table_key)?
                 .into_iter()
-                .filter(|column| !accepted.contains(column))
+                .filter(|column| {
+                    !accepted
+                        .iter()
+                        .any(|accepted| accepted.column == column.column)
+                })
                 .collect();
-        if !columns.is_empty() {
+        let redeclared = redeclared_tables.contains_key(&table_key);
+        if !columns.is_empty() || redeclared {
             declared_tables.insert(table_key, columns);
         }
     }
@@ -816,7 +889,7 @@ where
                             &super::table_ops::declared_full_text_columns(
                                 &desired_catalog,
                                 table_key,
-                            ),
+                            )?,
                         )
                         .await?;
                     (detached, Some(transaction))
@@ -904,7 +977,7 @@ where
             // rewrites whole fragments, Blob payloads included, as compaction
             // does.
             let declared =
-                super::table_ops::declared_full_text_columns(&desired_catalog, table_key);
+                super::table_ops::declared_full_text_columns(&desired_catalog, table_key)?;
             let mut tip_transaction = None;
             // #721: fragments whose deleted rows hold a null in a column about
             // to become required are rewritten first, deletions materialized,
@@ -937,21 +1010,36 @@ where
                 tip_transaction = Some(transaction);
                 fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
             }
+            let redeclared = redeclared_tables.remove(table_key).unwrap_or_default();
             let (tip, transaction) = match tip_transaction {
-                Some(transaction) => (tip, transaction),
+                Some(transaction) => (tip, Some(transaction)),
                 // The table already has the target schema: only a newly
                 // declared full-text index can still need a commit.
                 None => match db
                     .storage()
-                    .commit_full_text_declarations(tip, &declared, &witness)
+                    .commit_full_text_declarations(tip.clone(), &declared, &witness)
                     .await?
                 {
-                    Some(declared) => {
+                    Some((next, transaction)) => {
                         fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
-                        declared
+                        (next, Some(transaction))
                     }
-                    None => continue,
+                    None => (tip, None),
                 },
+            };
+            // A changed analyzer replaces its column's segments on the tip.
+            let (tip, transaction) = if redeclared.is_empty() {
+                match transaction {
+                    Some(transaction) => (tip, transaction),
+                    None => continue,
+                }
+            } else {
+                let next = db
+                    .storage()
+                    .commit_full_text_redeclarations(tip, &redeclared, &witness)
+                    .await?;
+                fail(&SCHEMA_APPLY_POST_TABLE_COMMIT)?;
+                next
             };
             let state = db.storage().table_state(&dataset_uri, &tip).await?;
             let published_dataset_version = entry.published_dataset_version + 1;
@@ -1003,12 +1091,24 @@ where
                 &base_branch_identifier,
                 base_graph_head.as_deref(),
             )?;
-            let Some((detached, transaction)) = db
-                .storage()
-                .commit_full_text_declarations(source_ds, columns, &witness)
-                .await?
-            else {
-                continue;
+            // A new column's declaration and a changed analyzer's
+            // replacement share one commit; a redeclaration of a column
+            // without a segment replaces nothing.
+            let (detached, transaction) = match redeclared_tables.remove(table_key) {
+                Some(mut redeclared) => {
+                    redeclared.extend(columns.iter().cloned());
+                    db.storage()
+                        .commit_full_text_redeclarations(source_ds, &redeclared, &witness)
+                        .await?
+                }
+                None => match db
+                    .storage()
+                    .commit_full_text_declarations(source_ds, columns, &witness)
+                    .await?
+                {
+                    Some(declared) => declared,
+                    None => continue,
+                },
             };
             let dataset_uri = db.storage().dataset_uri(&entry.dataset_path);
             let state = db.storage().table_state(&dataset_uri, &detached).await?;
@@ -1174,6 +1274,7 @@ where
         applied: true,
         graph_manifest_version: published.graph_manifest_version,
         steps: plan.steps,
+        one_way_constructs: plan.one_way_constructs,
         commit: Some(published.commit),
         contract: prepared.desired_contract().clone(),
     })

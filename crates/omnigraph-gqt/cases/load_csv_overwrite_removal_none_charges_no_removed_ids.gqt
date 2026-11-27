@@ -60,11 +60,7 @@ load executed: partitions 1 rows 1
 
 --- query
 query cites() {
-    match {
-        $a: Doc
-        $b: Doc
-        $a cites $b
-    }
+    match { $a: Doc, $b: Doc, $a cites $b }
     return { $a.slug, $b.slug }
 }
 

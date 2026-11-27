@@ -108,7 +108,18 @@ pub struct IndexFact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IndexKind {
-    Btree { usable: bool },
+    Btree {
+        usable: bool,
+    },
+    /// A BITMAP index (an enum or `Bool` property): equality, `in`, ranges
+    /// and `is null`, exactly. Never claims key coverage.
+    Bitmap,
+    /// A LABEL_LIST index (a list property): `value in $x.list`, exactly.
+    LabelList,
+    /// An NGRAM index (a String property): `contains`, as a candidate
+    /// superset Lance rechecks.
+    #[serde(rename = "ngram")]
+    NGram,
     Inverted,
     Vector,
     Unknown,
@@ -164,9 +175,74 @@ pub struct AdjacencyProof {
     pub version_window: Option<(u64, u64)>,
 }
 
+/// A read's plan budget as the planner charges it ([`omnigraph_compiler::budget`]):
+/// the meter, resumed from what typing and shaping charged, and the shape's
+/// size, which every pass over the plan is charged. Both are functions of
+/// the read and the schema, never of the snapshot, so a read charges the
+/// same planning work on every snapshot and every run.
+pub struct QueryWork {
+    pub meter: omnigraph_compiler::budget::PlanWork,
+    /// The read's shape steps, its return items and order keys
+    /// ([`omnigraph_compiler::shape::read::ReadShape::size`]).
+    pub steps: usize,
+    pub name: String,
+}
+
+impl QueryWork {
+    pub fn of(read: &omnigraph_compiler::shape::read::ReadShape) -> Self {
+        let meter = omnigraph_compiler::budget::PlanWork::resume(read.work);
+        meter.phase(format!("planning `{}`", read.name));
+        Self {
+            meter,
+            steps: read.size(),
+            name: read.name.clone(),
+        }
+    }
+
+    fn charged(
+        &self,
+        kind: omnigraph_compiler::budget::WorkKind,
+        n: usize,
+    ) -> Result<(), PlanError> {
+        self.meter
+            .charge(kind, n)
+            .map_err(|overrun| PlanError::Unsupported(Box::new(overrun.refusal(&self.name, &[]))))
+    }
+
+    /// Charge one planner pass over the plan: the shape's size.
+    pub fn pass(&self) -> Result<(), PlanError> {
+        self.charged(omnigraph_compiler::budget::WorkKind::Planning, self.steps)
+    }
+
+    /// Charge one shape step resolved into the logical plan.
+    pub fn step(&self) -> Result<(), PlanError> {
+        self.charged(omnigraph_compiler::budget::WorkKind::Planning, 1)
+    }
+
+    /// Charge `states` states a plan search explored: each candidate a rule
+    /// considers (a join order of a pattern block, an access path), before
+    /// it is considered, so a search stops at the budget.
+    pub fn explore(&self, states: usize) -> Result<(), PlanError> {
+        self.charged(omnigraph_compiler::budget::WorkKind::Planning, states)
+    }
+}
+
+/// Charge one planner pass to the read's plan budget, when `source` plans a
+/// read that carries one.
+pub(crate) fn charge_pass(source: &dyn PlanSource) -> Result<(), PlanError> {
+    source.query_work().map_or(Ok(()), QueryWork::pass)
+}
+
 /// The planner's whole view of the store. Implemented by the engine over its
 /// pinned snapshot; implemented in memory by the planner's own tests.
 pub trait PlanSource {
+    /// The plan budget of the read being planned, which resolution, every
+    /// pass and every plan search charge; `None` when the source plans no
+    /// read (a diff, a merge, a load, a write), or for a test source.
+    fn query_work(&self) -> Option<&QueryWork> {
+        None
+    }
+
     /// Render a key value only when its identity agrees with supported persisted rows.
     fn canonical_key_id(
         &self,
@@ -230,6 +306,16 @@ pub trait PlanSource {
         })
     }
 
+    /// The object fields `return { $k }` projects for an edge binding of
+    /// `type_name` (its selection's types joined by `|`):
+    /// `Catalog::edge_object_fields`. A source that serves no queries keeps
+    /// the default.
+    fn edge_object_fields(&self, type_name: &str) -> Result<arrow_schema::Fields, PlanError> {
+        Err(PlanError::Unresolved {
+            detail: format!("this plan source serves no edge object (asked for `{type_name}`)"),
+        })
+    }
+
     /// Whether the source's scanner can evaluate this GQ conjunct itself, so
     /// the placement pass may move it out of the in-memory arm. The engine
     /// answers from its lowering; a test source pushes everything.
@@ -264,6 +350,12 @@ pub trait PlanSource {
         None
     }
 
+    /// The rows the expansions of one read may produce, every hop together;
+    /// `None` is no budget. The plan records the value it read.
+    fn read_work_limit(&self) -> Option<u64> {
+        None
+    }
+
     /// The session's `ann_nprobes` setting, the probe cap a `nearest` scan
     /// carries; `None` is no cap. The plan records the value it read.
     fn ann_nprobes(&self) -> Option<usize> {
@@ -283,77 +375,11 @@ pub trait PlanSource {
         None
     }
 
-    /// How far the full-text index of `property` covers the pinned table
-    /// `type_key` names. The default claims an index of unproven coverage:
-    /// nothing is refused and every bm25 scan filters after scoring, the
-    /// placement under which every plan stays correct.
-    fn full_text_coverage(&self, _type_key: &str, _property: &str) -> FullTextCoverage {
-        FullTextCoverage::Partial
-    }
-
     /// The fingerprint of the catalogue table `type_key` names at this source:
     /// its rows and schema as the running binary derives them, so a plan records
     /// what it read and a replay checks it. `None` for a source with no catalogue.
     fn catalogue_fingerprint(&self, _type_key: &str) -> Option<String> {
         None
-    }
-}
-
-/// How far a property's full-text index covers the pinned dataset's
-/// fragments. Only full coverage makes a BM25 score independent of a filter
-/// applied before scoring: Lance scores the unindexed fragments flat, from
-/// statistics over the rows the filter admits. A segment of any coverage,
-/// even the untrained declaration every write records, carries the index's
-/// analyzer to the rows it does not cover; an absent index refuses every
-/// full-text call on the property (`PlanError::FullTextIndexRequired`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FullTextCoverage {
-    /// Every fragment of the pinned version is in a full-text segment, which
-    /// a table with no fragment has vacuously.
-    Full,
-    /// A full-text index exists; some fragment is not in it.
-    Partial,
-    /// No segment on the property records a full-text index, and the table
-    /// has rows.
-    Absent,
-}
-
-impl FullTextCoverage {
-    /// The coverage the index facts of one table establish for `column`:
-    /// `Absent` with no index on it, `Full` only when it has a full-text
-    /// index and every full-text index on it has known coverage of every
-    /// current fragment, `Partial` otherwise. An index of unknown kind or
-    /// unknown coverage on the column never counts as full.
-    pub fn of_facts(facts: &[IndexFact], column: &str) -> Self {
-        let on_column: Vec<&IndexFact> =
-            facts.iter().filter(|fact| fact.column == column).collect();
-        let full_text = on_column
-            .iter()
-            .any(|fact| fact.kind == IndexKind::Inverted);
-        let unknown = on_column.iter().any(|fact| fact.kind == IndexKind::Unknown);
-        if !full_text {
-            return if unknown { Self::Partial } else { Self::Absent };
-        }
-        let full = !unknown
-            && on_column
-                .iter()
-                .filter(|fact| fact.kind == IndexKind::Inverted)
-                .all(|fact| {
-                    fact.coverage
-                        .is_some_and(|coverage| coverage.covered == coverage.total)
-                });
-        if full { Self::Full } else { Self::Partial }
-    }
-
-    /// [`Self::of_facts`] for a table version holding `fragments` current
-    /// fragments: one with none has no row a full-text call could answer
-    /// differently, so it is covered whatever its indexes.
-    pub fn of_table(facts: &[IndexFact], column: &str, fragments: usize) -> Self {
-        if fragments == 0 {
-            return Self::Full;
-        }
-        Self::of_facts(facts, column)
     }
 }
 
@@ -373,7 +399,6 @@ pub struct MemorySource {
     table_data_bytes: HashMap<String, u64>,
     column_data_bytes: HashMap<String, HashMap<String, u64>>,
     query_memory_pool_bytes: u64,
-    full_text: HashMap<(String, String), FullTextCoverage>,
     /// When set, a key's canonical id renders as `id:<value>`, a parameter
     /// resolved from these values.
     canonical_keys: Option<omnigraph_compiler::ir::ParamMap>,
@@ -418,17 +443,6 @@ impl MemorySource {
                 row_count: Some(rows),
             },
         );
-        self
-    }
-
-    pub fn with_full_text_coverage(
-        mut self,
-        type_key: &str,
-        property: &str,
-        coverage: FullTextCoverage,
-    ) -> Self {
-        self.full_text
-            .insert((type_key.to_string(), property.to_string()), coverage);
         self
     }
 
@@ -539,7 +553,9 @@ impl PlanSource for MemorySource {
             _ => None,
         };
         Ok(match literal {
-            Some(omnigraph_compiler::query::ast::Literal::String(key)) => Some(format!("id:{key}")),
+            Some(omnigraph_compiler::query::value::Literal::String(key)) => {
+                Some(format!("id:{key}"))
+            }
             _ => None,
         })
     }
@@ -610,13 +626,6 @@ impl PlanSource for MemorySource {
 
     fn query_memory_pool_bytes(&self) -> u64 {
         self.query_memory_pool_bytes
-    }
-
-    fn full_text_coverage(&self, type_key: &str, property: &str) -> FullTextCoverage {
-        self.full_text
-            .get(&(type_key.to_string(), property.to_string()))
-            .copied()
-            .unwrap_or(FullTextCoverage::Partial)
     }
 
     fn explain_dump_dir(&self) -> Option<std::path::PathBuf> {

@@ -9,5 +9,5 @@ node Person { name: String @key }
 --- seed
 {"type":"Person","data":{"name":"alice"}}
 --- mutate
-load csv "people.csv" into node:Person mode append header
+load csv "people.csv" into node:Person mode insert header
 --- expect error: absolute URI

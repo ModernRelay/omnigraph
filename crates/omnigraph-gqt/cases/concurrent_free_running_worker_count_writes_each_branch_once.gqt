@@ -35,7 +35,7 @@ tables:
       n: {kind: ordinal, start: 10, step: 1}
 
 --- concurrent
-writer x4 on w${worker}: query put() { insert Chunk { slug: "cw", n: 100 } }
+writer x4 on w${worker}: query put() { replace Chunk { slug: "cw", n: 100 } }
 --- expect
 writer: ok
 

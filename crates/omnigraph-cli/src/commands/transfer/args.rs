@@ -15,10 +15,12 @@ pub(crate) struct LoadArgs {
     /// Without this flag a missing branch is an error, never a fork.
     #[arg(long)]
     pub(crate) from: Option<String>,
-    /// How existing entities are handled: overwrite | append | merge.
-    /// Required — overwrite is destructive, so there is no default.
-    #[arg(long)]
-    pub(crate) mode: CliLoadMode,
+    /// How records meet existing entities: insert (an existing key fails the
+    /// load) | upsert (sets the named properties) | replace (writes the whole
+    /// entity) | overwrite (each type becomes the batch's entities). Required:
+    /// overwrite is destructive, so there is no default.
+    #[arg(long, value_parser = parse_load_mode_arg)]
+    pub(crate) mode: LoadModeArg,
     /// Session setting for this invocation (repeatable): `name=value` in
     /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
     /// stores only: no served load route carries a `settings` field.
@@ -164,20 +166,81 @@ pub(crate) enum BlobCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CliLoadMode {
     Overwrite,
-    Append,
-    Merge,
+    Insert,
+    Upsert,
+    Replace,
+}
+
+/// `--mode` as written: a mode, or GQ 2's `append` or `merge`, which the
+/// load refuses as a command failure (a coded error, JSON under `--json`)
+/// rather than as a usage error.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LoadModeArg {
+    Mode(CliLoadMode),
+    Removed {
+        old: &'static str,
+        new: &'static str,
+    },
+}
+
+impl LoadModeArg {
+    /// The mode, or the refusal of a removed one: `Q004` naming the mode
+    /// that now means what it meant, before anything is read.
+    pub(crate) fn resolve(self) -> Result<CliLoadMode, omnigraph::error::OmniError> {
+        match self {
+            Self::Mode(mode) => Ok(mode),
+            Self::Removed { old, new } => {
+                use omnigraph_compiler::query::codes::Q004;
+                use omnigraph_compiler::{QueryDiagnostic, error::CompilerError};
+                Err(omnigraph::error::OmniError::Compiler(CompilerError::query(
+                    QueryDiagnostic::parse(
+                        Q004,
+                        omnigraph::loader::removed_mode_message(old, new),
+                        None,
+                    )
+                    .with_fix(format!("--mode {new}")),
+                )))
+            }
+        }
+    }
+}
+
+fn parse_load_mode_arg(value: &str) -> Result<LoadModeArg, String> {
+    Ok(match value {
+        "append" => LoadModeArg::Removed {
+            old: "append",
+            new: "insert",
+        },
+        "merge" => LoadModeArg::Removed {
+            old: "merge",
+            new: "replace",
+        },
+        value => LoadModeArg::Mode(parse_cli_load_mode(value)?),
+    })
+}
+
+/// `--mode`'s value, by the engine's names; GQ 2's `append` and `merge`
+/// are refused with the mode that now means what they meant.
+fn parse_cli_load_mode(value: &str) -> Result<CliLoadMode, String> {
+    Ok(match LoadMode::parse(value)? {
+        LoadMode::Overwrite => CliLoadMode::Overwrite,
+        LoadMode::Insert => CliLoadMode::Insert,
+        LoadMode::Upsert => CliLoadMode::Upsert,
+        LoadMode::Replace => CliLoadMode::Replace,
+    })
 }
 
 impl From<CliLoadMode> for LoadMode {
     fn from(value: CliLoadMode) -> Self {
         match value {
             CliLoadMode::Overwrite => LoadMode::Overwrite,
-            CliLoadMode::Append => LoadMode::Append,
-            CliLoadMode::Merge => LoadMode::Merge,
+            CliLoadMode::Insert => LoadMode::Insert,
+            CliLoadMode::Upsert => LoadMode::Upsert,
+            CliLoadMode::Replace => LoadMode::Replace,
         }
     }
 }
@@ -185,8 +248,9 @@ impl CliLoadMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             CliLoadMode::Overwrite => "overwrite",
-            CliLoadMode::Append => "append",
-            CliLoadMode::Merge => "merge",
+            CliLoadMode::Insert => "insert",
+            CliLoadMode::Upsert => "upsert",
+            CliLoadMode::Replace => "replace",
         }
     }
 }

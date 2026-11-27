@@ -27,7 +27,7 @@ set write_max_bytes = 4096;
 
 --- expect ok
 
---- load generate: v1 seed: 1 mode: merge
+--- load generate: v1 seed: 1 mode: replace
 tables:
   - kind: node
     name: Doc
@@ -49,7 +49,7 @@ query after_refusal() { match { $d: Doc } return { $d.slug, $d.title } }
 d.slug: String
 d.title: String
 
---- load generate: v1 seed: 1 mode: merge
+--- load generate: v1 seed: 1 mode: replace
 tables:
   - kind: node
     name: Doc

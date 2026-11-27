@@ -1,0 +1,87 @@
+# issue: none
+# notes: A `bm25_v1` score is the retrieval's, not the filter's: its statistics are the field corpus,
+# notes: taken before any graph or property filter (the GQ 3 RFC, section 4). The
+# notes: insert lands in a fragment no full-text segment covers; the exact lexical scan reads no index,
+# notes: so `t1` scores the same with and without a filter that excludes `t2`, the other new row, at
+# notes: every index state.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    year: I64
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","text":"graph engines","year":2020}}
+{"type":"Doc","data":{"slug":"d2","text":"graph search","year":2021}}
+{"type":"Doc","data":{"slug":"d3","text":"databases","year":2019}}
+
+--- query
+query covered() {
+    match { let $pop = { match { $d: Doc } where $d.year >= 2020 return { $d } }, from bm25($pop, $d.text, "graph") as $score }
+    return { $d.slug, $score as score }
+    order { $score desc }
+}
+
+--- expect ordered
+{"d.slug":"d1","score":0.434457136278}
+{"d.slug":"d2","score":0.434457136278}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect plan
+pipeline 0: Scan -> Score -> Projection => Sort
+validation scope invariants_only
+
+--- mutate
+query tail() {
+    replace Doc { slug: "t1", text: "graph", year: 2022 }
+    replace Doc { slug: "t2", text: "graph graph graph graph graph graph graph graph", year: 1990 }
+}
+--- expect ok
+
+--- query
+query unfiltered() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "graph") as $score }
+    return { $d.slug, $score as score }
+    order { $score desc }
+}
+
+--- expect ordered
+{"d.slug":"t2","score":0.465734971433}
+{"d.slug":"t1","score":0.390335146763}
+{"d.slug":"d1","score":0.325757640865}
+{"d.slug":"d2","score":0.325757640865}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- query
+query filtered() {
+    match { let $pop = { match { $d: Doc } where $d.year >= 2000 return { $d } }, from bm25($pop, $d.text, "graph") as $score }
+    return { $d.slug, $score as score }
+    order { $score desc }
+}
+
+--- expect ordered
+{"d.slug":"t1","score":0.390335146763}
+{"d.slug":"d1","score":0.325757640865}
+{"d.slug":"d2","score":0.325757640865}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- expect plan
+pipeline 0: Scan -> Score -> Projection => Sort
+validation scope invariants_only

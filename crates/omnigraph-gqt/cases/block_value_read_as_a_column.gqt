@@ -1,0 +1,267 @@
+# issue: none
+# notes: A block read as a value (`count { p }`, `sum(x) { p }`) in a `let`, as a
+# notes: return item, compared with another block's value, or under `or` and
+# notes: `not`, is the core's `Correlate(R, Group(p, [], [agg]))`: one value per
+# notes: outer row whatever `p` matches, so a company with no employees keeps a
+# notes: headcount of 0 and a `sum` over no rows is null. A filter over such
+# notes: values runs over those columns under three-valued logic, in a read's
+# notes: `where`, an inline read's, an `optional`'s and a write group's.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32?
+    city: String?
+}
+node Company {
+    slug: String @key
+}
+edge WorksAt: Person -> Company
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":36}}
+{"type":"Person","data":{"handle":"bob","age":25}}
+{"type":"Person","data":{"handle":"cy","age":41}}
+{"type":"Person","data":{"handle":"di","age":19}}
+{"type":"Company","data":{"slug":"acme"}}
+{"type":"Company","data":{"slug":"bolt"}}
+{"type":"Company","data":{"slug":"zed"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"WorksAt","from":"cy","to":"bolt"}
+{"edge":"Knows","from":"ada","to":"bob"}
+{"edge":"Knows","from":"ada","to":"cy"}
+{"edge":"Knows","from":"ada","to":"di"}
+{"edge":"Knows","from":"bob","to":"di"}
+
+--- query
+query headcount() {
+    match { $c: Company, let $n = count { $p: Person, $p worksAt $c } }
+    return { $c.slug, $n }
+}
+
+--- expect unordered
+{"c.slug":"acme","n":2}
+{"c.slug":"bolt","n":1}
+{"c.slug":"zed","n":0}
+
+--- expect shape
+c.slug: String
+n: I64
+
+--- query
+query headcount_of_one() {
+    match { $c: Company, let $n = count { $p: Person, $p worksAt $c } }
+    where $c.slug = "zed"
+    return { $c.slug, $n }
+}
+
+--- expect unordered
+{"c.slug":"zed","n":0}
+
+--- expect shape
+c.slug: String
+n: I64
+
+--- query
+query friends_returned() {
+    match { $p: Person }
+    return { $p.handle, count { $f: Person, $p knows $f } as n }
+}
+
+--- expect unordered
+{"n":3,"p.handle":"ada"}
+{"n":1,"p.handle":"bob"}
+{"n":0,"p.handle":"cy"}
+{"n":0,"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+n: I64
+
+--- query
+query friends_ages() {
+    match { $p: Person, let $total = sum($f.age) { $f: Person, $p knows $f } }
+    return { $p.handle, $total }
+}
+
+--- expect unordered
+{"p.handle":"ada","total":85.0}
+{"p.handle":"bob","total":19.0}
+{"p.handle":"cy"}
+{"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+total: F64?
+
+--- query
+query at_least_one_friend() {
+    match { $p: Person, let $n = count { $f: Person, $p knows $f } }
+    where $n >= 1
+    return { $p.handle, $n }
+}
+
+--- expect unordered
+{"n":3,"p.handle":"ada"}
+{"n":1,"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+n: I64
+
+--- query
+query knows_someone_or_old() {
+    match { $p: Person }
+    where exists { $f: Person, $p knows $f } or $p.age > 40
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query not_both() {
+    match { $p: Person }
+    where not (exists { $f: Person, $p knows $f } and $p.age > 30)
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+{"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query more_friends_than_employers() {
+    match { $p: Person }
+    where count { $f: Person, $p knows $f } > count { $c: Company, $p worksAt $c }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query friends_of_friends_counted() {
+    match {
+        $p: Person,
+        from { match { $q: Person, $p knows $q, let $m = count { $g: Person, $q knows $g } } return { $q, $m } },
+    }
+    return { $p.handle, $q.handle, $m }
+}
+
+--- expect unordered
+{"m":0,"p.handle":"ada","q.handle":"cy"}
+{"m":0,"p.handle":"ada","q.handle":"di"}
+{"m":0,"p.handle":"bob","q.handle":"di"}
+{"m":1,"p.handle":"ada","q.handle":"bob"}
+
+--- expect shape
+p.handle: String
+q.handle: String
+m: I64
+
+--- query
+query friends_who_know_someone() {
+    match {
+        $p: Person,
+        from { match { $q: Person, $p knows $q } where exists { $g: Person, $q knows $g } return { $q } },
+    }
+    return { $p.handle, $q.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada","q.handle":"bob"}
+
+--- expect shape
+p.handle: String
+q.handle: String
+
+--- query
+query optional_friend_who_knows_someone_or_is_old() {
+    match {
+        $p: Person,
+        optional { $f: Person, $p knows $f where exists { $g: Person, $f knows $g } or $f.age > 40 },
+    }
+    return { $p.handle, $f.handle }
+}
+
+--- expect unordered
+{"f.handle":"bob","p.handle":"ada"}
+{"f.handle":"cy","p.handle":"ada"}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+{"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+f.handle: String?
+
+--- query
+query employees_friends_friend_counts() {
+    match {
+        $c: Company,
+        $p: Person,
+        $p worksAt $c,
+        $p knows $q,
+        let $n = count { $r: Person, $q knows $r },
+    }
+    return { $c.slug, $p.handle, $q.handle, $n }
+}
+
+--- expect unordered
+{"c.slug":"acme","n":0,"p.handle":"ada","q.handle":"cy"}
+{"c.slug":"acme","n":0,"p.handle":"ada","q.handle":"di"}
+{"c.slug":"acme","n":0,"p.handle":"bob","q.handle":"di"}
+{"c.slug":"acme","n":1,"p.handle":"ada","q.handle":"bob"}
+
+--- expect shape
+c.slug: String
+p.handle: String
+q.handle: String
+n: I64
+
+--- mutate
+query mark_sociable_or_old() {
+    match { $p: Person }
+    where exists { $f: Person, $p knows $f } or $p.age > 40
+    update $p set { city: "x" }
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- query
+query marked() {
+    match { $p: Person }
+    where $p.city = "x"
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String

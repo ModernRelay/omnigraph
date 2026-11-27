@@ -1,0 +1,304 @@
+# issue: none
+# notes: Every form the planner lowers beyond the core operators, each over
+# notes: rows that stress its rule (a null, a parallel edge, a self-loop, a duplicate, a tie),
+# notes: compared with the reference interpreter: `optional`, `union` (positional names, an
+# notes: arm's own cut, an outer name), a call bound in the caller's scope, a `let` that `if`
+# notes: and `coalesce` guard, `limit $n`, an inline read's group and cut per outer row, a
+# notes: block against an outer scalar and an order key no return item computes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32?
+    city: String?
+    quota: I64?
+}
+node Company {
+    slug: String @key
+}
+edge WorksAt: Person -> Company {
+    since: I64?
+}
+edge Knows: Person -> Person {
+    weight: I64?
+}
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":36,"city":"London","quota":1}}
+{"type":"Person","data":{"handle":"bob","age":25,"quota":0}}
+{"type":"Person","data":{"handle":"cy","city":"Paris","quota":3}}
+{"type":"Person","data":{"handle":"di","age":19,"city":"London"}}
+{"type":"Person","data":{"handle":"ed","age":36,"quota":1}}
+{"type":"Company","data":{"slug":"acme"}}
+{"type":"Company","data":{"slug":"bolt"}}
+{"type":"Company","data":{"slug":"corp"}}
+{"edge":"WorksAt","from":"ada","to":"acme","data":{"since":2010}}
+{"edge":"WorksAt","from":"bob","to":"acme","data":{}}
+{"edge":"WorksAt","from":"cy","to":"bolt","data":{"since":2015}}
+{"edge":"WorksAt","from":"di","to":"acme","data":{"since":2018}}
+{"edge":"WorksAt","from":"ada","to":"bolt","data":{"since":2020}}
+{"edge":"Knows","from":"ada","to":"bob","data":{"weight":1}}
+{"edge":"Knows","from":"bob","to":"cy","data":{"weight":2}}
+{"edge":"Knows","from":"cy","to":"ada","data":{}}
+{"edge":"Knows","from":"ada","to":"ada","data":{"weight":3}}
+{"edge":"Knows","from":"di","to":"bob","data":{"weight":1}}
+{"edge":"Knows","from":"di","to":"bob","data":{"weight":5}}
+
+--- query
+query q() {
+    match { $p: Person, optional { $c: Company, $p worksAt $c } }
+    return { $p.handle, $c.slug }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"c.slug":"acme","p.handle":"di"}
+{"c.slug":"bolt","p.handle":"ada"}
+{"c.slug":"bolt","p.handle":"cy"}
+{"p.handle":"ed"}
+
+--- expect shape
+p.handle: String
+c.slug: String?
+
+--- query
+query q() {
+    match {
+        $p: Person,
+        optional { $c: Company, $p $w:worksAt $c },
+        optional { $q: Person, $p knows $q },
+    }
+    return { $p.handle, $c.slug, $w.since, $q.handle }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada","q.handle":"ada","w.since":2010}
+{"c.slug":"acme","p.handle":"ada","q.handle":"bob","w.since":2010}
+{"c.slug":"acme","p.handle":"bob","q.handle":"cy"}
+{"c.slug":"acme","p.handle":"di","q.handle":"bob","w.since":2018}
+{"c.slug":"bolt","p.handle":"ada","q.handle":"ada","w.since":2020}
+{"c.slug":"bolt","p.handle":"ada","q.handle":"bob","w.since":2020}
+{"c.slug":"bolt","p.handle":"cy","q.handle":"ada","w.since":2015}
+{"p.handle":"ed"}
+
+--- expect shape
+p.handle: String
+c.slug: String?
+w.since: I64?
+q.handle: String?
+
+--- query
+query q() {
+    match {
+        from union(
+            { match { $p: Person } where $p.city = "London" return { $p } },
+            { match { $a: Person, $r: Person, $a knows $r } return { $r as p } }),
+    }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"ada"}
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+{"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query q() {
+    match {
+        from union(
+            { match { $p: Person } return { $p.handle as h, $p.quota as a } order { $p.quota desc } limit 2 },
+            { match { $c: Company } return { $c.slug as h, 0 as a } }),
+    }
+    return { $h, $a }
+    order { $h }
+}
+
+--- expect ordered
+{"a":0,"h":"acme"}
+{"a":1,"h":"ada"}
+{"a":0,"h":"bolt"}
+{"a":0,"h":"corp"}
+{"a":3,"h":"cy"}
+
+--- expect shape
+h: String
+a: I64
+
+--- query
+query q() {
+    match {
+        $c: Company,
+        from union(
+            { match { $p: Person, $p worksAt $c } return { $p } },
+            { match { $p: Person, $q: Person, $q worksAt $c, $q knows $p } return { $p } }),
+    }
+    return { $c.slug, $p.handle }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"c.slug":"acme","p.handle":"bob"}
+{"c.slug":"acme","p.handle":"bob"}
+{"c.slug":"acme","p.handle":"cy"}
+{"c.slug":"acme","p.handle":"di"}
+{"c.slug":"bolt","p.handle":"ada"}
+{"c.slug":"bolt","p.handle":"ada"}
+{"c.slug":"bolt","p.handle":"ada"}
+{"c.slug":"bolt","p.handle":"bob"}
+{"c.slug":"bolt","p.handle":"cy"}
+
+--- expect shape
+c.slug: String
+p.handle: String
+
+--- query
+query colleagues($h: String) {
+    match { $me: Person, $c: Company, $q: Person, $me worksAt $c, $q worksAt $c }
+    where $me.handle = $h and $q.handle != $h
+    return { $q }
+}
+query q() {
+    match { $p: Person, from colleagues($p.handle) }
+    return { $p.handle, $q.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada","q.handle":"bob"}
+{"p.handle":"ada","q.handle":"cy"}
+{"p.handle":"ada","q.handle":"di"}
+{"p.handle":"bob","q.handle":"ada"}
+{"p.handle":"bob","q.handle":"di"}
+{"p.handle":"cy","q.handle":"ada"}
+{"p.handle":"di","q.handle":"ada"}
+{"p.handle":"di","q.handle":"bob"}
+
+--- expect shape
+p.handle: String
+q.handle: String
+
+--- query
+query q() {
+    match {
+        $p: Person,
+        let $years = coalesce($p.age, 0),
+        let $ratio = if($p.quota is null or $p.quota = 0, 0, 100 / $p.quota),
+    }
+    where $years < 40
+    return { $p.handle, $years, $ratio }
+}
+
+--- expect unordered
+{"p.handle":"ada","ratio":100,"years":36}
+{"p.handle":"bob","ratio":0,"years":25}
+{"p.handle":"cy","ratio":33,"years":0}
+{"p.handle":"di","ratio":0,"years":19}
+{"p.handle":"ed","ratio":100,"years":36}
+
+--- expect shape
+p.handle: String
+years: I32
+ratio: I64
+
+--- query
+query q($n: I64) {
+    match { $p: Person, $c: Company, $p worksAt $c }
+    return { $p.handle, $c.slug }
+    limit $n
+}
+
+--- params
+{"n": 3}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"c.slug":"bolt","p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+c.slug: String
+
+--- query
+query q() {
+    match {
+        $p: Person,
+        from { match { $q: Person, $p knows $q } return { count($q) as n } },
+    }
+    return { $p.handle, $n }
+}
+
+--- expect unordered
+{"n":0,"p.handle":"ed"}
+{"n":1,"p.handle":"bob"}
+{"n":1,"p.handle":"cy"}
+{"n":1,"p.handle":"di"}
+{"n":2,"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+n: I64
+
+--- query
+query q() {
+    match {
+        $c: Company,
+        from { match { $p: Person, $p $w:worksAt $c } return { $p, $w.since as since } order { $w.since desc } limit 1 },
+    }
+    return { $c.slug, $p.handle, $since }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"di","since":2018}
+{"c.slug":"bolt","p.handle":"ada","since":2020}
+
+--- expect shape
+c.slug: String
+p.handle: String
+since: I64
+
+--- query
+query q() {
+    match { $p: Person }
+    where count { $q: Person, $p knows $q } >= $p.quota
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query q() {
+    match { $p: Person }
+    return { $p.handle }
+    order { coalesce($p.age, 99) desc, $p.city }
+}
+
+--- expect ordered
+{"p.handle":"cy"}
+{"p.handle":"ed"}
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+{"p.handle":"di"}
+
+--- expect shape
+p.handle: String

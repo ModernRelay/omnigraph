@@ -228,7 +228,7 @@ fn merge_validation_is_delta_scoped() {
             let jsonl = (0..rows).map(|i| format!(
                 "{{\"type\":\"Person\",\"data\":{{\"name\":\"{prefix}-{i}\",\"age\":20}}}}\n"
             )).collect::<String>();
-            db.load("main", &jsonl, omnigraph::loader::LoadMode::Append)
+            db.load("main", &jsonl, omnigraph::loader::LoadMode::Insert)
                 .await
                 .unwrap();
             db.branch_create(&prefix).await.unwrap();
@@ -328,7 +328,7 @@ fn merge_lineage_setting_selects_the_completed_classifier() {
                     format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"lm-{i}\",\"age\":20}}}}\n")
                 })
                 .collect::<String>();
-            db.load("main", &jsonl, omnigraph::loader::LoadMode::Append)
+            db.load("main", &jsonl, omnigraph::loader::LoadMode::Insert)
                 .await
                 .unwrap();
             db.branch_create("feature").await.unwrap();
@@ -589,7 +589,7 @@ fn merge_delete_selects_rows_by_rowid_issue_1295() {
                     format!("{{\"type\":\"Person\",\"data\":{{\"name\":\"dv-{i}\",\"age\":20}}}}\n")
                 })
                 .collect::<String>();
-            db.load("main", &rows, omnigraph::loader::LoadMode::Append)
+            db.load("main", &rows, omnigraph::loader::LoadMode::Insert)
                 .await
                 .unwrap();
             db.branch_create("feature").await.unwrap();

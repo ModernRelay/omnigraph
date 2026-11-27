@@ -6178,7 +6178,7 @@
           {
             "name": "set",
             "in": "query",
-            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings; `engine` does not change\nchange-feed execution.",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings.",
             "required": false,
             "schema": {
               "type": "array",
@@ -7859,7 +7859,7 @@
           {
             "name": "set",
             "in": "query",
-            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings; `engine` does not change\nchange-feed execution.",
+            "description": "Repeatable session setting, `name=value` in GQ spelling\n(`set=merge_lineage=off`); only `request`-scope settings are accepted.\nValues are validated as session settings.",
             "required": false,
             "schema": {
               "type": "array",
@@ -9246,7 +9246,7 @@
           "mutations"
         ],
         "summary": "Compatibility-load NDJSON data through a JSON envelope.",
-        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting entities: `merge` upserts by id (default), `append` strictly inserts\nabsent ids, and `overwrite` replaces type data. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.",
+        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting entities: `replace` writes each record as the whole entity (default),\n`upsert` sets the properties a record names, `insert` creates and refuses\nan existing id with `key_conflict`, and `overwrite` replaces type data;\n`append` and `merge` are refused with their fix. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.",
         "operationId": "load",
         "parameters": [
           {
@@ -9656,7 +9656,7 @@
           {
             "name": "mode",
             "in": "query",
-            "description": "How existing entities are handled. Defaults to `merge`.",
+            "description": "What a record does to an existing key: `insert`, `upsert`, `replace`\nor `overwrite`. Defaults to `replace`; `append` and `merge` are\nrefused with `insert` and `replace` as their fixes.",
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/LoadMode"
@@ -12336,7 +12336,7 @@
             }
           },
           "409": {
-            "description": "Stored mutation write-authority conflict, or a full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required), neither cleared by retrying; or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)",
+            "description": "Stored mutation write-authority conflict, a full-text index requires explicit rebuilding (full_text_index_rebuild_required), which retrying does not clear, the stored query fails to compile under this release (stored_query_unavailable, with its diagnostic), or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -13114,7 +13114,7 @@
             }
           },
           "409": {
-            "description": "A full-text index requires explicit rebuilding (full_text_index_rebuild_required) or has no segment at the snapshot (full_text_index_required), neither cleared by retrying; or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)",
+            "description": "A full-text index requires explicit rebuilding (full_text_index_rebuild_required), which retrying does not clear; or the branch was deleted (`branch_deleted`) or is not ready (`branch_not_ready`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -14243,7 +14243,8 @@
             "type": "string",
             "description": "Name of the new branch. Must not already exist."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "BranchDeleteOutput": {
         "type": "object",
@@ -14457,7 +14458,8 @@
             ],
             "description": "Target branch that will receive the merge. Defaults to `main`."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "BranchOutcomeOutput": {
         "oneOf": [
@@ -14672,7 +14674,8 @@
               "type": "string"
             }
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ChangeBlockOutput": {
         "type": "object",
@@ -15029,8 +15032,8 @@
           },
           "query": {
             "type": "string",
-            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`. May instead\nbe one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),\nsent with no `name`, `params`, or `branch`.",
-            "example": "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
+            "description": "GQ mutation source containing `insert`, `upsert`, `replace`, `update` or\n`delete` statements.\nMay declare multiple named mutations; pick one with `name`. May instead\nbe one branch statement (grammar: `BranchStmt` in `omnigraph-compiler`),\nsent with no `name`, `params`, or `branch`.",
+            "example": "query insert_person($name: String, $age: I32) {\n    replace Person { name: $name, age: $age }\n}"
           },
           "settings": {
             "oneOf": [
@@ -15263,6 +15266,17 @@
           "code": {
             "type": "string"
           },
+          "end": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PositionOutput",
+                "description": "Where the refused construct ends (exclusive): with `position`, its\nspan."
+              }
+            ]
+          },
           "expected": {
             "type": "string"
           },
@@ -15278,15 +15292,30 @@
               "null"
             ]
           },
+          "further": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiagnosticOutput"
+            },
+            "description": "The independent refusals the same compile pass found after this one,\nin source order, each with its span and fix; each carries no further\nlist of its own. Applying every machine-applicable suggestion of this\ndiagnostic and its further ones at once is one repair pass."
+          },
           "position": {
             "oneOf": [
               {
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/PositionOutput"
+                "$ref": "#/components/schemas/PositionOutput",
+                "description": "Where the refused construct starts."
               }
             ]
+          },
+          "related": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RelatedSpanOutput"
+            },
+            "description": "Other source spans the refusal names: the first declaration of a\nname a later one repeats."
           },
           "stage": {
             "type": [
@@ -15433,7 +15462,7 @@
       },
       "ErrorCode": {
         "type": "string",
-        "description": "The registry of error codes. A server sends each code under the HTTP statuses named with it; a code without one never appears in an HTTP response.\n\n- `unauthorized` (401): The request carries no credential the server accepts: a bearer token is missing, unknown or expired. Supply one the server is configured to verify.\n- `forbidden` (403): The credential's actor may not do this: policy denies the action, or the action needs a policy permit the server has not been given.\n- `not_admitted` (403): The OIDC access token is valid, but the server admits no principal for its subject. Signing in again issues a token for the same subject and cannot help; the server's operator must admit the identity.\n- `bad_request` (400): The request is malformed or invalid: a body, query string, path parameter or header that does not decode, a query the compiler refuses (see `diagnostic`), or a value refused before any effect.\n- `api_contract_mismatch` (400): The request lacks exactly one `Omnigraph-Http-Api` header naming the contract this server speaks. Authentication and this check precede graph access and effects.\n- `actor_mismatch` (412): The request's `Omnigraph-If-Actor` header names another actor than its credential resolves to. Nothing ran.\n- `outcome_unknown` (500): A write whose completion the server could not settle: it may or may not have published. Read the target before writing again; never replay the write blindly. An MCP write call that was cancelled or passed its deadline answers it too.\n- `precondition_failed` (412): A request precondition no longer holds: the branch head moved past `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's `If-Match` names a value the cell no longer holds (a write's `blob_precondition_failure` names the current one). Nothing was written.\n- `recovery_required` (503): An overlapping durable recovery intent must be resolved first; see `recovery_required`.\n- `external_blob_source` (424): An admitted external Blob source could not be probed or read; see `external_blob_source`.\n- `change_feed_gap` (410): Retained history can no longer reconstruct a change continuation; see `change_feed_gap`. Resume from a new baseline.\n- `not_found` (404): The graph, branch, commit, query, entity or route the request names does not exist, or the caller may not learn that it does.\n- `method_not_allowed` (405): The request path is served, but not with the request's method.\n- `request_timeout` (408): The request body did not arrive before its deadline; nothing was admitted.\n- `conflict` (409): The request conflicts with the graph's current state: a concurrent change, an existing id, a merge conflict, an index that must be built first, or a commit that cannot be diffed. The details say which.\n- `branch_start_refusal` (409, 410): `branch create` could not start the branch at the commit `from_commit` named, and nothing was created; see `branch_start_refusal`, whose `not_retained` reason answers 410.\n- `unattached_cannot_publish` (409): The commit is an unattached snapshot, a kind that never publishes. Distinct from `conflict`, the authority-moved refusal of a publishable proposal.\n- `writer_fenced` (409): The branch's writer epoch refused the write: another process claimed the branch, or the serving process holds no claim on it; see `writer_fenced`. Nothing was written.\n- `branch_exists` (409): `branch create` names a branch that exists: a live branch has the name, or one above or below it in the `/` hierarchy. Nothing was created.\n- `branch_deleted` (409): The branch was deleted: a read or write of a branch whose delete has begun, or a `branch create` whose source was deleted under it. Nothing was written.\n- `branch_not_ready` (409): The branch is not ready: its create wrote the branch and no tree, so reads and writes refuse until `branch delete` removes it and a new `branch create` starts it again. Nothing was written.\n- `payload_too_large` (413): The request body, or the work it asks for, exceeds a bounded limit; `resource_limit` names the limit when it is the operation's. Split or reduce the request.\n- `unsupported_media_type` (415): The request body's content type is not one the route accepts.\n- `range_not_satisfiable` (416): The requested Blob byte range lies outside the value; see `blob_range`.\n- `too_many_requests` (429): Admission capacity is exhausted: an actor's, the server's, or the MCP endpoint's concurrent tool calls. Nothing started; retry after `Retry-After`.\n- `service_unavailable` (503): Operation admission is closed, or a deployment observation raced an owner change. Nothing started; retry after `Retry-After`, reconciling any earlier write first.\n- `graph_unavailable` (503): A known graph is not being served. The request did not start, so it may be retried once the graph is served again.\n- `internal` (500): The server failed. An error before any write took no effect; see the server log.\n- `cancelled` (no HTTP status): MCP only: the client cancelled a read tool call. A cancelled write answers `outcome_unknown`.\n- `deadline_exceeded` (no HTTP status): MCP only: a read tool call passed its deadline. A write that does answers `outcome_unknown`.\n- `result_too_large` (no HTTP status): MCP only: a tool result exceeds the result limit. Narrow the read.",
+        "description": "The registry of error codes. A server sends each code under the HTTP statuses named with it; a code without one never appears in an HTTP response.\n\n- `unauthorized` (401): The request carries no credential the server accepts: a bearer token is missing, unknown or expired. Supply one the server is configured to verify.\n- `forbidden` (403): The credential's actor may not do this: policy denies the action, or the action needs a policy permit the server has not been given.\n- `not_admitted` (403): The OIDC access token is valid, but the server admits no principal for its subject. Signing in again issues a token for the same subject and cannot help; the server's operator must admit the identity.\n- `bad_request` (400): The request is malformed or invalid: a body, query string, path parameter or header that does not decode, a query the compiler refuses (see `diagnostic`), or a value refused before any effect.\n- `api_contract_mismatch` (400): The request lacks exactly one `Omnigraph-Http-Api` header naming the contract this server speaks. Authentication and this check precede graph access and effects.\n- `actor_mismatch` (412): The request's `Omnigraph-If-Actor` header names another actor than its credential resolves to. Nothing ran.\n- `outcome_unknown` (500): A write whose completion the server could not settle: it may or may not have published. Read the target before writing again; never replay the write blindly. An MCP write call that was cancelled or passed its deadline answers it too.\n- `precondition_failed` (412): A request precondition no longer holds: the branch head moved past `Omnigraph-If-Graph-Commit` (see `precondition_failure`), or a Blob's `If-Match` names a value the cell no longer holds (a write's `blob_precondition_failure` names the current one). Nothing was written.\n- `recovery_required` (503): An overlapping durable recovery intent must be resolved first; see `recovery_required`.\n- `external_blob_source` (424): An admitted external Blob source could not be probed or read; see `external_blob_source`.\n- `change_feed_gap` (410): Retained history can no longer reconstruct a change continuation; see `change_feed_gap`. Resume from a new baseline.\n- `not_found` (404): The graph, branch, commit, query, entity or route the request names does not exist, or the caller may not learn that it does.\n- `method_not_allowed` (405): The request path is served, but not with the request's method.\n- `request_timeout` (408): The request body did not arrive before its deadline; nothing was admitted.\n- `conflict` (409): The request conflicts with the graph's current state: a concurrent change, an existing id, a merge conflict, an index that must be built first, or a commit that cannot be diffed. The details say which.\n- `branch_start_refusal` (409, 410): `branch create` could not start the branch at the commit `from_commit` named, and nothing was created; see `branch_start_refusal`, whose `not_retained` reason answers 410.\n- `unattached_cannot_publish` (409): The commit is an unattached snapshot, a kind that never publishes. Distinct from `conflict`, the authority-moved refusal of a publishable proposal.\n- `writer_fenced` (409): The branch's writer epoch refused the write: another process claimed the branch, or the serving process holds no claim on it; see `writer_fenced`. Nothing was written.\n- `branch_exists` (409): `branch create` names a branch that exists: a live branch has the name, or one above or below it in the `/` hierarchy. Nothing was created.\n- `branch_deleted` (409): The branch was deleted: a read or write of a branch whose delete has begun, or a `branch create` whose source was deleted under it. Nothing was written.\n- `branch_not_ready` (409): The branch is not ready: its create wrote the branch and no tree, so reads and writes refuse until `branch delete` removes it and a new `branch create` starts it again. Nothing was written.\n- `payload_too_large` (413): The request body, or the work it asks for, exceeds a bounded limit; `resource_limit` names the limit when it is the operation's. Split or reduce the request.\n- `unsupported_media_type` (415): The request body's content type is not one the route accepts.\n- `range_not_satisfiable` (416): The requested Blob byte range lies outside the value; see `blob_range`.\n- `too_many_requests` (429): Admission capacity is exhausted: an actor's, the server's, or the MCP endpoint's concurrent tool calls. Nothing started; retry after `Retry-After`.\n- `service_unavailable` (503): Operation admission is closed, or a deployment observation raced an owner change. Nothing started; retry after `Retry-After`, reconciling any earlier write first.\n- `graph_unavailable` (503): A known graph is not being served. The request did not start, so it may be retried once the graph is served again.\n- `stored_query_unavailable` (409): The stored query's source fails to compile under this server's release, so the server does not serve it; see `diagnostic`. Nothing ran. The operator applies a rewritten registry.\n- `internal` (500): The server failed. An error before any write took no effect; see the server log.\n- `cancelled` (no HTTP status): MCP only: the client cancelled a read tool call. A cancelled write answers `outcome_unknown`.\n- `deadline_exceeded` (no HTTP status): MCP only: a read tool call passed its deadline. A write that does answers `outcome_unknown`.\n- `result_too_large` (no HTTP status): MCP only: a tool result exceeds the result limit. Narrow the read.",
         "enum": [
           "unauthorized",
           "forbidden",
@@ -15462,6 +15491,7 @@
           "too_many_requests",
           "service_unavailable",
           "graph_unavailable",
+          "stored_query_unavailable",
           "internal",
           "cancelled",
           "deadline_exceeded",
@@ -15572,17 +15602,6 @@
               {
                 "$ref": "#/components/schemas/FullTextIndexRebuildRequiredOutput",
                 "description": "Set with HTTP 409 when a selected full-text index requires an explicit\nrebuild before search can succeed. Unlike a write-authority conflict,\nthis condition is not cleared by retrying. This additive discriminator\npreserves the closed [`ErrorCode`] contract."
-              }
-            ]
-          },
-          "full_text_index_required": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/FullTextIndexRequiredOutput",
-                "description": "Set with HTTP 409 when a full-text call reads a declared index that\nhas no segment at the query's snapshot. Building the index clears it;\nretrying does not."
               }
             ]
           },
@@ -15723,19 +15742,6 @@
           "reason": {
             "type": "string",
             "description": "Human-readable diagnosis; branch on the enclosing detail's presence,\nnot this text, to distinguish the operator-action-required condition."
-          }
-        }
-      },
-      "FullTextIndexRequiredOutput": {
-        "type": "object",
-        "description": "A full-text call read a declared full-text index that has no segment at\nthe query's snapshot (HTTP 409), so no segment carries its analyzer. This\nis not a retryable conflict: an operator builds the branch's index\n(`omnigraph index build --branch <branch>`). Historical snapshots stay\nunchanged.",
-        "required": [
-          "index"
-        ],
-        "properties": {
-          "index": {
-            "type": "string",
-            "description": "The index's property as `Type.property`."
           }
         }
       },
@@ -15921,6 +15927,13 @@
           "state": {
             "$ref": "#/components/schemas/GraphAvailability"
           },
+          "unavailable_queries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnavailableQueryOutput"
+            },
+            "description": "Stored queries of a served graph that fail to compile under this\nserver's release, each with its refusal; the graph serves every\nother query. Absent when there are none."
+          },
           "uri": {
             "type": "string"
           },
@@ -15963,6 +15976,13 @@
           "internal_schema_version"
         ],
         "properties": {
+          "gq_language": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The GQ language version this server compiles, `major.minor` (`\"3.0\"`).\nA server that omits the field is a GQ language 2 build."
+          },
           "internal_schema_version": {
             "type": "integer",
             "format": "int32",
@@ -16094,11 +16114,12 @@
               },
               {
                 "$ref": "#/components/schemas/LoadMode",
-                "description": "How existing entities are handled. Defaults to `merge`."
+                "description": "What a record does to an existing key: `insert`, `upsert`, `replace`\nor `overwrite`. Defaults to `replace`; `append` and `merge` are\nrefused with `insert` and `replace` as their fixes."
               }
             ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "InvokeStoredQueryOutput": {
         "oneOf": [
@@ -16139,7 +16160,8 @@
             ],
             "description": "Snapshot id to read from (read queries only — rejected for a stored\nmutation). Mutually exclusive with `branch`."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "KeyConflictOutput": {
         "type": "object",
@@ -16211,9 +16233,10 @@
         "type": "string",
         "description": "Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.",
         "enum": [
-          "overwrite",
-          "append",
-          "merge"
+          "insert",
+          "upsert",
+          "replace",
+          "overwrite"
         ]
       },
       "LoadOperatorExecutedOutput": {
@@ -16439,6 +16462,9 @@
           "nullable"
         ],
         "properties": {
+          "default": {
+            "description": "The declared default, the value an omitted parameter binds. A\nparameter with neither `nullable` nor a `default` is required. The\nkey is absent when no default is declared and `null` when the\ndeclared default is `null`."
+          },
           "item_kind": {
             "oneOf": [
               {
@@ -16458,7 +16484,7 @@
           },
           "nullable": {
             "type": "boolean",
-            "description": "`false` → the caller must supply it; `true` → optional."
+            "description": "Whether the parameter admits null."
           },
           "vector_dim": {
             "type": [
@@ -16573,7 +16599,7 @@
       },
       "QueriesCatalogOutput": {
         "type": "object",
-        "description": "Response for `GET /queries`: every stored query in a graph's\nregistry, each with typed parameters.",
+        "description": "Response for `GET /queries`: every stored query in a graph's\nregistry, each with typed parameters, and every stored query the server\ndoes not serve because its source fails to compile, each with its\nrefusal.",
         "required": [
           "queries"
         ],
@@ -16583,6 +16609,13 @@
             "items": {
               "$ref": "#/components/schemas/QueryCatalogEntry"
             }
+          },
+          "unavailable": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnavailableQueryOutput"
+            },
+            "description": "Stored queries that fail to compile under this server's release,\nby name; absent when there are none."
           }
         }
       },
@@ -16655,7 +16688,7 @@
           "query": {
             "type": "string",
             "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` instead. May be the branch\nstatement `branch list` or a branch control read (`branch diff …`,\n`branch merge-base …`, `branch merge … dry run`), sent with no `name`,\n`params`, `branch`, or `snapshot`; or one `explain` statement (`explain query …`), which\nanswers the v2 plan instead of\nrunning it, as one result per plan node (fields `tree`, `depth`, `node`,\n`detail`: the logical, physical and available DataFusion trees, then `plan` entries for\nthe passes and the document's other fields), under the same `params`,\n`branch`, or `snapshot` as the query itself. `explain load csv …` answers the accepted\nload plan as the same results (`logical_initial`, `logical`, `physical`, then `plan`\nentries), under `branch` alone: `snapshot`, `name` and `params` are refused.\nIt requires the load's `change` permission before probing source metadata,\nreads no payload byte, and publishes nothing.",
-            "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+            "example": "query get_person($name: String) {\n    match { $p: Person }\n    where $p.name = $name\n    return { $p.name, $p.age }\n}"
           },
           "settings": {
             "oneOf": [
@@ -16913,6 +16946,11 @@
           "status": {
             "type": "string",
             "description": "`loading`, `serving`, `degraded`, `blocked` or `draining`."
+          },
+          "unavailable_query_count": {
+            "type": "integer",
+            "description": "Stored queries of served graphs that fail to compile under this\nrelease and are unavailable; `GET /graphs` names them with their\nrefusals.",
+            "minimum": 0
           }
         }
       },
@@ -16924,6 +16962,27 @@
         "properties": {
           "operation_id": {
             "type": "string"
+          }
+        }
+      },
+      "RelatedSpanOutput": {
+        "type": "object",
+        "description": "Another source span a refusal names.",
+        "required": [
+          "position",
+          "end",
+          "message"
+        ],
+        "properties": {
+          "end": {
+            "$ref": "#/components/schemas/PositionOutput"
+          },
+          "message": {
+            "type": "string",
+            "description": "What stands there."
+          },
+          "position": {
+            "$ref": "#/components/schemas/PositionOutput"
           }
         }
       },
@@ -17007,13 +17066,6 @@
               "verify"
             ]
           },
-          "engine": {
-            "type": "string",
-            "description": "the engine a read query runs on; `v2`, the plan runner, is the one value; this setting does not change change-feed or merge execution",
-            "enum": [
-              "v2"
-            ]
-          },
           "history_release_bytes": {
             "type": "integer",
             "description": "the byte budget of a branch's buffer of unreleased commits; a mutate, load or branch merge of this session whose buffer and head reach it closes a history block and the publish after it writes the block under `__history`; query results never change, only where settled commits are stored and how many requests a publish makes",
@@ -17034,9 +17086,21 @@
               "verify"
             ]
           },
+          "plan_budget_limit": {
+            "type": "integer",
+            "description": "the largest plan budget a declaration may declare with `@budget(plan = n)`, the work units its compile and plan may charge; a declaration declaring more is refused (`T89`) before it is compiled, never clamped",
+            "maximum": 9223372036854775807,
+            "minimum": 1
+          },
           "query_memory_bytes": {
             "type": "integer",
             "description": "the memory pool one read query runs under, and the allowance one load statement's retained read-reuse buffers are admitted against; tracked work past it is refused, and a raised value is memory one query or load may hold",
+            "minimum": 1
+          },
+          "read_work_limit": {
+            "type": "integer",
+            "description": "how much work one read may do: the results its expansions and joins produce, the pairs a product forms, the neighbors a hop range examines, every traversal together, and the tokens and term comparisons of its exact lexical scans; exhaustion fails the read with an error naming it, never a partial result",
+            "maximum": 9223372036854775807,
             "minimum": 1
           },
           "traversal_work_limit": {
@@ -17212,6 +17276,35 @@
           "start": {
             "type": "integer",
             "minimum": 0
+          }
+        }
+      },
+      "UnavailableQueryOutput": {
+        "type": "object",
+        "description": "A stored query the server does not serve: its source fails to compile\nunder the server's release. The graph stays served; invoking this query\nanswers `stored_query_unavailable` with the same diagnostic.",
+        "required": [
+          "name",
+          "error"
+        ],
+        "properties": {
+          "diagnostic": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DiagnosticOutput",
+                "description": "The compiler's refusal: its code, position, fix and byte-range\nedits against the stored source."
+              }
+            ]
+          },
+          "error": {
+            "type": "string",
+            "description": "The refusal's one-line rendering."
+          },
+          "name": {
+            "type": "string",
+            "description": "Registry key / invoke path segment (`POST /queries/{name}`)."
           }
         }
       },

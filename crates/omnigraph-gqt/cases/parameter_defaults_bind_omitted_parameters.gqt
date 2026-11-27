@@ -1,0 +1,107 @@
+# issue: none
+# notes: A parameter's declared default binds when the caller omits the parameter, for a nullable and a
+# notes: required declaration, a negative default and a write; a supplied value replaces it, and an
+# notes: explicit null for a nullable parameter stays null (`$p.age > null` holds for no row). A default
+# notes: of another type than its declaration, or outside its declared type's range, is refused at type check.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32?
+}
+
+--- seed
+{"type":"Person","data":{"handle":"p1","age":20}}
+{"type":"Person","data":{"handle":"p2","age":30}}
+{"type":"Person","data":{"handle":"p3","age":36}}
+
+--- query
+query nullable_default($x: I32? = 30) { match { $p: Person } where $p.age > $x return { count($p) as n } }
+
+--- expect unordered
+{"n":1}
+
+--- expect shape
+n: I64
+
+--- query
+query required_default($x: I32 = 30) { match { $p: Person } where $p.age > $x return { count($p) as n } }
+
+--- expect unordered
+{"n":1}
+
+--- expect shape
+n: I64
+
+--- query
+query supplied_replaces_default($x: I32 = 30) { match { $p: Person } where $p.age > $x return { count($p) as n } }
+
+--- params
+{"x": 19}
+
+--- expect unordered
+{"n":3}
+
+--- expect shape
+n: I64
+
+--- query
+query explicit_null_stays_null($x: I32? = 30) { match { $p: Person } where $p.age > $x return { count($p) as n } }
+
+--- params
+{"x": null}
+
+--- expect unordered
+{"n":0}
+
+--- expect shape
+n: I64
+
+--- query
+query negative_default($x: I32 = -1, $y: I32? = 25) { match { $p: Person } where $p.age > $x and $p.age < $y return { $p.handle } }
+
+--- expect unordered
+{"p.handle":"p1"}
+
+--- expect shape
+p.handle: String
+
+--- mutate
+query insert_with_default($handle: String, $age: I32 = 41) { replace Person { handle: $handle, age: $age } }
+
+--- params
+{"handle": "p4"}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query inserted_age() { match { $p: Person } where $p.handle = "p4" return { $p.age } }
+
+--- expect unordered
+{"p.age":41}
+
+--- expect shape
+p.age: I32?
+
+--- query
+query mistyped_default($x: I32 = "five") { match { $p: Person } where $p.age > $x return { count($p) as n } }
+
+--- expect error: T3
+
+--- query
+query out_of_range_default($x: I32 = 3000000000) { match { $p: Person } where $p.age > $x return { count($p) as n } }
+
+--- expect error: T3
+
+--- query
+query out_of_range_negative_default($x: U32 = -1) { match { $p: Person } where $p.age > $x return { count($p) as n } }
+
+--- expect error: T3

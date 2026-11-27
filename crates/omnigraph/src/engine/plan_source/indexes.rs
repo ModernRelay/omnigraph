@@ -66,73 +66,45 @@ fn kind(index: &IndexMetadata) -> IndexKind {
         return IndexKind::Unknown;
     };
     let details = IndexDetails(details.clone());
+    use omnigraph_core::dataset_index::ScalarIndexFamily;
     if omnigraph_core::dataset_index::is_btree_index(index) {
         IndexKind::Btree { usable: false }
+    } else if let Some(family) = ScalarIndexFamily::of(index) {
+        match family {
+            ScalarIndexFamily::Bitmap => IndexKind::Bitmap,
+            ScalarIndexFamily::LabelList => IndexKind::LabelList,
+            ScalarIndexFamily::NGram => IndexKind::NGram,
+            // A BTREE detected by type URL but not by plugin name is not one
+            // the engine built.
+            ScalarIndexFamily::BTree => IndexKind::Unknown,
+        }
     } else if details.supports_fts() {
         IndexKind::Inverted
-    } else if details.is_vector() && vector_index_ranks_exactly_by_l2(index) {
+    } else if details.is_vector() && vector_index_ranks_exactly(index) {
         IndexKind::Vector
     } else {
         IndexKind::Unknown
     }
 }
 
-/// Whether a vector index segment scores every row of each partition it
-/// searches exactly by squared L2, the metric `nearest` promises: IVF with
-/// unquantized vectors (IVF_FLAT) and the L2 metric, the only vector index
-/// the engine builds. A segment with quantized vectors (PQ, SQ, RQ), an HNSW
-/// graph or another metric approximates or ranks differently, and so does
-/// one whose details are empty: Lance infers missing details when it loads
-/// indices, and an empty value left after that is unknown, not the proto
-/// defaults (L2, no compression) it would decode to. Details carrying a
-/// field this Lance does not know are not exact either: the decoder drops
-/// the field, which may be a newer sub-index (an IVF_VAMANA_FLAT index adds
-/// `vamana_index_config`, lance#10318), so the re-encoded details must be as
-/// long as the stored ones.
-pub(crate) fn vector_index_ranks_exactly_by_l2(index: &IndexMetadata) -> bool {
-    use lance_index::pb::{
-        VectorIndexDetails, VectorMetricType, vector_index_details::Compression,
-    };
-    let Some(details) = &index.index_details else {
-        return false;
-    };
-    if details.value.is_empty() || !IndexDetails(details.clone()).is_vector() {
-        return false;
-    }
-    let Ok(decoded) = details.to_msg::<VectorIndexDetails>() else {
-        return false;
-    };
-    if prost::Message::encoded_len(&decoded) != details.value.len() {
-        return false;
-    }
-    let details = decoded;
-    VectorMetricType::try_from(details.metric_type) == Ok(VectorMetricType::L2)
-        && details.hnsw_index_config.is_none()
-        && matches!(details.compression, None | Some(Compression::Flat(_)))
+/// Whether a vector index segment ranks exactly by one of the distances a
+/// field can declare (IVF_FLAT by L2, cosine or dot,
+/// [`crate::table_store::exact_vector_index_distance`]). A scan uses it only
+/// when that distance is the field's declared one.
+pub(crate) fn vector_index_ranks_exactly(index: &IndexMetadata) -> bool {
+    crate::table_store::exact_vector_index_distance(index).is_some()
 }
 
 /// Whether every vector index segment keyed on `column` of `dataset` ranks
-/// exactly by squared L2 ([`vector_index_ranks_exactly_by_l2`]); true when no
-/// vector index covers the column, since Lance then scores every row flat.
-pub(crate) async fn vector_indexes_rank_exactly_by_l2(
+/// exactly by `distance`, the field's declared distance; true when no vector
+/// index covers the column, since Lance then scores every row flat. An
+/// index built for another distance is never used.
+pub(crate) async fn vector_indexes_rank_exactly_by(
     dataset: &Dataset,
     column: &str,
+    distance: omnigraph_compiler::schema::vector::VectorDistance,
 ) -> Result<bool> {
-    let Some(field) = dataset.schema().field(column) else {
-        return Ok(true);
-    };
-    let indices = dataset.load_indices().await.map_err(OmniError::storage)?;
-    Ok(indices
-        .iter()
-        .filter(|index| !is_system_index(index))
-        .filter(|index| index.fields.first() == Some(&field.id))
-        .filter(|index| {
-            index
-                .index_details
-                .as_ref()
-                .is_none_or(|details| IndexDetails(details.clone()).is_vector())
-        })
-        .all(vector_index_ranks_exactly_by_l2))
+    crate::table_store::vector_indexes_rank_exactly(dataset, column, distance).await
 }
 
 fn fact(
@@ -242,12 +214,16 @@ mod tests {
         for family in [
             None,
             Some("FutureBTreeIndexDetails"),
-            Some("BitmapIndexDetails"),
+            Some("ZoneMapIndexDetails"),
+            Some("BloomFilterIndexDetails"),
         ] {
             let index = segment("key", 0, Some(&[1]), family);
             assert_eq!(kind(&index), IndexKind::Unknown, "{family:?}");
         }
         for (family, expected) in [
+            ("BitmapIndexDetails", IndexKind::Bitmap),
+            ("LabelListIndexDetails", IndexKind::LabelList),
+            ("NGramIndexDetails", IndexKind::NGram),
             ("InvertedIndexDetails", IndexKind::Inverted),
             // Empty vector details are unknown: Lance infers missing details
             // when it loads indices, so empty ones are details it could not.
@@ -257,8 +233,10 @@ mod tests {
         }
     }
 
-    /// Issue #1297: only an IVF_FLAT, L2 vector index is a vector index fact;
-    /// another metric, quantized vectors or an HNSW graph rank otherwise.
+    /// Issue #1297: only an IVF_FLAT vector index ranks exactly, by the L2,
+    /// cosine or dot metric it was built with; quantized vectors or an HNSW
+    /// graph rank otherwise. A scan uses an exact index only when its metric
+    /// is the field's declared distance.
     #[test]
     fn only_flat_l2_vector_details_claim_a_vector_index_issue_1297() {
         use lance_index::pb::{
@@ -267,6 +245,7 @@ mod tests {
                 Compression, FlatCompression, ProductQuantization, ScalarQuantization,
             },
         };
+        use omnigraph_compiler::schema::vector::VectorDistance;
         let flat = || Some(Compression::Flat(FlatCompression {}));
         let vector = |details: VectorIndexDetails| {
             let mut proto = pb::IndexMetadata {
@@ -282,10 +261,21 @@ mod tests {
         };
         let l2 = VectorMetricType::L2 as i32;
         let cases = [
-            (l2, flat(), None, true),
-            (l2, None, None, true),
-            (VectorMetricType::Cosine as i32, flat(), None, false),
-            (VectorMetricType::Dot as i32, flat(), None, false),
+            (l2, flat(), None, Some(VectorDistance::L2)),
+            (l2, None, None, Some(VectorDistance::L2)),
+            (
+                VectorMetricType::Cosine as i32,
+                flat(),
+                None,
+                Some(VectorDistance::Cosine),
+            ),
+            (
+                VectorMetricType::Dot as i32,
+                flat(),
+                None,
+                Some(VectorDistance::Dot),
+            ),
+            (VectorMetricType::Hamming as i32, flat(), None, None),
             (
                 l2,
                 Some(Compression::Pq(ProductQuantization {
@@ -293,15 +283,15 @@ mod tests {
                     num_sub_vectors: 2,
                 })),
                 None,
-                false,
+                None,
             ),
             (
                 l2,
                 Some(Compression::Sq(ScalarQuantization { num_bits: 8 })),
                 None,
-                false,
+                None,
             ),
-            (l2, flat(), Some(HnswParameters::default()), false),
+            (l2, flat(), Some(HnswParameters::default()), None),
         ];
         for (metric_type, compression, hnsw_index_config, exact) in cases {
             let index = vector(VectorIndexDetails {
@@ -312,11 +302,12 @@ mod tests {
                 ..Default::default()
             });
             assert_eq!(
-                vector_index_ranks_exactly_by_l2(&index),
+                crate::table_store::exact_vector_index_distance(&index),
                 exact,
                 "{metric_type} {compression:?}"
             );
-            let expected = if exact {
+            assert_eq!(vector_index_ranks_exactly(&index), exact.is_some());
+            let expected = if exact.is_some() {
                 IndexKind::Vector
             } else {
                 IndexKind::Unknown
@@ -335,7 +326,7 @@ mod tests {
         let mut details = (**index.index_details.as_ref().unwrap()).clone();
         details.value.extend([(10 << 3) | 2, 0]);
         index.index_details = Some(std::sync::Arc::new(details));
-        assert!(!vector_index_ranks_exactly_by_l2(&index));
+        assert!(!vector_index_ranks_exactly(&index));
         assert_eq!(kind(&index), IndexKind::Unknown);
     }
 

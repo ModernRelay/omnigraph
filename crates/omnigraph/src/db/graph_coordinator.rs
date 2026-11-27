@@ -1581,7 +1581,7 @@ mod tests {
         for load in 0..64 {
             let line = format!(r#"{{"type": "Person", "data": {{"name": "P{load}"}}}}"#);
             let receipt = lowered
-                .load_as_with_receipt("main", None, &line, crate::loader::LoadMode::Append, None)
+                .load_as_with_receipt("main", None, &line, crate::loader::LoadMode::Insert, None)
                 .await
                 .unwrap();
             published.push(receipt.commit.graph_commit_id);

@@ -1,7 +1,7 @@
 # issue: none
 # notes: An update's scan holds the type's pending rows and the matched copies it rewrites at once, and both count toward the 8,192 `keyed entities` allowance.
-# notes: The rewrite then replaces each matched row's pending version (issue #925), so repeated updates of the same rows hold their count, not a multiple of it.
-# notes: Three updates of all 4,096 rows are admitted: each later scan holds 4,096 pending and 4,096 matched rows, exactly 8,192.
+# notes: The rewrite then replaces each matched row's pending version, so repeated updates of the same rows hold their count, not a multiple of it.
+# notes: Each update is a statement over one group's selection of every row. Three updates of all 4,096 rows are admitted: each later scan holds 4,096 pending and 4,096 matched rows, exactly 8,192.
 # notes: With 4,097 rows the second update's scan holds 8,194 and is refused, though the rows it would leave pending are still 4,097; nothing is written.
 
 --- runner
@@ -28,9 +28,10 @@ tables:
 
 --- mutate
 query update_every_row_three_times() {
-    update Item set { n: 1 } where n >= 0
-    update Item set { n: 2 } where n >= 0
-    update Item set { n: 3 } where n >= 0
+    match { $i: Item } where $i.n >= 0
+    update $i set { n: 1 }
+    update $i set { n: 2 }
+    update $i set { n: 3 }
 }
 
 --- expect affected: nodes=12288 edges=0
@@ -48,7 +49,7 @@ query values_after_three_updates() {
 i.n: I64
 rows: I64
 
---- load generate: v1 seed: 0 mode: append
+--- load generate: v1 seed: 0 mode: insert
 tables:
   - kind: node
     name: Item
@@ -62,8 +63,9 @@ tables:
 
 --- mutate
 query update_every_row_twice() {
-    update Item set { n: 4 } where n >= 0
-    update Item set { n: 5 } where n >= 0
+    match { $i: Item } where $i.n >= 0
+    update $i set { n: 4 }
+    update $i set { n: 5 }
 }
 
 --- expect error: keyed entities for node:Item

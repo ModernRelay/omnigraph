@@ -69,7 +69,7 @@ fn remote_server_and_cli_end_to_end_flow() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     )
@@ -206,7 +206,7 @@ query insert_person($name: String, $age: I32) {
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
-            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }")
             .arg("--params")
             .arg(r#"{"name":"Mina"}"#)
             .arg("--json"),
@@ -222,7 +222,9 @@ query insert_person($name: String, $age: I32) {
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--query-string")
-            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg(
+                "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
+            )
             .arg("--params")
             .arg(r#"{"name":"Inline","age":42}"#)
             .arg("--json"),
@@ -234,7 +236,7 @@ query insert_person($name: String, $age: I32) {
         .post(format!("{}/graphs/{GRAPH_ID}/query", server.base_url))
         .json(&json!({
             "branch": "main",
-            "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+            "query": "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }",
             "params": { "name": "Inline" }
         }))
         .send()
@@ -251,7 +253,7 @@ query insert_person($name: String, $age: I32) {
         .post(format!("{}/graphs/{GRAPH_ID}/query", server.base_url))
         .json(&json!({
             "branch": "main",
-            "query": "query bad($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            "query": "query bad($name: String, $age: I32) { replace Person { name: $name, age: $age } }",
             "params": { "name": "Nope", "age": 1 }
         }))
         .send()
@@ -396,9 +398,8 @@ fn remote_read_preserves_projection_order_in_json_and_csv() {
         &ordered_query,
         r#"
 query ordered_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.age, $p.name }
 }
 "#,
@@ -447,6 +448,57 @@ query ordered_person($name: String) {
     assert_eq!(lines.next().unwrap(), "30,Alice");
 }
 
+/// Reads far deeper than the corpus's deepest compile and run on the
+/// server's and the CLI's runtime threads with the stacks those binaries
+/// choose, Tokio's defaults: an `or` chain of 10,000 terms and arithmetic
+/// nested in 1,000 brackets. Every walk over them grows its own stack (an
+/// `or` chain of 200 terms once overflowed a debug server's worker and
+/// aborted the process). The chain's compile work, about 80,000 units, is
+/// past the default plan budget: the operator raises the ceiling and the
+/// chain declares its budget.
+#[test]
+fn remote_read_deep_past_the_corpus_keeps_the_server_serving() {
+    let cluster = converged_loaded_cluster(GRAPH_ID, None);
+    let server = spawn_server_with_cluster_default_stack(
+        cluster.path(),
+        &[("OMNIGRAPH_PLAN_BUDGET_LIMIT", "1000000")],
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let chain = (0..10_000)
+        .map(|i| format!("$p.name = \"n{i}\""))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let mut nested = "$p.age".to_string();
+    for _ in 0..1_000 {
+        nested = format!("({nested} + 0)");
+    }
+    let deep = temp.path().join("deep.gq");
+    fs::write(
+        &deep,
+        format!(
+            "query chain() @budget(plan = 1000000) {{ match {{ $p: Person }} where {chain} or $p.name = \"Alice\" return {{ count($p) as n }} }}\n\
+             query nested() {{ match {{ $p: Person }} where {nested} > 29 return {{ count($p) as n }} }}"
+        ),
+    )
+    .unwrap();
+    for (name, rows) in [("chain", 1), ("nested", 2), ("chain", 1)] {
+        let payload = parse_stdout_json(&output_success(
+            cli()
+                .env_remove("RUST_MIN_STACK")
+                .arg("query")
+                .arg("--target")
+                .fixture_target(&server.base_url)
+                .arg("--graph")
+                .arg(GRAPH_ID)
+                .arg("--query")
+                .arg(&deep)
+                .arg(name)
+                .arg("--json"),
+        ));
+        assert_eq!(payload["rows"][0]["n"], rows, "{name}: {payload}");
+    }
+}
+
 #[test]
 fn remote_branch_create_list_merge_flow() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);
@@ -457,7 +509,7 @@ fn remote_branch_create_list_merge_flow() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     )
@@ -610,7 +662,7 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
             .post(format!("{graph_url}/mutate"))
             .json(&json!({
                 "branch": source,
-                "query": "query add($name: String) { insert Person { name: $name, age: 33 } }",
+                "query": "query add($name: String) { replace Person { name: $name, age: 33 } }",
                 "params": {"name": marker}
             }))
             .send()
@@ -737,7 +789,7 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
                     .post(format!("{graph_url}/query"))
                     .json(&json!({
                         "branch": branch,
-                        "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }",
+                        "query": "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }",
                         "params": {"name": marker}
                     }))
                     .send()
@@ -815,7 +867,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
             let proposal = client
                 .post(format!("{graph_url}/mutate"))
                 .json(&json!({
-                    "query": "query propose($name: String) as commit { insert Person { name: $name, age: 33 } }",
+                    "query": "query propose($name: String) as commit { replace Person { name: $name, age: 33 } }",
                     "params": {"name": marker}
                 }))
                 .send()
@@ -938,7 +990,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
             let rows = client
                 .post(format!("{graph_url}/query"))
                 .json(&json!({
-                    "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }",
+                    "query": "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }",
                     "params": {"name": marker}
                 }))
                 .send()
@@ -1398,7 +1450,7 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
         );
         let response = client.post(format!("{}/graphs/{GRAPH_ID}/query", server.base_url))
             .timeout(Duration::from_secs(3))
-            .bearer_auth(TOKEN).json(&json!({"query": format!("query inspect() {{ match {{ $p: Person {{ name: \"Alice\" }} }} return {{ $p.name, $p.{property} }} }}")}))
+            .bearer_auth(TOKEN).json(&json!({"query": format!("query inspect() {{ match {{ $p: Person }} where $p.name = \"Alice\" return {{ $p.name, $p.{property} }} }}")}))
             .send().unwrap();
         let status = response.status();
         let rows = response.json::<serde_json::Value>().unwrap();
@@ -1485,11 +1537,11 @@ fn remote_export_round_trips_full_branch_graph() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 
 query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
+    insert Knows { @src: $from, @dst: $to }
 }
 "#,
     )
@@ -1634,7 +1686,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .fixture_target(&server.base_url)
             .arg("--graph")
@@ -1652,7 +1704,7 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     assert_eq!(ingest_payload["branch_created"], true);
     assert!(ingest_payload["commit"]["graph_commit_id"].is_string());
     assert!(ingest_payload["commit"]["graph_manifest_version"].is_number());
-    assert_eq!(ingest_payload["mode"], "merge");
+    assert_eq!(ingest_payload["mode"], "replace");
     assert_eq!(ingest_payload["nodes"][0]["name"], "Person");
     assert_eq!(ingest_payload["nodes"][0]["entities_loaded"], 2);
     assert_eq!(ingest_payload["total_entities"], 2);
@@ -1714,7 +1766,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&extra)
             .arg("--branch")
@@ -1734,7 +1786,7 @@ fn remote_load_round_trips_and_requires_from_for_new_branches() {
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--data")
             .arg(&extra)
             .arg("--branch")
@@ -1797,7 +1849,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
         cli()
             .arg("load")
             .arg("--mode")
-            .arg("merge")
+            .arg("replace")
             .arg("--target")
             .fixture_target(&server.base_url)
             .arg("--graph")
@@ -1813,7 +1865,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
     assert_eq!(ingest_payload["branch"], "feature-ingest");
     assert_eq!(ingest_payload["base_branch"], "missing-base");
     assert_eq!(ingest_payload["branch_created"], false);
-    assert_eq!(ingest_payload["mode"], "merge");
+    assert_eq!(ingest_payload["mode"], "replace");
     assert_eq!(ingest_payload["nodes"][0]["name"], "Person");
     assert_eq!(ingest_payload["nodes"][0]["entities_loaded"], 2);
     assert_eq!(ingest_payload["total_entities"], 2);
@@ -1876,7 +1928,7 @@ fn remote_policy_enforces_branch_first_cli_workflow() {
         &mutation_file,
         r#"
 query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
+    replace Person { name: $name, age: $age }
 }
 "#,
     )
@@ -1957,7 +2009,7 @@ query insert_person($name: String, $age: I32) {
             .arg("--data")
             .arg(&batch)
             .arg("--mode")
-            .arg("append")
+            .arg("insert")
             .arg("--json"),
     );
     assert_eq!(
@@ -2203,7 +2255,7 @@ fn graphs_list_against_multi_graph_server() {
         .arg("--target")
         .fixture_target(&server.base_url)
         .arg("-e")
-        .arg("query q { match { $p: Person { name: \"x\" } } return { $p.name } }")
+        .arg("query q { match { $p: Person } where $p.name = \"x\" return { $p.name } }")
         .output()
         .unwrap();
     assert!(
@@ -2225,10 +2277,9 @@ fn graphs_list_against_multi_graph_server() {
 /// that path degrades exit 4 to the generic 1.
 #[test]
 fn mutate_if_commit_lost_cas_exits_4_issue_365() {
-    const FIND_ALICE: &str =
-        "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+    const FIND_ALICE: &str = "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }";
     const ADD_PERSON: &str =
-        "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
+        "query add($name: String, $age: I32) { replace Person { name: $name, age: $age } }";
     fn mutate_cmd(base_url: &str, name: &str, if_commit: Option<&str>) -> std::process::Output {
         let mut cmd = cli();
         cmd.arg("mutate")
@@ -2391,7 +2442,7 @@ fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
     let mutation = parse_stdout_json(&over_socket(&[
         "mutate",
         "-e",
-        r#"query add($title: String) { insert Document { title: $title, note: "over a socket" } }"#,
+        r#"query add($title: String) { replace Document { title: $title, note: "over a socket" } }"#,
         "--params",
         r#"{"title":"socket-mutate"}"#,
         "--json",
@@ -2407,7 +2458,7 @@ fn remote_unix_socket_serves_query_mutate_load_export_and_blob_get_issue_979() {
     let load = parse_stdout_json(&over_socket(&[
         "load",
         "--mode",
-        "merge",
+        "replace",
         "--data",
         rows.to_str().unwrap(),
         "--json",

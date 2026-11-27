@@ -1,0 +1,115 @@
+# issue: none
+# notes: A node an `optional` introduces, returned whole, is its node object where the `optional` matched and a null object where it matched nothing; the null object is left out of its row as every null cell is. The result column is nullable in the plan's result columns, the executed schema and the compiler's inferred schema alike.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+}
+node Company {
+    slug: String @key
+    name: String
+    founded: I32?
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"bob","name":"Bob"}}
+{"type":"Person","data":{"handle":"cy","name":"Cy","age":51}}
+{"type":"Company","data":{"slug":"acme","name":"Acme","founded":1990}}
+{"type":"Company","data":{"slug":"bolt","name":"Bolt"}}
+{"edge":"WorksAt","from":"ada","to":"acme","data":{}}
+{"edge":"WorksAt","from":"cy","to":"bolt","data":{}}
+{"edge":"Knows","from":"ada","to":"bob","data":{}}
+
+--- query
+query employers() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c } }
+
+--- expect unordered
+{"p.name":"Ada","c":{"@id":"acme","slug":"acme","name":"Acme","founded":1990}}
+{"p.name":"Bob"}
+{"p.name":"Cy","c":{"@id":"bolt","slug":"bolt","name":"Bolt"}}
+
+--- expect shape
+p.name: String
+c: Company?
+
+--- expect plan
+result columns [p.name: String, c: Company?]
+
+--- query
+query employers_ordered() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.handle, $c } order { $c desc, $p.handle } }
+
+--- expect ordered
+{"p.handle":"cy","c":{"@id":"bolt","slug":"bolt","name":"Bolt"}}
+{"p.handle":"ada","c":{"@id":"acme","slug":"acme","name":"Acme","founded":1990}}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+c: Company?
+
+--- query
+query friend_objects() { match { $p: Person, optional { $f: Person, $p knows $f } } return { $p.handle, $f as friend } }
+
+--- expect unordered
+{"p.handle":"ada","friend":{"@id":"bob","handle":"bob","name":"Bob"}}
+{"p.handle":"bob"}
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+friend: Person?
+
+--- query
+query employers_counted() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $c, count($p) as n } }
+
+--- expect unordered
+{"c":{"@id":"acme","slug":"acme","name":"Acme","founded":1990},"n":1}
+{"n":1}
+{"c":{"@id":"bolt","slug":"bolt","name":"Bolt"},"n":1}
+
+--- expect shape
+c: Company?
+n: I64
+
+--- query
+query distinct_employers() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return distinct { $c } }
+
+--- expect unordered
+{"c":{"@id":"acme","slug":"acme","name":"Acme","founded":1990}}
+{}
+{"c":{"@id":"bolt","slug":"bolt","name":"Bolt"}}
+
+--- expect shape
+c: Company?
+
+--- query
+query drawn_from_an_inline_read() { match { from { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p, $c } } } where $p.handle != "cy" return { $p.handle, $c } }
+
+--- expect unordered
+{"p.handle":"ada","c":{"@id":"acme","slug":"acme","name":"Acme","founded":1990}}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+c: Company?
+
+--- query
+query no_match_anywhere() { match { $p: Person, optional { $c: Company, $p worksAt $c } } where $c is null return { $p.handle, $c } }
+
+--- expect unordered
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+c: Company?

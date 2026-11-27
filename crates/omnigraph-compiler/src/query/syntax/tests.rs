@@ -1,0 +1,1952 @@
+//! The parser tests of the GQ 3 RFC, section 10
+//! ("Compiler parser tests"), the rule-set pin, and one repair per refusal
+//! shape.
+
+use super::parse::parse_source;
+use super::*;
+use crate::query::diagnostic::QueryDiagnostic;
+use crate::query::file::{FileBody, MutationWriteMode};
+use crate::query::parser::parse_query_diagnostic;
+use crate::query::syntax::EdgeSelector;
+use crate::query::value::CompOp;
+
+pub(crate) fn parse_text(src: &str) -> Result<SourceFile, QueryDiagnostic> {
+    parse_source(src)
+}
+
+#[track_caller]
+pub(crate) fn parsed(src: &str) -> SourceFile {
+    parse_text(src).unwrap_or_else(|e| panic!("refused:\n{src}\n{e:?}"))
+}
+
+#[track_caller]
+fn refusal_of(src: &str) -> QueryDiagnostic {
+    match parse_text(src) {
+        Ok(f) => panic!("accepted:\n{src}\n{f:#?}"),
+        Err(e) => e,
+    }
+}
+
+#[track_caller]
+fn code3(src: &str) -> &'static str {
+    refusal_of(src).code.as_str()
+}
+
+#[track_caller]
+fn decl(src: &str) -> Decl {
+    match parsed(src).body {
+        Body::Decls(mut d) => d.remove(0),
+        other => panic!("not a declaration: {other:?}"),
+    }
+}
+
+#[track_caller]
+fn read(src: &str) -> ReadBody {
+    match decl(src).body {
+        DeclBody::Read(r) => r,
+        other => panic!("not a read: {other:?}"),
+    }
+}
+
+#[track_caller]
+fn write(src: &str) -> WriteBody {
+    match decl(src).body {
+        DeclBody::Write(w) => w,
+        other => panic!("not a write: {other:?}"),
+    }
+}
+
+/// The elements of `query q() { match { <elements> } return { 1 as one } }`.
+#[track_caller]
+fn match_elements(elements: &str) -> Vec<Element> {
+    read(&format!(
+        "query q() {{ match {{ {elements} }} return {{ 1 as one }} }}"
+    ))
+    .pattern
+    .elements
+}
+
+#[track_caller]
+fn one_element(text: &str) -> Element {
+    let mut c = match_elements(text);
+    assert_eq!(c.len(), 1, "{text} gave {c:#?}");
+    c.remove(0)
+}
+
+/// The `where` of `query q() { match { $x: X } where <text> return { 1 as
+/// one } }`.
+#[track_caller]
+fn where_expr(text: &str) -> Expr {
+    read(&format!(
+        "query q() {{ match {{ $x: X }} where {text} return {{ 1 as one }} }}"
+    ))
+    .pattern
+    .predicate
+    .unwrap_or_else(|| panic!("{text}: no where"))
+}
+
+/// The refusal of `text` written as one element of a read's `match`.
+#[track_caller]
+fn element_refusal(text: &str) -> QueryDiagnostic {
+    refusal_of(&format!(
+        "query q() {{ match {{ {text} }} return {{ 1 as one }} }}"
+    ))
+}
+
+fn int(n: i128) -> Expr {
+    Expr::Literal(crate::query::value::Literal::Integer(n))
+}
+fn var(v: &str) -> Expr {
+    Expr::Variable(v.to_string())
+}
+fn arith(op: ArithOp, l: Expr, r: Expr) -> Expr {
+    Expr::Arith {
+        op,
+        left: Box::new(l),
+        right: Box::new(r),
+    }
+}
+fn cmp(op: CompOp, l: Expr, r: Expr) -> Expr {
+    Expr::Compare {
+        op,
+        left: Box::new(l),
+        right: Box::new(r),
+        at: SourceSpan::default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `match` holds the elements, `where` the predicate (section 3).
+
+#[test]
+fn match_holds_the_elements_and_where_the_predicate() {
+    let r = read(
+        "query colleagues($h: String) { match { $p: Person, $p worksAt $c, $q worksAt $c } where $p.handle = $h and $q != $p and not exists { $q blocked $p } return { $q.name } }",
+    );
+    assert_eq!(r.pattern.elements.len(), 3);
+    assert!(matches!(r.pattern.predicate, Some(Expr::And(..))));
+    // A trailing comma, and elements one per line.
+    assert_eq!(match_elements("$p: Person,").len(), 1);
+    assert_eq!(match_elements("\n  $p: Person,\n  $p knows $q,\n").len(), 2);
+    // A block holds elements and its own `where` inside its braces, and so
+    // does `optional`.
+    let compared = where_expr("count { $x knows $q where $q.age > 30 } > 2");
+    let Expr::Compare { left, .. } = &compared else {
+        panic!()
+    };
+    let Expr::Block(b) = left.as_ref() else {
+        panic!()
+    };
+    assert_eq!(b.pattern.elements.len(), 1);
+    assert!(b.pattern.predicate.is_some());
+    let Element::Optional(o) = one_element("optional { $p worksAt $c where $c.name = \"x\" }")
+    else {
+        panic!()
+    };
+    assert!(o.predicate.is_some());
+    // A write group selects with the same `match` and `where`.
+    let w = write(
+        "query relocate($slug: String) { match { $c: Company, $p worksAt $c } where $c.slug = $slug update $p set { city: null } }",
+    );
+    assert_eq!(w.groups[0].pattern.elements.len(), 2);
+    assert!(w.groups[0].pattern.predicate.is_some());
+}
+
+/// A second `where` joins the first with `and`, each side parenthesized, and
+/// a starred bounded range drops its star; both fixes reparse to the
+/// intended tree. A `with` after the pattern and an unbounded star print a
+/// note, since no rewrite keeps their meaning.
+#[test]
+fn a_second_where_a_with_and_a_starred_range_print_their_fixes() {
+    for (src, code, intended) in [
+        (
+            "query q() { match { $p: Person } where $p.age > 1 or $p.age < 0 where $p.age < 5 return { $p.handle } }",
+            "Q012",
+            "query q() { match { $p: Person } where ($p.age > 1 or $p.age < 0) and ($p.age < 5) return { $p.handle } }",
+        ),
+        (
+            "query q() { match { $p: Person, $p knows*{1,3} $q } return { $q.handle } }",
+            "Q014",
+            "query q() { match { $p: Person, $p knows{1,3} $q } return { $q.handle } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), code, "{src}: {e:?}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(
+            parse_source(&fixed).unwrap_or_else(|e| panic!("{src}\n{fixed}\n{e:?}")),
+            parsed(intended),
+            "{src}"
+        );
+    }
+    for src in [
+        "query q() { match { $p: Person, $p knows* $q } where $p.handle = \"p1\" return { count($q) as n } }",
+        "query q() { match { $p: Person } with $p return { $p.handle } }",
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q014", "{src}: {e:?}");
+        assert!(e.suggestion.is_none(), "{src}: a rewrite printed: {e:?}");
+    }
+}
+
+/// Each repair of a predicate written among the elements is one suggestion
+/// over the whole `match` and its `where`, which reparses to the intended
+/// tree (section 3's table).
+#[test]
+fn a_predicate_inside_match_prints_the_where_after_the_braces() {
+    for (src, code, intended) in [
+        (
+            "query q() { match { $p: Person, $p.age > 30 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where $p.age > 30 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person where $p.age > 30 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where $p.age > 30 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, $p.age > 30 } where $p.age < 60 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where $p.age > 30 and $p.age < 60 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, $p.a = 1 or $p.b = 2 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where ($p.a = 1 or $p.b = 2) return { $p } }",
+        ),
+        (
+            "query q($h: String) { match { $p: Person { handle: $h }, $p knows $q } return { $q } }",
+            "Q010",
+            "query q($h: String) { match { $p: Person, $p knows $q } where $p.handle = $h return { $q } }",
+        ),
+        (
+            "query q() { match { $d: Doc { year >= 2025 } } return { $d } }",
+            "Q010",
+            "query q() { match { $d: Doc } where $d.year >= 2025 return { $d } }",
+        ),
+        (
+            "query q() { match { $p: Person, not { $p knows $q } } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person } where not exists { $p knows $q } return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where not { $p knows $q } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person } where not exists { $p knows $q } return { $p } }",
+        ),
+        // A block holding only a filter of an outer name kept the rows its
+        // filter did not hold on, a null one included.
+        // A nested block is rewritten in the same suggestion as its
+        // enclosing one, so a block per pass never chains the fixes.
+        (
+            "query q() { match { $p: Person, not { $p knows $q  $q.age > 3  not { $q worksAt $c } } } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person } where not exists { $p knows $q where $q.age > 3 and not exists { $q worksAt $c } } return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, not { $p.age > 20 } } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person } where not coalesce($p.age > 20, false) return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, not { $p.age > 20 $p.name = \"a\" } } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person } where not coalesce($p.age > 20 and $p.name = \"a\", false) return { $p } }",
+        ),
+        // An `exists` block holding only filters binds nothing to test:
+        // its filter held, a null one excluded, nested blocks kept.
+        (
+            "query q() { match { $p: Person } where exists { $p.age > 20  exists { $p knows $q } } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where coalesce($p.age > 20 and exists { $p knows $q }, false) return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where exists { $p.age > 20 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where coalesce($p.age > 20, false) return { $p } }",
+        ),
+        // Every block function folds the same way over the one row a block
+        // of filters tests, its own `where` included: `count` to
+        // `if(…, 1, 0)`, `count(e)` to the rows where `e` is not null, `min`
+        // and `max` to the value, `sum` and `avg` to it as `F64`. Moving the
+        // filter to the block's `where` would leave no element, which does
+        // not parse.
+        (
+            "query q() { match { $p: Person } where count { $p.age > 2 } != 0 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false), 1, 0) != 0 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where count { $p.age > 2 where $p.age < 9 } > 0 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2 and $p.age < 9, false), 1, 0) > 0 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where count($p.age) { $p.age > 2 } > 0 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false) and $p.age is not null, 1, 0) > 0 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where max($p.age) { $p.age > 2 } > 1 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false), $p.age, null) > 1 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where sum($p.age) { $p.age > 2 } > 1 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false), cast($p.age, F64), null) > 1 return { $p } }",
+        ),
+        // Written among the elements, one edit moves the comparison and
+        // folds the block in it.
+        (
+            "query q() { match { $p: Person, count { $p.age > 2 } != 0 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where if(coalesce($p.age > 2, false), 1, 0) != 0 return { $p } }",
+        ),
+        // A block among the elements correlated only on the names bound
+        // before it; in the `where` it would read a later binding of the
+        // same name. It stays where it was written, as a `let`.
+        (
+            "query q() { match { $p: Person, exists { $p knows $x }, $x: Company } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person, let $block = exists { $p knows $x }, $x: Company } where $block return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, not { $p knows $x }, $x: Company } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person, let $block = not exists { $p knows $x }, $x: Company } where $block return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, $x: Company, exists { $p knows $x } } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person, $x: Company } where exists { $p knows $x } return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person $p knows $q } return { $q } }",
+            "Q016",
+            "query q() { match { $p: Person, $p knows $q } return { $q } }",
+        ),
+        (
+            "query q() { match { $p: Person } where count { $p knows $q $q.age > 3 } > 1 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where count { $p knows $q where $q.age > 3 } > 1 return { $p } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), code, "{src}: {e:?}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(
+            parse_source(&fixed).unwrap_or_else(|e| panic!("{src}\n{fixed}\n{e:?}")),
+            parsed(intended),
+            "{src}\n{fixed}"
+        );
+    }
+}
+
+/// A pattern holds at least one element. A list whose every element is a
+/// predicate keeps none once they move to the `where`, so its refusal prints
+/// no edit rather than a text that does not parse, which another rule's fix
+/// would undo: `optional { $p.age > 3 }` keeps every row either way.
+#[test]
+fn a_pattern_left_with_no_element_prints_no_edit() {
+    for src in [
+        "query q() { match { $p: Person, optional { $p.age > 3 } } return { $p } }",
+        "query q() { match { $p: Person, optional { $p.age > 3  $p.name = \"a\" } } return { $p } }",
+        "query q() { match { 1 = 1 } return { 1 as one } }",
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q017", "{src}: {e:?}");
+        assert!(e.suggestion.is_none(), "{src}: {e:?}");
+    }
+}
+
+#[test]
+fn every_list_takes_commas_and_a_missing_one_prints_it() {
+    for (src, intended) in [
+        (
+            "query q() { match { $p: Person } return { $p.name $p.age } }",
+            "query q() { match { $p: Person } return { $p.name, $p.age } }",
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name } order { $p.age desc $p.name } }",
+            "query q() { match { $p: Person } return { $p.name } order { $p.age desc, $p.name } }",
+        ),
+        (
+            "query q() { match { $p: Person } where contains($p.name \"a\") return { $p.name } }",
+            "query q() { match { $p: Person } where contains($p.name, \"a\") return { $p.name } }",
+        ),
+        (
+            "query w() { insert Person { handle: \"h\" name: \"n\" } }",
+            "query w() { insert Person { handle: \"h\", name: \"n\" } }",
+        ),
+        (
+            "query w() { match { $p: Person } update $p set {\n  age: 3\n  city: null\n} }",
+            "query w() { match { $p: Person } update $p set { age: 3, city: null } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q016", "{src}: {e:?}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(parse_source(&fixed).unwrap(), parsed(intended), "{fixed}");
+    }
+    // A trailing comma in every list but a call's arguments.
+    read("query q() { match { $p: Person, } return { $p.name, } order { $p.name, } }");
+    write("query w() { insert Person { handle: \"h\", } }");
+}
+
+// ---------------------------------------------------------------------------
+// Infix string predicates.
+
+/// An infix `contains` is a tree node the type checker refuses, since the
+/// left operand's type picks the fix (the call over a String, `in` over a
+/// list).
+#[test]
+fn an_infix_string_predicate_is_a_node_the_checker_refuses() {
+    let f = parse_query_diagnostic(
+        "query q() { match { $d: Doc } where $d.t contains \"x\" return { $d.t } }",
+    )
+    .unwrap();
+    let FileBody::Queries(decls) = f.body else {
+        panic!("a declaration file")
+    };
+    let DeclBody::Read(body) = &decls[0].syntax.decl().body else {
+        panic!("a read")
+    };
+    assert!(matches!(
+        body.pattern.predicate,
+        Some(Expr::InfixString { .. })
+    ));
+    // `gq` is an ordinary identifier.
+    assert!(
+        parse_query_diagnostic("query gq() { match { $p: P } where $p.gq = 3 return { $p.gq } }")
+            .is_ok()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `let` and `from` in every element position.
+
+const LET: &str = "let $v = $p.age";
+const FROM: &str = "from { match { $p knows $q } return { $q } }";
+
+#[test]
+fn let_and_from_in_every_element_position() {
+    for text in [LET, FROM] {
+        let probe = |c: &Element| matches!(c, Element::Let { .. } | Element::From { .. });
+        // First, middle and last of a `match`.
+        for elements in [
+            format!("{text}, $p: Person"),
+            format!("$p: Person, {text}, $p knows $q"),
+            format!("$p: Person, {text}"),
+        ] {
+            let c = match_elements(&elements);
+            assert_eq!(c.len(), elements.matches(", ").count() + 1, "{elements}");
+            assert!(c.iter().any(probe), "{elements}: {c:#?}");
+        }
+        // Inside every block.
+        for block in ["optional", "exists", "count"] {
+            let pattern = if block == "optional" {
+                match one_element(&format!("{block} {{ $p: Person, {text} }}")) {
+                    Element::Optional(p) => p,
+                    other => panic!("{block}: {other:?}"),
+                }
+            } else {
+                let suffix = if block == "count" { " > 0" } else { "" };
+                match &where_expr(&format!("{block} {{ $p: Person, {text} }}{suffix}")) {
+                    Expr::Block(b) => b.pattern.clone(),
+                    Expr::Compare { left, .. } => match left.as_ref() {
+                        Expr::Block(b) => b.pattern.clone(),
+                        other => panic!("{block}: {other:?}"),
+                    },
+                    other => panic!("{block}: {other:?}"),
+                }
+            };
+            assert!(pattern.elements.iter().any(probe), "{block}: {pattern:#?}");
+        }
+        // Inside an inline read, as `from`'s and `let`'s relation.
+        let c = one_element(&format!(
+            "from {{ match {{ $p: Person, {text} }} return {{ $p }} }}"
+        ));
+        let Element::From {
+            rel: RelExpr::Inline(body),
+            ..
+        } = c
+        else {
+            panic!()
+        };
+        assert!(body.pattern.elements.iter().any(probe));
+        // In a write group's `match`.
+        let w = write(&format!(
+            "query w() {{ match {{ $p: Person, {text} }} update $p set {{ age: 1 }} }}"
+        ));
+        assert!(
+            w.all_elements().into_iter().any(probe),
+            "{:#?}",
+            w.all_elements()
+        );
+    }
+}
+
+#[test]
+fn from_takes_an_inline_read_a_variable_and_a_call() {
+    assert!(matches!(
+        one_element("from { match { $p: Person } return { $p } }"),
+        Element::From {
+            rel: RelExpr::Inline(_),
+            score: None
+        }
+    ));
+    assert!(matches!(
+        one_element("from $docs"),
+        Element::From { rel: RelExpr::Variable(v), score: None } if v == "docs"
+    ));
+    let Element::From {
+        rel: RelExpr::Call(c),
+        ..
+    } = one_element("from colleagues($x.handle)")
+    else {
+        panic!()
+    };
+    assert_eq!(c.name, "colleagues");
+    // A call's name need not touch its parenthesis.
+    let Element::From {
+        rel: RelExpr::Call(c),
+        ..
+    } = one_element("from colleagues ($x.handle)")
+    else {
+        panic!()
+    };
+    assert_eq!(c.name, "colleagues");
+    // A ranking's population may be written inline; `as` names its score.
+    let Element::From {
+        rel: RelExpr::Call(c),
+        score,
+    } = one_element(
+        "from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20, recall: 0.9) as $distance",
+    )
+    else {
+        panic!()
+    };
+    assert_eq!((c.args.len(), c.options.len()), (3, 2));
+    assert!(matches!(c.args[0], Arg::Inline(_)));
+    assert_eq!(score.as_deref(), Some("distance"));
+    let Element::From {
+        rel: RelExpr::Variable(v),
+        score,
+    } = one_element("from $r as $s")
+    else {
+        panic!()
+    };
+    assert_eq!((v.as_str(), score.as_deref()), ("r", Some("s")));
+    // `from` followed by anything else is a parse error at the word, and so
+    // is a bare name anywhere in a `match`.
+    for text in ["from = 1", "from", "from (1) = 1"] {
+        let e = element_refusal(text);
+        assert!(["Q018", "Q019"].contains(&e.code.as_str()), "{text}: {e:?}");
+        assert_eq!(e.position.unwrap().column, 21, "{text}: at the word");
+    }
+}
+
+/// Inside `match` any word is an edge name, keywords included, and a quoted
+/// name is still accepted (section 7).
+#[test]
+fn any_word_is_an_edge_name_inside_match() {
+    for word in [
+        "true", "false", "let", "from", "in", "and", "or", "not", "is", "null", "insert", "update",
+        "delete", "where", "match", "return",
+    ] {
+        let Element::Traversal(t) = one_element(&format!("$a {word} $b")) else {
+            panic!("{word} as an edge")
+        };
+        assert_eq!(t.selector, EdgeSelector::Named(word.into()), "{word}");
+        let Element::Traversal(q) = one_element(&format!("$a \"{word}\" $b")) else {
+            panic!("{word} quoted")
+        };
+        assert_eq!(q, t, "{word}: the quoted name is the same triple");
+        // A bound edge of that name, with bounds, undirected, alternated.
+        one_element(&format!("$a $k:{word} $b"));
+        one_element(&format!("$a {word}{{1,2}} $b"));
+        one_element(&format!("$a <{word}> $b"));
+        one_element(&format!("$a ({word} | knows) $b"));
+    }
+    // In a write group, a statement word between two variables in `match`
+    // is a triple, and the statement after the braces is a statement.
+    let w = write("query w() { match { $a: Person, $a delete $b } delete $b }");
+    assert_eq!((w.all_elements().len(), w.all_statements().len()), (2, 1));
+    for word in ["let", "from"] {
+        // A property after a dot, in `where` and in return.
+        let r = read(&format!(
+            "query q() {{ match {{ $p: Person }} where $p.{word} > 0 return {{ $p.{word} as {word} }} order {{ {word} }} }}"
+        ));
+        assert_eq!(r.projections[0].alias.as_deref(), Some(word));
+        // A bare mutation property.
+        let w = write(&format!(
+            "query w() {{ insert Person {{ {word}: 1, handle: \"h\" }} }}"
+        ));
+        assert!(
+            matches!(&w.all_statements()[0], Stmt::Insert { assignments, .. } if assignments[0].property == word)
+        );
+        // A registry row is never named an element keyword (section 5), so
+        // `from(1)` and `let(1)` are refused, not calls.
+        let e = refusal_of(&format!(
+            "query q() {{ match {{ $x: X }} where $x.a = {word}(1) return {{ 1 as one }} }}"
+        ));
+        assert_eq!(e.code.as_str(), "Q019", "{word}");
+    }
+    // An edge insert assigns its endpoints as `@src` and `@dst`; `from` and
+    // `to` still parse as names, and the type checker refuses them on an
+    // edge with the fix.
+    let w =
+        write("query hire($h: String, $slug: String) { insert WorksAt { @src: $h, @dst: $slug } }");
+    assert!(matches!(
+        &w.all_statements()[0],
+        Stmt::Insert { assignments, .. } if assignments[0].property == "@src" && assignments[1].property == "@dst"
+    ));
+}
+
+/// `upsert` and `replace` are statement words only where a statement
+/// starts (the GQ 3 RFC, section 3, Keyed writes), so `replace` stays free
+/// as a call name, and each keyed statement carries its mode.
+#[test]
+fn upsert_and_replace_are_statement_words_only_at_statement_start() {
+    for (word, mode) in [
+        ("insert", InsertMode::Insert),
+        ("upsert", InsertMode::Upsert),
+        ("replace", InsertMode::Replace),
+    ] {
+        let w = write(&format!(
+            "query w() {{ match {{ $p: Person }} {word} Tag {{ name: $p.name }} }}"
+        ));
+        assert!(
+            matches!(&w.all_statements()[0], Stmt::Insert { mode: m, .. } if *m == mode),
+            "{word}"
+        );
+    }
+    // A call named `replace` in an expression is a call, not a statement.
+    let r =
+        read(r#"query q() { match { $p: Person } return { replace($p.name, "a", "b") as r } }"#);
+    assert!(
+        matches!(&r.projections[0].expr, Expr::Call(c) if c.name == "replace"),
+        "{:?}",
+        r.projections[0].expr
+    );
+    let w = write(
+        r#"query w() { match { $p: Person } update $p set { name: replace($p.name, "a", "b") } }"#,
+    );
+    assert!(matches!(
+        &w.all_statements()[0],
+        Stmt::Update { assignments, .. } if matches!(&assignments[0].value, Expr::Call(c) if c.name == "replace")
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// The arithmetic ladder.
+
+#[test]
+fn minus_is_arithmetic_and_the_arrow_is_refused() {
+    let gt = |l| cmp(CompOp::Gt, l, int(0));
+    assert_eq!(
+        where_expr("$n - 1 > 0"),
+        gt(arith(ArithOp::Sub, var("n"), int(1)))
+    );
+    // A negative number is unary minus over a literal, so `$n -1`, `$n- 1`
+    // and `$n-1` are one subtraction (section 3).
+    for spelled in ["$n -1 > 0", "$n- 1 > 0", "$n-1 > 0"] {
+        assert_eq!(where_expr(spelled), where_expr("$n - 1 > 0"), "{spelled}");
+    }
+    assert_eq!(
+        where_expr("$n - $m > 0"),
+        gt(arith(ArithOp::Sub, var("n"), var("m")))
+    );
+    assert_eq!(where_expr("$n-$m > 0"), where_expr("$n - $m > 0"));
+    // In `return`, items are separated by commas, so `$a -$b` is one item.
+    let r = read("query q() { match { $p: Person } return { $p.age -1 as a, -$p.age as b } }");
+    assert_eq!(r.projections.len(), 2);
+    // `$a -knows- $b` is the arrow, refused with the triple as the fix.
+    let e = element_refusal("$a -knows- $b");
+    assert_eq!(e.code.as_str(), "Q007");
+    assert_eq!(e.fix.as_deref(), Some("$a <knows> $b"));
+    let e = element_refusal("$a -knows-> $b");
+    assert_eq!(e.fix.as_deref(), Some("$a knows $b"));
+    let e = element_refusal("$a <-knows- $b");
+    assert_eq!(e.fix.as_deref(), Some("$b knows $a"));
+    let e = element_refusal("$a -$k:knows{1,2}-> $b");
+    assert_eq!(e.fix.as_deref(), Some("$a $k:knows{1,2} $b"));
+    let e = element_refusal("$a -in-> $b");
+    assert_eq!(e.fix.as_deref(), Some("$a in $b"));
+    let e = element_refusal("$a -(knows | likes)-> $b");
+    assert_eq!(e.fix.as_deref(), Some("$a (knows | likes) $b"));
+}
+
+#[test]
+fn the_ladder_has_the_usual_precedence_and_associativity() {
+    // `*` binds tighter than `+`; both are left-associative; unary minus
+    // binds tightest; comparison is below arithmetic and above `not`.
+    assert_eq!(
+        where_expr("$a + $b * $c > 0"),
+        cmp(
+            CompOp::Gt,
+            arith(
+                ArithOp::Add,
+                var("a"),
+                arith(ArithOp::Mul, var("b"), var("c"))
+            ),
+            int(0)
+        )
+    );
+    assert_eq!(
+        where_expr("$a - $b - $c > 0"),
+        cmp(
+            CompOp::Gt,
+            arith(
+                ArithOp::Sub,
+                arith(ArithOp::Sub, var("a"), var("b")),
+                var("c")
+            ),
+            int(0)
+        )
+    );
+    assert_eq!(
+        where_expr("$a / $b % $c > 0"),
+        cmp(
+            CompOp::Gt,
+            arith(
+                ArithOp::Rem,
+                arith(ArithOp::Div, var("a"), var("b")),
+                var("c")
+            ),
+            int(0)
+        )
+    );
+    assert_eq!(
+        where_expr("0 < -$a * $b"),
+        cmp(
+            CompOp::Lt,
+            int(0),
+            arith(ArithOp::Mul, Expr::Neg(Box::new(var("a"))), var("b"))
+        )
+    );
+    assert_eq!(
+        where_expr("-$a > 0"),
+        cmp(CompOp::Gt, Expr::Neg(Box::new(var("a"))), int(0))
+    );
+    assert_eq!(
+        where_expr("(-$a) > 0"),
+        cmp(CompOp::Gt, Expr::Neg(Box::new(var("a"))), int(0))
+    );
+    // A newline is not a separator: `$a.x` then `-$b.y` on the next line is
+    // one subtraction.
+    assert_eq!(
+        where_expr("$a.x\n  -$b.y > 0"),
+        where_expr("$a.x - $b.y > 0")
+    );
+    assert_eq!(
+        where_expr("$a * ($b + $c) > --1"),
+        cmp(
+            CompOp::Gt,
+            arith(
+                ArithOp::Mul,
+                var("a"),
+                arith(ArithOp::Add, var("b"), var("c"))
+            ),
+            Expr::Neg(Box::new(Expr::Neg(Box::new(int(1)))))
+        )
+    );
+    assert!(matches!(
+        &where_expr("not $a + 1 > 2 and $b"),
+        Expr::And(l, _) if matches!(**l, Expr::Not(_))
+    ));
+    // Comparison stays non-associative.
+    assert!(parse_text("query q() { match { $x: X } where $a < $b < $c return { $a } }").is_err());
+    // Arithmetic in `return`, `order`, `let`, `where` and an assignment.
+    let r = read(
+        "query doubled($min: I32) { match { $p: Person, let $born = 2026 - $p.age } where $p.age = $min + 1 and $p.age * 2 >= $min return { $p.name, $p.age * 2 as twice, (2026 - $p.age) as born_about } order { -$p.age, $born % 10 desc } }",
+    );
+    assert_eq!(r.projections.len(), 3);
+    let w = write(
+        "query birthday($h: String) { match { $p: Person } where $p.handle = $h update $p set { age: $p.age + 1 } }",
+    );
+    assert!(
+        matches!(&w.all_statements()[0], Stmt::Update { assignments, .. } if matches!(assignments[0].value, Expr::Arith { .. }))
+    );
+}
+
+#[test]
+fn float_literals_take_an_exponent() {
+    use crate::query::value::Literal;
+    for (text, value) in [
+        ("1.5e3", 1.5e3),
+        ("2.0E-2", 2.0e-2),
+        ("6.02e+23", 6.02e23),
+        ("0.5", 0.5),
+    ] {
+        assert_eq!(
+            where_expr(&format!("$x.f > {text}")),
+            cmp(
+                CompOp::Gt,
+                Expr::Prop {
+                    variable: "x".into(),
+                    property: "f".into()
+                },
+                Expr::Literal(Literal::Float(value))
+            ),
+            "{text}"
+        );
+    }
+    // A negative exponent float is unary minus over the literal.
+    assert!(matches!(
+        &where_expr("$x.f > -1.0e-3"),
+        Expr::Compare { right, .. } if matches!(**right, Expr::Neg(_))
+    ));
+    // `1e3` without a fraction is not a float. The RFC's `float_lit` admits
+    // only `d.d[e…]`; with an unbounded integer rule, `1e3` would read as
+    // `1` followed by the bare name `e3`. The word boundary on `integer`
+    // makes it a parse error instead.
+    assert!(parse_text("query q() { match { $x: X } return { 1e3 } }").is_err());
+    assert!(parse_text("query q() { match { $x: X } return { 1.5e } }").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The reserved set.
+
+/// Every word the grammar spells as a keyword, other than the six
+/// reserved ones.
+const CONTEXTUAL: &[&str] = &[
+    "query",
+    "match",
+    "return",
+    "order",
+    "limit",
+    "distinct",
+    "as",
+    "asc",
+    "desc",
+    "let",
+    "from",
+    "optional",
+    "exists",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "insert",
+    "update",
+    "delete",
+    "set",
+    "where",
+    "commit",
+    "unattached",
+    "branch",
+    "on",
+    "mutation",
+    "gq",
+    "true",
+    "false",
+    "date",
+    "datetime",
+    "now",
+    "nearest",
+    "bm25",
+    "rrf",
+    "l2",
+    "union",
+    "search",
+    "fuzzy",
+    "match_text",
+    "terms",
+    "match_terms",
+    "contains",
+    "starts_with",
+    "if",
+    "coalesce",
+    "concat",
+    "show",
+    "reset",
+    "all",
+    "explain",
+    "load",
+    "csv",
+    "into",
+    "mode",
+    "for",
+    "unwind",
+    "case",
+    "having",
+    "retrieve",
+    "view",
+    "batch",
+    "returning",
+    "recall",
+    "k",
+    "weights",
+    "to",
+    "merge",
+    "diff",
+    "list",
+    "create",
+    "upsert",
+    "replace",
+];
+const RESERVED: &[&str] = &["and", "or", "not", "is", "null", "in"];
+
+#[test]
+fn the_reserved_set_is_the_six_words() {
+    for word in CONTEXTUAL {
+        // A property after a dot, an edge, an alias and a bare mutation
+        // property.
+        let src = format!(
+            "query q() {{ match {{ $p: Person, $p {word} $q }} where $p.{word} = 1 return {{ $p.{word} as {word} }} }}"
+        );
+        let r = read(&src);
+        assert!(
+            matches!(&r.pattern.elements[1], Element::Traversal(_)),
+            "`{word}` as an edge: {:#?}",
+            r.pattern.elements
+        );
+        assert_eq!(r.projections[0].alias.as_deref(), Some(*word), "{word}");
+        let w = write(&format!("query w() {{ insert Person {{ {word}: 1 }} }}"));
+        assert_eq!(w.all_statements().len(), 1, "{word}");
+        let w = write(&format!(
+            "query w() {{ match {{ $p: Person }} update $p set {{ {word}: 2 }} }}"
+        ));
+        assert_eq!(w.all_statements().len(), 1, "{word}");
+    }
+    for word in RESERVED {
+        // Refused as an alias; a property after a dot and an edge name are
+        // fine.
+        assert!(
+            parse_text(&format!(
+                "query q() {{ match {{ $p: P }} return {{ $p.a as {word} }} }}"
+            ))
+            .is_err(),
+            "{word} as an alias"
+        );
+        read(&format!(
+            "query q() {{ match {{ $p: P }} where $p.{word} = 1 return {{ $p.{word} }} }}"
+        ));
+        assert!(
+            matches!(one_element(&format!("$a {word} $b")), Element::Traversal(_)),
+            "{word} as an edge"
+        );
+    }
+}
+
+/// `$d in $x` inside `match` is a triple over the edge named `in`; in
+/// `where` it is the membership test, which the type checker refuses with
+/// the triple's place as the fix when `$x` is a node, and inside `match`
+/// with a list on the right it is `T7` with the `where` as the fix.
+#[test]
+fn in_is_an_edge_in_match_and_membership_in_where() {
+    let Element::Traversal(t) = one_element("$d in $x") else {
+        panic!()
+    };
+    assert_eq!(t.selector, EdgeSelector::Named("in".into()));
+    assert_eq!(
+        where_expr("$d in $x"),
+        Expr::In {
+            needle: Box::new(var("d")),
+            list: Box::new(var("x")),
+            at: SourceSpan::default(),
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Refused respellings with their fix.
+
+#[test]
+fn delete_and_update_with_where_print_the_group() {
+    let e = refusal_of("query retire($h: String) { delete WorksAt where @src = $h }");
+    assert_eq!(e.code.as_str(), "Q008");
+    assert_eq!(
+        e.fix.as_deref(),
+        Some("match { $x: WorksAt } where $x.@src = $h  delete $x")
+    );
+    let e = refusal_of(
+        "query retire($h: String) { update Person set { city: \"x\" } where handle = $h and age > 3 }",
+    );
+    assert_eq!(e.code.as_str(), "Q008");
+    assert_eq!(
+        e.fix.as_deref(),
+        Some(
+            "match { $x: Person } where $x.handle = $h and $x.age > 3  update $x set { city: \"x\" }"
+        )
+    );
+    // Over a bound variable the predicate joins the group's `where`.
+    for (src, intended) in [
+        (
+            "query q() { match { $x: Person } delete $x where $x.age > 3 }",
+            "query q() { match { $x: Person } where $x.age > 3 delete $x }",
+        ),
+        (
+            "query q() { match { $x: Person } where $x.age < 90 update $x set { a: 1 } where $x.age > 3 }",
+            "query q() { match { $x: Person } where $x.age < 90 and $x.age > 3 update $x set { a: 1 } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q008", "{src}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(parse_source(&fixed).unwrap(), parsed(intended), "{fixed}");
+    }
+}
+
+/// A statement runs once per row its group selects. The fix of
+/// `T … where` opens a group, so a statement written after it that selects
+/// nothing of its own stays in the group it was written in, before the new
+/// one, rather than running once per selected row; each later `T … where`
+/// opens its own group, binding a name of its own.
+#[test]
+fn a_where_statements_group_keeps_each_later_statements_own_rows() {
+    for (src, intended) in [
+        (
+            "query m() { update Doc set { n: 5 } where n = 1  insert Note { text: \"once\" } }",
+            "query m() { insert Note { text: \"once\" }  match { $x: Doc } where $x.n = 1  update $x set { n: 5 } }",
+        ),
+        (
+            "query m() { insert Note { text: \"a\" }  delete Doc where n = 1  insert Note { text: \"b\" } }",
+            "query m() { insert Note { text: \"a\" }  insert Note { text: \"b\" }  match { $x: Doc } where $x.n = 1  delete $x }",
+        ),
+        (
+            "query m() { update Doc set { n: 5 } where n = 1  insert Note { text: \"once\" }  update Note set { text: \"b\" } where text = \"a\" }",
+            "query m() { insert Note { text: \"once\" }  match { $x: Doc } where $x.n = 1  update $x set { n: 5 }  match { $n: Note } where $n.text = \"a\"  update $n set { text: \"b\" } }",
+        ),
+        // A statement written in a group with a `match` stays in it.
+        (
+            "query m() { match { $p: Person } update $p set { a: 1 }  update Doc set { n: 5 } where n = 1  insert Note { text: \"each\" } }",
+            "query m() { match { $p: Person } update $p set { a: 1 }  insert Note { text: \"each\" }  match { $x: Doc } where $x.n = 1  update $x set { n: 5 } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q008", "{src}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(
+            parse_source(&fixed).unwrap_or_else(|e| panic!("{src}\n{fixed}\n{e:?}")),
+            parsed(intended),
+            "{fixed}"
+        );
+    }
+}
+
+#[test]
+fn the_mutation_keyword_is_refused_with_query_as_the_fix() {
+    let e = refusal_of("mutation hire($h: String) { insert Person { handle: $h } }");
+    assert_eq!(e.code.as_str(), "Q009");
+    // The fix is the construct the diagnostic points at, the keyword, with
+    // the suggestion applied.
+    assert_eq!(e.fix.as_deref(), Some("query"));
+    let edit = &e.suggestion.as_ref().unwrap().edits[0];
+    assert_eq!(edit.replacement, "query");
+    // A read body under `mutation` gets the same fix.
+    assert_eq!(
+        code3("mutation r() { match { $p: P } return { $p } }"),
+        "Q009"
+    );
+    // `mutation` stays an identifier everywhere else.
+    read(
+        "query mutation() { match { $p: P } where $p.mutation = 1 return { $p.mutation as mutation } }",
+    );
+}
+
+#[test]
+fn as_commit_is_a_write_body_clause() {
+    let d = decl(
+        "query retire($h: String) as commit { match { $p: Person } where $p.handle = $h delete $p }",
+    );
+    assert_eq!(d.write_mode, MutationWriteMode::AsCommit);
+    let d = decl(
+        "query propose($h: String) as unattached branch on $h { insert Person { handle: $h, name: $h } }",
+    );
+    assert!(matches!(d.write_mode, MutationWriteMode::Unattached { .. }));
+    let e = refusal_of("query r() as commit { match { $p: P } return { $p } }");
+    assert_eq!(e.code.as_str(), "Q011");
+    let e = refusal_of("query r() as unattached branch { match { $p: P } return { $p } }");
+    assert_eq!(e.code.as_str(), "Q011");
+}
+
+#[test]
+fn a_write_groups_elements_are_in_its_match() {
+    // Elements written without `match { }`, before or after the statements.
+    for (src, intended) in [
+        (
+            "query w($h: String) { $p: Person, $p.handle = $h delete $p }",
+            "query w($h: String) { match { $p: Person } where $p.handle = $h delete $p }",
+        ),
+        (
+            "query w($h: String) { $p: Person { handle: $h } delete $p }",
+            "query w($h: String) { match { $p: Person } where $p.handle = $h delete $p }",
+        ),
+        (
+            "query w() { delete $p  $p: Person }",
+            "query w() { match { $p: Person } delete $p }",
+        ),
+        (
+            "query w() { match { $p: Person } delete $p  $p.age > 3 }",
+            "query w() { match { $p: Person } where $p.age > 3 delete $p }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q013", "{src}: {e:?}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(
+            parse_source(&fixed).unwrap_or_else(|e| panic!("{fixed}\n{e:?}")),
+            parsed(intended),
+            "{fixed}"
+        );
+    }
+    // Several statements after one selection, and later groups opening with
+    // their own `match`.
+    let w = write(
+        "query close_company($slug: String) { match { $c: Company, $p $k:worksAt $c } where $c.slug = $slug delete $k  update $p set { city: null } }",
+    );
+    assert_eq!((w.all_elements().len(), w.all_statements().len()), (2, 2));
+    let w = write(
+        "query two() { insert Person { handle: \"a\" } match { $p: Person } where $p.handle = \"a\" update $p set { age: 1 } match { $q: Person } update $q set { age: 2 } }",
+    );
+    assert_eq!(w.groups.len(), 3);
+    assert!(w.groups[0].pattern.elements.is_empty());
+    // `null` is an assignment value; in operand position it stays a
+    // reserved word.
+    assert!(
+        matches!(&w.all_statements()[1], Stmt::Update { assignments, .. }
+        if assignments[0].value == int(1))
+    );
+    let w = write("query w() { match { $p: P } update $p set { a: null, b: 1 } }");
+    assert!(
+        matches!(&w.all_statements()[0], Stmt::Update { assignments, .. }
+        if assignments[0].value == Expr::Literal(crate::query::value::Literal::Null))
+    );
+    write("query w() { insert P { a: null,  b: 1 } }");
+    // `null` is a literal operand; the type checker refuses it where its
+    // context fixes no type, and a comparison with it.
+    assert!(parse_text("query w() { insert P { a: null + 1 } }").is_ok());
+    assert!(parse_text("query q() { match { $p: P } where $p.a = null return { $p } }").is_ok());
+}
+
+/// The non-canonical spellings section 3 admits parse to their canonical
+/// form's tree, and each records its lint code and canonical text
+/// (section 6): `||`, `case` in both forms with and without `else`, `<>`,
+/// a single-quoted string and a keyword or registry name in another case.
+#[test]
+fn non_canonical_spellings_parse_to_the_canonical_tree_and_name_their_fix() {
+    for (written, canonical, codes) in [
+        (
+            "where $a || $b || $c = \"x\"",
+            "where concat($a, $b, $c) = \"x\"",
+            &["L213"][..],
+        ),
+        (
+            "where ($a || $b) || $c = \"x\"",
+            "where concat(concat($a, $b), $c) = \"x\"",
+            &["L213", "L213"][..],
+        ),
+        (
+            "where case when $d.year > 1 then 1 else 2 end = 1",
+            "where if($d.year > 1, 1, 2) = 1",
+            &["L212"][..],
+        ),
+        (
+            "where case when $d.year > 1 then 1 when $d.year < 0 then 3 end = 1",
+            "where if($d.year > 1, 1, if($d.year < 0, 3, null)) = 1",
+            &["L212"][..],
+        ),
+        (
+            "where case $d.year when 1 then \"a\" when 2 then \"b\" else \"c\" end = \"a\"",
+            "where if($d.year = 1, \"a\", if($d.year = 2, \"b\", \"c\")) = \"a\"",
+            &["L212"][..],
+        ),
+        ("where $d.year <> 1", "where $d.year != 1", &["L214"][..]),
+        (
+            "where $d.title = 'it\\'s \"x\"'",
+            "where $d.title = \"it's \\\"x\\\"\"",
+            &["L215"][..],
+        ),
+        (
+            "WHERE $d.year IS NOT NULL AND LOWER($d.title) = \"x\" OR $d.ok = TRUE",
+            "where $d.year is not null and lower($d.title) = \"x\" or $d.ok = true",
+            &["L216"; 8][..],
+        ),
+    ] {
+        let full = |w: &str| format!("query q() {{ match {{ $d: Doc }} {w} return {{ $d }} }}");
+        let got = parse_source(&full(written)).unwrap_or_else(|e| panic!("{written}: {e:?}"));
+        assert_eq!(got, parsed(&full(canonical)), "{written}");
+        let Body::Decls(decls) = &got.body else {
+            panic!("a declaration")
+        };
+        let found: Vec<&str> = decls[0].respellings.0.iter().map(|r| r.code).collect();
+        assert_eq!(found, codes, "{written}");
+        // Applying every fix gives the canonical text, which records none.
+        let src = full(written);
+        let mut fixed = src.clone();
+        let mut fixes: Vec<_> = decls[0].respellings.0.clone();
+        fixes.retain(|r| {
+            !decls[0]
+                .respellings
+                .0
+                .iter()
+                .any(|o| o != r && o.start <= r.start && r.end <= o.end)
+        });
+        for r in fixes.iter().rev() {
+            fixed.replace_range(r.start..r.end, &r.fix);
+        }
+        assert_eq!(parsed(&fixed), parsed(&full(canonical)), "{fixed}");
+    }
+    for (src, fix) in [
+        ("let $x in $r", "from $r"),
+        ("let ($a, $b) in $r", "from $r"),
+    ] {
+        let e = element_refusal(src);
+        assert_eq!(e.code.as_str(), "Q012", "{src}");
+        assert_eq!(e.fix.as_deref(), Some(fix), "{src}");
+    }
+    // Over a list there is no row form, and the parser cannot tell a list
+    // from a relation: both readings are printed.
+    for src in ["for $x in $list", "unwind $list as $x"] {
+        let e = element_refusal(src);
+        assert_eq!(e.code.as_str(), "Q012", "{src}");
+        let fix = e.fix.unwrap();
+        assert!(
+            fix.contains("from $list") && fix.contains("in $list"),
+            "{src}: {fix}"
+        );
+    }
+    // Infix `contains` and `starts_with` parse to a node the type checker
+    // refuses (`T7`), since the left operand's type picks the fix.
+    for src in ["$d.title starts_with \"O\"", "$d.tags contains \"rust\""] {
+        assert!(matches!(where_expr(src), Expr::InfixString { .. }));
+    }
+    // Every annotation parses; the type checker decides which names it reads
+    // (`T80`), so a later typed annotation is additive.
+    parse_text("query q() @if_commit($c) { match { $p: P } delete $p }").unwrap();
+    parse_text("query q() @valid(from = 1) { match { $p: P } return { $p } }").unwrap();
+    // `retrieve`, `having` and `view` are refused at the word, each naming
+    // the GQ form (section 3's refused respellings).
+    for (src, code) in [
+        (
+            "query q() { match { $d: Doc } retrieve { $d.e: nearest($q) } return { $d } }",
+            "Q020",
+        ),
+        (
+            "query q() { match { $d: Doc } return { $d } having { $d } }",
+            "Q014",
+        ),
+        ("view v() { match { $d: Doc } return { $d } }", "Q009"),
+    ] {
+        assert_eq!(code3(src), code, "{src}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declarations.
+
+#[test]
+fn one_keyword_and_the_body_shape_is_the_kind() {
+    assert!(matches!(
+        decl("query r() { match { $p: P } return { $p } }").body,
+        DeclBody::Read(_)
+    ));
+    assert!(matches!(
+        decl("query w() { insert P { a: 1 } }").body,
+        DeclBody::Write(_)
+    ));
+    // A write whose selection comes from a ranked read.
+    let w = write(
+        "query tag_near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 20) as $distance } update $d set { tags: [\"near\"] } }",
+    );
+    assert_eq!((w.all_elements().len(), w.all_statements().len()), (2, 1));
+    // A statement keyword stays a property name, after a dot and as a key.
+    write("query w() { match { $p: P } where $p.insert = 1 and $p.update = 2 delete $p }");
+    // Parameters with defaults, `limit $k`, generic annotations.
+    let d = decl(
+        "query top_people($k: I64 = 10, $neg: I32 = -1, $s: String? = \"x\") @description(\"d\") @budget(plan = 1000) @example(\"e\") { match { $p: Person } return { $p.name } order { $p.age desc } limit $k }",
+    );
+    assert!(d.params[1].default.as_ref().unwrap().negative);
+    assert_eq!(d.annotations.len(), 3);
+    let DeclBody::Read(r) = d.body else { panic!() };
+    assert_eq!(r.limit, Some(Limit::Param("k".into())));
+    // Several declarations in one file.
+    let f = parsed("query a() { match { $p: P } return { $p } }\nquery b() { insert P { a: 1 } }");
+    assert!(matches!(f.body, Body::Decls(ref d) if d.len() == 2));
+    // `explain` over a declaration.
+    assert!(matches!(
+        parsed("explain query a() { match { from $r } return { $p } }").body,
+        Body::Explain { ref before, .. } if before.is_empty()
+    ));
+    // `explain` after the declarations its read may call.
+    assert!(matches!(
+        parsed("query h() { match { $p: P } return { $p } }\nexplain query a() { match { from h() } return { $p } }").body,
+        Body::Explain { ref before, ref decl } if before.len() == 1 && decl.name == "a"
+    ));
+    // The missing parameter list keeps its fix.
+    let e = refusal_of("query a { match { $p: P } return { $p } }");
+    assert_eq!(
+        (e.code.as_str(), e.fix.as_deref()),
+        ("Q002", Some("query a()"))
+    );
+}
+
+#[test]
+fn calls_take_positionals_then_options_and_one_distinct_form() {
+    let called = where_expr("nearest($pop, $x.embedding, $q, k: 2)");
+    let Expr::Call(c) = &called else { panic!() };
+    assert_eq!((c.args.len(), c.options.len()), (3, 1));
+    // An option before a positional is refused with the reordered arguments.
+    let e = refusal_of("query q() { match { $x: X } where f(k: 1, $x) return { 1 } }");
+    assert_eq!(e.code.as_str(), "Q005");
+    assert_eq!(e.fix.as_deref(), Some("$x, k: 1"));
+    // Options only.
+    where_expr("f(k: 1, mode: any)");
+    // `distinct` under any aggregate name (the type checker keeps T57).
+    let r = read(
+        "query q() { match { $p: P } return { count(distinct $p.city) as c, sum(distinct $p.age) as s } }",
+    );
+    assert!(matches!(r.projections[1].expr, Expr::AggDistinct { .. }));
+    // `date("…")` is a literal everywhere, including inside a list.
+    assert!(matches!(
+        where_expr("$x.d in [date(\"2025-01-01\"), date(\"2025-01-02\")]"),
+        Expr::In { .. }
+    ));
+    // Nested relation functions.
+    one_element(
+        "from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60, weights: [0.7, 0.3]) as $score",
+    );
+    // A block value as an operand, compared with another binding's value.
+    let e = where_expr("count { $d in $x } + 1 >= $x.min_docs");
+    assert!(matches!(&e, Expr::Compare { left, .. } if matches!(**left, Expr::Arith { .. })));
+}
+
+#[test]
+fn a_block_is_an_operand() {
+    // One tree for one text: `count { p } > 1 or $x` is the disjunction, as
+    // the same text is anywhere else an expression stands, never
+    // `count { p } > (1 or $x)`.
+    assert!(matches!(
+        where_expr("count { $a: P } > 1 or $x"),
+        Expr::Or(..)
+    ));
+    assert!(matches!(where_expr("exists { $a: P }"), Expr::Block(_)));
+    // A block written among the elements is a predicate, moved to `where`.
+    assert_eq!(
+        element_refusal("$x: X, exists { $a: P }").code.as_str(),
+        "Q017"
+    );
+}
+
+#[test]
+fn a_product_of_two_variables_is_not_the_wildcard_triple() {
+    // `$a * $b` is the wildcard triple in `match` and a product in an
+    // expression; with predicates out of `match`, the two never meet.
+    assert_eq!(
+        where_expr("$n * $m > 10"),
+        cmp(CompOp::Gt, arith(ArithOp::Mul, var("n"), var("m")), int(10))
+    );
+    assert!(matches!(where_expr("$n * $m or $ok"), Expr::Or(..)));
+    assert!(matches!(one_element("$a * $b"), Element::Traversal(_)));
+    assert!(matches!(one_element("$a *{1,3} $b"), Element::Traversal(_)));
+    assert!(matches!(one_element("$a $k:* $b"), Element::Traversal(_)));
+    let c = match_elements("$a * $b, $b: Person");
+    assert!(matches!(c[0], Element::Traversal(_)), "{c:#?}");
+    assert_eq!(c.len(), 2);
+    // Followed by an operator, it is a filter written among the elements.
+    assert_eq!(element_refusal("$a * $b > 3").code.as_str(), "Q017");
+}
+
+#[test]
+fn a_bare_from_or_let_before_a_variable_is_the_element() {
+    // The contextual keyword wins over a bare name at element start; a bare
+    // name is never a value in a read.
+    assert!(parse_text("query q() { match { from  $a: Person } return { 1 } }").is_err());
+    assert!(matches!(one_element("let  $a = 1"), Element::Let { .. }));
+}
+
+#[test]
+fn a_call_to_contains_is_a_call() {
+    // The infix recognizer is word-bounded and does not touch `(`, so this
+    // is a call, not `$p.active contains (…)`.
+    assert!(matches!(
+        where_expr("$p.active and contains($p.name, \"a\") and starts_with($p.name, \"b\")"),
+        Expr::And(..)
+    ));
+    // The infix form with a space is still recognised, as the tree node the
+    // type checker refuses.
+    assert!(matches!(
+        where_expr("$p.name contains \"a\""),
+        Expr::InfixString { .. }
+    ));
+}
+
+#[test]
+fn a_date_call_is_the_date_literal() {
+    // `date("…")` is the literal production, never a call to a function
+    // named `date`, with or without a space before its parenthesis.
+    for spelled in ["date(\"2025-01-01\")", "date (\"2025-01-01\")"] {
+        assert_eq!(
+            where_expr(&format!("$x.d = {spelled}")),
+            cmp(
+                CompOp::Eq,
+                Expr::Prop {
+                    variable: "x".into(),
+                    property: "d".into()
+                },
+                Expr::Literal(crate::query::value::Literal::Date("2025-01-01".into()))
+            )
+        );
+    }
+    // With another argument shape it is a call.
+    assert!(matches!(
+        &where_expr("$x.d = date($s)"),
+        Expr::Compare { right, .. } if matches!(**right, Expr::Call(_))
+    ));
+}
+
+#[test]
+fn recognizers_shadow_only_ill_typed_text() {
+    // The arrow recognizer takes `$a - x - $b`, `x` a bare name, a string or
+    // a bare meta-field; in `where` such text is arithmetic over a bare name
+    // (refused at the word) or never well typed.
+    for middle in ["x", "\"s\"", "@id"] {
+        assert_eq!(
+            element_refusal(&format!("$a - {middle} - $b"))
+                .code
+                .as_str(),
+            "Q007",
+            "{middle}"
+        );
+    }
+    // A number, a property or a parenthesised term in the middle is
+    // arithmetic.
+    for middle in ["1", "$x.n", "($x)"] {
+        where_expr(&format!("$a - {middle} - $b > 0"));
+    }
+    // `let ($a) in …` is the refused respelling.
+    assert_eq!(element_refusal("let($a) in [1]").code.as_str(), "Q012");
+}
+
+/// Section 7's `list_elem`: a list literal holds literals, a negative number
+/// among them, and parameters. A list of literals alone stays a literal;
+/// unary minus over a parameter, an expression and a parameter default
+/// holding a parameter are refused.
+#[test]
+fn a_list_literal_holds_literals_and_parameters_only() {
+    let list = |text: &str| match &where_expr(text) {
+        Expr::In { list, .. } => list.as_ref().clone(),
+        other => panic!("{text}: {other:?}"),
+    };
+    assert_eq!(
+        list("$x.a in [1, -2]"),
+        Expr::Literal(crate::query::value::Literal::List(vec![
+            crate::query::value::Literal::Integer(1),
+            crate::query::value::Literal::Integer(-2),
+        ]))
+    );
+    assert_eq!(
+        list("$x.a in [$a, - 1, 2.5, \"s\", $b]"),
+        Expr::List {
+            elements: vec![
+                Expr::Variable("a".into()),
+                Expr::Literal(crate::query::value::Literal::Integer(-1)),
+                Expr::Literal(crate::query::value::Literal::Float(2.5)),
+                Expr::Literal(crate::query::value::Literal::String("s".into())),
+                Expr::Variable("b".into()),
+            ],
+            at: SourceSpan::default(),
+        }
+    );
+    for refused in [
+        "query q() { match { $x: X } where $x.a in [-$a] return { 1 as one } }",
+        "query q() { match { $x: X } where $x.a in [$a + 1] return { 1 as one } }",
+        "query q() { match { $x: X } where $x.a in [$x.b, $a] return { 1 as one } }",
+        "query q($l: [I64] = [$a]) { match { $x: X } return { 1 as one } }",
+    ] {
+        assert!(parse_text(refused).is_err(), "{refused}");
+    }
+}
+
+#[test]
+fn reserved_words_in_where() {
+    // `$a and $b` in `where` is the conjunction of two Boolean operands;
+    // `is` and `null` between two variables are parse errors.
+    assert!(matches!(where_expr("$a and $b"), Expr::And(..)));
+    assert!(matches!(where_expr("$a or $b"), Expr::Or(..)));
+    assert!(matches!(where_expr("$a in $b"), Expr::In { .. }));
+    for word in ["is", "null"] {
+        assert!(
+            parse_text(&format!(
+                "query q() {{ match {{ $a: Person }} where $a {word} $b return {{ 1 }} }}"
+            ))
+            .is_err(),
+            "{word}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rule-set pin (section 11, rule 1).
+
+/// Every rule `grammar.pest` defines, sorted.
+const SYNTAX_RULES: &[&str] = &[
+    "BLOCK_COMMENT",
+    "COMMENT",
+    "LINE_COMMENT",
+    "WHITESPACE",
+    "agg_distinct",
+    "agg_name",
+    "alias",
+    "alias_string_rec",
+    "and_expr",
+    "annotation",
+    "annotation_arg",
+    "annotation_colon_rec",
+    "annotation_kwarg",
+    "annotation_name",
+    "annotation_value",
+    "arrow_close",
+    "arrow_open",
+    "arrow_traversal",
+    "as_commit_clause",
+    "as_unattached_clause",
+    "assignment",
+    "assignments",
+    "bare_elements_rec",
+    "bare_name_rec",
+    "base_type",
+    "between_rec",
+    "binding",
+    "binding_brace_filter",
+    "binding_braces_rec",
+    "binding_lower_rec",
+    "binding_paren_head",
+    "binding_paren_rec",
+    "block_body",
+    "block_value",
+    "blockless_rec",
+    "bool_lit",
+    "brace_body",
+    "brace_colon_compare",
+    "brace_compare",
+    "brace_item",
+    "brace_items_rec",
+    "branch_create",
+    "branch_delete",
+    "branch_diff",
+    "branch_list",
+    "branch_merge",
+    "branch_merge_base",
+    "branch_name",
+    "branch_stmt",
+    "call",
+    "call_arg",
+    "call_args",
+    "call_block_rec",
+    "call_keyword",
+    "call_keyword_word",
+    "call_name",
+    "call_option",
+    "call_word",
+    "case_expr",
+    "catalogue_edge",
+    "chained_rec",
+    "commit_drop",
+    "commit_publish",
+    "commit_stmt",
+    "comp_op",
+    "comparison",
+    "concat_bars",
+    "continuation",
+    "count_star_rec",
+    "create_from_commit",
+    "create_rec",
+    "cypher_hops",
+    "cypher_name",
+    "cypher_node",
+    "cypher_pattern",
+    "cypher_prop",
+    "cypher_rel",
+    "cypher_rel_body",
+    "cypher_typed_node",
+    "date_lit",
+    "datetime_lit",
+    "declaration",
+    "delete_multi_rec",
+    "delete_stmt",
+    "delete_type_rec",
+    "detach_rec",
+    "diff_after_page",
+    "diff_limit",
+    "digits",
+    "dir_first_rec",
+    "distinct_item_rec",
+    "dry_run_clause",
+    "edge_alternation",
+    "edge_alternatives",
+    "edge_binding",
+    "edge_group_rec",
+    "edge_ident",
+    "edge_name",
+    "edge_sel",
+    "edge_wildcard",
+    "element",
+    "elements",
+    "empty_args_rec",
+    "endpoint_field",
+    "eq_assign_rec",
+    "exp_float_rec",
+    "explain_stmt",
+    "expr",
+    "expr_ident",
+    "filter_rec",
+    "float_lit",
+    "from_clause",
+    "from_paren_rec",
+    "fw_between",
+    "fw_by",
+    "fw_call",
+    "fw_create",
+    "fw_detach",
+    "fw_ends",
+    "fw_filter",
+    "fw_group",
+    "fw_having",
+    "fw_like",
+    "fw_match",
+    "fw_offset",
+    "fw_optional",
+    "fw_retrieve",
+    "fw_starts",
+    "fw_with",
+    "group_by_rec",
+    "having_rec",
+    "ident",
+    "ident_chars",
+    "in_paren_rec",
+    "infix_string_op",
+    "inline_read",
+    "inner_where_rec",
+    "insert_paren_rec",
+    "insert_stmt",
+    "insert_word",
+    "integer",
+    "keyword_call_rec",
+    "kw_after",
+    "kw_all",
+    "kw_and",
+    "kw_as",
+    "kw_branch",
+    "kw_case",
+    "kw_columns",
+    "kw_commit",
+    "kw_create",
+    "kw_csv",
+    "kw_date",
+    "kw_datetime",
+    "kw_delete",
+    "kw_delimiter",
+    "kw_diff",
+    "kw_distinct",
+    "kw_drop",
+    "kw_dry",
+    "kw_else",
+    "kw_end",
+    "kw_exists",
+    "kw_explain",
+    "kw_first",
+    "kw_for",
+    "kw_from",
+    "kw_header",
+    "kw_in",
+    "kw_insert",
+    "kw_into",
+    "kw_is",
+    "kw_last",
+    "kw_let",
+    "kw_limit",
+    "kw_list",
+    "kw_load",
+    "kw_match",
+    "kw_merge",
+    "kw_merge_base",
+    "kw_mode",
+    "kw_mutation",
+    "kw_not",
+    "kw_null",
+    "kw_nulls",
+    "kw_on",
+    "kw_optional",
+    "kw_or",
+    "kw_order",
+    "kw_page",
+    "kw_publish",
+    "kw_query",
+    "kw_replace",
+    "kw_reset",
+    "kw_return",
+    "kw_run",
+    "kw_set",
+    "kw_show",
+    "kw_then",
+    "kw_to",
+    "kw_unattached",
+    "kw_unwind",
+    "kw_update",
+    "kw_upsert",
+    "kw_view",
+    "kw_when",
+    "kw_where",
+    "let_clause",
+    "like_rec",
+    "limit_clause",
+    "limit_neg_rec",
+    "list_elem",
+    "list_item",
+    "list_lit",
+    "list_to_rows",
+    "list_type",
+    "literal",
+    "load_columns",
+    "load_delimiter",
+    "load_header",
+    "load_kind",
+    "load_mode",
+    "load_mode_name",
+    "load_option",
+    "load_stmt",
+    "load_target",
+    "match_clause",
+    "match_nobrace_rec",
+    "match_prefix_rec",
+    "matchless_read_rec",
+    "meta_assign_rec",
+    "meta_field",
+    "missing_comma_rec",
+    "missing_param_list",
+    "mutation_body",
+    "mutation_decl",
+    "mutation_stmt",
+    "neg_number",
+    "neg_sign",
+    "negation_rec",
+    "not_block_rec",
+    "not_expr",
+    "not_in_rec",
+    "null_test",
+    "null_value",
+    "nulls_placement",
+    "offset_rec",
+    "operand",
+    "optional_block",
+    "optional_rec",
+    "or_expr",
+    "order_by_rec",
+    "order_clause",
+    "order_dir",
+    "ordering",
+    "param",
+    "param_default",
+    "param_item",
+    "param_list",
+    "param_untyped_rec",
+    "positional",
+    "prefix_rec",
+    "product",
+    "product_op",
+    "projection",
+    "prop_access",
+    "prop_chain_rec",
+    "prop_match",
+    "prop_match_list",
+    "prop_method_head",
+    "prop_method_rec",
+    "prop_star_rec",
+    "qualified_assign_rec",
+    "query_decl",
+    "query_file",
+    "read_body",
+    "read_tail",
+    "regex_rec",
+    "relation_expr",
+    "reserved",
+    "reserved_alias",
+    "reserved_property",
+    "reset_stmt",
+    "retrieve_rec",
+    "return_clause",
+    "return_nobrace_rec",
+    "second_where_rec",
+    "set_item",
+    "set_rec",
+    "set_stmt",
+    "setting_name",
+    "setting_stmt",
+    "setting_value",
+    "show_stmt",
+    "sq_string_char",
+    "sql_alias_rec",
+    "star_item_rec",
+    "star_mark",
+    "star_range_rec",
+    "starts_with_words_rec",
+    "statement_trailer",
+    "stmt_keyword",
+    "stmt_var_rec",
+    "stray_braces_rec",
+    "string_char",
+    "string_lit",
+    "sum",
+    "sum_op",
+    "swapped_read_rec",
+    "trailing_elements_rec",
+    "trailing_match_rec",
+    "traversal",
+    "traversal_bounds",
+    "type_arg",
+    "type_name",
+    "type_prop_rec",
+    "type_ref",
+    "unary",
+    "unary_minus",
+    "undirected_edge",
+    "update_noset_rec",
+    "update_stmt",
+    "value_list",
+    "variable",
+    "vector_type",
+    "view_decl",
+    "where_clause",
+    "where_stmt",
+    "with_after_rec",
+    "with_item",
+    "with_rec",
+    "write_element",
+    "write_group",
+];
+
+/// No new grammar rule without an amendment (section 11, rule 1): a rule
+/// added to or removed from the grammar turns this red, and the fix is an
+/// amendment to the GQ RFC that names the production, the token the grammar
+/// refused where it starts, and the collision it designs around.
+/// Recognizers (`_rec`, and the rules only they use) print a fix and accept
+/// nothing section 7 refuses, but they are pinned too, so a recognizer that
+/// starts accepting text is seen.
+#[test]
+fn the_rule_set_is_pinned() {
+    let grammar = include_str!("grammar.pest");
+    let mut rules: Vec<&str> = grammar
+        .lines()
+        .filter_map(|line| {
+            let (name, _) = line.split_once('=')?;
+            let name = name.trim();
+            (!name.is_empty()
+                && !line.starts_with(char::is_whitespace)
+                && !line.starts_with("//")
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+            .then_some(name)
+        })
+        .collect();
+    rules.sort_unstable();
+    rules.dedup();
+    assert_eq!(
+        rules, SYNTAX_RULES,
+        "the grammar's rule set moved; a grammar change is an amendment to the GQ RFC (section 11, rule 1)"
+    );
+}
+
+// The repairs of every parse refusal, and the parser's robustness to every
+// cut of a refused source, are held by the refusal table
+// (`omnigraph-gqt`'s `tests/integration/law_refusals.rs`).
+
+/// One parse reports at most 256 refusals however many independent ones a
+/// source holds, from the grammar or from the builder (here 5000 return
+/// items, each a SQL alias).
+#[test]
+fn a_parse_reports_a_bounded_number_of_refusals() {
+    let items: Vec<String> = (0..5000).map(|i| format!("a{i} = $p.name")).collect();
+    let source = format!(
+        "query q() {{ match {{ $p: Person }} return {{ {} }} }}",
+        items.join(", ")
+    );
+    let before = crate::query::diagnostic::PREFIX_READS.with(|n| n.get());
+    let refusals = super::parse::parse_source_all(&source).1;
+    assert_eq!(refusals.len(), 256);
+    // Each refusal is positioned from the source's line index, never by
+    // reading the source up to it.
+    assert_eq!(
+        crate::query::diagnostic::PREFIX_READS.with(|n| n.get()),
+        before
+    );
+    let lines: Vec<_> = refusals.iter().map(|d| d.position.unwrap()).collect();
+    for p in &lines {
+        assert_eq!(
+            *p,
+            crate::query::diagnostic::Position::at(&source, p.byte as usize)
+        );
+    }
+}
+
+mod round_trip;
+
+/// SQL's `union` between two reads is refused naming it, with the
+/// `union` relation function as the fix.
+#[test]
+fn a_sql_union_between_reads_prints_the_relation_function() {
+    let d = refusal_of(
+        "query q() { match { $p: Person } return { $p.name } union match { $c: Company } return { $c.name } }",
+    );
+    assert_eq!(d.code.as_str(), "Q014", "{d}");
+    assert!(d.message.contains("`union`"), "{d}");
+    assert!(
+        d.fix.as_deref().is_some_and(|f| f.contains("from union({")),
+        "{d:?}"
+    );
+    assert_eq!(d.position.map(|p| p.column), Some(53));
+}
+
+/// A leading `gq N;` line is refused as a language-version declaration a
+/// source does not make, with its deletion as the fix.
+#[test]
+fn a_language_version_line_prints_its_deletion() {
+    let body = "query q() { match { $p: Person } return { $p.name } }";
+    for line in ["gq 2;\n", "gq 3;\n"] {
+        let src = format!("{line}{body}");
+        let d = refusal_of(&src);
+        assert_eq!(d.code.as_str(), "Q012", "{d}");
+        assert_eq!(
+            d.message, "a source declares no language version; delete it",
+            "{d}"
+        );
+        let fixed = super::parse::apply_edits(&src, &d.suggestion.as_ref().unwrap().edits);
+        assert_eq!(fixed, body);
+    }
+}
+
+#[test]
+fn an_integer_literal_reads_the_whole_integer_range_issue_1279() {
+    use crate::query::value::Literal;
+    let value = |text: &str| match &where_expr(&format!("$a.n = {text}")) {
+        Expr::Compare { right, .. } => right.as_ref().clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        value("18446744073709551615"),
+        Expr::Literal(Literal::Integer(i128::from(u64::MAX)))
+    );
+    assert!(matches!(
+        &value("-9223372036854775808"),
+        Expr::Neg(inner) if **inner == Expr::Literal(Literal::Integer(1_i128 << 63))
+    ));
+    for (text, needle) in [
+        ("18446744073709551616", "above the largest U64"),
+        ("-9223372036854775809", "below the smallest I64"),
+    ] {
+        let src = format!("query q() {{ match {{ $a: A }} where $a.n = {text} return {{ $a }} }}");
+        let refused = refusal_of(&src);
+        assert_eq!(refused.code.as_str(), "Q005", "{refused:?}");
+        assert!(refused.message.contains(needle), "{refused:?}");
+        let at = src.find(text.trim_start_matches('-')).unwrap();
+        assert_eq!(
+            refused.position.map(|p| p.byte as usize),
+            Some(at),
+            "{refused:?}"
+        );
+    }
+}

@@ -163,7 +163,7 @@ Graph-scoped actions are:
 |---|---|
 | `read` | Queries, snapshots, branches, commits, Blob reads, and change polling |
 | `export` | Export and change-feed baseline capture |
-| `change` | Mutations, loads, `load csv` (and its `explain` source probe), and Blob put/clear |
+| `change` | Mutations, loads, `load csv` (and its `explain` source probe), and Blob put/clear; a mutation with a `match` also needs `read` on its branch (an `insert` with no `match` needs `change` alone) |
 | `schema_apply` | Schema changes: `cluster apply --target` needs it on each existing graph whose schema changes |
 | `branch_create`, `branch_delete`, `branch_merge` | Corresponding branch operation |
 | `branch_claim` | Claim of a branch's writer epoch; no CLI command or HTTP route claims in this release, only a program embedding the engine |

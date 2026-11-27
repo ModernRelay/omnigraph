@@ -1,0 +1,1 @@
+- A traversal whose destination has no identity index reads it in slices sized from the query's free memory, not 256 ids each, so its scans no longer multiply with the frontier.

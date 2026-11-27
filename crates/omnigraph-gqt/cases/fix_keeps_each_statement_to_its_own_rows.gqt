@@ -1,0 +1,75 @@
+# issue: none
+# notes: GQ 2 write bodies whose `update … where` or `delete … where` is followed by an `insert`: each statement
+# notes: ran once, the insert inserting one row whether the selection matched two rows or none. `lint --fix` opens a
+# notes: group for the selecting statement and keeps the insert out of it, so the rewrite inserts one row. The hand
+# notes: rewrite is crates/omnigraph-gqt/cases/fix_keeps_each_statement_to_its_own_rows.gqt.
+
+# notes: The hand rewrite of crates/omnigraph-gqt/gq-2/fix_keeps_each_statement_to_its_own_rows.gqt, each step the text `lint --fix
+# notes: --review-fixes` writes for the GQ 2 step: the same rows, which the Cross-Version Comparison
+# notes: checks against GQ 2, and the same typed IR, which the lint-fix GQ 2 proof checks.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    name: String @key
+    n: I32?
+}
+node Note {
+    text: String?
+}
+
+--- seed
+{"type":"Doc","data":{"name":"a","n":1}}
+{"type":"Doc","data":{"name":"b","n":1}}
+
+--- mutate
+query two_selected() {
+  insert Note { text: "once" }
+  match { $x: Doc } where $x.n = 1  update $x set { n: 5 }
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- mutate
+query none_selected() {
+  insert Note { text: "still once" }
+  match { $x: Doc } where $x.n = 9  update $x set { n: 7 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query notes() {
+  match {
+    $n: Note
+  }
+  return { $n.text }
+}
+
+--- expect unordered
+{"n.text":"once"}
+{"n.text":"still once"}
+
+--- expect shape
+n.text: String
+
+--- query
+query docs() {
+  match {
+    $d: Doc
+  }
+  return { $d.name, $d.n }
+}
+
+--- expect unordered
+{"d.n":5,"d.name":"a"}
+{"d.n":5,"d.name":"b"}
+
+--- expect shape
+d.name: String
+d.n: I32

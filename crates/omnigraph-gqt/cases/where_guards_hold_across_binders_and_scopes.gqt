@@ -1,0 +1,100 @@
+# issue: none
+# notes: A3's evaluation order holds across binders and scopes. A `where`'s conjuncts filter in
+# notes: written order, so a conjunct over a later binder guards a failing one over an earlier
+# notes: binder; a correlated block under `or` or `if` is evaluated only where its guard lets it;
+# notes: an outer `where` is not evaluated below an inner scope that can fail, which then fails
+# notes: on every row; and a block run from a bound key (`key_set`) never evaluates a failing
+# notes: conjunct on a row the correlated form would not reach. Each is a row-or-refusal
+# notes: difference, checked against the reference interpreter.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32
+}
+node Company {
+    slug: String @key
+    size: I32
+}
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"handle":"ada","age":0}}
+{"type":"Person","data":{"handle":"bob","age":5}}
+{"type":"Person","data":{"handle":"cy","age":50}}
+{"type":"Company","data":{"slug":"acme","size":0}}
+{"type":"Company","data":{"slug":"bolt","size":7}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"WorksAt","from":"cy","to":"bolt"}
+
+--- query
+query later_binder_guards() {
+    match { $a: Person, $b: Company, $a worksAt $b }
+    where $b.size > 1000 and 100 / $a.age > 1
+    return { $a.handle }
+}
+
+--- expect unordered
+
+--- expect shape
+a.handle: String
+
+--- query
+query block_under_or() {
+    match { $p: Person }
+    where $p.age = 0 or count { $c: Company, $p worksAt $c where 10 / $p.age > 1 } > 0
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query block_under_if() {
+    match { $p: Person }
+    where if($p.age = 0, true, count { $c: Company, $p worksAt $c where 10 / $p.age > 1 } > 0)
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query failing_optional_runs_before_where() {
+    match { $p: Person, optional { $c: Company, $p worksAt $c where 10 / $p.age > 1 } }
+    where $p.age > 0
+    return { $p.handle, $c.slug }
+}
+
+--- expect error: E2
+
+--- query
+query key_set_block_reaches_no_other_row() {
+    match { $p: Person }
+    where $p.handle = "cy" and not exists { $c: Company, $p worksAt $c where $c.slug = "acme" and 10 / $c.size > 1 }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+
+--- expect plan
+anti join $p: correlated

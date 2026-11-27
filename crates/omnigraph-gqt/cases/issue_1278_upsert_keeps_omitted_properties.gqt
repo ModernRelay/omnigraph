@@ -1,0 +1,124 @@
+# issue: 1278
+# red_on: 717ca0c04: `upsert` ran as a whole-row write, so step 2, `upsert Doc { slug: "d2", n: null }`, failed with `missing required property 'title'` instead of keeping the stored title
+# notes: `upsert` on an existing key sets the properties it names and keeps the others (scalar, list and vector here; Blob in writes.rs); an explicit `null` clears. On a new key it creates, an omitted nullable property null and an omitted required one refused; an existing key needs no required property.
+# notes: A second `upsert` of a key in the same write keeps what the first wrote, and the result holds on a branch and across a restart.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String
+    n: I64?
+    tags: [String]?
+    emb: Vector(3)?
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"one","n":7,"tags":["a","b"],"emb":[1.0,2.0,3.0]}}
+{"type":"Doc","data":{"slug":"d2","title":"two","n":8,"tags":["c"],"emb":[4.0,5.0,6.0]}}
+{"type":"Doc","data":{"slug":"d3","title":"three","n":9,"tags":["d"],"emb":[7.0,8.0,9.0]}}
+
+--- mutate
+query upsert_d1() {
+    upsert Doc { slug: "d1", title: "new" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query clear_d2_n() {
+    upsert Doc { slug: "d2", n: null }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query create_d4() {
+    upsert Doc { slug: "d4", title: "four" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query create_d5_without_title() {
+    upsert Doc { slug: "d5", n: 5 }
+}
+
+--- expect error: missing required property 'title'
+
+--- mutate
+query twice_in_one_write() {
+    upsert Doc { slug: "d6", title: "six", n: 6 }
+    upsert Doc { slug: "d6", tags: ["x"] }
+}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.n, $d.tags, $d.emb }
+}
+
+--- expect unordered
+{"d.emb":[1.0,2.0,3.0],"d.n":7,"d.slug":"d1","d.tags":["a","b"],"d.title":"new"}
+{"d.emb":[4.0,5.0,6.0],"d.slug":"d2","d.tags":["c"],"d.title":"two"}
+{"d.emb":[7.0,8.0,9.0],"d.n":9,"d.slug":"d3","d.tags":["d"],"d.title":"three"}
+{"d.slug":"d4","d.title":"four"}
+{"d.n":6,"d.slug":"d6","d.tags":["x"],"d.title":"six"}
+--- expect shape
+d.slug: String
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(3)?
+
+--- mutate
+branch create feature
+
+--- expect ok
+
+--- mutate branch: feature
+query upsert_d3_on_feature() {
+    upsert Doc { slug: "d3", n: 30 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- query
+query d3() {
+    match { $d: Doc } where $d.slug = "d3"
+    return { $d.title, $d.n, $d.tags, $d.emb }
+}
+
+--- expect unordered
+{"d.emb":[7.0,8.0,9.0],"d.n":9,"d.tags":["d"],"d.title":"three"}
+--- expect shape
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(3)?
+
+--- query branch: feature
+query d3() {
+    match { $d: Doc } where $d.slug = "d3"
+    return { $d.title, $d.n, $d.tags, $d.emb }
+}
+
+--- expect unordered
+{"d.emb":[7.0,8.0,9.0],"d.n":30,"d.tags":["d"],"d.title":"three"}
+--- expect shape
+d.title: String
+d.n: I64?
+d.tags: [String]?
+d.emb: Vector(3)?

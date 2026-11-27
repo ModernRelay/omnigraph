@@ -15,8 +15,8 @@ node Tag {
 --- seed
 {"type":"Person","data":{"name":"alice"}}
 --- concurrent
-w1: set engine = v2;
-  query add() { insert Person { name: "bob" } }
+w1: set query_memory_bytes = 1048576;
+  query add() { replace Person { name: "bob" } }
 r1: query all() { match { $p: Person } return { $p.name } }
 --- expect
 w1: ok

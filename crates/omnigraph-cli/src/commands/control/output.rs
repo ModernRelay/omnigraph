@@ -31,6 +31,9 @@ pub(crate) struct QueriesParam {
     #[serde(rename = "type")]
     pub(crate) type_name: String,
     pub(crate) nullable: bool,
+    /// The declared default, which an omitted parameter binds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) default: Option<serde_json::Value>,
 }
 
 #[derive(serde::Serialize)]
@@ -52,6 +55,11 @@ pub(crate) struct QueriesListItem {
 #[derive(serde::Serialize)]
 pub(crate) struct QueriesListOutput {
     pub(crate) queries: Vec<QueriesListItem>,
+    /// Stored queries whose source this binary refuses to parse, each with
+    /// its refusal, as a served graph's catalog lists them; `queries
+    /// validate` type-checks the others too.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unavailable: Vec<omnigraph_api_types::UnavailableQueryOutput>,
 }
 
 pub(super) fn write_policy_explain(
@@ -100,7 +108,10 @@ pub(super) fn write_queries_validate(
         for issue in &output.breakages {
             writeln!(stdout, "ERROR  query '{}': {}", issue.query, issue.message)?;
             if let Some(diagnostic) = &issue.diagnostic {
-                for line in crate::output::diagnostic_detail_lines(diagnostic) {
+                for line in crate::output::diagnostic_detail_lines(diagnostic)
+                    .into_iter()
+                    .chain(crate::output::further_diagnostic_lines(diagnostic))
+                {
                     writeln!(stdout, "{line}")?;
                 }
             }
@@ -120,7 +131,7 @@ pub(super) fn write_queries_list(
 ) -> Result<()> {
     if json {
         write_json(output, stdout)?;
-    } else if output.queries.is_empty() {
+    } else if output.queries.is_empty() && output.unavailable.is_empty() {
         writeln!(stdout, "(no stored queries registered)")?;
     } else {
         for q in &output.queries {
@@ -129,10 +140,13 @@ pub(super) fn write_queries_list(
                 .iter()
                 .map(|p| {
                     format!(
-                        "${}: {}{}",
+                        "${}: {}{}{}",
                         p.name,
                         p.type_name,
-                        if p.nullable { "?" } else { "" }
+                        if p.nullable { "?" } else { "" },
+                        p.default
+                            .as_ref()
+                            .map_or_else(String::new, |value| format!(" = {value}"))
                     )
                 })
                 .collect::<Vec<_>>();
@@ -152,6 +166,12 @@ pub(super) fn write_queries_list(
             )?;
         }
     }
+    if !json {
+        // A query whose source this binary refuses: its name and refusal.
+        for q in &output.unavailable {
+            writeln!(stdout, "unavailable {}: {}", q.name, q.error)?;
+        }
+    }
     Ok(())
 }
 
@@ -164,7 +184,7 @@ pub(super) fn write_queries_catalog(
 ) -> Result<()> {
     if json {
         write_json(catalog, stdout)?;
-    } else if catalog.queries.is_empty() {
+    } else if catalog.queries.is_empty() && catalog.unavailable.is_empty() {
         writeln!(stdout, "(no stored queries registered)")?;
     } else {
         for q in &catalog.queries {
@@ -187,6 +207,11 @@ pub(super) fn write_queries_catalog(
                 stdout,
             )?;
         }
+        // A query whose source fails to compile under the server's release:
+        // its name and its refusal, which its printed fix repairs.
+        for q in &catalog.unavailable {
+            writeln!(stdout, "unavailable {}: {}", q.name, q.error)?;
+        }
     }
     Ok(())
 }
@@ -203,7 +228,11 @@ fn catalog_param_type(param: &ParamDescriptor) -> String {
         (ParamKind::Vector, _, Some(dim)) => format!("{}({dim})", spell(ParamKind::Vector)),
         (kind, _, _) => spell(kind),
     };
-    format!("{base}{}", if param.nullable { "?" } else { "" })
+    let default = param
+        .default
+        .as_ref()
+        .map_or_else(String::new, |value| format!(" = {value}"));
+    format!("{base}{}{default}", if param.nullable { "?" } else { "" })
 }
 
 /// One `queries list` entry, shared by the direct and served forms.
@@ -309,11 +338,26 @@ mod tests {
                 mutation: false,
                 description: Some("Find people\nby name".into()),
                 instruction: Some(String::new()),
-                params: vec![QueriesParam {
-                    name: "name".into(),
-                    type_name: "String".into(),
-                    nullable: true,
-                }],
+                params: vec![
+                    QueriesParam {
+                        name: "name".into(),
+                        type_name: "String".into(),
+                        nullable: true,
+                        default: None,
+                    },
+                    QueriesParam {
+                        name: "limit".into(),
+                        type_name: "I32".into(),
+                        nullable: false,
+                        default: Some(json!(10)),
+                    },
+                ],
+            }],
+            unavailable: vec![omnigraph_api_types::UnavailableQueryOutput {
+                name: "legacy".into(),
+                error: "error[Q009] at line 1, column 1: `mutation` is not a declaration keyword"
+                    .into(),
+                diagnostic: None,
             }],
         };
         let mut human = Vec::new();
@@ -321,10 +365,11 @@ mod tests {
         assert_eq!(
             String::from_utf8(human).unwrap(),
             concat!(
-                "read  people($name: String?) [mcp: people]\n",
+                "read  people($name: String?, $limit: I32 = 10) [mcp: people]\n",
                 "    description: Find people\n",
                 "                 by name\n",
                 "    instruction: \n",
+                "unavailable legacy: error[Q009] at line 1, column 1: `mutation` is not a declaration keyword\n",
             )
         );
         let mut encoded = Vec::new();
@@ -334,7 +379,10 @@ mod tests {
             json!({
                 "queries": [{"name":"people", "mcp_expose":true, "tool_name":null,
                     "mutation":false, "description":"Find people\nby name", "instruction":"",
-                    "params":[{"name":"name", "type":"String", "nullable":true}]}]
+                    "params":[{"name":"name", "type":"String", "nullable":true},
+                        {"name":"limit", "type":"I32", "nullable":false, "default":10}]}],
+                "unavailable": [{"name":"legacy",
+                    "error":"error[Q009] at line 1, column 1: `mutation` is not a declaration keyword"}]
             })
         );
         assert_eq!(encoded.last(), Some(&b'\n'));
@@ -343,7 +391,15 @@ mod tests {
             assert!(write_queries_list(&output, json, &mut full).is_err());
         }
         let mut empty = Vec::new();
-        write_queries_list(&QueriesListOutput { queries: vec![] }, false, &mut empty).unwrap();
+        write_queries_list(
+            &QueriesListOutput {
+                queries: vec![],
+                unavailable: vec![],
+            },
+            false,
+            &mut empty,
+        )
+        .unwrap();
         assert_eq!(empty, b"(no stored queries registered)\n");
     }
 
@@ -355,6 +411,7 @@ mod tests {
             item_kind,
             vector_dim,
             nullable,
+            default: None,
         };
         let catalog = QueriesCatalogOutput {
             queries: vec![
@@ -383,9 +440,21 @@ mod tests {
                     description: None,
                     instruction: Some("Use for bulk changes".into()),
                     mutation: true,
-                    params: vec![param("count", ParamKind::BigInt, None, None, false)],
+                    params: vec![
+                        param("count", ParamKind::BigInt, None, None, false),
+                        ParamDescriptor {
+                            default: Some(json!(3)),
+                            ..param("batch", ParamKind::Int, None, None, false)
+                        },
+                    ],
                 },
             ],
+            unavailable: vec![omnigraph_api_types::UnavailableQueryOutput {
+                name: "legacy".into(),
+                error: "error[Q014] at line 1, column 46: `==` is not GQ; equality is `=`; fix: ="
+                    .into(),
+                diagnostic: None,
+            }],
         };
         let mut human = Vec::new();
         write_queries_catalog(&catalog, false, &mut human).unwrap();
@@ -396,8 +465,9 @@ mod tests {
                 "$since: datetime)\n",
                 "    description: Find people\n",
                 "                 by name\n",
-                "mutation  retag($count: bigint) [mcp: retag_people]\n",
+                "mutation  retag($count: bigint, $batch: int = 3) [mcp: retag_people]\n",
                 "    instruction: Use for bulk changes\n",
+                "unavailable legacy: error[Q014] at line 1, column 46: `==` is not GQ; equality is `=`; fix: =\n",
             )
         );
         let mut encoded = Vec::new();
@@ -412,8 +482,15 @@ mod tests {
             assert!(write_queries_catalog(&catalog, json, &mut full).is_err());
         }
         let mut empty = Vec::new();
-        write_queries_catalog(&QueriesCatalogOutput { queries: vec![] }, false, &mut empty)
-            .unwrap();
+        write_queries_catalog(
+            &QueriesCatalogOutput {
+                queries: vec![],
+                unavailable: vec![],
+            },
+            false,
+            &mut empty,
+        )
+        .unwrap();
         assert_eq!(empty, b"(no stored queries registered)\n");
     }
 
@@ -521,6 +598,7 @@ mod tests {
                 write_available: true,
                 failure: None,
                 action: GraphAvailabilityAction::None,
+                unavailable_queries: Vec::new(),
             }],
         };
         let mut human = Vec::new();

@@ -20,7 +20,7 @@ node Person {
 
 --- mutate
 query root_bob() as unattached branch {
-    insert Person { name: "bob", age: 41 }
+    replace Person { name: "bob", age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -35,7 +35,7 @@ scope: next_step
 
 --- mutate
 query child_carol() as unattached branch on "${r}" {
-    insert Person { name: "carol", age: 52 }
+    replace Person { name: "carol", age: 52 }
 }
 
 --- expect error: injected failpoint triggered: propose.post_candidate_pre_tag
@@ -55,7 +55,7 @@ p.name: String
 
 --- mutate
 query child_dave() as unattached branch on "${r}" {
-    insert Person { name: "dave", age: 63 }
+    replace Person { name: "dave", age: 63 }
 }
 
 --- expect affected: nodes=1 edges=0

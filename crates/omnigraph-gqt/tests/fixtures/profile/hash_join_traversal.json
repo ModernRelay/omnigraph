@@ -1,6 +1,6 @@
 {
   "explain_version": 1,
-  "query": "query liked() {\n    match { $p: Person $p likes $d }\n    return { $p.name, $d.title }\n    order { $p.name, $d.title }\n}",
+  "query": "query liked() {\n    match { $p: Person, $p likes $d }\n    return { $p.name, $d.title }\n    order { $p.name, $d.title }\n}",
   "physical_plan": {
     "node": "Sort",
     "keys": [

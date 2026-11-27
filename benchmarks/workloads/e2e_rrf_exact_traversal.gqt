@@ -1,0 +1,66 @@
+# issue: none
+# notes: A fusion of two exact `bm25` arms (the exact lexical scan, not an index-ranked order) with a traversal after it and the exact winner x; named apart from the index-ranked workload it replaced, whose timings it does not continue. One operation on a fresh handle is timed; checks and restart are outside the timer.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query recall_two_terms($q1: String, $q2: String) {
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $a: Artifact,
+      $c chunkOfArtifact $a,
+    }
+    where match_terms($c.text, terms($q1, mode: any))
+    return { $c.slug }
+    order { $score desc }
+    limit 1
+}
+
+--- params
+{"q1":"alpha","q2":"beta"}
+
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+fuse $c: arms [bm25, bm25]
+
+--- restart
+
+--- query
+query recall_two_terms($q1: String, $q2: String) {
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $a: Artifact,
+      $c chunkOfArtifact $a,
+    }
+    where match_terms($c.text, terms($q1, mode: any))
+    return { $c.slug }
+    order { $score desc }
+    limit 1
+}
+
+--- params
+{"q1":"alpha","q2":"beta"}
+
+--- expect unordered
+{"c.slug":"x"}
+
+--- expect shape
+c.slug: String
+
+--- expect plan
+expand $c $a: selection named [ChunkOfArtifact out]
+fuse $c: arms [bm25, bm25]

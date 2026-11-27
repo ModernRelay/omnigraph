@@ -202,7 +202,7 @@ impl Seed {
                 .await
                 .map(|_| ())
                 .map_err(|error| format!("seed load failed: {error}")),
-            Self::Generated(generated) => generated.load(session, "main", LoadMode::Append).await,
+            Self::Generated(generated) => generated.load(session, "main", LoadMode::Insert).await,
         }
     }
 }
@@ -236,10 +236,22 @@ pub(crate) fn parse_arguments(
         .parse::<u64>()
         .map_err(|_| "generator seed must be an unsigned 64-bit integer")?;
     let mode = match values.get("mode:").copied() {
-        Some("append") => LoadMode::Append,
-        Some("merge") => LoadMode::Merge,
-        None if !is_load => LoadMode::Append,
-        _ => return Err("a generated load requires `mode: append` or `mode: merge`".into()),
+        None if !is_load => LoadMode::Insert,
+        None => {
+            return Err(
+                "a generated load requires `mode: insert`, `mode: upsert` or `mode: replace`"
+                    .into(),
+            );
+        }
+        Some(name) => match LoadMode::parse(name)? {
+            LoadMode::Overwrite => {
+                return Err(
+                    "a generated load requires `mode: insert`, `mode: upsert` or `mode: replace`"
+                        .into(),
+                );
+            }
+            keyed => keyed,
+        },
     };
     let branch = values.get("branch:").copied().unwrap_or("main");
     if branch.is_empty() {
@@ -329,7 +341,7 @@ impl Branches {
                 })?;
             if let Some(generated) = self.recipe(&name)? {
                 generated
-                    .load(session, &name, LoadMode::Append)
+                    .load(session, &name, LoadMode::Insert)
                     .await
                     .map_err(|error| format!("branches fixture: load {name}: {error}"))?;
             }

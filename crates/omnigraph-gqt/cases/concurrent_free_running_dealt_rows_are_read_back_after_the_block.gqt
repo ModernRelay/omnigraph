@@ -18,7 +18,7 @@ node Chunk { slug: String @key n: I64 }
 {"type":"Chunk","data":{"slug":"seed","n":0}}
 
 --- concurrent
-writer x4: load generate: v1 seed: 42 mode: append
+writer x4: load generate: v1 seed: 42 mode: insert
   tables:
     - kind: node
       name: Chunk
@@ -27,7 +27,7 @@ writer x4: load generate: v1 seed: 42 mode: append
       columns:
         slug: {kind: key, prefix: cw-, width: 3}
         n: {kind: ordinal, start: 100, step: 1}
-reader: query seed_row() { match { $c: Chunk { slug: "seed" } } return { $c.n } }
+reader: query seed_row() { match { $c: Chunk } where $c.slug = "seed" return { $c.n } }
 --- expect
 writer: ok
 reader: ok

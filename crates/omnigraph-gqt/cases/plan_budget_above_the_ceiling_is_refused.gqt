@@ -1,0 +1,57 @@
+# issue: none
+# notes: A declared `@budget(plan = n)` above the session's ceiling, `plan_budget_limit`, is refused with `T89` before the
+# notes: declaration is compiled, never clamped; at or under it the declaration runs. A read and a write alike, direct
+# notes: and served: a served request may lower the ceiling, never raise it past the server's.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+}
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada"}}
+
+--- query
+set plan_budget_limit = 50;
+query within() @budget(plan = 50) { match { $p: Person } return { $p.handle } }
+
+--- expect unordered
+{"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+
+--- query
+set plan_budget_limit = 50;
+query above() @budget(plan = 51) { match { $p: Person } return { $p.handle } }
+
+--- expect error: type error: T89: `above` declares `@budget(plan = 51)`, above this session's ceiling `plan_budget_limit` = 50
+
+--- query
+query above_the_default_ceiling() @budget(plan = 65537) { match { $p: Person } return { $p.handle } }
+
+--- expect error: type error: T89: `above_the_default_ceiling` declares `@budget(plan = 65537)`, above this session's ceiling `plan_budget_limit` = 65536
+
+--- mutate
+set plan_budget_limit = 10;
+query rename() @budget(plan = 11) { match { $p: Person } where $p.handle = "ada" update $p set { name: "Ada L" } }
+
+--- expect error: type error: T89: `rename` declares `@budget(plan = 11)`, above this session's ceiling `plan_budget_limit` = 10
+
+--- query
+query names() { match { $p: Person } return { $p.name } }
+
+--- expect unordered
+{"p.name":"Ada"}
+
+--- expect shape
+p.name: String

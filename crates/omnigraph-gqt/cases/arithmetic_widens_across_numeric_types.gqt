@@ -1,0 +1,200 @@
+# issue: none
+# notes: Arithmetic over two numeric types meets in their common type through an
+# notes: explicit widening `Cast` that keeps each operand's nullability: a
+# notes: narrower integer widens to the wider, `U32` with a signed integer is
+# notes: `I64`, an integer with a float is `F64`, `F32` beside a float literal is
+# notes: `F64`. An integer literal, a negated one included, takes the other
+# notes: operand's type when it fits, so `$p.age - -3` over an `I32` is `I32`
+# notes: arithmetic and overflows at `I32`; `(0 - 3)` is an `I64` operand.
+# notes: `coalesce` and `if` widen their arguments to the common type, and
+# notes: overflow, truncating division and the sign of `%` hold at the widened
+# notes: type. Unary minus over an unsigned value is `T72`. A null dividend over a zero divisor is
+# notes: null, as every arithmetic over a null operand is.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    age: I32?
+    karma: I64?
+    score: F64?
+    small: U32?
+}
+node Doc {
+    slug: String @key
+    rating: F32?
+}
+
+--- seed
+{"type":"Person","data":{"handle":"p1","age":36,"karma":10,"score":1.5,"small":7}}
+{"type":"Person","data":{"handle":"p2","age":20,"karma":9223372036854775800,"score":0.5,"small":1}}
+{"type":"Person","data":{"handle":"p3","karma":4}}
+{"type":"Doc","data":{"slug":"d1","rating":2.0}}
+{"type":"Doc","data":{"slug":"d2","rating":3.0}}
+{"type":"Doc","data":{"slug":"d3"}}
+
+--- query
+query mixed_widths() {
+    match { $p: Person }
+    where $p.handle != "p2"
+    return {
+        $p.handle,
+        $p.age + $p.karma as int_wide,
+        $p.score * $p.karma as float_int,
+        $p.age * $p.score as int_float,
+        $p.small + $p.age as unsigned_signed,
+        $p.karma / $p.age as truncated,
+    }
+    order { $p.handle }
+}
+
+--- expect ordered
+{"p.handle":"p1","int_wide":46,"float_int":15.0,"int_float":54.0,"unsigned_signed":43,"truncated":0}
+{"p.handle":"p3"}
+
+--- expect shape
+p.handle: String
+int_wide: I64?
+float_int: F64?
+int_float: F64?
+unsigned_signed: I64?
+truncated: I64?
+
+--- query
+query overflow_at_the_widened_type() {
+    match { $p: Person }
+    where $p.handle = "p2"
+    return { $p.age + $p.karma as x }
+}
+
+--- expect error: E1
+
+--- query
+query negative_literals() {
+    match { $p: Person }
+    where $p.handle = "p1"
+    return {
+        $p.age - -3 as minus_negative,
+        $p.age + (-3) as plus_negative,
+        $p.age * -1 as times_negative,
+        $p.age / -5 as divided,
+        $p.age % -5 as remainder,
+        -$p.age % 5 as negated_remainder,
+        $p.age - (0 - 3) as computed,
+    }
+}
+
+--- expect unordered
+{"minus_negative":39,"plus_negative":33,"times_negative":-36,"divided":-7,"remainder":1,"negated_remainder":-1,"computed":39}
+
+--- expect shape
+minus_negative: I32?
+plus_negative: I32?
+times_negative: I32?
+divided: I32?
+remainder: I32?
+negated_remainder: I32?
+computed: I64?
+
+--- query
+query a_negative_literal_overflows_at_i32() {
+    match { $p: Person }
+    where $p.handle = "p1"
+    return { $p.age * -100000000 as x }
+}
+
+--- expect error: E1
+
+--- query
+query float32_with_a_float_literal() {
+    match { $d: Doc }
+    where $d.rating * 1.5 <= 4.0
+    return { $d.slug, $d.rating * 1.5 as scaled }
+}
+
+--- expect unordered
+{"d.slug":"d1","scaled":3.0}
+
+--- expect shape
+d.slug: String
+scaled: F64?
+
+--- query
+query conditional_rows_widen_their_arguments() {
+    match { $p: Person }
+    where $p.handle != "p2"
+    return {
+        $p.handle,
+        coalesce($p.age, -1) as age_or_negative,
+        coalesce($p.age, $p.karma) as age_or_karma,
+        coalesce($p.score, $p.age) as score_or_age,
+        if($p.score > 1.0, $p.age, $p.karma) as chosen,
+    }
+    order { $p.handle }
+}
+
+--- expect ordered
+{"p.handle":"p1","age_or_negative":36,"age_or_karma":36,"score_or_age":1.5,"chosen":36}
+{"p.handle":"p3","age_or_negative":-1,"age_or_karma":4,"chosen":4}
+
+--- expect shape
+p.handle: String
+age_or_negative: I32
+age_or_karma: I64?
+score_or_age: F64?
+chosen: I64?
+
+--- query
+query coalesce_widens_a_division_it_never_evaluates() {
+    match { $p: Person }
+    where $p.handle = "p1"
+    return { coalesce($p.age, 1 / 0) as x }
+}
+
+--- expect unordered
+{"x":36}
+
+--- expect shape
+x: I64
+
+--- query
+query coalesce_evaluates_the_division_where_the_value_is_null() {
+    match { $p: Person }
+    where $p.handle = "p3"
+    return { coalesce($p.age, 1 / 0) as x }
+}
+
+--- expect error: E2
+
+--- query
+query a_null_dividend_over_a_zero_divisor_is_null($z: I32) {
+    match { $p: Person }
+    where $p.handle = "p3"
+    return { $p.handle, $p.age / $z as quotient, $p.age % $z as remainder }
+}
+
+--- params
+{"z": 0}
+
+--- expect unordered
+{"p.handle":"p3"}
+
+--- expect shape
+p.handle: String
+quotient: I32?
+remainder: I32?
+
+--- query
+query unary_minus_over_an_unsigned_value() {
+    match { $p: Person }
+    return { -$p.small as x }
+}
+
+--- expect error: type error: T72:

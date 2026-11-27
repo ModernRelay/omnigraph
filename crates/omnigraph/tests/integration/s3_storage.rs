@@ -62,7 +62,7 @@ async fn s3_compatible_graph_lifecycle_works() {
         .load(
             "main",
             r#"{"type":"Person","data":{"name":"RunOnly","age":31}}"#,
-            LoadMode::Append,
+            LoadMode::Insert,
         )
         .await
         .unwrap();
@@ -164,7 +164,7 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
     db.load(
         "main",
         r#"{"type":"Person","data":{"name":"Loaded-Over-S3","age":34}}"#,
-        LoadMode::Append,
+        LoadMode::Insert,
     )
     .await
     .unwrap();
@@ -221,7 +221,7 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
         })
     );
     let probes = MergeWriteProbes::default();
-    with_merge_write_probes(probes.clone(), db.load("main", &rows, LoadMode::Append))
+    with_merge_write_probes(probes.clone(), db.load("main", &rows, LoadMode::Insert))
         .await
         .unwrap();
     assert_eq!(probes.external_blob_probe_inputs(), 2);

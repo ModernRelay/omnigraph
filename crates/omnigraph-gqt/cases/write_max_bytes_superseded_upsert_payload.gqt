@@ -1,6 +1,6 @@
 # issue: none
-# notes: A later write of a key in the same mutation replaces its pending version (issue #925), so a superseded version is not retained and its Blob is not counted.
-# notes: Two upserts of key "same" each carry 15,999 bytes: one version stays, 15,999 bytes fit write_max_bytes = 30000, and the row has the second note; carrying its Blob is refused at 15998 and admitted at 15999.
+# notes: A later write of a key in the same write replaces its pending version, so a superseded version is not retained and its Blob is not counted.
+# notes: Two replaces of key "same" each carry 15,999 bytes: one version stays, 15,999 bytes fit write_max_bytes = 30000, and the row has the second note; carrying its Blob is refused at 15998 and admitted at 15999, by an update that shares its write with an upsert of another row, so it rewrites whole rows rather than patching the note.
 # notes: Two distinct keys each carrying 15,999 bytes keep both versions: 31,998 bytes exceed 30000 and are refused as `decoded blob input bytes per operation`, and neither row is written.
 
 --- runner
@@ -24,8 +24,8 @@ node Doc {
 --- mutate
 set write_max_bytes = 30000;
 query upsert_twice($payload: Blob) {
-    insert Doc { slug: "same", content: $payload, note: "first" }
-    insert Doc { slug: "same", content: $payload, note: "second" }
+    replace Doc { slug: "same", content: $payload, note: "first" }
+    replace Doc { slug: "same", content: $payload, note: "second" }
 }
 
 --- params
@@ -49,8 +49,9 @@ d.note: String
 --- mutate
 set write_max_bytes = 15998;
 query carry_one_byte_short() {
-    update Doc set { note: "carried" } where slug = "same"
-    update Doc set { note: "none" } where slug = "nobody"
+    match { $d: Doc } where $d.slug = "same"
+    update $d set { note: "carried" }
+    upsert Doc { slug: "spare", note: "none" }
 }
 
 --- expect error: materialized blob payload bytes
@@ -58,11 +59,12 @@ query carry_one_byte_short() {
 --- mutate
 set write_max_bytes = 15999;
 query carry_exact() {
-    update Doc set { note: "carried" } where slug = "same"
-    update Doc set { note: "none" } where slug = "nobody"
+    match { $d: Doc } where $d.slug = "same"
+    update $d set { note: "carried" }
+    upsert Doc { slug: "spare", note: "none" }
 }
 
---- expect affected: nodes=1 edges=0
+--- expect affected: nodes=2 edges=0
 
 --- mutate
 set write_max_bytes = 30000;
@@ -84,6 +86,7 @@ query docs_after_refusal() {
 
 --- expect unordered
 {"d.slug": "same", "d.note": "carried"}
+{"d.slug": "spare", "d.note": "none"}
 
 --- expect shape
 d.slug: String

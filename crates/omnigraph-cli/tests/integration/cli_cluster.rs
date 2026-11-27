@@ -1793,7 +1793,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 } else {
                     serde_json::json!({
                         "branch":"main", "base_branch":null, "branch_created":false,
-                        "mode":"append", "nodes":[{"name":"Person", "entities_loaded":1}],
+                        "mode":"insert", "nodes":[{"name":"Person", "entities_loaded":1}],
                         "edges":[], "total_entities":1, "actor_id":"legacy-actor", "commit":null,
                         "embedding_generation":null
                     })
@@ -1822,7 +1822,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                     .timeout(std::time::Duration::from_secs(15));
                 if verb == "load" {
                     fs::write(temp.path().join("batch.jsonl"), "{}\n").unwrap();
-                    command.args(["--data", "batch.jsonl", "--mode", "append"]);
+                    command.args(["--data", "batch.jsonl", "--mode", "insert"]);
                 } else {
                     command.arg("q");
                 }
@@ -1843,7 +1843,7 @@ fn managed_data_issue_633_explicit_targets_ignore_folder_context() {
                 assert_eq!(
                     requests[0].path,
                     if verb == "load" {
-                        "/graphs/knowledge/load/ndjson?branch=main&mode=append"
+                        "/graphs/knowledge/load/ndjson?branch=main&mode=insert"
                     } else {
                         "/graphs/knowledge/queries/q"
                     }
@@ -2825,7 +2825,7 @@ fn cluster_plan_json_reads_inferred_local_state() {
     write_cluster_config_fixture(temp.path());
     apply_cluster_fixture(temp.path());
     fs::write(temp.path().join("people.gq"),
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }").unwrap();
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }").unwrap();
     let json = cluster_json(temp.path(), "plan");
     assert_eq!(json["ok"], true);
     assert_eq!(json["state_observations"]["state_found"], true);
@@ -2838,6 +2838,72 @@ fn cluster_plan_json_reads_inferred_local_state() {
                 && change["operation"] == "update"),
         "{json}"
     );
+
+    // A schema change needs an actor the installed policy grants
+    // `schema_apply`, as apply does.
+    let plan_as = |root: &std::path::Path, json: bool| {
+        let mut command = cli();
+        command
+            .args(["--as", "act-cluster-test", "cluster", "plan", "--target"])
+            .arg(root)
+            .arg("--config")
+            .arg(root);
+        if json {
+            command.arg("--json");
+        }
+        output_success(&mut command)
+    };
+    // A comment-only edit keeps the accepted identity: the plan reports the
+    // schema update as text only, with no step, and says the graph keeps its
+    // accepted source.
+    let schema = fs::read_to_string(temp.path().join("people.pg")).unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        format!("// reviewed\n{schema}"),
+    )
+    .unwrap();
+    let json = parse_stdout_json(&plan_as(temp.path(), true));
+    assert_eq!(json["ok"], true, "{json}");
+    let change = json["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["resource"] == "schema.knowledge")
+        .unwrap();
+    assert_eq!(change["operation"], "update");
+    assert_eq!(change["text_only"], true, "{change}");
+    assert_eq!(change["migration"]["supported"], true);
+    assert_eq!(change["migration"]["steps"], serde_json::json!([]));
+    let human = stdout_string(&plan_as(temp.path(), false));
+    assert!(
+        human.contains("Update schema.knowledge [text only]"),
+        "{human}"
+    );
+    assert!(
+        human.contains(
+            "graph keeps its accepted schema source, which `omnigraph schema show` shows"
+        ),
+        "{human}"
+    );
+
+    // A real change after it is no longer text only.
+    fs::write(
+        temp.path().join("people.pg"),
+        format!(
+            "// reviewed\n{}",
+            schema.replace("age: I32?", "age: I32?\n  bio: String?")
+        ),
+    )
+    .unwrap();
+    let json = parse_stdout_json(&plan_as(temp.path(), true));
+    let change = json["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["resource"] == "schema.knowledge")
+        .unwrap();
+    assert!(change.get("text_only").is_none(), "{change}");
+    assert_ne!(change["migration"]["steps"], serde_json::json!([]));
 }
 
 #[test]
@@ -3314,7 +3380,7 @@ fn load_statement_over_the_cluster_root_is_refused_before_admission() {
     };
     let load = |csv_path: &std::path::Path| {
         format!(
-            "load csv \"file://{}\" into node:Person mode append header",
+            "load csv \"file://{}\" into node:Person mode insert header",
             csv_path.display()
         )
     };
@@ -3402,7 +3468,7 @@ async fn v2_root_admission_blocks_cli_write_and_native_control_doors() {
         vec!["cleanup", "--keep", "1", "--confirm", "--json"],
         vec!["branch", "create", "must-not-exist"],
         vec![
-            "load", "--data", data, "--mode", "append", "--base", base_graph,
+            "load", "--data", data, "--mode", "insert", "--base", base_graph,
         ],
     ] {
         let output = output_failure(cli().args(&args).arg("--target").arg(&graph).arg("--yes"));

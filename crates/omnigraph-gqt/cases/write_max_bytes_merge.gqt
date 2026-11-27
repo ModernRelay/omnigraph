@@ -33,7 +33,7 @@ branch create source;
 
 --- mutate branch: source
 query insert_source($payload: Blob) {
-    insert Doc { slug: "source", content: $payload, note: "source" }
+    replace Doc { slug: "source", content: $payload, note: "source" }
 }
 
 --- params
@@ -43,7 +43,7 @@ query insert_source($payload: Blob) {
 
 --- mutate
 query insert_target() {
-    insert Doc { slug: "target", note: "target" }
+    replace Doc { slug: "target", note: "target" }
 }
 
 --- expect affected: nodes=1 edges=0

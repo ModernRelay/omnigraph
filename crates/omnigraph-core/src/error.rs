@@ -173,19 +173,6 @@ pub fn missing_graph_property_at_snapshot(table_key: &str, property: &str) -> St
     )
 }
 
-/// The current property's lifetime is in the pinned table version under the
-/// name it had before a rename.
-pub fn renamed_graph_property_at_snapshot(
-    table_key: &str,
-    property: &str,
-    stored_name: &str,
-) -> String {
-    format!(
-        "property '{property}' of {} is named '{stored_name}' at this snapshot; a historical query cannot read a property across a rename",
-        graph_type_subject(table_key)
-    )
-}
-
 /// The pinned table version stores the column without a stable property id,
 /// so it cannot show which property lifetime the column belongs to.
 pub fn unwitnessed_graph_property_at_snapshot(table_key: &str, property: &str) -> String {
@@ -195,8 +182,16 @@ pub fn unwitnessed_graph_property_at_snapshot(table_key: &str, property: &str) -
     )
 }
 
+/// What a `key_conflict` asks of its author: a strict `insert` (or an
+/// `insert` load) met an existing key, which the two other keyed modes write.
+pub const KEY_CONFLICT_FIX: &str =
+    "; `upsert` sets the named properties of an existing entity and `replace` writes its whole row";
+
 fn format_key_conflict(type_key: &str) -> String {
-    format!("{} already has this id", graph_type_subject(type_key))
+    format!(
+        "{} already has this id{KEY_CONFLICT_FIX}",
+        graph_type_subject(type_key)
+    )
 }
 
 /// Why a branch cannot start at a graph commit. Each reason is decided before
@@ -328,16 +323,6 @@ pub enum OmniError {
         remedy = FULL_TEXT_REBUILD_COMMAND
     )]
     FullTextIndexRebuildRequired { index: String, reason: String },
-    /// A full-text call reads a declared full-text index that has no segment
-    /// at the query's snapshot, so no segment carries the index's analyzer
-    /// and Lance would match with a bare, case-sensitive tokenizer. Refused
-    /// before any scan rather than answered differently; `index` is
-    /// `Type.property`.
-    #[error(
-        "full-text index '{index}' has no segment at this snapshot; build it with {remedy} (historical snapshots are unchanged)",
-        remedy = INDEX_BUILD_COMMAND
-    )]
-    FullTextIndexRequired { index: String },
     /// The exact staged-commit adapter proved that Lance contention was
     /// effect-free. This operation-local signal lets RFC-023 distinguish a
     /// safe key-fence re-evaluation from an arbitrary storage failure; generic
@@ -824,7 +809,6 @@ impl OmniError {
             | Self::RetryableCommitConflict(_)
             | Self::HistoricalVersionReclaimed { .. }
             | Self::FullTextIndexRebuildRequired { .. }
-            | Self::FullTextIndexRequired { .. }
             | Self::RecoveryRequired { .. }
             | Self::InitializationCommitted { .. }
             | Self::InitializationIndeterminate { .. } => false,
@@ -2876,7 +2860,7 @@ mod tests {
     fn graph_facing_error_display_uses_logical_subjects() {
         assert_eq!(
             OmniError::key_conflict("node:Person", "p1").to_string(),
-            "node type 'Person' already has this id"
+            format!("node type 'Person' already has this id{KEY_CONFLICT_FIX}")
         );
         assert_eq!(
             OmniError::KeyConflict {
@@ -2884,7 +2868,7 @@ mod tests {
                 entity_id: None,
             }
             .to_string(),
-            "edge type 'Knows' already has this id"
+            format!("edge type 'Knows' already has this id{KEY_CONFLICT_FIX}")
         );
         assert_eq!(
             OmniError::HistoricalVersionReclaimed {

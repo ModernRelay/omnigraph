@@ -1,16 +1,17 @@
 query suite_series($suite: String) {
     match {
-        $u: Suite { name: $suite }
-        $u groups $s
-        $r ran $s
-        $r built $c
+        $u: Suite,
+        $u groups $s,
+        $r ran $s,
+        $r built $c,
     }
+    where $u.name = $suite
     return {
-        $s.name as scenario
-        $c.sha as commit
-        $r.invoked_at_unix_ms as invoked_at_unix_ms
-        $r.p50_us as p50_us
+        $s.name as scenario,
+        $c.sha as commit,
+        $r.invoked_at_unix_ms as invoked_at_unix_ms,
+        $r.p50_us as p50_us,
         $r.claim_eligible as claim_eligible
     }
-    order { scenario asc, invoked_at_unix_ms asc }
+    order { scenario, invoked_at_unix_ms }
 }

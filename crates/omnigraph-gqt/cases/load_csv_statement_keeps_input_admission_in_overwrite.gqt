@@ -144,13 +144,13 @@ load csv "counters.csv" into node:Counter mode overwrite header
 
 --- mutate
 set write_max_bytes = 256;
-load csv "counters.csv" into node:Counter mode append header
+load csv "counters.csv" into node:Counter mode insert header
 
 --- expect error: retained keyed batch bytes per operation
 
 --- mutate
 set write_max_bytes = 256;
-load csv "counters.csv" into node:Counter mode merge header
+load csv "counters.csv" into node:Counter mode replace header
 
 --- expect error: retained keyed batch bytes per operation
 
@@ -8364,11 +8364,11 @@ id
 invalid_integer
 
 --- mutate
-load csv "row_limit.csv" into node:Counter mode append header
+load csv "row_limit.csv" into node:Counter mode insert header
 --- expect error: keyed entities for node:Counter: actual 8193, limit 8192
 
 --- mutate
-load csv "row_limit.csv" into node:Counter mode merge header
+load csv "row_limit.csv" into node:Counter mode replace header
 --- expect error: keyed entities for node:Counter: actual 8193, limit 8192
 
 --- query
@@ -8379,11 +8379,11 @@ query rows_unchanged() { match { $n: Counter } return { $n.id } }
 n.id: I64
 
 --- mutate
-load csv "row_limit.csv" into node:Unkeyed mode append header
+load csv "row_limit.csv" into node:Unkeyed mode insert header
 --- expect error: keyed entities for node:Unkeyed: actual 8193, limit 8192
 
 --- mutate
-load csv "row_limit.csv" into node:Unkeyed mode merge header
+load csv "row_limit.csv" into node:Unkeyed mode replace header
 --- expect error: keyed entities for node:Unkeyed: actual 8193, limit 8192
 
 --- query

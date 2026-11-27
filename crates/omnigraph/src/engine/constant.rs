@@ -6,9 +6,11 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use datafusion::scalar::ScalarValue;
-use omnigraph_compiler::ir::{IRExpr, IROp, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::ir::expr::ScalarFunc;
+use omnigraph_compiler::ir::{IRExpr, IRParam, ParamMap};
+use omnigraph_compiler::query::value::{BinaryOp, Literal};
 use omnigraph_compiler::types::{ExprType, ScalarType};
+use omnigraph_planner::{PatternStep, ReadShape};
 
 use crate::error::{OmniError, Result};
 
@@ -50,18 +52,15 @@ pub(crate) fn evaluate_constant(expr: &IRExpr, params: &ParamMap) -> Result<Lite
                 .ok_or_else(|| OmniError::manifest(format!("parameter '{name}' not provided")))?,
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
-            | IRExpr::Search { .. }
-            | IRExpr::Fuzzy { .. }
-            | IRExpr::MatchText { .. }
-            | IRExpr::Bm25 { .. }
-            | IRExpr::Rrf { .. }
             | IRExpr::Variable(_, _)
             | IRExpr::Aggregate { .. }
             | IRExpr::AliasRef(_, _)
             | IRExpr::Binary { .. }
             | IRExpr::Not(_, _)
             | IRExpr::Cast { .. }
-            | IRExpr::IsNull { .. } => {
+            | IRExpr::IsNull { .. }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. } => {
                 return Err(OmniError::manifest_internal(
                     "Blob constant is not a URI leaf",
                 ));
@@ -77,6 +76,13 @@ pub(crate) fn evaluate_constant(expr: &IRExpr, params: &ParamMap) -> Result<Lite
     let array = evaluate_constant_array(expr, params)?;
     literal_from_scalar(
         ScalarValue::try_from_array(array.as_ref(), 0).map_err(OmniError::datafusion)?,
+    )
+}
+
+/// The value at `row` of a result column as the Literal a write assigns.
+pub(crate) fn literal_at(values: &ArrayRef, row: usize) -> Result<Literal> {
+    literal_from_scalar(
+        ScalarValue::try_from_array(values.as_ref(), row).map_err(OmniError::datafusion)?,
     )
 }
 
@@ -133,98 +139,244 @@ fn literal_list(values: &ArrayRef) -> Result<Literal> {
 }
 
 /// Fold bound constant filters without changing their compiler-selected types.
-pub(crate) fn fold_query_constants(ir: &QueryIR, params: &ParamMap) -> Result<QueryIR> {
+/// A `limit $param` takes the count the parameter is bound to here, so the
+/// plan's cut is that count and a replay folds its own value table's.
+/// A `nearest` window `k: $param` takes its bound count the same way.
+pub(crate) fn fold_query_constants(ir: &ReadShape, params: &ParamMap) -> Result<ReadShape> {
     let mut folded = ir.clone();
-    fold_pipeline(&mut folded.pipeline, params)?;
+    fold_pipeline(&mut folded.pipeline, &ir.params, params)?;
+    if let Some(name) = &folded.limit_param {
+        folded.limit = Some(bound_count(name, "limit", 0, &ir.params, params)?);
+    }
     Ok(folded)
 }
 
-fn fold_pipeline(pipeline: &mut [IROp], params: &ParamMap) -> Result<()> {
+/// The count of at least `min` the parameter `name` is bound to; `what`
+/// names the construct that reads it.
+fn bound_count(
+    name: &str,
+    what: &str,
+    min: u64,
+    declared: &[IRParam],
+    params: &ParamMap,
+) -> Result<u64> {
+    let ty = declared
+        .iter()
+        .find(|param| param.declaration.name == *name)
+        .map(|param| param.ty.clone())
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("`{what} ${name}` names no declared parameter"))
+        })?;
+    super::scan::resolve_to_int(&IRExpr::Param(name.to_string(), ty), params)
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|count| *count >= min)
+        .ok_or_else(|| match min {
+            0 => OmniError::manifest(format!(
+                "`{what} ${name}` must be bound to a non-negative integer"
+            )),
+            _ => OmniError::manifest(format!(
+                "`{what} ${name}` must be bound to an integer of at least {min}"
+            )),
+        })
+}
+
+fn fold_pipeline(
+    pipeline: &mut [PatternStep],
+    declared: &[IRParam],
+    params: &ParamMap,
+) -> Result<()> {
     for op in pipeline {
         match op {
-            IROp::NodeScan { filters, .. }
-            | IROp::Expand {
-                dst_filters: filters,
-                ..
-            } => {
-                for filter in filters {
-                    *filter = fold_expr(filter, params)?;
+            PatternStep::NodeScan { .. } | PatternStep::Expand { .. } => {}
+            PatternStep::Filter { pred: filter, .. } => *filter = fold_expr(filter, params)?,
+            PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
+                fold_pipeline(inner, declared, params)?
+            }
+            PatternStep::Union { arms, .. } => {
+                for arm in arms {
+                    fold_pipeline(arm, declared, params)?;
                 }
             }
-            IROp::Filter(filter) => *filter = fold_expr(filter, params)?,
-            IROp::AntiJoin { inner, .. } => fold_pipeline(inner, params)?,
+            // A fusion's `k` binds as it runs, where the engine refuses a
+            // value outside its range.
+            PatternStep::Fuse { arms, .. } => {
+                for arm in arms {
+                    fold_pipeline(&mut arm.steps, declared, params)?;
+                }
+            }
+            // An inline read's own `limit $param` takes its bound count, as
+            // the read's does.
+            PatternStep::Correlate { inner, read, .. } => {
+                fold_pipeline(inner, declared, params)?;
+                if let Some(name) = &read.limit_param {
+                    read.limit = Some(bound_count(name, "limit", 0, declared, params)?);
+                }
+                if let Some(window) = &mut read.window
+                    && let Some(name) = &window.targets_param
+                {
+                    window.targets = Some(bound_count(name, "k:", 1, declared, params)?);
+                }
+            }
+            // A window `k: $param` takes its bound count; the ranking's query
+            // binds at its scan.
+            PatternStep::Rank {
+                window,
+                window_param: Some(name),
+                ..
+            } => *window = Some(bound_count(name, "k:", 1, declared, params)?),
+            // The ranking's query binds at its scan, as a leading key's does,
+            // and a score's query vector at its node.
+            PatternStep::Rank { .. } | PatternStep::Score { .. } => {}
+            // A `let` that can fail runs on the rows that reach it, so it is
+            // not folded: a folded value would fail a read with no row.
+            PatternStep::Let { .. } => {}
         }
     }
     Ok(())
 }
 
 fn fold_expr(expr: &IRExpr, params: &ParamMap) -> Result<IRExpr> {
-    if matches!(expr, IRExpr::Cast { .. }) {
-        return Ok(expr.clone());
+    fold_with(expr, params, &constant_nodes(expr))
+}
+
+/// [`is_constant`] of every node of `expr`, by address, computed once
+/// bottom up rather than once per level.
+fn constant_nodes(expr: &IRExpr) -> std::collections::HashMap<*const IRExpr, bool> {
+    let mut constant = std::collections::HashMap::new();
+    let mut pending = vec![(expr, false)];
+    while let Some((node, children_done)) = pending.pop() {
+        if !children_done {
+            pending.push((node, true));
+            pending.extend(node.children().into_iter().map(|child| (child, false)));
+            continue;
+        }
+        let of = |child: &IRExpr| constant[&(child as *const IRExpr)];
+        let value = match node {
+            IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
+            IRExpr::Call {
+                func: ScalarFunc::List,
+                args,
+                ..
+            } => args.iter().all(of),
+            IRExpr::Binary {
+                op: BinaryOp::Arith(_),
+                ..
+            }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. } => false,
+            IRExpr::Binary { left, right, .. } => of(left) && of(right),
+            IRExpr::Not(inner, _) => of(inner),
+            IRExpr::IsNull { expr, .. } | IRExpr::Cast { expr, .. } => of(expr),
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(_, _) => false,
+        };
+        constant.insert(node as *const IRExpr, value);
     }
-    if is_constant(expr) && !matches!(expr, IRExpr::Literal(_, _) | IRExpr::Param(_, _)) {
-        if matches!(expr.ty(), ExprType::ExactInteger { .. }) {
+    constant
+}
+
+/// [`fold_expr`] reading each node's constancy from `constant`.
+fn fold_with(
+    expr: &IRExpr,
+    params: &ParamMap,
+    constant: &std::collections::HashMap<*const IRExpr, bool>,
+) -> Result<IRExpr> {
+    omnigraph_compiler::stack::deep(|| {
+        if matches!(expr, IRExpr::Cast { .. }) {
             return Ok(expr.clone());
         }
-        return Ok(IRExpr::Literal(
-            evaluate_constant(expr, params)?,
-            expr.ty().clone(),
-        ));
-    }
-    Ok(match expr {
-        IRExpr::Binary {
-            left,
-            op,
-            right,
-            ty,
-        } => IRExpr::Binary {
-            left: Box::new(fold_expr(left, params)?),
-            op: *op,
-            right: Box::new(fold_expr(right, params)?),
-            ty: ty.clone(),
-        },
-        IRExpr::Not(inner, ty) => IRExpr::Not(Box::new(fold_expr(inner, params)?), ty.clone()),
-        IRExpr::IsNull { expr, negated, ty } => IRExpr::IsNull {
-            expr: Box::new(fold_expr(expr, params)?),
-            negated: *negated,
-            ty: ty.clone(),
-        },
-        IRExpr::Cast { expr, ty } => IRExpr::Cast {
-            expr: Box::new(fold_expr(expr, params)?),
-            ty: ty.clone(),
-        },
-        IRExpr::PropAccess { .. }
-        | IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Param(_, _)
-        | IRExpr::Literal(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _) => expr.clone(),
+        if constant[&(expr as *const IRExpr)]
+            && !matches!(expr, IRExpr::Literal(_, _) | IRExpr::Param(_, _))
+        {
+            if matches!(expr.ty(), ExprType::ExactInteger { .. }) {
+                return Ok(expr.clone());
+            }
+            return Ok(IRExpr::Literal(
+                evaluate_constant(expr, params)?,
+                expr.ty().clone(),
+            ));
+        }
+        Ok(match expr {
+            IRExpr::Binary {
+                left,
+                op,
+                right,
+                ty,
+            } => IRExpr::Binary {
+                left: Box::new(fold_with(left, params, constant)?),
+                op: *op,
+                right: Box::new(fold_with(right, params, constant)?),
+                ty: ty.clone(),
+            },
+            IRExpr::Not(inner, ty) => {
+                IRExpr::Not(Box::new(fold_with(inner, params, constant)?), ty.clone())
+            }
+            IRExpr::IsNull { expr, negated, ty } => IRExpr::IsNull {
+                expr: Box::new(fold_with(expr, params, constant)?),
+                negated: *negated,
+                ty: ty.clone(),
+            },
+            IRExpr::Cast { expr, ty } => IRExpr::Cast {
+                expr: Box::new(fold_with(expr, params, constant)?),
+                ty: ty.clone(),
+            },
+            IRExpr::Neg { expr, ty } => IRExpr::Neg {
+                expr: Box::new(fold_with(expr, params, constant)?),
+                ty: ty.clone(),
+            },
+            IRExpr::Call { func, args, ty } => IRExpr::Call {
+                func: *func,
+                args: args
+                    .iter()
+                    .map(|arg| fold_with(arg, params, constant))
+                    .collect::<Result<_>>()?,
+                ty: ty.clone(),
+            },
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Param(_, _)
+            | IRExpr::Literal(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(_, _) => expr.clone(),
+        })
     })
 }
 
+/// Whether `expr` reads no row. Arithmetic is never folded early: an
+/// overflow or a zero divisor refuses the row it was written for, and a
+/// filter above may exclude every row (A3); registry calls are evaluated
+/// per batch like any other operator.
 pub(super) fn is_constant(expr: &IRExpr) -> bool {
-    match expr {
-        IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
-        IRExpr::Binary { left, right, .. } => is_constant(left) && is_constant(right),
-        IRExpr::Not(inner, _) => is_constant(inner),
-        IRExpr::IsNull { expr, .. } | IRExpr::Cast { expr, .. } => is_constant(expr),
-        IRExpr::PropAccess { .. }
-        | IRExpr::Nearest { .. }
-        | IRExpr::Search { .. }
-        | IRExpr::Fuzzy { .. }
-        | IRExpr::MatchText { .. }
-        | IRExpr::Bm25 { .. }
-        | IRExpr::Rrf { .. }
-        | IRExpr::Variable(_, _)
-        | IRExpr::Aggregate { .. }
-        | IRExpr::AliasRef(_, _) => false,
-    }
+    omnigraph_compiler::stack::deep(|| {
+        match expr {
+            IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
+            // A list holding parameters is fixed once they are bound.
+            IRExpr::Call {
+                func: ScalarFunc::List,
+                args,
+                ..
+            } => args.iter().all(is_constant),
+            IRExpr::Binary {
+                op: BinaryOp::Arith(_),
+                ..
+            }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. } => false,
+            IRExpr::Binary { left, right, .. } => is_constant(left) && is_constant(right),
+            IRExpr::Not(inner, _) => is_constant(inner),
+            IRExpr::IsNull { expr, .. } | IRExpr::Cast { expr, .. } => is_constant(expr),
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Aggregate { .. }
+            | IRExpr::AliasRef(_, _) => false,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -232,7 +384,7 @@ mod tests {
     use super::*;
     use arrow_array::{Array, Decimal128Array, Float64Array, ListArray};
     use arrow_schema::{DataType, Field};
-    use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+    use omnigraph_compiler::query::value::CompOp;
     use omnigraph_compiler::types::PropType;
 
     fn scalar(kind: ScalarType, nullable: bool) -> ExprType {
@@ -243,14 +395,14 @@ mod tests {
     fn constant_cast_executes_without_erasing_its_stored_witness() {
         let cast = IRExpr::Cast {
             expr: Box::new(IRExpr::Literal(
-                Literal::Float(30.0),
-                scalar(ScalarType::F64, false),
+                Literal::Integer(30),
+                scalar(ScalarType::I64, false),
             )),
-            ty: scalar(ScalarType::I64, false),
+            ty: scalar(ScalarType::I32, false),
         };
         let params = ParamMap::new();
         let values = evaluate_constant_array(&cast, &params).expect("exact literal narrowing");
-        assert_eq!(values.data_type(), &DataType::Int64);
+        assert_eq!(values.data_type(), &DataType::Int32);
         assert_eq!(
             evaluate_constant(&cast, &params).unwrap(),
             Literal::Integer(30)

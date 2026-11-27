@@ -504,6 +504,9 @@ pub(super) fn align_sources(
     columns.push(destination);
     columns.extend(edges.iter().cloned());
     let output = RecordBatch::try_new(Arc::clone(schema), columns)?;
+    // Every expansion's rows count against the read's work budget, so a
+    // chain of hops whose rows multiply is bounded where memory is not.
+    memory.charge_produced(output.num_rows() as u64)?;
     memory.output(&output)?;
     Ok(output)
 }

@@ -26,19 +26,21 @@ use super::roles::Source;
 use crate::table_store::TableStore;
 
 pub fn lower_predicate(predicate: &Predicate, id_col: &str) -> Result<Expr> {
-    Ok(match predicate {
-        Predicate::IdAfter { id } => col(id_col).gt(lit(id.clone())),
-        Predicate::VersionWindow { from, to } => col("_row_last_updated_at_version")
-            .gt(lit(*from))
-            .and(col("_row_last_updated_at_version").lt_eq(lit(*to))),
-        Predicate::And { left, right } => {
-            lower_predicate(left, id_col)?.and(lower_predicate(right, id_col)?)
-        }
-        Predicate::Gq { text, .. } => {
-            return Err(ExecError::internal(format!(
-                "a GQ predicate is lowered by the engine, not by the scan operator: {text}"
-            )));
-        }
+    omnigraph_compiler::stack::deep(|| {
+        Ok(match predicate {
+            Predicate::IdAfter { id } => col(id_col).gt(lit(id.clone())),
+            Predicate::VersionWindow { from, to } => col("_row_last_updated_at_version")
+                .gt(lit(*from))
+                .and(col("_row_last_updated_at_version").lt_eq(lit(*to))),
+            Predicate::And { left, right } => {
+                lower_predicate(left, id_col)?.and(lower_predicate(right, id_col)?)
+            }
+            Predicate::Gq { text, .. } => {
+                return Err(ExecError::internal(format!(
+                    "a GQ predicate is lowered by the engine, not by the scan operator: {text}"
+                )));
+            }
+        })
     })
 }
 

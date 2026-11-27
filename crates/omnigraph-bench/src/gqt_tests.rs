@@ -21,7 +21,7 @@ const END_TO_END: [(&str, StepKind); 14] = [
     ("e2e-branch-first-write", StepKind::Mutate),
     ("e2e-nearest-prefilter", StepKind::Query),
     ("e2e-nearest-nprobes-one", StepKind::Query),
-    ("e2e-rrf-traversal", StepKind::Query),
+    ("e2e-rrf-exact-traversal", StepKind::Query),
 ];
 const QUERY_SHAPES: [&str; 14] = [
     "e2e-query-scan",
@@ -380,7 +380,7 @@ scenario_tests!(
         end_to_end_e2e_branch_first_write => "e2e-branch-first-write",
         end_to_end_e2e_nearest_prefilter => "e2e-nearest-prefilter",
         end_to_end_e2e_nearest_nprobes_one => "e2e-nearest-nprobes-one",
-        end_to_end_e2e_rrf_traversal => "e2e-rrf-traversal",
+        end_to_end_e2e_rrf_exact_traversal => "e2e-rrf-exact-traversal",
     ]
 );
 
@@ -796,10 +796,10 @@ async fn an_authored_fixture_loads_its_csv_sections_and_uri_sources() {
          --- schema\nnode Item {{ key: String @key val: I64 }}\n\n\
          --- seed\n{{\"type\":\"Item\",\"data\":{{\"key\":\"a\",\"val\":1}}}}\n\n\
          --- csv people.csv\nkey,val\nb,2\n\n\
-         --- mutate\nload csv \"people.csv\" into node:Item mode append header\n--- expect ok\n\n\
-         --- mutate\nload csv \"file://{sources}/more.csv\" into node:Item mode append header\n--- expect ok\n\n\
+         --- mutate\nload csv \"people.csv\" into node:Item mode insert header\n--- expect ok\n\n\
+         --- mutate\nload csv \"file://{sources}/more.csv\" into node:Item mode insert header\n--- expect ok\n\n\
          --- restart\n\n\
-         --- mutate\nload csv \"file://{sources}/after.csv\" into node:Item mode append header\n--- expect ok\n",
+         --- mutate\nload csv \"file://{sources}/after.csv\" into node:Item mode insert header\n--- expect ok\n",
         sources = sources.display()
     );
     let fixture_path = entry.join("fixture.gqt");
@@ -1562,7 +1562,7 @@ fn nested_and_relocated_catalogs_keep_content_identity_and_refuse_aliases() {
 #[tokio::test]
 async fn expected_parameter_error_does_not_claim_a_warming_engine_read() {
     let mut p = plan("tiny-read");
-    let prefix = "--- query\nquery invalid($key: String) { match { $i: Item { key: $key } } return { $i.val } }\n--- params\n{\"key\":42}\n--- expect error: params rejected\n\n";
+    let prefix = "--- query\nquery invalid($key: String) { match { $i: Item } where $i.key = $key return { $i.val } }\n--- params\n{\"key\":42}\n--- expect error: params rejected\n\n";
     let at = p.queries.text.find("--- query").unwrap();
     p.queries.text.insert_str(at, prefix);
     p.queries.sha256 = sha256_bytes(p.queries.text.as_bytes());

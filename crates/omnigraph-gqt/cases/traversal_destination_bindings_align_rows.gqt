@@ -46,11 +46,8 @@ edge WorksAt: Person -> Company
 
 --- query
 query at_acme() {
-    match {
-        $p: Person
-        $p worksAt $c
-        $c: Company { name: "Acme" }
-    }
+    match { $p: Person, $p worksAt $c, $c: Company }
+    where $c.name = "Acme"
     return { $p.name }
 }
 
@@ -62,11 +59,7 @@ p.name: String
 
 --- query
 query employee_companies() {
-    match {
-        $p: Person
-        $p worksAt $c
-        $c: Company
-    }
+    match { $p: Person, $p worksAt $c, $c: Company }
     return { $p.name, $c.name }
 }
 
@@ -80,11 +73,8 @@ c.name: String
 
 --- query
 query fof_chain($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $mid
-        $mid knows $fof
-    }
+    match { $p: Person, $p knows $mid, $mid knows $fof }
+    where $p.name = $name
     return { $p.name, $mid.name, $fof.name }
 }
 
@@ -101,12 +91,8 @@ fof.name: String
 
 --- query
 query fof_via($name: String, $mid_name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $mid
-        $mid: Person { name: $mid_name }
-        $mid knows $fof
-    }
+    match { $p: Person, $p knows $mid, $mid: Person, $mid knows $fof }
+    where $p.name = $name and $mid.name = $mid_name
     return { $fof.name }
 }
 
@@ -121,11 +107,8 @@ fof.name: String
 
 --- query
 query at_acme_named() {
-    match {
-        $p: Person
-        $p worksAt $c
-        $c: Company { name: "Acme" }
-    }
+    match { $p: Person, $p worksAt $c, $c: Company }
+    where $c.name = "Acme"
     return { $p.name, $c.name }
 }
 
@@ -138,11 +121,8 @@ c.name: String
 
 --- query
 query at_company($company: String) {
-    match {
-        $p: Person
-        $p worksAt $c
-        $c: Company { name: $company }
-    }
+    match { $p: Person, $p worksAt $c, $c: Company }
+    where $c.name = $company
     return { $p.name, $c.name }
 }
 
@@ -158,11 +138,8 @@ c.name: String
 
 --- query
 query fan_out($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $f
-        $p worksAt $c
-    }
+    match { $p: Person, $p knows $f, $p worksAt $c }
+    where $p.name = $name
     return { $f.name, $c.name }
 }
 
@@ -179,11 +156,8 @@ c.name: String
 
 --- query
 query at_phantom() {
-    match {
-        $p: Person
-        $p worksAt $c
-        $c: Company { name: "NonExistent" }
-    }
+    match { $p: Person, $p worksAt $c, $c: Company }
+    where $c.name = "NonExistent"
     return { $p.name }
 }
 

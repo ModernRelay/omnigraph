@@ -1,11 +1,12 @@
 # issue: 566
-# red_on: 545176bd; `order { count($d) desc }` is `unsupported ordering expression` on v2 and the door's order-key refusal on v1; `$p.age > 30 as adult` in return is `unsupported projection expression` on v2.
+# red_on: 545176bd; `order { count($d) desc }` is `unsupported ordering expression` on v2; `$p.age > 30 as adult` in return is `unsupported projection expression` on v2.
 # notes: Part 3 of issue 566: an order key that is not a property access binds
 # notes: against the return list. `order { count($d) desc }` sorts by the
 # notes: `count($d) as deals` column; an unaliased aggregate written the same way
 # notes: in return matches as a tree and sorts by its own column; a key that
 # notes: matches no return item is T42 with the key quoted as written. A Boolean
-# notes: key binds the same way to its aliased return item. Group rows have no
+# notes: key binds the same way to its aliased return item; one no return item
+# notes: computes is evaluated beside the return items. Group rows have no
 # notes: tie-break, so the sort direction is shown through `limit 1`.
 
 --- runner
@@ -48,9 +49,8 @@ edge RelevantMarket: Deal -> Market {}
 {"edge":"RelevantMarket","from":"d3","to":"us"}
 
 --- query
-set engine = v2;
 query per_market($slug: String) {
-    match { $p: Person { slug: $slug }  $d: Deal  $d ledByPerson $p  $d relevantMarket $m }
+    match { $p: Person, $d: Deal, $d ledByPerson $p, $d relevantMarket $m } where $p.slug = $slug
     return { $m.name, count($d) as deals }
     order { count($d) desc }
     limit 25
@@ -68,9 +68,8 @@ m.name: String
 deals: I64
 
 --- query
-set engine = v2;
 query top_market($slug: String) {
-    match { $p: Person { slug: $slug }  $d: Deal  $d ledByPerson $p  $d relevantMarket $m }
+    match { $p: Person, $d: Deal, $d ledByPerson $p, $d relevantMarket $m } where $p.slug = $slug
     return { $m.name, count($d) as deals }
     order { count($d) desc }
     limit 1
@@ -87,9 +86,8 @@ m.name: String
 deals: I64
 
 --- query
-set engine = v2;
 query smallest_market_unaliased($slug: String) {
-    match { $p: Person { slug: $slug }  $d: Deal  $d ledByPerson $p  $d relevantMarket $m }
+    match { $p: Person, $d: Deal, $d ledByPerson $p, $d relevantMarket $m } where $p.slug = $slug
     return { $m.name, count($d) }
     order { count($d) }
     limit 1
@@ -106,17 +104,15 @@ m.name: String
 d: I64
 
 --- query
-set engine = v2;
 query per_market_by_max() {
-    match { $d: Deal  $d relevantMarket $m }
+    match { $d: Deal, $d relevantMarket $m }
     return { $m.name, count($d) as deals }
     order { max($d.amount) }
 }
 
---- expect error: T42: order key `max($d.amount)` does not appear in return; add it to return or order by its alias
+--- expect error: T42: an aggregate order key must repeat a return item; order by its alias
 
 --- query
-set engine = v2;
 query adults_first() {
     match { $p: Person }
     return { $p.slug, $p.age > 30 as adult }
@@ -133,11 +129,31 @@ p.slug: String
 adult: Bool?
 
 --- query
-set engine = v2;
 query boolean_key_unbound() {
     match { $p: Person }
     return { $p.slug }
     order { $p.age > 30 }
 }
 
---- expect error: T42: order key `$p.age > 30` does not appear in return; add it to return or order by its alias
+--- expect ordered
+{"p.slug": "carol"}
+{"p.slug": "bob"}
+{"p.slug": "alice"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query computed_key_under_a_limit() {
+    match { $p: Person }
+    return { $p.slug }
+    order { $p.age > 30 desc, $p.slug }
+    limit 2
+}
+
+--- expect ordered
+{"p.slug": "alice"}
+{"p.slug": "bob"}
+
+--- expect shape
+p.slug: String

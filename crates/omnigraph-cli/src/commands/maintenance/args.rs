@@ -12,8 +12,8 @@ pub(crate) enum IndexCommand {
     Build(IndexBuildArgs),
     /// Rebuild one kind of index from a branch's current rows
     ///
-    /// `--kind full-text` uses the default English analyzer and replaces any
-    /// custom tokenizer settings.
+    /// `--kind full-text` uses each property's analyzer profile (`english_v1`
+    /// where none is declared) and replaces any custom tokenizer settings.
     Rebuild(IndexRebuildArgs),
 }
 

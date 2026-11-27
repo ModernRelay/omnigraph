@@ -70,6 +70,35 @@ A materializing rewrite (a carried update or merge cell, the bounded rewrite str
 
 A whole-object surface cannot carry a ranged external descriptor: `ExternalBlobRef::whole_object_uri` returns a `RangedExternalBlob` (whose display never includes the URI) for it, and the HTTP redirect, CLI delivery and export all refuse it rather than widen it. Surfaces that are not reloaded describe it instead: `BlobRowReader` takes `RangedExternalBlobs::{Refuse, Describe}` and returns `LogicalBlobValue::RangedExternal` under `Describe`, which `describe_ranged_blob_cells` writes as `{"uri", "offset", "length"}` with a positive length (the decoder below guarantees one; a missing length there is an internal error) into the row images of `logical_row_image` (change-feed images, entity reads) and the snapshot rows of the change-feed baseline, and change-row comparison compares exactly, so a ranged row never wedges a feed cursor or refuses a baseline. The baseline shares export's table walk and line format and passes `Describe` where export passes `Refuse`: it is the exact state its consumer starts from, and a refusal there would leave the graph with no baseline. The descriptor decoder refuses an external descriptor with an offset but size 0 as a Blob integrity error: Lance reads size 0 as the object's size but keeps the position, which would read past the object's end.
 
+## Copying a Blob from a row
+
+A mutation assignment that reads a Blob from its group's row
+(`update $t set { content: $f.content }`, the same in `insert`, `upsert` and
+`replace`, and under `if` and `coalesce`) is the one place the type checker
+reads a Blob as a value (`T24` everywhere else, a `let` and `is null`
+included). The write shaper lowers the value to the cells it copies
+(`shape::write::BlobValue`): each Blob leaf `$v.p` becomes the selection
+read's column holding `$v`'s identity, plus the edge type column where the
+binding matches several edge types, and each `if` condition a Bool column.
+`exec/blob_copy.rs` then reads, per selection batch, the cells the batch's
+rows name at the write's snapshot: one filtered scan per source table and
+property (`id` in the batch's ids, projecting the id and the descriptor, with
+stable row ids) classifies every cell from its descriptor; the value's `if`
+and `coalesce` choose a cell per row (a null cell is a null value); the
+chosen managed lengths are charged to the write budget
+(`decoded blob input bytes per operation`, across the statement's batches)
+before any payload is read; and each source column's chosen managed cells are
+read in one `TableStore::managed_blob_payloads` call. A cell no row chooses is
+neither charged nor read. The value is returned in the input spelling above
+(`base64:` bytes, an external whole-object URI, null), so the target cell is
+admitted and built exactly as a parameter's value is: an external URI passes
+`ExternalBlobPolicy`, and the keyed write materializes its object. A ranged
+external source is refused (`ManifestErrorKind::BadRequest`, the
+`RangedExternalBlob` display, no URI), since its whole-object spelling would
+widen it. An `update` omits a Blob a row value assigns from its scan, as it
+omits a constant's, and never stages a column patch for it. `E4` names two
+different Blob values for one entity without showing either.
+
 ## Engine cell writes
 
 `Session::put_blob_at_as` and `Session::clear_blob_at_as` (`exec/blob_write.rs`) replace one cell of an existing row. They are Mutation-protocol writes, not a writer kind of their own: an attempt captures a `WriteTxn`, stages one `PendingMode::Upsert` row through `MutationStaging`, and runs the Mutation tail, `commit_staged_mutation` (validation, staging, `commit_all`'s detached commit) then `publish_committed_mutation` (the protocol's one publisher call). `forbidden_apis.rs` registers the file under `MUTATION_V9`.
@@ -101,6 +130,7 @@ Export emits managed values as base64 and whole-object external values as URI de
 ## Test owners
 
 - Engine logical reads and ingestion: `crates/omnigraph/tests/integration/end_to_end.rs`, `integration/branching.rs`, and in-source Blob/table-store tests.
+- Copying a Blob from a row: `writes.rs::blob_read_from_a_row_copies_the_cell_its_row_selects` (managed, external, null and several rows read back with `read_blob_at`, one batched read, the budget before any read, `E4`, a ranged source), the GQT case `blob_read_from_a_row_in_an_assignment.gqt`, the lowering table in `omnigraph-compiler` `query::check::tests::lowering`, and the DST golden rows `UpdateCopyBlob1M` and `ReplaceCopy4Blob1M`.
 - Engine cell writes: `integration/end_to_end.rs::blob_put_and_clear_replace_one_cell_by_exact_id` (node and edge, preconditions, the receipt), `writes.rs` (`blob_put_*` and `blob_write_*`: the inclusive bound, carried siblings, a denied carried reference), `policy_engine_chassis.rs`, the `BlobPut` and `BlobClear` writers of `detached_commit_matrix.rs`, and `failpoints.rs` (a competing write re-evaluates the precondition and re-carries the row, a schema or branch change refuses the retry, a lost acknowledgement publishes once, a write after publication leaves the receipt unchanged).
 - Export and change-feed Blob reads: `integration/export.rs::export_reads_each_batch_of_managed_blobs_in_one_read_per_column` (one batched read per Blob column per batch, request order, the baseline's shared walk), `integration/changes.rs::change_feed_detects_same_length_blob_only_update` (one read per managed cell an image or the tie-break needs), `integration/end_to_end.rs::blob_read_returns_bytes` (export and an edge entity read return the read facade's bytes across fragments), and the call-site pin `forbidden_apis.rs::lance_batched_blob_read_call_counts_are_pinned`.
 - Base and storage-root disjointness: in-source `blob.rs` tests (root forms and S3/local overlap), `integration/end_to_end.rs::external_blob_policy_refuses_base_overlapping_graph_root`, and the `omnigraph-cluster` tests `external_blob_config_rejects_bases_overlapping_storage_root`, `direct_source_operations_use_selected_root_and_same_id_never_reexecutes` (plan and apply refuse an overlapping base over existing state), the server's `boot_quarantines_overlapping_external_blob_base_and_strict_boot_refuses`, `external_blob_config_reports_uncomparable_storage_root_under_its_own_code`, `serving_quarantines_applied_policies_overlapping_storage_root` (the classifier), `serving_snapshot_quarantines_graph_whose_applied_base_overlaps_storage_root` (the snapshot reader: quarantine with a healthy sibling, refusal when none is left, ledger unchanged), and `serving_snapshot_refuses_overlapping_policy_its_digest_does_not_bind`.
