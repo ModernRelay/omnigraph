@@ -229,17 +229,25 @@ fn normalized_config_path(path: &Path) -> Result<PathBuf> {
 
 /// Bounded operator-owned text input, including config, credentials and backups.
 pub(crate) fn read_operator_file(path: &Path, description: &str) -> Result<Option<String>> {
+    read_operator_file_with_limit(path, description, OPERATOR_FILE_MAX_BYTES)
+}
+
+pub(crate) fn read_operator_file_with_limit(
+    path: &Path,
+    description: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => bail!("could not read {description} '{}': {error}", path.display()),
     };
     let mut text = String::new();
-    file.take(OPERATOR_FILE_MAX_BYTES as u64 + 1)
+    file.take(max_bytes as u64 + 1)
         .read_to_string(&mut text)
         .map_err(|error| eyre!("could not read {description} '{}': {error}", path.display()))?;
-    if text.len() > OPERATOR_FILE_MAX_BYTES {
-        bail!("{description} exceeds 1 MiB");
+    if text.len() > max_bytes {
+        bail!("{description} exceeds {} MiB", max_bytes / (1024 * 1024));
     }
     Ok(Some(text))
 }

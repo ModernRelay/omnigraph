@@ -8,6 +8,48 @@ use super::{Completion, UndeliveredFailure, finish, run_from};
 use crate::{client::GraphClient, command_outcome, invocation::MachineErrors};
 
 #[tokio::test]
+async fn profile_edit_refusal_reports_session_cleanup_issue_1169() {
+    for created_session in [false, true] {
+        for machine in [None, Some(MachineErrors::Json)] {
+            let mut discarded = false;
+            let error = crate::commands::targets::registration_save_error(
+                crate::targets::refusal("config_not_editable", "authored YAML cannot be edited"),
+                created_session,
+                async {
+                    discarded = true;
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(discarded, created_session);
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let result =
+                super::complete_onboarding(Err(error), machine.is_some(), &mut stdout, &mut stderr);
+            let completion =
+                finish(result, None, None, machine, false, &mut stdout, &mut stderr).unwrap();
+            assert_eq!(completion.code(), 2);
+            let message = if machine.is_some() {
+                let body: Value = serde_json::from_slice(&stdout).unwrap();
+                assert_eq!(body["code"], "config_not_editable");
+                assert!(stderr.is_empty());
+                body["error"].as_str().unwrap().to_owned()
+            } else {
+                assert!(stdout.is_empty());
+                String::from_utf8(stderr).unwrap()
+            };
+            assert!(message.contains("authored YAML cannot be edited"));
+            let outcome = if created_session {
+                "local session cleanup completed: true"
+            } else {
+                "profile sign-in preserved"
+            };
+            assert!(message.contains(outcome), "{message}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn login_uses_the_default_profile_without_starting_onboarding_issue_1115() {
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join("config.yaml");
@@ -2260,4 +2302,110 @@ fn server_test_target(endpoint: &str) -> crate::targets::ResolvedTarget {
             address: endpoint.into(),
         },
     )
+}
+
+#[tokio::test]
+async fn target_edits_preserve_the_authored_operator_document_issue_1169() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.yaml");
+    let source = concat!(
+        "# Operator config kept in dotfiles.\nversion: 1\n\n",
+        "targets:\n  # Primary graph.\n  personal:\n",
+        "    kind: server\n    endpoint: https://graph.example.test\n",
+        "    auth: {provider: token, source: {file: tokens/personal}}\n\n",
+        "aliases:\n  recent: {target: 'personal', graph: personal, query: notes}\n",
+        "defaults: {target: personal} # current selection\n",
+    );
+    std::fs::write(&path, source).unwrap();
+    let registered = serde_json::to_vec(&serde_json::json!({
+        "kind": "server", "endpoint": "https://other.example.test", "default_graph": null,
+        "auth": {"provider": "exec", "command": [home.path().join("get-token")]}
+    }))
+    .unwrap();
+    for (args, stdin) in [
+        (
+            vec!["omnigraph", "target", "add", "second"],
+            &registered[..],
+        ),
+        (vec!["omnigraph", "target", "remove", "second"], &[][..]),
+        (
+            vec!["omnigraph", "config", "rename-target", "personal", "studio"],
+            &[][..],
+        ),
+    ] {
+        let action = args[2];
+        let result = super::execute(
+            crate::invocation::parse_from(args).unwrap(),
+            crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+            &mut &stdin[..],
+            false,
+            &mut Vec::new(),
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.code(), 0);
+        let actual = std::fs::read_to_string(&path).unwrap();
+        match action {
+            "add" => {
+                assert!(actual.contains("second:"));
+                assert!(!actual.contains("timeout") && !actual.contains("default_graph"));
+                let (prefix, suffix) = source.split_once("\n\naliases:").unwrap();
+                assert!(
+                    actual.starts_with(prefix)
+                        && actual.ends_with(&format!("\n\naliases:{suffix}")),
+                    "{actual}"
+                );
+            }
+            "remove" => assert_eq!(actual, source),
+            _ => assert_eq!(
+                actual,
+                source
+                    .replace("  personal:", "  studio:")
+                    .replace("target: 'personal'", "target: 'studio'")
+                    .replace("target: personal}", "target: studio}")
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn uneditable_target_rename_reports_its_code_without_replacing_yaml_issue_1169() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.yaml");
+    for style in ["|-", ">-"] {
+        let source = format!(
+            "version: 1\ntargets: {{old: {{kind: server, endpoint: 'https://example.test', auth: {{provider: anonymous}}}}}}\ndefaults:\n  target: {style} # keep this presentation\n    old\n# next section\naliases: {{}}\n"
+        );
+        std::fs::write(&path, &source).unwrap();
+        for name in ["new", "null"] {
+            let mut stderr = Vec::new();
+            let result = super::execute(
+                crate::invocation::parse_from([
+                    "omnigraph",
+                    "config",
+                    "rename-target",
+                    "old",
+                    name,
+                ])
+                .unwrap(),
+                crate::operator::InvocationConfig::at(Some(home.path().to_owned()), None),
+                &mut io::empty(),
+                false,
+                &mut Vec::new(),
+                false,
+                &mut stderr,
+            )
+            .await
+            .unwrap();
+            assert_ne!(result.code(), 0);
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains("config_not_editable")
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
 }

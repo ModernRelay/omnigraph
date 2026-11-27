@@ -28,6 +28,7 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 yaml_serde = { workspace = true }
+yaml-rt = { version = "0.3.3", default-features = false }
 libyaml-rs = "0.3"
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "process"] }
 reqwest = { workspace = true, features = ["blocking", "stream", "rustls-tls-native-roots"] }
