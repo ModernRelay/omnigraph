@@ -4012,6 +4012,17 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
         // Null is compatible with any nullable type; default to String for inference.
         Literal::Null => Ok(PropType::scalar(ScalarType::String, true)),
         Literal::String(_) => Ok(PropType::scalar(ScalarType::String, false)),
+        Literal::Integer(value)
+            if *value > i128::from(u64::MAX) || *value < i128::from(i64::MIN) =>
+        {
+            Err(CompilerError::typed(
+                T3,
+                "integer literal is outside the I64 and U64 range".to_string(),
+            ))
+        }
+        Literal::Integer(value) if *value > i128::from(i64::MAX) => {
+            Ok(PropType::scalar(ScalarType::U64, false))
+        }
         Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
         Literal::Float(value) if value.is_infinite() => Err(CompilerError::typed(
             T3,
@@ -4030,6 +4041,20 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
             Ok(PropType::scalar(ScalarType::DateTime, false))
         }
         Literal::List(items) => {
+            let (mut negative, mut above_i64) = (false, false);
+            for item in items {
+                if let Literal::Integer(value) = item {
+                    negative |= *value < 0;
+                    above_i64 |= *value > i128::from(i64::MAX);
+                }
+            }
+            if negative && above_i64 {
+                return Err(CompilerError::typed(
+                    T3,
+                    "list literal mixes a negative member with one above 9223372036854775807; no integer type holds both"
+                        .to_string(),
+                ));
+            }
             let mut scalar = None;
             for item in items {
                 let item_type = literal_type(item)?;
@@ -4045,10 +4070,17 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
                 scalar = Some(match scalar {
                     None => item_type.scalar,
                     Some(previous) if previous == item_type.scalar => previous,
-                    Some(ScalarType::I64 | ScalarType::F64)
-                        if matches!(item_type.scalar, ScalarType::I64 | ScalarType::F64) =>
+                    Some(previous @ (ScalarType::I64 | ScalarType::U64 | ScalarType::F64))
+                        if matches!(
+                            item_type.scalar,
+                            ScalarType::I64 | ScalarType::U64 | ScalarType::F64
+                        ) =>
                     {
-                        ScalarType::F64
+                        if previous == ScalarType::F64 || item_type.scalar == ScalarType::F64 {
+                            ScalarType::F64
+                        } else {
+                            ScalarType::U64
+                        }
                     }
                     Some(_) => {
                         return Err(CompilerError::typed(

@@ -1070,8 +1070,8 @@ impl std::hash::Hash for Literal {
 }
 
 /// The literal as explain text. It is the spelling the parser accepts except
-/// for `null`, a negative number and a non-finite float, which GQ has no
-/// literal for. A float prints in fixed notation with a decimal point.
+/// for `null` and a non-finite float, which GQ has no literal for. A float
+/// prints in fixed notation with a decimal point.
 impl std::fmt::Display for Literal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

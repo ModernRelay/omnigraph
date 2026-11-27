@@ -263,12 +263,15 @@ edge_ident = @{ !reserved ~ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_
 type_name = @{ "@"? ~ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
 ident = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
-literal = { list_lit | datetime_lit | date_lit | string_lit | float_lit | integer | bool_lit }
+// A number literal may carry a leading minus; `integer` has none, so a count
+// (`limit`, `{min,max}` bounds, `Vector(N)`, a setting value) stays unsigned.
+literal = { list_lit | datetime_lit | date_lit | string_lit | float_lit | int_lit | bool_lit }
 date_lit = { "date" ~ "(" ~ string_lit ~ ")" }
 datetime_lit = { "datetime" ~ "(" ~ string_lit ~ ")" }
 list_lit = { "[" ~ (literal ~ ("," ~ literal)*)? ~ "]" }
 string_lit = @{ "\"" ~ string_char* ~ "\"" }
 string_char = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
-float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+float_lit = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+int_lit = @{ "-"? ~ ASCII_DIGIT+ }
 integer = @{ ASCII_DIGIT+ }
 bool_lit = @{ ("true" | "false") ~ !(ASCII_ALPHANUMERIC | "_") }

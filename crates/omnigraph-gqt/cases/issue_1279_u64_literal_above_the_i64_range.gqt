@@ -1,0 +1,174 @@
+# issue: 1279
+# red_on: 64b3b2f3; the case is invalid before the fix: the parser reads every integer literal into an `i64`, so `18446744073709551615` is `invalid integer: number too large to fit in target type` and `-1` is `expected not_expr`.
+# notes: An integer literal carries the whole `U64` range, narrowed at the typed boundary like a parameter; a literal
+# notes: outside both the `I64` and the `U64` range is refused at type checking with `T3`, and a negative literal
+# notes: assigned to a `U64` property is refused where the value is narrowed, before any row is written.
+# notes: A list literal whose members straddle `i64::MAX` is one `[U64]` list when none is negative, in `in` and in a
+# notes: `[U64]` assignment; a negative member beside one above `i64::MAX` is `T3`, since no integer type holds both;
+# notes: a literal above `i64::MAX` is typed `U64` in the plan.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    key: String @key
+    size: U64
+    n: I64?
+    sizes: [U64]?
+}
+
+--- seed
+{"type":"Item","data":{"key":"a","size":18446744073709551615,"n":-1,"sizes":[0,18446744073709551615]}}
+{"type":"Item","data":{"key":"b","size":0,"n":3,"sizes":[3]}}
+
+--- query
+query item_at_the_unsigned_maximum() {
+    match { $i: Item $i.size = 18446744073709551615 }
+    return { $i.key }
+}
+
+--- expect unordered
+{"i.key": "a"}
+
+--- expect shape
+i.key: String
+
+--- query
+set engine = v2;
+query unsigned_maximum_literal_typed_u64() {
+    match { $i: Item $i.size = 18446744073709551615 }
+    return { $i.key }
+}
+
+--- expect unordered
+{"i.key": "a"}
+
+--- expect shape
+i.key: String
+
+--- expect plan
+type 18446744073709551615: U64
+
+--- query
+query signed_member_beside_the_unsigned_maximum() {
+    match { $i: Item $i.n in [-1, 18446744073709551615] }
+    return { $i.key }
+}
+
+--- expect error: T3: list literal mixes a negative member with one above 9223372036854775807
+
+--- query
+query small_member_beside_the_unsigned_maximum() {
+    match { $i: Item $i.size in [3, 18446744073709551615] }
+    return { $i.key }
+}
+
+--- expect unordered
+{"i.key": "a"}
+
+--- expect shape
+i.key: String
+
+--- mutate
+query insert_a_list_straddling_the_signed_maximum() {
+    insert Item { key: "d", size: 1, sizes: [9223372036854775807, 9223372036854775808] }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query inserted_list_read_back() {
+    match { $i: Item $i.key = "d" }
+    return { $i.sizes }
+}
+
+--- expect unordered
+{"i.sizes": [9223372036854775807, 9223372036854775808]}
+
+--- expect shape
+i.sizes: [U64]?
+
+--- query
+query items_above_the_signed_maximum() {
+    match { $i: Item $i.size > 9223372036854775807 }
+    return { $i.key }
+}
+
+--- expect unordered
+{"i.key": "a"}
+
+--- expect shape
+i.key: String
+
+--- query
+query unsigned_values_against_a_negative_literal() {
+    match { $i: Item $i.size > -1 }
+    return { $i.key }
+}
+
+--- expect unordered
+{"i.key": "a"}
+{"i.key": "b"}
+{"i.key": "d"}
+
+--- expect shape
+i.key: String
+
+--- mutate
+query insert_item_at_the_unsigned_maximum() {
+    insert Item { key: "c", size: 18446744073709551615 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query inserted_item_keeps_the_whole_value() {
+    match { $i: Item $i.size = 18446744073709551615 }
+    return { $i.key }
+}
+
+--- expect unordered
+{"i.key": "a"}
+{"i.key": "c"}
+
+--- expect shape
+i.key: String
+
+--- query
+query literal_above_the_unsigned_range() {
+    match { $i: Item $i.size = 18446744073709551616 }
+    return { $i.key }
+}
+
+--- expect error: T3: integer literal is outside the I64 and U64 range
+
+--- query
+query literal_below_the_signed_range() {
+    match { $i: Item $i.size > -9223372036854775809 }
+    return { $i.key }
+}
+
+--- expect error: T3: integer literal is outside the I64 and U64 range
+
+--- mutate
+query negative_value_into_an_unsigned_property() {
+    insert Item { key: "d", size: -1 }
+}
+
+--- expect error: integer value -1 exceeds UInt64 range
+
+--- query
+query no_row_was_written() {
+    match { $i: Item }
+    return { count($i) as n }
+}
+
+--- expect unordered
+{"n": 4}
+
+--- expect shape
+n: I64
