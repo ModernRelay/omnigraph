@@ -1083,6 +1083,7 @@ async fn run_cell(case: &MergeCase) -> DirectionResult {
 /// cannot spread the cells over its workers.
 const CELL_WORKERS: usize = 8;
 
+// contract: merge:2
 #[test]
 fn merge_pair_truth_table() {
     let start = Instant::now();

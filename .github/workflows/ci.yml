@@ -171,6 +171,13 @@ jobs:
       - name: Verify documentation structure and RFC registry
         run: python3 scripts/check-docs.py
 
+      # A `✓` in docs/dev/contract.md is derived from the tests under crates/
+      # that name its statement; this run only reports, `--update` rewrites.
+      - name: Verify contract marks match the tests that name them
+        run: |
+          python3 scripts/check-contract-marks.py --self-test
+          python3 scripts/check-contract-marks.py
+
       - name: Test release-note composition
         run: python3 scripts/test_release_notes.py
 
